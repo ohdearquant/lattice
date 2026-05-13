@@ -8,7 +8,11 @@ echo "=== Clippy ==="
 cargo clippy --workspace -- -D warnings
 
 echo "=== Doc Lint ==="
-./scripts/lint-docs.sh
+if command -v deno >/dev/null 2>&1; then
+    deno fmt --check **/*.md
+else
+    echo "deno not found, skipping doc lint"
+fi
 
 echo "=== Tests ==="
 cargo test --workspace

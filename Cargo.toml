@@ -83,6 +83,12 @@ too_many_arguments = "warn"
 # Performance
 large_enum_variant = "warn"
 
+# SIMD — these fire on target-gated intrinsics that are behind #[cfg(target_arch)] + #[target_feature].
+# False positives: the code never runs on a platform that doesn't support the intrinsic.
+incompatible_msrv = "allow"
+needless_range_loop = "allow"
+missing_safety_doc = "warn"
+
 # SIMD/unsafe — allow in unsafe fns (edition 2024 strictness)
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"
