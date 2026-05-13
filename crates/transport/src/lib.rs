@@ -54,7 +54,6 @@
 //! ```
 
 #![warn(missing_docs)]
-#![warn(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
 pub mod barycenter;

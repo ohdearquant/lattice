@@ -1,5 +1,3 @@
-#![warn(clippy::all)]
-
 //! lattice-fann: Fast neural network primitives for Lattice
 //!
 //! This crate provides lightweight neural network building blocks optimized

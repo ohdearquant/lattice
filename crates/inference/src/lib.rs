@@ -6,7 +6,6 @@
 //! `foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
 //! See `foundation/STABILITY.md` for the full policy.
 //!
-#![warn(clippy::all)]
 // ML inference kernels: many functions have >7 args by necessity (BLAS-style APIs
 // where grouping into structs would require heap allocation in hot paths), and many
 // loops use the index to access multiple arrays simultaneously so the
