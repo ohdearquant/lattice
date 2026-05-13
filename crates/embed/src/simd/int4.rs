@@ -217,6 +217,7 @@ pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
     a_deq.iter().zip(b_deq.iter()).map(|(&x, &y)| x * y).sum()
 }
 
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn finish_int4_dot(raw_dot: i32, sum_a: i32, sum_b: i32, a: &Int4Vector, b: &Int4Vector) -> f32 {
     let raw_dot = raw_dot as f32;

@@ -22,11 +22,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-      - name: Build
-        run: cargo build --workspace --release
+        with:
+          cache-on-failure: true
+      - name: Clean lattice crates (force rebuild, keep dep cache)
+        run: |
+          cargo clean -p lattice-inference 2>/dev/null || true
+          cargo clean -p lattice-embed 2>/dev/null || true
+          cargo clean -p lattice-fann 2>/dev/null || true
+          cargo clean -p lattice-tune 2>/dev/null || true
+          cargo clean -p lattice-transport 2>/dev/null || true
+      - run: ./scripts/ci.sh

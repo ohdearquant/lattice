@@ -8,7 +8,6 @@
 //!
 //! # lattice-embed
 
-#![warn(clippy::all)]
 #![warn(missing_docs)]
 #![allow(clippy::clone_on_copy)]
 //!
