@@ -23,7 +23,7 @@ inference-hook = ["dep:lattice-inference"]
 sqlite = ["dep:rusqlite", "serde"]
 
 [dependencies]
-lattice-fann = { path = "../fann" }
+lattice-fann = { version = "0.1.0", path = "../fann" }
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -44,7 +44,7 @@ safetensors = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 
 # Inference hook (optional — for LoRA adapter injection)
-lattice-inference = { path = "../inference", optional = true, features = ["f16"] }
+lattice-inference = { version = "0.1.0", path = "../inference", optional = true, features = ["f16"] }
 
 [[bin]]
 name = "generate_lora"
