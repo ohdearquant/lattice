@@ -6,12 +6,15 @@ Pure Rust inference engine for transformer embedding models.
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
 [![CI](https://github.com/ohdearquant/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/lattice/actions)
 
-No ONNX. No Python. No external ML runtime. Lattice implements the full compute graph — weight
-loading, tokenization, forward pass, and vector operations — in Rust, with hand-written SIMD
-kernels and Metal/WGPU GPU backends.
+No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full compute graph
+— weight loading, tokenization, forward pass, and vector operations — in Rust, with hand-written
+SIMD kernels optimized for CPU and Apple Silicon Metal.
 
-Built for embedding workloads that need to run in servers, edge deployments, or as a library
-dependency without dragging in a Python interpreter or a 300 MB ONNX runtime.
+Built for embedding workloads on CPU and macOS GPU. Optimized for AVX2 (x86), NEON (ARM),
+and Metal (Apple Silicon) — not CUDA. If you need NVIDIA GPU inference, use
+[candle](https://github.com/huggingface/candle) or [mistral.rs](https://github.com/EricLBuehler/mistral.rs).
+Lattice targets the other 90% of deployments: servers, edge, laptops, and library dependencies
+that shouldn't drag in a 300 MB ONNX runtime.
 
 ---
 
@@ -61,10 +64,10 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 
 | Feature                       | Description                                                                                  |
 | ----------------------------- | -------------------------------------------------------------------------------------------- |
-| Pure Rust compute             | Hand-written SIMD kernels (AVX2/NEON/AVX-512). No C++ FFI, no ONNX.                          |
+| Pure Rust compute             | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                             |
 | Two transformer architectures | BERT/BGE encoder-only (mean pooling) and Qwen3 decoder-only (causal GQA, last-token pooling) |
 | 9 supported models            | BGE, mE5, MiniLM, Qwen3-Embedding families — see table below                                 |
-| Metal + WGPU backends         | GPU acceleration on macOS (Metal) and cross-platform (Vulkan/DX12 via WGPU)                  |
+| Metal GPU backend             | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.   |
 | Three pure Rust tokenizers    | WordPiece, SentencePiece, BPE — no Hugging Face tokenizers C extension                       |
 | Safetensors native            | Memory-mapped weight loading from HuggingFace `.safetensors` format                          |
 | MRL support                   | Matryoshka truncation for Qwen3 models (configurable output dimension >= 32)                 |
@@ -87,8 +90,8 @@ lattice-embed          (public API — embedding service, SIMD distance ops, LRU
     v
 lattice-inference      (transformer kernel — BERT/Qwen3 forward pass, tokenizers, weights)
     |
-    +---> CPU backends       Metal (macOS)     WGPU (cross-platform)
-          AVX2/NEON kernels   Metal MSL shaders  WGSL compute shaders
+    +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
+          AVX2/NEON kernels   Apple Silicon      Vulkan/DX12
 
 
 lattice-fann           (standalone — tiny network primitives, <5ms CPU inference)
