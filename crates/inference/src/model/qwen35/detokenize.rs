@@ -42,7 +42,7 @@ pub fn bytes_to_unicode() -> Vec<char> {
     }
 
     let mut table = vec!['\0'; 256];
-    for (b, c) in bs.into_iter().zip(cs.into_iter()) {
+    for (b, c) in bs.into_iter().zip(cs) {
         table[b as usize] =
             char::from_u32(c as u32).expect("invariant: byte-to-unicode codepoint is valid");
     }

@@ -1021,6 +1021,7 @@ impl<'a> MtpVerifier<'a> {
     /// Draft `config.draft_length` candidate tokens using iterative MTP forwards.
     ///
     /// Stops early if `eos_token` is produced.
+    #[allow(clippy::explicit_counter_loop)]
     pub fn draft_tokens(
         &mut self,
         current_token_id: u32,
