@@ -1,7 +1,11 @@
 // ---------------------------------------------------------------------------
 // AVX2+FMA matmul_bt — 4 accumulators × 8 lanes = 32 elements/iter
 // ---------------------------------------------------------------------------
-/// **Unstable**: AVX2+FMA matmul; intrinsic selection and unroll factor may change.
+/// AVX2+FMA matrix multiply (B transposed). Intrinsic selection and unroll factor may change.
+///
+/// # Safety
+/// Caller must ensure `a.len() >= m*k`, `b.len() >= n*k`, `c.len() >= m*n`,
+/// and the CPU supports AVX2+FMA (checked at runtime by the dispatch layer).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn matmul_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
@@ -65,9 +69,14 @@ pub unsafe fn matmul_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usiz
 // ---------------------------------------------------------------------------
 // AVX-512 matmul_bt — 4 accumulators × 16 lanes = 64 elements/iter
 // ---------------------------------------------------------------------------
-/// **Unstable**: AVX-512 matmul; requires avx512f feature flag, interface may change.
+/// AVX-512 matrix multiply (B transposed). Requires avx512f feature flag.
+///
+/// # Safety
+/// Caller must ensure `a.len() >= m*k`, `b.len() >= n*k`, `c.len() >= m*n`,
+/// and the CPU supports AVX-512F (checked at runtime by the dispatch layer).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[allow(clippy::incompatible_msrv)]
 pub unsafe fn matmul_avx512(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
         let a_row = a.as_ptr().add(i * k);
