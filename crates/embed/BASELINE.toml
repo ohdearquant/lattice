@@ -1,0 +1,35 @@
+# target: foundation/embed/BASELINE.toml
+
+[metadata]
+version = "0.1.0"
+module = "foundation/embed"
+created = "2026-04-29"
+updated = "2026-04-29"
+
+[performance]
+cold_start_latency = "pending_measurement"  # needs: delete cache, time first encode()
+cache_hit_latency = "pending_measurement"   # needs: time encode() with warm cache
+model_cache_path = "~/.lattice/cache/embed_{model}_{dim}d.bin"  # source: implicit_contracts.md section 2
+model_cache_creation_trigger = "shutdown"    # source: implicit_contracts.md section 2
+regression_tolerance_pct = 20               # source: Bencher/SLO convention
+
+[quality]
+simd_parity_avx2_neon_scalar = "pending_measurement"  # needs: /simd-parity differential tests
+neon_alignment_2560d = true                 # source: verdict.md PASS item 4
+qwen3_4b_native_dims = 2560                # source: summary_20260429_150820
+qwen3_0_6b_native_dims = 1024              # source: summary_20260429_150820
+mrl_wiring_status = "not_wired"            # source: summary_20260429_150820
+batch_encoding_status = "shipped"           # source: summary_20260429_194409
+
+[security]
+simd_config_documented = false              # source: implicit_contracts.md section 5
+default_cache_capacity_documented = false   # source: implicit_contracts.md section 5
+default_max_batch_size_documented = false   # source: implicit_contracts.md section 5
+dependency_vulnerability_policy = "deny"    # source: cargo-deny convention
+
+[contracts]
+embedding_model_db_contract = "enum_variant_as_string"  # source: implicit_contracts.md leak 2
+model_dir_casing_inconsistency = true       # source: implicit_contracts.md section 2
+production_model = "multilingual-e5-small"  # source: implicit_contracts.md section 2
+default_model_without_config = "bge_small_en_v15"  # source: implicit_contracts.md section 2
+lattice_embed_dim_stability = "experimental"  # source: implicit_contracts.md section 1

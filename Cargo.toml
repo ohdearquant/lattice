@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/inference",
+    "crates/embed",
+    "crates/fann",
+    "crates/tune",
+    "crates/transport",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Ocean <ocean@lionagi.ai>"]
+license = "Apache-2.0"
+repository = "https://github.com/ohdearquant/lattice"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+
+# Async
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Concurrency
+parking_lot = "0.12"
+rayon = "1.10"
+
+# Crypto / Hashing
+sha2 = "0.10"
+blake3 = "1.5"
+
+# Database (optional, for caching)
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Types
+uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random
+rand = "0.8"
+rand_distr = "0.4"
+
+# Logging
+tracing = "0.1"
+
+# Safe serialization
+safetensors = "0.5"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Arc swap
+arc-swap = "1.7"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Testing
+proptest = "1.0"
+tempfile = "3.10"
+
+[workspace.lints.clippy]
+# Correctness
+correctness = { level = "deny", priority = -1 }
+
+# Style — tighten defaults
+needless_return = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+implicit_clone = "warn"
+cloned_instead_of_copied = "warn"
+uninlined_format_args = "warn"
+
+# Complexity
+type_complexity = "warn"
+too_many_arguments = "warn"
+
+# Performance
+large_enum_variant = "warn"
+
+# SIMD/unsafe — allow in unsafe fns (edition 2024 strictness)
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "allow"

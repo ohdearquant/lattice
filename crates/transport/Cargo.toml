@@ -1,0 +1,29 @@
+[package]
+name = "lattice-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optimal transport math (Sinkhorn, Wasserstein, barycenters) for Lattice"
+
+[dependencies]
+rayon = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[example]]
+name = "sinkhorn_ot"
+
+[[bench]]
+name = "round0_transport"
+harness = false
+
+[features]
+default = []
+
+[lints]
+workspace = true

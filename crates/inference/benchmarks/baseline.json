@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "created": "2026-03-28",
+  "device": "Apple M2 Max",
+  "commit": "e6b2a5c0b",
+  "metrics": {
+    "gdn_ref_us_per_step": {
+      "value": 1856.26,
+      "unit": "us",
+      "description": "GatedDeltaNet reference step latency"
+    },
+    "gdn_fused_us_per_step": {
+      "value": 1689.67,
+      "unit": "us",
+      "description": "GatedDeltaNet fused step latency"
+    },
+    "gdn_fused_speedup": {
+      "value": 1.10,
+      "unit": "x",
+      "description": "Fused / reference speedup ratio"
+    },
+    "llm_tok_per_sec": {
+      "value": 4.18,
+      "unit": "tok/s",
+      "description": "Qwen3.5-2B decode throughput (greedy, 20 tokens)"
+    },
+    "llm_ttft_ms": {
+      "value": 956.05,
+      "unit": "ms",
+      "description": "Time to first token (short prompt)"
+    },
+    "llm_prefill_ms_per_tok": {
+      "value": 191.21,
+      "unit": "ms/tok",
+      "description": "Qwen3.5-2B prefill latency per prompt token"
+    },
+    "llm_total_ms_20tok": {
+      "value": 4780.27,
+      "unit": "ms",
+      "description": "Total time to generate 20 tokens from short prompt"
+    },
+    "llm_load_ms": {
+      "value": 10072.0,
+      "unit": "ms",
+      "description": "Model weight loading time"
+    },
+    "embed_short_ms": {
+      "value": 10.50,
+      "unit": "ms",
+      "description": "Qwen3-0.6B encode 'hello world'"
+    },
+    "embed_medium_ms": {
+      "value": 18.60,
+      "unit": "ms",
+      "description": "Qwen3-0.6B encode ~250 char text"
+    },
+    "embed_long_ms": {
+      "value": 330.33,
+      "unit": "ms",
+      "description": "Qwen3-0.6B encode ~4500 char text"
+    }
+  }
+}

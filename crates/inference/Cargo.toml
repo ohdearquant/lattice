@@ -1,0 +1,151 @@
+[package]
+name = "lattice-inference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
+
+[features]
+default = ["std", "download"]
+std = []
+f16 = []
+metal-gpu = ["dep:metal", "dep:objc"]
+wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+bench-internals = []
+bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
+backfill = ["dep:rusqlite", "f16"]
+download = ["dep:ureq", "dep:sha2"]
+
+[dependencies]
+memmap2 = "0.9"
+rayon = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ureq = { version = "2", features = ["tls"], optional = true }
+sha2 = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+metal = { version = "0.33", optional = true }
+objc = { version = "0.2", optional = true }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
+
+[[bin]]
+name = "backfill_qwen3"
+path = "src/bin/backfill_qwen3.rs"
+required-features = ["backfill"]
+
+[[bin]]
+name = "quantize_q4"
+path = "src/bin/quantize_q4.rs"
+
+[[bin]]
+name = "chat_metal"
+path = "src/bin/chat_metal.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_metal"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_gpu"
+required-features = ["f16", "wgpu-gpu"]
+
+[[example]]
+name = "bench_suite"
+required-features = ["f16"]
+
+[[example]]
+name = "bench_embedding"
+required-features = ["f16"]
+
+[[example]]
+name = "profile_metal"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "profile_metal_decode"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_profile"
+required-features = ["f16"]
+
+[[example]]
+name = "layer_sweep"
+required-features = ["f16"]
+
+[[example]]
+name = "bench_q4_prefill"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_gdn_decode"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_persistent_state"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_stability"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_concurrent"
+required-features = ["f16", "metal-gpu"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = { workspace = true }
+
+[[bench]]
+name = "attention_bench"
+harness = true
+
+[[bench]]
+name = "inference_bench"
+harness = false
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false
+
+[[bench]]
+name = "e2e_bench"
+harness = false
+
+[[bench]]
+name = "inference_perf"
+harness = false
+
+[[bench]]
+name = "topk_readback"
+harness = false
+
+[[bench]]
+name = "decode_attn_bench"
+harness = false
+required-features = ["f16"]
+
+[[bench]]
+name = "compute_attention_bench"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "kv_cache_layout_bench"
+harness = false
+required-features = ["bench-internals"]
+
+[lints]
+workspace = true

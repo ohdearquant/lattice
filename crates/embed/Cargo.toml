@@ -1,0 +1,72 @@
+[package]
+name = "lattice-embed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SIMD-accelerated vector operations and embedding generation"
+
+[dependencies]
+# Async
+tokio = { workspace = true, features = ["sync", "rt"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Embedding generation (native, pure Rust)
+lattice-inference = { path = "../inference", optional = true, features = ["f16"] }
+
+# Time
+chrono = { workspace = true }
+
+# Caching
+lru = "0.12"
+blake3 = { workspace = true }
+parking_lot = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+simsimd = "6"
+proptest = "1"
+
+[features]
+default = ["native"]
+native = ["dep:lattice-inference"]
+metal-gpu = ["lattice-inference/metal-gpu"]
+avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
+
+[[example]]
+name = "basic_embed"
+required-features = ["native"]
+
+[[example]]
+name = "similarity"
+
+[[bench]]
+name = "simd_bench"
+harness = false
+
+[[bench]]
+name = "simd"
+harness = false
+
+[[bench]]
+name = "embeddings"
+harness = false
+
+[[bench]]
+name = "simsimd_comparison"
+harness = false
+
+[lints]
+workspace = true

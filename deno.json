@@ -1,0 +1,12 @@
+{
+  "lint": {
+    "include": ["**/*.md"],
+    "exclude": ["target/"]
+  },
+  "fmt": {
+    "include": ["**/*.md"],
+    "exclude": ["target/"],
+    "proseWrap": "preserve",
+    "lineWidth": 120
+  }
+}

@@ -1,0 +1,34 @@
+# target: foundation/inference/BASELINE.toml
+
+[metadata]
+version = "0.1.0"
+module = "foundation/inference"
+created = "2026-04-29"
+updated = "2026-04-29"
+
+[performance]
+qwen3_0_6b_latency_p50 = "pending_measurement"  # needs: cargo bench with Qwen3-0.6B
+gpu_rs_file_size_kb = 99                         # source: verdict.md MAJ-2
+flash_rs_file_size_kb = 46                       # source: verdict.md MAJ-2
+flash_causal_rs_file_size_kb = 23                # source: verdict.md MAJ-2
+
+[quality]
+metal_fa_head_dim = 128                     # source: verdict.md CRIT-1 (metal.rs:518)
+qwen3_4b_head_dim_actual = 80              # source: derived 2560/32, verdict.md CRIT-1
+metal_4b_correctness = "blocked"           # source: verdict.md CRIT-1
+metal_gqa_groups_hardcoded = 2             # source: verdict.md CRIT-1 (metal.rs:1616)
+qwen3_4b_layers = 28                       # source: verdict.md MIN-1
+verdict_overall = "approve_with_fixes"     # source: verdict.md (CRIT:2 MAJ:3 MIN:2 PASS:8)
+qwen3_0_6b_ndcg_improvement = "+44%"      # source: summary_20260429_150820
+service_layer_batching = "none"            # source: verdict.md MAJ-1 (native.rs:28-34)
+
+[security]
+unsafe_block_count = "pending_measurement"  # needs: cargo geiger -p lattice-inference
+hardcoded_constants = 300                   # source: summary_20260429_194409
+dependency_vulnerability_policy = "deny"    # source: cargo-deny convention
+
+[contracts]
+cpu_fallback_env = "LATTICE_NO_GPU"         # source: implicit_contracts.md section 1
+model_inference_config = "shipped"          # source: summary_20260429_194409
+qwen3_4b_weight_size_bf16_gb = 8.0         # source: summary_20260429_150820
+qwen3_4b_shard_count = 2                   # source: summary_20260429_150820

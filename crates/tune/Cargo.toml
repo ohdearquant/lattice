@@ -1,0 +1,59 @@
+[package]
+name = "lattice-tune"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Training infrastructure for Lattice neural models"
+
+[features]
+default = ["std", "sqlite"]
+std = []
+serde = ["dep:serde", "dep:serde_json", "lattice-fann/serde"]
+# GPU-accelerated training via lattice-fann
+gpu = ["lattice-fann/gpu", "dep:wgpu", "dep:bytemuck"]
+# Enable GPU tests that require actual GPU hardware (disabled in CI by default)
+gpu-tests = ["gpu"]
+# Safe checkpoint serialization (recommended for production)
+safetensors = ["dep:safetensors"]
+# Implement LoraHook trait from lattice-inference for adapter injection
+inference-hook = ["dep:lattice-inference"]
+# SQLite-backed model registry storage
+sqlite = ["dep:rusqlite", "serde"]
+
+[dependencies]
+lattice-fann = { path = "../fann" }
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+uuid.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+arc-swap.workspace = true
+parking_lot.workspace = true
+
+# GPU dependencies (optional)
+wgpu = { version = "23.0", optional = true }
+bytemuck = { version = "1.19", features = ["derive"], optional = true }
+
+# Safe serialization (optional)
+safetensors = { workspace = true, optional = true }
+
+# SQLite storage (optional)
+rusqlite = { workspace = true, optional = true }
+
+# Inference hook (optional — for LoRA adapter injection)
+lattice-inference = { path = "../inference", optional = true, features = ["f16"] }
+
+[[bin]]
+name = "generate_lora"
+path = "src/bin/generate_lora.rs"
+required-features = ["safetensors", "inference-hook"]
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

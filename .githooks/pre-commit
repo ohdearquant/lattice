@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+echo "Running pre-commit checks..."
+
+# Format check
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo "Format check failed. Run 'make fmt' to fix."
+    exit 1
+fi
+
+# Clippy
+cargo clippy --workspace -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "Clippy check failed. Fix warnings before committing."
+    exit 1
+fi
+
+# Doc lint
+./scripts/lint-docs.sh
+
+echo "Pre-commit checks passed."
