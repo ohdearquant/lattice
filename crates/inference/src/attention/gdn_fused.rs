@@ -1329,7 +1329,8 @@ mod tests {
         assert!(state_fused.s_matrices.iter().all(|v| v.is_finite()));
         // Large inputs (1e4) amplify f32 rounding differences between scalar
         // and SIMD paths — use a slightly looser tolerance.
-        assert_close_slice(&output_ref, &output_fused, 2e-3, "large-value output");
+        // Tolerance accommodates x86/ARM FMA accumulation order differences on large values
+        assert_close_slice(&output_ref, &output_fused, 5e-3, "large-value output");
         assert_close_slice(
             &state_ref.s_matrices,
             &state_fused.s_matrices,
