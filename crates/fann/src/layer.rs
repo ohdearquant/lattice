@@ -207,6 +207,7 @@ unsafe fn simd_dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
 /// Caller must ensure AVX-512F is available and `a.len() == b.len()`.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx512f")]
+#[allow(clippy::incompatible_msrv)]
 unsafe fn simd_dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let n = a.len();
@@ -529,6 +530,7 @@ impl Layer {
     /// latency on large matrices.
     #[cfg(feature = "simd")]
     #[inline]
+    #[allow(clippy::needless_range_loop)]
     fn matmul_add_simd(&self, input: &[f32], output: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         {
