@@ -11,9 +11,14 @@
 //! Output: `o_t = g_cmp·o_t^cmp + g_slc·o_t^slc + g_win·o_t^win` (Eq. 5).
 //!
 //! **Caller responsibility**: linear projections of Q/K/V and RoPE are the caller's
-//! responsibility. This module takes raw (non-RoPE) Q/K **and** RoPE'd Q/K — compression
-//! uses non-RoPE Q/K (intra-block PE already encodes within-block position; applying RoPE
-//! would double-count per arXiv:2501.18795), selection and sliding window use RoPE'd Q/K.
+//! responsibility. Per paper §3.3.3 the three branches use **independent keys and values**
+//! ("we provide independent keys and values for three branches" — to prevent shortcut
+//! learning), so the kernel takes separately-projected `k_cmp`/`v_cmp`, `k_slc`/`v_slc`,
+//! `k_win`/`v_win`. Compression uses **non-RoPE** Q/K (`q`, `k_cmp`) — its intra-block PE
+//! already encodes within-block position; applying RoPE would double-count per
+//! arXiv:2501.18795. Selection and sliding window use **RoPE'd** Q/K (`q_rope`, `k_slc`,
+//! `k_win`). All V is RoPE-free. Queries are not independent per branch — the paper
+//! specifies independent K/V only.
 //!
 //! Implementation is faithful to the paper's equations. Where `lucidrains` diverges from
 //! the paper, the paper wins (see ADR-042 §Key Design Choice 1 for the full list).
@@ -33,8 +38,9 @@ use crate::forward::cpu::matmul_bt;
 /// Invariants (asserted in [`NsaConfig::validate`] and [`apply_native_sparse_attention`]):
 /// - `compress_block (l)` must be divisible by `compress_stride (d)`
 /// - `select_block (l')` must be divisible by `compress_stride (d)`
+/// - `compress_block (l) <= select_block (l')` — the paper's Eq. 9 precondition
 /// - `num_heads % num_kv_heads == 0`
-/// - All sizes > 0
+/// - All sizes (including `num_selected`) > 0
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NsaConfig {
     /// Number of query heads.
@@ -71,6 +77,7 @@ impl NsaConfig {
         assert!(self.compress_block > 0, "compress_block (l) must be > 0");
         assert!(self.compress_stride > 0, "compress_stride (d) must be > 0");
         assert!(self.select_block > 0, "select_block (l') must be > 0");
+        assert!(self.num_selected > 0, "num_selected (n) must be > 0");
         assert!(self.window > 0, "window (w) must be > 0");
         assert_eq!(
             self.num_heads % self.num_kv_heads,
@@ -93,6 +100,13 @@ impl NsaConfig {
             "select_block (l'={}) must be divisible by compress_stride (d={})",
             self.select_block,
             self.compress_stride
+        );
+        // ADR-042 §Key Design Choice 5: the paper scopes Eq. 9 to `l <= l'`.
+        assert!(
+            self.compress_block <= self.select_block,
+            "compress_block (l={}) must be <= select_block (l'={}) — paper Eq. 9 precondition",
+            self.compress_block,
+            self.select_block
         );
     }
 
@@ -137,8 +151,9 @@ impl NsaConfig {
 
     /// **Unstable**: number of compression blocks that overlap one selection block = `l' / d`.
     ///
-    /// Used in Eq. 9: importance of selection block `j` aggregates over compression block
-    /// probabilities whose indices span `[cps*j, cps*j + cps + ipc - 1]`.
+    /// Used in Eq. 9 (`p_cmp[cps*j - m - n]`): the importance of selection block `j`
+    /// aggregates compression-block probabilities whose indices span
+    /// `[cps*j - cps - ipc + 2, cps*j]`. See `aggregate_selection_importance`.
     #[inline]
     pub fn compress_per_select(&self) -> usize {
         self.select_block / self.compress_stride
@@ -313,16 +328,24 @@ const MASK_VALUE: f32 = -10_000.0_f32;
 ///
 /// # Buffer layouts
 ///
-/// - `q_buf`:      `[seq_len, num_heads * head_dim]` — non-RoPE query
-/// - `k_buf`:      `[seq_len, num_kv_heads * head_dim]` — non-RoPE key
-/// - `q_rope_buf`: `[seq_len, num_heads * head_dim]` — RoPE'd query
-/// - `k_rope_buf`: `[seq_len, num_kv_heads * head_dim]` — RoPE'd key
-/// - `v_buf`:      `[seq_len, num_kv_heads * head_dim]` — value (RoPE-free)
+/// Per paper §3.3.3 the three branches use independent K/V; the kernel therefore takes
+/// 8 caller-supplied activation buffers (ADR-042 §Key Design Choice 4):
+///
+/// - `q_buf`:      `[seq_len, num_heads * head_dim]` — non-RoPE query (compression)
+/// - `q_rope_buf`: `[seq_len, num_heads * head_dim]` — RoPE'd query (selection, window)
+/// - `k_cmp_buf`:  `[seq_len, num_kv_heads * head_dim]` — non-RoPE key, compression branch
+/// - `k_slc_buf`:  `[seq_len, num_kv_heads * head_dim]` — RoPE'd key, selection branch
+/// - `k_win_buf`:  `[seq_len, num_kv_heads * head_dim]` — RoPE'd key, sliding-window branch
+/// - `v_cmp_buf`:  `[seq_len, num_kv_heads * head_dim]` — value, compression branch (RoPE-free)
+/// - `v_slc_buf`:  `[seq_len, num_kv_heads * head_dim]` — value, selection branch (RoPE-free)
+/// - `v_win_buf`:  `[seq_len, num_kv_heads * head_dim]` — value, sliding-window branch (RoPE-free)
 /// - `x_buf`:      `[seq_len, model_dim]` — normed hidden state for gate
 /// - `attn_out`:   `[seq_len, num_heads * head_dim]` — output
 ///
-/// Raw Q/K are used only in the compression branch. RoPE'd Q/K are used in the
-/// selection and sliding-window branches. V is RoPE-free in all branches.
+/// The compression branch uses non-RoPE Q/K (`q_buf`, `k_cmp_buf`); the selection and
+/// sliding-window branches use RoPE'd Q/K (`q_rope_buf`, `k_slc_buf`, `k_win_buf`). V is
+/// RoPE-free in all branches. Keys and values are independent *per branch* (separate
+/// projections); queries are not — the paper specifies independent K/V only.
 ///
 /// The model dimension `model_dim` is inferred from `x_buf.len() / seq_len`.
 ///
@@ -332,10 +355,13 @@ const MASK_VALUE: f32 = -10_000.0_f32;
 #[allow(clippy::too_many_arguments)]
 pub fn apply_native_sparse_attention(
     q_buf: &[f32],
-    k_buf: &[f32],
     q_rope_buf: &[f32],
-    k_rope_buf: &[f32],
-    v_buf: &[f32],
+    k_cmp_buf: &[f32],
+    k_slc_buf: &[f32],
+    k_win_buf: &[f32],
+    v_cmp_buf: &[f32],
+    v_slc_buf: &[f32],
+    v_win_buf: &[f32],
     x_buf: &[f32],
     weights: &NsaWeights,
     attn_out: &mut [f32],
@@ -370,13 +396,6 @@ pub fn apply_native_sparse_attention(
         q_buf.len()
     );
     assert_eq!(
-        k_buf.len(),
-        seq_len * kv_dim,
-        "k_buf length mismatch: expected {}, got {}",
-        seq_len * kv_dim,
-        k_buf.len()
-    );
-    assert_eq!(
         q_rope_buf.len(),
         seq_len * q_dim,
         "q_rope_buf length mismatch: expected {}, got {}",
@@ -384,18 +403,46 @@ pub fn apply_native_sparse_attention(
         q_rope_buf.len()
     );
     assert_eq!(
-        k_rope_buf.len(),
+        k_cmp_buf.len(),
         seq_len * kv_dim,
-        "k_rope_buf length mismatch: expected {}, got {}",
+        "k_cmp_buf length mismatch: expected {}, got {}",
         seq_len * kv_dim,
-        k_rope_buf.len()
+        k_cmp_buf.len()
     );
     assert_eq!(
-        v_buf.len(),
+        k_slc_buf.len(),
         seq_len * kv_dim,
-        "v_buf length mismatch: expected {}, got {}",
+        "k_slc_buf length mismatch: expected {}, got {}",
         seq_len * kv_dim,
-        v_buf.len()
+        k_slc_buf.len()
+    );
+    assert_eq!(
+        k_win_buf.len(),
+        seq_len * kv_dim,
+        "k_win_buf length mismatch: expected {}, got {}",
+        seq_len * kv_dim,
+        k_win_buf.len()
+    );
+    assert_eq!(
+        v_cmp_buf.len(),
+        seq_len * kv_dim,
+        "v_cmp_buf length mismatch: expected {}, got {}",
+        seq_len * kv_dim,
+        v_cmp_buf.len()
+    );
+    assert_eq!(
+        v_slc_buf.len(),
+        seq_len * kv_dim,
+        "v_slc_buf length mismatch: expected {}, got {}",
+        seq_len * kv_dim,
+        v_slc_buf.len()
+    );
+    assert_eq!(
+        v_win_buf.len(),
+        seq_len * kv_dim,
+        "v_win_buf length mismatch: expected {}, got {}",
+        seq_len * kv_dim,
+        v_win_buf.len()
     );
     assert_eq!(
         attn_out.len(),
@@ -533,7 +580,7 @@ pub fn apply_native_sparse_attention(
                 let pe = p * head_dim;
                 let dst = p * head_dim;
                 for dd in 0..head_dim {
-                    phi_in_buf[dst + dd] = k_buf[src + dd] + pos_enc_k[pe + dd];
+                    phi_in_buf[dst + dd] = k_cmp_buf[src + dd] + pos_enc_k[pe + dd];
                 }
             }
 
@@ -566,7 +613,7 @@ pub fn apply_native_sparse_attention(
                 let pe = p * head_dim;
                 let dst = p * head_dim;
                 for dd in 0..head_dim {
-                    phi_in_buf[dst + dd] = v_buf[src + dd] + pos_enc_v[pe + dd];
+                    phi_in_buf[dst + dd] = v_cmp_buf[src + dd] + pos_enc_v[pe + dd];
                 }
             }
             let tmp1 = &mut scratch.phi_tmp1[..phi_in];
@@ -645,19 +692,11 @@ pub fn apply_native_sparse_attention(
                     }
                 }
 
-                // Eq. 9 (SUM, not mean) + Eq. 10 (sum over Q-head group):
-                // Causally valid selection blocks for qt: (j+1)*l' <= qt → j < qt/l'
+                // Eq. 9 (paper-verbatim index `(l'/d)*sj - m - n`, see
+                // `aggregate_selection_importance`) + Eq. 10 (sum over Q-head group).
                 let valid_sblocks = count_valid_select_blocks(qt, lp, max_sblocks);
                 for sj in 0..valid_sblocks {
-                    let mut block_score: f32 = 0.0;
-                    for m in 0..cps {
-                        for n in 0..ipc {
-                            let ci = cps * sj + m + n;
-                            if ci < valid_cblocks {
-                                block_score += scores[ci];
-                            }
-                        }
-                    }
+                    let block_score = aggregate_selection_importance(scores, sj, cps, ipc);
                     // Eq. 10: accumulate across Q heads in this KV group.
                     scratch.importance[kv_h * max_sblocks.max(1) + sj] += block_score;
                 }
@@ -786,9 +825,8 @@ pub fn apply_native_sparse_attention(
                     let tok = tok_start + p;
                     let dst = (gathered * lp + p) * head_dim;
                     let src = tok * kv_dim + kv_h * head_dim;
-                    sel_k_buf[dst..dst + head_dim]
-                        .copy_from_slice(&k_rope_buf[src..src + head_dim]);
-                    sel_v_buf[dst..dst + head_dim].copy_from_slice(&v_buf[src..src + head_dim]);
+                    sel_k_buf[dst..dst + head_dim].copy_from_slice(&k_slc_buf[src..src + head_dim]);
+                    sel_v_buf[dst..dst + head_dim].copy_from_slice(&v_slc_buf[src..src + head_dim]);
                 }
                 gathered += 1;
             }
@@ -871,7 +909,7 @@ pub fn apply_native_sparse_attention(
                     let k_off = tok * kv_dim + kv_h * head_dim;
                     let dot: f32 = q_head
                         .iter()
-                        .zip(k_rope_buf[k_off..k_off + head_dim].iter())
+                        .zip(k_win_buf[k_off..k_off + head_dim].iter())
                         .map(|(&a, &b)| a * b)
                         .sum();
                     scores[wi] = dot * scale;
@@ -886,7 +924,7 @@ pub fn apply_native_sparse_attention(
                     let p = scores[wi];
                     let v_off = tok * kv_dim + kv_h * head_dim;
                     for dd in 0..head_dim {
-                        out_slot[dd] += p * v_buf[v_off + dd];
+                        out_slot[dd] += p * v_win_buf[v_off + dd];
                     }
                 }
             }
@@ -957,6 +995,40 @@ fn count_valid_compress_blocks(qt: usize, l: usize, d: usize, max_cblocks: usize
 fn count_valid_select_blocks(qt: usize, lp: usize, max_sblocks: usize) -> usize {
     // max j s.t. j*l' <= qt  →  j <= qt / l'
     (qt / lp + 1).min(max_sblocks)
+}
+
+/// Eq. 9 selection-block importance: aggregate compression-branch probabilities.
+///
+/// For selection block `sj`, the paper's Eq. 9 (arXiv:2502.11089, §3.3.2) is:
+///
+/// ```text
+/// p_t^slc[sj] = Σ_{m=0}^{cps-1} Σ_{n=0}^{ipc-1} p_t^cmp[cps*sj - m - n]
+/// ```
+///
+/// where `cps = l'/d` and `ipc = l/d`. The compression index `cps*sj - m - n` has **both
+/// `m` and `n` subtracted** (paper-verbatim — an earlier ADR draft had `+ m + n`, which is
+/// wrong). `p_cmp` is the causally-valid compression-probability vector for query `t`; an
+/// index outside `[0, p_cmp.len())` — negative for small `sj`, or beyond the causal
+/// frontier — carries no probability mass and contributes 0. See ADR-042 §KDC 5 for the
+/// worked index expansion.
+#[inline]
+fn aggregate_selection_importance(p_cmp: &[f32], sj: usize, cps: usize, ipc: usize) -> f32 {
+    let base = cps * sj;
+    let mut acc = 0.0_f32;
+    for m in 0..cps {
+        for n in 0..ipc {
+            let offset = m + n;
+            // `base - offset` underflows for small `sj`; a negative index is simply out of
+            // range and contributes 0, same as an index past the causal frontier.
+            if offset <= base {
+                let ci = base - offset;
+                if ci < p_cmp.len() {
+                    acc += p_cmp[ci];
+                }
+            }
+        }
+    }
+    acc
 }
 
 /// Numerically stable in-place softmax.
@@ -1058,19 +1130,25 @@ mod tests {
         let model_dim = cfg.q_dim(); // use q_dim as model_dim in tests
         let weights = make_weights(cfg, model_dim, seed);
         let q = det_data(seq_len * cfg.q_dim(), seed + 1);
-        let k = det_data(seq_len * cfg.kv_dim(), seed + 2);
-        let q_rope = det_data(seq_len * cfg.q_dim(), seed + 3);
-        let k_rope = det_data(seq_len * cfg.kv_dim(), seed + 4);
-        let v = det_data(seq_len * cfg.kv_dim(), seed + 5);
-        let x = det_data(seq_len * model_dim, seed + 6);
+        let q_rope = det_data(seq_len * cfg.q_dim(), seed + 2);
+        let k_cmp = det_data(seq_len * cfg.kv_dim(), seed + 3);
+        let k_slc = det_data(seq_len * cfg.kv_dim(), seed + 4);
+        let k_win = det_data(seq_len * cfg.kv_dim(), seed + 5);
+        let v_cmp = det_data(seq_len * cfg.kv_dim(), seed + 6);
+        let v_slc = det_data(seq_len * cfg.kv_dim(), seed + 7);
+        let v_win = det_data(seq_len * cfg.kv_dim(), seed + 8);
+        let x = det_data(seq_len * model_dim, seed + 9);
         let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
         let mut scratch = NsaScratch::default();
         apply_native_sparse_attention(
             &q,
-            &k,
             &q_rope,
-            &k_rope,
-            &v,
+            &k_cmp,
+            &k_slc,
+            &k_win,
+            &v_cmp,
+            &v_slc,
+            &v_win,
             &x,
             &weights,
             &mut out,
@@ -1193,6 +1271,9 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
             &weights,
             &mut out,
             1,
@@ -1267,6 +1348,9 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
             &weights,
             &mut out,
             0,
@@ -1290,33 +1374,35 @@ mod tests {
         let weights = make_weights(&cfg, model_dim, 200);
 
         let q = det_data(seq_len * cfg.q_dim(), 201);
-        let k_base = det_data(seq_len * cfg.kv_dim(), 202);
-        let q_rope = det_data(seq_len * cfg.q_dim(), 203);
-        let k_rope_base = det_data(seq_len * cfg.kv_dim(), 204);
-        let v_base = det_data(seq_len * cfg.kv_dim(), 205);
-        let x = det_data(seq_len * model_dim, 206);
+        let q_rope = det_data(seq_len * cfg.q_dim(), 202);
+        let x = det_data(seq_len * model_dim, 203);
+        // Six independent K/V branch buffers: k_cmp, k_slc, k_win, v_cmp, v_slc, v_win.
+        let kv_base: [Vec<f32>; 6] =
+            std::array::from_fn(|i| det_data(seq_len * cfg.kv_dim(), 210 + i as u64));
 
-        // Perturb K and V at all positions except 0.
-        let mut k_perturbed = k_base.clone();
-        let mut k_rope_perturbed = k_rope_base.clone();
-        let mut v_perturbed = v_base.clone();
-        for pos in 1..seq_len {
-            for d in 0..cfg.kv_dim() {
-                k_perturbed[pos * cfg.kv_dim() + d] += 99_999.0;
-                k_rope_perturbed[pos * cfg.kv_dim() + d] += 99_999.0;
-                v_perturbed[pos * cfg.kv_dim() + d] += 99_999.0;
+        // Perturb every K/V buffer at all positions except 0.
+        let kv_perturbed: [Vec<f32>; 6] = std::array::from_fn(|i| {
+            let mut b = kv_base[i].clone();
+            for pos in 1..seq_len {
+                for d in 0..cfg.kv_dim() {
+                    b[pos * cfg.kv_dim() + d] += 99_999.0;
+                }
             }
-        }
+            b
+        });
 
-        let run = |k: &[f32], kr: &[f32], v: &[f32]| {
+        let run = |kv: &[Vec<f32>; 6]| {
             let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
             let mut scratch = NsaScratch::default();
             apply_native_sparse_attention(
                 &q,
-                k,
                 &q_rope,
-                kr,
-                v,
+                &kv[0],
+                &kv[1],
+                &kv[2],
+                &kv[3],
+                &kv[4],
+                &kv[5],
                 &x,
                 &weights,
                 &mut out,
@@ -1327,8 +1413,8 @@ mod tests {
             out
         };
 
-        let out_base = run(&k_base, &k_rope_base, &v_base);
-        let out_perturbed = run(&k_perturbed, &k_rope_perturbed, &v_perturbed);
+        let out_base = run(&kv_base);
+        let out_perturbed = run(&kv_perturbed);
 
         // Position 0's output must be bit-identical.
         for d in 0..cfg.q_dim() {
@@ -1429,20 +1515,26 @@ mod tests {
         }
 
         let q = det_data(seq_len * cfg.q_dim(), 601);
-        let k = det_data(seq_len * cfg.kv_dim(), 602);
-        let q_rope = det_data(seq_len * cfg.q_dim(), 603);
-        let k_rope = det_data(seq_len * cfg.kv_dim(), 604);
-        let v = det_data(seq_len * cfg.kv_dim(), 605);
-        let x = det_data(seq_len * model_dim, 606);
+        let q_rope = det_data(seq_len * cfg.q_dim(), 602);
+        let k_cmp = det_data(seq_len * cfg.kv_dim(), 603);
+        let k_slc = det_data(seq_len * cfg.kv_dim(), 604);
+        let k_win = det_data(seq_len * cfg.kv_dim(), 605);
+        let v_cmp = det_data(seq_len * cfg.kv_dim(), 606);
+        let v_slc = det_data(seq_len * cfg.kv_dim(), 607);
+        let v_win = det_data(seq_len * cfg.kv_dim(), 608);
+        let x = det_data(seq_len * model_dim, 609);
 
         let mut out_nsa = vec![0.0f32; seq_len * cfg.q_dim()];
         let mut scratch = NsaScratch::default();
         apply_native_sparse_attention(
             &q,
-            &k,
             &q_rope,
-            &k_rope,
-            &v,
+            &k_cmp,
+            &k_slc,
+            &k_win,
+            &v_cmp,
+            &v_slc,
+            &v_win,
             &x,
             &weights,
             &mut out_nsa,
@@ -1451,9 +1543,9 @@ mod tests {
             &mut scratch,
         );
 
-        // Pure sliding-window reference scaled by g_win.
+        // Pure sliding-window reference scaled by g_win — window branch uses k_win/v_win.
         let mut out_win = vec![0.0f32; seq_len * cfg.q_dim()];
-        compute_sliding_window_reference(&q_rope, &k_rope, &v, &mut out_win, seq_len, &cfg);
+        compute_sliding_window_reference(&q_rope, &k_win, &v_win, &mut out_win, seq_len, &cfg);
         let g_win = sigmoid(100.0_f32);
         for v in out_win.iter_mut() {
             *v *= g_win;
@@ -1572,6 +1664,46 @@ mod tests {
         assert_eq!(count_valid_select_blocks(8, 4, 5), 3);
         // Clamped by max_sblocks
         assert_eq!(count_valid_select_blocks(100, 4, 5), 5);
+    }
+
+    // ---------------------------------------------------------------
+    // Eq. 9 importance aggregation — hand-computed from the paper
+    //
+    // The expected sums below are worked out by hand from arXiv:2502.11089
+    // Eq. 9 (`p_cmp[(l'/d)*j - m - n]`). This check is grounded in the paper,
+    // NOT transcribed from the kernel's per-token loop or the test oracle —
+    // so it catches a spec-level misreading that a kernel-vs-oracle parity
+    // test (which shares one spec) cannot. See ADR-042 §KDC 5.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_aggregate_selection_importance_hand_computed() {
+        // Powers of two, so any subset-sum is unambiguous: [1,2,4,...,256].
+        let p: Vec<f32> = (0..9).map(|i| (1u32 << i) as f32).collect();
+
+        // --- Non-default ratio: l=4, d=2, l'=8 → cps = l'/d = 4, ipc = l/d = 2 ---
+        // j=0: ci = 0 - m - n; only (m,n)=(0,0) is in range → p[0].
+        assert_eq!(aggregate_selection_importance(&p, 0, 4, 2), 1.0);
+        // j=1: ci = 4 - m - n over m∈[0,4), n∈[0,2) → multiset {4,3,3,2,2,1,1,0}
+        //      = p[0] + 2p[1] + 2p[2] + 2p[3] + p[4] = 1 + 4 + 8 + 16 + 16 = 45.
+        assert_eq!(aggregate_selection_importance(&p, 1, 4, 2), 45.0);
+        // j=2: ci = 8 - m - n → multiset {8,7,7,6,6,5,5,4}
+        //      = p[4] + 2p[5] + 2p[6] + 2p[7] + p[8] = 16 + 64 + 128 + 256 + 256 = 720.
+        assert_eq!(aggregate_selection_importance(&p, 2, 4, 2), 720.0);
+
+        // --- Default ratio: l=4, d=2, l'=4 → cps = 2, ipc = 2 ---
+        // j=1: ci = 2 - m - n over m,n∈[0,2) → multiset {2,1,1,0}
+        //      = p[0] + 2p[1] + p[2] = 1 + 4 + 4 = 9.
+        assert_eq!(aggregate_selection_importance(&p, 1, 2, 2), 9.0);
+
+        // --- Upper-bound clamp: compression indices >= p_cmp.len() contribute 0 ---
+        // j=2, cps=4, ipc=2 with p_cmp truncated to len 5: of the multiset
+        // {8,7,7,6,6,5,5,4}, only index 4 is in range → p[4] = 16.
+        assert_eq!(aggregate_selection_importance(&p[..5], 2, 4, 2), 16.0);
+
+        // The old buggy `+ m + n` form would sum indices {4,5,5,6,6,7,7,8} for
+        // j=1/cps=4/ipc=2 → 720, not 45. The `+`/`-` forms are disjoint here, so
+        // the j=1 == 45 assertion above pins the sign.
     }
 
     // ---------------------------------------------------------------

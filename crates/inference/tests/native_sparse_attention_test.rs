@@ -4,14 +4,23 @@
 //!
 //! ADR-042 (`docs/adr/ADR-042-native-sparse-attention.md`) is the authoritative spec.
 //! The naive oracle below (`ref_native_sparse_attention`) is a direct transcription of
-//! the paper's equations (Yuan et al., arXiv:2502.11089, Eq. 5, 7–12) as described in
-//! ADR-042.  It shares NO code with the kernel body; its derivation is independent.
+//! the paper's equations (Yuan et al., arXiv:2502.11089, Eq. 5, 7–12). It shares NO code
+//! with the kernel body — but, like the kernel, it transcribes its spec from the paper
+//! via ADR-042, so a kernel-vs-oracle parity test is implementation-independent, *not*
+//! specification-independent. (Round-1 review caught an Eq. 9 sign error that both had
+//! copied from this ADR.) The Eq. 9 index is therefore also checked against the paper
+//! directly by `aggregate_selection_importance`'s hand-computed unit test in the kernel
+//! module — that test, not this parity oracle, is the spec-level anchor for Eq. 9.
 //!
 //! # Algorithm summary (oracle follows this exactly)
 //!
+//! Per paper §3.3.3 the three branches use **independent K/V** — the kernel and this
+//! oracle take 8 activation buffers: `q` (non-RoPE) and `q_rope`; `k_cmp` (non-RoPE),
+//! `k_slc`, `k_win` (RoPE'd); `v_cmp`, `v_slc`, `v_win` (RoPE-free).
+//!
 //! For each query position `t`:
 //!
-//! **Compression branch** (uses non-RoPE Q/K, ADR-042 §4)
+//! **Compression branch** (uses non-RoPE `q` / `k_cmp` / `v_cmp`, ADR-042 §4)
 //!   - Compression block `i` covers raw-K tokens `[i*d, i*d+l)`.
 //!   - Intra-block PE (learned, per KV-head) is added to each block before φ.
 //!   - φ: Linear(phi_in→phi_in) → ReLU → Linear(phi_in→head_dim). Shared weights,
@@ -22,17 +31,19 @@
 //!     Masked positions contribute 0.
 //!   - o_t^cmp = p_t^cmp · cv_valid.
 //!
-//! **Selection branch** (uses RoPE'd Q/K, ADR-042 §5–7)
+//! **Selection branch** (uses RoPE'd `q_rope` / `k_slc` / `v_slc`, ADR-042 §5–7)
 //!   - Selection block `j` covers tokens `[j*l', (j+1)*l')`.
 //!   - Valid for `t` iff `j*l' < t+1` (at least one token seen).
-//!   - Eq. 9 importance: `p_slc[j] = Σ_{m=0}^{cps-1} Σ_{n=0}^{ipc-1} p_cmp[cps*j+m+n]`
-//!     where `cps = l'/d`, `ipc = l/d`.  Invalid compression blocks contribute 0.
+//!   - Eq. 9 importance (paper-verbatim index, **minus** both `m` and `n`):
+//!     `p_slc[j] = Σ_{m=0}^{cps-1} Σ_{n=0}^{ipc-1} p_cmp[cps*j - m - n]`
+//!     where `cps = l'/d`, `ipc = l/d`. A compression index outside `[0, n_cblocks)` —
+//!     negative for small `j`, or causally invalid — contributes 0.
 //!   - Eq. 10 GQA group sum: sum importance across all query heads in a KV-head group.
 //!   - Top-n forced: always include block 0 (initial) and the 2 highest-indexed valid
 //!     blocks (local); remaining n-3 are top-scored from the rest.
 //!   - Gather ≤ n*l' tokens, apply token-level causal mask, standard softmax attn.
 //!
-//! **Sliding-window branch** (uses RoPE'd Q/K, ADR-042 §8)
+//! **Sliding-window branch** (uses RoPE'd `q_rope` / `k_win` / `v_win`, ADR-042 §8)
 //!   - Tokens `[max(0, t-w+1), t]` inclusive.
 //!
 //! **Gating** (ADR-042 §9)
@@ -201,11 +212,14 @@ fn ref_dense_causal_attention(
 /// Output: `[seq_len, num_heads * head_dim]`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn ref_native_sparse_attention(
-    q_buf: &[f32],      // [seq_len, num_heads*head_dim]        non-RoPE
-    k_buf: &[f32],      // [seq_len, num_kv_heads*head_dim]     non-RoPE
-    q_rope_buf: &[f32], // [seq_len, num_heads*head_dim]        RoPE'd
-    k_rope_buf: &[f32], // [seq_len, num_kv_heads*head_dim]     RoPE'd
-    v_buf: &[f32],      // [seq_len, num_kv_heads*head_dim]     RoPE-free
+    q_buf: &[f32],      // [seq_len, num_heads*head_dim]      non-RoPE Q (compression)
+    q_rope_buf: &[f32], // [seq_len, num_heads*head_dim]      RoPE'd Q (selection, window)
+    k_cmp_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   non-RoPE K, compression
+    k_slc_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   RoPE'd K, selection
+    k_win_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   RoPE'd K, window
+    v_cmp_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   V, compression (RoPE-free)
+    v_slc_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   V, selection (RoPE-free)
+    v_win_buf: &[f32],  // [seq_len, num_kv_heads*head_dim]   V, window (RoPE-free)
     x_buf: &[f32],      // [seq_len, model_dim]
     weights: &NsaWeights,
     seq_len: usize,
@@ -260,9 +274,9 @@ fn ref_native_sparse_attention(
                 let raw_v_off = tok * num_kv_heads * head_dim + kv_h * head_dim;
                 for dim in 0..head_dim {
                     block_k[p * head_dim + dim] =
-                        k_buf[raw_k_off + dim] + weights.k_intrablock_pos[pe_off + dim];
+                        k_cmp_buf[raw_k_off + dim] + weights.k_intrablock_pos[pe_off + dim];
                     block_v[p * head_dim + dim] =
-                        v_buf[raw_v_off + dim] + weights.v_intrablock_pos[pe_off + dim];
+                        v_cmp_buf[raw_v_off + dim] + weights.v_intrablock_pos[pe_off + dim];
                 }
             }
 
@@ -400,15 +414,24 @@ fn ref_native_sparse_attention(
             let h_end = h_start + n_rep;
 
             for j in 0..n_sblocks_total {
-                // Eq. 9 for each head in the group, then sum (Eq. 10)
+                // Eq. 9 (paper arXiv:2502.11089 §3.3.2): the importance of selection
+                // block j for one query head sums the compression probabilities at
+                // indices `p_cmp[cps*j - m - n]` (both m and n subtracted). Eq. 10 then
+                // sums across the query heads in the KV group.
                 let mut group_sum = 0.0_f32;
+                let base = cps * j;
                 for h in h_start..h_end {
                     let mut head_sum = 0.0_f32;
                     for m in 0..cps {
                         for n_idx in 0..ipc {
-                            let ci = cps * j + m + n_idx;
-                            if ci < n_cblocks {
-                                head_sum += p_cmp_per_head[h][ci];
+                            let offset = m + n_idx;
+                            // base - offset; a negative index (small j) or one past the
+                            // causal frontier carries no probability mass → skip.
+                            if offset <= base {
+                                let ci = base - offset;
+                                if ci < n_cblocks {
+                                    head_sum += p_cmp_per_head[h][ci];
+                                }
                             }
                         }
                     }
@@ -526,7 +549,7 @@ fn ref_native_sparse_attention(
                 .iter()
                 .map(|&tok| {
                     let k_off = tok * num_kv_heads * head_dim + kv_h * head_dim;
-                    let k_tok = &k_rope_buf[k_off..k_off + head_dim];
+                    let k_tok = &k_slc_buf[k_off..k_off + head_dim];
                     let dot: f32 = q_t.iter().zip(k_tok.iter()).map(|(a, b)| a * b).sum();
                     dot * scale
                 })
@@ -537,7 +560,7 @@ fn ref_native_sparse_attention(
             // Weighted sum of V
             for (idx, &tok) in gathered_toks.iter().enumerate() {
                 let v_off = tok * num_kv_heads * head_dim + kv_h * head_dim;
-                let v_tok = &v_buf[v_off..v_off + head_dim];
+                let v_tok = &v_slc_buf[v_off..v_off + head_dim];
                 let w = scores[idx];
                 for dim in 0..head_dim {
                     o_slc_per_head[h][dim] += w * v_tok[dim];
@@ -560,7 +583,7 @@ fn ref_native_sparse_attention(
             let mut scores = vec![0.0_f32; win_len];
             for (si, tok) in (win_start..=t).enumerate() {
                 let k_off = tok * num_kv_heads * head_dim + kv_h * head_dim;
-                let k_tok = &k_rope_buf[k_off..k_off + head_dim];
+                let k_tok = &k_win_buf[k_off..k_off + head_dim];
                 let dot: f32 = q_t.iter().zip(k_tok.iter()).map(|(a, b)| a * b).sum();
                 scores[si] = dot * scale;
             }
@@ -568,7 +591,7 @@ fn ref_native_sparse_attention(
 
             for (si, tok) in (win_start..=t).enumerate() {
                 let v_off = tok * num_kv_heads * head_dim + kv_h * head_dim;
-                let v_tok = &v_buf[v_off..v_off + head_dim];
+                let v_tok = &v_win_buf[v_off..v_off + head_dim];
                 let w = scores[si];
                 for dim in 0..head_dim {
                     o_win_per_head[h][dim] += w * v_tok[dim];
@@ -598,7 +621,12 @@ fn ref_native_sparse_attention(
 // Test input builders
 // ===================================================================
 
+/// `(q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights)` — the 8 activation
+/// buffers `apply_native_sparse_attention` takes, plus `x` and the learned weights.
 type NsaInputs = (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
     Vec<f32>,
     Vec<f32>,
     Vec<f32>,
@@ -613,12 +641,16 @@ fn make_nsa_inputs(cfg: &NsaConfig, seq_len: usize, model_dim: usize, seed: u64)
     let phi_in = cfg.phi_in();
     let head_dim = cfg.head_dim;
 
+    // Independent K/V per branch (paper §3.3.3): 8 distinct activation buffers.
     let q = det_data(seq_len * cfg.q_dim(), seed);
-    let k = det_data(seq_len * cfg.kv_dim(), seed + 1);
-    let q_rope = det_data(seq_len * cfg.q_dim(), seed + 2);
-    let k_rope = det_data(seq_len * cfg.kv_dim(), seed + 3);
-    let v = det_data(seq_len * cfg.kv_dim(), seed + 4);
-    let x = det_data(seq_len * model_dim, seed + 5);
+    let q_rope = det_data(seq_len * cfg.q_dim(), seed + 1);
+    let k_cmp = det_data(seq_len * cfg.kv_dim(), seed + 2);
+    let k_slc = det_data(seq_len * cfg.kv_dim(), seed + 3);
+    let k_win = det_data(seq_len * cfg.kv_dim(), seed + 4);
+    let v_cmp = det_data(seq_len * cfg.kv_dim(), seed + 5);
+    let v_slc = det_data(seq_len * cfg.kv_dim(), seed + 6);
+    let v_win = det_data(seq_len * cfg.kv_dim(), seed + 7);
+    let x = det_data(seq_len * model_dim, seed + 8);
 
     // Scale weights down to avoid extreme exp values.
     // φ weights: the MLP input is ~O(1); w1 shapes [phi_in, phi_in], large.
@@ -669,7 +701,9 @@ fn make_nsa_inputs(cfg: &NsaConfig, seq_len: usize, model_dim: usize, seed: u64)
         g_proj_b,
     };
 
-    (q, k, q_rope, k_rope, v, x, weights)
+    (
+        q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights,
+    )
 }
 
 // ===================================================================
@@ -736,21 +770,27 @@ fn test_nsa_parity_kernel_vs_oracle() {
         };
 
         let seed = (seq_len as u64) * 1009 + (num_heads as u64) * 31;
-        let (q, k, q_rope, k_rope, v, x, weights) = make_nsa_inputs(&cfg, seq_len, model_dim, seed);
+        let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights) =
+            make_nsa_inputs(&cfg, seq_len, model_dim, seed);
 
         // Reference oracle
-        let ref_out =
-            ref_native_sparse_attention(&q, &k, &q_rope, &k_rope, &v, &x, &weights, seq_len, &cfg);
+        let ref_out = ref_native_sparse_attention(
+            &q, &q_rope, &k_cmp, &k_slc, &k_win, &v_cmp, &v_slc, &v_win, &x, &weights, seq_len,
+            &cfg,
+        );
 
         // Kernel under test
         let mut kernel_out = vec![0.0_f32; seq_len * cfg.q_dim()];
         let mut scratch = NsaScratch::default();
         apply_native_sparse_attention(
             &q,
-            &k,
             &q_rope,
-            &k_rope,
-            &v,
+            &k_cmp,
+            &k_slc,
+            &k_win,
+            &v_cmp,
+            &v_slc,
+            &v_win,
             &x,
             &weights,
             &mut kernel_out,
@@ -770,7 +810,7 @@ fn test_nsa_parity_kernel_vs_oracle() {
 }
 
 /// Independence check: with window >= seq_len and gates forced window-only,
-/// NSA output must equal `sigmoid(100) * dense_causal_attention(q_rope, k_rope, v)`.
+/// NSA output must equal `sigmoid(100) * dense_causal_attention(q_rope, k_win, v_win)`.
 ///
 /// This test does NOT use the NSA oracle — it writes an independent dense attention
 /// reference and checks a structural invariant of the gating mechanism.
@@ -792,7 +832,7 @@ fn test_window_only_equals_dense_causal() {
     let model_dim = 8;
     let seed = 9999_u64;
 
-    let (q, k, q_rope, k_rope, v, _x, mut weights) =
+    let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, _x, mut weights) =
         make_nsa_inputs(&cfg, seq_len, model_dim, seed);
 
     // Force gates: g_cmp ≈ 0, g_slc ≈ 0, g_win ≈ 1 via biases.
@@ -808,11 +848,12 @@ fn test_window_only_equals_dense_causal() {
     // x can be anything since g_proj_w is zero; reuse a dummy
     let x = vec![0.0_f32; seq_len * model_dim];
 
-    // Dense causal reference
+    // Dense causal reference — the sliding-window branch (the only active branch under
+    // these forced gates) uses q_rope / k_win / v_win, so the dense reference must too.
     let dense_out = ref_dense_causal_attention(
         &q_rope,
-        &k_rope,
-        &v,
+        &k_win,
+        &v_win,
         seq_len,
         cfg.num_heads,
         cfg.num_kv_heads,
@@ -827,10 +868,13 @@ fn test_window_only_equals_dense_causal() {
     let mut scratch = NsaScratch::default();
     apply_native_sparse_attention(
         &q,
-        &k,
         &q_rope,
-        &k_rope,
-        &v,
+        &k_cmp,
+        &k_slc,
+        &k_win,
+        &v_cmp,
+        &v_slc,
+        &v_win,
         &x,
         &weights,
         &mut kernel_out,
@@ -847,10 +891,10 @@ fn test_window_only_equals_dense_causal() {
     );
 }
 
-/// Causal masking: position 0's output must not depend on future K/K_rope/V.
+/// Causal masking: position 0's output must not depend on future K/V.
 ///
-/// Two runs differing ONLY in K, K_rope, and V at positions 1..seq_len.
-/// Position 0 output must be bit-identical. A later position must differ.
+/// Two runs differing ONLY in the six independent K/V branch buffers at positions
+/// 1..seq_len. Position 0 output must be bit-identical. A later position must differ.
 #[test]
 fn test_causal_masking_integration() {
     let cfg = NsaConfig {
@@ -867,32 +911,37 @@ fn test_causal_masking_integration() {
     let model_dim = 8;
     let seed = 7777_u64;
 
-    let (q, k_base, q_rope, k_rope_base, v_base, x, weights) =
+    let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights) =
         make_nsa_inputs(&cfg, seq_len, model_dim, seed);
 
     let kv_dim = cfg.kv_dim();
 
-    // Perturb K, K_rope, V at positions 1..seq_len
-    let mut k_perturbed = k_base.clone();
-    let mut k_rope_perturbed = k_rope_base.clone();
-    let mut v_perturbed = v_base.clone();
-    for pos in 1..seq_len {
-        for d in 0..kv_dim {
-            k_perturbed[pos * kv_dim + d] += 12345.0;
-            k_rope_perturbed[pos * kv_dim + d] += 12345.0;
-            v_perturbed[pos * kv_dim + d] += 12345.0;
-        }
-    }
+    // The six independent K/V branch buffers: k_cmp, k_slc, k_win, v_cmp, v_slc, v_win.
+    let kv_base: [Vec<f32>; 6] = [k_cmp, k_slc, k_win, v_cmp, v_slc, v_win];
 
-    let run = |k: &[f32], k_rope: &[f32], v: &[f32]| {
+    // Perturb every K/V buffer at positions 1..seq_len.
+    let kv_perturbed: [Vec<f32>; 6] = std::array::from_fn(|i| {
+        let mut b = kv_base[i].clone();
+        for pos in 1..seq_len {
+            for d in 0..kv_dim {
+                b[pos * kv_dim + d] += 12345.0;
+            }
+        }
+        b
+    });
+
+    let run = |kv: &[Vec<f32>; 6]| {
         let mut out = vec![0.0_f32; seq_len * cfg.q_dim()];
         let mut scratch = NsaScratch::default();
         apply_native_sparse_attention(
             &q,
-            k,
             &q_rope,
-            k_rope,
-            v,
+            &kv[0],
+            &kv[1],
+            &kv[2],
+            &kv[3],
+            &kv[4],
+            &kv[5],
             &x,
             &weights,
             &mut out,
@@ -903,8 +952,8 @@ fn test_causal_masking_integration() {
         out
     };
 
-    let out_base = run(&k_base, &k_rope_base, &v_base);
-    let out_perturbed = run(&k_perturbed, &k_rope_perturbed, &v_perturbed);
+    let out_base = run(&kv_base);
+    let out_perturbed = run(&kv_perturbed);
 
     let out_dim = cfg.q_dim();
 

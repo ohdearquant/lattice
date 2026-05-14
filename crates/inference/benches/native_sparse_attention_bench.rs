@@ -178,11 +178,16 @@ fn bench_nsa_throughput() {
         let weights = make_weights(&cfg, model_dim, seed);
 
         let mut rng = Lcg::new(seed.wrapping_add(1));
+        // Independent K/V per branch (paper §3.3.3): the caller projects K and V
+        // three times. Distinct random buffers mirror that.
         let q = scaled(random_vec(seq_len * cfg.q_dim(), &mut rng), 0.1);
-        let k = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
         let q_rope = scaled(random_vec(seq_len * cfg.q_dim(), &mut rng), 0.1);
-        let k_rope = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
-        let v = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_cmp = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_slc = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_win = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_cmp = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_slc = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_win = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
         let x = scaled(random_vec(seq_len * model_dim, &mut rng), 0.1);
         let mut out = vec![0.0_f32; seq_len * cfg.q_dim()];
         let mut scratch = NsaScratch::default();
@@ -191,10 +196,13 @@ fn bench_nsa_throughput() {
         for _ in 0..3 {
             apply_native_sparse_attention(
                 black_box(&q),
-                black_box(&k),
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_cmp),
+                black_box(&k_slc),
+                black_box(&k_win),
+                black_box(&v_cmp),
+                black_box(&v_slc),
+                black_box(&v_win),
                 black_box(&x),
                 black_box(&weights),
                 black_box(&mut out),
@@ -208,10 +216,13 @@ fn bench_nsa_throughput() {
         let us = average_us(iters, || {
             apply_native_sparse_attention(
                 black_box(&q),
-                black_box(&k),
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_cmp),
+                black_box(&k_slc),
+                black_box(&k_win),
+                black_box(&v_cmp),
+                black_box(&v_slc),
+                black_box(&v_win),
                 black_box(&x),
                 black_box(&weights),
                 black_box(&mut out),
@@ -365,13 +376,18 @@ fn bench_sparse_vs_dense() {
         let weights = make_weights(&cfg, model_dim, seed);
 
         let mut rng = Lcg::new(seed.wrapping_add(7));
-        // Dense baseline uses q_rope/k_rope as its Q/K (RoPE'd, same as a standard
-        // dense attention layer). NSA gets both raw and RoPE'd buffers.
+        // NSA takes 8 activation buffers (independent K/V per branch, paper §3.3.3).
+        // The dense baseline is single-branch by definition; it borrows the window
+        // branch's RoPE'd Q/K/V (`q_rope`, `k_win`, `v_win`) — dense causal is the
+        // sliding window extended to the full context.
         let q = scaled(random_vec(seq_len * cfg.q_dim(), &mut rng), 0.1);
-        let k = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
         let q_rope = scaled(random_vec(seq_len * cfg.q_dim(), &mut rng), 0.1);
-        let k_rope = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
-        let v = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_cmp = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_slc = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let k_win = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_cmp = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_slc = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
+        let v_win = scaled(random_vec(seq_len * cfg.kv_dim(), &mut rng), 0.1);
         let x = scaled(random_vec(seq_len * model_dim, &mut rng), 0.1);
 
         let mut nsa_out = vec![0.0_f32; seq_len * cfg.q_dim()];
@@ -383,10 +399,13 @@ fn bench_sparse_vs_dense() {
         for _ in 0..3 {
             apply_native_sparse_attention(
                 black_box(&q),
-                black_box(&k),
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_cmp),
+                black_box(&k_slc),
+                black_box(&k_win),
+                black_box(&v_cmp),
+                black_box(&v_slc),
+                black_box(&v_win),
                 black_box(&x),
                 black_box(&weights),
                 black_box(&mut nsa_out),
@@ -396,8 +415,8 @@ fn bench_sparse_vs_dense() {
             );
             dense_causal_baseline(
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_win),
+                black_box(&v_win),
                 black_box(&mut dense_out),
                 seq_len,
                 &cfg,
@@ -410,8 +429,8 @@ fn bench_sparse_vs_dense() {
         let us_dense = average_us(iters, || {
             dense_causal_baseline(
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_win),
+                black_box(&v_win),
                 black_box(&mut dense_out),
                 seq_len,
                 &cfg,
@@ -423,10 +442,13 @@ fn bench_sparse_vs_dense() {
         let us_nsa = average_us(iters, || {
             apply_native_sparse_attention(
                 black_box(&q),
-                black_box(&k),
                 black_box(&q_rope),
-                black_box(&k_rope),
-                black_box(&v),
+                black_box(&k_cmp),
+                black_box(&k_slc),
+                black_box(&k_win),
+                black_box(&v_cmp),
+                black_box(&v_slc),
+                black_box(&v_win),
                 black_box(&x),
                 black_box(&weights),
                 black_box(&mut nsa_out),
