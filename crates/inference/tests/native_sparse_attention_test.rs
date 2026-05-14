@@ -1060,15 +1060,90 @@ fn test_nsa_selection_no_future_leak() {
         &mut scratch,
     );
 
-    // Position 0's selection branch gathers only token 0 (softmax of a single
-    // score is 1.0), so o_slc[0] == v_slc[0] == 0.5 and out[0] ≈ g_slc * 0.5.
-    // A leaked future token would push out[0] to ~1e9.
+    // Position 0's selection branch gathers only token 0 (softmax of a single score
+    // is 1.0), so o_slc[0] == v_slc[0] == 0.5. Compression has no valid block for
+    // qt=0 and v_win is zero, so out[0] == g_slc * 0.5 == sigmoid(100) * 0.5 exactly.
+    // Asserting the precise value (not just a loose bound) means a *disabled*
+    // selection branch returning 0.0 fails the test too — not only a 1e9 leak.
+    let expected = sigmoid(100.0_f32) * 0.5;
     for d in 0..head_dim {
         assert!(
-            out[d].abs() < 1.0,
-            "position 0 dim {d}: out={} — a future-token V leaked through the \
-             selection branch (expected ~0.5; a leak would be ~1e9)",
+            (out[d] - expected).abs() < 1.0e-4,
+            "position 0 dim {d}: out={} expected≈{expected} — the selection branch \
+             either leaked a future-token V (would be ~1e9) or returned 0.0",
             out[d]
+        );
+    }
+}
+
+/// Causal prefix-invariance regression (round-3 review, finding 1).
+///
+/// A causal prefill kernel must produce the same output for query `t` regardless of
+/// how many tokens follow it. The selection-block count was computed with `floor`,
+/// so a short prefix could have *zero* selection blocks while the same prefix inside
+/// a longer sequence had one — silently activating the selection branch for earlier
+/// queries. With `ceil` block counting the available block set depends only on `t`.
+#[test]
+fn test_nsa_prefix_invariance() {
+    let cfg = NsaConfig {
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        compress_block: 4,
+        compress_stride: 2,
+        select_block: 4,
+        num_selected: 3,
+        window: 4,
+    };
+    let long_len = 8;
+    let short_len = 3; // < select_block: with `floor` this had 0 selection blocks
+    let model_dim = 8;
+    let seed = 4242_u64;
+
+    // Build inputs for the long sequence; the short run uses the first `short_len`
+    // tokens of every buffer — an exact prefix. Weights are seq_len-independent.
+    let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights) =
+        make_nsa_inputs(&cfg, long_len, model_dim, seed);
+
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+
+    let run = |len: usize| -> Vec<f32> {
+        let mut out = vec![0.0_f32; len * q_dim];
+        let mut scratch = NsaScratch::default();
+        apply_native_sparse_attention(
+            &q[..len * q_dim],
+            &q_rope[..len * q_dim],
+            &k_cmp[..len * kv_dim],
+            &k_slc[..len * kv_dim],
+            &k_win[..len * kv_dim],
+            &v_cmp[..len * kv_dim],
+            &v_slc[..len * kv_dim],
+            &v_win[..len * kv_dim],
+            &x[..len * model_dim],
+            &weights,
+            &mut out,
+            len,
+            &cfg,
+            &mut scratch,
+        );
+        out
+    };
+
+    let out_long = run(long_len);
+    let out_short = run(short_len);
+
+    // The first `short_len` query outputs must be bit-identical: those queries see
+    // exactly the same prefix in both runs.
+    for i in 0..short_len * q_dim {
+        assert_eq!(
+            out_short[i].to_bits(),
+            out_long[i].to_bits(),
+            "prefix-invariance violated at output index {i} (query {}): \
+             out_short={} out_long={} — appending future tokens changed an earlier output",
+            i / q_dim,
+            out_short[i],
+            out_long[i]
         );
     }
 }

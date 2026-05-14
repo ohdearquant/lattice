@@ -150,12 +150,19 @@ impl NsaConfig {
         (seq_len - self.compress_block) / self.compress_stride + 1
     }
 
-    /// **Unstable**: number of full selection blocks for a sequence of `seq_len` tokens.
+    /// **Unstable**: number of selection blocks for a sequence of `seq_len` tokens.
     ///
-    /// Selection block `j` covers `[j*l', (j+1)*l')`. Partial trailing blocks are excluded.
+    /// Selection block `j` covers `[j*l', (j+1)*l')`. The count is `ceil(seq_len / l')`,
+    /// **not** `floor` — a partial trailing block (one extending past `seq_len`) is still a
+    /// real block. This is load-bearing for causal prefix-invariance: query `t`'s available
+    /// selection-block set must depend only on `t`, never on the final `seq_len`. With a
+    /// `floor` count, appending a future token could turn a previously-excluded partial
+    /// block into a full one and retroactively change an earlier query's output. The
+    /// non-existent / future tokens of a partial block are simply never gathered (the
+    /// gather keeps only `tok <= qt`).
     #[inline]
     pub fn num_select_blocks(&self, seq_len: usize) -> usize {
-        seq_len / self.select_block
+        seq_len.div_ceil(self.select_block)
     }
 
     /// **Unstable**: number of compression blocks that overlap one selection block = `l' / d`.
@@ -839,8 +846,11 @@ pub fn apply_native_sparse_attention(
                 let tok_start = bj * lp;
                 for p in 0..lp {
                     let tok = tok_start + p;
+                    // Hard causal exclusion. `tok > qt` also covers tokens past the end
+                    // of the sequence in a partial trailing block: `qt < seq_len`, so
+                    // `tok >= seq_len` implies `tok > qt`.
                     if tok > qt {
-                        continue; // future token — hard causal exclusion
+                        continue;
                     }
                     let dst = n_gathered * head_dim;
                     let src = tok * kv_dim + kv_h * head_dim;
@@ -985,11 +995,14 @@ fn count_valid_compress_blocks(qt: usize, l: usize, d: usize, max_cblocks: usize
 /// Number of causally valid selection blocks for query position `qt`.
 ///
 /// Block `j` covers tokens `[j*l', (j+1)*l')`; it is causally valid iff it contains at
-/// least one token `<= qt`, i.e. `j*l' <= qt`. A valid block may be **partial** (contain
-/// tokens `> qt`) — the selection branch gathers only the `<= qt` tokens of a selected
-/// block (hard causal exclusion, not a soft mask).
-/// Only full selection blocks are candidates, so the count is clamped to `max_sblocks`.
-/// See ADR-042 §KDC 7.
+/// least one token `<= qt`, i.e. `j*l' <= qt` — so blocks `0..=qt/l'` are valid, giving
+/// `qt/l' + 1`. A valid block may be **partial** (contain tokens `> qt`); the selection
+/// branch gathers only its `<= qt` tokens (hard causal exclusion, not a soft mask).
+///
+/// The `.min(max_sblocks)` is a defensive upper bound that — given `num_select_blocks`
+/// uses `ceil` — provably never binds: for any `qt < seq_len`, `qt/l' + 1 <=
+/// ceil(seq_len/l') = max_sblocks`. So the result is `qt/l' + 1`, a function of `qt`
+/// alone (causal prefix-invariance). See ADR-042 §KDC 7.
 #[inline]
 fn count_valid_select_blocks(qt: usize, lp: usize, max_sblocks: usize) -> usize {
     // max j s.t. j*l' <= qt  →  j <= qt / l'
@@ -1671,10 +1684,11 @@ mod tests {
     #[test]
     fn test_num_select_blocks() {
         let cfg = small_cfg(); // l'=4
+        // ceil(seq_len / l') — a partial trailing block still counts (prefix-invariance).
         assert_eq!(cfg.num_select_blocks(0), 0);
-        assert_eq!(cfg.num_select_blocks(3), 0);
+        assert_eq!(cfg.num_select_blocks(3), 1); // ceil(3/4) = 1, not 0
         assert_eq!(cfg.num_select_blocks(4), 1);
-        assert_eq!(cfg.num_select_blocks(7), 1);
+        assert_eq!(cfg.num_select_blocks(7), 2); // ceil(7/4) = 2, not 1
         assert_eq!(cfg.num_select_blocks(8), 2);
     }
 
