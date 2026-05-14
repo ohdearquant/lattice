@@ -62,9 +62,9 @@ Public surface:
 
 **Positive**:
 
-- Differential attention is independently testable and benchmarkable (6 unit tests, 4 integration tests, dedicated benchmark).
+- Differential attention is independently testable and benchmarkable (11 unit tests, 5 integration tests, dedicated benchmark).
 - When a DIFF Transformer checkpoint becomes a target, the math is already implemented and validated.
-- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at ~1.5–2.0x a single-softmax baseline (measured: 1.97x / 1.96x / 1.48x for the 2h / 4h-GQA / 8h-GQA shapes at seq_len 256; the ratio shrinks at larger head counts as the shared per-pair scratch traffic grows). The baseline has identical loop topology *and* identical per-pair scratch-slab layout, so the only working-set difference is the differential kernel's `scores2` slab — itself part of the mechanism. A comparison against the batched `apply_gqa_attention` would instead conflate kernel topology and scratch cache-layout with mechanism cost.
+- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at roughly **2x** a single-softmax baseline — observed in the ~1.9–2.1x band across the 2h-MHA / 4h-GQA / 8h-GQA shapes at seq_len 256, roughly flat across head counts. This is an unstabilized wall-clock microbenchmark with ±0.1x run-to-run variance, not a statistically rigorous measurement; treat it as an order-of-magnitude check, not a precise figure. The baseline has identical loop topology *and* identical per-pair scratch-slab layout, so the only working-set difference is the differential kernel's `scores2` slab — itself part of the mechanism. A comparison against the batched `apply_gqa_attention` would instead conflate kernel topology and scratch cache-layout with mechanism cost.
 
 **Negative**:
 
