@@ -2,7 +2,7 @@
 
 Global ADR index for the Lattice project. Numbered sequentially, grouped by crate.
 
-## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-041)
+## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-042)
 
 | ADR                                            | Title                                |
 | ---------------------------------------------- | ------------------------------------ |
@@ -19,6 +19,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                  |
 | [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)     |
 | [041](ADR-041-differential-attention.md)       | Differential Attention               |
+| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention              |
 
 ## lattice-embed (ADR-012 to ADR-019)
 
