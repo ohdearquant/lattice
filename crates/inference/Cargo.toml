@@ -117,6 +117,10 @@ name = "differential_attention_bench"
 harness = false
 
 [[bench]]
+name = "native_sparse_attention_bench"
+harness = false
+
+[[bench]]
 name = "gated_attention_bench"
 harness = false
 
