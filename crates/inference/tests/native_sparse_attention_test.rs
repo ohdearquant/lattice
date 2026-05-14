@@ -397,8 +397,9 @@ fn ref_native_sparse_attention(
         }
 
         // ---- Eq. 9 + 10: per-KV-head importance scores for selection ----
-        // Eq. 9: importance of selection block j for a single query head h:
-        //   p_slc[h][j] = Σ_{m=0}^{cps-1} Σ_{n=0}^{ipc-1} p_cmp[h][cps*j + m + n]
+        // Eq. 9 (paper-verbatim index, both m and n SUBTRACTED): importance of
+        // selection block j for a single query head h:
+        //   p_slc[h][j] = Σ_{m=0}^{cps-1} Σ_{n=0}^{ipc-1} p_cmp[h][cps*j - m - n]
         //
         // Eq. 10: group-sum across the n_rep query heads in kv_h's group:
         //   score_kv[kv_h][j] = Σ_{h in group(kv_h)} p_slc[h][j]
@@ -735,24 +736,29 @@ fn test_nsa_parity_kernel_vs_oracle() {
         usize,
         &str,
     )] = &[
+        // n >= 3 everywhere — the forced-block scheme (1 initial + 2 local) needs it,
+        // and `NsaConfig::validate` now asserts it.
         // --- Early-token: seq_len < compress_block (no compression blocks) ---
-        (1, 2, 2, 4, 4, 2, 4, 2, 8, 8, "early-no-cmp-seq1"),
-        (3, 2, 2, 4, 4, 2, 4, 2, 8, 8, "early-no-cmp-seq3"),
+        (1, 2, 2, 4, 4, 2, 4, 3, 8, 8, "early-no-cmp-seq1"),
+        (3, 2, 2, 4, 4, 2, 4, 3, 8, 8, "early-no-cmp-seq3"),
         // --- Early-token: seq_len < select_block (no selection blocks) ---
-        (3, 2, 2, 4, 4, 2, 8, 2, 8, 8, "early-no-slc-seq3"),
+        (3, 2, 2, 4, 4, 2, 8, 3, 8, 8, "early-no-slc-seq3"),
         // --- MHA: single block spanning ---
-        (8, 2, 2, 4, 4, 2, 4, 2, 8, 8, "mha-2h-seq8-l4-d2-lp4"),
+        (8, 2, 2, 4, 4, 2, 4, 3, 8, 8, "mha-2h-seq8-l4-d2-lp4"),
         // --- MHA: multiple blocks ---
         (12, 2, 2, 4, 4, 2, 4, 3, 8, 8, "mha-2h-seq12-l4-d2-lp4-n3"),
         // --- GQA: num_kv_heads < num_heads ---
-        (8, 4, 2, 4, 4, 2, 4, 2, 8, 8, "gqa-4h-2kv-seq8"),
+        (8, 4, 2, 4, 4, 2, 4, 3, 8, 8, "gqa-4h-2kv-seq8"),
         (12, 4, 1, 4, 4, 2, 4, 3, 8, 8, "gqa-4h-1kv-seq12"),
         // --- Larger head_dim ---
         (10, 2, 2, 8, 4, 2, 4, 3, 8, 16, "mha-hd8-seq10"),
         // --- Window larger than seq_len (window-only effective) ---
-        (6, 2, 2, 4, 4, 2, 4, 2, 32, 8, "win-large-seq6"),
+        (6, 2, 2, 4, 4, 2, 4, 3, 32, 8, "win-large-seq6"),
         // --- Multiple compression blocks, GQA ---
         (16, 4, 2, 4, 4, 2, 4, 3, 8, 8, "gqa-4h-2kv-seq16-multi"),
+        // --- Free-block path: n=5 with 6 valid selection blocks, so the
+        //     importance-based top-(n-3) selection is actually exercised ---
+        (24, 2, 2, 4, 4, 2, 4, 5, 8, 8, "free-path-seq24-n5"),
     ];
 
     for &(seq_len, num_heads, num_kv_heads, head_dim, l, d, lp, n_sel, win, model_dim, name) in
@@ -825,7 +831,7 @@ fn test_window_only_equals_dense_causal() {
         compress_block: 4,
         compress_stride: 2,
         select_block: 4,
-        num_selected: 2,
+        num_selected: 3,
         window: 64, // window >> seq_len → all tokens in window
     };
     let seq_len = 8;
@@ -904,7 +910,7 @@ fn test_causal_masking_integration() {
         compress_block: 4,
         compress_stride: 2,
         select_block: 4,
-        num_selected: 2,
+        num_selected: 3,
         window: 8,
     };
     let seq_len = 8;
@@ -974,4 +980,95 @@ fn test_causal_masking_integration() {
         later_changed,
         "no later position changed — the perturbation had no effect, which is unexpected"
     );
+}
+
+/// Selection-branch causal-leak regression (round-2 review, finding 1).
+///
+/// Soft-masking future tokens with a finite sentinel (e.g. `-10000`) leaks when a
+/// *real* valid score falls below the sentinel: after softmax the masked future
+/// token wins. Here the one causally-valid selection token (position 0) is given an
+/// extreme-negative score, and the future tokens of position 0's own partial
+/// selection block carry huge V values. With hard causal exclusion the future
+/// tokens are never gathered, so position 0's output stays bounded near `v_slc[0]`.
+#[test]
+fn test_nsa_selection_no_future_leak() {
+    let cfg = NsaConfig {
+        num_heads: 1,
+        num_kv_heads: 1,
+        head_dim: 2,
+        compress_block: 2,
+        compress_stride: 2,
+        select_block: 4,
+        num_selected: 3,
+        window: 1,
+    };
+    let seq_len = 4;
+    let model_dim = 4;
+    let head_dim = cfg.head_dim;
+    let kv_dim = cfg.kv_dim();
+
+    // q_rope[0] · k_slc[0] is extreme-negative → the valid token's score is far
+    // below any finite mask sentinel.
+    let mut q_rope = vec![0.0_f32; seq_len * cfg.q_dim()];
+    let mut k_slc = vec![0.0_f32; seq_len * kv_dim];
+    for d in 0..head_dim {
+        q_rope[d] = -1000.0; // query position 0
+        k_slc[d] = 1000.0; // key position 0  → dot = -2e6
+    }
+
+    // v_slc: position 0 holds a small known value; positions 1..3 (future tokens
+    // of position 0's own selection block [0, 4)) carry enormous values.
+    let mut v_slc = vec![0.0_f32; seq_len * kv_dim];
+    for d in 0..head_dim {
+        v_slc[d] = 0.5; // position 0
+    }
+    for slot in v_slc.iter_mut().skip(kv_dim) {
+        *slot = 1.0e9; // future tokens — must never leak into position 0
+    }
+
+    // Remaining buffers can be zero: compression has no causally-valid block for
+    // qt=0, and the window (w=1) covers only position 0 itself.
+    let q = vec![0.0_f32; seq_len * cfg.q_dim()];
+    let k_cmp = vec![0.0_f32; seq_len * kv_dim];
+    let k_win = vec![0.0_f32; seq_len * kv_dim];
+    let v_cmp = vec![0.0_f32; seq_len * kv_dim];
+    let v_win = vec![0.0_f32; seq_len * kv_dim];
+    let x = vec![0.0_f32; seq_len * model_dim];
+
+    // Correctly-shaped φ / gate weights, then force gates select-only:
+    // g_cmp ≈ 0, g_slc ≈ 1, g_win ≈ 0 (row order [cmp, slc, win] for the 1 head).
+    let (.., mut weights) = make_nsa_inputs(&cfg, seq_len, model_dim, 1);
+    weights.g_proj_w = vec![0.0_f32; 3 * cfg.num_heads * model_dim];
+    weights.g_proj_b = vec![-100.0, 100.0, -100.0];
+
+    let mut out = vec![0.0_f32; seq_len * cfg.q_dim()];
+    let mut scratch = NsaScratch::default();
+    apply_native_sparse_attention(
+        &q,
+        &q_rope,
+        &k_cmp,
+        &k_slc,
+        &k_win,
+        &v_cmp,
+        &v_slc,
+        &v_win,
+        &x,
+        &weights,
+        &mut out,
+        seq_len,
+        &cfg,
+        &mut scratch,
+    );
+
+    // Position 0's selection branch gathers only token 0 (softmax of a single
+    // score is 1.0), so o_slc[0] == v_slc[0] == 0.5 and out[0] ≈ g_slc * 0.5.
+    // A leaked future token would push out[0] to ~1e9.
+    for d in 0..head_dim {
+        assert!(
+            out[d].abs() < 1.0,
+            "position 0 dim {d}: out={} — a future-token V leaked through the \
+             selection branch (expected ~0.5; a leak would be ~1e9)",
+            out[d]
+        );
+    }
 }

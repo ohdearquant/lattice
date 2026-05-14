@@ -40,7 +40,8 @@ use crate::forward::cpu::matmul_bt;
 /// - `select_block (l')` must be divisible by `compress_stride (d)`
 /// - `compress_block (l) <= select_block (l')` — the paper's Eq. 9 precondition
 /// - `num_heads % num_kv_heads == 0`
-/// - All sizes (including `num_selected`) > 0
+/// - `num_selected (n) >= 3` — the forced-block scheme needs 1 initial + 2 local blocks
+/// - All other sizes > 0
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NsaConfig {
     /// Number of query heads.
@@ -56,7 +57,8 @@ pub struct NsaConfig {
     pub compress_stride: usize,
     /// Selection block length `l'`. Top-`n` selection blocks are attended at full resolution.
     pub select_block: usize,
-    /// Number of top-scored selection blocks `n`. Includes forced initial + 2 local blocks.
+    /// Number of top-scored selection blocks `n`. Must be `>= 3`: the scheme always
+    /// includes a forced initial block + 2 local blocks, plus `n - 3` top-scored.
     pub num_selected: usize,
     /// Sliding window size `w`. Attention covers `k_rope[max(0,t-w+1)..=t]`.
     pub window: usize,
@@ -77,7 +79,14 @@ impl NsaConfig {
         assert!(self.compress_block > 0, "compress_block (l) must be > 0");
         assert!(self.compress_stride > 0, "compress_stride (d) must be > 0");
         assert!(self.select_block > 0, "select_block (l') must be > 0");
-        assert!(self.num_selected > 0, "num_selected (n) must be > 0");
+        // The paper's forced-block scheme is "1 initial + 2 local" blocks — undefined
+        // for n < 3 (ADR-042 §KDC 7 already speaks of "the remaining n - 3").
+        assert!(
+            self.num_selected >= 3,
+            "num_selected (n={}) must be >= 3 — the forced-block scheme needs \
+             1 initial + 2 local blocks",
+            self.num_selected
+        );
         assert!(self.window > 0, "window (w) must be > 0");
         assert_eq!(
             self.num_heads % self.num_kv_heads,
@@ -313,12 +322,6 @@ impl NsaScratch {
 }
 
 // ===================================================================
-// Constants
-// ===================================================================
-
-const MASK_VALUE: f32 = -10_000.0_f32;
-
-// ===================================================================
 // Core kernel
 // ===================================================================
 
@@ -465,6 +468,14 @@ pub fn apply_native_sparse_attention(
         "x_buf length must be seq_len*model_dim (model_dim inferred as {}), got {}",
         model_dim,
         x_buf.len()
+    );
+    // A non-empty sequence must carry a non-empty hidden state. Without this, an empty
+    // x_buf infers model_dim = 0, the length check above passes vacuously, the g_proj_w
+    // shape check is skipped, and the gate silently degrades to bias-only — masking a
+    // caller that passed the wrong x_buf.
+    assert!(
+        seq_len == 0 || model_dim > 0,
+        "x_buf must be non-empty when seq_len > 0 (model_dim inferred as 0)"
     );
 
     // Weight shape asserts — checked even for seq_len=0 to catch mis-constructed NsaWeights.
@@ -791,9 +802,12 @@ pub fn apply_native_sparse_attention(
         // ----------------------------------------------------------------
         // 2c: Selection attention
         //
-        // For each KV head: gather the selected blocks' K (RoPE'd) and V
-        // (RoPE-free) into contiguous buffers, then compute scaled-dot-product
-        // attention per Q head with token-level causal masking.
+        // For each KV head: gather the selected blocks' K (RoPE'd) and V into
+        // contiguous buffers — gathering *only* tokens `<= qt`. A selected block
+        // may be the query's own, partial, block; its future tokens are never
+        // gathered. This is hard causal exclusion, not a soft additive mask —
+        // a soft mask leaks when a real score falls below the mask value.
+        // ADR-042 §KDC 7. Then standard scaled-dot-product attention per Q head.
         // ----------------------------------------------------------------
         for kv_h in 0..num_kv_heads {
             let valid_sblocks = count_valid_select_blocks(qt, lp, max_sblocks);
@@ -810,12 +824,14 @@ pub fn apply_native_sparse_attention(
                 continue;
             }
 
-            let total_sel_toks = n_valid_sel * lp;
-            let sel_k_buf = &mut scratch.sel_k[..total_sel_toks * head_dim];
-            let sel_v_buf = &mut scratch.sel_v[..total_sel_toks * head_dim];
+            // `n_valid_sel * lp` bounds the gathered count; scratch is sized for it.
+            let max_sel_toks = n_valid_sel * lp;
+            let sel_k_buf = &mut scratch.sel_k[..max_sel_toks * head_dim];
+            let sel_v_buf = &mut scratch.sel_v[..max_sel_toks * head_dim];
 
-            // Gather selected blocks' K (RoPE'd) and V into flat buffers.
-            let mut gathered = 0usize;
+            // Gather only causally-valid tokens (`tok <= qt`) — future tokens of a
+            // partial selected block are never gathered.
+            let mut n_gathered = 0usize;
             for &bj in sel_idxs.iter().take(n_sel) {
                 if bj == usize::MAX || bj >= valid_sblocks {
                     continue;
@@ -823,13 +839,19 @@ pub fn apply_native_sparse_attention(
                 let tok_start = bj * lp;
                 for p in 0..lp {
                     let tok = tok_start + p;
-                    let dst = (gathered * lp + p) * head_dim;
+                    if tok > qt {
+                        continue; // future token — hard causal exclusion
+                    }
+                    let dst = n_gathered * head_dim;
                     let src = tok * kv_dim + kv_h * head_dim;
                     sel_k_buf[dst..dst + head_dim].copy_from_slice(&k_slc_buf[src..src + head_dim]);
                     sel_v_buf[dst..dst + head_dim].copy_from_slice(&v_slc_buf[src..src + head_dim]);
+                    n_gathered += 1;
                 }
-                gathered += 1;
             }
+            // Every valid selected block has its first token `bj*lp <= qt`, so
+            // n_valid_sel > 0 implies at least one token was gathered.
+            debug_assert!(n_gathered > 0, "n_valid_sel > 0 must imply n_gathered > 0");
 
             // Attend each Q head in this KV group against the gathered tokens.
             let q_head_start = kv_h * n_rep;
@@ -838,9 +860,8 @@ pub fn apply_native_sparse_attention(
                 let q_off = qt * q_dim + qh * head_dim;
                 let q_head = &q_rope_buf[q_off..q_off + head_dim];
 
-                let scores = &mut scratch.sel_scores[..total_sel_toks];
-                // Compute dot products.
-                for ti in 0..total_sel_toks {
+                let scores = &mut scratch.sel_scores[..n_gathered];
+                for ti in 0..n_gathered {
                     let k_off = ti * head_dim;
                     let dot: f32 = q_head
                         .iter()
@@ -850,36 +871,13 @@ pub fn apply_native_sparse_attention(
                     scores[ti] = dot * scale;
                 }
 
-                // Token-level causal masking (ADR-042 §KDC 7, §KDC 12). A valid selection
-                // block may be partial — it can contain tokens > qt (e.g. the query's own
-                // block). Those future tokens are masked; the query attends tok <= qt
-                // (including itself). This masking is load-bearing, not defensive.
-                {
-                    let mut gi = 0usize;
-                    for &bj in sel_idxs.iter().take(n_sel) {
-                        if bj == usize::MAX || bj >= valid_sblocks {
-                            continue;
-                        }
-                        for p in 0..lp {
-                            let tok = bj * lp + p;
-                            if tok > qt {
-                                scores[gi * lp + p] = MASK_VALUE;
-                            }
-                        }
-                        gi += 1;
-                    }
-                }
-
                 softmax_inplace(scores);
 
                 let out_off = qt * q_dim + qh * head_dim;
                 let out_slot = &mut scratch.out_slc[out_off..out_off + head_dim];
                 out_slot.fill(0.0);
-                for ti in 0..total_sel_toks {
+                for ti in 0..n_gathered {
                     let p = scores[ti];
-                    if p == 0.0 {
-                        continue;
-                    }
                     let v_off = ti * head_dim;
                     for dd in 0..head_dim {
                         out_slot[dd] += p * sel_v_buf[v_off + dd];
@@ -988,7 +986,8 @@ fn count_valid_compress_blocks(qt: usize, l: usize, d: usize, max_cblocks: usize
 ///
 /// Block `j` covers tokens `[j*l', (j+1)*l')`; it is causally valid iff it contains at
 /// least one token `<= qt`, i.e. `j*l' <= qt`. A valid block may be **partial** (contain
-/// tokens `> qt`) — the selection kernel applies token-level causal masking to those.
+/// tokens `> qt`) — the selection branch gathers only the `<= qt` tokens of a selected
+/// block (hard causal exclusion, not a soft mask).
 /// Only full selection blocks are candidates, so the count is clamped to `max_sblocks`.
 /// See ADR-042 §KDC 7.
 #[inline]
@@ -1233,6 +1232,14 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "num_selected (n=2) must be >= 3")]
+    fn test_num_selected_below_3_panics() {
+        let mut cfg = small_cfg();
+        cfg.num_selected = 2; // forced-block scheme needs 1 initial + 2 local
+        cfg.validate();
+    }
+
+    #[test]
     #[should_panic(expected = "compress_stride (d) must be > 0")]
     fn test_zero_stride_via_apply_panics() {
         let cfg = NsaConfig {
@@ -1277,6 +1284,43 @@ mod tests {
             &weights,
             &mut out,
             1,
+            &cfg,
+            &mut scratch,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "x_buf must be non-empty when seq_len > 0")]
+    fn test_empty_x_buf_nonempty_seq_panics() {
+        // An empty x_buf for a non-empty sequence must be rejected, not silently
+        // accepted as model_dim = 0 (which degrades the gate to bias-only).
+        let cfg = small_cfg();
+        let seq_len = 2;
+        let weights = make_weights(&cfg, cfg.q_dim(), 1);
+        let q = det_data(seq_len * cfg.q_dim(), 1);
+        let q_rope = det_data(seq_len * cfg.q_dim(), 2);
+        let k_cmp = det_data(seq_len * cfg.kv_dim(), 3);
+        let k_slc = det_data(seq_len * cfg.kv_dim(), 4);
+        let k_win = det_data(seq_len * cfg.kv_dim(), 5);
+        let v_cmp = det_data(seq_len * cfg.kv_dim(), 6);
+        let v_slc = det_data(seq_len * cfg.kv_dim(), 7);
+        let v_win = det_data(seq_len * cfg.kv_dim(), 8);
+        let x: Vec<f32> = vec![]; // empty x_buf with seq_len > 0 — must panic
+        let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
+        let mut scratch = NsaScratch::default();
+        apply_native_sparse_attention(
+            &q,
+            &q_rope,
+            &k_cmp,
+            &k_slc,
+            &k_win,
+            &v_cmp,
+            &v_slc,
+            &v_win,
+            &x,
+            &weights,
+            &mut out,
+            seq_len,
             &cfg,
             &mut scratch,
         );
