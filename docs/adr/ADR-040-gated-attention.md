@@ -11,7 +11,7 @@
 
 Qwen3.5 and Qwen3-Next use an elementwise sigmoid gate applied to the SDPA output before the output projection. The gate is packed into the Q projection weight: `q_proj` has shape `[2*q_dim, hidden]`, producing both Q and gate vectors in a single matmul. After attention computes the context vector, the gate modulates it element-wise: `context[i] *= sigmoid(gate[i])`.
 
-This mechanism was introduced in the "Gated Attention in Large Language Models" paper (NeurIPS 2025 Best Paper, Qwen/Alibaba, arXiv:2505.06708). It eliminates attention sinks (first-token attention mass drops from ~46.7% to ~4.8%) and improves long-context performance (RULER 64K: 37.51→66.60). The latency overhead is under 2%.
+This mechanism was introduced in "Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free" (Qiu et al., Qwen/Alibaba, arXiv:2505.06708, NeurIPS 2025 Best Paper). It eliminates attention sinks (first-token attention mass drops from ~46.7% to ~4.8%) and improves long-context performance (RULER 64K: 37.51→66.60). The latency overhead is under 2%.
 
 Prior to this ADR, the gated attention logic was inlined in `model/qwen35/forward.rs` — functional but not reusable by other model architectures that ship with the same gating pattern (e.g., Qwen3-Next, future Diff Transformer variants with output gating).
 
@@ -77,7 +77,19 @@ The Qwen3.5 forward pass calls `deinterleave_q_gate` and `apply_sigmoid_gate` (e
 
 ## References
 
-- `src/attention/gated.rs` — `deinterleave_q_gate()`, `apply_sigmoid_gate()`, `apply_sigmoid_gate_scalar()`
+### Papers
+
+- Qiu et al. (2025) — "Gated Attention for Large Language Models: Non-linearity, Sparsity, and Attention-Sink-Free" — arXiv:2505.06708 — <https://arxiv.org/abs/2505.06708> — NeurIPS 2025 Best Paper. Introduces the G1 SDPA-output sigmoid gate; source of the attention-sink and long-context numbers cited in Context.
+- Schraudolph, N. N. (1999) — "A Fast, Compact Approximation of the Exponential Function" — Neural Computation 11(4):853–862 — <https://doi.org/10.1162/089976699300016467>. The bit-trick `exp` approximation used by `apply_sigmoid_gate_fast` (and by the existing `softmax.rs` SIMD path).
+
+### Architecture / implementation
+
+- Qwen3-Next model card — <https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct>. The hybrid GatedDeltaNet + Gated Attention layer schedule that motivates a reusable gate module.
+- HuggingFace Transformers — `models/qwen3_next/modular_qwen3_next.py` — <https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modular_qwen3_next.py>. Reference for the packed `[Q|gate]` `q_proj` layout and per-head interleaving convention that `deinterleave_q_gate` matches.
+
+### Internal
+
+- `src/attention/gated.rs` — `deinterleave_q_gate()`, `apply_sigmoid_gate()`, `apply_sigmoid_gate_fast()`, `apply_sigmoid_gate_scalar()`
 - `src/model/qwen35/forward.rs` — call sites in `project_qkv()` and `full_attention_step_from_attn_out()`
-- Qwen/Alibaba 2025 — "Gated Attention in Large Language Models" — arXiv:2505.06708, NeurIPS 2025 Best Paper
+- `src/model/qwen35/cache.rs` — `ForwardScratch::split_q_and_gate()`
 - ADR-010 — Attention Mechanisms (parent ADR for all attention variants)
