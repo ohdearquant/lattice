@@ -139,7 +139,7 @@ pub fn apply_sigmoid_gate_scalar(context: &mut [f32], gate: &[f32]) {
 // Sigmoid gate — NEON (aarch64)
 // ===================================================================
 
-/// **Unstable**: NEON sigmoid gate; dispatch via [`apply_sigmoid_gate`].
+/// **Unstable**: NEON sigmoid gate; dispatch via [`apply_sigmoid_gate_fast`].
 ///
 /// Uses the Schraudolph fast-exp bit trick (same as `softmax.rs`) for the
 /// sigmoid denominator. Accuracy: ~5-6% relative error on the sigmoid, which
@@ -150,7 +150,7 @@ pub fn apply_sigmoid_gate_scalar(context: &mut [f32], gate: &[f32]) {
 /// - Caller must ensure NEON is available (guaranteed by `simd_config()`).
 /// - `context.len()` must equal `gate.len()`; the SIMD loop accesses both
 ///   slices at the same offsets without bounds checks. Upheld by the
-///   `assert_eq!` in [`apply_sigmoid_gate`] before dispatch.
+///   `assert_eq!` in [`apply_sigmoid_gate_fast`] before dispatch.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn apply_sigmoid_gate_neon(context: &mut [f32], gate: &[f32]) {
@@ -206,7 +206,7 @@ unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 // Sigmoid gate — AVX2 (x86_64)
 // ===================================================================
 
-/// **Unstable**: AVX2 sigmoid gate; dispatch via [`apply_sigmoid_gate`].
+/// **Unstable**: AVX2 sigmoid gate; dispatch via [`apply_sigmoid_gate_fast`].
 ///
 /// Uses the same Schraudolph fast-exp bit trick as the NEON path.
 ///
@@ -215,7 +215,7 @@ unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 /// - Caller must ensure AVX2 is available (guaranteed by `simd_config()`).
 /// - `context.len()` must equal `gate.len()`; the SIMD loop accesses both
 ///   slices at the same offsets without bounds checks. Upheld by the
-///   `assert_eq!` in [`apply_sigmoid_gate`] before dispatch.
+///   `assert_eq!` in [`apply_sigmoid_gate_fast`] before dispatch.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn apply_sigmoid_gate_avx2(context: &mut [f32], gate: &[f32]) {

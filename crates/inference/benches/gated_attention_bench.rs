@@ -2,7 +2,8 @@
 //!
 //! Measures:
 //! - `deinterleave_q_gate` throughput at Qwen3.5 and Qwen3-Next head shapes.
-//! - `apply_sigmoid_gate` scalar vs SIMD throughput.
+//! - `apply_sigmoid_gate` (exact, production default) vs `apply_sigmoid_gate_fast`
+//!   (approximate SIMD) throughput.
 //! - Isolated gate application cost vs hypothetical non-gated baseline (zero-cost memcopy).
 //!
 //! Run with:
@@ -12,7 +13,7 @@
 //! under `cargo test --bench`.
 
 use lattice_inference::attention::gated::{
-    apply_sigmoid_gate, apply_sigmoid_gate_scalar, deinterleave_q_gate,
+    apply_sigmoid_gate, apply_sigmoid_gate_fast, apply_sigmoid_gate_scalar, deinterleave_q_gate,
 };
 use std::hint::black_box;
 use std::time::Instant;
@@ -170,8 +171,8 @@ fn bench_deinterleave() {
 
 fn bench_sigmoid_gate() {
     println!(
-        "\n=== apply_sigmoid_gate (scalar vs SIMD) ===\n{:<18} {:>8} {:>14} {:>14} {:>10}",
-        "model", "q_dim", "scalar_us", "simd_us", "speedup"
+        "\n=== sigmoid gate: exact scalar vs approximate SIMD (apply_sigmoid_gate_fast) ===\n{:<18} {:>8} {:>14} {:>14} {:>10}",
+        "model", "q_dim", "scalar_us", "fast_us", "speedup"
     );
     println!(
         "{:<18} {:>8} {:>14} {:>14} {:>10}",
@@ -201,25 +202,25 @@ fn bench_sigmoid_gate() {
             })
         };
 
-        // SIMD (dispatched)
-        let us_simd = {
+        // Approximate SIMD (apply_sigmoid_gate_fast — NEON/AVX2 fast-exp)
+        let us_fast = {
             let mut ctx = ctx_base.clone();
             // Warm-up
             for _ in 0..50 {
                 ctx.copy_from_slice(&ctx_base);
-                apply_sigmoid_gate(black_box(&mut ctx), black_box(&gate));
+                apply_sigmoid_gate_fast(black_box(&mut ctx), black_box(&gate));
             }
             average_us(iters, || {
                 ctx.copy_from_slice(&ctx_base);
-                apply_sigmoid_gate(black_box(&mut ctx), black_box(&gate));
+                apply_sigmoid_gate_fast(black_box(&mut ctx), black_box(&gate));
                 black_box(&ctx);
             })
         };
 
-        let speedup = us_scalar / us_simd;
+        let speedup = us_scalar / us_fast;
         println!(
             "{:<18} {:>8} {:>14.3} {:>14.3} {:>10.2}x",
-            case.name, q_dim, us_scalar, us_simd, speedup
+            case.name, q_dim, us_scalar, us_fast, speedup
         );
     }
 }

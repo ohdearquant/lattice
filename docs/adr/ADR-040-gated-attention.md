@@ -19,13 +19,15 @@ Prior to this ADR, the gated attention logic was inlined in `model/qwen35/forwar
 
 ## Decision
 
-Extract gated attention into a **fifth attention module** at `src/attention/gated.rs` with two public primitives:
+Extract gated attention into a **fifth attention module** at `src/attention/gated.rs` with three public primitives:
 
 1. **`deinterleave_q_gate(q_and_gate, q_buf, gate_buf, num_heads, head_dim)`** — splits the packed `[Q_h0|G_h0|Q_h1|G_h1|...]` layout into separate Q and gate buffers.
 
-2. **`apply_sigmoid_gate(context, gate)`** — applies `context[i] *= sigmoid(gate[i])` with runtime SIMD dispatch (NEON on aarch64, AVX2 on x86_64, scalar fallback).
+2. **`apply_sigmoid_gate(context, gate)`** — applies `context[i] *= sigmoid(gate[i])` using exact `f32::exp`. This is the production default, matching all other Qwen3.5 execution paths.
 
-The Qwen3.5 forward pass calls these functions instead of inlining the logic. Future model architectures that use the same gating pattern (widened `q_proj` with per-head interleaved gate) can reuse the module directly.
+3. **`apply_sigmoid_gate_fast(context, gate)`** — same operation with runtime SIMD dispatch (NEON on aarch64, AVX2 on x86_64) using the Schraudolph fast-exp approximation. Opt-in only.
+
+The Qwen3.5 forward pass calls `deinterleave_q_gate` and `apply_sigmoid_gate` (exact) instead of inlining the logic. Future model architectures that use the same gating pattern (widened `q_proj` with per-head interleaved gate) can reuse the module directly.
 
 ---
 
@@ -33,7 +35,7 @@ The Qwen3.5 forward pass calls these functions instead of inlining the logic. Fu
 
 1. **Free functions, not a struct or trait**: The gate is a post-processing step on an existing attention output, not an alternative attention mechanism. It composes with GQA, MHA, or any other SDPA variant. A struct wrapping the full attention computation would duplicate the GQA/MHA scaffolding; free functions compose cleanly instead.
 
-2. **SIMD sigmoid via Schraudolph fast-exp**: The sigmoid denominator `1 + exp(-x)` uses the same bit-trick approximation as `softmax.rs` (~5–6% relative error on exp, sufficient for gating). This avoids introducing a separate `libm` or polynomial approximation path. The NEON path achieves 6.8–7.6× speedup over scalar; gate overhead is 0.18–0.76 µs per layer.
+2. **Exact sigmoid by default, fast SIMD opt-in**: `apply_sigmoid_gate` uses exact `f32::exp` so the extracted module produces bit-identical output to the pre-refactor inline code and to every other Qwen3.5 backend (prefill, f16, q8, Metal, speculative). The exact gate adds ~1.7–6.9 µs per full-attention layer at Qwen3.5 head shapes. `apply_sigmoid_gate_fast` provides an approximate SIMD path (Schraudolph fast-exp, same bit-trick as `softmax.rs`, ~5–6% relative error) that benchmarks 7.1–7.7× faster than scalar — but adopting it in production requires switching all comparable paths together, which is out of scope for this extraction PR.
 
 3. **Deinterleave as a separate function**: The packed `[Q|gate]` layout is a weight-format concern, not an attention-algorithm concern. Keeping deinterleave separate from the gate application means models that store Q and gate in separate tensors (e.g., a future checkpoint format) can skip deinterleave entirely and call `apply_sigmoid_gate` directly.
 
@@ -58,7 +60,7 @@ The Qwen3.5 forward pass calls these functions instead of inlining the logic. Fu
 
 **Positive**:
 
-- Gated attention is independently testable and benchmarkable (7 unit tests, 3 integration tests, dedicated benchmark).
+- Gated attention is independently testable and benchmarkable (7 unit tests, 6 integration tests, dedicated benchmark).
 - Any model architecture using packed `[Q|gate]` projection can reuse the module without code duplication.
 - SIMD acceleration is automatic via runtime dispatch — callers do not need to know the target architecture.
 
