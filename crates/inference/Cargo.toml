@@ -113,6 +113,10 @@ name = "attention_bench"
 harness = true
 
 [[bench]]
+name = "differential_attention_bench"
+harness = false
+
+[[bench]]
 name = "gated_attention_bench"
 harness = false
 

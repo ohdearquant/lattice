@@ -1,3 +1,4 @@
+pub mod differential;
 pub mod flash;
 pub mod flash_causal;
 pub mod gated;

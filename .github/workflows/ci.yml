@@ -21,6 +21,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt, clippy
+      - name: Pin the real toolchain bin on PATH
+        # Some macos-latest runner images ship ~/.cargo/bin/cargo as a copy of
+        # rustup-init rather than the rustup proxy, so `cargo fmt` fails with
+        # "error: unexpected argument 'fmt'". rustup itself is unaffected — resolve
+        # the real toolchain bin dir through it and put it first on PATH so every
+        # later step (cache, clean, ci.sh) gets a working cargo. No-op on healthy
+        # images and on Linux.
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
