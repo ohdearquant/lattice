@@ -64,7 +64,7 @@ Public surface:
 
 - Differential attention is independently testable and benchmarkable (6 unit tests, 4 integration tests, dedicated benchmark).
 - When a DIFF Transformer checkpoint becomes a target, the math is already implemented and validated.
-- Benchmark shows the differential mechanism (second softmax + subtract + sub-RMSNorm) costs only ~4–11% over a same-sized plain GQA kernel.
+- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at ~1.8–2.2x a single-softmax baseline with identical loop topology. The comparison is topology-controlled: a comparison against the batched `apply_gqa_attention` would conflate kernel topology with mechanism cost.
 
 **Negative**:
 
