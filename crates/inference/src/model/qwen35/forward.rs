@@ -6,7 +6,7 @@ use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights,
 };
-use crate::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
+use crate::attention::gated::apply_sigmoid_gate;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
@@ -249,21 +249,10 @@ impl Qwen35Model {
         matmul_bt(input, &weights.q_proj, q_and_gate, 1, hidden, q_proj_dim);
         self.lora.apply(layer_idx, "q_proj", input, q_and_gate);
 
-        // q_and_gate is borrowed above; we need to split q_buf and gate_z borrows.
-        // Copy q_and_gate into a local slice view first, then deinterleave.
-        let q_and_gate_len = q_proj_dim;
-        {
-            // SAFETY: q_buf and gate_z are separate fields of scratch — no alias.
-            // We take non-overlapping mutable slices after the immutable borrow of q_and_gate ends.
-            let q_and_gate = scratch.q_and_gate[..q_and_gate_len].to_vec();
-            deinterleave_q_gate(
-                &q_and_gate,
-                &mut scratch.q_buf[..q_dim],
-                &mut scratch.gate_z[..q_dim],
-                num_q_heads,
-                head_dim,
-            );
-        }
+        // Deinterleave packed [Q|gate] into q_buf and gate_z.
+        // Uses raw pointer access on the three disjoint Vec fields to avoid a
+        // per-layer heap allocation (was: .to_vec(), 32 KB on the decode hot path).
+        scratch.split_q_and_gate(num_q_heads, head_dim);
 
         let input = &scratch.input_tmp[..hidden];
         matmul_bt(

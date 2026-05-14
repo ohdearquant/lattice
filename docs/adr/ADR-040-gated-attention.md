@@ -70,6 +70,7 @@ The Qwen3.5 forward pass calls these functions instead of inlining the logic. Fu
 **Risks**:
 
 - The Schraudolph fast-exp approximation produces ~1% absolute error on sigmoid values near 0.5. For gating this is acceptable (the paper's headwise variant, which is coarser, still shows strong results). However, if a future model uses the gate output for purposes other than multiplicative modulation (e.g., as a routing score), the approximation may need to be revisited.
+- **Production path uses approximate sigmoid**: `apply_sigmoid_gate` dispatches to NEON/AVX2 fast-exp in production builds; `apply_sigmoid_gate_scalar` (exact) is used only as fallback and in tests. The integration test covers both paths with tolerances of ≤1e-6 (scalar) and ≤2e-2 (dispatched) respectively.
 
 ---
 

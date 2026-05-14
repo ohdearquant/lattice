@@ -127,6 +127,53 @@ impl ForwardScratch {
         resize(&mut self.logits, cfg.vocab_size);
     }
 
+    /// Deinterleave packed `[Q|gate]` from `q_and_gate` into `q_buf` and `gate_z`.
+    ///
+    /// Zero-allocation — operates directly on the pre-allocated scratch fields.
+    /// The three fields are separate `Vec<f32>` allocations and cannot alias.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds if any buffer is too short.
+    pub(crate) fn split_q_and_gate(&mut self, num_heads: usize, head_dim: usize) {
+        let q_dim = num_heads * head_dim;
+        debug_assert!(
+            self.q_and_gate.len() >= 2 * q_dim,
+            "q_and_gate too short: {} < {}",
+            self.q_and_gate.len(),
+            2 * q_dim
+        );
+        debug_assert!(
+            self.q_buf.len() >= q_dim,
+            "q_buf too short: {} < {q_dim}",
+            self.q_buf.len()
+        );
+        debug_assert!(
+            self.gate_z.len() >= q_dim,
+            "gate_z too short: {} < {q_dim}",
+            self.gate_z.len()
+        );
+        // SAFETY: `q_and_gate`, `q_buf`, and `gate_z` are separate `Vec` fields
+        // whose backing allocations cannot overlap. We read from `q_and_gate` and
+        // write to `q_buf` and `gate_z` through non-overlapping raw pointers.
+        // The debug_asserts above guarantee all accesses are in-bounds.
+        unsafe {
+            let src_ptr = self.q_and_gate.as_ptr();
+            let q_ptr = self.q_buf.as_mut_ptr();
+            let g_ptr = self.gate_z.as_mut_ptr();
+            for h in 0..num_heads {
+                let src = h * head_dim * 2;
+                let dst = h * head_dim;
+                std::ptr::copy_nonoverlapping(src_ptr.add(src), q_ptr.add(dst), head_dim);
+                std::ptr::copy_nonoverlapping(
+                    src_ptr.add(src + head_dim),
+                    g_ptr.add(dst),
+                    head_dim,
+                );
+            }
+        }
+    }
+
     pub(crate) fn ensure_decode_capacity(
         &mut self,
         hidden: usize,

@@ -59,8 +59,17 @@ pub fn deinterleave_q_gate(
 ///
 /// Uses the SIMD path when the target architecture supports it; falls back
 /// to the scalar path otherwise.
+///
+/// # Panics
+///
+/// Panics if `context.len() != gate.len()`.
 #[inline]
 pub fn apply_sigmoid_gate(context: &mut [f32], gate: &[f32]) {
+    assert_eq!(
+        context.len(),
+        gate.len(),
+        "apply_sigmoid_gate: context and gate must have equal length"
+    );
     let config = simd_config();
 
     #[cfg(target_arch = "aarch64")]
@@ -113,7 +122,10 @@ pub fn apply_sigmoid_gate_scalar(context: &mut [f32], gate: &[f32]) {
 ///
 /// # Safety
 ///
-/// Caller must ensure NEON is available (guaranteed by `simd_config()`).
+/// - Caller must ensure NEON is available (guaranteed by `simd_config()`).
+/// - `context.len()` must equal `gate.len()`; the SIMD loop accesses both
+///   slices at the same offsets without bounds checks. Upheld by the
+///   `assert_eq!` in [`apply_sigmoid_gate`] before dispatch.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn apply_sigmoid_gate_neon(context: &mut [f32], gate: &[f32]) {
@@ -175,7 +187,10 @@ unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch6
 ///
 /// # Safety
 ///
-/// Caller must ensure AVX2 is available (guaranteed by `simd_config()`).
+/// - Caller must ensure AVX2 is available (guaranteed by `simd_config()`).
+/// - `context.len()` must equal `gate.len()`; the SIMD loop accesses both
+///   slices at the same offsets without bounds checks. Upheld by the
+///   `assert_eq!` in [`apply_sigmoid_gate`] before dispatch.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn apply_sigmoid_gate_avx2(context: &mut [f32], gate: &[f32]) {
