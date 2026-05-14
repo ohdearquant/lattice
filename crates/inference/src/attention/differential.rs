@@ -116,11 +116,18 @@ pub struct DiffLambdaParams {
 ///
 /// The dot products are over `head_dim`. The result can be any real value; it is
 /// NOT clamped (negative lambda_full is valid and meaningful in the reference).
+///
+/// # Panics
+///
+/// Panics if the four lambda vectors do not all have equal length. A real
+/// `assert_eq!` (not `debug_assert`) — a misloaded checkpoint with mismatched
+/// shapes must fail loudly, not silently truncate via `zip()` in release.
 #[inline]
 pub fn compute_lambda_full(params: &DiffLambdaParams, lambda_init: f32) -> f32 {
-    debug_assert_eq!(params.lambda_q1.len(), params.lambda_k1.len());
-    debug_assert_eq!(params.lambda_q2.len(), params.lambda_k2.len());
-    debug_assert_eq!(params.lambda_q1.len(), params.lambda_q2.len());
+    let len = params.lambda_q1.len();
+    assert_eq!(params.lambda_k1.len(), len, "lambda_k1 length != lambda_q1");
+    assert_eq!(params.lambda_q2.len(), len, "lambda_q2 length != lambda_q1");
+    assert_eq!(params.lambda_k2.len(), len, "lambda_k2 length != lambda_q1");
 
     let dot1: f32 = params
         .lambda_q1
@@ -250,6 +257,20 @@ pub fn apply_differential_attention(
         0,
         "num_heads must be divisible by num_kv_heads"
     );
+    for (name, v) in [
+        ("lambda_q1", &lambda_params.lambda_q1),
+        ("lambda_k1", &lambda_params.lambda_k1),
+        ("lambda_q2", &lambda_params.lambda_q2),
+        ("lambda_k2", &lambda_params.lambda_k2),
+    ] {
+        assert_eq!(
+            v.len(),
+            cfg.head_dim,
+            "{name} length must equal head_dim ({}), got {}",
+            cfg.head_dim,
+            v.len()
+        );
+    }
 
     if seq_len == 0 {
         return;
@@ -656,97 +677,124 @@ mod tests {
     #[test]
     fn test_diff_attn_causal_masking() {
         // Verify position i attends only to j <= i.
-        // Strategy: set v[pos] = pos+1 for position `pos`. If the output at position 0
-        // is influenced by position 1's value, the test will catch a masking bug.
         //
-        // With seq_len=3, pos=0 should only see v[0], not v[1] or v[2].
-        // We set v[1] and v[2] to very large values; if causal masking is correct,
-        // they won't contaminate output[0].
+        // Differential test: run two inputs that differ ONLY in the V values at
+        // future positions (1, 2). If causal masking is correct, out[pos 0] must
+        // be bit-identical between the two runs — position 0 cannot see future V.
+        //
+        // A magnitude bound would NOT catch a broken mask here: the sub-layer
+        // RMSNorm normalizes a contaminated row back to O(1), hiding the leak.
         let head_dim = 2_usize;
         let cfg = make_cfg(1, 1, head_dim, 0);
         let seq_len = 3_usize;
+        let v_head_dim = 2 * head_dim;
 
         let q = det_data(seq_len * cfg.q_dim(), 101);
         let k = det_data(seq_len * cfg.k_dim(), 202);
+        let params = zero_lambda_params(head_dim);
+        let subln_w = vec![1.0f32; 2 * head_dim];
 
-        // v[0] = [1, 1, 1, 1], v[1] = v[2] = very large
-        let mut v = vec![0.0f32; seq_len * cfg.v_dim()];
-        let v_head_dim = 2 * head_dim;
-        // position 0
-        for d in 0..v_head_dim {
-            v[0 * v_head_dim + d] = 1.0;
-        }
-        // positions 1 and 2 get huge values
+        // Base V.
+        let v_base = det_data(seq_len * cfg.v_dim(), 303);
+
+        // Variant V: identical at position 0, perturbed at future positions 1 and 2.
+        let mut v_perturbed = v_base.clone();
         for pos in 1..seq_len {
             for d in 0..v_head_dim {
-                v[pos * v_head_dim + d] = 1e6;
+                v_perturbed[pos * v_head_dim + d] += 12_345.0;
             }
         }
 
-        let params = zero_lambda_params(head_dim);
-        let subln_w = vec![1.0f32; 2 * head_dim];
-        let mut out = vec![0.0f32; seq_len * cfg.out_dim()];
-        let mut scratch = DiffAttnScratch::default();
+        let run = |v: &[f32]| {
+            let mut out = vec![0.0f32; seq_len * cfg.out_dim()];
+            let mut scratch = DiffAttnScratch::default();
+            apply_differential_attention(
+                &q,
+                &k,
+                v,
+                &params,
+                &subln_w,
+                1e-6,
+                &mut out,
+                seq_len,
+                &cfg,
+                &mut scratch,
+            );
+            out
+        };
 
-        apply_differential_attention(
-            &q,
-            &k,
-            &v,
-            &params,
-            &subln_w,
-            1e-6,
-            &mut out,
-            seq_len,
-            &cfg,
-            &mut scratch,
-        );
+        let out_base = run(&v_base);
+        let out_perturbed = run(&v_perturbed);
 
-        // output[0] should NOT be anywhere near 1e6
-        let out_pos0_max = out[..v_head_dim]
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        // Position 0's output must be unchanged — it cannot attend to future V.
+        for d in 0..v_head_dim {
+            assert_eq!(
+                out_base[d].to_bits(),
+                out_perturbed[d].to_bits(),
+                "position 0 changed when only future V changed — causal mask leak at dim {d}"
+            );
+        }
+        // Sanity: a later position SHOULD change (otherwise the perturbation was a no-op).
+        let pos2_changed = (0..v_head_dim).any(|d| {
+            let off = 2 * cfg.out_dim() + d;
+            out_base[off] != out_perturbed[off]
+        });
         assert!(
-            out_pos0_max.abs() < 1e4,
-            "position 0 attended to future positions! out_pos0_max = {out_pos0_max}"
+            pos2_changed,
+            "position 2 should be affected by the future-V perturbation"
         );
     }
 
     // ---------------------------------------------------------------
-    // test_lambda_zero_recovers_difference
+    // test_lambda_one_zeroes_identical_maps
     // ---------------------------------------------------------------
 
     #[test]
-    fn test_lambda_zero_recovers_difference() {
-        // If both softmax maps are identical AND lambda_full = 0, then
-        // the differential = s1 - 0*s2 = s1 = standard attention.
+    fn test_lambda_one_zeroes_identical_maps() {
+        // Invariant: if the two softmax maps are identical AND lambda_full == 1,
+        // then differential = s1 - 1·s2 = 0, so the output collapses to ~0.
         //
-        // We force lambda_full ≈ 0 by using params where exp(dot1) - exp(dot2) = -lambda_init,
-        // which is numerically tricky. Instead, test the simpler invariant:
-        // if lambda_full = 1 and both softmax maps are identical (which happens
-        // when q0 == q1 and k0 == k1 for all tokens), the differential weights sum to 0,
-        // and the output should be ~0.
+        // Identical maps: q0 == q1 and k0 == k1 for every position → matmul + softmax
+        // produce bit-identical s1 and s2.
+        // lambda_full == 1: lambda_full = exp(dot1) - exp(dot2) + lambda_init.
+        //   Set dot2 = 0 (zero lambda_q2/k2) → exp(dot2) = 1.
+        //   Need exp(dot1) = 2 - lambda_init → dot1 = ln(2 - lambda_init), achieved
+        //   via lambda_q1 = [ln(2-lambda_init), 0, ...], lambda_k1 = [1, 0, ...].
         //
-        // lambda_full = 1 is achieved when exp(dot1) - exp(dot2) + lambda_init = 1
-        // → exp(dot1) - exp(dot2) = 1 - lambda_init
-        // This is hard to hit exactly. Instead we directly test that with equal
-        // q0==q1 / k0==k1 and zero-lambda params (lambda_full=lambda_init),
-        // the differential weight matrix is (1-lambda_init) * s1, which is nonzero.
-        // The lambda_full==1 case (zero output) requires lambda_params tuning — we skip
-        // exact-zero but verify the subtraction direction instead.
+        // Tolerance: the f32 ln→exp round-trip leaves lambda_full ≈ 1.0 ± ~1e-7
+        // rather than exactly 1.0, so `diff` is a tiny non-zero residual. The
+        // sub-layer RMSNorm's eps floor (1e-6) then scales that residual up to
+        // ~1e-5 magnitude. A 1e-3 bound is still decisive: it would FAIL by 2-3
+        // orders of magnitude if the subtraction were removed (output ≈ 0.8),
+        // sign-flipped (≈ 1.6), or lambda ignored (≈ 0.8) — unlike the previous
+        // "output is nonzero" check, which all three of those would pass.
         let head_dim = 4_usize;
         let cfg = make_cfg(1, 1, head_dim, 0); // lambda_init = 0.2
         let seq_len = 3_usize;
+        let lambda_init = cfg.lambda_init();
 
-        // Make q0 == q1 and k0 == k1 for every position so both softmax maps are identical.
-        // q_buf layout: [seq_len, 2*num_heads*head_dim] = [seq_len, 2*head_dim]
-        // Positions: q[pos * 2*head_dim .. pos * 2*head_dim + 2*head_dim]
-        // First head_dim = head 0 (q0), second head_dim = head 1 (q1)
+        // lambda params engineered so compute_lambda_full ≈ 1.0.
+        let mut lambda_q1 = vec![0.0f32; head_dim];
+        let mut lambda_k1 = vec![0.0f32; head_dim];
+        lambda_q1[0] = (2.0 - lambda_init).ln();
+        lambda_k1[0] = 1.0;
+        let params = DiffLambdaParams {
+            lambda_q1,
+            lambda_k1,
+            lambda_q2: vec![0.0f32; head_dim],
+            lambda_k2: vec![0.0f32; head_dim],
+        };
+        let lambda_full = compute_lambda_full(&params, lambda_init);
+        assert!(
+            (lambda_full - 1.0).abs() < 1e-5,
+            "test setup error: lambda_full should be ≈1.0, got {lambda_full}"
+        );
+
+        // q0 == q1 and k0 == k1 for every position → both softmax maps identical.
         let mut q = vec![0.0f32; seq_len * cfg.q_dim()];
         let mut k = vec![0.0f32; seq_len * cfg.k_dim()];
         for pos in 0..seq_len {
             let base = pos * cfg.q_dim();
-            // q0 == q1 for all positions
             for d in 0..head_dim {
                 q[base + d] = det_data(1, (pos * head_dim + d) as u64)[0];
                 q[base + head_dim + d] = q[base + d]; // q1 = q0
@@ -758,7 +806,6 @@ mod tests {
             }
         }
         let v = det_data(seq_len * cfg.v_dim(), 77);
-        let params = zero_lambda_params(head_dim); // lambda_full = lambda_init = 0.2
         let subln_w = vec![1.0f32; 2 * head_dim];
         let mut out = vec![0.0f32; seq_len * cfg.out_dim()];
         let mut scratch = DiffAttnScratch::default();
@@ -776,19 +823,11 @@ mod tests {
             &mut scratch,
         );
 
-        // With q0==q1 and k0==k1, both softmax maps are identical.
-        // differential = s1 - lambda_init*s1 = (1-lambda_init)*s1 ≠ 0.
-        // The output should be non-trivially non-zero (confirming the subtraction works).
-        let any_nonzero = out.iter().any(|&x| x.abs() > 1e-8);
+        // diff = s1 - lambda_full·s2 ≈ 0 → context ≈ 0 → output ≈ 0.
+        let max_abs = out.iter().copied().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!(
-            any_nonzero,
-            "output should be non-zero when lambda_full = lambda_init < 1"
+            max_abs < 1e-3,
+            "identical maps with lambda_full≈1 must yield ~0 output, got max_abs={max_abs}"
         );
-
-        // Now verify the subtraction direction: with identical maps and lambda_init=0.2,
-        // the effective weight is (1-lambda_init)=0.8× the single-map weights.
-        // Output should be proportional to (1-lambda_init) * standard attention output.
-        // We can't easily verify the exact proportionality here without an oracle,
-        // but the non-zero check and shape check together confirm the path runs correctly.
     }
 }

@@ -2,8 +2,11 @@
 //!
 //! Measures:
 //! - `apply_differential_attention` throughput at representative sequence lengths.
-//! - Overhead of the differential mechanism vs a plain GQA-style single-softmax baseline
-//!   (the cost of the second softmax + subtract + sub-RMSNorm).
+//! - Cost of the differential mechanism, isolated against a single-softmax baseline
+//!   that has the *same loop topology* (per-KV-head / per-pair) as the differential
+//!   kernel. The difference is exactly: second Q/K extract + second GEMM + second
+//!   softmax + subtract + sub-RMSNorm. This controls for kernel topology, which a
+//!   comparison against the batched `apply_gqa_attention` would not.
 //!
 //! Run with:
 //!   cargo bench --bench differential_attention_bench
@@ -13,9 +16,11 @@
 use lattice_inference::attention::differential::{
     DiffAttnConfig, DiffAttnScratch, DiffLambdaParams, apply_differential_attention,
 };
-use lattice_inference::attention::gqa::{GqaConfig, GqaScratch, apply_gqa_attention};
+use lattice_inference::forward::cpu::matmul_bt;
 use std::hint::black_box;
 use std::time::Instant;
+
+const MASK_VALUE: f32 = -10_000.0_f32;
 
 // ===================================================================
 // Utilities
@@ -172,55 +177,175 @@ fn bench_diff_attn() {
 }
 
 // ===================================================================
-// Benchmark: differential vs GQA baseline overhead
+// Single-softmax baseline — SAME loop topology as the differential kernel
 //
-// GQA attention (apply_gqa_attention) does one softmax per head-pair.
-// Differential attention does two softmax passes per head-pair + subtract + subln.
-// This section shows the marginal cost of the differential mechanism.
-//
-// NOTE: GQA and differential have different buffer layouts (GQA uses the
-// standard embed_dim = num_heads*head_dim; differential uses 2*num_heads
-// packed heads). We compare them at the same "effective" model size:
-// a GQA config with (2*num_heads, num_kv_heads, head_dim) covering the same
-// parameter count as the differential config's Q/K projections.
+// Mirrors apply_differential_attention's per-KV-head / per-pair structure
+// exactly, but computes only ONE softmax map: no second Q/K extract, no
+// second GEMM, no second softmax, no subtract, no sub-RMSNorm. The gap
+// between this and the differential kernel is the mechanism cost, with
+// loop topology held constant. (A comparison against the *batched*
+// apply_gqa_attention would conflate topology with mechanism.)
 // ===================================================================
 
-fn bench_overhead_vs_gqa() {
+#[derive(Default)]
+struct SingleSoftmaxScratch {
+    scores: Vec<f32>,
+    v_head_t: Vec<f32>,
+    q_packed: Vec<f32>,
+    k_packed: Vec<f32>,
+    context: Vec<f32>,
+}
+
+impl SingleSoftmaxScratch {
+    fn reserve_for(&mut self, seq_len: usize, cfg: &DiffAttnConfig) {
+        let v_head_dim = 2 * cfg.head_dim;
+        self.scores.resize(seq_len * seq_len, 0.0);
+        self.v_head_t.resize(v_head_dim * seq_len, 0.0);
+        self.q_packed.resize(seq_len * cfg.head_dim, 0.0);
+        self.k_packed.resize(seq_len * cfg.head_dim, 0.0);
+        self.context.resize(seq_len * v_head_dim, 0.0);
+    }
+}
+
+/// Single-softmax attention with the same per-KV-head / per-pair loop topology
+/// as `apply_differential_attention`, minus the differential mechanism.
+fn single_softmax_baseline(
+    q_buf: &[f32],
+    k_buf: &[f32],
+    v_buf: &[f32],
+    attn_out: &mut [f32],
+    seq_len: usize,
+    cfg: &DiffAttnConfig,
+    scratch: &mut SingleSoftmaxScratch,
+) {
+    if seq_len == 0 {
+        return;
+    }
+    scratch.reserve_for(seq_len, cfg);
+
+    let head_dim = cfg.head_dim;
+    let v_head_dim = 2 * head_dim;
+    let n_rep = cfg.n_rep();
+    let scale = (head_dim as f32).powf(-0.5);
+    let out_scale = 1.0 - cfg.lambda_init();
+
+    let q_row_stride = cfg.q_dim();
+    let k_row_stride = cfg.k_dim();
+    let v_row_stride = cfg.v_dim();
+    let out_row_stride = cfg.out_dim();
+
+    for kv_h in 0..cfg.num_kv_heads {
+        // Extract + transpose V for this KV head.
+        let v_head_offset = kv_h * v_head_dim;
+        for pos in 0..seq_len {
+            let src_off = pos * v_row_stride + v_head_offset;
+            for d in 0..v_head_dim {
+                scratch.v_head_t[d * seq_len + pos] = v_buf[src_off + d];
+            }
+        }
+
+        let pair_start = kv_h * n_rep;
+        for pair_h in pair_start..pair_start + n_rep {
+            // Extract the FIRST packed Q head and FIRST packed K head only.
+            let q_ph = 2 * pair_h;
+            let k_ph = 2 * kv_h;
+            for pos in 0..seq_len {
+                let qs = pos * q_row_stride + q_ph * head_dim;
+                scratch.q_packed[pos * head_dim..pos * head_dim + head_dim]
+                    .copy_from_slice(&q_buf[qs..qs + head_dim]);
+                let ks = pos * k_row_stride + k_ph * head_dim;
+                scratch.k_packed[pos * head_dim..pos * head_dim + head_dim]
+                    .copy_from_slice(&k_buf[ks..ks + head_dim]);
+            }
+
+            // One GEMM, scale + causal mask, one softmax.
+            matmul_bt(
+                &scratch.q_packed[..seq_len * head_dim],
+                &scratch.k_packed[..seq_len * head_dim],
+                &mut scratch.scores[..seq_len * seq_len],
+                seq_len,
+                head_dim,
+                seq_len,
+            );
+            for qi in 0..seq_len {
+                let row = &mut scratch.scores[qi * seq_len..(qi + 1) * seq_len];
+                for (ki, v) in row.iter_mut().enumerate() {
+                    if ki <= qi {
+                        *v *= scale;
+                    } else {
+                        *v = MASK_VALUE;
+                    }
+                }
+                let valid = qi + 1;
+                let max_val = row[..valid]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0_f32;
+                for v in &mut row[..valid] {
+                    *v = (*v - max_val).exp();
+                    sum += *v;
+                }
+                if sum > 0.0 {
+                    let inv = 1.0 / sum;
+                    for v in &mut row[..valid] {
+                        *v *= inv;
+                    }
+                }
+                row[valid..].fill(0.0);
+            }
+
+            // One GEMM with V, scale, write out.
+            matmul_bt(
+                &scratch.scores[..seq_len * seq_len],
+                &scratch.v_head_t[..v_head_dim * seq_len],
+                &mut scratch.context[..seq_len * v_head_dim],
+                seq_len,
+                seq_len,
+                v_head_dim,
+            );
+            for pos in 0..seq_len {
+                let src = pos * v_head_dim;
+                let dst = pos * out_row_stride + pair_h * v_head_dim;
+                for d in 0..v_head_dim {
+                    attn_out[dst + d] = scratch.context[src + d] * out_scale;
+                }
+            }
+        }
+    }
+}
+
+// ===================================================================
+// Benchmark: differential mechanism overhead (topology-controlled)
+// ===================================================================
+
+fn bench_mechanism_overhead() {
     println!(
-        "\n=== overhead: differential vs GQA-baseline (same Q/K projection size) ===\n{:<26} {:>8} {:>14} {:>14} {:>10}",
-        "model", "seq_len", "gqa_us", "diff_us", "overhead"
+        "\n=== differential mechanism overhead (vs same-topology single-softmax baseline) ===\n{:<26} {:>8} {:>14} {:>14} {:>10}",
+        "model", "seq_len", "baseline_us", "diff_us", "overhead"
     );
     println!(
         "{:<26} {:>8} {:>14} {:>14} {:>10}",
         "--------------------------", "--------", "--------------", "--------------", "----------",
     );
 
-    // Only benchmark at seq_len=256 to keep output concise
     const BENCH_SEQ: usize = 256;
 
     for &(name, num_heads, num_kv_heads, head_dim, layer_depth) in MODEL_CASES {
-        let diff_cfg = DiffAttnConfig {
+        let cfg = DiffAttnConfig {
             num_heads,
             num_kv_heads,
             head_dim,
             layer_depth,
         };
 
-        // GQA with the same packed head count (2*num_heads Q heads, same KV heads)
-        // and same head_dim. This matches the same Q/K projection sizes.
-        let gqa_cfg = GqaConfig {
-            num_heads: 2 * num_heads,       // packed heads
-            num_kv_heads: 2 * num_kv_heads, // packed KV heads
-            head_dim,
-        };
-
         let seq_len = BENCH_SEQ;
         let mut rng = Lcg::new((seq_len as u64) ^ 0xDEAD_BEEF);
 
-        // Differential inputs
-        let dq = random_vec(seq_len * diff_cfg.q_dim(), &mut rng);
-        let dk = random_vec(seq_len * diff_cfg.k_dim(), &mut rng);
-        let dv = random_vec(seq_len * diff_cfg.v_dim(), &mut rng);
+        // Shared inputs — both kernels read the same Q/K/V buffers.
+        let q = random_vec(seq_len * cfg.q_dim(), &mut rng);
+        let k = random_vec(seq_len * cfg.k_dim(), &mut rng);
+        let v = random_vec(seq_len * cfg.v_dim(), &mut rng);
         let params = DiffLambdaParams {
             lambda_q1: vec![0.0; head_dim],
             lambda_k1: vec![0.0; head_dim],
@@ -228,74 +353,70 @@ fn bench_overhead_vs_gqa() {
             lambda_k2: vec![0.0; head_dim],
         };
         let subln_w = vec![1.0_f32; 2 * head_dim];
-        let mut dout = vec![0.0_f32; seq_len * diff_cfg.out_dim()];
-        let mut dscratch = DiffAttnScratch::default();
 
-        // GQA inputs (same total Q/K/V bytes as differential)
-        let gq = random_vec(seq_len * gqa_cfg.q_dim(), &mut rng);
-        let gk = random_vec(seq_len * gqa_cfg.kv_dim(), &mut rng);
-        let gv = random_vec(seq_len * gqa_cfg.kv_dim(), &mut rng);
-        let mut gout = vec![0.0_f32; seq_len * gqa_cfg.q_dim()];
-        let mut gscratch = GqaScratch::default();
+        let mut diff_out = vec![0.0_f32; seq_len * cfg.out_dim()];
+        let mut diff_scratch = DiffAttnScratch::default();
+        let mut base_out = vec![0.0_f32; seq_len * cfg.out_dim()];
+        let mut base_scratch = SingleSoftmaxScratch::default();
 
-        // Warm-up both
+        // Warm-up both.
         for _ in 0..20 {
             apply_differential_attention(
-                black_box(&dq),
-                black_box(&dk),
-                black_box(&dv),
+                black_box(&q),
+                black_box(&k),
+                black_box(&v),
                 black_box(&params),
                 black_box(&subln_w),
                 1e-6,
-                black_box(&mut dout),
+                black_box(&mut diff_out),
                 seq_len,
-                &diff_cfg,
-                &mut dscratch,
+                &cfg,
+                &mut diff_scratch,
             );
-            apply_gqa_attention(
-                black_box(&gq),
-                black_box(&gk),
-                black_box(&gv),
-                black_box(&mut gout),
+            single_softmax_baseline(
+                black_box(&q),
+                black_box(&k),
+                black_box(&v),
+                black_box(&mut base_out),
                 seq_len,
-                gqa_cfg,
-                &mut gscratch,
+                &cfg,
+                &mut base_scratch,
             );
         }
 
         let iters = iterations_for_seq(seq_len);
 
-        let us_gqa = average_us(iters, || {
-            apply_gqa_attention(
-                black_box(&gq),
-                black_box(&gk),
-                black_box(&gv),
-                black_box(&mut gout),
+        let us_base = average_us(iters, || {
+            single_softmax_baseline(
+                black_box(&q),
+                black_box(&k),
+                black_box(&v),
+                black_box(&mut base_out),
                 seq_len,
-                gqa_cfg,
-                &mut gscratch,
+                &cfg,
+                &mut base_scratch,
             );
-            black_box(&gout);
+            black_box(&base_out);
         });
 
         let us_diff = average_us(iters, || {
             apply_differential_attention(
-                black_box(&dq),
-                black_box(&dk),
-                black_box(&dv),
+                black_box(&q),
+                black_box(&k),
+                black_box(&v),
                 black_box(&params),
                 black_box(&subln_w),
                 1e-6,
-                black_box(&mut dout),
+                black_box(&mut diff_out),
                 seq_len,
-                &diff_cfg,
-                &mut dscratch,
+                &cfg,
+                &mut diff_scratch,
             );
-            black_box(&dout);
+            black_box(&diff_out);
         });
 
-        let overhead = us_diff / us_gqa;
-        println!("{name:<26} {seq_len:>8} {us_gqa:>14.3} {us_diff:>14.3} {overhead:>9.2}x");
+        let overhead = us_diff / us_base;
+        println!("{name:<26} {seq_len:>8} {us_base:>14.3} {us_diff:>14.3} {overhead:>9.2}x");
     }
 }
 
@@ -307,6 +428,6 @@ fn main() {
     println!("Differential Attention Benchmark");
     println!("=================================");
     bench_diff_attn();
-    bench_overhead_vs_gqa();
+    bench_mechanism_overhead();
     println!();
 }

@@ -359,9 +359,11 @@ fn test_diff_attn_output_length() {
     }
 }
 
-/// Verify causal masking: position 0's output must not depend on position 1's V.
+/// Verify causal masking: position 0's output must not depend on future V.
 ///
-/// Injects a very large value at v[pos=1] and checks that out[pos=0] stays bounded.
+/// Differential test: run two inputs that differ ONLY in V at positions 1..seq_len.
+/// `out[pos 0]` must be bit-identical between the runs. A magnitude bound would NOT
+/// catch a leak — the sub-layer RMSNorm renormalizes a contaminated row back to O(1).
 #[test]
 fn test_causal_masking_integration() {
     let cfg = DiffAttnConfig {
@@ -371,38 +373,57 @@ fn test_causal_masking_integration() {
         layer_depth: 0,
     };
     let seq_len = 4;
-    let (q, k, mut v, params, subln_w) = make_inputs(&cfg, seq_len, 777);
+    let (q, k, v_base, params, subln_w) = make_inputs(&cfg, seq_len, 777);
 
-    // Spike v at position 1
     let v_head_dim = 2 * cfg.head_dim;
     let v_stride = cfg.num_kv_heads * v_head_dim;
-    for d in 0..v_head_dim {
-        v[1 * v_stride + d] = 1e8;
+
+    // Variant: identical at position 0, perturbed at all future positions.
+    let mut v_perturbed = v_base.clone();
+    for pos in 1..seq_len {
+        for d in 0..v_stride {
+            v_perturbed[pos * v_stride + d] += 9_876.0;
+        }
     }
 
-    let mut out = vec![0.0_f32; seq_len * cfg.out_dim()];
-    let mut scratch = DiffAttnScratch::default();
-    apply_differential_attention(
-        &q,
-        &k,
-        &v,
-        &params,
-        &subln_w,
-        1e-6,
-        &mut out,
-        seq_len,
-        &cfg,
-        &mut scratch,
-    );
+    let run = |v: &[f32]| {
+        let mut out = vec![0.0_f32; seq_len * cfg.out_dim()];
+        let mut scratch = DiffAttnScratch::default();
+        apply_differential_attention(
+            &q,
+            &k,
+            v,
+            &params,
+            &subln_w,
+            1e-6,
+            &mut out,
+            seq_len,
+            &cfg,
+            &mut scratch,
+        );
+        out
+    };
 
+    let out_base = run(&v_base);
+    let out_perturbed = run(&v_perturbed);
     let out_stride = cfg.out_dim();
-    let max_pos0 = out[..out_stride]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+
+    // Position 0 must be unchanged — it cannot attend to future V.
+    for d in 0..out_stride {
+        assert_eq!(
+            out_base[d].to_bits(),
+            out_perturbed[d].to_bits(),
+            "position 0 changed when only future V changed — causal mask leak at dim {d}"
+        );
+    }
+    // Sanity: the last position SHOULD change, or the perturbation was a no-op.
+    let last_changed = (0..out_stride).any(|d| {
+        let off = (seq_len - 1) * out_stride + d;
+        out_base[off] != out_perturbed[off]
+    });
     assert!(
-        max_pos0.abs() < 1e6,
-        "position 0 contaminated by future position 1: max_pos0={max_pos0}"
+        last_changed,
+        "last position should be affected by the future-V perturbation"
     );
 }
 
