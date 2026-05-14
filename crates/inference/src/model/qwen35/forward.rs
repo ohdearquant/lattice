@@ -249,9 +249,6 @@ impl Qwen35Model {
         matmul_bt(input, &weights.q_proj, q_and_gate, 1, hidden, q_proj_dim);
         self.lora.apply(layer_idx, "q_proj", input, q_and_gate);
 
-        // Deinterleave packed [Q|gate] into q_buf and gate_z.
-        // Uses raw pointer access on the three disjoint Vec fields to avoid a
-        // per-layer heap allocation (was: .to_vec(), 32 KB on the decode hot path).
         scratch.split_q_and_gate(num_q_heads, head_dim);
 
         let input = &scratch.input_tmp[..hidden];

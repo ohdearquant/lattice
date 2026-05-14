@@ -52,23 +52,42 @@ pub fn deinterleave_q_gate(
 // Sigmoid gate — scalar
 // ===================================================================
 
-/// **Unstable**: apply elementwise sigmoid gate to `context`.
+/// **Unstable**: apply elementwise sigmoid gate to `context` using exact `exp`.
 ///
 /// Computes `context[i] *= 1 / (1 + exp(-gate[i]))` for every element.
 /// This is the G1 SDPA-output gating from the Gated Attention paper.
 ///
-/// Uses the SIMD path when the target architecture supports it; falls back
-/// to the scalar path otherwise.
+/// Uses exact `f32::exp` to match all other Qwen3.5 execution paths (prefill,
+/// f16, q8, Metal, speculative). See [`apply_sigmoid_gate_fast`] for the
+/// approximate SIMD variant.
 ///
 /// # Panics
 ///
 /// Panics if `context.len() != gate.len()`.
 #[inline]
 pub fn apply_sigmoid_gate(context: &mut [f32], gate: &[f32]) {
+    apply_sigmoid_gate_scalar(context, gate);
+}
+
+/// **Unstable**: apply elementwise sigmoid gate with approximate SIMD fast-exp.
+///
+/// Uses the Schraudolph bit-trick for `exp` (~5–6% relative error), dispatching
+/// to NEON or AVX2 when available. Achieves 6–8× speedup over the scalar path
+/// but produces different numerical output.
+///
+/// Use this only when all comparable execution paths (prefill, decode, etc.)
+/// agree on the same approximation. For refactoring where exact parity is
+/// required, use [`apply_sigmoid_gate`] instead.
+///
+/// # Panics
+///
+/// Panics if `context.len() != gate.len()`.
+#[inline]
+pub fn apply_sigmoid_gate_fast(context: &mut [f32], gate: &[f32]) {
     assert_eq!(
         context.len(),
         gate.len(),
-        "apply_sigmoid_gate: context and gate must have equal length"
+        "apply_sigmoid_gate_fast: context and gate must have equal length"
     );
     let config = simd_config();
 
@@ -258,13 +277,12 @@ unsafe fn fast_exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m2
 // SIMD dispatch alias (public, for benchmarks)
 // ===================================================================
 
-/// **Unstable**: apply elementwise sigmoid gate with SIMD acceleration.
+/// **Unstable**: alias for [`apply_sigmoid_gate_fast`].
 ///
-/// This is an alias for [`apply_sigmoid_gate`]; the dispatch to NEON/AVX2/scalar
-/// is handled inside. Exposed separately so benchmarks can compare paths explicitly.
+/// Exposed so benchmarks can compare scalar vs SIMD paths by name.
 #[inline]
 pub fn apply_sigmoid_gate_simd(context: &mut [f32], gate: &[f32]) {
-    apply_sigmoid_gate(context, gate);
+    apply_sigmoid_gate_fast(context, gate);
 }
 
 // ===================================================================
