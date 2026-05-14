@@ -29,7 +29,7 @@ Implement NSA as a **seventh attention module** at `src/attention/native_sparse.
 
 Public surface:
 
-- **`NsaConfig`** — `num_heads`, `num_kv_heads`, `head_dim`, and the five NSA hyperparameters `compress_block` (`l`), `compress_stride` (`d`), `select_block` (`l'`), `num_selected` (`n`), `window` (`w`). Helper methods for derived counts and a `validate()` enforcing the positivity, `num_heads % num_kv_heads == 0`, `l ≤ l'`, `d | l`, and `d | l'` invariants.
+- **`NsaConfig`** — `num_heads`, `num_kv_heads`, `head_dim`, and the five NSA hyperparameters `compress_block` (`l`), `compress_stride` (`d`), `select_block` (`l'`), `num_selected` (`n`), `window` (`w`). Helper methods for derived counts and a `validate()` enforcing the positivity, `num_heads % num_kv_heads == 0`, `l ≤ l'`, `d | l`, `d | l'`, and `num_selected ≥ 3` invariants.
 - **`NsaWeights`** — the learned NSA parameters (caller-supplied, like `differential.rs`'s `DiffLambdaParams`): the K/V compression MLPs `phi_k` / `phi_v`, the intra-block position encodings `k_intrablock_pos` / `v_intrablock_pos`, and the gate projection `g_proj`.
 - **`NsaScratch`** — pre-allocated scratch buffers (follows `GqaScratch` / `DiffAttnScratch`).
 - **`apply_native_sparse_attention()`** — the three-branch causal prefill kernel.
@@ -69,9 +69,9 @@ Public surface:
 
 7. **Top-`n` selection with forced blocks.** **Selection-block causal validity**: a selection block `j` (covering tokens `[j·l', (j+1)·l')`) is causally valid for query `t` iff it contains at least one token `≤ t` — `j·l' ≤ t`. A valid block may be **partial**: it can contain tokens `> t` (e.g. the query's own block). Only *full* `l'`-token selection blocks are candidates (`num_select_blocks` counts full blocks); a query in the trailing partial region beyond the last full block cannot select its own partial block, but the sliding window covers it.
 
-   Per the paper's Section 4.1 ("including fixed activating the 1 initial block and 2 local blocks"), the `n` selected blocks always include: the **initial block** (selection-block 0) and the **2 local blocks** (the 2 highest-indexed causally-valid selection blocks for query `t`); the remaining `n − 3` are the top-scored of the rest. If fewer than `n` selection blocks are causally valid, all valid blocks are taken.
+   Per the paper's Section 4.1 ("including fixed activating the 1 initial block and 2 local blocks"), the `n` selected blocks always include: the **initial block** (selection-block 0) and the **2 local blocks** (the 2 highest-indexed causally-valid selection blocks for query `t`); the remaining `n − 3` are the top-scored of the rest. If fewer than `n` selection blocks are causally valid, all valid blocks are taken. The scheme is only defined for `n ≥ 3` (1 initial + 2 local) — `NsaConfig::validate` asserts `num_selected ≥ 3` rather than silently dropping a forced block when `n < 3`.
 
-   Selection attention is standard scaled-dot-product over the gathered tokens of the selected blocks. Because a selected block may be partial, **token-level causal masking is load-bearing**: within each gathered block, tokens with index `> t` are masked out, so the query attends only `≤ t` (including itself).
+   Selection attention is standard scaled-dot-product over the gathered tokens of the selected blocks. Because a selected block may be partial, **the gather is hard-causal**: only tokens with index `≤ t` are gathered into the score buffer — future tokens are never scored, never softmaxed, never summed. (An earlier draft soft-masked them with a finite additive sentinel; round-2 review showed that leaks when a real score falls below the sentinel — hard exclusion has no value-dependent failure mode.)
 
 8. **Sliding window**: standard causal local attention over `k_rope_{max(0, t−w+1) .. t}` — the last `w` tokens inclusive of `t`.
 
@@ -81,7 +81,7 @@ Public surface:
 
 11. **Uniform `head_dim`.** The paper uses asymmetric dims (`d_k = 192`, `d_v = 128`, an MLA detail). All existing Lattice attention modules use a uniform `head_dim`; NSA follows suit. Asymmetric dims are a deferred extension.
 
-12. **Additive `-10,000.0` causal mask** — consistent with ADR-010 design choice #2 and ADR-041; masked positions are also explicitly zeroed after softmax.
+12. **Hard causal exclusion, no additive mask.** All three branches exclude causally-invalid tokens/blocks *before* softmax — they are never scored: compression skips blocks not fully seen, selection gathers only `≤ t` tokens, the sliding window iterates only `≤ t`. NSA deliberately diverges from the additive `−10,000.0` mask convention of ADR-010/ADR-041: a finite additive sentinel leaks when a real score falls below it (round-2 review caught exactly this in the selection branch), and hard exclusion has no value-dependent failure mode.
 
 13. **Standalone, not wired into a model.** No checkpoint targets this φ-MLP NSA variant — the one public checkpoint, `zen-E/NSA-1B`, is the fla-org mean-pool variant — so wiring it into a forward pass would be speculative. The module is independently testable and benchmarkable; model integration is deferred until a concrete checkpoint target exists.
 
