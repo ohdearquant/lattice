@@ -115,11 +115,14 @@ fn default_tie_word_embeddings() -> bool {
     true
 }
 
-// Nested rope_parameters in HF config.json (27B+ models nest rope_theta here).
+// Nested rope_parameters in HF config.json (many models nest rope_theta and
+// partial_rotary_factor here instead of at the top level of text_config).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct RopeParams {
     #[serde(default)]
     pub rope_theta: f64,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
 }
 
 // Private helper for HF config.json structure (outer wrapper with text_config).
@@ -341,12 +344,14 @@ impl Qwen35Config {
         if let Some(tie) = parsed.tie_word_embeddings {
             cfg.tie_word_embeddings = tie;
         }
-        // 27B+ models nest rope_theta under rope_parameters — extract if flat field is 0.
-        if cfg.rope_theta == 0.0 {
-            if let Some(rp) = &cfg.rope_parameters {
-                if rp.rope_theta > 0.0 {
-                    cfg.rope_theta = rp.rope_theta;
-                }
+        // Many models nest rope_theta and partial_rotary_factor under rope_parameters
+        // instead of at the text_config level — extract when the flat fields are unset.
+        if let Some(rp) = &cfg.rope_parameters {
+            if cfg.rope_theta == 0.0 && rp.rope_theta > 0.0 {
+                cfg.rope_theta = rp.rope_theta;
+            }
+            if let Some(prf) = rp.partial_rotary_factor {
+                cfg.partial_rotary_factor = prf;
             }
         }
         if cfg.layer_types.len() != cfg.num_hidden_layers {
