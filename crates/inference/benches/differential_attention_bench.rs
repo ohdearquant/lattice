@@ -3,10 +3,14 @@
 //! Measures:
 //! - `apply_differential_attention` throughput at representative sequence lengths.
 //! - Cost of the differential mechanism, isolated against a single-softmax baseline
-//!   that has the *same loop topology* (per-KV-head / per-pair) as the differential
-//!   kernel. The difference is exactly: second Q/K extract + second GEMM + second
-//!   softmax + subtract + sub-RMSNorm. This controls for kernel topology, which a
-//!   comparison against the batched `apply_gqa_attention` would not.
+//!   that has the *same loop topology* (per-KV-head / per-pair) **and the same
+//!   per-pair scratch-slab layout** as the differential kernel. The only working-set
+//!   difference is the differential kernel's second score slab (`scores2`), which is
+//!   itself part of the mechanism. The gap between the two is therefore: second Q/K
+//!   extract + second GEMM + second softmax (its `scores2` slab) + subtract +
+//!   sub-RMSNorm. This controls for both kernel topology and scratch-buffer
+//!   cache-layout, which a comparison against the batched `apply_gqa_attention`
+//!   would not.
 //!
 //! Run with:
 //!   cargo bench --bench differential_attention_bench
@@ -177,38 +181,48 @@ fn bench_diff_attn() {
 }
 
 // ===================================================================
-// Single-softmax baseline — SAME loop topology as the differential kernel
+// Single-softmax baseline — SAME loop topology AND scratch layout as the
+// differential kernel.
 //
 // Mirrors apply_differential_attention's per-KV-head / per-pair structure
-// exactly, but computes only ONE softmax map: no second Q/K extract, no
-// second GEMM, no second softmax, no subtract, no sub-RMSNorm. The gap
-// between this and the differential kernel is the mechanism cost, with
-// loop topology held constant. (A comparison against the *batched*
-// apply_gqa_attention would conflate topology with mechanism.)
+// and its per-pair scratch-slab indexing exactly, but computes only ONE
+// softmax map: no second Q/K extract, no second GEMM, no second softmax
+// (and no `scores2` slab), no subtract, no sub-RMSNorm. The gap between
+// this and the differential kernel is the mechanism cost, with both loop
+// topology and scratch-buffer cache-layout held constant. (A comparison
+// against the *batched* apply_gqa_attention would conflate topology with
+// mechanism.)
 // ===================================================================
 
 #[derive(Default)]
 struct SingleSoftmaxScratch {
+    /// Per-pair score slabs `[num_heads, seq_len, seq_len]` — mirrors
+    /// `DiffAttnScratch::scores1` exactly. (The differential kernel additionally
+    /// holds `scores2` of the same shape; that second slab IS the mechanism.)
     scores: Vec<f32>,
     v_head_t: Vec<f32>,
     q_packed: Vec<f32>,
     k_packed: Vec<f32>,
+    /// Per-pair context slabs `[num_heads, seq_len, 2*head_dim]` — mirrors
+    /// `DiffAttnScratch::context` exactly.
     context: Vec<f32>,
 }
 
 impl SingleSoftmaxScratch {
     fn reserve_for(&mut self, seq_len: usize, cfg: &DiffAttnConfig) {
+        let n_pairs = cfg.num_heads;
         let v_head_dim = 2 * cfg.head_dim;
-        self.scores.resize(seq_len * seq_len, 0.0);
+        self.scores.resize(n_pairs * seq_len * seq_len, 0.0);
         self.v_head_t.resize(v_head_dim * seq_len, 0.0);
         self.q_packed.resize(seq_len * cfg.head_dim, 0.0);
         self.k_packed.resize(seq_len * cfg.head_dim, 0.0);
-        self.context.resize(seq_len * v_head_dim, 0.0);
+        self.context.resize(n_pairs * seq_len * v_head_dim, 0.0);
     }
 }
 
 /// Single-softmax attention with the same per-KV-head / per-pair loop topology
-/// as `apply_differential_attention`, minus the differential mechanism.
+/// and per-pair scratch-slab layout as `apply_differential_attention`, minus the
+/// differential mechanism.
 fn single_softmax_baseline(
     q_buf: &[f32],
     k_buf: &[f32],
@@ -258,17 +272,20 @@ fn single_softmax_baseline(
                     .copy_from_slice(&k_buf[ks..ks + head_dim]);
             }
 
-            // One GEMM, scale + causal mask, one softmax.
+            // One GEMM, scale + causal mask, one softmax — into this pair's slab,
+            // mirroring the differential kernel's per-pair `scores1` indexing.
+            let score_off = pair_h * seq_len * seq_len;
+            let score_slice = &mut scratch.scores[score_off..score_off + seq_len * seq_len];
             matmul_bt(
                 &scratch.q_packed[..seq_len * head_dim],
                 &scratch.k_packed[..seq_len * head_dim],
-                &mut scratch.scores[..seq_len * seq_len],
+                score_slice,
                 seq_len,
                 head_dim,
                 seq_len,
             );
             for qi in 0..seq_len {
-                let row = &mut scratch.scores[qi * seq_len..(qi + 1) * seq_len];
+                let row = &mut score_slice[qi * seq_len..(qi + 1) * seq_len];
                 for (ki, v) in row.iter_mut().enumerate() {
                     if ki <= qi {
                         *v *= scale;
@@ -295,11 +312,14 @@ fn single_softmax_baseline(
                 row[valid..].fill(0.0);
             }
 
-            // One GEMM with V, scale, write out.
+            // One GEMM with V, scale, write out — into this pair's context slab,
+            // mirroring the differential kernel's per-pair `context` indexing.
+            let ctx_off = pair_h * seq_len * v_head_dim;
+            let ctx_slice = &mut scratch.context[ctx_off..ctx_off + seq_len * v_head_dim];
             matmul_bt(
-                &scratch.scores[..seq_len * seq_len],
+                score_slice,
                 &scratch.v_head_t[..v_head_dim * seq_len],
-                &mut scratch.context[..seq_len * v_head_dim],
+                ctx_slice,
                 seq_len,
                 seq_len,
                 v_head_dim,
@@ -308,7 +328,7 @@ fn single_softmax_baseline(
                 let src = pos * v_head_dim;
                 let dst = pos * out_row_stride + pair_h * v_head_dim;
                 for d in 0..v_head_dim {
-                    attn_out[dst + d] = scratch.context[src + d] * out_scale;
+                    attn_out[dst + d] = ctx_slice[src + d] * out_scale;
                 }
             }
         }

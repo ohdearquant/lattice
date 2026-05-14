@@ -219,6 +219,21 @@ pub fn apply_differential_attention(
 ) {
     use crate::forward::cpu::matmul_bt;
 
+    // Config validation — must precede the buffer-length asserts below. `cfg.q_dim()`,
+    // `k_dim()`, etc. silently collapse to 0 when `num_heads` or `head_dim` is 0, which
+    // would make those length checks vacuously pass; and `num_kv_heads == 0` would reach
+    // a raw divide-by-zero in the `%` check and in `cfg.n_rep()`.
+    assert!(cfg.num_heads > 0, "num_heads must be > 0");
+    assert!(cfg.num_kv_heads > 0, "num_kv_heads must be > 0");
+    assert!(cfg.head_dim > 0, "head_dim must be > 0");
+    assert_eq!(
+        cfg.num_heads % cfg.num_kv_heads,
+        0,
+        "num_heads ({}) must be divisible by num_kv_heads ({})",
+        cfg.num_heads,
+        cfg.num_kv_heads
+    );
+
     assert_eq!(
         q_buf.len(),
         seq_len * cfg.q_dim(),
@@ -251,11 +266,6 @@ pub fn apply_differential_attention(
         "attn_out length mismatch: expected {} got {}",
         seq_len * cfg.out_dim(),
         attn_out.len()
-    );
-    assert_eq!(
-        cfg.num_heads % cfg.num_kv_heads,
-        0,
-        "num_heads must be divisible by num_kv_heads"
     );
     for (name, v) in [
         ("lambda_q1", &lambda_params.lambda_q1),
@@ -828,6 +838,76 @@ mod tests {
         assert!(
             max_abs < 1e-3,
             "identical maps with lambda_full≈1 must yield ~0 output, got max_abs={max_abs}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Config validation guards
+    //
+    // Each guard fires before any buffer is inspected, so empty buffers
+    // are sufficient to reach (and only reach) the assertion under test.
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "num_heads must be > 0")]
+    fn test_zero_num_heads_panics() {
+        let cfg = make_cfg(0, 1, 4, 0);
+        let params = zero_lambda_params(4);
+        let mut out: Vec<f32> = vec![];
+        let mut scratch = DiffAttnScratch::default();
+        apply_differential_attention(
+            &[],
+            &[],
+            &[],
+            &params,
+            &[],
+            1e-6,
+            &mut out,
+            1,
+            &cfg,
+            &mut scratch,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_kv_heads must be > 0")]
+    fn test_zero_num_kv_heads_panics() {
+        let cfg = make_cfg(2, 0, 4, 0);
+        let params = zero_lambda_params(4);
+        let mut out: Vec<f32> = vec![];
+        let mut scratch = DiffAttnScratch::default();
+        apply_differential_attention(
+            &[],
+            &[],
+            &[],
+            &params,
+            &[],
+            1e-6,
+            &mut out,
+            1,
+            &cfg,
+            &mut scratch,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim must be > 0")]
+    fn test_zero_head_dim_panics() {
+        let cfg = make_cfg(2, 2, 0, 0);
+        let params = zero_lambda_params(0);
+        let mut out: Vec<f32> = vec![];
+        let mut scratch = DiffAttnScratch::default();
+        apply_differential_attention(
+            &[],
+            &[],
+            &[],
+            &params,
+            &[],
+            1e-6,
+            &mut out,
+            1,
+            &cfg,
+            &mut scratch,
         );
     }
 }

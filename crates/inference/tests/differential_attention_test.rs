@@ -467,3 +467,124 @@ fn test_scratch_reuse() {
         );
     }
 }
+
+/// Independent check of the GQA head-mapping convention.
+///
+/// The naive reference (`ref_differential_attention`) derives the KV head for
+/// query-pair `h` as `h / n_rep` — the *same* integer-division mapping the kernel
+/// uses. A shared misunderstanding of the grouping (contiguous vs. interleaved)
+/// would pass both, so that oracle alone cannot validate it.
+///
+/// This test removes the `/ n_rep` derivation from the oracle path entirely. GQA
+/// is *defined* as MHA with each KV head physically replicated `n_rep` times in
+/// contiguous order (`repeat_kv`; in Microsoft's reference this is what
+/// `flash_attn_func` does internally). So:
+///
+///   1. Run a GQA config (`num_kv_heads < num_heads`) on K/V data with distinct
+///      KV heads.
+///   2. Build an MHA config (`num_kv_heads == num_heads`, `n_rep == 1` — no
+///      grouping logic in the compute path) whose K/V buffers are the GQA buffers
+///      with each KV head materialized `n_rep` times, using a *hardcoded* pair→KV
+///      table rather than `/ n_rep`.
+///   3. The two outputs must be bit-identical: query-pair `h` sees the same Q/K/V
+///      in both runs, so every matmul/softmax/norm is the same arithmetic on the
+///      same bytes.
+///
+/// If the kernel's grouping convention disagreed with contiguous `repeat_kv`, the
+/// GQA run would diverge from the materialized-MHA run.
+///
+/// This does not replace a capture from the actual flash-attn reference (which
+/// needs CUDA hardware), but it closes the "shared derivation" gap: the oracle
+/// here decides the grouping by explicit data placement, not by the kernel's own
+/// indexing formula.
+#[test]
+fn test_gqa_equals_materialized_mha() {
+    // GQA config: 4 query-pairs, 2 KV heads → n_rep = 2.
+    let gqa_cfg = DiffAttnConfig {
+        num_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 4,
+        layer_depth: 3,
+    };
+    // Contiguous repeat_kv for num_heads=4, num_kv_heads=2: query-pair h is served
+    // by KV head h/2 → [0, 0, 1, 1]. Written as a literal, NOT computed via
+    // `/ n_rep`, so this oracle shares no grouping derivation with the kernel.
+    const PAIR_TO_KV: [usize; 4] = [0, 0, 1, 1];
+
+    let seq_len = 5;
+    let head_dim = gqa_cfg.head_dim;
+    let v_head_dim = 2 * head_dim;
+
+    let (q, k_gqa, v_gqa, params, subln_w) = make_inputs(&gqa_cfg, seq_len, 4242);
+
+    // MHA config: one KV head per query-pair (n_rep = 1). head_dim is unchanged,
+    // so `params` and `subln_w` from make_inputs are valid for both configs.
+    let mha_cfg = DiffAttnConfig {
+        num_heads: gqa_cfg.num_heads,
+        num_kv_heads: gqa_cfg.num_heads,
+        head_dim,
+        layer_depth: gqa_cfg.layer_depth,
+    };
+
+    // Materialize K: MHA KV head `m` holds GQA KV head `PAIR_TO_KV[m]`'s two
+    // packed K heads.
+    let gqa_k_stride = gqa_cfg.k_dim();
+    let mha_k_stride = mha_cfg.k_dim();
+    let mut k_mha = vec![0.0_f32; seq_len * mha_k_stride];
+    for pos in 0..seq_len {
+        for (mha_kv, &gqa_kv) in PAIR_TO_KV.iter().enumerate() {
+            for half in 0..2 {
+                let src = pos * gqa_k_stride + (2 * gqa_kv + half) * head_dim;
+                let dst = pos * mha_k_stride + (2 * mha_kv + half) * head_dim;
+                k_mha[dst..dst + head_dim].copy_from_slice(&k_gqa[src..src + head_dim]);
+            }
+        }
+    }
+
+    // Materialize V: MHA KV head `m` holds GQA KV head `PAIR_TO_KV[m]`'s V head.
+    let gqa_v_stride = gqa_cfg.v_dim();
+    let mha_v_stride = mha_cfg.v_dim();
+    let mut v_mha = vec![0.0_f32; seq_len * mha_v_stride];
+    for pos in 0..seq_len {
+        for (mha_kv, &gqa_kv) in PAIR_TO_KV.iter().enumerate() {
+            let src = pos * gqa_v_stride + gqa_kv * v_head_dim;
+            let dst = pos * mha_v_stride + mha_kv * v_head_dim;
+            v_mha[dst..dst + v_head_dim].copy_from_slice(&v_gqa[src..src + v_head_dim]);
+        }
+    }
+
+    // Q is never grouped, and q_dim/out_dim depend only on num_heads (identical
+    // between the two configs) — so the Q buffer and output shape are shared.
+    assert_eq!(gqa_cfg.q_dim(), mha_cfg.q_dim());
+    assert_eq!(gqa_cfg.out_dim(), mha_cfg.out_dim());
+
+    let run = |cfg: &DiffAttnConfig, k: &[f32], v: &[f32]| {
+        let mut out = vec![0.0_f32; seq_len * cfg.out_dim()];
+        let mut scratch = DiffAttnScratch::default();
+        apply_differential_attention(
+            &q,
+            k,
+            v,
+            &params,
+            &subln_w,
+            1e-6,
+            &mut out,
+            seq_len,
+            cfg,
+            &mut scratch,
+        );
+        out
+    };
+
+    let out_gqa = run(&gqa_cfg, &k_gqa, &v_gqa);
+    let out_mha = run(&mha_cfg, &k_mha, &v_mha);
+
+    for (i, (g, m)) in out_gqa.iter().zip(out_mha.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            m.to_bits(),
+            "GQA output diverged from materialized-MHA at index {i}: {g} vs {m} \
+             — kernel head-grouping disagrees with contiguous repeat_kv"
+        );
+    }
+}
