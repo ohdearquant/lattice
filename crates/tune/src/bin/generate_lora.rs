@@ -1,9 +1,10 @@
-//! Qwen3.5-2B generation with LoRA adapter — proves MLX-trained adapters work in Rust inference.
+//! Qwen3.5 generation with LoRA adapter — proves PEFT/MLX-trained adapters work in Rust inference.
 //!
 //! Usage:
 //!   cargo run --release -p lattice-tune --features "safetensors,inference-hook" \
 //!     --bin generate_lora -- \
-//!     --lora platform/tune/output/mlx-qwen35-2b-code-r16/adapter_exported.safetensors \
+//!     --model-dir ~/.lattice/models/qwen3.5-0.8b \
+//!     --lora adapter.safetensors \
 //!     --prompt "Write a Rust function that checks if a number is prime" \
 //!     --max-tokens 64
 
@@ -15,6 +16,15 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn default_model_cache() -> PathBuf {
+    std::env::var("LATTICE_MODEL_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".lattice").join("models")
+        })
 }
 
 fn main() {
@@ -29,18 +39,19 @@ fn main() {
 
     let seed: Option<u64> = parse_arg(&args, "--seed").and_then(|s| s.parse().ok());
 
+    let temperature: Option<f32> = parse_arg(&args, "--temperature").and_then(|s| s.parse().ok());
+
     let lora_path: Option<PathBuf> = parse_arg(&args, "--lora").map(PathBuf::from);
 
-    let model_dir = std::env::var("LATTICE_MODEL_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".lattice").join("models")
-        })
-        .join("qwen3.5-2b");
+    let model_dir = if let Some(dir) = parse_arg(&args, "--model-dir") {
+        PathBuf::from(dir)
+    } else {
+        let model_name = parse_arg(&args, "--model").unwrap_or_else(|| "qwen3.5-0.8b".to_string());
+        default_model_cache().join(model_name)
+    };
 
     // Load base model
-    println!("Loading Qwen3.5-2B from {:?}...", model_dir);
+    println!("Loading model from {:?}...", model_dir);
     let t0 = Instant::now();
 
     let mut model =
@@ -87,6 +98,9 @@ fn main() {
     let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.seed = seed;
+    if let Some(t) = temperature {
+        gen_cfg.temperature = t;
+    }
 
     println!("\nPrompt: {prompt}");
     println!(

@@ -334,3 +334,353 @@ fn test_qwen36_greedy_one_token_smoke() {
         out.token_ids.len() + out.prompt_tokens
     );
 }
+
+// ---------------------------------------------------------------------------
+// LoRA serving integration tests
+//
+// These verify the LoRA *serving* path: that `Qwen35Model::forward_step` invokes
+// the `LoraHook` at every adapted projection (`q/k/v/o_proj`, `gate/up/down_proj`,
+// and the GatedDeltaNet `in_proj_*`/`out_proj`) with buffer shapes matching the
+// trait contract, and that an active adapter deterministically changes the
+// output logits. The synthetic-model builder mirrors the one in
+// `forward/batch_prefill.rs`'s test module — kept local rather than shared to
+// avoid a cross-module test-support dependency.
+// ---------------------------------------------------------------------------
+mod lora_serving {
+    use super::super::*;
+    use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights};
+    use crate::lora_hook::{LoraHook, NoopLoraHook};
+    use crate::model::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
+    use crate::rope::RopeTable;
+    use crate::tokenizer::bpe::BpeTokenizer;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    /// Deterministic xorshift RNG → uniform noise in `[-scale, scale]`.
+    fn rand_vec(state: &mut u64, len: usize, scale: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            out.push(((x >> 32) as u32 as f32 / u32::MAX as f32 * 2.0 - 1.0) * scale);
+        }
+        out
+    }
+
+    /// Minimal byte-level BPE tokenizer. `forward_step` never touches the
+    /// tokenizer; the model struct just needs a value for the field.
+    fn test_tokenizer() -> BpeTokenizer {
+        let json = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true },
+  "post_processor": null,
+  "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<unk>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": false,
+    "vocab": { "<unk>": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, " ": 6 },
+    "merges": []
+  }
+}"#;
+        BpeTokenizer::from_tokenizer_json_str(json).expect("test tokenizer parses")
+    }
+
+    /// Compact 4-layer hybrid config: `layer_types = [linear, linear, linear, full]`,
+    /// so a single `forward_step` exercises both attention paths plus the FFN.
+    fn test_config() -> Qwen35Config {
+        let num_hidden_layers = 4;
+        let full_attention_interval = 4;
+        Qwen35Config {
+            hidden_size: 64,
+            num_hidden_layers,
+            vocab_size: 97,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 16,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            rope_parameters: None,
+            linear_num_key_heads: 4,
+            linear_num_value_heads: Some(4),
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval,
+            layer_types: compute_layer_types(num_hidden_layers, full_attention_interval),
+            layer_mask: vec![true; num_hidden_layers],
+            eos_token_id: 96,
+            max_position_embeddings: 1024,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+        }
+    }
+
+    /// Build a synthetic `Qwen35Model` with deterministic random weights.
+    fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
+        let mut rng = seed | 1;
+        let h = cfg.hidden_size;
+
+        let embed_tokens = rand_vec(&mut rng, cfg.vocab_size * h, 0.02);
+        let final_norm = rand_vec(&mut rng, h, 0.02);
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for layer_type in &cfg.layer_types {
+            let common = CommonLayerWeights {
+                input_layernorm: rand_vec(&mut rng, h, 0.02),
+                post_attention_layernorm: rand_vec(&mut rng, h, 0.02),
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
+                    up_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
+                    down_proj: rand_vec(&mut rng, h * cfg.intermediate_size, 0.02),
+                }),
+            };
+            let attn = match layer_type {
+                LayerType::LinearAttention => {
+                    let qkv_dim = cfg.linear_qkv_dim();
+                    let output_dim = cfg.linear_output_dim();
+                    let nh = cfg.linear_num_key_heads;
+                    let kernel = cfg.linear_conv_kernel_dim;
+                    AttentionWeights::Linear(GatedDeltaNetWeights {
+                        in_proj_qkv: rand_vec(&mut rng, qkv_dim * h, 0.02),
+                        in_proj_qkv_rows: qkv_dim,
+                        in_proj_qkv_cols: h,
+                        in_proj_z: rand_vec(&mut rng, output_dim * h, 0.02),
+                        in_proj_z_rows: output_dim,
+                        in_proj_z_cols: h,
+                        in_proj_b: rand_vec(&mut rng, nh * h, 0.02),
+                        in_proj_b_rows: nh,
+                        in_proj_b_cols: h,
+                        in_proj_a: rand_vec(&mut rng, nh * h, 0.02),
+                        in_proj_a_rows: nh,
+                        in_proj_a_cols: h,
+                        a_log: rand_vec(&mut rng, nh, 0.02),
+                        dt_bias: rand_vec(&mut rng, nh, 0.02),
+                        conv1d_weight: rand_vec(&mut rng, qkv_dim * kernel, 0.02),
+                        conv_dim: qkv_dim,
+                        kernel_size: kernel,
+                        norm_weight: rand_vec(&mut rng, output_dim, 0.02),
+                        out_proj: rand_vec(&mut rng, h * output_dim, 0.02),
+                        out_proj_rows: h,
+                        out_proj_cols: output_dim,
+                    })
+                }
+                LayerType::FullAttention => {
+                    let q_dim = cfg.full_q_dim();
+                    let kv_dim = cfg.full_kv_dim();
+                    AttentionWeights::Full(FullAttentionLayerWeights {
+                        q_proj: rand_vec(&mut rng, 2 * q_dim * h, 0.02),
+                        k_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
+                        v_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
+                        o_proj: rand_vec(&mut rng, h * q_dim, 0.02),
+                        q_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
+                        k_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
+                    })
+                }
+            };
+            layers.push((attn, common));
+        }
+
+        let rope = RopeTable::new(
+            cfg.rope_dim(),
+            cfg.max_position_embeddings.min(8192),
+            cfg.rope_theta,
+        );
+
+        Qwen35Model {
+            config: cfg,
+            weights: ModelWeights {
+                embed_tokens,
+                lm_head: None,
+                final_norm,
+                layers,
+            },
+            tokenizer: test_tokenizer(),
+            rope,
+            lora: Box::new(NoopLoraHook),
+        }
+    }
+
+    /// Allocate the per-call mutable state `forward_step` needs.
+    fn fresh_state(cfg: &Qwen35Config) -> (Vec<GatedDeltaNetState>, KvCache, ForwardScratch) {
+        let gdn = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let kv = KvCache::new(cfg.num_full_attention_layers());
+        (gdn, kv, ForwardScratch::new())
+    }
+
+    /// One recorded `LoraHook` call: `(layer_idx, module, x.len(), output.len())`.
+    type CallLog = Vec<(usize, String, usize, usize)>;
+
+    /// `LoraHook` that records every call into a shared [`CallLog`].
+    struct SpyHook {
+        calls: Arc<Mutex<CallLog>>,
+    }
+    impl LoraHook for SpyHook {
+        fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((layer_idx, module.to_string(), x.len(), output.len()));
+        }
+    }
+
+    /// `LoraHook` that adds a constant delta to one specific `(layer, module)` output.
+    struct DeltaHook {
+        layer: usize,
+        module: &'static str,
+        delta: f32,
+    }
+    impl LoraHook for DeltaHook {
+        fn apply(&self, layer_idx: usize, module: &str, _x: &[f32], output: &mut [f32]) {
+            if layer_idx == self.layer && module == self.module {
+                for o in output.iter_mut() {
+                    *o += self.delta;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lora_hook_invoked_at_every_adapted_projection() {
+        let cfg = test_config();
+        let mut model = build_model(cfg.clone(), 0xA11C_E5ED);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        model.set_lora(Box::new(SpyHook {
+            calls: Arc::clone(&calls),
+        }));
+
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        model.forward_step(1, 0, &mut gdn, &mut kv, &mut scratch);
+
+        let recorded = calls.lock().unwrap();
+
+        // Expected (layer, module) set, derived independently from the config.
+        let mut expected: BTreeSet<(usize, String)> = BTreeSet::new();
+        for (layer_idx, layer_type) in cfg.layer_types.iter().enumerate() {
+            let attn_modules: &[&str] = match layer_type {
+                LayerType::FullAttention => &["q_proj", "k_proj", "v_proj", "o_proj"],
+                LayerType::LinearAttention => &[
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "out_proj",
+                ],
+            };
+            for m in attn_modules
+                .iter()
+                .chain(["gate_proj", "up_proj", "down_proj"].iter())
+            {
+                expected.insert((layer_idx, (*m).to_string()));
+            }
+        }
+
+        let seen: BTreeSet<(usize, String)> = recorded
+            .iter()
+            .map(|(l, m, _, _)| (*l, m.clone()))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "LoRA hook must fire at exactly the adapted projections of every layer"
+        );
+        assert_eq!(
+            recorded.len(),
+            expected.len(),
+            "each projection must invoke the hook exactly once per forward_step"
+        );
+
+        // Buffer shapes must match the trait contract: `x` is the projection
+        // input, `output` is the projection output.
+        let h = cfg.hidden_size;
+        for (layer_idx, module, x_len, out_len) in recorded.iter() {
+            let (exp_x, exp_out) = match module.as_str() {
+                "q_proj" => (h, 2 * cfg.full_q_dim()),
+                "k_proj" | "v_proj" => (h, cfg.full_kv_dim()),
+                "o_proj" => (cfg.full_q_dim(), h),
+                "gate_proj" | "up_proj" => (h, cfg.intermediate_size),
+                "down_proj" => (cfg.intermediate_size, h),
+                "in_proj_qkv" => (h, cfg.linear_qkv_dim()),
+                "in_proj_z" => (h, cfg.linear_output_dim()),
+                "in_proj_b" | "in_proj_a" => (h, cfg.linear_num_key_heads),
+                "out_proj" => (cfg.linear_output_dim(), h),
+                other => panic!("unexpected module name passed to LoraHook: {other}"),
+            };
+            assert_eq!(
+                (*x_len, *out_len),
+                (exp_x, exp_out),
+                "layer {layer_idx} {module}: hook got (x={x_len}, out={out_len}), expected (x={exp_x}, out={exp_out})"
+            );
+        }
+    }
+
+    #[test]
+    fn lora_adapter_changes_logits_deterministically() {
+        let cfg = test_config();
+        let mut model = build_model(cfg.clone(), 0x0D15_EA5E);
+
+        let run = |model: &Qwen35Model| {
+            let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+            model.forward_step(2, 0, &mut gdn, &mut kv, &mut scratch);
+            scratch.logits[..cfg.vocab_size].to_vec()
+        };
+
+        // Two NoopLoraHook runs must be bit-identical — this establishes that any
+        // difference below is provably caused by the adapter, not nondeterminism.
+        model.set_lora(Box::new(NoopLoraHook));
+        let baseline_a = run(&model);
+        let baseline_b = run(&model);
+        assert_eq!(
+            baseline_a, baseline_b,
+            "forward_step must be deterministic under NoopLoraHook"
+        );
+
+        // An adapter targeting a real projection must move the logits.
+        model.set_lora(Box::new(DeltaHook {
+            layer: 3,
+            module: "q_proj",
+            delta: 0.5,
+        }));
+        let adapted = run(&model);
+        assert_ne!(
+            adapted, baseline_a,
+            "an active LoRA adapter on a real projection must change the logits"
+        );
+
+        // An adapter keyed to a non-existent (layer, module) must be a no-op —
+        // confirms forward_step only dispatches the hook to real projections.
+        model.set_lora(Box::new(DeltaHook {
+            layer: 999,
+            module: "q_proj",
+            delta: 0.5,
+        }));
+        let unmatched = run(&model);
+        assert_eq!(
+            unmatched, baseline_a,
+            "an adapter keyed to a non-existent layer must not affect output"
+        );
+    }
+}
