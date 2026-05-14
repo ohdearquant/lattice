@@ -185,6 +185,55 @@ impl Qwen35Config {
         }
     }
 
+    /// **Unstable**: Qwen3.5-0.8B configuration. Same hybrid architecture as the
+    /// 2B (24 layers, `[linear, linear, linear, full] x 6`), scaled down. The
+    /// released checkpoint is a vision-language model; this is its text decoder.
+    pub fn qwen35_0_8b() -> Self {
+        let num_hidden_layers = 24;
+        let full_attention_interval = 4;
+        let layer_types = compute_layer_types(num_hidden_layers, full_attention_interval);
+
+        Self {
+            hidden_size: 1024,
+            num_hidden_layers,
+            vocab_size: 248_320,
+            intermediate_size: 3584,
+            rms_norm_eps: 1e-6,
+            // Full attention
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            rope_parameters: None,
+            // Linear attention (GatedDeltaNet)
+            linear_num_key_heads: 16,
+            linear_num_value_heads: Some(16),
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            // MoE (absent — 0.8B is dense)
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            // Projection
+            tie_word_embeddings: true,
+            // Layer pattern
+            full_attention_interval,
+            layer_types,
+            layer_mask: vec![true; num_hidden_layers],
+            // Generation
+            eos_token_id: 248_044,
+            max_position_embeddings: 262_144,
+            // MTP: Qwen3.5-0.8B ships 1 MTP layer
+            mtp_num_hidden_layers: 1,
+            mtp_use_dedicated_embeddings: false,
+        }
+    }
+
     /// **Unstable**: Qwen3.6-35B-A3B text configuration defaults from HF `text_config`.
     pub fn qwen36_35b_a3b() -> Self {
         let num_hidden_layers = 40;
@@ -877,5 +926,87 @@ mod tests {
             "Qwen3.5 mtp_num_hidden_layers must default to 0"
         );
         assert!(!cfg.mtp_use_dedicated_embeddings);
+    }
+
+    #[test]
+    fn test_qwen35_0_8b_preset_dimensions() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert_eq!(cfg.vocab_size, 248_320);
+        assert_eq!(cfg.intermediate_size, 3584);
+        assert_eq!(cfg.num_attention_heads, 8);
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.rope_dim(), 64); // 256 * 0.25
+        assert_eq!(cfg.linear_num_key_heads, 16);
+        assert_eq!(cfg.linear_num_value_heads(), 16);
+        assert_eq!(cfg.linear_key_head_dim, 128);
+        assert_eq!(cfg.linear_value_head_dim, 128);
+        assert_eq!(cfg.eos_token_id, 248_044);
+        assert_eq!(cfg.max_position_embeddings, 262_144);
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        assert!(cfg.tie_word_embeddings);
+        assert!(!cfg.is_moe(), "Qwen3.5-0.8B is dense, not MoE");
+        // Same hybrid pattern as the 2B: [linear, linear, linear, full] x 6.
+        assert_eq!(cfg.layer_types.len(), 24);
+        assert_eq!(cfg.num_full_attention_layers(), 6);
+        assert_eq!(cfg.num_linear_attention_layers(), 18);
+    }
+
+    #[test]
+    fn test_qwen35_0_8b_config_json_fixture_parses() {
+        // Parse the real released config.json (downloaded verbatim) — proves
+        // from_config_json handles the 0.8B checkpoint, not just my transcription.
+        let json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen35_0_8b_config.json"
+        ));
+        let cfg =
+            Qwen35Config::from_config_json_str(json).expect("Qwen3.5-0.8B config.json parses");
+
+        // Core dims must match the released checkpoint.
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.num_hidden_layers, 24);
+        assert_eq!(cfg.vocab_size, 248_320);
+        assert_eq!(cfg.intermediate_size, 3584);
+        assert_eq!(cfg.num_attention_heads, 8);
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.linear_num_key_heads, 16);
+        assert_eq!(cfg.linear_num_value_heads(), 16);
+        assert_eq!(cfg.linear_key_head_dim, 128);
+        assert_eq!(cfg.linear_value_head_dim, 128);
+        assert_eq!(cfg.linear_conv_kernel_dim, 4);
+        assert_eq!(cfg.full_attention_interval, 4);
+        assert_eq!(cfg.eos_token_id, 248_044);
+        assert_eq!(cfg.max_position_embeddings, 262_144);
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+
+        // Released checkpoint is a dense vision-language model — neither the MoE
+        // fields nor the vision wrapper may leak into the text config.
+        assert!(!cfg.is_moe(), "Qwen3.5-0.8B is dense, not MoE");
+
+        // rope_theta and partial_rotary_factor are nested under rope_parameters
+        // in this checkpoint; verify they resolve to the correct values.
+        assert_eq!(cfg.rope_theta, 10_000_000.0);
+        assert!((cfg.partial_rotary_factor - 0.25).abs() < 1e-6);
+        assert_eq!(cfg.rope_dim(), 64);
+
+        // layer_types comes from the explicit JSON array: [lin, lin, lin, full] x 6.
+        assert_eq!(cfg.layer_types.len(), 24);
+        assert_eq!(cfg.num_full_attention_layers(), 6);
+        assert_eq!(cfg.num_linear_attention_layers(), 18);
+        let full_indices: Vec<usize> = cfg
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t == LayerType::FullAttention)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(full_indices, vec![3, 7, 11, 15, 19, 23]);
+
+        // tie_word_embeddings is taken from the outer wrapper.
+        assert!(cfg.tie_word_embeddings);
     }
 }

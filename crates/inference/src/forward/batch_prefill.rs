@@ -11,6 +11,13 @@
 //! avoid a duplicate inherent-method definition. Integration is a one-line swap:
 //! either rename this method to `generate`, or have the existing `generate()`
 //! delegate to it.
+//!
+//! **LoRA limitation**: this batched path does not invoke the `LoraHook` — it has
+//! no `lora.apply()` calls. The live `generate()` in `generation.rs` is unaffected
+//! because it prefills token-by-token via `forward_step`, which does apply the
+//! hook. But the "one-line swap" above would silently drop LoRA adapters during
+//! prompt prefill; wiring the hook through the projections here is a prerequisite
+//! for that swap.
 
 use crate::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
 use crate::attention::gdn::{
