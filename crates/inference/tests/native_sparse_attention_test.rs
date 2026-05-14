@@ -41,7 +41,8 @@
 //!   - Eq. 10 GQA group sum: sum importance across all query heads in a KV-head group.
 //!   - Top-n forced: always include block 0 (initial) and the 2 highest-indexed valid
 //!     blocks (local); remaining n-3 are top-scored from the rest.
-//!   - Gather ≤ n*l' tokens, apply token-level causal mask, standard softmax attn.
+//!   - Gather only the `<= t` tokens of each selected block (hard causal exclusion,
+//!     not a soft mask), then standard softmax attention.
 //!
 //! **Sliding-window branch** (uses RoPE'd `q_rope` / `k_win` / `v_win`, ADR-042 §8)
 //!   - Tokens `[max(0, t-w+1), t]` inclusive.
@@ -713,8 +714,9 @@ fn make_nsa_inputs(cfg: &NsaConfig, seq_len: usize, model_dim: usize, seed: u64)
 
 /// Parity test: kernel output matches naive oracle within 1e-4.
 ///
-/// Covers MHA, GQA, early-token cases (seq_len < compress_block,
-/// seq_len < select_block), and multi-block spanning sequences.
+/// Covers MHA, GQA, early-token cases (seq_len < compress_block → no compression
+/// blocks; seq_len < select_block → a single partial selection block), and
+/// multi-block spanning sequences.
 #[test]
 fn test_nsa_parity_kernel_vs_oracle() {
     const TOLERANCE: f32 = 1e-4;
@@ -741,8 +743,8 @@ fn test_nsa_parity_kernel_vs_oracle() {
         // --- Early-token: seq_len < compress_block (no compression blocks) ---
         (1, 2, 2, 4, 4, 2, 4, 3, 8, 8, "early-no-cmp-seq1"),
         (3, 2, 2, 4, 4, 2, 4, 3, 8, 8, "early-no-cmp-seq3"),
-        // --- Early-token: seq_len < select_block (no selection blocks) ---
-        (3, 2, 2, 4, 4, 2, 8, 3, 8, 8, "early-no-slc-seq3"),
+        // --- Early-token: seq_len < select_block (one partial selection block) ---
+        (3, 2, 2, 4, 4, 2, 8, 3, 8, 8, "early-partial-slc-seq3"),
         // --- MHA: single block spanning ---
         (8, 2, 2, 4, 4, 2, 4, 3, 8, 8, "mha-2h-seq8-l4-d2-lp4"),
         // --- MHA: multiple blocks ---
@@ -1076,34 +1078,35 @@ fn test_nsa_selection_no_future_leak() {
     }
 }
 
-/// Causal prefix-invariance regression (round-3 review, finding 1).
+/// Run the kernel on a long sequence and on a truncated prefix of it, and assert the
+/// first `short_len` query outputs are bit-identical. A causal prefill kernel must
+/// produce the same output for query `t` regardless of how many tokens follow it.
 ///
-/// A causal prefill kernel must produce the same output for query `t` regardless of
-/// how many tokens follow it. The selection-block count was computed with `floor`,
-/// so a short prefix could have *zero* selection blocks while the same prefix inside
-/// a longer sequence had one — silently activating the selection branch for earlier
-/// queries. With `ceil` block counting the available block set depends only on `t`.
-#[test]
-fn test_nsa_prefix_invariance() {
-    let cfg = NsaConfig {
-        num_heads: 2,
-        num_kv_heads: 1,
-        head_dim: 4,
-        compress_block: 4,
-        compress_stride: 2,
-        select_block: 4,
-        num_selected: 3,
-        window: 4,
-    };
-    let long_len = 8;
-    let short_len = 3; // < select_block: with `floor` this had 0 selection blocks
+/// `force_select_only` overrides the gate to `g_slc ≈ 1`, `g_cmp ≈ g_win ≈ 0` so the
+/// prefix-invariance check isolates the selection branch.
+fn assert_prefix_invariant(
+    cfg: &NsaConfig,
+    short_len: usize,
+    long_len: usize,
+    force_select_only: bool,
+) {
     let model_dim = 8;
-    let seed = 4242_u64;
+    let seed = (short_len as u64) * 131 + long_len as u64 * 7 + 4242;
 
-    // Build inputs for the long sequence; the short run uses the first `short_len`
-    // tokens of every buffer — an exact prefix. Weights are seq_len-independent.
-    let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, weights) =
-        make_nsa_inputs(&cfg, long_len, model_dim, seed);
+    // Weights are seq_len-independent, so the long and short runs share them.
+    let (q, q_rope, k_cmp, k_slc, k_win, v_cmp, v_slc, v_win, x, mut weights) =
+        make_nsa_inputs(cfg, long_len, model_dim, seed);
+
+    if force_select_only {
+        weights.g_proj_w = vec![0.0_f32; 3 * cfg.num_heads * model_dim];
+        let mut g_proj_b = Vec::with_capacity(3 * cfg.num_heads);
+        for _ in 0..cfg.num_heads {
+            g_proj_b.push(-100.0_f32); // g_cmp ≈ 0
+            g_proj_b.push(100.0); // g_slc ≈ 1
+            g_proj_b.push(-100.0); // g_win ≈ 0
+        }
+        weights.g_proj_b = g_proj_b;
+    }
 
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -1124,7 +1127,7 @@ fn test_nsa_prefix_invariance() {
             &weights,
             &mut out,
             len,
-            &cfg,
+            cfg,
             &mut scratch,
         );
         out
@@ -1133,17 +1136,64 @@ fn test_nsa_prefix_invariance() {
     let out_long = run(long_len);
     let out_short = run(short_len);
 
-    // The first `short_len` query outputs must be bit-identical: those queries see
-    // exactly the same prefix in both runs.
     for i in 0..short_len * q_dim {
         assert_eq!(
             out_short[i].to_bits(),
             out_long[i].to_bits(),
-            "prefix-invariance violated at output index {i} (query {}): \
-             out_short={} out_long={} — appending future tokens changed an earlier output",
+            "prefix-invariance violated at output index {i} (query {}, short_len={short_len}, \
+             long_len={long_len}): out_short={} out_long={} — appending future tokens \
+             changed an earlier output",
             i / q_dim,
             out_short[i],
             out_long[i]
         );
     }
+}
+
+/// Causal prefix-invariance regression (round-3 review, finding 1; broadened round-4).
+///
+/// The selection-block count was computed with `floor`, so a short prefix could have
+/// *zero* selection blocks while the same prefix inside a longer sequence had one —
+/// silently activating the selection branch for earlier queries. With `ceil` block
+/// counting the available block set depends only on `t`. The cases below span the
+/// compression and free-block-selection paths too, not just the original `floor` bug.
+#[test]
+fn test_nsa_prefix_invariance() {
+    let base = |l, d, lp, n, w| NsaConfig {
+        num_heads: 2,
+        num_kv_heads: 1,
+        head_dim: 4,
+        compress_block: l,
+        compress_stride: d,
+        select_block: lp,
+        num_selected: n,
+        window: w,
+    };
+
+    // short_len < l': the original floor/ceil bug — the selection branch must not
+    // toggle on between the short and long runs.
+    assert_prefix_invariant(&base(4, 2, 4, 3, 4), 3, 8, false);
+    // short_len > l: the compression branch is active inside the prefix (multiple
+    // compression blocks for the later prefix queries).
+    assert_prefix_invariant(&base(4, 2, 4, 3, 4), 8, 16, false);
+    // n=5 with more than n valid selection blocks: exercises importance-based
+    // free-block selection within the prefix.
+    assert_prefix_invariant(&base(4, 2, 4, 5, 8), 24, 32, false);
+    // Larger l' (l != l'), GQA, and gates forced select-only so the check isolates
+    // the selection branch.
+    assert_prefix_invariant(
+        &NsaConfig {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 4,
+            compress_block: 4,
+            compress_stride: 2,
+            select_block: 8,
+            num_selected: 4,
+            window: 4,
+        },
+        10,
+        20,
+        true,
+    );
 }

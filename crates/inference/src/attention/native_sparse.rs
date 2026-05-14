@@ -247,11 +247,9 @@ pub struct NsaWeights {
 #[derive(Default, Clone, Debug)]
 pub struct NsaScratch {
     // --- φ MLP intermediates ---
-    /// φ first-layer hidden: `[phi_in]` for one block.
-    phi_hidden: Vec<f32>,
     /// φ first-layer input (block flattened with PE): `[phi_in]`.
     phi_input: Vec<f32>,
-    /// φ first-layer output: `[phi_in]`.
+    /// φ first-layer output (ReLU'd in place, then fed to layer 2): `[phi_in]`.
     phi_tmp1: Vec<f32>,
 
     // --- Compression branch ---
@@ -305,7 +303,6 @@ impl NsaScratch {
         let win = cfg.window;
         let lp = cfg.select_block;
 
-        self.phi_hidden.resize(phi_in, 0.0);
         self.phi_input.resize(phi_in, 0.0);
         self.phi_tmp1.resize(phi_in, 0.0);
         // ck/cv are per-KV-head: num_kv_heads × max_cblocks × head_dim
