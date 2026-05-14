@@ -1,5 +1,6 @@
 pub mod flash;
 pub mod flash_causal;
+pub mod gated;
 pub mod gdn;
 pub mod gdn_fused;
 pub mod gqa;

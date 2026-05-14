@@ -127,6 +127,31 @@ impl ForwardScratch {
         resize(&mut self.logits, cfg.vocab_size);
     }
 
+    /// Deinterleave packed `[Q|gate]` from `q_and_gate` into `q_buf` and `gate_z`.
+    ///
+    /// Zero-allocation — destructures `self` into disjoint field borrows and
+    /// delegates to [`deinterleave_q_gate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if any buffer is too short for `num_heads * head_dim`.
+    pub(crate) fn split_q_and_gate(&mut self, num_heads: usize, head_dim: usize) {
+        let q_dim = num_heads * head_dim;
+        let Self {
+            q_and_gate,
+            q_buf,
+            gate_z,
+            ..
+        } = self;
+        crate::attention::gated::deinterleave_q_gate(
+            &q_and_gate[..2 * q_dim],
+            &mut q_buf[..q_dim],
+            &mut gate_z[..q_dim],
+            num_heads,
+            head_dim,
+        );
+    }
+
     pub(crate) fn ensure_decode_capacity(
         &mut self,
         hidden: usize,

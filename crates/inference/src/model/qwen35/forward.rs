@@ -6,6 +6,7 @@ use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights,
 };
+use crate::attention::gated::apply_sigmoid_gate;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
@@ -210,10 +211,7 @@ impl Qwen35Model {
             num_kv_heads,
         );
 
-        for d in 0..q_dim {
-            let sig = 1.0 / (1.0 + (-scratch.gate_z[d]).exp());
-            scratch.context[d] *= sig;
-        }
+        apply_sigmoid_gate(&mut scratch.context[..q_dim], &scratch.gate_z[..q_dim]);
 
         matmul_bt(
             &scratch.context[..q_dim],
@@ -251,15 +249,7 @@ impl Qwen35Model {
         matmul_bt(input, &weights.q_proj, q_and_gate, 1, hidden, q_proj_dim);
         self.lora.apply(layer_idx, "q_proj", input, q_and_gate);
 
-        let gate_z = &mut scratch.gate_z[..q_dim];
-        for h in 0..num_q_heads {
-            let src = h * head_dim * 2;
-            let dst = h * head_dim;
-            scratch.q_buf[dst..dst + head_dim]
-                .copy_from_slice(&scratch.q_and_gate[src..src + head_dim]);
-            gate_z[dst..dst + head_dim]
-                .copy_from_slice(&scratch.q_and_gate[src + head_dim..src + head_dim * 2]);
-        }
+        scratch.split_q_and_gate(num_q_heads, head_dim);
 
         let input = &scratch.input_tmp[..hidden];
         matmul_bt(
