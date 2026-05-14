@@ -39,7 +39,7 @@ Public surface:
 
 3. **Subtract scores, then one V matmul**: The reference computes `attn1 = softmax1 @ v` and `attn2 = softmax2 @ v` separately, then `attn1 - lambda_full·attn2`. The kernel instead computes `(softmax1 - lambda_full·softmax2) @ v` — a single V matmul. This is exactly equivalent by linearity of matrix multiplication and saves one GEMM per head pair.
 
-4. **GQA via post-split head mapping**: `multihead_flashdiff_1.py` *defines* a `repeat_kv` helper but does **not** call it — it splits Q/K into `q1/q2/k1/k2` first (with `num_heads` / `num_kv_heads` heads respectively), then passes them to `flash_attn_func`, which performs standard GQA grouping internally. The standard convention `kv_head = query_head // n_rep` therefore applies to the *post-split* logical heads. The kernel maps logical pair `h` to KV head `h / n_rep`, packed K heads `2·(h/n_rep)` and `2·(h/n_rep)+1`. This was verified against the Microsoft source — an earlier reading that assumed `repeat_kv` was applied to the pre-split `2·num_kv_heads` axis was wrong.
+4. **GQA via post-split head mapping**: `multihead_flashdiff_1.py` *defines* a `repeat_kv` helper but does **not** call it — it splits Q/K into `q1/q2/k1/k2` first (with `num_heads` / `num_kv_heads` heads respectively), then passes them to `flash_attn_func`, which performs standard GQA grouping internally. The standard convention `kv_head = query_head // n_rep` therefore applies to the *post-split* logical heads. The kernel maps logical pair `h` to KV head `h / n_rep`, packed K heads `2·(h/n_rep)` and `2·(h/n_rep)+1`. This was verified against the Microsoft source — an earlier reading that assumed `repeat_kv` was applied to the pre-split `2·num_kv_heads` axis was wrong. `test_gqa_equals_materialized_mha` guards it: a GQA run must produce bit-identical output to a pure-MHA run (`n_rep = 1`) whose KV heads are materialized in contiguous `repeat_kv` order.
 
 5. **Additive `-10,000.0` causal mask**: Consistent with ADR-010 design choice #2 — avoids the NaN risk of `-inf` on fully-masked rows. The softmax loop only iterates the causal prefix, so masked positions are also explicitly zeroed.
 
@@ -64,12 +64,12 @@ Public surface:
 
 - Differential attention is independently testable and benchmarkable (6 unit tests, 4 integration tests, dedicated benchmark).
 - When a DIFF Transformer checkpoint becomes a target, the math is already implemented and validated.
-- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at ~1.8–2.2x a single-softmax baseline with identical loop topology. The comparison is topology-controlled: a comparison against the batched `apply_gqa_attention` would conflate kernel topology with mechanism cost.
+- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at ~1.5–2.0x a single-softmax baseline (measured: 1.97x / 1.96x / 1.48x for the 2h / 4h-GQA / 8h-GQA shapes at seq_len 256; the ratio shrinks at larger head counts as the shared per-pair scratch traffic grows). The baseline has identical loop topology *and* identical per-pair scratch-slab layout, so the only working-set difference is the differential kernel's `scores2` slab — itself part of the mechanism. A comparison against the batched `apply_gqa_attention` would instead conflate kernel topology and scratch cache-layout with mechanism cost.
 
 **Negative**:
 
 - Sixth attention module adds a sixth test suite to maintain.
-- The integration test's reference and the optimized kernel share the GQA head-mapping convention. The mapping was manually verified against the Microsoft source, but a fully independent oracle (e.g. tracked vectors from a PyTorch run of the actual reference) would be stronger. MHA cases (`n_rep = 1`) are unambiguous and independently meaningful.
+- The integration test's naive reference (`ref_differential_attention`) shares the `pair_h / n_rep` GQA head-mapping derivation with the kernel, so on its own it cannot catch a shared grouping misunderstanding (contiguous vs. interleaved). `test_gqa_equals_materialized_mha` closes most of this gap: it runs a GQA config against an MHA config (`n_rep = 1`, no grouping logic in the compute path) whose KV heads are physically materialized in contiguous `repeat_kv` order via a hardcoded pair→KV table, and asserts bit-identical output — the oracle there decides the grouping by explicit data placement, not by the kernel's own indexing formula. The remaining gap is a capture from the actual flash-attn reference, which requires CUDA hardware that Lattice's CI does not have.
 
 **Risks**:
 
