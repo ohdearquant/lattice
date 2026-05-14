@@ -58,10 +58,23 @@ impl DiffAttnConfig {
     }
 
     /// **Unstable**: GQA repeat factor per KV head: `num_heads / num_kv_heads`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_kv_heads == 0` or `num_heads` is not divisible by it. Real
+    /// `assert!`s (not `debug_assert`) — this is a public method, so a release
+    /// caller passing an invalid config must fail loudly rather than divide by
+    /// zero or silently floor a non-divisible ratio.
     #[inline]
     pub fn n_rep(&self) -> usize {
-        debug_assert!(self.num_kv_heads > 0);
-        debug_assert_eq!(self.num_heads % self.num_kv_heads, 0);
+        assert!(self.num_kv_heads > 0, "num_kv_heads must be > 0");
+        assert_eq!(
+            self.num_heads % self.num_kv_heads,
+            0,
+            "num_heads ({}) must be divisible by num_kv_heads ({})",
+            self.num_heads,
+            self.num_kv_heads
+        );
         self.num_heads / self.num_kv_heads
     }
 
@@ -909,5 +922,20 @@ mod tests {
             &cfg,
             &mut scratch,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_kv_heads must be > 0")]
+    fn test_n_rep_zero_num_kv_heads_panics() {
+        // `n_rep()` is public — a direct caller in release must fail loudly,
+        // not hit a raw divide-by-zero.
+        let _ = make_cfg(4, 0, 8, 0).n_rep();
+    }
+
+    #[test]
+    #[should_panic(expected = "must be divisible")]
+    fn test_n_rep_non_divisible_panics() {
+        // Non-divisible config must panic, not silently floor 5/2 → 2.
+        let _ = make_cfg(5, 2, 8, 0).n_rep();
     }
 }
