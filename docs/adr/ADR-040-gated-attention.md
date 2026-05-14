@@ -39,7 +39,7 @@ The Qwen3.5 forward pass calls these functions instead of inlining the logic. Fu
 
 4. **No headwise variant**: The paper ablates both headwise (one scalar per head) and elementwise (one scalar per head dimension) gating. Qwen3.5 and Qwen3-Next ship with elementwise. The headwise variant is cheaper but cannot load released checkpoints. We implement only elementwise; headwise can be added as a separate function if a checkpoint requires it.
 
-5. **Temporary allocation in deinterleave call site**: The refactored Qwen3.5 forward path copies `q_and_gate` to a temporary `Vec` before calling `deinterleave_q_gate`, because Rust's borrow checker prevents simultaneous mutable access to `scratch.q_and_gate`, `scratch.q_buf`, and `scratch.gate_z`. The allocation is 32 KB at the largest model size (16 heads × 256 dim × 2 × 4 bytes) and is negligible relative to the attention matmul. A future optimization could add a dedicated scratch buffer to eliminate this allocation.
+5. **Zero-allocation deinterleave via struct destructuring**: The Qwen3.5 forward path calls `ForwardScratch::split_q_and_gate()`, which destructures `self` into disjoint field borrows (`q_and_gate`, `q_buf`, `gate_z`) and delegates to `deinterleave_q_gate`. This satisfies the borrow checker without `unsafe` or heap allocation. The production path uses the same extracted function that the benchmarks and unit tests exercise.
 
 ---
 
@@ -65,7 +65,6 @@ The Qwen3.5 forward pass calls these functions instead of inlining the logic. Fu
 **Negative**:
 
 - Fifth attention module adds a fifth test suite to maintain.
-- The `to_vec()` copy in the Qwen3.5 call site adds a small per-layer allocation on the decode path.
 
 **Risks**:
 

@@ -103,7 +103,13 @@ pub fn apply_sigmoid_gate(context: &mut [f32], gate: &[f32]) {
 /// **Unstable**: scalar elementwise sigmoid gate; used as fallback and in tests.
 #[inline]
 pub fn apply_sigmoid_gate_scalar(context: &mut [f32], gate: &[f32]) {
-    debug_assert_eq!(context.len(), gate.len());
+    assert_eq!(
+        context.len(),
+        gate.len(),
+        "apply_sigmoid_gate_scalar: context.len()={} != gate.len()={}",
+        context.len(),
+        gate.len(),
+    );
     for (c, &g) in context.iter_mut().zip(gate.iter()) {
         let sig = 1.0 / (1.0 + (-g).exp());
         *c *= sig;
