@@ -36,13 +36,18 @@
 //! `mean_abs_error`, `tolerance`, and (for chain probe failures)
 //! `probe_tokens` in the diagnostic message.
 //!
-//! ## What the probe does (and does NOT do)
+//! ## What the chain probe does (and does NOT do)
 //!
-//! The probe is **NOT a faithful Qwen3.5 forward.** It is a deterministic
-//! *rotation-chain probe* that exercises every linear tensor with a
-//! [`crate::quant::quarot::plan::RotationPlan`] rule plus every
-//! `*_layernorm` tensor with a
-//! [`crate::quant::quarot::rmsnorm_fusion::RmsNormFusionTarget`] entry:
+//! The chain probe is **NOT a faithful Qwen3.5 forward.** It is a
+//! deterministic *residual-stream walk* that consumes a deliberately
+//! narrow subset of the rotation plan — one input projection + one
+//! output projection per attention layer, plus the full dense MLP and
+//! the embedding / lm_head edges. It does NOT exercise every planned
+//! tensor (it skips `k_proj`, `v_proj`, the gate-z half of `q_proj`,
+//! `in_proj_qkv`, `in_proj_a`, `in_proj_b`); the per-tensor
+//! matrix-equivalence check is what covers those. The chain probe's
+//! value is end-to-end residual-stream coverage; the per-tensor check's
+//! value is per-matrix completeness:
 //!
 //! ```text
 //!   h ← embed_tokens[token]
@@ -193,11 +198,20 @@ impl Default for ForwardEquivalenceConfig {
 /// the assertion contract that gated the `Ok` return.
 #[derive(Debug, Clone)]
 pub struct ForwardEquivalenceReport {
-    /// Largest per-element absolute error across all probe tokens.
+    /// Max-abs delta the gate observed, taken as the maximum of (a) the
+    /// chain probe's per-logit max across all probe tokens and (b) the
+    /// per-tensor matrix-equivalence check's per-element max across
+    /// every planned tensor. A successful return guarantees this value
+    /// is at or below `tolerance`.
     pub max_abs_error: f64,
-    /// Mean absolute error across all `num_probe_tokens * vocab_size` logits.
+    /// Mean absolute error across all `num_probe_tokens * vocab_size`
+    /// chain-probe logits. **Chain-probe-only** — per-tensor deltas
+    /// contribute to `max_abs_error` but not to this mean, because
+    /// element counts vary per tensor and a single weighted mean would
+    /// be skewed by the largest matrix.
     pub mean_abs_error: f64,
-    /// Tokens actually probed (deterministic from `seed` and `vocab_size`).
+    /// Tokens actually probed by the chain probe (deterministic from
+    /// `seed` and `vocab_size`).
     pub probe_tokens: Vec<u32>,
     /// Tolerance the gate evaluated against (echoed for downstream logging).
     pub tolerance: f64,
@@ -221,10 +235,12 @@ pub struct ForwardEquivalenceReport {
 ///
 /// `rotation` MUST be the same [`RandomizedHadamard`] the caller passed
 /// to [`crate::quant::quarot::pipeline::absorb_rotations`]. The
-/// per-tensor check uses it to verify the algebraic identity
-/// `W_rot · (R · x) = W_orig · ((1 + γ) ⊙ x)` (input-side, fused) or
-/// `W_rot · y = R · (W_orig · y)` (output-side) on each planned tensor.
-/// A mismatch between this rotation and the one absorbed into the
+/// per-tensor check uses it to **reconstruct the expected `W_rot`**
+/// from the original-side source via the same primitives the pipeline
+/// uses (column-multiply by `(1 + γ)` if fusion applies, then
+/// [`absorb_input_rotation_f64`] or [`absorb_output_rotation_f64`]),
+/// and compares every stored element to the actual rotated matrix. A
+/// mismatch between this rotation and the one absorbed into the
 /// rotated working set is one of the bugs the gate explicitly catches
 /// (per-tensor check will refuse).
 ///
