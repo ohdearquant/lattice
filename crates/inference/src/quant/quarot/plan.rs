@@ -250,12 +250,14 @@ impl RotationPlan {
     /// Plan rules for **the linear-layer subset** of Qwen3.5 residual-stream
     /// rotation. Covers GQA + GDN + dense MLP + embed/lm_head.
     ///
-    /// **NOT a complete v0 conversion plan.** Two known blockers (see module doc
-    /// §Known gaps): (1) RMSNorm `(1+gamma)` does not commute with Hadamard,
-    /// must be fused into the following linear layer before the conversion
-    /// is correctness-preserving; (2) no coverage validation against the
-    /// loader's tensor list. Step 3c/3d will close both before a real
-    /// `quantize_quarot` binary runs.
+    /// **NOT a complete v0 conversion plan.** Rotation rules only — see
+    /// module doc §Known gaps for the full list of conversion-binary
+    /// responsibilities not captured here: shifted RMSNorm `(1+gamma)`
+    /// fusion + neutralization (input/post/final), `tie_word_embeddings=false`
+    /// config flip, fused `lm_head` materialization, per-layer coverage
+    /// against `qwen_required_tensor_names` (currently `#[cfg(test)]`-gated),
+    /// and LoRA-runtime incompatibility marker. Step 3c/3d's
+    /// `quantize_quarot` binary owns all of these.
     pub fn qwen35_residual_stream_linear_layers() -> Self {
         let r_in = TensorRotation {
             side: AbsorptionSide::InputSide,
@@ -294,10 +296,13 @@ impl RotationPlan {
                 req("mlp.down_proj.weight", r_out),
                 // Embedding — always required
                 req("embed_tokens.weight", r_in),
-                // lm_head — optional. Absent when tie_word_embeddings=true
-                // (Qwen3.5 default per qwen35_config.rs:177). When tied, the
-                // logits_weight() fallback at weights.rs:51 uses embed_tokens,
-                // which is already rotated input-side and handles both roles.
+                // lm_head — optional in the INPUT SafeTensors. Absent when
+                // tie_word_embeddings=true (Qwen3.5 default per
+                // qwen35_config.rs:177); step 3c's converter materializes
+                // it from embed_tokens AND flips tie_word_embeddings=false
+                // in the output config so the runtime loads it. See module
+                // §Tied embeddings for why the tied-fallback path is NOT
+                // correctness-preserving.
                 opt("lm_head.weight", r_in),
             ],
         }
