@@ -316,10 +316,36 @@ pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
 // BF16-input quantization API (for streaming model shards)
 // ---------------------------------------------------------------------------
 
+/// Assert that `shape.iter().product()` equals `data_len`.
+///
+/// SafeTensors' own `TensorView::new` rejects shape/data-size mismatches
+/// (returns `InvalidTensorView`). The Q4 entry points keep the same
+/// contract — without this check, a caller can produce a [`Q4Tensor`]
+/// whose `shape` claims `[1, 96]` while `original_len` reads 64, and
+/// `save_q4_file` will then write the inconsistent metadata into a `.q4`
+/// header that downstream loaders (`write_merged_qkvz`, the Metal
+/// runtime path) trust without re-verification. Uses `checked_mul` so
+/// `usize` overflow on a malformed shape surfaces as a panic at
+/// construction, not as a wraparound that aliases a valid length.
+#[track_caller]
+fn assert_shape_matches_data_len(shape: &[usize], data_len: usize) {
+    let numel = shape
+        .iter()
+        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+        .unwrap_or_else(|| {
+            panic!("shape product overflowed usize: shape={shape:?}");
+        });
+    assert_eq!(
+        numel, data_len,
+        "shape product {numel} (shape={shape:?}) must equal data length {data_len}"
+    );
+}
+
 /// Quantize a BF16 tensor (raw `u16` slice) into a [`Q4Tensor`].
 ///
-/// `shape.iter().product()` must equal `data.len()`.
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
 pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -356,8 +382,9 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
 /// side of a Q4 bin boundary or shift `abs_max` for the block. The f32 path
 /// avoids that truncation.
 ///
-/// `shape.iter().product()` must equal `data.len()`.
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
 pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -396,8 +423,9 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
 /// at exact-midpoint values and rotated activations rarely sit on bin
 /// boundaries.
 ///
-/// `shape.iter().product()` must equal `data.len()`.
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
 pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -1271,6 +1299,43 @@ mod tests {
             max_f32 <= max_bf16,
             "f32 max abs error ({max_f32:.6}) should be <= bf16 max abs error ({max_bf16:.6})"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_f32_to_q4_rejects_shape_data_mismatch() {
+        let data = synthetic_f32_uniform(64, 41);
+        // shape claims 96 elements; data has 64 → must panic.
+        let _ = quantize_f32_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_f64_to_q4_rejects_shape_data_mismatch() {
+        let data: Vec<f64> = synthetic_f32_uniform(64, 43)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let _ = quantize_f64_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_bf16_to_q4_rejects_shape_data_mismatch() {
+        // Lock the same contract on the pre-existing BF16 entry point — the
+        // SafeTensors source format rejects shape/data mismatches and the Q4
+        // bridge must not silently weaken that invariant.
+        let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
+        let _ = quantize_bf16_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflowed usize")]
+    fn quantize_f32_to_q4_rejects_shape_product_overflow() {
+        let data = vec![0.0_f32; 32];
+        // usize::MAX * 2 overflows; checked_mul must catch it before the
+        // length comparison aliases to a valid length by wraparound.
+        let _ = quantize_f32_to_q4(&data, &[usize::MAX, 2]);
     }
 
     #[test]
