@@ -45,7 +45,7 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{quantize_f64_to_q4, save_q4_file};
+use crate::weights::q4_weights::{q4_f32_to_f16, quantize_f64_to_q4, save_q4_file};
 
 /// CLI / library options for [`convert_quarot_qwen35`].
 #[derive(Debug, Clone)]
@@ -134,6 +134,11 @@ pub fn convert_quarot_qwen35(
     output_dir: &Path,
     opts: &ConversionOptions,
 ) -> Result<ConversionReport, InferenceError> {
+    // Path-layout validation runs FIRST so the cheap CLI footguns
+    // (same dir, non-empty target) fail before any expensive tensor
+    // work and before any disk write.
+    validate_output_dir_layout(input_dir, output_dir)?;
+
     let config_path = input_dir.join("config.json");
     let config_json = fs::read_to_string(&config_path).map_err(|e| {
         InferenceError::Inference(format!(
@@ -301,6 +306,67 @@ pub fn convert_quarot_qwen35(
     })
 }
 
+/// Refuse two CLI footguns that would otherwise let a failed conversion
+/// leave the caller with corrupted source artifacts or a half-stale
+/// output directory:
+///
+/// 1. `input_dir` and `output_dir` resolving to the **same canonical
+///    path** — the converter would write a mutated (untied)
+///    `config.json` on top of the source, then if the gate later
+///    refused, the user would be left with a broken source checkpoint.
+///    The runtime loader then takes the untied branch and demands a
+///    `lm_head.weight` that never reached disk.
+/// 2. A pre-existing **non-empty `output_dir`** — refuse-on-fail
+///    short-circuits before any new files are written, so stale `.q4`
+///    artifacts from a previous run would survive a gate failure and
+///    the runtime would still pick them up. The PR-documented invariant
+///    is "absent or empty after a refuse"; enforce it by requiring
+///    `output_dir` to be empty (or absent) before we start.
+///
+/// Both checks fire before tensors are loaded, so the cost of bailing
+/// is just a stat call.
+fn validate_output_dir_layout(input_dir: &Path, output_dir: &Path) -> Result<(), InferenceError> {
+    let input_canon = fs::canonicalize(input_dir).map_err(|e| {
+        InferenceError::Inference(format!(
+            "validate_output_dir_layout: cannot canonicalize input_dir {}: {e}",
+            input_dir.display()
+        ))
+    })?;
+    if !output_dir.exists() {
+        return Ok(());
+    }
+    let output_canon = fs::canonicalize(output_dir).map_err(|e| {
+        InferenceError::Inference(format!(
+            "validate_output_dir_layout: cannot canonicalize output_dir {}: {e}",
+            output_dir.display()
+        ))
+    })?;
+    if input_canon == output_canon {
+        return Err(InferenceError::Inference(format!(
+            "validate_output_dir_layout: input and output directories resolve to the same \
+             path ({}); refusing to overwrite source artifacts. Pass a separate \
+             --output-dir to avoid corrupting the input checkpoint.",
+            input_canon.display()
+        )));
+    }
+    let mut entries = fs::read_dir(output_dir).map_err(|e| {
+        InferenceError::Inference(format!(
+            "validate_output_dir_layout: cannot read output_dir {}: {e}",
+            output_dir.display()
+        ))
+    })?;
+    if entries.next().is_some() {
+        return Err(InferenceError::Inference(format!(
+            "validate_output_dir_layout: output_dir {} is not empty; refusing to mix \
+             new conversion output with pre-existing files. Remove the directory or \
+             pass a fresh path — a refused conversion must not leave a partial mix \
+             of stale + new artifacts.",
+            output_canon.display()
+        )));
+    }
+    Ok(())
+}
+
 fn sanitize_tensor_name(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -362,7 +428,14 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
 
     let mut payload = Vec::with_capacity(data.len() * 2);
     for &v in data {
-        let h = f32_to_f16_bits(v as f32);
+        // Use the subnormal-aware helper from `weights::q4_weights`. The
+        // hand-rolled flush-to-zero variant in `bin/quantize_q4.rs`
+        // silently rounds f16-subnormal-but-f32-normal values
+        // (~1e-7 range) to zero — relevant here because every kept
+        // tensor (norms, A_log, dt_bias, conv1d, etc.) passes through
+        // this path. `q4_f32_to_f16` round-trips through the f16
+        // subnormal range correctly.
+        let h = q4_f32_to_f16(v as f32);
         payload.extend_from_slice(&h.to_le_bytes());
     }
     write_all(&payload)?;
@@ -371,66 +444,11 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
     Ok(bytes_written)
 }
 
-/// Convert f32 to IEEE-754 f16 bit pattern with round-to-nearest-even.
-/// Matches `bin/quantize_q4.rs::f32_to_f16` exactly so .f16 files this
-/// converter produces are byte-compatible with the existing path.
-#[inline]
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let frac = bits & 0x007f_ffff;
-
-    if exp == 0xff {
-        if frac == 0 {
-            return sign | 0x7c00;
-        }
-        let mut payload = ((frac >> 13) as u16) & 0x03ff;
-        if payload == 0 {
-            payload = 1;
-        }
-        return sign | 0x7c00 | payload | 0x0200;
-    }
-    if exp == 0 {
-        return sign;
-    }
-
-    let exp32 = exp - 127;
-    if exp32 > 15 {
-        return sign | 0x7c00;
-    }
-
-    if exp32 >= -14 {
-        let frac16_raw = (frac >> 13) as u16;
-        let round_bit = ((frac >> 12) & 1) as u16;
-        let sticky = (frac & 0x0fff) != 0;
-        let frac16 = frac16_raw
-            + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
-                1
-            } else {
-                0
-            };
-        let mut exp16 = (exp32 + 15) as u16;
-        let mut frac16_final = frac16 & 0x03ff;
-        if frac16 == 0x0400 {
-            frac16_final = 0;
-            exp16 += 1;
-            if exp16 >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-        return sign | (exp16 << 10) | frac16_final;
-    }
-
-    sign
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
     use serde_json::Value;
-    use std::io::Write as _;
 
     // ------------------------------------------------------------------
     // Tiny test config + SafeTensors writer (local to this module to
@@ -1018,27 +1036,138 @@ mod tests {
         assert_eq!(bytes_written, raw.len());
     }
 
-    /// f32_to_f16_bits matches the convention used in bin/quantize_q4 for
-    /// a few canonical values (zero, one, negative, subnormal-to-zero).
+    /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
+    /// Includes an f16-subnormal regression: codex round-1 flagged that
+    /// the old local helper flushed every value below f16's smallest
+    /// normal to zero, silently corrupting small-magnitude weights in
+    /// kept tensors (e.g., `A_log`, `dt_bias`, GDN `linear_attn.norm`).
     #[test]
-    fn f32_to_f16_bits_canonical_values() {
-        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
-        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
-        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
-        assert_eq!(f32_to_f16_bits(-1.0), 0xbc00);
-        // f32 subnormals → 0 in f16.
-        assert_eq!(f32_to_f16_bits(1e-40_f32), 0);
-        // Infinity preserves sign.
-        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
-        assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+    fn q4_f32_to_f16_canonical_and_subnormal_values() {
+        assert_eq!(q4_f32_to_f16(0.0), 0x0000);
+        assert_eq!(q4_f32_to_f16(-0.0), 0x8000);
+        assert_eq!(q4_f32_to_f16(1.0), 0x3c00);
+        assert_eq!(q4_f32_to_f16(-1.0), 0xbc00);
+        assert_eq!(q4_f32_to_f16(f32::INFINITY), 0x7c00);
+        assert_eq!(q4_f32_to_f16(f32::NEG_INFINITY), 0xfc00);
+        // f16 smallest positive normal is 2^-14 ≈ 6.103515625e-5; values
+        // below that but above the f16 subnormal floor (2^-24) must NOT
+        // flush to zero — they should encode as f16 subnormals.
+        let h = q4_f32_to_f16(1e-7_f32);
+        assert_ne!(
+            h, 0,
+            "1e-7 (an f16 subnormal range value) must not flush to zero \
+             — that was the codex round-1 Medium"
+        );
+        // f32 subnormals (well below f16's subnormal range) DO round to zero
+        // because there's no f16 representation for them.
+        assert_eq!(q4_f32_to_f16(1e-40_f32), 0);
     }
 
-    /// f32_to_bf16_bits helper smoke check (used by other downstream
-    /// tests if BF16 fixtures get added later).
+    /// f32_to_bf16_bits helper smoke check (used by the test fixture
+    /// writer; not exercised by the converter itself).
     #[test]
     fn f32_to_bf16_bits_canonical_values() {
         assert_eq!(f32_to_bf16_bits(0.0), 0);
         assert_eq!(f32_to_bf16_bits(1.0), 0x3f80);
         assert_eq!(f32_to_bf16_bits(-1.0), 0xbf80);
+    }
+
+    // ------------------------------------------------------------------
+    // Path-layout refuses (codex round-1 Majors 1 + 2)
+    // ------------------------------------------------------------------
+
+    /// Major 1: when input and output paths resolve to the same canonical
+    /// path, the converter must refuse before any write would corrupt
+    /// the source `config.json`.
+    #[test]
+    fn convert_quarot_qwen35_rejects_same_input_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 50);
+        let config_before = fs::read(input.join("config.json")).unwrap();
+
+        let err = convert_quarot_qwen35(
+            &input,
+            &input, // same path
+            &ConversionOptions::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("same path"), "unexpected error: {msg}");
+        // Source config must be byte-identical after the rejection.
+        let config_after = fs::read(input.join("config.json")).unwrap();
+        assert_eq!(
+            config_before, config_after,
+            "rejected conversion must not have mutated the source config.json"
+        );
+    }
+
+    /// Major 1 sibling: even when the two paths differ literally (e.g.,
+    /// trailing slash, symlink), canonicalization must still catch the
+    /// equivalence.
+    #[test]
+    fn convert_quarot_qwen35_rejects_same_input_output_dir_via_trailing_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 51);
+        let same_with_slash = tmp.path().join("input/.");
+
+        let err = convert_quarot_qwen35(&input, &same_with_slash, &ConversionOptions::default())
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("same path"), "unexpected error: {msg}");
+    }
+
+    /// Major 2: a pre-existing non-empty output directory must trigger
+    /// refusal before any conversion work, so a previously-written `.q4`
+    /// artifact cannot survive a gate failure and be picked up by the
+    /// runtime loader.
+    #[test]
+    fn convert_quarot_qwen35_rejects_non_empty_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 52);
+        fs::create_dir_all(&output).unwrap();
+        let stale_path = output.join("stale_artifact.q4");
+        fs::write(&stale_path, b"old-q4-bytes").unwrap();
+
+        let err =
+            convert_quarot_qwen35(&input, &output, &ConversionOptions::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not empty"), "unexpected error: {msg}");
+        // The stale artifact must still be on disk (untouched), because
+        // we never started writing — the operator owns cleanup.
+        assert!(stale_path.exists(), "stale file must not be deleted");
+        let bytes = fs::read(&stale_path).unwrap();
+        assert_eq!(&bytes[..], b"old-q4-bytes");
+    }
+
+    /// Empty pre-existing output dir is fine — the converter populates it.
+    #[test]
+    fn convert_quarot_qwen35_accepts_empty_pre_existing_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 53);
+        fs::create_dir_all(&output).unwrap(); // empty
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xABCD_EF01,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert!(report.planned_quantized > 0);
+        assert!(output.join("config.json").exists());
     }
 }
