@@ -7,35 +7,66 @@
 //! Step 3 of [ADR-044](../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md)
 //! glues this plan to SafeTensors I/O and the Q4 bridge.
 //!
-//! ## Scope
+//! ## Scope of this slice
 //!
-//! v0 / step 3 handles the **residual-stream rotation only** — a single
-//! rotation `R_res` of dimension `hidden_size`. Every linear layer that
-//! reads or writes the residual stream gets `R_res` absorbed on the
-//! corresponding side:
+//! Plan covers the **linear-layer tensors that read or write the residual
+//! stream** in Qwen3.5 hybrid (both GQA full-attention layers and
+//! GatedDeltaNet linear-attention layers):
 //!
-//! | Tensor | Reads from residual | Writes to residual | Absorption |
-//! |---|---|---|---|
-//! | `attn.q_proj`, `attn.k_proj`, `attn.v_proj` | ✓ | — | input-side |
-//! | `attn.o_proj` | — | ✓ | output-side |
-//! | `mlp.gate_proj`, `mlp.up_proj` | ✓ | — | input-side |
-//! | `mlp.down_proj` | — | ✓ | output-side |
-//! | `lm_head` | ✓ | — | input-side |
-//! | `embed_tokens` | — | ✓ | output-side |
+//! | Tensor | Reads from residual | Writes to residual | Storage shape | Absorption | Why |
+//! |---|---|---|---|---|---|
+//! | `self_attn.q_proj.weight` | ✓ | — | `[q_dim, hidden]` | input-side | hidden = `cols` |
+//! | `self_attn.k_proj.weight` | ✓ | — | `[kv_dim, hidden]` | input-side | hidden = `cols` |
+//! | `self_attn.v_proj.weight` | ✓ | — | `[kv_dim, hidden]` | input-side | hidden = `cols` |
+//! | `self_attn.o_proj.weight` | — | ✓ | `[hidden, q_dim]` | output-side | hidden = `rows` |
+//! | `mlp.gate_proj.weight` | ✓ | — | `[intermediate, hidden]` | input-side | hidden = `cols` |
+//! | `mlp.up_proj.weight` | ✓ | — | `[intermediate, hidden]` | input-side | hidden = `cols` |
+//! | `mlp.down_proj.weight` | — | ✓ | `[hidden, intermediate]` | output-side | hidden = `rows` |
+//! | `linear_attn.in_proj_qkv.weight` | ✓ | — | `[qkv_dim, hidden]` | input-side | hidden = `cols` |
+//! | `linear_attn.in_proj_z.weight` | ✓ | — | `[output_dim, hidden]` | input-side | hidden = `cols` |
+//! | `linear_attn.in_proj_b.weight` | ✓ | — | `[num_heads, hidden]` | input-side | hidden = `cols` |
+//! | `linear_attn.in_proj_a.weight` | ✓ | — | `[num_heads, hidden]` | input-side | hidden = `cols` |
+//! | `linear_attn.out_proj.weight` | — | ✓ | `[hidden, output_dim]` | output-side | hidden = `rows` |
+//! | `lm_head.weight` (untied) | ✓ | — | `[vocab_size, hidden]` | input-side | hidden = `cols` (each row is a linear functional on the hidden state) |
+//! | `embed_tokens.weight` | — | ✓ | `[vocab_size, hidden]` | **input-side** | despite being a "writer", the storage shape `[vocab_size, hidden]` means each row IS an embedding vector of dim hidden; rotating those rows produces a rotated output, which corresponds to **`W ← W · R^T`** (input-side absorption on the hidden dimension). Output-side absorption would try to match R against `vocab_size` rows and fail dimensionally. |
 //!
-//! Plus pre- and post-norm RMSNorm weights that scale the residual: those
-//! need `g ← R · g` (scale becomes rotated). RMSNorm only multiplies
-//! element-wise so the rotation must be commuted through carefully — for
-//! Hadamard rotations and RMSNorm specifically, this is the QuaRot
-//! identity used in the paper.
+//! Tied embeddings (Qwen3.5 default): when `tie_word_embeddings=true` the
+//! logits weight is `embed_tokens` itself (`logits_weight()` in
+//! `weights.rs:51`). Input-side absorption on `embed_tokens` gives the
+//! right answer for both uses: as embedding it produces `R · embedding`
+//! (rotated output written to residual); as tied lm_head it consumes
+//! `R · hidden_state` (rotated input read from residual) and produces
+//! `W · hidden_original = logits_original` — both correct from a single
+//! absorption.
 //!
-//! **Deferred to v1** (per ADR-044 §Scope, "Out of v0 entirely"):
+//! ## Known gaps (BLOCKERS for real-model conversion — step 3c/3d must address)
+//!
+//! - **RMSNorm `(1 + gamma)` scaling does not commute with Hadamard
+//!   rotation in general.** Qwen3.5 applies RMSNorm with shifted scale
+//!   `(1 + gamma)` (norm.rs:16) at `input_layernorm`,
+//!   `post_attention_layernorm`, `final_norm`, and inside GatedDeltaNet's
+//!   `linear_attn.norm`. Linear-weight absorption alone does NOT preserve
+//!   the model output. The QuaRot paper fuses `(1 + gamma)` into the
+//!   immediately-following linear layer (so each `g_i` becomes part of
+//!   the next `W`'s rows); after fusion, the normalize-only step is
+//!   rotation-invariant. This fusion is NOT in step 3a — step 3c or 3d
+//!   must implement it before any real-model conversion can be claimed
+//!   correct.
+//! - **No coverage validation against the loader's expected tensor list.**
+//!   `for_tensor` matches by suffix, so a stray `mtp.*` or future-named
+//!   tensor in the SafeTensors file (ignored by the runtime loader per
+//!   ADR-043 §Out-of-scope) could be rotated without affecting the
+//!   model. Step 3b's SafeTensors reader must call `validate_coverage`
+//!   to assert: every plan rule matches ≥ 1 tensor, every loaded tensor
+//!   in the residual-touching set matches exactly one plan rule.
+//!
+//! ## Deferred (correctly v1)
+//!
 //! - Per-head-dim rotations on QKV head spaces (improves activation
 //!   quantization; not needed for weight-only Q4)
-//! - MoE expert weights (DeepSeekMoE-style routed experts in Qwen3.5
-//!   MoE layers — same absorption pattern but applied per expert slice)
-//! - GatedDeltaNet linear-attention layers (different residual-stream
-//!   interface; needs separate analysis)
+//! - MoE expert weights (DeepSeekMoE-style routed experts in Qwen3.5 MoE
+//!   layers — same absorption pattern but applied per-expert slice;
+//!   tensor names `mlp.experts.gate_up_proj`, `mlp.experts.down_proj`)
 
 use crate::error::InferenceError;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
@@ -92,42 +123,57 @@ pub struct RotationPlan {
 }
 
 impl RotationPlan {
-    /// Plan for Qwen3.5-style decoder-only models with a single
-    /// residual-stream rotation absorbed across every weight that touches
-    /// the residual.
+    /// Plan rules for **the linear-layer subset** of Qwen3.5 residual-stream
+    /// rotation. Covers GQA + GDN + dense MLP + embed/lm_head.
     ///
-    /// Covers: GQA q_proj/k_proj/v_proj input-side, GQA o_proj output-side,
-    /// dense MLP gate/up input-side and down output-side, embed_tokens
-    /// output-side, lm_head input-side.
-    ///
-    /// Does NOT cover MoE expert weights (deferred — see module doc),
-    /// GatedDeltaNet linear-attention layers (deferred), and per-head-dim
-    /// rotations (deferred to v1).
-    pub fn qwen35_residual_stream() -> Self {
-        let rs = TensorRotation {
+    /// **NOT a complete v0 conversion plan.** Two known blockers (see module doc
+    /// §Known gaps): (1) RMSNorm `(1+gamma)` does not commute with Hadamard,
+    /// must be fused into the following linear layer before the conversion
+    /// is correctness-preserving; (2) no coverage validation against the
+    /// loader's tensor list. Step 3c/3d will close both before a real
+    /// `quantize_quarot` binary runs.
+    pub fn qwen35_residual_stream_linear_layers() -> Self {
+        let r_in = TensorRotation {
             side: AbsorptionSide::InputSide,
             rotation_id: RotationId::ResidualStream,
         };
-        let rs_out = TensorRotation {
+        let r_out = TensorRotation {
             side: AbsorptionSide::OutputSide,
             rotation_id: RotationId::ResidualStream,
         };
         Self {
             rules: vec![
-                ("self_attn.q_proj.weight".into(), rs),
-                ("self_attn.k_proj.weight".into(), rs),
-                ("self_attn.v_proj.weight".into(), rs),
-                ("self_attn.o_proj.weight".into(), rs_out),
-                ("mlp.gate_proj.weight".into(), rs),
-                ("mlp.up_proj.weight".into(), rs),
-                ("mlp.down_proj.weight".into(), rs_out),
-                ("embed_tokens.weight".into(), rs_out),
-                ("lm_head.weight".into(), rs),
+                // GQA full-attention layers
+                ("self_attn.q_proj.weight".into(), r_in),
+                ("self_attn.k_proj.weight".into(), r_in),
+                ("self_attn.v_proj.weight".into(), r_in),
+                ("self_attn.o_proj.weight".into(), r_out),
+                // GDN linear-attention layers — same absorption pattern as GQA
+                ("linear_attn.in_proj_qkv.weight".into(), r_in),
+                ("linear_attn.in_proj_z.weight".into(), r_in),
+                ("linear_attn.in_proj_b.weight".into(), r_in),
+                ("linear_attn.in_proj_a.weight".into(), r_in),
+                ("linear_attn.out_proj.weight".into(), r_out),
+                // Dense MLP layers
+                ("mlp.gate_proj.weight".into(), r_in),
+                ("mlp.up_proj.weight".into(), r_in),
+                ("mlp.down_proj.weight".into(), r_out),
+                // Embedding + LM head (each row is a hidden-dim functional;
+                // input-side absorption applies R to the hidden dim regardless
+                // of whether the tensor is used as embedding or lm_head)
+                ("embed_tokens.weight".into(), r_in),
+                ("lm_head.weight".into(), r_in),
             ],
         }
     }
 
     /// Look up the rotation for a tensor by its SafeTensors name.
+    ///
+    /// Suffix-match against the rule patterns. Step 3b's SafeTensors reader
+    /// MUST cross-check this against the loader's expected tensor list via
+    /// [`Self::validate_coverage`] before rotating anything — `for_tensor`
+    /// alone is too permissive (it would match a future-added or unused
+    /// tensor with a colliding suffix).
     pub fn for_tensor(&self, name: &str) -> Option<TensorRotation> {
         self.rules
             .iter()
@@ -139,6 +185,61 @@ impl RotationPlan {
     /// checks but not for runtime dispatch.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Cross-check the plan against an actual SafeTensors tensor list.
+    ///
+    /// Returns a [`CoverageReport`] listing:
+    /// - which plan rule patterns matched zero tensors (likely typo or
+    ///   wrong model architecture)
+    /// - which loaded tensors matched a plan rule (the rotation targets)
+    ///
+    /// Step 3b's binary should refuse-on-fail when any rule has zero matches —
+    /// that signals the plan was built for a different architecture than
+    /// the loaded SafeTensors. Step 3c's correctness pass should also assert
+    /// that every residual-touching tensor in the loader's expected list IS
+    /// in the plan; that check requires the loader's list, which lives in
+    /// `model/qwen35/loading.rs` and is not imported here to keep this module
+    /// architecture-agnostic at the dispatch layer.
+    pub fn validate_coverage<'a, I>(&self, tensor_names: I) -> CoverageReport
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let names: Vec<&str> = tensor_names.into_iter().collect();
+        let mut matched_tensors: Vec<String> = Vec::new();
+        let mut unmatched_rules: Vec<String> = Vec::new();
+
+        for (pat, _) in &self.rules {
+            let any = names.iter().any(|n| n.ends_with(pat));
+            if !any {
+                unmatched_rules.push(pat.clone());
+            }
+        }
+        for name in &names {
+            if self.for_tensor(name).is_some() {
+                matched_tensors.push((*name).to_string());
+            }
+        }
+        CoverageReport {
+            matched_tensors,
+            unmatched_rules,
+        }
+    }
+}
+
+/// Result of [`RotationPlan::validate_coverage`]. `unmatched_rules` being
+/// non-empty indicates a plan-vs-model mismatch; the conversion binary
+/// should refuse to proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageReport {
+    pub matched_tensors: Vec<String>,
+    pub unmatched_rules: Vec<String>,
+}
+
+impl CoverageReport {
+    /// `true` iff every plan rule matched at least one tensor name.
+    pub fn is_complete(&self) -> bool {
+        self.unmatched_rules.is_empty()
     }
 }
 
@@ -196,55 +297,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen35_plan_covers_dense_residual_stream_tensors() {
-        let plan = RotationPlan::qwen35_residual_stream();
-        assert_eq!(plan.rule_count(), 9);
-
-        let cases = [
-            (
-                "model.layers.0.self_attn.q_proj.weight",
-                AbsorptionSide::InputSide,
-            ),
-            (
-                "model.layers.5.self_attn.k_proj.weight",
-                AbsorptionSide::InputSide,
-            ),
-            (
-                "model.layers.5.self_attn.v_proj.weight",
-                AbsorptionSide::InputSide,
-            ),
-            (
-                "model.layers.5.self_attn.o_proj.weight",
-                AbsorptionSide::OutputSide,
-            ),
-            (
-                "model.layers.23.mlp.gate_proj.weight",
-                AbsorptionSide::InputSide,
-            ),
-            (
-                "model.layers.23.mlp.up_proj.weight",
-                AbsorptionSide::InputSide,
-            ),
-            (
-                "model.layers.23.mlp.down_proj.weight",
-                AbsorptionSide::OutputSide,
-            ),
-            ("model.embed_tokens.weight", AbsorptionSide::OutputSide),
-            ("lm_head.weight", AbsorptionSide::InputSide),
-        ];
-        for (name, expected_side) in cases {
-            let tr = plan
-                .for_tensor(name)
-                .unwrap_or_else(|| panic!("plan missed tensor {name}"));
-            assert_eq!(tr.side, expected_side, "wrong side for {name}");
-            assert_eq!(tr.rotation_id, RotationId::ResidualStream);
-        }
-    }
-
-    #[test]
     fn qwen35_plan_misses_moe_expert_weights() {
         // Documents the v1 deferral — MoE expert tensors are NOT in the v0 plan.
-        let plan = RotationPlan::qwen35_residual_stream();
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         let moe_names = [
             "model.layers.0.mlp.experts.gate_up_proj.weight",
             "model.layers.0.mlp.experts.down_proj.weight",
@@ -258,26 +313,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_plan_misses_gdn_linear_attention_weights() {
-        // Documents the v1 deferral — GatedDeltaNet tensors are NOT in v0.
-        let plan = RotationPlan::qwen35_residual_stream();
-        let gdn_names = [
-            "model.layers.0.linear_attn.A_log",
-            "model.layers.0.linear_attn.dt_bias",
-            "model.layers.0.linear_attn.in_proj.weight",
-            "model.layers.0.linear_attn.out_proj.weight",
-        ];
-        for name in gdn_names {
-            assert!(
-                plan.for_tensor(name).is_none(),
-                "GDN tensor {name} should not match v0 plan"
-            );
-        }
-    }
-
-    #[test]
     fn apply_tensor_rotation_skips_unplanned() {
-        let plan = RotationPlan::qwen35_residual_stream();
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         let hidden = 64;
         let r = RandomizedHadamard::new(7, hidden).unwrap();
         let mut weight = vec![1.0_f32; hidden * hidden];
@@ -306,7 +343,7 @@ mod tests {
         // because down_proj writes BACK to the rotated residual stream.
         let hidden = 64;
         let intermediate = 128;
-        let plan = RotationPlan::qwen35_residual_stream();
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         let r = RandomizedHadamard::new(0xC0FFEE, hidden).unwrap();
 
         let mut state = 1_u64;
@@ -373,7 +410,7 @@ mod tests {
 
     #[test]
     fn f64_apply_matches_f32_apply_pattern() {
-        let plan = RotationPlan::qwen35_residual_stream();
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         let hidden = 64;
         let r = RandomizedHadamard::new(11, hidden).unwrap();
         let mut weight_f32: Vec<f32> = (0..hidden * hidden)
