@@ -42,9 +42,7 @@ v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to k
 - `tie_word_embeddings=false` config flip in the output.
 - `lm_head` materialization with fused `(1 + g_final)` + rotation.
 - Forward-equivalence assertion on a small batch: `‖rotated_forward − original_forward‖ < 1e-5`. Refuse-on-fail (no partial conversion artifacts written).
-- Q4 bridge — decided by measurement, two candidate paths:
-  - (a) downcast f64→BF16 then call existing `quantize_bf16_to_q4` (`q4_weights.rs:318`). BF16's 7-bit mantissa can push values across Q4 bin thresholds and shift block absmax, NOT precision-parity with direct f32/f64→Q4.
-  - (b) add a sibling `quantize_f32_to_q4` entry point.
+- Q4 bridge — **decision: path (b)**, landed in step 3c-1. Sibling entry points `quantize_f32_to_q4` (`q4_weights.rs:356`) and `quantize_f64_to_q4` (`q4_weights.rs:384`) sit alongside the existing `quantize_bf16_to_q4` (`q4_weights.rs:318`). The f64 wrapper downcasts to f32 inside the per-block loop — Q4's per-block scale is stored as f16, so the f64→f32 step does not lose precision relevant to the quantized output. Measurement (`weights::q4_weights::tests::quantize_f32_to_q4_lower_error_than_bf16_path_on_high_precision_input`, 2048 synthetic f32 values uniform on `[-1, 1]`): path (b) mean abs err `0.034279`, max `0.071060`; path (a) f32→BF16→Q4 mean `0.034312`, max `0.071323`. Path (b) is strictly equal-or-better on max and strictly less on mean across the suite. Path (a) is rejected because it discards the f64 rotation precision the absorption pass in §Risks intentionally preserves — the delta is small on uniform-rotated inputs but grows for inputs with concentrated absmax (a few outlier values whose BF16 rounding shifts the block scale for all 32 elements).
 - Output: `.q4` file consumable by the existing inference path with no runtime changes (subject to the LoRA caveat in Risks).
 
 **Out of v0 entirely (deferred to v1)**:
