@@ -15,14 +15,19 @@
 //!    through one input projection + one output projection per attention
 //!    layer plus the full MLP block. Catches errors that propagate
 //!    through the residual stream.
-//! 2. **Per-tensor rotation-equivalence check** — iterates EVERY
-//!    [`RotationPlan`] rule and verifies the algebraic identity
-//!    `W_rot · (R · x) = W_orig · ((1 + γ) ⊙ x)` (input-side, fused) or
-//!    `W_rot · y = R · (W_orig · y)` (output-side) on a deterministic
-//!    random test vector. Catches per-tensor corruption / missed
-//!    rotation absorption / missed fusion on tensors the chain probe
-//!    does not consume — `k_proj`, `v_proj`, the gate-z half of
-//!    `q_proj`, `in_proj_qkv`, `in_proj_a`, `in_proj_b`.
+//! 2. **Per-tensor matrix-equivalence check** — enumerates the
+//!    config-required planned tensor set (via [`qwen_required_tensor_names`]
+//!    filtered through [`RotationPlan`], plus `lm_head.weight`
+//!    unconditionally for the post-materialize state), reconstructs the
+//!    expected `W_rot` from the original-side source using the same
+//!    primitives the pipeline does (column-multiply by `(1 + γ)` if
+//!    fusion applies, then [`absorb_input_rotation_f64`] or
+//!    [`absorb_output_rotation_f64`]), and compares **every stored
+//!    element** to the actual rotated matrix. Catches per-tensor
+//!    corruption / missed rotation absorption / missed fusion on tensors
+//!    the chain probe does not consume — `k_proj`, `v_proj`, gate-z half
+//!    of `q_proj`, `in_proj_qkv`, `in_proj_a`, `in_proj_b` — and refuses
+//!    when a planned tensor is missing from either working set.
 //!
 //! The two checks are complementary: (1) catches residual-stream
 //! breakage holistically, (2) catches every planned tensor individually
@@ -142,6 +147,7 @@
 use std::collections::HashMap;
 
 use crate::error::InferenceError;
+use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::lm_head::{
@@ -150,7 +156,10 @@ use crate::quant::quarot::lm_head::{
 };
 use crate::quant::quarot::pipeline::TensorEntry;
 use crate::quant::quarot::plan::{AbsorptionSide, RotationPlan};
-use crate::quant::quarot::rmsnorm_fusion::{RmsNormFusionTarget, qwen35_per_layer_fusion_plan};
+use crate::quant::quarot::rmsnorm_fusion::{
+    RmsNormFusionTarget, fuse_shifted_rmsnorm_into_next_layer_f64, qwen35_per_layer_fusion_plan,
+};
+use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
 
 /// Probe sample size + tolerance settings for
 /// [`assert_forward_equivalence_qwen35`].
@@ -328,7 +337,6 @@ pub fn assert_forward_equivalence_qwen35(
         rotation,
         &rotation_plan,
         &fusion_plan,
-        forward_cfg.seed,
     )?;
 
     if per_tensor_max_abs > forward_cfg.tolerance {
@@ -350,19 +358,41 @@ pub fn assert_forward_equivalence_qwen35(
     })
 }
 
-/// Per-tensor algebraic-identity check for each [`RotationPlan`] rule.
+/// Per-tensor **matrix-equivalence** check for each [`RotationPlan`] rule.
 ///
-/// For input-side tensors with fusion `γ`:
-/// `‖ W_rot · (R · x) − W_orig · ((1 + γ) ⊙ x) ‖_∞`
+/// For every config-required planned tensor (enumerated from
+/// [`qwen_required_tensor_names`] plus `lm_head.weight` unconditionally
+/// — the loader omits it for tied configs, but post-pipeline rotated
+/// sets must have it), reconstructs the expected post-pipeline matrix
+/// from the original-side source by applying the same primitives the
+/// pipeline does:
 ///
-/// For input-side tensors without fusion (`embed_tokens` only in the
-/// Qwen3.5 plan):
-/// `‖ W_rot · (R · x) − W_orig · x ‖_∞`
+/// - Input-side, fused: `clone → fuse_shifted_rmsnorm_into_next_layer_f64 → absorb_input_rotation_f64`
+/// - Input-side, no fusion (`embed_tokens` only): `clone → absorb_input_rotation_f64`
+/// - Output-side (`o_proj`, `out_proj`, `down_proj`): `clone → absorb_output_rotation_f64`
 ///
-/// For output-side tensors (`o_proj`, `out_proj`, `down_proj`):
-/// `‖ W_rot · y − R · (W_orig · y) ‖_∞`
+/// Then compares the reconstructed matrix to `rotated[name]` element-wise
+/// and tracks the max-abs delta across every planned tensor. This is a
+/// **direct matrix equivalence** check — it has no nullspace (every
+/// stored element of `W_rot` must match the reconstruction), unlike a
+/// single-probe-vector check which could miss perturbations orthogonal
+/// to the probe direction.
 ///
-/// Returns the max across every planned tensor in the working set.
+/// For tied configs where `original` lacks `lm_head.weight` (caller took
+/// the snapshot before `materialize_lm_head_for_qwen35`), the
+/// reconstruction uses `embed_tokens.weight` as the source for
+/// `lm_head` — matching what `materialize_lm_head_for_qwen35` does
+/// internally (clone, then the same fuse + rotate sequence).
+///
+/// # Errors
+///
+/// - Any expected planned tensor missing from either working set.
+/// - Shape / data length mismatch on any planned tensor.
+/// - Input-side tensor with `cols != hidden_size`, or output-side with
+///   `rows != hidden_size` (rotation plan invariant violation).
+/// - Output-side tensor unexpectedly carrying a fusion rule (rotation /
+///   fusion plan inconsistency — should not happen with the Qwen3.5
+///   plans).
 fn check_per_tensor_rotation_equivalence(
     original: &HashMap<String, TensorEntry>,
     rotated: &HashMap<String, TensorEntry>,
@@ -370,153 +400,157 @@ fn check_per_tensor_rotation_equivalence(
     rotation: &RandomizedHadamard,
     rotation_plan: &RotationPlan,
     fusion_plan: &[RmsNormFusionTarget],
-    seed: u64,
 ) -> Result<f64, InferenceError> {
     let hidden = cfg.hidden_size;
 
-    // Name → fusion gamma lookup. γ is read from `original` (un-neutralized);
-    // the rotated set has γ = 0 post-fusion, which is what makes the algebra
-    // check meaningful.
-    let mut fusion_gamma: HashMap<&str, &[f64]> = HashMap::new();
+    // downstream tensor name → norm tensor name (where γ lives in `original`).
+    let mut fusion_gamma: HashMap<&str, &str> = HashMap::new();
     for target in fusion_plan {
-        let norm = original.get(&target.norm_tensor).ok_or_else(|| {
-            InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: fusion norm tensor `{}` \
-                 not in original working set",
-                target.norm_tensor
-            ))
-        })?;
-        if norm.shape.len() != 1 || norm.data.len() != norm.shape[0] {
-            return Err(InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: norm tensor `{}` shape/data \
-                 mismatch (shape={:?}, data.len()={})",
-                target.norm_tensor,
-                norm.shape,
-                norm.data.len()
-            )));
-        }
         for downstream in &target.downstream_weights {
-            fusion_gamma.insert(downstream.as_str(), norm.data.as_slice());
+            fusion_gamma.insert(downstream.as_str(), target.norm_tensor.as_str());
         }
     }
 
-    let x_input = synthetic_unit_vec(hidden, seed);
-    let mut x_input_rot = x_input.clone();
-    rotation.apply_f64(&mut x_input_rot)?;
-
-    // Cache deterministic output-side test vectors by cols dim.
-    let mut output_y_cache: HashMap<usize, Vec<f64>> = HashMap::new();
+    // Config-derived expected planned-tensor set. Filters
+    // qwen_required_tensor_names through the rotation plan and appends
+    // lm_head.weight unconditionally (tied configs omit it from
+    // required-names but always need it post-materialize).
+    let required = qwen_required_tensor_names(cfg);
+    let mut expected_planned: Vec<String> = required
+        .into_iter()
+        .filter(|n| rotation_plan.for_tensor(n).is_some())
+        .collect();
+    let lm_head_name = QWEN35_LM_HEAD_NAME.to_string();
+    if !expected_planned.iter().any(|n| n == &lm_head_name) {
+        expected_planned.push(lm_head_name);
+    }
 
     let mut max_abs = 0.0_f64;
 
-    for (name, t_orig) in original {
-        let Some(tensor_rotation) = rotation_plan.for_tensor(name) else {
-            continue;
-        };
-        let t_rot = rotated.get(name).ok_or_else(|| {
+    for expected_name in &expected_planned {
+        let tensor_rotation = rotation_plan.for_tensor(expected_name).ok_or_else(|| {
             InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: planned tensor `{name}` \
-                 not in rotated working set"
+                "check_per_tensor_rotation_equivalence: expected planned tensor `{expected_name}` \
+                 has no rotation rule (qwen_required_tensor_names/rotation_plan inconsistency)"
             ))
         })?;
-        if t_orig.shape.len() != 2 || t_rot.shape != t_orig.shape {
+
+        // Source tensor on the `original` side. Tied configs may have
+        // taken the snapshot before materialize, in which case lm_head
+        // falls back to embed_tokens (the source materialize would clone).
+        let source = if let Some(t) = original.get(expected_name) {
+            t
+        } else if expected_name == QWEN35_LM_HEAD_NAME && cfg.tie_word_embeddings {
+            original.get(QWEN35_EMBED_TOKENS_NAME).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "check_per_tensor_rotation_equivalence: tied config requires \
+                     either `{QWEN35_LM_HEAD_NAME}` or `{QWEN35_EMBED_TOKENS_NAME}` in the \
+                     original working set as the source for lm_head reconstruction"
+                ))
+            })?
+        } else {
             return Err(InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: tensor `{name}` shape mismatch \
-                 (original={:?}, rotated={:?})",
-                t_orig.shape, t_rot.shape
+                "check_per_tensor_rotation_equivalence: planned tensor `{expected_name}` \
+                 missing from original working set"
+            )));
+        };
+
+        let actual = rotated.get(expected_name).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: planned tensor `{expected_name}` \
+                 missing from rotated working set"
+            ))
+        })?;
+
+        if source.shape.len() != 2 || actual.shape != source.shape {
+            return Err(InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: tensor `{expected_name}` shape mismatch \
+                 (source={:?}, rotated={:?})",
+                source.shape, actual.shape
             )));
         }
-        let rows = t_orig.shape[0];
-        let cols = t_orig.shape[1];
-        let expected = rows.checked_mul(cols).ok_or_else(|| {
+        let rows = source.shape[0];
+        let cols = source.shape[1];
+        let expected_len = rows.checked_mul(cols).ok_or_else(|| {
             InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: rows*cols overflow on `{name}` \
+                "check_per_tensor_rotation_equivalence: rows*cols overflow on `{expected_name}` \
                  ({rows}*{cols})"
             ))
         })?;
-        if t_orig.data.len() != expected || t_rot.data.len() != expected {
+        if source.data.len() != expected_len || actual.data.len() != expected_len {
             return Err(InferenceError::Inference(format!(
-                "check_per_tensor_rotation_equivalence: tensor `{name}` data.len() \
-                 mismatch (original={}, rotated={}, rows*cols={expected})",
-                t_orig.data.len(),
-                t_rot.data.len()
+                "check_per_tensor_rotation_equivalence: tensor `{expected_name}` data.len() mismatch \
+                 (source={}, rotated={}, rows*cols={expected_len})",
+                source.data.len(),
+                actual.data.len()
             )));
         }
 
-        let delta = match tensor_rotation.side {
+        // Reconstruct expected `W_rot` from `W_orig` using the same primitives
+        // the pipeline uses (fuse first if applicable, then absorb the rotation
+        // on the planned side).
+        let mut expected_rot = source.data.clone();
+        match tensor_rotation.side {
             AbsorptionSide::InputSide => {
                 if cols != hidden {
                     return Err(InferenceError::Inference(format!(
-                        "check_per_tensor_rotation_equivalence: input-side tensor `{name}` \
+                        "check_per_tensor_rotation_equivalence: input-side tensor `{expected_name}` \
                          cols={cols} != hidden={hidden} (rotation plan invariant violated)"
                     )));
                 }
-                let x_for_orig: Vec<f64> = if let Some(gamma) = fusion_gamma.get(name.as_str()) {
-                    if gamma.len() != cols {
+                if let Some(norm_name) = fusion_gamma.get(expected_name.as_str()) {
+                    let norm = original.get(*norm_name).ok_or_else(|| {
+                        InferenceError::Inference(format!(
+                            "check_per_tensor_rotation_equivalence: fusion gamma source \
+                             `{norm_name}` (for downstream `{expected_name}`) not in original \
+                             working set"
+                        ))
+                    })?;
+                    if norm.shape.len() != 1 || norm.shape[0] != cols || norm.data.len() != cols {
                         return Err(InferenceError::Inference(format!(
-                            "check_per_tensor_rotation_equivalence: fusion gamma for `{name}` \
-                             length {} != cols={cols}",
-                            gamma.len()
+                            "check_per_tensor_rotation_equivalence: fusion gamma `{norm_name}` \
+                             shape/data mismatch (shape={:?}, data.len()={}, expected cols={cols})",
+                            norm.shape,
+                            norm.data.len()
                         )));
                     }
-                    x_input
-                        .iter()
-                        .zip(gamma.iter())
-                        .map(|(xi, gi)| xi * (1.0 + gi))
-                        .collect()
-                } else {
-                    x_input.clone()
-                };
-                let y_orig = matvec_f64(&t_orig.data, rows, cols, &x_for_orig);
-                let y_rot = matvec_f64(&t_rot.data, rows, cols, &x_input_rot);
-                max_abs_diff(&y_orig, &y_rot)
+                    fuse_shifted_rmsnorm_into_next_layer_f64(
+                        &mut expected_rot,
+                        rows,
+                        cols,
+                        &norm.data,
+                    )?;
+                }
+                absorb_input_rotation_f64(&mut expected_rot, rows, cols, rotation)?;
             }
             AbsorptionSide::OutputSide => {
                 if rows != hidden {
                     return Err(InferenceError::Inference(format!(
-                        "check_per_tensor_rotation_equivalence: output-side tensor `{name}` \
+                        "check_per_tensor_rotation_equivalence: output-side tensor `{expected_name}` \
                          rows={rows} != hidden={hidden} (rotation plan invariant violated)"
                     )));
                 }
-                let y_test = output_y_cache
-                    .entry(cols)
-                    .or_insert_with(|| synthetic_unit_vec(cols, seed.wrapping_add(cols as u64)))
-                    .clone();
-                let y_orig = matvec_f64(&t_orig.data, rows, cols, &y_test);
-                let mut y_orig_rot = y_orig.clone();
-                rotation.apply_f64(&mut y_orig_rot)?;
-                let y_rot = matvec_f64(&t_rot.data, rows, cols, &y_test);
-                max_abs_diff(&y_orig_rot, &y_rot)
+                if fusion_gamma.contains_key(expected_name.as_str()) {
+                    return Err(InferenceError::Inference(format!(
+                        "check_per_tensor_rotation_equivalence: output-side tensor `{expected_name}` \
+                         unexpectedly has a fusion rule (rotation/fusion plan inconsistency)"
+                    )));
+                }
+                absorb_output_rotation_f64(&mut expected_rot, rows, cols, rotation)?;
             }
-        };
+        }
 
+        let delta = expected_rot
+            .iter()
+            .zip(actual.data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         if delta > max_abs {
             max_abs = delta;
         }
     }
 
     Ok(max_abs)
-}
-
-fn synthetic_unit_vec(n: usize, seed: u64) -> Vec<f64> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let bits = (state >> 11) as u32;
-            (bits as f64 / u32::MAX as f64) - 0.5
-        })
-        .collect()
-}
-
-fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
 }
 
 fn deterministic_probe_tokens(seed: u64, n: usize, vocab_size: usize) -> Vec<u32> {
@@ -1524,6 +1558,91 @@ mod tests {
             -1.0,
             26,
         );
+    }
+
+    /// Matrix-equivalence vs single-vector: codex round 2 demonstrated
+    /// that the single-probe-vector implementation would miss a row
+    /// perturbation orthogonal to the probe direction. The current
+    /// matrix-equivalence implementation compares every stored element,
+    /// so any non-zero element-level perturbation is caught. This test
+    /// confirms by perturbing a single element of `k_proj` (chain probe
+    /// never matvecs k_proj, single-vector check could miss the row).
+    #[test]
+    fn per_tensor_check_catches_single_element_perturbation_orthogonal_to_probe_vector() {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, 30);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0x9876_5432, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        // Sanity: the correct pipeline passes.
+        assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap();
+
+        // Perturb a single element of k_proj. A single-probe-vector
+        // check could mask this if the probe row was orthogonal; the
+        // matrix-equivalence check sees the element directly.
+        let k_name = "model.language_model.layers.1.self_attn.k_proj.weight";
+        let victim = rotated.get_mut(k_name).unwrap();
+        victim.data[0] += 0.5;
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
+    }
+
+    /// Refuse: planned tensor missing from BOTH `original` and
+    /// `rotated`. Without an enumerated expected-planned-tensor set,
+    /// an iteration-driven check would silently skip the absent tensor
+    /// and the gate could return `Ok` despite a partial working set.
+    /// The gate must enumerate the config-required set and refuse.
+    #[test]
+    fn per_tensor_check_errors_when_planned_tensor_missing_from_both_maps() {
+        let cfg = tied_tiny_test_cfg();
+        let mut original = build_working_set(&cfg, 31);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0xFEED_0BAD, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        // Drop k_proj from BOTH maps. Chain probe never uses k_proj, so
+        // it would happily pass. Per-tensor check must enumerate the
+        // expected set and notice.
+        let k_name = "model.language_model.layers.1.self_attn.k_proj.weight".to_string();
+        assert!(original.remove(&k_name).is_some());
+        assert!(rotated.remove(&k_name).is_some());
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(&k_name), "unexpected error: {msg}");
+        assert!(msg.contains("missing"), "unexpected error: {msg}");
     }
 
     /// `embed_tokens` corruption: covered by BOTH the chain probe and
