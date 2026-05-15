@@ -40,6 +40,7 @@ pub mod generate;
 pub mod kv_cache;
 pub mod lora_hook;
 pub mod pool;
+pub mod quant;
 pub mod rope;
 pub mod sampling;
 pub mod speculative;
