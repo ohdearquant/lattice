@@ -5,12 +5,24 @@
 //! See [ADR-044](../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md) §Decision
 //! for the absorption identity.
 //!
+//! ## Bias semantics — v0 scope
+//!
+//! This module rotates **weight matrices only**. It does not touch biases.
+//! v0 targets bias-free linear projections (Qwen3 / Qwen3.5 attention QKV
+//! and output projections, MLP up/gate/down — all bias-free in the
+//! Llama-style architectures lattice currently supports). If a future
+//! caller wires a model with biased projections, output-side absorption
+//! is incomplete on its own: the output bias `b` would also need
+//! `b ← R · b` so the post-bias activation matches `R · y`. Input-side
+//! absorption is unaffected by biases (the bias adds AFTER the matmul).
+//! A bias helper is a one-line follow-up when needed; left out of v0 to
+//! keep the API surface minimal.
+//!
 //! ## Identity
 //!
-//! A linear layer computes `y = W · x` (no bias rotation here — bias on the
-//! output side is rotated alongside `W`; bias on the input side is unaffected).
-//! If we rotate the input by `R` (so the upstream activation becomes `R · x`),
-//! we want the layer to produce the same output. Rewrite:
+//! A linear layer (bias-free) computes `y = W · x`. If we rotate the
+//! input by `R` (so the upstream activation becomes `R · x`), we want
+//! the layer to produce the same output. Rewrite:
 //!
 //! ```text
 //!   y = W · x = W · R^T · (R · x) = (W · R^T) · x'
