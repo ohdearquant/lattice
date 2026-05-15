@@ -8,6 +8,17 @@ Pure Rust inference engine. Apache-2.0. github.com/ohdearquant/lattice
 - Every claim in a PR description must match the actual diff.
 - SIMD code requires manual verification — AI models cannot reason about intrinsic correctness.
 - Include `cargo test` and `cargo bench` output for performance-sensitive changes.
+- **Agent-authored GitHub content must be attributed.** When an AI agent (Claude, codex, etc.) authors a PR body, issue, or comment via a human's `gh` CLI session, the content must start with an attribution line so reviewers can distinguish agent-written prose from human-written prose. Required format:
+
+  ```
+  > _Comment authored by <Agent name> (<provider>) on behalf of @<github-handle>._
+  ```
+
+  Examples:
+  - `> _Comment authored by Claude (Anthropic agent) on behalf of @ohdearquant._`
+  - `> _PR description authored by Codex (OpenAI agent) on behalf of @ohdearquant._`
+
+  The attribution goes at the top of the body, in blockquote-italic form so it renders distinctly on GitHub. Co-authored-by trailers in commits are separate and still required per the commit-message convention.
 
 ## Common Rules
 
