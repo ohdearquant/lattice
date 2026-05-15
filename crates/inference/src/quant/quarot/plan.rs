@@ -30,47 +30,61 @@
 //! | `lm_head.weight` (untied only) | ✓ | — | `[vocab_size, hidden]` | input-side | hidden = `cols`; **optional rule** — Qwen3.5 ties embeddings (`tie_word_embeddings=true` at `qwen35_config.rs:177`) so `lm_head.weight` is absent from the SafeTensors file in the default Qwen3.5 builds. `validate_coverage` does not treat its absence as a coverage failure. |
 //! | `embed_tokens.weight` | — | ✓ | `[vocab_size, hidden]` | **input-side** | despite being a "writer", the storage shape `[vocab_size, hidden]` means each row IS an embedding vector of dim hidden; rotating those rows produces a rotated output, which corresponds to **`W ← W · R^T`** (input-side absorption on the hidden dimension). Output-side absorption would try to match R against `vocab_size` rows and fail dimensionally. |
 //!
-//! ## Tied embeddings + final-RMSNorm fusion conflict
+//! ## Tied embeddings + final-RMSNorm: only one correct path
 //!
-//! When `tie_word_embeddings=true` and step 3c/3d implements the final-norm
-//! `(1 + g_final)` fusion (see Known gaps), the tied matrix would need to
-//! serve two different roles:
-//! - As **embedding**, the rows are token vectors: `R · E[i]` should equal
-//!   the rotated embedding output. The required absorption is
-//!   `W ← W · R^T` (each row of E gets rotated). No final-norm scale is
-//!   relevant here — embedding output is the FIRST residual write.
-//! - As **lm_head**, the rows are logits-readout linear functionals
-//!   composed AFTER the final RMSNorm. If `(1 + g_final)` is fused into
-//!   the lm_head, each row of the lm-head matrix needs an additional
-//!   element-wise scale by `(1 + g_final)` (a column multiply on `W`
-//!   storage). The pre-fusion lm_head IS `E`, but post-fusion it
-//!   becomes `E · diag(1 + g_final)` — a different matrix.
+//! Step 3c/3d MUST implement the QuaRot fusion of the final-norm scale
+//! into an **untied** `lm_head`, AND set the runtime `final_norm.weight`
+//! (the `(1 + g_final)` Qwen3.5 shifted-scale at `norm.rs:16`) to the
+//! neutral value (gamma = 0, so `D = I`).
 //!
-//! These two requirements cannot be satisfied by a single shared tensor
-//! unless `g_final == 0`. Step 3c/3d will need to either:
-//! - **Untie** the embeddings during conversion: materialize a separate
-//!   `lm_head` tensor that absorbs both the rotation AND the fused
-//!   `(1 + g_final)` scale, leaving `embed_tokens` to handle just the
-//!   embedding role. The runtime `logits_weight()` fallback at
-//!   `weights.rs:51` already supports untied lm_head.
-//! - **Keep final-RMSNorm online** (do not fuse): the rotation is then
-//!   absorbed into `embed_tokens` (as in this plan) and the final
-//!   RMSNorm runs at runtime with its original `(1 + g_final)`. The
-//!   normalize step is rotation-invariant (`||R · x|| = ||x||`), but
-//!   the per-channel `(1 + g)` scale does not commute with `R^T`
-//!   on the lm-head side — so this path is only correct if the lm
-//!   head is ALSO rotated input-side (which our plan does on `lm_head`
-//!   when untied) and the final-norm scale is applied BEFORE the
-//!   rotation in the runtime forward pass. The Qwen3.5 forward at
-//!   `forward.rs` does norm-then-linear, so this ordering already
-//!   holds — but only if the linear (lm_head) reads from the
-//!   ROTATED post-norm residual, which means the final norm output
-//!   must be left in the rotated basis. This works for the untied
-//!   case; for tied, see above.
+//! ### Why no "keep final-RMSNorm online" alternative
 //!
-//! Net: step 3c/3d must choose one path. The plan here covers the
-//! linear-tensor side of both options; the decision belongs in the
-//! conversion binary.
+//! Qwen3.5's forward at `forward.rs:81` is norm-then-linear with shifted
+//! RMSNorm: `n = D · normalize(h)` then `logits = W_lm · n`, where
+//! `D = diag(1 + g_final)`. After QuaRot, the residual is in the rotated
+//! basis (`h_rot = R · h`). Using normalize's rotation-invariance
+//! (`||R · x|| = ||x||` so `normalize(R · h) = R · normalize(h)`), the
+//! online-runtime computes:
+//!
+//! ```text
+//!   n_rot       = D · normalize(h_rot) = D · R · normalize(h)
+//!   logits_run  = lm_head' · n_rot     = lm_head' · D · R · normalize(h)
+//! ```
+//!
+//! For `logits_run = logits_original = W_lm · D · normalize(h)`, we need
+//! `lm_head' · D · R = W_lm · D`, i.e., `lm_head' = W_lm · D · R^T · D^{-1}`.
+//! That is **not** a clean input-side rotation of `W_lm`: it depends on
+//! `D` non-commutatively (`D` is diagonal, `R` is dense Hadamard, they
+//! do not commute). Any "rotate lm_head input-side and leave final norm
+//! alone" recipe is wrong — for both tied and untied embeddings.
+//!
+//! ### The only correct fusion path
+//!
+//! Offline:
+//! 1. **Untie embeddings**: materialize `lm_head` as a separate tensor.
+//!    (When the input model has `tie_word_embeddings=true`, the converter
+//!    must copy `embed_tokens` into `lm_head` BEFORE rotation, so the
+//!    two roles can be transformed independently.)
+//! 2. **Fuse final-norm scale into the new lm_head**:
+//!    `lm_head_fused := W_lm · diag(1 + g_final)` (column multiply on
+//!    `W_lm` storage, per the Known gaps section).
+//! 3. **Rotate**: apply input-side absorption to `lm_head_fused`:
+//!    `lm_head_final := lm_head_fused · R^T = W_lm · D · R^T`.
+//! 4. **Zero out the runtime final-norm scale**: in the saved model,
+//!    set `final_norm.weight` such that the shifted formula
+//!    `(1 + g)` evaluates to `1` (i.e., `g = 0`).
+//! 5. The plain `embed_tokens` continues to absorb just `R^T`
+//!    (input-side, as in this plan).
+//!
+//! Runtime then computes:
+//! `lm_head_final · normalize(h_rot) = W_lm · D · R^T · R · normalize(h)
+//! = W_lm · D · normalize(h) = logits_original`. Correct.
+//!
+//! This makes the runtime `logits_weight()` fallback at `weights.rs:51`
+//! relevant: it returns the (now-untied) `lm_head` directly. The plan
+//! here lists `lm_head.weight` as Optional only because the input
+//! SafeTensors file may not contain it pre-conversion; the converter
+//! produces it during step 3c.
 //!
 //! ## Known gaps (BLOCKERS for real-model conversion — step 3c/3d must address)
 //!
@@ -147,14 +161,6 @@ pub enum RotationId {
     ResidualStream,
 }
 
-/// Plan binding tensor-name patterns to [`TensorRotation`] entries.
-///
-/// Patterns are matched as suffixes of the tensor's SafeTensors name —
-/// e.g., a pattern `"self_attn.q_proj.weight"` matches
-/// `"model.layers.0.self_attn.q_proj.weight"` and
-/// `"model.layers.23.self_attn.q_proj.weight"`. This is intentionally simple;
-/// Qwen3.5's naming is regular enough that suffix-matching covers it
-/// without a full glob engine.
 /// Whether a rule must match at least one tensor to count as complete coverage.
 ///
 /// `Required` rules are model-architecture invariants — `q_proj`, `o_proj`,
@@ -177,6 +183,23 @@ struct Rule {
     requirement: RuleRequirement,
 }
 
+/// Plan binding tensor-name patterns to [`TensorRotation`] entries.
+///
+/// Patterns are matched as suffixes of the tensor's SafeTensors name —
+/// e.g., a pattern `"self_attn.q_proj.weight"` matches
+/// `"model.layers.0.self_attn.q_proj.weight"` and
+/// `"model.layers.23.self_attn.q_proj.weight"`. This is intentionally
+/// simple; Qwen3.5's naming is regular enough that suffix-matching
+/// covers it without a full glob engine.
+///
+/// Construct one of the architecture-specific plans (currently only
+/// [`Self::qwen35_residual_stream_linear_layers`]) and look up
+/// per-tensor absorption via [`Self::for_tensor`]. For coverage sanity
+/// checks against a SafeTensors file's tensor list see
+/// [`Self::validate_coverage`] — but note that method's contract is
+/// **suffix-presence only**, not per-layer coverage; the conversion
+/// binary in step 3b/3c will need a stricter check against the loader's
+/// config-derived expected tensor list.
 #[derive(Debug, Clone)]
 pub struct RotationPlan {
     rules: Vec<Rule>,
@@ -259,9 +282,18 @@ impl RotationPlan {
         self.rules.len()
     }
 
-    /// Cross-check the plan against an actual SafeTensors tensor list.
+    /// Cross-check the plan against an actual SafeTensors tensor list at
+    /// the **suffix-presence** level.
     ///
-    /// Returns a [`CoverageReport`] with four lists:
+    /// This validates that every Required rule pattern matches at least one
+    /// tensor name in the input — it does NOT validate per-layer coverage
+    /// (a model with 24 layers but only 1 layer's tensors present will
+    /// pass this check). Per-layer coverage requires the loader's
+    /// config-derived expected name list, which step 3b's conversion binary
+    /// must construct using `crate::model::qwen35::loading`'s
+    /// `expected_tensor_names(config)` helper (TBD in step 3b).
+    ///
+    /// Returns a [`CoverageReport`] with five lists:
     /// - `matched_tensors`: loaded tensors that matched some plan rule
     /// - `unplanned_tensors`: loaded tensors that matched NO plan rule
     ///   (caller decides — likely passes them through unchanged, but a
