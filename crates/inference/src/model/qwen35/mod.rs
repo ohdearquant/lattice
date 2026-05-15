@@ -40,5 +40,10 @@ pub(crate) use weights::{
 pub use detokenize::bytes_to_unicode;
 #[cfg(test)]
 pub use generation::should_stop_token;
-#[cfg(test)]
+
+/// Exposed for consumers that need to drive a per-layer coverage check
+/// over a Qwen3.5 checkpoint without going through the model loader —
+/// e.g., the QuaRot offline converter (ADR-044 step 3c) iterating
+/// rotation rules against an actual safetensors file. Originally
+/// `#[cfg(test)]`-only; promoted in step 3b.
 pub use loading::qwen_required_tensor_names;
