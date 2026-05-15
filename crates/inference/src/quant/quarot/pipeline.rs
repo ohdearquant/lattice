@@ -14,14 +14,27 @@
 //!
 //! ## What this module does NOT own (deferred to later sub-steps)
 //!
-//! - **`lm_head` materialization + final_norm fusion** (step 3c-3). When
-//!   `tie_word_embeddings=true`, `lm_head.weight` is not present in the
-//!   input SafeTensors; the binary must clone `embed_tokens.weight` and
-//!   fuse `(1 + g_final)` into the materialized matrix BEFORE this
-//!   pipeline absorbs the residual rotation onto it. Until 3c-3 lands,
-//!   callers either (a) target untied configs only, or (b) pre-populate
-//!   `lm_head.weight` in the working set before invoking
-//!   [`absorb_rotations`].
+//! - **`lm_head` materialization + final_norm fusion** (step 3c-3). The
+//!   shifted final RMSNorm `(1 + g_final)` must be folded into `lm_head`
+//!   BEFORE [`absorb_rotations`] runs — the diagonal `D = diag(1 + g_final)`
+//!   does not commute with the Hadamard rotation, so leaving the final
+//!   norm online while rotating `lm_head` produces wrong logits (see
+//!   `plan.rs` §Tied embeddings for the algebra). This applies to BOTH
+//!   tied and untied configs:
+//!     - Tied (`tie_word_embeddings=true`, Qwen3.5 default): `lm_head.weight`
+//!       is absent from SafeTensors; the binary must clone `embed_tokens.weight`
+//!       into a materialized `lm_head.weight`, fuse `(1 + g_final)` into it,
+//!       then add a `final_norm → lm_head` fusion target and flip the output
+//!       config to `tie_word_embeddings=false`.
+//!     - Untied: `lm_head.weight` already exists; the caller still must add
+//!       a `final_norm → lm_head` fusion target so the runtime norm becomes
+//!       a no-op before rotation absorption.
+//!
+//!   Until step 3c-3 lands, **this module is not a complete model
+//!   converter**. Callers can use it for sub-stage tests (RMSNorm fusion
+//!   primitives, residual-stream rotation absorption on the planned
+//!   tensors), but composing into a runnable QuaRot `.q4` artifact also
+//!   requires the final-norm/`lm_head` work in 3c-3.
 //! - **Forward-equivalence assertion** with refuse-on-fail (step 3c-4).
 //! - **Binary entry point + CLI** (step 3c-5).
 //! - **MoE expert weights** — deferred to v1 per `plan.rs` §Deferred.
