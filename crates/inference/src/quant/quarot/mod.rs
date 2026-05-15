@@ -4,6 +4,7 @@
 
 pub mod hadamard;
 pub mod io;
+pub mod lm_head;
 pub mod pipeline;
 pub mod plan;
 pub mod rmsnorm_fusion;
