@@ -27,9 +27,9 @@ v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to k
 
 | Step | PR | Scope |
 |---|---|---|
-| 1 | this PR | Walsh-Hadamard + RandomizedHadamard primitives, unit-tested. No model code touched. |
-| 2 | next | Rotation absorption: read SafeTensors → compute `W·Q^T` for each linear layer affected by a planned rotation → save rotated weights as new SafeTensors. Includes equivalence assertion (`||rotated_forward − original_forward|| < 1e-5` on a small batch) before the rotated weights are written. |
-| 3 | next | Wire rotated SafeTensors through existing `weights::q4_weights::quantize_bf16_to_q4`. Binary `quantize_quarot` modeled on `quantize_q4` taking seed + model path. |
+| 1 | PR #15 (merged) | Walsh-Hadamard + RandomizedHadamard primitives (f32 + f64), unit-tested. No model code touched. |
+| 2 | this PR (`feat/quarot-rotation-absorption`) | Rotation absorption math: `absorb_input_rotation`, `absorb_output_rotation` (f32 + f64 variants) for a row-major weight matrix. Synthetic-linear-layer equivalence tests validate the identity `(W · R^T) · (R · x) = W · x` and the two-layer round-trip pattern (output-side on layer A, input-side on layer B = identity). No SafeTensors I/O yet — saving an intermediate rotated SafeTensors file is unnecessary since step 3's binary will read → absorb → quantize → write Q4 in a single offline pass. |
+| 3 | next | End-to-end `quantize_quarot` binary modeled on `quantize_q4`: takes seed + model path, parses the layer topology into a `RotationPlan`, reads SafeTensors with the existing memmap parser. Applies absorption in **f64 for the rotation math**. Bridge to Q4 has two candidate paths, both deferred for step 3 to choose and measure: (a) downcast f64→BF16 inside the absorption pipeline, then call existing `weights::q4_weights::quantize_bf16_to_q4` (`q4_weights.rs:318`). BF16's 7-bit mantissa can push values across Q4 bin thresholds near boundaries and can shift a block's absmax (which sets the scale = absmax/7), so this is **not** precision-parity with a direct f32/f64→Q4 path — it must be measured on the perplexity benchmark in step 4 before claiming acceptable. (b) Add a sibling `quantize_f32_to_q4` (or `_f64_to_q4`) entry point that skips the BF16 intermediate. More code but the cleaner precision story. Step 3 picks one based on early-stage measurement on a small calibration set. Runs the forward-equivalence assertion on a small batch (`||rotated_forward − original_forward|| < 1e-5`) before writing. Output is a `.q4` file consumable by the existing inference path with no runtime changes. |
 | 4 | next | Bench: rotated-Q4 vs unrotated-Q4 perplexity delta on Qwen3-0.6B / Qwen3.5-0.8B against WikiText-2 calibration. Acceptance: delta < 0.5 PPL. |
 
 **Out of v0 entirely (deferred to v1)**:
@@ -54,7 +54,7 @@ For non-power-of-2 hidden dims (4B, BERT), v1 cannot use naive zero-pad-then-pro
 
 **Hadamard size = power of 2 only.** v0 covers decoder models whose hidden and head dims are all powers of 2 (Qwen3-0.6B, Qwen3.5-0.8B — see model-coverage table above). Models with non-power-of-2 hidden dims (Qwen3-Embedding-4B at 2560, BERT-base at 768) are **explicitly deferred** to v1; naive zero-pad + project-back is not orthogonal and so cannot be used. v1 will pick from block-diagonal partition (QuaRot paper's approach), Paley-construction Hadamards, or Givens products.
 
-**Offline rotation, not on-the-fly.** v0 saves the rotated+quantized weights as a new `.q4` file. The forward pass loads it like any other Q4 model — no runtime rotation cost. Tradeoff: 2× disk usage during conversion. Trade is worth it because rotation is a one-time cost.
+**Offline rotation, not on-the-fly.** v0 saves the rotated+quantized weights as a new `.q4` file. The forward pass loads it like any other Q4 model — no runtime rotation cost. Disk during conversion is the mmap'd BF16 input plus the smaller `.q4` output — no full-precision rotated intermediate. Trade is worth it because rotation is a one-time cost.
 
 **Rotation absorption pattern.** For a linear layer `y = Wx`:
 - Pre-rotation: `y = W @ Q^T @ Q @ x = (W @ Q^T) @ (Q @ x)`
@@ -90,8 +90,7 @@ These are consequences of accepting v0 as the design (across all 4 PRs), not of 
 ### Negative
 
 - Hadamard transform requires power-of-2 dimensions; non-power-of-2 hidden sizes (4B, BERT-base) deferred to v1 with no naive padding option.
-- 2× disk during conversion (original + rotated).
-- One-time conversion cost (~minutes for Qwen3-0.6B; ~hour for 8B-class models).
+- One-time conversion cost (~minutes for Qwen3-0.6B; ~hour for 8B-class models). Disk during conversion is original BF16 (mmap) + smaller `.q4` output — no full-precision rotated intermediate (step 3's pipeline does read → absorb → quantize → write in one pass).
 - Public API surface (`hadamard::{walsh_hadamard_in_place, RandomizedHadamard}`) lands before any consumer exists in the codebase — locks in transform-order, precision, and naming before downstream code stresses the contract. Mitigation: this matches the existing lattice-inference convention of keeping module APIs `pub` for cross-module use, and the crate-level STABILITY doc already flags the crate as `Experimental` with churn expected. If the step-2 PR (rotation absorption) needs to change the primitive API, that change ships in the same PR.
 
 ### Risks

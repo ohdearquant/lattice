@@ -3,3 +3,4 @@
 //! See [ADR-044](../../../../docs/adr/ADR-044-quarot-rotated-quantization.md).
 
 pub mod hadamard;
+pub mod rotation;
