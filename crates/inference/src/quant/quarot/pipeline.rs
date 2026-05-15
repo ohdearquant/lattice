@@ -145,9 +145,13 @@ pub fn fuse_rmsnorms(
             fuse_shifted_rmsnorm_into_next_layer_f64(&mut w.data, rows, cols, &gamma_data)?;
         }
 
-        let norm_entry = tensors.get_mut(&target.norm_tensor).expect(
-            "norm tensor was present at top of loop; HashMap entry cannot disappear mid-iteration",
-        );
+        let norm_entry = tensors.get_mut(&target.norm_tensor).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "fuse_rmsnorms: norm tensor `{}` disappeared from working set \
+                 between gamma capture and neutralization; this should be unreachable",
+                target.norm_tensor
+            ))
+        })?;
         neutralize_rmsnorm_gamma_f64(&mut norm_entry.data);
     }
     Ok(())
