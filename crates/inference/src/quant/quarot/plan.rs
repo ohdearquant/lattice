@@ -60,57 +60,97 @@
 //!
 //! ### The only correct fusion path
 //!
-//! Offline:
+//! Offline (step 3c performs ALL of these):
 //! 1. **Untie embeddings**: materialize `lm_head` as a separate tensor.
-//!    (When the input model has `tie_word_embeddings=true`, the converter
+//!    When the input model has `tie_word_embeddings=true`, the converter
 //!    must copy `embed_tokens` into `lm_head` BEFORE rotation, so the
-//!    two roles can be transformed independently.)
-//! 2. **Fuse final-norm scale into the new lm_head**:
+//!    two roles can be transformed independently.
+//! 2. **Flip the output config** to `tie_word_embeddings=false`. The
+//!    runtime loader at `loading.rs:266` only loads `lm_head.weight`
+//!    when `cfg.tie_word_embeddings` is false; without this flip, the
+//!    runtime falls back to `embed_tokens` via `logits_weight()` at
+//!    `weights.rs:51` and the fused `lm_head` is never consulted —
+//!    silently producing wrong logits. **This is a config-mutation
+//!    requirement, NOT just a weight transform.**
+//! 3. **Fuse final-norm scale into the new lm_head**:
 //!    `lm_head_fused := W_lm · diag(1 + g_final)` (column multiply on
 //!    `W_lm` storage, per the Known gaps section).
-//! 3. **Rotate**: apply input-side absorption to `lm_head_fused`:
+//! 4. **Rotate**: apply input-side absorption to `lm_head_fused`:
 //!    `lm_head_final := lm_head_fused · R^T = W_lm · D · R^T`.
-//! 4. **Zero out the runtime final-norm scale**: in the saved model,
+//! 5. **Zero out the runtime final-norm scale**: in the saved model,
 //!    set `final_norm.weight` such that the shifted formula
 //!    `(1 + g)` evaluates to `1` (i.e., `g = 0`).
-//! 5. The plain `embed_tokens` continues to absorb just `R^T`
+//! 6. The plain `embed_tokens` continues to absorb just `R^T`
 //!    (input-side, as in this plan).
 //!
 //! Runtime then computes:
 //! `lm_head_final · normalize(h_rot) = W_lm · D · R^T · R · normalize(h)
 //! = W_lm · D · normalize(h) = logits_original`. Correct.
 //!
-//! This makes the runtime `logits_weight()` fallback at `weights.rs:51`
-//! relevant: it returns the (now-untied) `lm_head` directly. The plan
-//! here lists `lm_head.weight` as Optional only because the input
-//! SafeTensors file may not contain it pre-conversion; the converter
-//! produces it during step 3c.
+//! `lm_head.weight` is Optional in THIS plan because the input
+//! SafeTensors may not contain it pre-conversion (tied case). The
+//! converter at step 3c materializes it. After conversion, the saved
+//! model is always-untied (step 2 above), so `validate_coverage` on
+//! the OUTPUT SafeTensors will see `lm_head.weight` present and the
+//! rule satisfied.
 //!
-//! ## Known gaps (BLOCKERS for real-model conversion — step 3c/3d must address)
+//! ## Known gaps — BLOCKERS for real-model conversion that this plan DOES NOT capture
 //!
-//! - **RMSNorm `(1 + gamma)` scaling does not commute with Hadamard
-//!   rotation in general.** Qwen3.5 applies RMSNorm with shifted scale
-//!   `(1 + gamma)` (norm.rs:16) at `input_layernorm`,
-//!   `post_attention_layernorm`, `final_norm`, and inside GatedDeltaNet's
-//!   `linear_attn.norm`. Linear-weight absorption alone does NOT preserve
-//!   the model output. The QuaRot paper fuses `(1 + gamma)` into the
-//!   immediately-following linear layer's input-dimension scaling.
-//!   Specifically, for a row-major weight `W` of shape `[out, hidden]`
-//!   (the `matmul_bt` convention used by Qwen3.5), each column `j` of `W`
-//!   gets multiplied by `(1 + gamma[j])` — equivalent to `W ← W · diag(1 + g)`,
-//!   which in storage means `W[i, j] *= (1 + g[j])` for all `i, j`. This is
-//!   a column multiply on the input-dim direction, NOT a row multiply.
-//!   After fusion, the normalize-only step is
-//!   rotation-invariant. This fusion is NOT in step 3a — step 3c or 3d
-//!   must implement it before any real-model conversion can be claimed
-//!   correct.
-//! - **No coverage validation against the loader's expected tensor list.**
-//!   `for_tensor` matches by suffix, so a stray `mtp.*` or future-named
-//!   tensor in the SafeTensors file (ignored by the runtime loader per
-//!   ADR-043 §Out-of-scope) could be rotated without affecting the
-//!   model. Step 3b's SafeTensors reader must call `validate_coverage`
-//!   to assert: every plan rule matches ≥ 1 tensor, every loaded tensor
-//!   in the residual-touching set matches exactly one plan rule.
+//! **This plan is rotation-rule data only.** `validate_coverage().is_complete()`
+//! verifies suffix-presence of the rotation targets — nothing more. A
+//! converter that rotates every planned tensor and stops there will
+//! **produce wrong logits**. Step 3c's binary owns a separate
+//! `ConversionPlan` (TBD) that bundles this rotation plan with all the
+//! mutations below; only `ConversionPlan::validate` should be treated
+//! as the full-correctness gate.
+//!
+//! Required mutations NOT captured in this plan:
+//!
+//! - **Shifted RMSNorm `(1 + gamma)` fusion + neutralization.** Qwen3.5
+//!   applies RMSNorm with shifted scale `(1 + gamma)` at `norm.rs:16` for
+//!   `input_layernorm` (forward.rs:41), `post_attention_layernorm`
+//!   (forward.rs:66), and `final_norm` (forward.rs:81). A diagonal
+//!   scale does not commute with Hadamard rotation. The QuaRot paper
+//!   fuses `(1 + gamma)` into the immediately-following linear layer
+//!   as a column multiply: `W ← W · diag(1 + g)` (storage:
+//!   `W[i, j] *= (1 + g[j])`), then sets the runtime `*_layernorm.weight`
+//!   to the neutral value (`gamma = 0`, so the shifted formula returns
+//!   `1`). The converter must do this fusion for input_layernorm,
+//!   post_attention_layernorm, AND final_norm (the final_norm + lm_head
+//!   case is spelled out separately above).
+//! - **GDN `linear_attn.norm` is different — internal, plain `gamma`.**
+//!   GDN's gated-RMSNorm at `gdn.rs:425, 440` and `gdn_fused.rs:127`
+//!   multiplies plain `gamma[i]`, NOT `(1 + gamma[i])`. More
+//!   importantly, this norm runs INSIDE the GDN block, between the
+//!   linear-attention compute and `out_proj`. The residual-stream
+//!   rotation enters at `in_proj_*` (input-side absorbed) and exits at
+//!   `out_proj` (output-side absorbed); it does not cross
+//!   `linear_attn.norm`. So the plain-gamma GDN norm does NOT need
+//!   QuaRot fusion — it operates on internal GDN state in a basis
+//!   unaffected by residual rotation. Step 3c must NOT attempt to fuse
+//!   this norm.
+//! - **Tied-embedding untying + `tie_word_embeddings=false` config flip**
+//!   (described in detail in the §Tied embeddings section above).
+//!
+//! Required loader-side helper not yet exposed:
+//!
+//! - **`qwen_required_tensor_names(cfg)` is `#[cfg(test)]`-only** at
+//!   `model/qwen35/mod.rs:44`. Step 3b's conversion binary cannot call
+//!   it as written. Step 3b must promote this re-export out of the
+//!   test cfg before the per-layer coverage check can run.
+//!
+//! Out-of-scope (silently-broken) integrations:
+//!
+//! - **Runtime LoRA injection is incompatible with QuaRot-converted
+//!   models.** The forward path applies LoRA deltas after the base
+//!   matmul using the same activation, e.g., `forward.rs:249, 467` and
+//!   `gdn_fused.rs:385`. The rotated base projection produces output in
+//!   a different basis than an un-rotated LoRA adapter delta, so summing
+//!   them is invalid. v0 marks QuaRot models as LoRA-runtime-incompatible.
+//!   A future LoRA-aware path would either (a) rotate adapter weights
+//!   on load using the converter's seed (requires the seed in the
+//!   `.q4` artifact metadata), or (b) refuse to compose at adapter-load
+//!   time when the base is QuaRot-converted.
 //!
 //! ## Deferred (correctly v1)
 //!
@@ -119,6 +159,7 @@
 //! - MoE expert weights (DeepSeekMoE-style routed experts in Qwen3.5 MoE
 //!   layers — same absorption pattern but applied per-expert slice;
 //!   tensor names `mlp.experts.gate_up_proj`, `mlp.experts.down_proj`)
+//! - Runtime LoRA compatibility (see above — currently incompatible)
 
 use crate::error::InferenceError;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
@@ -288,10 +329,15 @@ impl RotationPlan {
     /// This validates that every Required rule pattern matches at least one
     /// tensor name in the input — it does NOT validate per-layer coverage
     /// (a model with 24 layers but only 1 layer's tensors present will
-    /// pass this check). Per-layer coverage requires the loader's
-    /// config-derived expected name list, which step 3b's conversion binary
-    /// must construct using `crate::model::qwen35::loading`'s
-    /// `expected_tensor_names(config)` helper (TBD in step 3b).
+    /// pass this check), and it does NOT validate the non-rotation
+    /// mutations required for a correct conversion (RMSNorm fusion,
+    /// `tie_word_embeddings` flip, etc. — see module §Known gaps).
+    ///
+    /// Per-layer coverage requires the loader's config-derived expected
+    /// name list, which lives at `model/qwen35/loading.rs:12` as
+    /// `qwen_required_tensor_names(cfg)`. Step 3b must promote that
+    /// re-export out of `#[cfg(test)]` at `model/qwen35/mod.rs:44`
+    /// before the conversion binary can call it.
     ///
     /// Returns a [`CoverageReport`] with five lists:
     /// - `matched_tensors`: loaded tensors that matched some plan rule
@@ -310,6 +356,15 @@ impl RotationPlan {
     /// `is_complete()` returns true iff `unmatched_required_rules` and
     /// `ambiguous_tensors` are both empty (optional rules with zero
     /// matches are allowed; unplanned tensors are caller's call).
+    ///
+    /// **`is_complete()` is NOT a correctness gate.** It only validates
+    /// the rotation rules' suffix presence. The conversion binary's
+    /// full-validity check must additionally verify: RMSNorm fusion
+    /// applied to input_layernorm/post_attention_layernorm/final_norm,
+    /// `tie_word_embeddings` flipped to false, fused `lm_head`
+    /// materialized, per-layer coverage against
+    /// `qwen_required_tensor_names`, and forward-equivalence delta
+    /// below threshold. See module §Known gaps.
     pub fn validate_coverage<'a, I>(&self, tensor_names: I) -> CoverageReport
     where
         I: IntoIterator<Item = &'a str>,
