@@ -118,20 +118,31 @@ struct ParsedEntry {
     header: Option<TensorHeader>,
 }
 
-/// Bytes per element for every standard SafeTensors dtype name. Mirrors
-/// the table in the official `safetensors` Rust crate. `None` for any
-/// unrecognized dtype string — the offset-contiguity check still runs,
-/// but the per-tensor byte-length validation is skipped for such entries.
+/// Bits per element for every standard SafeTensors dtype name. The
+/// bit-size variant (rather than bytes) is required because the format
+/// admits sub-byte dtypes: `F4` stores 4 bits per element, and
+/// `F6_E2M3` / `F6_E3M2` store 6 bits.
 ///
-/// Kept inline rather than depending on the `safetensors` crate to match
+/// Returns `None` for any unrecognized dtype string. The caller MUST
+/// reject unknown dtypes rather than treat them as opaque, since they
+/// indicate either a newer SafeTensors revision the reader has not yet
+/// been updated for or a corrupted header — in either case the runtime
+/// loader (or the official `safetensors` crate) would reject the file
+/// too, and the converter should not bless what the runtime wouldn't.
+///
+/// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
+/// crate. Kept inline rather than depending on `safetensors` to match
 /// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
-/// parses safetensors headers directly).
-fn safetensors_bytes_per_elem(dtype_str: &str) -> Option<usize> {
+/// parses safetensors headers directly). When upstream adds a dtype,
+/// add it here and to the round-4 regression tests.
+fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
     match dtype_str {
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" => Some(1),
-        "I16" | "U16" | "F16" | "BF16" => Some(2),
-        "I32" | "U32" | "F32" => Some(4),
-        "I64" | "U64" | "F64" => Some(8),
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(8),
+        "I16" | "U16" | "F16" | "BF16" => Some(16),
+        "I32" | "U32" | "F32" => Some(32),
+        "I64" | "U64" | "F64" | "C64" => Some(64),
         _ => None,
     }
 }
@@ -192,10 +203,13 @@ impl Shard {
 
         let data_len = mmap.len() - data_offset;
 
-        // Phase 1: parse every entry (including unsupported dtypes) so we
-        // can validate offset contiguity across the whole data section.
-        // Per-tensor byte length is checked here for any recognized
-        // SafeTensors dtype, not just the F32/F16/BF16 we decode.
+        // Phase 1: parse every entry — including dtypes the converter
+        // doesn't decode — so we can validate offset contiguity across
+        // the whole data section. Per-tensor byte length is validated
+        // against the bit-size table of every standard SafeTensors
+        // dtype (sub-byte dtypes like F4 require the shape product to
+        // be byte-aligned), and any unrecognized dtype string is
+        // rejected outright — the runtime / official parser would.
         let mut parsed: Vec<ParsedEntry> = Vec::with_capacity(obj.len());
         for (name, entry) in obj {
             if name == "__metadata__" {
@@ -271,19 +285,29 @@ impl Shard {
                     ))
                 })
             })?;
-            if let Some(bpe) = safetensors_bytes_per_elem(dtype_str) {
-                let expected = numel.checked_mul(bpe).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name}: byte length overflows usize"
-                    ))
-                })?;
-                let actual = end - start;
-                if actual != expected {
-                    return Err(InferenceError::InvalidSafetensors(format!(
-                        "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
-                         expected {expected}, got {actual}"
-                    )));
-                }
+            let bits = safetensors_bits_per_elem(dtype_str).ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "tensor {name}: unrecognized SafeTensors dtype {dtype_str:?}"
+                ))
+            })?;
+            let total_bits = numel.checked_mul(bits).ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "tensor {name}: bit length overflows usize"
+                ))
+            })?;
+            if total_bits % 8 != 0 {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {name}: sub-byte dtype {dtype_str} with shape {shape:?} \
+                     produces {total_bits} bits, which is not byte-aligned"
+                )));
+            }
+            let expected = total_bits / 8;
+            let actual = end - start;
+            if actual != expected {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
+                     expected {expected}, got {actual}"
+                )));
             }
 
             let header = SourceDType::from_header_str(dtype_str).map(|dtype| TensorHeader {
@@ -1097,6 +1121,100 @@ mod tests {
         match err {
             InferenceError::InvalidSafetensors(msg) => {
                 assert!(msg.contains("non-contiguous"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// An entirely unrecognized dtype string is rejected at open time,
+    /// not silently skipped. The runtime / official parser would reject
+    /// the same bytes; the converter must not bless what the runtime
+    /// wouldn't.
+    #[test]
+    fn unknown_dtype_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "x": { "dtype": "FUTURE_DTYPE", "shape": [1], "data_offsets": [0, 4] },
+        });
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &[0u8; 4]);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("unrecognized SafeTensors dtype"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// F8_E8M0 is 8 bits per element; shape [2] requires 2 bytes.
+    /// Declaring a 1-byte range fails the byte-length check, even though
+    /// F8_E8M0 isn't a converter-decoded dtype.
+    #[test]
+    fn f8_e8m0_byte_length_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "x": { "dtype": "F8_E8M0", "shape": [2], "data_offsets": [0, 1] },
+        });
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &[0u8; 1]);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("byte length mismatch"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// C64 is complex64 — 64 bits = 8 bytes per element. Shape [1]
+    /// requires 8 bytes; declaring a 4-byte range fails.
+    #[test]
+    fn c64_byte_length_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "z": { "dtype": "C64", "shape": [1], "data_offsets": [0, 4] },
+        });
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &[0u8; 4]);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("byte length mismatch"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// F4 stores 4 bits per element. Shape [3] = 12 bits, which is not
+    /// byte-aligned — the file is unreadable regardless of declared
+    /// offsets. The reader rejects this at open time.
+    #[test]
+    fn f4_sub_byte_misalignment_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "x": { "dtype": "F4", "shape": [3], "data_offsets": [0, 2] },
+        });
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &[0u8; 2]);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("not byte-aligned"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// F6_E2M3 stores 6 bits per element. Shape [4] = 24 bits = 3 bytes;
+    /// declaring a 2-byte range fails the byte-length check.
+    #[test]
+    fn f6_e2m3_byte_length_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "x": { "dtype": "F6_E2M3", "shape": [4], "data_offsets": [0, 2] },
+        });
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &[0u8; 2]);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("byte length mismatch"), "got: {msg}");
             }
             other => panic!("expected InvalidSafetensors, got {other:?}"),
         }
