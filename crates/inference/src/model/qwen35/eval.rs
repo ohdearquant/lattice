@@ -38,12 +38,22 @@ impl Default for PerplexityConfig {
 /// Result of [`Qwen35Model::compute_perplexity`].
 #[derive(Clone, Debug)]
 pub struct PerplexityReport {
+    /// Perplexity: `exp(mean_nll)`. Lower is better.
     pub ppl: f64,
+    /// Mean cross-entropy in nats per scored token: `total_nll / num_tokens_scored`.
     pub mean_nll: f64,
+    /// Sum of NLLs across every scored token, in nats.
     pub total_nll: f64,
+    /// Tokens that contributed to the average. With `stride < window` and
+    /// `tokens.len() <= window` this equals `tokens.len() - 1`; otherwise
+    /// it is the same value, since each non-first global token is scored
+    /// exactly once.
     pub num_tokens_scored: usize,
+    /// Number of windows the harness ran over the corpus.
     pub num_windows: usize,
+    /// Window size passed in [`PerplexityConfig`], echoed for the report.
     pub window: usize,
+    /// Stride passed in [`PerplexityConfig`], echoed for the report.
     pub stride: usize,
 }
 
@@ -60,13 +70,25 @@ impl Qwen35Model {
     /// constructed fresh inside this function; the caller's state (if any) is
     /// not touched.
     ///
-    /// Errors if `tokens.len() < 2` or if any `token_id >= cfg.vocab_size`.
+    /// Errors if `tokens.len() < 2`, if any `token_id >= cfg.vocab_size`, or
+    /// if `tokens.len() > self.max_context()` (the precomputed RoPE table
+    /// only covers positions `0..max_context`; the underlying `forward_step`
+    /// would otherwise panic on out-of-range RoPE indexing).
     pub fn compute_token_nlls(&self, tokens: &[u32]) -> Result<Vec<f32>, InferenceError> {
         let cfg = &self.config;
         if tokens.len() < 2 {
             return Err(InferenceError::Inference(format!(
                 "compute_token_nlls: need at least 2 tokens, got {}",
                 tokens.len()
+            )));
+        }
+        let max_context = self.max_context();
+        if tokens.len() > max_context {
+            return Err(InferenceError::Inference(format!(
+                "compute_token_nlls: tokens.len() ({}) exceeds RoPE capacity ({}); \
+                 use a shorter window or load the model with a larger context table",
+                tokens.len(),
+                max_context
             )));
         }
         if let Some((bad_idx, &bad)) = tokens
@@ -118,6 +140,13 @@ impl Qwen35Model {
     /// Each window resets the KV cache + GDN state, so context never crosses a
     /// window boundary — `window - stride` tokens of context precede each
     /// scored token (zero context for the first `stride` tokens of the corpus).
+    ///
+    /// `stride` must be strictly less than `window`. Equal values would
+    /// produce disjoint windows whose first token (the global boundary token)
+    /// has no predecessor inside its own window and would therefore go
+    /// unscored — silently breaking the "scored exactly once" invariant.
+    /// Callers that want maximally-disjoint windows should pass
+    /// `stride = window - 1`.
     pub fn compute_perplexity(
         &self,
         tokens: &[u32],
@@ -134,10 +163,19 @@ impl Qwen35Model {
                 "compute_perplexity: stride must be > 0".into(),
             ));
         }
-        if cfg.stride > cfg.window {
+        if cfg.stride >= cfg.window {
             return Err(InferenceError::Inference(format!(
-                "compute_perplexity: stride ({}) must be <= window ({})",
+                "compute_perplexity: stride ({}) must be < window ({}); \
+                 stride == window silently drops every window-boundary token",
                 cfg.stride, cfg.window
+            )));
+        }
+        let max_context = self.max_context();
+        if cfg.window > max_context {
+            return Err(InferenceError::Inference(format!(
+                "compute_perplexity: window ({}) exceeds RoPE capacity ({}); \
+                 use a shorter window or load the model with a larger context table",
+                cfg.window, max_context
             )));
         }
         if tokens.len() < 2 {
@@ -625,6 +663,18 @@ mod tests {
         assert!(
             model
                 .compute_perplexity(
+                    &tokens,
+                    &PerplexityConfig {
+                        window: 4,
+                        stride: 4,
+                    }
+                )
+                .is_err(),
+            "stride == window must error (would silently drop boundary tokens)"
+        );
+        assert!(
+            model
+                .compute_perplexity(
                     &[1],
                     &PerplexityConfig {
                         window: 4,
@@ -641,8 +691,8 @@ mod tests {
         let cfg = test_config();
         let model = build_model(cfg, 0xA110_CA7E);
         let tokens: Vec<u32> = (1u32..=12).collect();
-        // window = corpus length: the strided harness collapses to a single
-        // window and the aggregated NLL must equal the direct sum.
+        // window covers the whole corpus → strided harness collapses to a
+        // single window and the aggregated NLL must equal the direct sum.
         let nlls = model.compute_token_nlls(&tokens).unwrap();
         let direct_total: f64 = nlls.iter().map(|&x| x as f64).sum();
         let report = model
@@ -650,7 +700,7 @@ mod tests {
                 &tokens,
                 &PerplexityConfig {
                     window: tokens.len(),
-                    stride: tokens.len(),
+                    stride: tokens.len() - 1,
                 },
             )
             .unwrap();
@@ -661,6 +711,78 @@ mod tests {
             "single-window strided PPL must agree with compute_token_nlls sum: got {} vs {}",
             report.total_nll,
             direct_total
+        );
+    }
+
+    #[test]
+    fn compute_perplexity_rejects_stride_equal_window() {
+        // Round-1 codex finding: stride == window silently dropped every
+        // window-boundary token (the first token of each disjoint window has
+        // no predecessor inside its own window). The harness now errors
+        // before that can happen.
+        let cfg = test_config();
+        let model = build_model(cfg, 0xDADA_F00D);
+        let tokens: Vec<u32> = (1u32..=20).collect();
+        let err = model
+            .compute_perplexity(
+                &tokens,
+                &PerplexityConfig {
+                    window: 10,
+                    stride: 10,
+                },
+            )
+            .expect_err("stride == window must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stride") && msg.contains("window"),
+            "error must name both `stride` and `window`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compute_perplexity_rejects_window_above_rope_capacity() {
+        // Round-1 codex finding: the public Result-returning API was able
+        // to panic by indexing the precomputed RoPE table past its end.
+        // The harness now validates window <= max_context up-front.
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xC0FF_EE42);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xC0FF_EE42);
+        let tokens: Vec<u32> = (1..=8).cycle().take(max_context + 4).collect();
+        let err = model
+            .compute_perplexity(
+                &tokens,
+                &PerplexityConfig {
+                    window: max_context + 1,
+                    stride: 8,
+                },
+            )
+            .expect_err("window > max_context must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("RoPE") && msg.contains(&format!("{max_context}")),
+            "error must mention the RoPE capacity; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compute_token_nlls_rejects_tokens_above_rope_capacity() {
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xC0FF_EE43);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xC0FF_EE43);
+        let tokens: Vec<u32> = (1..=8).cycle().take(max_context + 1).collect();
+        let err = model
+            .compute_token_nlls(&tokens)
+            .expect_err("tokens.len() > max_context must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("RoPE") && msg.contains(&format!("{max_context}")),
+            "error must mention the RoPE capacity; got: {msg}"
         );
     }
 }

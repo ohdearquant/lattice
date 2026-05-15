@@ -34,6 +34,17 @@ impl RopeTable {
         Self { cos, sin, half_dim }
     }
 
+    /// **Unstable**: number of positions the precomputed table can serve.
+    /// Callers that index `apply` / `cos_at` / `sin_at` beyond this will panic.
+    #[inline]
+    pub fn max_positions(&self) -> usize {
+        if self.half_dim == 0 {
+            0
+        } else {
+            self.cos.len() / self.half_dim
+        }
+    }
+
     /// **Unstable**: raw cos accessor; exposed for testing only.
     #[inline]
     pub fn cos_at(&self, idx: usize) -> f32 {
