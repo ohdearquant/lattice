@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Read AGENTS.md first"
+    url: https://github.com/ohdearquant/lattice/blob/main/AGENTS.md
+    about: "Coding conventions, crate ownership, AI-assisted contribution policy. Read before filing."
