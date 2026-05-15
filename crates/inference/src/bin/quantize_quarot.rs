@@ -29,6 +29,10 @@
 //! - `--num-probe-tokens <USIZE>`: chain-probe sample size. Default `4`.
 //! - `--dry-run`: run the pipeline + gate but skip every disk write.
 //!   Useful for CI sanity passes against a real safetensors source.
+//!   Dry-run also skips the output-directory layout checks (same-path,
+//!   non-empty) because there are no writes that could be corrupted —
+//!   the caller can point `--output-dir` at the input directory or at
+//!   a populated location and the existing files are untouched.
 //!
 //! Exit codes:
 //! - `0`: conversion succeeded; output dir is complete (or dry-run

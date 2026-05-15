@@ -115,7 +115,11 @@ struct IndexEntry {
 ///
 /// `opts.dry_run = true` runs the full pipeline + gate but skips every
 /// disk write, returning a report with `planned_quantized = 0`,
-/// `kept_f16 = 0`, `total_bytes_out = 0`.
+/// `kept_f16 = 0`, `total_bytes_out = 0`. In dry-run the
+/// output-directory layout validation (same-path, non-empty checks) is
+/// also skipped — those constraints exist to keep the write path from
+/// corrupting source artifacts, and dry-run produces no writes by
+/// definition.
 ///
 /// # Errors
 ///
@@ -136,8 +140,14 @@ pub fn convert_quarot_qwen35(
 ) -> Result<ConversionReport, InferenceError> {
     // Path-layout validation runs FIRST so the cheap CLI footguns
     // (same dir, non-empty target) fail before any expensive tensor
-    // work and before any disk write.
-    validate_output_dir_layout(input_dir, output_dir)?;
+    // work and before any disk write. Skipped in dry-run because the
+    // function returns before any `fs::create_dir_all` or file write
+    // happens, so the footguns cannot fire — callers may legitimately
+    // dry-run against an existing populated output location or a
+    // placeholder that happens to equal the input directory.
+    if !opts.dry_run {
+        validate_output_dir_layout(input_dir, output_dir)?;
+    }
 
     let config_path = input_dir.join("config.json");
     let config_json = fs::read_to_string(&config_path).map_err(|e| {
@@ -308,7 +318,10 @@ pub fn convert_quarot_qwen35(
 
 /// Refuse two CLI footguns that would otherwise let a failed conversion
 /// leave the caller with corrupted source artifacts or a half-stale
-/// output directory:
+/// output directory. The caller skips this validator in dry-run because
+/// dry-run produces no writes — the footguns cannot fire — and callers
+/// may want to dry-run against an existing populated output location
+/// or a placeholder that happens to equal the input directory.
 ///
 /// 1. `input_dir` and `output_dir` resolving to the **same canonical
 ///    path** — the converter would write a mutated (untied)
@@ -449,6 +462,7 @@ mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
     use serde_json::Value;
+    use std::path::PathBuf;
 
     // ------------------------------------------------------------------
     // Tiny test config + SafeTensors writer (local to this module to
@@ -1144,6 +1158,104 @@ mod tests {
         assert!(stale_path.exists(), "stale file must not be deleted");
         let bytes = fs::read(&stale_path).unwrap();
         assert_eq!(&bytes[..], b"old-q4-bytes");
+    }
+
+    /// Dry-run must NOT enforce the write-mode same-dir refuse. A CI
+    /// probe that points `--output-dir` at the same place as
+    /// `--model-dir` is harmless because dry-run writes nothing, and
+    /// the gate value is still useful as a fast pipeline sanity pass.
+    #[test]
+    fn convert_quarot_qwen35_dry_run_ignores_same_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 60);
+
+        // Snapshot every byte under input to assert dry-run touches nothing.
+        let listing_before = list_dir_recursive(&input);
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &input, // intentionally the same path
+            &ConversionOptions {
+                rotation_seed: 0xDEAD_C0DE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.planned_quantized, 0);
+        assert_eq!(report.total_bytes_out, 0);
+
+        let listing_after = list_dir_recursive(&input);
+        assert_eq!(
+            listing_before, listing_after,
+            "dry-run must not mutate the directory it shares with input"
+        );
+    }
+
+    /// Dry-run with a non-empty pre-existing output_dir is also fine —
+    /// no write happens, and the stale artifacts must survive the
+    /// dry-run untouched.
+    #[test]
+    fn convert_quarot_qwen35_dry_run_ignores_non_empty_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 61);
+        fs::create_dir_all(&output).unwrap();
+        let stale = output.join("stale.q4");
+        fs::write(&stale, b"old-bytes").unwrap();
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xBEEF_FACE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.planned_quantized, 0);
+        assert_eq!(report.kept_f16, 0);
+        assert_eq!(report.total_bytes_out, 0);
+
+        // Stale file must survive bit-for-bit; no new files in output.
+        assert!(stale.exists(), "stale file must not be deleted in dry-run");
+        assert_eq!(fs::read(&stale).unwrap(), b"old-bytes");
+        let listing: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(listing.len(), 1, "dry-run must not add files: {listing:?}");
+    }
+
+    /// Recursive directory listing helper for "filesystem unchanged"
+    /// assertions in dry-run tests. Returns (relative path, byte length)
+    /// pairs sorted by path so two listings compare equal iff the
+    /// filesystem state matches.
+    fn list_dir_recursive(root: &Path) -> Vec<(PathBuf, u64)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    out.push((rel, metadata.len()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
     }
 
     /// Empty pre-existing output dir is fine — the converter populates it.
