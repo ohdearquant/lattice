@@ -132,12 +132,15 @@
 //! - **Tied-embedding untying + `tie_word_embeddings=false` config flip**
 //!   (described in detail in the §Tied embeddings section above).
 //!
-//! Required loader-side helper not yet exposed:
+//! Loader-side helpers available to the converter:
 //!
-//! - **`qwen_required_tensor_names(cfg)` is `#[cfg(test)]`-only** at
-//!   `model/qwen35/mod.rs:44`. Step 3b's conversion binary cannot call
-//!   it as written. Step 3b must promote this re-export out of the
-//!   test cfg before the per-layer coverage check can run.
+//! - [`crate::model::qwen35::qwen_required_tensor_names`] returns the
+//!   per-config expected tensor list (per-layer, per-architecture
+//!   variant). Step 3b promoted this out of `#[cfg(test)]`. Step 3c
+//!   uses it to validate that every required tensor in the input
+//!   safetensors is reachable before quantization begins.
+//! - [`crate::quant::quarot::io::QuarotTensorReader`] (step 3b) provides
+//!   the streaming f64 read path with single-file + sharded auto-detect.
 //!
 //! Out-of-scope (silently-broken) integrations:
 //!
@@ -255,9 +258,10 @@ impl RotationPlan {
     /// responsibilities not captured here: shifted RMSNorm `(1+gamma)`
     /// fusion + neutralization (input/post/final), `tie_word_embeddings=false`
     /// config flip, fused `lm_head` materialization, per-layer coverage
-    /// against `qwen_required_tensor_names` (currently `#[cfg(test)]`-gated),
-    /// and LoRA-runtime incompatibility marker. Step 3c/3d's
-    /// `quantize_quarot` binary owns all of these.
+    /// against `qwen_required_tensor_names` (exposed in step 3b via
+    /// [`crate::model::qwen35::qwen_required_tensor_names`]), and
+    /// LoRA-runtime incompatibility marker. Step 3c/3d's `quantize_quarot`
+    /// binary owns all of these.
     pub fn qwen35_residual_stream_linear_layers() -> Self {
         let r_in = TensorRotation {
             side: AbsorptionSide::InputSide,
@@ -339,10 +343,10 @@ impl RotationPlan {
     /// `tie_word_embeddings` flip, etc. — see module §Known gaps).
     ///
     /// Per-layer coverage requires the loader's config-derived expected
-    /// name list, which lives at `model/qwen35/loading.rs:12` as
-    /// `qwen_required_tensor_names(cfg)`. Step 3b must promote that
-    /// re-export out of `#[cfg(test)]` at `model/qwen35/mod.rs:44`
-    /// before the conversion binary can call it.
+    /// name list at [`crate::model::qwen35::qwen_required_tensor_names`].
+    /// Step 3b promoted that re-export out of `#[cfg(test)]` so the
+    /// conversion binary can call it; step 3c performs the actual
+    /// per-layer cross-check.
     ///
     /// Returns a [`CoverageReport`] with five lists:
     /// - `matched_tensors`: loaded tensors that matched some plan rule
