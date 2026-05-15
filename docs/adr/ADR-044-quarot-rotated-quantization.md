@@ -1,6 +1,6 @@
 # ADR-044: QuaRot — Hadamard-Rotated 4-bit Quantization
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-15
 **Crate**: lattice-inference
 
@@ -21,26 +21,38 @@ No public pure-Rust QuaRot implementation exists.
 
 Implement QuaRot v0 in `lattice-inference` as a new module `quant::quarot` (not a new crate — per CLAUDE.md the inference crate already holds weight-format and quantization code).
 
-### Scope — v0 (this PR)
+### Scope — v0 (multi-PR)
 
-**In**:
-- Walsh-Hadamard transform primitive (fast in-place, `n` must be a power of 2)
-- Random Hadamard matrix generator (signed permutation × structured Hadamard, seedable)
-- Rotation absorption into linear-layer weight matrices (offline, save rotated weights as new safetensors)
-- Integration with existing `weights::q4_weights::quantize_bf16_to_q4` — apply rotation first, then quantize
-- Binary: `quantize_quarot` modeled on `quantize_q4`, takes rotation seed + model path
-- Bench: rotated-Q4 vs unrotated-Q4 perplexity delta on Qwen3-0.6B WikiText-2 calibration
+v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to keep each diff small and reviewable:
 
-**Out (deferred to v1)**:
+| Step | PR | Scope |
+|---|---|---|
+| 1 | this PR | Walsh-Hadamard + RandomizedHadamard primitives, unit-tested. No model code touched. |
+| 2 | next | Rotation absorption: read SafeTensors → compute `W·Q^T` for each linear layer affected by a planned rotation → save rotated weights as new SafeTensors. Includes equivalence assertion (`||rotated_forward − original_forward|| < 1e-5` on a small batch) before the rotated weights are written. |
+| 3 | next | Wire rotated SafeTensors through existing `weights::q4_weights::quantize_bf16_to_q4`. Binary `quantize_quarot` modeled on `quantize_q4` taking seed + model path. |
+| 4 | next | Bench: rotated-Q4 vs unrotated-Q4 perplexity delta on Qwen3-0.6B / Qwen3.5-0.8B against WikiText-2 calibration. Acceptance: delta < 0.5 PPL. |
+
+**Out of v0 entirely (deferred to v1)**:
 - INT4 activation quantization (online during forward pass)
 - INT4 KV cache quantization
 - INT4 attention scores
 - Per-layer rotation seeds (v0 uses one global Hadamard for the residual stream + one per attention head dim)
 - Calibration-data tuning (v0 uses random Hadamard only — the QuaRot paper shows this is competitive without learned rotations)
 
+**Model coverage in v0**:
+
+| Model | hidden | head_dim | v0 supported? |
+|---|---:|---:|---|
+| Qwen3-0.6B (decoder) | 1024 | 128 | ✅ both power of 2 |
+| Qwen3.5-0.8B (hybrid) | 1024 | 128 | ✅ both power of 2 |
+| Qwen3-Embedding-4B | 2560 | (n/a — encoder) | ❌ **explicitly deferred** — `2560 = 2^9 · 5`, not a power of 2; needs randomized Hadamard with padding or structured non-power-of-2 transforms |
+| BERT-base (encoder) | 768 | 64 | ❌ **explicitly deferred** — `768 = 2^8 · 3`, not a power of 2 |
+
+The v1 follow-up will add padded-Hadamard support (round up to next power-of-2, project back) so 4B and BERT-class models are covered.
+
 ### Key Design Choices
 
-**Hadamard size = power of 2 only.** Qwen3-0.6B has `hidden=1024`, `head_dim=128` — both are powers of 2, so structured Walsh-Hadamard works without padding. For non-power-of-2 hidden sizes we'd need randomized Hadamard via Hadamard-of-bigger-power-of-2 with masking; deferred.
+**Hadamard size = power of 2 only.** v0 covers the decoder models whose hidden and head dims are all powers of 2 (Qwen3-0.6B, Qwen3.5-0.8B — see model-coverage table above). Models with non-power-of-2 dims (Qwen3-Embedding-4B at hidden=2560, BERT-base at hidden=768) are **explicitly deferred** to v1, which will use padded-Hadamard (project into next power-of-2, apply transform, project back).
 
 **Offline rotation, not on-the-fly.** v0 saves the rotated+quantized weights as a new `.q4` file. The forward pass loads it like any other Q4 model — no runtime rotation cost. Tradeoff: 2× disk usage during conversion. Trade is worth it because rotation is a one-time cost.
 

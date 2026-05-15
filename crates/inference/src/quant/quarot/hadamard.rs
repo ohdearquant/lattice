@@ -75,11 +75,17 @@ fn signs_from_seed(seed: u64, n: usize) -> Vec<f32> {
     signs
 }
 
-/// Randomized Hadamard rotation `R = D · H` where `D` is a seeded diagonal of
-/// ±1 entries and `H` is the orthonormal Walsh-Hadamard transform.
+/// Randomized Hadamard rotation `R = H · D` where `D` is a seeded diagonal of
+/// ±1 entries and `H` is the orthonormal Walsh-Hadamard transform. Both `D` and
+/// `H` are symmetric and orthogonal, so `R` is orthogonal: `R^T R = (H·D)^T (H·D)
+/// = D·H·H·D = D·D = I`.
 ///
-/// `R` is orthogonal (`R^T R = I`); applying it twice does NOT recover the input
-/// because `D · H · D · H ≠ I` in general. To invert, use [`Self::apply_inverse`].
+/// [`Self::apply`] computes `R · x = H · (D · x)` — apply `D` first (sign flip
+/// per coordinate), then `H` (orthonormal Walsh-Hadamard). [`Self::apply_inverse`]
+/// computes `R^T · x = D · (H · x)` — `H` first, then `D`.
+///
+/// Applying [`Self::apply`] twice does NOT recover the input because
+/// `H · D · H · D ≠ I` in general; use [`Self::apply_inverse`] to undo a rotation.
 #[derive(Debug, Clone)]
 pub struct RandomizedHadamard {
     signs: Vec<f32>,
@@ -105,7 +111,8 @@ impl RandomizedHadamard {
         self.signs.len()
     }
 
-    /// Apply `R · x = H · D · x` to `data` in place.
+    /// Apply `R · x = H · (D · x)` to `data` in place: sign-flip by `D`, then
+    /// orthonormal Walsh-Hadamard.
     ///
     /// Returns an error if `data.len() != self.dim()`.
     pub fn apply(&self, data: &mut [f32]) -> Result<(), InferenceError> {
@@ -122,7 +129,8 @@ impl RandomizedHadamard {
         walsh_hadamard_orthonormal_in_place(data)
     }
 
-    /// Apply `R^T · x = D · H · x` to `data` in place — the inverse of [`Self::apply`].
+    /// Apply `R^T · x = D · (H · x)` to `data` in place — the inverse of
+    /// [`Self::apply`]. Orthonormal Walsh-Hadamard, then sign-flip by `D`.
     pub fn apply_inverse(&self, data: &mut [f32]) -> Result<(), InferenceError> {
         if data.len() != self.signs.len() {
             return Err(InferenceError::Inference(format!(
