@@ -6,15 +6,30 @@
 //! [`assert_forward_equivalence_qwen35`] — the converter binary (step 3c-5)
 //! must call this gate AFTER running the full pipeline
 //! (materialize_lm_head → fuse_rmsnorms → absorb_rotations) and BEFORE
-//! quantizing or writing artifacts to disk. The gate runs a deterministic
-//! probe forward on both the pre-pipeline `original` working set and the
-//! post-pipeline `rotated` working set, then refuses the conversion when
-//! the per-element max-abs error exceeds `tolerance`.
+//! quantizing or writing artifacts to disk. The gate runs two checks and
+//! refuses the conversion (`Err(InferenceError::Inference)`) when either
+//! exceeds `tolerance`:
 //!
-//! The refuse semantic is **`Err(InferenceError::Inference)`**. The caller
-//! must not write any conversion artifacts when this returns `Err` — the
-//! pipeline produced logits that disagree with the original model, and
-//! shipping that quantized output would silently degrade accuracy.
+//! 1. **Rotation-chain probe** — a linearized end-to-end forward (see
+//!    §"What the probe does" below) that exercises the residual stream
+//!    through one input projection + one output projection per attention
+//!    layer plus the full MLP block. Catches errors that propagate
+//!    through the residual stream.
+//! 2. **Per-tensor rotation-equivalence check** — iterates EVERY
+//!    [`RotationPlan`] rule and verifies the algebraic identity
+//!    `W_rot · (R · x) = W_orig · ((1 + γ) ⊙ x)` (input-side, fused) or
+//!    `W_rot · y = R · (W_orig · y)` (output-side) on a deterministic
+//!    random test vector. Catches per-tensor corruption / missed
+//!    rotation absorption / missed fusion on tensors the chain probe
+//!    does not consume — `k_proj`, `v_proj`, the gate-z half of
+//!    `q_proj`, `in_proj_qkv`, `in_proj_a`, `in_proj_b`.
+//!
+//! The two checks are complementary: (1) catches residual-stream
+//! breakage holistically, (2) catches every planned tensor individually
+//! including the ones (1) shortcuts past. The refuse semantic is the
+//! same — `Err(InferenceError::Inference)` with `max_abs_error`,
+//! `mean_abs_error`, `tolerance`, and (for chain probe failures)
+//! `probe_tokens` in the diagnostic message.
 //!
 //! ## What the probe does (and does NOT do)
 //!
@@ -60,32 +75,47 @@
 //! fusion targets (the fusion plan column-multiplies `(1 + γ_in)` into
 //! all of `q_proj`, `k_proj`, `v_proj`).
 //!
-//! ### What the probe IS sufficient to catch
+//! ### What the gate IS sufficient to catch
 //!
-//! - Missing rotation absorption on any tensor in the chain: `embed_tokens`,
-//!   `q_proj`, `o_proj`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`,
-//!   `down_proj`, `lm_head`.
+//! - Missing rotation absorption on **every** tensor in the rotation
+//!   plan — both the ones in the chain probe (`embed_tokens`, `q_proj`,
+//!   `o_proj`, `in_proj_z`, `out_proj`, `gate_proj`, `up_proj`,
+//!   `down_proj`, `lm_head`) and the ones the per-tensor check adds
+//!   coverage for (`k_proj`, `v_proj`, gate-z half of `q_proj`,
+//!   `in_proj_qkv`, `in_proj_a`, `in_proj_b`).
 //! - RMSNorm fusion missing: `(1 + γ)` left online for `input_layernorm`,
-//!   `post_attention_layernorm`, or `final_norm`.
+//!   `post_attention_layernorm`, or `final_norm`. The per-tensor check
+//!   verifies the post-fusion algebraic identity holds for each fused
+//!   downstream, so a partial fusion (e.g., fused into `q_proj` but not
+//!   `k_proj`) is caught.
 //! - `lm_head` not materialized when the input config is tied — the
 //!   rotated probe needs a present `lm_head.weight` to consume the
 //!   `(1 + γ_final)` column scale and the input-side rotation.
 //! - `final_norm` fusion target not appended — γ_final left non-zero in
 //!   the rotated set means the runtime double-applies the scale once
 //!   it's also baked into lm_head.
-//! - Wrong rotation (different `R` between two pipelines, or wrong
+//! - Wrong rotation (different `R` between the rotation passed to this
+//!   gate and the one absorbed into the rotated working set, or wrong
 //!   absorption side).
+//! - Tensor-level corruption on any planned tensor (scaling, partial
+//!   re-quantization, double-rotation), even on tensors the chain
+//!   probe never matvecs against.
 //!
-//! ### What the probe is NOT sufficient to catch
+//! ### What the gate is NOT sufficient to catch
 //!
 //! - Bugs that only manifest in `silu(gate) ⊙ up` — a real Qwen forward
 //!   would exercise this; the probe linearizes it. Step 4 of ADR-044
 //!   (perplexity bench on real calibration data) is the full check.
-//! - Bugs in the full attention compute (softmax / RoPE / K, V) — the
-//!   probe shortcuts through projections only.
-//! - Quantization error — the probe runs in f64 on the pre-quantization
+//! - Bugs in the full attention compute (softmax / RoPE) — the probe
+//!   shortcuts through projections only.
+//! - Quantization error — the gate runs in f64 on the pre-quantization
 //!   working set. Q4 round-trip error is bounded by the Q4 bridge's own
 //!   tests (`weights::q4_weights`).
+//! - Tensors **outside** the rotation plan — e.g., GDN's
+//!   `linear_attn.norm.weight` (plain-gamma, intentionally NOT fused per
+//!   ADR-044 §Risks), `q_norm`/`k_norm`, `A_log`, `dt_bias`, `conv1d`.
+//!   The plan and fusion plan together define the gate's correctness
+//!   contract; tensors outside both are caller-responsibility.
 //!
 //! ## Tied vs untied originals
 //!
@@ -113,10 +143,14 @@ use std::collections::HashMap;
 
 use crate::error::InferenceError;
 use crate::model::qwen35_config::Qwen35Config;
+use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
+    qwen35_final_norm_fusion_target,
 };
 use crate::quant::quarot::pipeline::TensorEntry;
+use crate::quant::quarot::plan::{AbsorptionSide, RotationPlan};
+use crate::quant::quarot::rmsnorm_fusion::{RmsNormFusionTarget, qwen35_per_layer_fusion_plan};
 
 /// Probe sample size + tolerance settings for
 /// [`assert_forward_equivalence_qwen35`].
@@ -162,30 +196,43 @@ pub struct ForwardEquivalenceReport {
 
 /// **Refuse-on-fail forward-equivalence gate** for QuaRot Qwen3.5 conversion.
 ///
-/// Runs the rotation-chain probe (see module doc) on `original` and
-/// `rotated`, returns `Ok(report)` when the per-element max-abs error
-/// stays within `forward_cfg.tolerance`, and **returns
-/// `Err(InferenceError::Inference)`** otherwise. The error message
-/// includes the observed max-abs and mean-abs deltas and the configured
-/// tolerance so callers can surface a useful diagnostic without
-/// re-running the probe.
+/// Runs both the rotation-chain probe and the per-tensor rotation-equivalence
+/// check (see module doc) on `original` and `rotated`. Returns
+/// `Ok(report)` only when BOTH checks stay within `forward_cfg.tolerance`,
+/// and **returns `Err(InferenceError::Inference)`** otherwise. The error
+/// message names which check tripped and includes the observed max-abs
+/// delta, the configured tolerance, and (for chain-probe failures) the
+/// probe tokens — enough for the binary's caller to triage from logs
+/// without re-running.
 ///
 /// The converter binary (step 3c-5) MUST treat the `Err` return as a
 /// hard refuse: do NOT proceed to quantization, do NOT write the output
 /// `.q4` file, do NOT mutate the output `config.json`. The whole point
 /// of this gate is to keep wrong-output artifacts off disk.
 ///
+/// `rotation` MUST be the same [`RandomizedHadamard`] the caller passed
+/// to [`crate::quant::quarot::pipeline::absorb_rotations`]. The
+/// per-tensor check uses it to verify the algebraic identity
+/// `W_rot · (R · x) = W_orig · ((1 + γ) ⊙ x)` (input-side, fused) or
+/// `W_rot · y = R · (W_orig · y)` (output-side) on each planned tensor.
+/// A mismatch between this rotation and the one absorbed into the
+/// rotated working set is one of the bugs the gate explicitly catches
+/// (per-tensor check will refuse).
+///
 /// # Errors
 ///
 /// - `cfg.is_moe()` — MoE conversion is deferred to v1.
-/// - `forward_cfg.num_probe_tokens == 0` or `tolerance <= 0`.
-/// - Any required tensor is missing from either working set, or has the
+/// - `forward_cfg.num_probe_tokens == 0` or `tolerance` is not a positive finite.
+/// - `rotation.dim() != cfg.hidden_size`.
+/// - Any planned tensor is missing from either working set, or has the
 ///   wrong shape or data length.
-/// - Forward delta exceeds tolerance — the refuse-on-fail case.
+/// - Either the chain probe or the per-tensor check exceeds tolerance —
+///   the refuse-on-fail case. The error message names which check tripped.
 pub fn assert_forward_equivalence_qwen35(
     original: &HashMap<String, TensorEntry>,
     rotated: &HashMap<String, TensorEntry>,
     cfg: &Qwen35Config,
+    rotation: &RandomizedHadamard,
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<ForwardEquivalenceReport, InferenceError> {
     if cfg.is_moe() {
@@ -212,16 +259,24 @@ pub fn assert_forward_equivalence_qwen35(
             "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
         ));
     }
+    if rotation.dim() != cfg.hidden_size {
+        return Err(InferenceError::Inference(format!(
+            "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
+            rotation.dim(),
+            cfg.hidden_size
+        )));
+    }
 
+    // 1. Rotation-chain probe.
     let probe_tokens = deterministic_probe_tokens(
         forward_cfg.seed,
         forward_cfg.num_probe_tokens,
         cfg.vocab_size,
     );
 
-    let mut max_abs = 0.0_f64;
-    let mut total_abs = 0.0_f64;
-    let mut count: usize = 0;
+    let mut chain_max_abs = 0.0_f64;
+    let mut chain_total_abs = 0.0_f64;
+    let mut chain_count: usize = 0;
 
     for &token in &probe_tokens {
         let logits_orig = rotation_chain_probe_qwen35(original, cfg, token)?;
@@ -236,36 +291,232 @@ pub fn assert_forward_equivalence_qwen35(
         }
         for (a, b) in logits_orig.iter().zip(logits_rot.iter()) {
             let d = (a - b).abs();
-            if d > max_abs {
-                max_abs = d;
+            if d > chain_max_abs {
+                chain_max_abs = d;
             }
-            total_abs += d;
-            count += 1;
+            chain_total_abs += d;
+            chain_count += 1;
         }
     }
 
-    let mean_abs = if count > 0 {
-        total_abs / count as f64
+    let chain_mean_abs = if chain_count > 0 {
+        chain_total_abs / chain_count as f64
     } else {
         0.0
     };
 
-    if max_abs > forward_cfg.tolerance {
+    if chain_max_abs > forward_cfg.tolerance {
         return Err(InferenceError::Inference(format!(
-            "forward-equivalence refused: max_abs_error={max_abs} exceeds tolerance={} \
-             (mean_abs_error={mean_abs}, probe_tokens={:?}). \
+            "forward-equivalence refused: chain probe max_abs_error={chain_max_abs} \
+             exceeds tolerance={} (mean_abs_error={chain_mean_abs}, probe_tokens={:?}). \
              Do NOT write conversion artifacts — the pipeline produced logits \
              that disagree with the original model.",
             forward_cfg.tolerance, probe_tokens
         )));
     }
 
+    // 2. Per-tensor rotation-equivalence check. Covers every planned tensor,
+    //    including the ones the chain probe shortcuts past (k_proj, v_proj,
+    //    gate-z half of q_proj, in_proj_qkv, in_proj_a, in_proj_b).
+    let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+    let mut fusion_plan = qwen35_per_layer_fusion_plan(cfg)?;
+    fusion_plan.push(qwen35_final_norm_fusion_target());
+    let per_tensor_max_abs = check_per_tensor_rotation_equivalence(
+        original,
+        rotated,
+        cfg,
+        rotation,
+        &rotation_plan,
+        &fusion_plan,
+        forward_cfg.seed,
+    )?;
+
+    if per_tensor_max_abs > forward_cfg.tolerance {
+        return Err(InferenceError::Inference(format!(
+            "forward-equivalence refused: per-tensor max_abs_error={per_tensor_max_abs} \
+             exceeds tolerance={} (chain probe max={chain_max_abs}, mean={chain_mean_abs}). \
+             At least one planned tensor disagrees with the rotation/fusion algebra. \
+             Do NOT write conversion artifacts.",
+            forward_cfg.tolerance
+        )));
+    }
+
+    let max_abs = chain_max_abs.max(per_tensor_max_abs);
     Ok(ForwardEquivalenceReport {
         max_abs_error: max_abs,
-        mean_abs_error: mean_abs,
+        mean_abs_error: chain_mean_abs,
         probe_tokens,
         tolerance: forward_cfg.tolerance,
     })
+}
+
+/// Per-tensor algebraic-identity check for each [`RotationPlan`] rule.
+///
+/// For input-side tensors with fusion `γ`:
+/// `‖ W_rot · (R · x) − W_orig · ((1 + γ) ⊙ x) ‖_∞`
+///
+/// For input-side tensors without fusion (`embed_tokens` only in the
+/// Qwen3.5 plan):
+/// `‖ W_rot · (R · x) − W_orig · x ‖_∞`
+///
+/// For output-side tensors (`o_proj`, `out_proj`, `down_proj`):
+/// `‖ W_rot · y − R · (W_orig · y) ‖_∞`
+///
+/// Returns the max across every planned tensor in the working set.
+fn check_per_tensor_rotation_equivalence(
+    original: &HashMap<String, TensorEntry>,
+    rotated: &HashMap<String, TensorEntry>,
+    cfg: &Qwen35Config,
+    rotation: &RandomizedHadamard,
+    rotation_plan: &RotationPlan,
+    fusion_plan: &[RmsNormFusionTarget],
+    seed: u64,
+) -> Result<f64, InferenceError> {
+    let hidden = cfg.hidden_size;
+
+    // Name → fusion gamma lookup. γ is read from `original` (un-neutralized);
+    // the rotated set has γ = 0 post-fusion, which is what makes the algebra
+    // check meaningful.
+    let mut fusion_gamma: HashMap<&str, &[f64]> = HashMap::new();
+    for target in fusion_plan {
+        let norm = original.get(&target.norm_tensor).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: fusion norm tensor `{}` \
+                 not in original working set",
+                target.norm_tensor
+            ))
+        })?;
+        if norm.shape.len() != 1 || norm.data.len() != norm.shape[0] {
+            return Err(InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: norm tensor `{}` shape/data \
+                 mismatch (shape={:?}, data.len()={})",
+                target.norm_tensor,
+                norm.shape,
+                norm.data.len()
+            )));
+        }
+        for downstream in &target.downstream_weights {
+            fusion_gamma.insert(downstream.as_str(), norm.data.as_slice());
+        }
+    }
+
+    let x_input = synthetic_unit_vec(hidden, seed);
+    let mut x_input_rot = x_input.clone();
+    rotation.apply_f64(&mut x_input_rot)?;
+
+    // Cache deterministic output-side test vectors by cols dim.
+    let mut output_y_cache: HashMap<usize, Vec<f64>> = HashMap::new();
+
+    let mut max_abs = 0.0_f64;
+
+    for (name, t_orig) in original {
+        let Some(tensor_rotation) = rotation_plan.for_tensor(name) else {
+            continue;
+        };
+        let t_rot = rotated.get(name).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: planned tensor `{name}` \
+                 not in rotated working set"
+            ))
+        })?;
+        if t_orig.shape.len() != 2 || t_rot.shape != t_orig.shape {
+            return Err(InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: tensor `{name}` shape mismatch \
+                 (original={:?}, rotated={:?})",
+                t_orig.shape, t_rot.shape
+            )));
+        }
+        let rows = t_orig.shape[0];
+        let cols = t_orig.shape[1];
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: rows*cols overflow on `{name}` \
+                 ({rows}*{cols})"
+            ))
+        })?;
+        if t_orig.data.len() != expected || t_rot.data.len() != expected {
+            return Err(InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: tensor `{name}` data.len() \
+                 mismatch (original={}, rotated={}, rows*cols={expected})",
+                t_orig.data.len(),
+                t_rot.data.len()
+            )));
+        }
+
+        let delta = match tensor_rotation.side {
+            AbsorptionSide::InputSide => {
+                if cols != hidden {
+                    return Err(InferenceError::Inference(format!(
+                        "check_per_tensor_rotation_equivalence: input-side tensor `{name}` \
+                         cols={cols} != hidden={hidden} (rotation plan invariant violated)"
+                    )));
+                }
+                let x_for_orig: Vec<f64> = if let Some(gamma) = fusion_gamma.get(name.as_str()) {
+                    if gamma.len() != cols {
+                        return Err(InferenceError::Inference(format!(
+                            "check_per_tensor_rotation_equivalence: fusion gamma for `{name}` \
+                             length {} != cols={cols}",
+                            gamma.len()
+                        )));
+                    }
+                    x_input
+                        .iter()
+                        .zip(gamma.iter())
+                        .map(|(xi, gi)| xi * (1.0 + gi))
+                        .collect()
+                } else {
+                    x_input.clone()
+                };
+                let y_orig = matvec_f64(&t_orig.data, rows, cols, &x_for_orig);
+                let y_rot = matvec_f64(&t_rot.data, rows, cols, &x_input_rot);
+                max_abs_diff(&y_orig, &y_rot)
+            }
+            AbsorptionSide::OutputSide => {
+                if rows != hidden {
+                    return Err(InferenceError::Inference(format!(
+                        "check_per_tensor_rotation_equivalence: output-side tensor `{name}` \
+                         rows={rows} != hidden={hidden} (rotation plan invariant violated)"
+                    )));
+                }
+                let y_test = output_y_cache
+                    .entry(cols)
+                    .or_insert_with(|| synthetic_unit_vec(cols, seed.wrapping_add(cols as u64)))
+                    .clone();
+                let y_orig = matvec_f64(&t_orig.data, rows, cols, &y_test);
+                let mut y_orig_rot = y_orig.clone();
+                rotation.apply_f64(&mut y_orig_rot)?;
+                let y_rot = matvec_f64(&t_rot.data, rows, cols, &y_test);
+                max_abs_diff(&y_orig_rot, &y_rot)
+            }
+        };
+
+        if delta > max_abs {
+            max_abs = delta;
+        }
+    }
+
+    Ok(max_abs)
+}
+
+fn synthetic_unit_vec(n: usize, seed: u64) -> Vec<f64> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let bits = (state >> 11) as u32;
+            (bits as f64 / u32::MAX as f64) - 0.5
+        })
+        .collect()
+}
+
+fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max)
 }
 
 fn deterministic_probe_tokens(seed: u64, n: usize, vocab_size: usize) -> Vec<u32> {
@@ -728,6 +979,7 @@ mod tests {
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap();
@@ -756,35 +1008,11 @@ mod tests {
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap();
         assert!(report.max_abs_error < 1e-5, "unexpected delta: {report:?}");
-    }
-
-    /// Sanity: identical working sets give zero delta. Catches probe
-    /// non-determinism that would silently mask real bugs.
-    #[test]
-    fn forward_equivalence_is_zero_on_identical_sets() {
-        let cfg = tiny_test_cfg();
-        let mut original = build_working_set(&cfg, 3);
-        insert_tensor(
-            &mut original,
-            QWEN35_LM_HEAD_NAME,
-            vec![cfg.vocab_size, cfg.hidden_size],
-            synthetic_f64(cfg.vocab_size * cfg.hidden_size, 333),
-        );
-        let rotated = original.clone();
-
-        let report = assert_forward_equivalence_qwen35(
-            &original,
-            &rotated,
-            &cfg,
-            &ForwardEquivalenceConfig::default(),
-        )
-        .unwrap();
-        assert_eq!(report.max_abs_error, 0.0);
-        assert_eq!(report.mean_abs_error, 0.0);
     }
 
     /// Refuse: rotate without fusing the final_norm target. The mismatch
@@ -812,6 +1040,7 @@ mod tests {
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -853,6 +1082,7 @@ mod tests {
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -888,6 +1118,7 @@ mod tests {
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -911,11 +1142,13 @@ mod tests {
             vec![cfg.vocab_size, cfg.hidden_size],
             synthetic_f64(cfg.vocab_size * cfg.hidden_size, 7777),
         );
+        let rotation = RandomizedHadamard::new(1, cfg.hidden_size).unwrap();
 
         let err = assert_forward_equivalence_qwen35(
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -938,11 +1171,13 @@ mod tests {
 
         // Remove a required tensor from `original` to simulate a partial load.
         original.remove(QWEN35_FINAL_NORM_NAME);
+        let rotation = RandomizedHadamard::new(2, cfg.hidden_size).unwrap();
 
         let err = assert_forward_equivalence_qwen35(
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -977,11 +1212,13 @@ mod tests {
             synthetic_f64(cfg.vocab_size * cfg.hidden_size, 999),
         );
         let rotated = original.clone();
+        let rotation = RandomizedHadamard::new(3, cfg.hidden_size).unwrap();
 
         let err = assert_forward_equivalence_qwen35(
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -999,10 +1236,14 @@ mod tests {
         assert!(cfg.is_moe());
         let original = HashMap::new();
         let rotated = HashMap::new();
+        // MoE check returns before rotation.dim() is consulted; any
+        // power-of-2-dim rotation suffices for the parameter slot.
+        let rotation = RandomizedHadamard::new(0, 8).unwrap();
         let err = assert_forward_equivalence_qwen35(
             &original,
             &rotated,
             &cfg,
+            &rotation,
             &ForwardEquivalenceConfig::default(),
         )
         .unwrap_err();
@@ -1015,11 +1256,13 @@ mod tests {
         let cfg = tiny_test_cfg();
         let original = HashMap::new();
         let rotated = HashMap::new();
+        let rotation = RandomizedHadamard::new(0, cfg.hidden_size).unwrap();
         let fc = ForwardEquivalenceConfig {
             num_probe_tokens: 0,
             ..Default::default()
         };
-        let err = assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &fc).unwrap_err();
+        let err = assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &rotation, &fc)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("num_probe_tokens must be > 0"),
@@ -1032,19 +1275,44 @@ mod tests {
         let cfg = tiny_test_cfg();
         let original = HashMap::new();
         let rotated = HashMap::new();
+        let rotation = RandomizedHadamard::new(0, cfg.hidden_size).unwrap();
         for bad in [0.0_f64, -1e-5, f64::NAN] {
             let fc = ForwardEquivalenceConfig {
                 tolerance: bad,
                 ..Default::default()
             };
-            let err =
-                assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &fc).unwrap_err();
+            let err = assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &rotation, &fc)
+                .unwrap_err();
             let msg = format!("{err}");
             assert!(
                 msg.contains("tolerance must be a positive finite value"),
                 "unexpected error for tolerance={bad}: {msg}"
             );
         }
+    }
+
+    /// Refuse: rotation.dim() != cfg.hidden_size — caller passed a
+    /// rotation built for the wrong space.
+    #[test]
+    fn forward_equivalence_rejects_rotation_dim_mismatch() {
+        let cfg = tiny_test_cfg();
+        let original = build_working_set(&cfg, 11);
+        let rotated = original.clone();
+        let rotation = RandomizedHadamard::new(0, cfg.hidden_size * 2).unwrap();
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("rotation.dim()"), "unexpected error: {msg}");
+        assert!(
+            msg.contains(&format!("cfg.hidden_size={}", cfg.hidden_size)),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Determinism: same seed → same probe tokens. Catches a clock-based or
@@ -1088,14 +1356,212 @@ mod tests {
             tolerance: 1e-12,
             ..Default::default()
         };
-        let err = assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &fc).unwrap_err();
+        let err = assert_forward_equivalence_qwen35(&original, &rotated, &cfg, &rotation, &fc)
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("max_abs_error="), "unexpected error: {msg}");
         assert!(
             msg.contains("exceeds tolerance="),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("mean_abs_error="), "unexpected error: {msg}");
-        assert!(msg.contains("probe_tokens="), "unexpected error: {msg}");
+        // Either chain-probe or per-tensor message format is acceptable —
+        // both name the failing check explicitly.
+        assert!(
+            msg.contains("chain probe") || msg.contains("per-tensor"),
+            "expected refuse message to name the failing check: {msg}"
+        );
+    }
+
+    /// Per-tensor coverage helper: run the full pipeline correctly, then
+    /// scale `victim_name` by `factor` in the rotated working set and
+    /// assert the gate refuses. Covers the chain-probe-skipped planned
+    /// tensors that codex flagged in round 1.
+    fn assert_corrupting_planned_tensor_refuses(victim_name: &str, factor: f64, seed: u64) {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, seed);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation =
+            RandomizedHadamard::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), cfg.hidden_size)
+                .unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        // Verify the pipeline is correct BEFORE corruption (so a refuse
+        // after corruption is attributable to the corruption alone).
+        assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("pre-corruption pipeline must pass for victim `{victim_name}`: {e}")
+        });
+
+        let victim = rotated
+            .get_mut(victim_name)
+            .unwrap_or_else(|| panic!("victim tensor `{victim_name}` missing from working set"));
+        for v in victim.data.iter_mut() {
+            *v *= factor;
+        }
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("forward-equivalence refused"),
+            "expected refuse for corrupted `{victim_name}`: {msg}"
+        );
+        assert!(
+            msg.contains("per-tensor"),
+            "corruption of `{victim_name}` should be caught by the per-tensor check: {msg}"
+        );
+    }
+
+    /// Per-tensor coverage: corrupting `k_proj` is invisible to the chain
+    /// probe (probe shortcuts through `q_proj` → `o_proj`) but must be
+    /// caught by the per-tensor algebraic check. This regression case is
+    /// the specific gap codex flagged in PR #28 round-1 review.
+    #[test]
+    fn per_tensor_check_catches_corrupted_k_proj() {
+        assert_corrupting_planned_tensor_refuses(
+            "model.language_model.layers.1.self_attn.k_proj.weight",
+            1000.0,
+            21,
+        );
+    }
+
+    /// Per-tensor coverage: `v_proj` is also chain-probe-skipped.
+    #[test]
+    fn per_tensor_check_catches_corrupted_v_proj() {
+        assert_corrupting_planned_tensor_refuses(
+            "model.language_model.layers.1.self_attn.v_proj.weight",
+            -2.0,
+            22,
+        );
+    }
+
+    /// Per-tensor coverage: `q_proj` is shape `[2 * full_q_dim, hidden]`
+    /// because Qwen3.5 fuses Q + gate_z. The chain probe takes only the
+    /// first `full_q_dim` (the Q half). Corrupting the second half
+    /// (gate_z) must still be caught.
+    #[test]
+    fn per_tensor_check_catches_corrupted_q_proj_gate_z_half() {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, 23);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0xAB12_34CD, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        // Locate the layer index that is a full-attention layer in this
+        // tiny config (the tied_tiny_test_cfg has one full and one linear).
+        let full_layer = (0..cfg.num_hidden_layers)
+            .find(|&i| cfg.is_full_attention(i))
+            .expect("tied_tiny_test_cfg must have at least one full-attention layer");
+        let q_name = format!("model.language_model.layers.{full_layer}.self_attn.q_proj.weight");
+        let full_q_dim = cfg.full_q_dim();
+        let hidden = cfg.hidden_size;
+        let victim = rotated.get_mut(&q_name).unwrap();
+        // Scale only the gate-z half (rows full_q_dim .. 2 * full_q_dim).
+        for r in full_q_dim..(2 * full_q_dim) {
+            for c in 0..hidden {
+                victim.data[r * hidden + c] *= 3.0;
+            }
+        }
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
+    }
+
+    /// Per-tensor coverage: GDN `in_proj_qkv` is chain-probe-skipped (the
+    /// GDN branch probes `in_proj_z`). Corruption must still refuse.
+    #[test]
+    fn per_tensor_check_catches_corrupted_in_proj_qkv() {
+        assert_corrupting_planned_tensor_refuses(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            10.0,
+            24,
+        );
+    }
+
+    /// Per-tensor coverage: GDN `in_proj_a` is chain-probe-skipped.
+    #[test]
+    fn per_tensor_check_catches_corrupted_in_proj_a() {
+        assert_corrupting_planned_tensor_refuses(
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+            0.5,
+            25,
+        );
+    }
+
+    /// Per-tensor coverage: GDN `in_proj_b` is chain-probe-skipped.
+    #[test]
+    fn per_tensor_check_catches_corrupted_in_proj_b() {
+        assert_corrupting_planned_tensor_refuses(
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+            -1.0,
+            26,
+        );
+    }
+
+    /// `embed_tokens` corruption: covered by BOTH the chain probe and
+    /// the per-tensor check. The chain probe runs first, so its message
+    /// is what we see — but either is a valid refuse.
+    #[test]
+    fn either_check_catches_corrupted_embed_tokens() {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, 27);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0xEDEDED, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        let embed = rotated.get_mut(QWEN35_EMBED_TOKENS_NAME).unwrap();
+        for v in embed.data.iter_mut() {
+            *v *= 1.5;
+        }
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("forward-equivalence refused"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("chain probe") || msg.contains("per-tensor"),
+            "expected refuse message to name the failing check: {msg}"
+        );
     }
 }
