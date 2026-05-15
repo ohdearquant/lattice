@@ -41,18 +41,18 @@ v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to k
 
 **Model coverage in v0**:
 
-| Model | hidden | head_dim | v0 supported? |
-|---|---:|---:|---|
-| Qwen3-0.6B (decoder) | 1024 | 128 | ✅ both power of 2 |
-| Qwen3.5-0.8B (hybrid) | 1024 | 128 | ✅ both power of 2 |
-| Qwen3-Embedding-4B | 2560 | (n/a — encoder) | ❌ **explicitly deferred** — `2560 = 2^9 · 5`, not a power of 2; needs randomized Hadamard with padding or structured non-power-of-2 transforms |
-| BERT-base (encoder) | 768 | 64 | ❌ **explicitly deferred** — `768 = 2^8 · 3`, not a power of 2 |
+| Model | hidden | GQA head_dim | linear-attn head_dim | v0 supported? |
+|---|---:|---:|---:|---|
+| Qwen3-0.6B (decoder) | 1024 | 128 | n/a | ✅ both power of 2 |
+| Qwen3.5-0.8B (hybrid GDN+GQA) | 1024 | 256 | 128 (linear K/V) | ✅ all power of 2 |
+| Qwen3-Embedding-4B (decoder, served by `QwenModel`) | 2560 | 128 | n/a | ❌ **explicitly deferred** — `2560 = 2^9 · 5`, hidden not a power of 2 |
+| BERT-base (encoder) | 768 | 64 | n/a | ❌ **explicitly deferred** — `768 = 2^8 · 3`, hidden not a power of 2 |
 
-The v1 follow-up will add padded-Hadamard support (round up to next power-of-2, project back) so 4B and BERT-class models are covered.
+For non-power-of-2 hidden dims (4B, BERT), v1 cannot use naive zero-pad-then-project — `π ∘ H_N ∘ P` (project up to power of 2, apply Hadamard, drop padded coords) is **not** orthogonal on the original space and breaks the QuaRot invariant. v1 needs one of: (a) the QuaRot paper's online block-diagonal approach (rotates within sub-blocks that are individually power of 2), (b) Paley-construction Hadamard matrices that exist for some specific non-power-of-2 dims, or (c) Givens / Householder products that are orthogonal but not structured. Which path v1 takes is an open question.
 
 ### Key Design Choices
 
-**Hadamard size = power of 2 only.** v0 covers the decoder models whose hidden and head dims are all powers of 2 (Qwen3-0.6B, Qwen3.5-0.8B — see model-coverage table above). Models with non-power-of-2 dims (Qwen3-Embedding-4B at hidden=2560, BERT-base at hidden=768) are **explicitly deferred** to v1, which will use padded-Hadamard (project into next power-of-2, apply transform, project back).
+**Hadamard size = power of 2 only.** v0 covers decoder models whose hidden and head dims are all powers of 2 (Qwen3-0.6B, Qwen3.5-0.8B — see model-coverage table above). Models with non-power-of-2 hidden dims (Qwen3-Embedding-4B at 2560, BERT-base at 768) are **explicitly deferred** to v1; naive zero-pad + project-back is not orthogonal and so cannot be used. v1 will pick from block-diagonal partition (QuaRot paper's approach), Paley-construction Hadamards, or Givens products.
 
 **Offline rotation, not on-the-fly.** v0 saves the rotated+quantized weights as a new `.q4` file. The forward pass loads it like any other Q4 model — no runtime rotation cost. Tradeoff: 2× disk usage during conversion. Trade is worth it because rotation is a one-time cost.
 
@@ -77,19 +77,22 @@ For QKV projections in attention, the rotation `Q` is shared across Q, K, V head
 
 ## Consequences
 
+These are consequences of accepting v0 as the design (across all 4 PRs), not of the primitives-only PR that lands first.
+
 ### Positive
 
-- 4-bit weights with paper-claimed near-lossless accuracy (PPL delta < 0.5 vs F32 target)
-- Foundation for v1 INT4 activation+KV — the rotated activation distributions are quantizable, which the un-rotated ones aren't
-- Demonstrates pure-Rust QuaRot ahead of any other inference engine (no public Rust impl exists as of 2026-05-15)
-- Knowledge-graph node `QuaRot` moves from `researched` → `implemented`
-- Composes with future SpinQuant / learned rotations (same absorption infrastructure)
+- Once v0 is fully landed (step 4 PR): 4-bit weights targeting paper-claimed PPL delta < 0.5 vs F32 on Qwen3-0.6B / Qwen3.5-0.8B. The target number is the paper's; it must be re-measured on our pipeline before being claimed.
+- Foundation for v1 INT4 activation+KV — the rotated activation distributions are quantizable; the un-rotated ones aren't.
+- Pure-Rust QuaRot implementation. The reference [spcl/QuaRot](https://github.com/spcl/QuaRot) is Python/CUDA; some Rust-adjacent quantization work exists (e.g., `konjoai/squish`'s `squish_quant_rs`) but isn't a QuaRot implementation. So "first pure-Rust QuaRot" is plausible but not certain — verify before claiming externally.
+- Knowledge-graph node `QuaRot` moves from `researched` → `implemented` when step 4 lands.
+- Composes with future SpinQuant / learned rotations (same absorption infrastructure).
 
 ### Negative
 
-- Hadamard transform requires power-of-2 dimensions; non-power-of-2 hidden sizes need padding or skip
-- 2× disk during conversion (original + rotated)
-- One-time conversion cost (~minutes for Qwen3-0.6B; ~hour for 8B-class models)
+- Hadamard transform requires power-of-2 dimensions; non-power-of-2 hidden sizes (4B, BERT-base) deferred to v1 with no naive padding option.
+- 2× disk during conversion (original + rotated).
+- One-time conversion cost (~minutes for Qwen3-0.6B; ~hour for 8B-class models).
+- Public API surface (`hadamard::{walsh_hadamard_in_place, RandomizedHadamard}`) lands before any consumer exists in the codebase — locks in transform-order, precision, and naming before downstream code stresses the contract. Mitigation: this matches the existing lattice-inference convention of keeping module APIs `pub` for cross-module use, and the crate-level STABILITY doc already flags the crate as `Experimental` with churn expected. If the step-2 PR (rotation absorption) needs to change the primitive API, that change ships in the same PR.
 
 ### Risks
 

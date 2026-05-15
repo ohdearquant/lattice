@@ -5,7 +5,9 @@
 //!
 //! Two factories are exposed:
 //! - [`walsh_hadamard_in_place`] — deterministic structured Hadamard
-//! - [`RandomizedHadamard`] — seeded D·H where D is diag(±1) and H is structured
+//! - [`RandomizedHadamard`] — seeded `R = H · D` where `D` is diag(±1) and `H` is
+//!   the orthonormal Walsh-Hadamard. See [`RandomizedHadamard`] for the explicit
+//!   operation order on apply / apply_inverse.
 
 use crate::error::InferenceError;
 
@@ -56,7 +58,7 @@ pub fn walsh_hadamard_orthonormal_in_place(data: &mut [f32]) -> Result<(), Infer
 }
 
 /// Deterministic seeded random sign vector — used as the diagonal `D` in the
-/// `D · H` randomized Hadamard transform.
+/// `R = H · D` randomized Hadamard transform.
 ///
 /// Uses a splitmix64 PRNG for reproducibility across platforms without pulling
 /// in a `rand` dependency at the call site. Same `seed + n` always produces the
