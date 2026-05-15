@@ -40,6 +40,33 @@
 use crate::error::InferenceError;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 
+fn check_shape(
+    fn_name: &str,
+    weight_len: usize,
+    rows: usize,
+    cols: usize,
+    rotation_dim: usize,
+    rotation_dim_should_match: usize,
+    matching_label: &str,
+) -> Result<(), InferenceError> {
+    let expected = rows.checked_mul(cols).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "{fn_name}: rows*cols overflow (rows={rows}, cols={cols})"
+        ))
+    })?;
+    if weight_len != expected {
+        return Err(InferenceError::Inference(format!(
+            "{fn_name}: weight length {weight_len} != rows*cols {expected}"
+        )));
+    }
+    if rotation_dim != rotation_dim_should_match {
+        return Err(InferenceError::Inference(format!(
+            "{fn_name}: rotation.dim()={rotation_dim} but weight.{matching_label}={rotation_dim_should_match}"
+        )));
+    }
+    Ok(())
+}
+
 /// Absorb `R` into the input side of a row-major `[rows × cols]` weight matrix
 /// in place: `W ← W · R^T`. After this, a layer computing `y = W · x` produces
 /// the same output when fed the pre-rotated input `x' = R · x`.
@@ -51,20 +78,15 @@ pub fn absorb_input_rotation(
     cols: usize,
     rotation: &RandomizedHadamard,
 ) -> Result<(), InferenceError> {
-    if weight.len() != rows * cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_input_rotation: weight length {} != rows*cols {}",
-            weight.len(),
-            rows * cols
-        )));
-    }
-    if rotation.dim() != cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_input_rotation: rotation.dim()={} but weight.cols={}",
-            rotation.dim(),
-            cols
-        )));
-    }
+    check_shape(
+        "absorb_input_rotation",
+        weight.len(),
+        rows,
+        cols,
+        rotation.dim(),
+        cols,
+        "cols",
+    )?;
     for r in 0..rows {
         let row = &mut weight[r * cols..(r + 1) * cols];
         rotation.apply(row)?;
@@ -83,20 +105,15 @@ pub fn absorb_output_rotation(
     cols: usize,
     rotation: &RandomizedHadamard,
 ) -> Result<(), InferenceError> {
-    if weight.len() != rows * cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_output_rotation: weight length {} != rows*cols {}",
-            weight.len(),
-            rows * cols
-        )));
-    }
-    if rotation.dim() != rows {
-        return Err(InferenceError::Inference(format!(
-            "absorb_output_rotation: rotation.dim()={} but weight.rows={}",
-            rotation.dim(),
-            rows
-        )));
-    }
+    check_shape(
+        "absorb_output_rotation",
+        weight.len(),
+        rows,
+        cols,
+        rotation.dim(),
+        rows,
+        "rows",
+    )?;
     let mut column = vec![0.0_f32; rows];
     for c in 0..cols {
         for r in 0..rows {
@@ -120,20 +137,15 @@ pub fn absorb_input_rotation_f64(
     cols: usize,
     rotation: &RandomizedHadamard,
 ) -> Result<(), InferenceError> {
-    if weight.len() != rows * cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_input_rotation_f64: weight length {} != rows*cols {}",
-            weight.len(),
-            rows * cols
-        )));
-    }
-    if rotation.dim() != cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_input_rotation_f64: rotation.dim()={} but weight.cols={}",
-            rotation.dim(),
-            cols
-        )));
-    }
+    check_shape(
+        "absorb_input_rotation_f64",
+        weight.len(),
+        rows,
+        cols,
+        rotation.dim(),
+        cols,
+        "cols",
+    )?;
     for r in 0..rows {
         let row = &mut weight[r * cols..(r + 1) * cols];
         rotation.apply_f64(row)?;
@@ -148,20 +160,15 @@ pub fn absorb_output_rotation_f64(
     cols: usize,
     rotation: &RandomizedHadamard,
 ) -> Result<(), InferenceError> {
-    if weight.len() != rows * cols {
-        return Err(InferenceError::Inference(format!(
-            "absorb_output_rotation_f64: weight length {} != rows*cols {}",
-            weight.len(),
-            rows * cols
-        )));
-    }
-    if rotation.dim() != rows {
-        return Err(InferenceError::Inference(format!(
-            "absorb_output_rotation_f64: rotation.dim()={} but weight.rows={}",
-            rotation.dim(),
-            rows
-        )));
-    }
+    check_shape(
+        "absorb_output_rotation_f64",
+        weight.len(),
+        rows,
+        cols,
+        rotation.dim(),
+        rows,
+        "rows",
+    )?;
     let mut column = vec![0.0_f64; rows];
     for c in 0..cols {
         for r in 0..rows {
@@ -310,6 +317,18 @@ mod tests {
         let r = RandomizedHadamard::new(1, 64).unwrap();
         let mut w = vec![0.0_f32; 100];
         assert!(absorb_input_rotation(&mut w, 16, 64, &r).is_err());
+    }
+
+    #[test]
+    fn rows_cols_overflow_rejected() {
+        let r = RandomizedHadamard::new(1, 64).unwrap();
+        let mut w = vec![0.0_f32; 100];
+        let err = absorb_input_rotation(&mut w, usize::MAX, 64, &r).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("overflow"),
+            "expected overflow error, got: {msg}"
+        );
     }
 
     fn synthetic_weight_f64(rows: usize, cols: usize, seed: u64) -> Vec<f64> {
