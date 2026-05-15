@@ -257,7 +257,11 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
         let block = quantize_block(&vals);
-        // SAFETY: Q4Block is #[repr(C)] with size 18 and alignment 1; byte-casting is valid.
+        // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+        // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
+        // rule). Casting to `&[u8; 18]` is valid because the target element type
+        // is `u8` (alignment 1 ≤ source alignment 2) and the source byte length
+        // matches the destination length exactly.
         let bytes: &[u8; 18] = unsafe { &*std::ptr::from_ref(&block).cast() };
         out.extend_from_slice(bytes);
     }
@@ -312,10 +316,36 @@ pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
 // BF16-input quantization API (for streaming model shards)
 // ---------------------------------------------------------------------------
 
+/// Assert that `shape.iter().product()` equals `data_len`.
+///
+/// SafeTensors' own `TensorView::new` rejects shape/data-size mismatches
+/// (returns `InvalidTensorView`). The Q4 entry points keep the same
+/// contract — without this check, a caller can produce a [`Q4Tensor`]
+/// whose `shape` claims `[1, 96]` while `original_len` reads 64, and
+/// `save_q4_file` will then write the inconsistent metadata into a `.q4`
+/// header that downstream loaders (`write_merged_qkvz`, the Metal
+/// runtime path) trust without re-verification. Uses `checked_mul` so
+/// `usize` overflow on a malformed shape surfaces as a panic at
+/// construction, not as a wraparound that aliases a valid length.
+#[track_caller]
+fn assert_shape_matches_data_len(shape: &[usize], data_len: usize) {
+    let numel = shape
+        .iter()
+        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+        .unwrap_or_else(|| {
+            panic!("shape product overflowed usize: shape={shape:?}");
+        });
+    assert_eq!(
+        numel, data_len,
+        "shape product {numel} (shape={shape:?}) must equal data length {data_len}"
+    );
+}
+
 /// Quantize a BF16 tensor (raw `u16` slice) into a [`Q4Tensor`].
 ///
-/// `shape.iter().product()` must equal `data.len()`.
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
 pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -324,6 +354,86 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
         let mut vals = [0.0f32; 32];
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = bf16_to_f32(v);
+        }
+        blocks.push(quantize_block(&vals));
+    }
+
+    Q4Tensor {
+        blocks,
+        shape: shape.to_vec(),
+        original_len,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QuaRot-pipeline quantization API (ADR-044 step 3c)
+// ---------------------------------------------------------------------------
+
+/// Quantize an `f32` tensor into a [`Q4Tensor`].
+///
+/// QuaRot offline-conversion entry point (ADR-044 §"Step 3c contract"). Prefer
+/// this over [`quantize_bf16_to_q4`] when the source is the output of a
+/// rotation pass and not a raw checkpoint, so the per-block `abs_max` is
+/// computed from the same precision the upstream math produced rather than
+/// from BF16-truncated values.
+///
+/// BF16's 7-bit mantissa is narrower than Q4_0's per-block scale resolution
+/// (f16, 10-bit mantissa), so values pre-rounded to BF16 can sit on the wrong
+/// side of a Q4 bin boundary or shift `abs_max` for the block. The f32 path
+/// avoids that truncation.
+///
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
+pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
+    let original_len = data.len();
+    let n_blocks = original_len.div_ceil(32);
+    let mut blocks = Vec::with_capacity(n_blocks);
+
+    for chunk in data.chunks(32) {
+        let mut vals = [0.0f32; 32];
+        vals[..chunk.len()].copy_from_slice(chunk);
+        blocks.push(quantize_block(&vals));
+    }
+
+    Q4Tensor {
+        blocks,
+        shape: shape.to_vec(),
+        original_len,
+    }
+}
+
+/// Quantize an `f64` tensor into a [`Q4Tensor`] via f32 downcast.
+///
+/// Delegated wrapper around [`quantize_f32_to_q4`] for the QuaRot pipeline,
+/// where rotation absorption runs in f64 per ADR-044 §Risks ("keep rotation
+/// math in f64 [...] quantize in f32, store scales in f16 as before"). The
+/// f32 downcast happens inside the per-block loop so callers do not allocate
+/// an intermediate `Vec<f32>`.
+///
+/// **Intentionally f32-precision quantization.** This is NOT a true f64
+/// quantizer — `abs_max`, the scale reciprocal, and the per-nibble round all
+/// happen in f32, matching ADR-044 §Risks. The wrapper exists to avoid the
+/// BF16 round-trip in [`quantize_bf16_to_q4`] and to skip an intermediate
+/// f32 allocation at the call site, not to preserve f64 precision into the
+/// nibble selection. Values within ~½ ULP of an f32 representation may
+/// quantize to a different nibble than a hypothetical f64 reference would,
+/// e.g., an exact f64 `0.5 - 1e-8` downcasts to f32 `0.5` and (with Rust's
+/// `round` rounding halfway away from zero) lands on nibble 9 instead of 8.
+/// QuaRot conversion accepts this — the dequantized magnitude is identical
+/// at exact-midpoint values and rotated activations rarely sit on bin
+/// boundaries.
+///
+/// Panics if `shape.iter().product()` does not equal `data.len()`.
+pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
+    assert_shape_matches_data_len(shape, data.len());
+    let original_len = data.len();
+    let n_blocks = original_len.div_ceil(32);
+    let mut blocks = Vec::with_capacity(n_blocks);
+
+    for chunk in data.chunks(32) {
+        let mut vals = [0.0f32; 32];
+        for (i, &v) in chunk.iter().enumerate() {
+            vals[i] = v as f32;
         }
         blocks.push(quantize_block(&vals));
     }
@@ -408,8 +518,11 @@ pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Resul
         f.write_all(&(dim as u64).to_le_bytes())?;
     }
     f.write_all(&(tensor.original_len as u64).to_le_bytes())?;
-    // SAFETY: Q4Block is #[repr(C)], size 18, alignment 1. The cast produces a valid
-    // byte slice of length blocks.len() * 18.
+    // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+    // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
+    // rule). Casting to a `&[u8]` is valid because the target element type is
+    // `u8` (alignment 1 ≤ source alignment 2). The resulting slice has length
+    // `blocks.len() * 18` matching the source contiguous storage.
     let block_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             tensor.blocks.as_ptr().cast::<u8>(),
@@ -1044,5 +1157,201 @@ mod tests {
             mae < 0.30,
             "mean abs error {mae:.4} >= 0.30 (Q4 MAE for uniform [-7,7] expected ≈ 0.25)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // QuaRot pipeline entry points (ADR-044 step 3c-1)
+    // -----------------------------------------------------------------------
+
+    fn f32_to_bf16_bits(v: f32) -> u16 {
+        // BF16 = top 16 bits of f32, round-to-nearest-even.
+        let bits = v.to_bits();
+        let lsb = (bits >> 16) & 1;
+        let rounding_bias = 0x7fff + lsb;
+        ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+    }
+
+    fn synthetic_f32_uniform(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let u = (state >> 32) as f32 / u32::MAX as f32;
+                u * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_shape_and_length() {
+        let src = synthetic_f32_uniform(96, 17);
+        let q = quantize_f32_to_q4(&src, &[3, 32]);
+        assert_eq!(q.shape, vec![3, 32]);
+        assert_eq!(q.original_len, 96);
+        assert_eq!(q.blocks.len(), 3, "96 elems = 3 full Q4 blocks");
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_pads_partial_block() {
+        let src = synthetic_f32_uniform(40, 19);
+        let q = quantize_f32_to_q4(&src, &[40]);
+        assert_eq!(q.original_len, 40);
+        assert_eq!(q.blocks.len(), 2, "40 elems = 1 full + 1 partial Q4 block");
+    }
+
+    #[test]
+    fn quantize_f64_to_q4_matches_f32_path_after_downcast() {
+        // The f64 wrapper must agree byte-for-byte with the f32 entry after the
+        // caller does the downcast explicitly. This locks down the contract
+        // that the f64 path is a thin convenience wrapper, not a different
+        // quantization recipe.
+        let src_f64: Vec<f64> = synthetic_f32_uniform(256, 23)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let src_f32: Vec<f32> = src_f64.iter().map(|&v| v as f32).collect();
+        let q_f64 = quantize_f64_to_q4(&src_f64, &[256]);
+        let q_f32 = quantize_f32_to_q4(&src_f32, &[256]);
+        assert_eq!(q_f64.shape, q_f32.shape);
+        assert_eq!(q_f64.original_len, q_f32.original_len);
+        assert_eq!(
+            q_f64.blocks.len(),
+            q_f32.blocks.len(),
+            "f64 path must produce same block count"
+        );
+        for (i, (a, b)) in q_f64.blocks.iter().zip(q_f32.blocks.iter()).enumerate() {
+            assert_eq!(a.scale, b.scale, "block {i} scale mismatch");
+            assert_eq!(a.packed, b.packed, "block {i} packed mismatch");
+        }
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_matches_bf16_path_when_input_is_bf16_castable() {
+        // Control test: when the f32 input has zero mantissa entropy below the
+        // BF16 truncation point (i.e., it was already bf16 -> f32), both paths
+        // MUST produce identical Q4 tensors. This nails down the equivalence
+        // so any divergence in the high-precision test below is provably
+        // attributable to BF16 truncation, not to a behavioral difference
+        // between the two quantize_* implementations.
+        let bf16_bits: Vec<u16> = synthetic_f32_uniform(256, 29)
+            .into_iter()
+            .map(f32_to_bf16_bits)
+            .collect();
+        let f32_from_bf16: Vec<f32> = bf16_bits.iter().map(|&b| bf16_to_f32(b)).collect();
+
+        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[256]);
+        let q_f32 = quantize_f32_to_q4(&f32_from_bf16, &[256]);
+        assert_eq!(q_bf16.blocks.len(), q_f32.blocks.len());
+        for (i, (a, b)) in q_bf16.blocks.iter().zip(q_f32.blocks.iter()).enumerate() {
+            assert_eq!(a.scale, b.scale, "block {i} scale should match");
+            assert_eq!(a.packed, b.packed, "block {i} packed should match");
+        }
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_lower_error_than_bf16_path_on_high_precision_input() {
+        // ADR-044 §"Step 3c contract" decision driver: when the source carries
+        // >7 bits of mantissa entropy (e.g., the output of an f64 rotation
+        // pass), the bf16 route discards information the f32 route preserves.
+        //
+        // Measurement: take 2048 pseudo-random f32 values uniform in [-1, 1]
+        // (23-bit mantissa entropy). Quantize via both paths, dequantize, and
+        // compare against the f32 source.
+        //
+        // Expectation: path (b) `quantize_f32_to_q4` produces strictly lower
+        // max abs error AND lower mean abs error than path (a) f32->bf16->Q4.
+        let src = synthetic_f32_uniform(2048, 31);
+        let bf16_bits: Vec<u16> = src.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[2048]);
+        let q_f32 = quantize_f32_to_q4(&src, &[2048]);
+        let deq_bf16 = dequantize_q4_to_f32(&q_bf16);
+        let deq_f32 = dequantize_q4_to_f32(&q_f32);
+
+        let err = |reconstructed: &[f32]| -> (f32, f32) {
+            let mut max_err = 0.0_f32;
+            let mut sum_err = 0.0_f32;
+            for (s, r) in src.iter().zip(reconstructed.iter()) {
+                let e = (s - r).abs();
+                max_err = max_err.max(e);
+                sum_err += e;
+            }
+            (max_err, sum_err / src.len() as f32)
+        };
+        let (max_bf16, mean_bf16) = err(&deq_bf16);
+        let (max_f32, mean_f32) = err(&deq_f32);
+
+        // Self-documenting measurement print (visible via `cargo test -- --nocapture`).
+        // Numbers feed the ADR-044 §"Step 3c contract" Q4 bridge decision record.
+        eprintln!(
+            "[3c-1 measurement] n=2048 source=f32 uniform [-1,1]: \
+             f32_path mean_abs_err={mean_f32:.6} max_abs_err={max_f32:.6}; \
+             bf16_path mean_abs_err={mean_bf16:.6} max_abs_err={max_bf16:.6}"
+        );
+
+        assert!(
+            mean_f32 < mean_bf16,
+            "f32 mean abs error ({mean_f32:.6}) should be < bf16 mean abs error ({mean_bf16:.6})"
+        );
+        assert!(
+            max_f32 <= max_bf16,
+            "f32 max abs error ({max_f32:.6}) should be <= bf16 max abs error ({max_bf16:.6})"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_f32_to_q4_rejects_shape_data_mismatch() {
+        let data = synthetic_f32_uniform(64, 41);
+        // shape claims 96 elements; data has 64 → must panic.
+        let _ = quantize_f32_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_f64_to_q4_rejects_shape_data_mismatch() {
+        let data: Vec<f64> = synthetic_f32_uniform(64, 43)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let _ = quantize_f64_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn quantize_bf16_to_q4_rejects_shape_data_mismatch() {
+        // Lock the same contract on the pre-existing BF16 entry point — the
+        // SafeTensors source format rejects shape/data mismatches and the Q4
+        // bridge must not silently weaken that invariant.
+        let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
+        let _ = quantize_bf16_to_q4(&data, &[3, 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflowed usize")]
+    fn quantize_f32_to_q4_rejects_shape_product_overflow() {
+        let data = vec![0.0_f32; 32];
+        // usize::MAX * 2 overflows; checked_mul must catch it before the
+        // length comparison aliases to a valid length by wraparound.
+        let _ = quantize_f32_to_q4(&data, &[usize::MAX, 2]);
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_block_layout_matches_quantize_row() {
+        // Sanity: for input that is an exact multiple of 32, the entry should
+        // produce the same per-block byte layout as `quantize_row_q4_0`
+        // (which the existing kernels are already validated against).
+        let src = synthetic_f32_uniform(128, 37);
+        let q = quantize_f32_to_q4(&src, &[128]);
+        let row_bytes = quantize_row_q4_0(&src);
+        assert_eq!(row_bytes.len(), q.blocks.len() * 18);
+        // SAFETY: Q4Block is #[repr(C)] size 18, alignment 2 (from leading
+        // `scale: u16`); byte-cast is valid because target element type is u8.
+        let q_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(q.blocks.as_ptr().cast::<u8>(), q.blocks.len() * 18)
+        };
+        assert_eq!(q_bytes, row_bytes.as_slice());
     }
 }

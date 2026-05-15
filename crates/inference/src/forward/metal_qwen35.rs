@@ -8766,7 +8766,8 @@ kernel void add_and_copy(
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
             let n_blocks = tensor.blocks.len();
             // Re-serialise the blocks into raw bytes (18 bytes each, Q4Block is #[repr(C)]).
-            // SAFETY: Q4Block is #[repr(C)], size 18, alignment 1.
+            // SAFETY: Q4Block is #[repr(C)] size 18, alignment 2 (from leading
+            // `scale: u16`); byte-cast is valid because target element type is u8.
             let raw: Vec<u8> = unsafe {
                 std::slice::from_raw_parts(tensor.blocks.as_ptr().cast::<u8>(), n_blocks * 18)
                     .to_vec()
