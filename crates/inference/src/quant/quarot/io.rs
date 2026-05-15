@@ -71,13 +71,6 @@ impl SourceDType {
         }
     }
 
-    fn bytes_per_elem(self) -> usize {
-        match self {
-            SourceDType::F32 => 4,
-            SourceDType::F16 | SourceDType::BF16 => 2,
-        }
-    }
-
     /// Header string name (matches the safetensors JSON `dtype` field).
     pub fn name(self) -> &'static str {
         match self {
@@ -104,7 +97,43 @@ struct Shard {
     /// Absolute file offset where the data section begins
     /// (`8 + header_len`).
     data_offset: usize,
+    /// Only supported-dtype tensors (F32 / F16 / BF16). Unsupported
+    /// dtypes participate in offset-contiguity validation at parse time
+    /// but are not exposed to the read API.
     headers: HashMap<String, TensorHeader>,
+}
+
+/// One tensor entry parsed from the SafeTensors header, before the
+/// supported-dtype filter is applied. Retained per-entry so the
+/// global offset contiguity check covers every tensor — including
+/// unsupported dtypes — to catch aliasing and corrupted indexes that
+/// per-tensor validation alone would miss.
+struct ParsedEntry {
+    name: String,
+    start: usize,
+    end: usize,
+    /// `Some` for F32/F16/BF16; `None` for any other SafeTensors dtype.
+    /// `None` entries are still kept in the contiguity check but never
+    /// appear in `Shard::headers`.
+    header: Option<TensorHeader>,
+}
+
+/// Bytes per element for every standard SafeTensors dtype name. Mirrors
+/// the table in the official `safetensors` Rust crate. `None` for any
+/// unrecognized dtype string — the offset-contiguity check still runs,
+/// but the per-tensor byte-length validation is skipped for such entries.
+///
+/// Kept inline rather than depending on the `safetensors` crate to match
+/// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
+/// parses safetensors headers directly).
+fn safetensors_bytes_per_elem(dtype_str: &str) -> Option<usize> {
+    match dtype_str {
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" => Some(1),
+        "I16" | "U16" | "F16" | "BF16" => Some(2),
+        "I32" | "U32" | "F32" => Some(4),
+        "I64" | "U64" | "F64" => Some(8),
+        _ => None,
+    }
 }
 
 impl Shard {
@@ -161,9 +190,13 @@ impl Shard {
             ))
         })?;
 
-        let mut headers = HashMap::with_capacity(obj.len());
         let data_len = mmap.len() - data_offset;
 
+        // Phase 1: parse every entry (including unsupported dtypes) so we
+        // can validate offset contiguity across the whole data section.
+        // Per-tensor byte length is checked here for any recognized
+        // SafeTensors dtype, not just the F32/F16/BF16 we decode.
+        let mut parsed: Vec<ParsedEntry> = Vec::with_capacity(obj.len());
         for (name, entry) in obj {
             if name == "__metadata__" {
                 continue;
@@ -174,12 +207,6 @@ impl Shard {
                     "tensor {name}: missing or non-string dtype"
                 ))
             })?;
-            let Some(dtype) = SourceDType::from_header_str(dtype_str) else {
-                // Tensors with unsupported dtypes (I32, I64, BOOL, …) are
-                // skipped silently. The converter only requests weight
-                // tensors (always floating-point) so this is safe.
-                continue;
-            };
 
             let shape: Vec<usize> = entry
                 .get("shape")
@@ -244,30 +271,75 @@ impl Shard {
                     ))
                 })
             })?;
-            let expected = numel.checked_mul(dtype.bytes_per_elem()).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: byte length overflows usize"
-                ))
-            })?;
-            let actual = end - start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: byte length mismatch for {} {:?}: \
-                     expected {expected}, got {actual}",
-                    dtype.name(),
-                    shape
-                )));
+            if let Some(bpe) = safetensors_bytes_per_elem(dtype_str) {
+                let expected = numel.checked_mul(bpe).ok_or_else(|| {
+                    InferenceError::InvalidSafetensors(format!(
+                        "tensor {name}: byte length overflows usize"
+                    ))
+                })?;
+                let actual = end - start;
+                if actual != expected {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
+                         expected {expected}, got {actual}"
+                    )));
+                }
             }
 
-            headers.insert(
-                name.clone(),
-                TensorHeader {
-                    dtype,
-                    shape,
-                    start,
-                    end,
-                },
-            );
+            let header = SourceDType::from_header_str(dtype_str).map(|dtype| TensorHeader {
+                dtype,
+                shape,
+                start,
+                end,
+            });
+
+            parsed.push(ParsedEntry {
+                name: name.clone(),
+                start,
+                end,
+                header,
+            });
+        }
+
+        // Phase 2: validate that all tensor byte ranges are sorted,
+        // disjoint, contiguous from offset 0, and exhaust the data
+        // section. This mirrors the official `safetensors` crate
+        // validation rules — without it, a corrupted checkpoint could
+        // silently alias two tensor names to the same byte range (e.g.
+        // both `a` and `b` pointing at `[0, 4)`), or hide leading /
+        // trailing padding, and the converter would rotate or quantize
+        // bytes that the runtime would never load.
+        parsed.sort_by_key(|p| (p.start, p.end));
+        let mut prev_end = 0usize;
+        for p in &parsed {
+            if p.start != prev_end {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: data_offsets non-contiguous at tensor {}: \
+                     expected start={prev_end}, got [{}, {})",
+                    path.display(),
+                    p.name,
+                    p.start,
+                    p.end,
+                )));
+            }
+            prev_end = p.end;
+        }
+        if prev_end != data_len {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "{}: data section is {data_len} bytes but tensors cover {prev_end} bytes \
+                 (trailing or missing payload)",
+                path.display(),
+            )));
+        }
+
+        // Phase 3: expose only supported-dtype tensors via the read API.
+        // Unsupported entries already had their offsets validated above
+        // and their bytes accounted for in the contiguity check.
+        let mut headers = HashMap::with_capacity(parsed.len());
+        for p in parsed {
+            if let Some(header) = p.header {
+                headers.insert(p.name, header);
+            }
         }
 
         Ok(Shard {
@@ -905,6 +977,129 @@ mod tests {
         assert!(!reader.has_tensor("decoy"));
         let (data, _) = reader.read_tensor_f64("real").unwrap();
         assert_eq!(data, vec![1.0]);
+    }
+
+    /// Helper for malformed-layout tests: writes a hand-crafted SafeTensors
+    /// file with a caller-supplied header object and raw data section.
+    fn write_raw_safetensors(path: &Path, header_json: &Value, data: &[u8]) {
+        let header_str = serde_json::to_string(header_json).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(header_str.len() as u64).to_le_bytes());
+        buf.extend_from_slice(header_str.as_bytes());
+        buf.extend_from_slice(data);
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    /// Two F32 tensors declared at the same `[0, 4)` byte range alias each
+    /// other — the official safetensors parser rejects this via
+    /// `InvalidOffset`, and so must we, because a converter that reads
+    /// both names would silently rotate the same bytes twice.
+    #[test]
+    fn overlapping_offsets_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+            "b": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+        });
+        write_raw_safetensors(
+            &dir.path().join("model.safetensors"),
+            &header,
+            &1.0f32.to_le_bytes(),
+        );
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("non-contiguous"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// First tensor starts at offset 4 — the data section has a 4-byte
+    /// leading hole. The official parser rejects this; we must too.
+    #[test]
+    fn leading_hole_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "w": { "dtype": "F32", "shape": [1], "data_offsets": [4, 8] },
+        });
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&7.0f32.to_le_bytes());
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &data);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("non-contiguous"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// Gap between the end of tensor `a` and the start of tensor `b` —
+    /// 4 stray bytes in the middle of the data section.
+    #[test]
+    fn internal_hole_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "a": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+            "b": { "dtype": "F32", "shape": [1], "data_offsets": [8, 12] },
+        });
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&2.0f32.to_le_bytes());
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &data);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("non-contiguous"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// Data section has 4 extra trailing bytes beyond the last tensor's
+    /// declared end. The official parser rejects this; we must too.
+    #[test]
+    fn trailing_payload_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "w": { "dtype": "F32", "shape": [1], "data_offsets": [0, 4] },
+        });
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 4]);
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &data);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("trailing or missing payload"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
+    }
+
+    /// An unsupported-dtype (I64) tensor at offset 4 must still fail the
+    /// global contiguity check — offset validation applies to every
+    /// declared tensor, not just the F32/F16/BF16 ones the reader decodes.
+    #[test]
+    fn unsupported_dtype_with_bad_offsets_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = serde_json::json!({
+            "x": { "dtype": "I64", "shape": [1], "data_offsets": [4, 12] },
+        });
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&[0u8; 4]);
+        data.extend_from_slice(&42i64.to_le_bytes());
+        write_raw_safetensors(&dir.path().join("model.safetensors"), &header, &data);
+        let err = QuarotTensorReader::open(dir.path()).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("non-contiguous"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
     }
 
     /// Index declares `required.weight` in a shard whose actual contents
