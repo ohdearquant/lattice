@@ -18,11 +18,16 @@
 //! forward-equivalence assertion depends on this.
 //!
 //! - `model.safetensors` present → single-file layout.
-//! - else `model.safetensors.index.json` present → sharded layout. Shards
-//!   are opened lazily on first access to a tensor they contain and re-used
-//!   for subsequent reads, mirroring
-//!   [`crate::weights::f32_weights::ShardedSafetensors`].
+//! - else `model.safetensors.index.json` present → sharded layout. All
+//!   unique shard files referenced by the index are opened and parsed
+//!   eagerly at [`QuarotTensorReader::open`], so [`tensor_names`] and
+//!   [`has_tensor`] mean "readable supported tensor" in both modes.
+//!   This surfaces missing-in-shard or unsupported-dtype-in-shard
+//!   failures before step 3c's rotation pass begins instead of mid-run.
 //! - Otherwise: error at [`QuarotTensorReader::open`].
+//!
+//! [`tensor_names`]: QuarotTensorReader::tensor_names
+//! [`has_tensor`]: QuarotTensorReader::has_tensor
 //!
 //! On-disk decode for F32 / F16 / BF16 is hand-rolled to keep this module
 //! independent of the `f16` cargo feature. The conversion is bit-identical
@@ -36,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use memmap2::Mmap;
 use serde_json::Value;
@@ -291,12 +296,37 @@ enum Backing {
         shard: Shard,
     },
     Sharded {
-        root: PathBuf,
-        /// Tensor name → shard file name (relative to `root`).
+        /// Tensor name → shard file name (relative to the model directory).
+        ///
+        /// This is the raw declaration from `model.safetensors.index.json`.
+        /// An entry here does NOT imply readability — the corresponding
+        /// shard may not contain the tensor (corrupted index) or may
+        /// store it with an unsupported dtype that
+        /// [`Shard::open`] drops. Use [`Backing::readable_in_sharded`] for
+        /// the readable-supported view.
         weight_map: HashMap<String, String>,
-        /// Lazily opened shards, keyed by shard file name.
+        /// All unique shards from `weight_map.values()`, opened eagerly at
+        /// [`QuarotTensorReader::open`]. Keyed by shard file name.
         shards: HashMap<String, Shard>,
     },
+}
+
+impl Backing {
+    /// `true` iff `name` is declared in the manifest AND present in the
+    /// owning shard's parsed headers with a supported dtype.
+    ///
+    /// In sharded mode this is the readable-supported view that
+    /// [`QuarotTensorReader::has_tensor`] exposes.
+    fn readable_in_sharded(
+        weight_map: &HashMap<String, String>,
+        shards: &HashMap<String, Shard>,
+        name: &str,
+    ) -> bool {
+        weight_map
+            .get(name)
+            .and_then(|file| shards.get(file))
+            .is_some_and(|shard| shard.headers.contains_key(name))
+    }
 }
 
 /// Streaming SafeTensors reader for the QuaRot conversion pipeline.
@@ -333,11 +363,18 @@ impl QuarotTensorReader {
             })
         } else if index_path.exists() {
             let index = parse_index(model_dir)?;
+            let mut shards: HashMap<String, Shard> = HashMap::new();
+            for shard_file in index.weight_map.values() {
+                if shards.contains_key(shard_file) {
+                    continue;
+                }
+                let shard = Shard::open(&model_dir.join(shard_file))?;
+                shards.insert(shard_file.clone(), shard);
+            }
             Ok(Self {
                 backing: Backing::Sharded {
-                    root: model_dir.to_path_buf(),
                     weight_map: index.weight_map,
-                    shards: HashMap::new(),
+                    shards,
                 },
             })
         } else {
@@ -349,33 +386,45 @@ impl QuarotTensorReader {
         }
     }
 
-    /// All known tensor names.
+    /// All readable supported tensor names.
     ///
-    /// In sharded mode this consults the index file's weight map without
-    /// opening any shards, so it is cheap to call.
+    /// Returns names that are present in the owning checkpoint AND stored
+    /// with a supported dtype (F32 / F16 / BF16). In sharded mode this is
+    /// the intersection of the index file's weight map with the shards'
+    /// parsed headers — entries the index declares but the shard does not
+    /// deliver (corrupted index or unsupported dtype) are excluded so
+    /// that step 3c's converter preflight cannot pass on a tensor it
+    /// will later fail to read.
     pub fn tensor_names(&self) -> Vec<String> {
         match &self.backing {
             Backing::Single { shard } => shard.headers.keys().cloned().collect(),
-            Backing::Sharded { weight_map, .. } => weight_map.keys().cloned().collect(),
+            Backing::Sharded { weight_map, shards } => weight_map
+                .keys()
+                .filter(|name| Backing::readable_in_sharded(weight_map, shards, name))
+                .cloned()
+                .collect(),
         }
     }
 
-    /// Whether the model declares a tensor with the given name.
+    /// Whether `name` is a readable supported tensor in this checkpoint.
     ///
-    /// In sharded mode this consults the index file's weight map without
-    /// opening the containing shard.
+    /// Returns `true` iff [`tensor_names`] would include `name`. In sharded
+    /// mode this means the index declares it AND the owning shard's
+    /// parsed headers contain it with a supported dtype.
+    ///
+    /// [`tensor_names`]: Self::tensor_names
     pub fn has_tensor(&self, name: &str) -> bool {
         match &self.backing {
             Backing::Single { shard } => shard.headers.contains_key(name),
-            Backing::Sharded { weight_map, .. } => weight_map.contains_key(name),
+            Backing::Sharded { weight_map, shards } => {
+                Backing::readable_in_sharded(weight_map, shards, name)
+            }
         }
     }
 
     /// Shape of a named tensor.
-    ///
-    /// In sharded mode this may open the containing shard on first access.
-    pub fn tensor_shape(&mut self, name: &str) -> Result<Vec<usize>, InferenceError> {
-        let shard = self.ensure_shard_for(name)?;
+    pub fn tensor_shape(&self, name: &str) -> Result<Vec<usize>, InferenceError> {
+        let shard = self.shard_for(name)?;
         shard
             .headers
             .get(name)
@@ -384,10 +433,8 @@ impl QuarotTensorReader {
     }
 
     /// Source dtype of a named tensor as stored on disk.
-    ///
-    /// In sharded mode this may open the containing shard on first access.
-    pub fn source_dtype(&mut self, name: &str) -> Result<SourceDType, InferenceError> {
-        let shard = self.ensure_shard_for(name)?;
+    pub fn source_dtype(&self, name: &str) -> Result<SourceDType, InferenceError> {
+        let shard = self.shard_for(name)?;
         shard
             .headers
             .get(name)
@@ -401,11 +448,8 @@ impl QuarotTensorReader {
     ///
     /// No conversion cache is kept — the converter discards tensors after
     /// rotation/fusion so caching would only bloat memory.
-    pub fn read_tensor_f64(
-        &mut self,
-        name: &str,
-    ) -> Result<(Vec<f64>, Vec<usize>), InferenceError> {
-        let shard = self.ensure_shard_for(name)?;
+    pub fn read_tensor_f64(&self, name: &str) -> Result<(Vec<f64>, Vec<usize>), InferenceError> {
+        let shard = self.shard_for(name)?;
         let header = shard
             .headers
             .get(name)
@@ -416,33 +460,27 @@ impl QuarotTensorReader {
         Ok((data, header.shape))
     }
 
-    fn ensure_shard_for(&mut self, name: &str) -> Result<&Shard, InferenceError> {
-        match &mut self.backing {
+    fn shard_for(&self, name: &str) -> Result<&Shard, InferenceError> {
+        match &self.backing {
             Backing::Single { shard } => {
                 if !shard.headers.contains_key(name) {
                     return Err(InferenceError::MissingTensor(name.to_string()));
                 }
                 Ok(shard)
             }
-            Backing::Sharded {
-                root,
-                weight_map,
-                shards,
-            } => {
+            Backing::Sharded { weight_map, shards } => {
                 let shard_file = weight_map
                     .get(name)
-                    .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?
-                    .clone();
-                if !shards.contains_key(&shard_file) {
-                    let path = root.join(&shard_file);
-                    let new_shard = Shard::open(&path)?;
-                    shards.insert(shard_file.clone(), new_shard);
-                }
-                shards.get(&shard_file).ok_or_else(|| {
+                    .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+                let shard = shards.get(shard_file).ok_or_else(|| {
                     InferenceError::InvalidSafetensors(format!(
-                        "internal: failed to cache shard {shard_file}"
+                        "internal: shard {shard_file} not opened at QuarotTensorReader::open"
                     ))
-                })
+                })?;
+                if !shard.headers.contains_key(name) {
+                    return Err(InferenceError::MissingTensor(name.to_string()));
+                }
+                Ok(shard)
             }
         }
     }
@@ -649,7 +687,7 @@ mod tests {
             &[("w", FixtureDType::F32, vec![2, 3], &values)],
         );
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert!(reader.has_tensor("w"));
         assert_eq!(reader.tensor_shape("w").unwrap(), vec![2, 3]);
         assert_eq!(reader.source_dtype("w").unwrap(), SourceDType::F32);
@@ -670,7 +708,7 @@ mod tests {
             &[("w", FixtureDType::BF16, vec![3, 2], &values)],
         );
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert_eq!(reader.source_dtype("w").unwrap(), SourceDType::BF16);
         let (got, shape) = reader.read_tensor_f64("w").unwrap();
         assert_eq!(shape, vec![3, 2]);
@@ -692,7 +730,7 @@ mod tests {
             &[("w", FixtureDType::F16, vec![6], &values)],
         );
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert_eq!(reader.source_dtype("w").unwrap(), SourceDType::F16);
         let (got, _) = reader.read_tensor_f64("w").unwrap();
         for (g, &v) in got.iter().zip(values.iter()) {
@@ -732,7 +770,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert!(reader.has_tensor("a.weight"));
         assert!(reader.has_tensor("b.weight"));
         assert!(!reader.has_tensor("missing"));
@@ -762,7 +800,7 @@ mod tests {
             &dir.path().join("model.safetensors"),
             &[("present", FixtureDType::F32, vec![1], &[1.0])],
         );
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         let err = reader.read_tensor_f64("absent").unwrap_err();
         match err {
             InferenceError::MissingTensor(name) => assert_eq!(name, "absent"),
@@ -830,7 +868,7 @@ mod tests {
         buf.extend_from_slice(&42i64.to_le_bytes());
         std::fs::write(dir.path().join("model.safetensors"), &buf).unwrap();
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert!(reader.has_tensor("supported"));
         assert!(!reader.has_tensor("ignored"));
         let (data, _) = reader.read_tensor_f64("supported").unwrap();
@@ -862,11 +900,85 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = QuarotTensorReader::open(dir.path()).unwrap();
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert!(reader.has_tensor("real"));
         assert!(!reader.has_tensor("decoy"));
         let (data, _) = reader.read_tensor_f64("real").unwrap();
         assert_eq!(data, vec![1.0]);
+    }
+
+    /// Index declares `required.weight` in a shard whose actual contents
+    /// do NOT include that tensor. `has_tensor` and `tensor_names` must
+    /// reflect the readable view, not the manifest, so step 3c's preflight
+    /// rejects the checkpoint before the rotation pass starts.
+    #[test]
+    fn sharded_index_entry_missing_from_shard_is_not_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_file = "model-00001-of-00001.safetensors";
+        // Shard contains only `other.weight`, not `required.weight`.
+        write_safetensors(
+            &dir.path().join(shard_file),
+            &[("other.weight", FixtureDType::F32, vec![1], &[1.0])],
+        );
+        let index = serde_json::json!({
+            "metadata": {"total_size": 4usize},
+            "weight_map": {
+                "required.weight": shard_file,
+                "other.weight": shard_file,
+            },
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
+        assert!(reader.has_tensor("other.weight"));
+        assert!(!reader.has_tensor("required.weight"));
+        assert_eq!(reader.tensor_names(), vec!["other.weight".to_string()]);
+        let err = reader.read_tensor_f64("required.weight").unwrap_err();
+        assert!(matches!(err, InferenceError::MissingTensor(_)));
+    }
+
+    /// Index declares `required.weight` in a shard that DOES contain a
+    /// tensor by that name but with an unsupported dtype (I64). The shard
+    /// parser drops unsupported entries, so the reader must report the
+    /// tensor as not-readable.
+    #[test]
+    fn sharded_index_entry_unsupported_dtype_is_not_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard_file = "model-00001-of-00001.safetensors";
+        // Hand-build a shard with one I64 tensor (unsupported dtype).
+        let header = serde_json::json!({
+            "required.weight": {
+                "dtype": "I64",
+                "shape": [1],
+                "data_offsets": [0, 8],
+            }
+        });
+        let header_str = serde_json::to_string(&header).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(header_str.len() as u64).to_le_bytes());
+        buf.extend_from_slice(header_str.as_bytes());
+        buf.extend_from_slice(&42i64.to_le_bytes());
+        std::fs::write(dir.path().join(shard_file), &buf).unwrap();
+
+        let index = serde_json::json!({
+            "metadata": {"total_size": 8usize},
+            "weight_map": {"required.weight": shard_file},
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
+        assert!(!reader.has_tensor("required.weight"));
+        assert!(reader.tensor_names().is_empty());
+        let err = reader.read_tensor_f64("required.weight").unwrap_err();
+        assert!(matches!(err, InferenceError::MissingTensor(_)));
     }
 
     /// Compile-time check that `qwen_required_tensor_names` is reachable
