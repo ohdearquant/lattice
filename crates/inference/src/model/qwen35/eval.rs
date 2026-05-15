@@ -170,18 +170,30 @@ impl Qwen35Model {
                 cfg.stride, cfg.window
             )));
         }
-        let max_context = self.max_context();
-        if cfg.window > max_context {
-            return Err(InferenceError::Inference(format!(
-                "compute_perplexity: window ({}) exceeds RoPE capacity ({}); \
-                 use a shorter window or load the model with a larger context table",
-                cfg.window, max_context
-            )));
-        }
         if tokens.len() < 2 {
             return Err(InferenceError::Inference(format!(
                 "compute_perplexity: need at least 2 tokens, got {}",
                 tokens.len()
+            )));
+        }
+        // The longest slice we will ever hand to forward_step is
+        // `min(window, tokens.len())` — long windows are clipped by the
+        // corpus per-iteration via `end = min(begin + window, n)`. So a
+        // configured `window > max_context` is only dangerous when the
+        // corpus is itself long enough to push the slice past the RoPE
+        // table. Mirrors HuggingFace's `min(begin + max_length, seq_len)`
+        // clipping in the fixed-length-PPL recipe.
+        let max_context = self.max_context();
+        let effective_window = cfg.window.min(tokens.len());
+        if effective_window > max_context {
+            return Err(InferenceError::Inference(format!(
+                "compute_perplexity: effective window ({} = min(window {}, tokens.len() {})) \
+                 exceeds RoPE capacity ({}); use a shorter window or load the model \
+                 with a larger context table",
+                effective_window,
+                cfg.window,
+                tokens.len(),
+                max_context
             )));
         }
 
@@ -765,6 +777,34 @@ mod tests {
             msg.contains("RoPE") && msg.contains(&format!("{max_context}")),
             "error must mention the RoPE capacity; got: {msg}"
         );
+    }
+
+    #[test]
+    fn compute_perplexity_accepts_long_window_on_short_corpus() {
+        // Round-2 codex finding: the long-window guard was rejecting safe
+        // short-corpus invocations. The effective slice length is
+        // `min(window, tokens.len())`, so an oversized window with a small
+        // corpus must succeed — the per-window clip keeps every slice
+        // within the RoPE table.
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xC0FF_EE44);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xC0FF_EE44);
+        let tokens: Vec<u32> = (1u32..=8).collect();
+        assert!(tokens.len() < max_context, "guard assumption");
+        let report = model
+            .compute_perplexity(
+                &tokens,
+                &PerplexityConfig {
+                    window: max_context + 1_000,
+                    stride: 8,
+                },
+            )
+            .expect("short corpus with oversized window must succeed");
+        assert_eq!(report.num_windows, 1);
+        assert_eq!(report.num_tokens_scored, tokens.len() - 1);
     }
 
     #[test]
