@@ -2,6 +2,7 @@
 //!
 //! See [ADR-044](../../../../docs/adr/ADR-044-quarot-rotated-quantization.md).
 
+pub mod convert;
 pub mod forward_equivalence;
 pub mod hadamard;
 pub mod io;
