@@ -257,7 +257,11 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
         let block = quantize_block(&vals);
-        // SAFETY: Q4Block is #[repr(C)] with size 18 and alignment 1; byte-casting is valid.
+        // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+        // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
+        // rule). Casting to `&[u8; 18]` is valid because the target element type
+        // is `u8` (alignment 1 ≤ source alignment 2) and the source byte length
+        // matches the destination length exactly.
         let bytes: &[u8; 18] = unsafe { &*std::ptr::from_ref(&block).cast() };
         out.extend_from_slice(bytes);
     }
@@ -374,11 +378,23 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
 /// Quantize an `f64` tensor into a [`Q4Tensor`] via f32 downcast.
 ///
 /// Delegated wrapper around [`quantize_f32_to_q4`] for the QuaRot pipeline,
-/// where rotation absorption runs in f64 per ADR-044 §Risks. The f32 downcast
-/// happens inside the per-block loop so callers do not allocate an
-/// intermediate `Vec<f32>`. Q4_0 stores the per-block scale as f16 (10-bit
-/// mantissa), so the f64→f32 step does not lose precision relevant to the
-/// quantized output.
+/// where rotation absorption runs in f64 per ADR-044 §Risks ("keep rotation
+/// math in f64 [...] quantize in f32, store scales in f16 as before"). The
+/// f32 downcast happens inside the per-block loop so callers do not allocate
+/// an intermediate `Vec<f32>`.
+///
+/// **Intentionally f32-precision quantization.** This is NOT a true f64
+/// quantizer — `abs_max`, the scale reciprocal, and the per-nibble round all
+/// happen in f32, matching ADR-044 §Risks. The wrapper exists to avoid the
+/// BF16 round-trip in [`quantize_bf16_to_q4`] and to skip an intermediate
+/// f32 allocation at the call site, not to preserve f64 precision into the
+/// nibble selection. Values within ~½ ULP of an f32 representation may
+/// quantize to a different nibble than a hypothetical f64 reference would,
+/// e.g., an exact f64 `0.5 - 1e-8` downcasts to f32 `0.5` and (with Rust's
+/// `round` rounding halfway away from zero) lands on nibble 9 instead of 8.
+/// QuaRot conversion accepts this — the dequantized magnitude is identical
+/// at exact-midpoint values and rotated activations rarely sit on bin
+/// boundaries.
 ///
 /// `shape.iter().product()` must equal `data.len()`.
 pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
@@ -474,8 +490,11 @@ pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Resul
         f.write_all(&(dim as u64).to_le_bytes())?;
     }
     f.write_all(&(tensor.original_len as u64).to_le_bytes())?;
-    // SAFETY: Q4Block is #[repr(C)], size 18, alignment 1. The cast produces a valid
-    // byte slice of length blocks.len() * 18.
+    // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+    // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
+    // rule). Casting to a `&[u8]` is valid because the target element type is
+    // `u8` (alignment 1 ≤ source alignment 2). The resulting slice has length
+    // `blocks.len() * 18` matching the source contiguous storage.
     let block_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             tensor.blocks.as_ptr().cast::<u8>(),
@@ -1263,7 +1282,8 @@ mod tests {
         let q = quantize_f32_to_q4(&src, &[128]);
         let row_bytes = quantize_row_q4_0(&src);
         assert_eq!(row_bytes.len(), q.blocks.len() * 18);
-        // SAFETY: Q4Block is #[repr(C)] size 18, alignment 1; byte-cast is valid.
+        // SAFETY: Q4Block is #[repr(C)] size 18, alignment 2 (from leading
+        // `scale: u16`); byte-cast is valid because target element type is u8.
         let q_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(q.blocks.as_ptr().cast::<u8>(), q.blocks.len() * 18)
         };
