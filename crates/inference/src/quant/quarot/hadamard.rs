@@ -57,6 +57,46 @@ pub fn walsh_hadamard_orthonormal_in_place(data: &mut [f32]) -> Result<(), Infer
     Ok(())
 }
 
+/// `f64` variant of [`walsh_hadamard_in_place`]. Same butterfly, double precision.
+///
+/// Used by the absorption step (planned in PR 2 of ADR-044) where rotation
+/// math must be computed in `f64` to keep error well below the per-tensor `f16`
+/// quantization-scale storage budget. See ADR-044 §Risks.
+pub fn walsh_hadamard_f64_in_place(data: &mut [f64]) -> Result<(), InferenceError> {
+    let n = data.len();
+    if n == 0 || !n.is_power_of_two() {
+        return Err(InferenceError::Inference(format!(
+            "walsh_hadamard_f64 requires a power-of-two length, got {n}"
+        )));
+    }
+
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let x = data[j];
+                let y = data[j + h];
+                data[j] = x + y;
+                data[j + h] = x - y;
+            }
+            i += h * 2;
+        }
+        h *= 2;
+    }
+    Ok(())
+}
+
+/// `f64` variant of [`walsh_hadamard_orthonormal_in_place`].
+pub fn walsh_hadamard_orthonormal_f64_in_place(data: &mut [f64]) -> Result<(), InferenceError> {
+    walsh_hadamard_f64_in_place(data)?;
+    let scale = 1.0_f64 / (data.len() as f64).sqrt();
+    for v in data.iter_mut() {
+        *v *= scale;
+    }
+    Ok(())
+}
+
 /// Deterministic seeded random sign vector — used as the diagonal `D` in the
 /// `R = H · D` randomized Hadamard transform.
 ///
@@ -144,6 +184,38 @@ impl RandomizedHadamard {
         walsh_hadamard_orthonormal_in_place(data)?;
         for (v, s) in data.iter_mut().zip(self.signs.iter()) {
             *v *= s;
+        }
+        Ok(())
+    }
+
+    /// `f64` variant of [`Self::apply`]. The sign vector `D` is stored once
+    /// and cast to `f64` per element — same signs, double precision.
+    pub fn apply_f64(&self, data: &mut [f64]) -> Result<(), InferenceError> {
+        if data.len() != self.signs.len() {
+            return Err(InferenceError::Inference(format!(
+                "RandomizedHadamard::apply_f64: length mismatch (have {}, want {})",
+                data.len(),
+                self.signs.len()
+            )));
+        }
+        for (v, s) in data.iter_mut().zip(self.signs.iter()) {
+            *v *= f64::from(*s);
+        }
+        walsh_hadamard_orthonormal_f64_in_place(data)
+    }
+
+    /// `f64` variant of [`Self::apply_inverse`].
+    pub fn apply_inverse_f64(&self, data: &mut [f64]) -> Result<(), InferenceError> {
+        if data.len() != self.signs.len() {
+            return Err(InferenceError::Inference(format!(
+                "RandomizedHadamard::apply_inverse_f64: length mismatch (have {}, want {})",
+                data.len(),
+                self.signs.len()
+            )));
+        }
+        walsh_hadamard_orthonormal_f64_in_place(data)?;
+        for (v, s) in data.iter_mut().zip(self.signs.iter()) {
+            *v *= f64::from(*s);
         }
         Ok(())
     }
@@ -285,6 +357,69 @@ mod tests {
         let r = RandomizedHadamard::new(1, 16).unwrap();
         let mut data = vec![0.0_f32; 8];
         assert!(r.apply(&mut data).is_err());
+    }
+
+    fn approx_eq_f64(a: &[f64], b: &[f64], tol: f64) {
+        assert_eq!(a.len(), b.len(), "length mismatch");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < tol,
+                "index {i}: {x} vs {y} (delta {})",
+                (x - y).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn walsh_hadamard_f64_size_2_known_result() {
+        let mut data = [1.0_f64, 2.0];
+        walsh_hadamard_f64_in_place(&mut data).unwrap();
+        approx_eq_f64(&data, &[3.0, -1.0], 1e-12);
+    }
+
+    #[test]
+    fn walsh_hadamard_f64_orthonormal_is_isometry() {
+        let original: Vec<f64> = (0..32).map(|i| (i as f64 * 0.137).sin()).collect();
+        let original_norm: f64 = original.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let mut data = original.clone();
+        walsh_hadamard_orthonormal_f64_in_place(&mut data).unwrap();
+        let transformed_norm: f64 = data.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!(
+            (original_norm - transformed_norm).abs() < 1e-12,
+            "||x||={original_norm} vs ||Hx||={transformed_norm}"
+        );
+    }
+
+    #[test]
+    fn walsh_hadamard_f64_orthonormal_is_involution() {
+        let original: Vec<f64> = (0..64).map(|i| (i as f64 * 0.71).cos()).collect();
+        let mut data = original.clone();
+        walsh_hadamard_orthonormal_f64_in_place(&mut data).unwrap();
+        walsh_hadamard_orthonormal_f64_in_place(&mut data).unwrap();
+        approx_eq_f64(&data, &original, 1e-12);
+    }
+
+    #[test]
+    fn randomized_hadamard_f64_inverse_round_trips() {
+        let r = RandomizedHadamard::new(0xDEAD_BEEF, 256).unwrap();
+        let original: Vec<f64> = (0..256).map(|i| (i as f64 * 0.41).cos() + 0.3).collect();
+        let mut data = original.clone();
+        r.apply_f64(&mut data).unwrap();
+        r.apply_inverse_f64(&mut data).unwrap();
+        approx_eq_f64(&data, &original, 1e-12);
+    }
+
+    #[test]
+    fn randomized_hadamard_f32_f64_agree_in_precision() {
+        let r = RandomizedHadamard::new(7, 256).unwrap();
+        let mut f32_data: Vec<f32> = (0..256).map(|i| (i as f32 * 0.13).sin()).collect();
+        let mut f64_data: Vec<f64> = f32_data.iter().map(|&x| x as f64).collect();
+        r.apply(&mut f32_data).unwrap();
+        r.apply_f64(&mut f64_data).unwrap();
+        for (i, (a, b)) in f32_data.iter().zip(f64_data.iter()).enumerate() {
+            let delta = (*a as f64 - b).abs();
+            assert!(delta < 1e-5, "index {i}: f32={a} vs f64={b}, delta={delta}");
+        }
     }
 
     #[test]

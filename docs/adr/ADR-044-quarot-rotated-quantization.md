@@ -15,7 +15,7 @@ QuaRot (Ashkboos et al., NeurIPS 2024, [arxiv:2404.00456]) proposes applying ran
 
 Result on LLaMA-2-70B (paper): 4-bit weights+activations+KV with at most 0.47 WikiText-2 perplexity loss; 99% zero-shot retention. Lossless 6/8-bit.
 
-No public pure-Rust QuaRot implementation exists.
+The reference QuaRot implementation ([spcl/QuaRot](https://github.com/spcl/QuaRot)) is Python/CUDA. We did not find a public pure-Rust QuaRot implementation in a brief search; some Rust-adjacent quantization work exists (e.g., [konjoai/squish](https://github.com/konjoai/squish)'s `squish_quant_rs`) but is not QuaRot. The "first pure-Rust QuaRot" framing is plausible but unverified — claim only after a more thorough survey if it ever matters for external communication.
 
 ## Decision
 
