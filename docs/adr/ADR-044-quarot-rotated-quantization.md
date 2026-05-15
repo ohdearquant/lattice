@@ -27,9 +27,9 @@ v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to k
 
 | Step | PR | Scope |
 |---|---|---|
-| 1 | this PR | Walsh-Hadamard + RandomizedHadamard primitives, unit-tested. No model code touched. |
-| 2 | next | Rotation absorption: read SafeTensors → compute `W·Q^T` for each linear layer affected by a planned rotation → save rotated weights as new SafeTensors. Includes equivalence assertion (`||rotated_forward − original_forward|| < 1e-5` on a small batch) before the rotated weights are written. |
-| 3 | next | Wire rotated SafeTensors through existing `weights::q4_weights::quantize_bf16_to_q4`. Binary `quantize_quarot` modeled on `quantize_q4` taking seed + model path. |
+| 1 | PR #15 (merged) | Walsh-Hadamard + RandomizedHadamard primitives (f32 + f64), unit-tested. No model code touched. |
+| 2 | this PR (`feat/quarot-rotation-absorption`) | Rotation absorption math: `absorb_input_rotation`, `absorb_output_rotation` (f32 + f64 variants) for a row-major weight matrix. Synthetic-linear-layer equivalence tests validate the identity `(W · R^T) · (R · x) = W · x` and the two-layer round-trip pattern (output-side on layer A, input-side on layer B = identity). No SafeTensors I/O yet — saving an intermediate rotated SafeTensors file is unnecessary since step 3's binary will read → absorb → quantize → write Q4 in a single offline pass. |
+| 3 | next | End-to-end `quantize_quarot` binary modeled on `quantize_q4`: takes seed + model path, parses the layer topology into a `RotationPlan`, reads SafeTensors with the existing memmap parser, applies absorption in f64, runs the forward-equivalence assertion on a small batch (`||rotated_forward − original_forward|| < 1e-5`), then feeds rotated tensors through `weights::q4_weights::quantize_bf16_to_q4`. Output is a `.q4` file consumable by the existing inference path with no runtime changes. |
 | 4 | next | Bench: rotated-Q4 vs unrotated-Q4 perplexity delta on Qwen3-0.6B / Qwen3.5-0.8B against WikiText-2 calibration. Acceptance: delta < 0.5 PPL. |
 
 **Out of v0 entirely (deferred to v1)**:
