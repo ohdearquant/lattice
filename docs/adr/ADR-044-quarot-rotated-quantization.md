@@ -45,12 +45,19 @@ v0 is the offline rotation + Q4-weight-only path. Ships in 4 sequential PRs to k
 
 | Model | hidden | GQA head_dim | linear-attn head_dim | v0 supported? |
 |---|---:|---:|---:|---|
-| Qwen3-0.6B (decoder) | 1024 | 128 | n/a | ✅ both power of 2 |
-| Qwen3.5-0.8B (hybrid GDN+GQA) | 1024 | 256 | 128 (linear K/V) | ✅ all power of 2 |
-| Qwen3-Embedding-4B (decoder, served by `QwenModel`) | 2560 | 128 | n/a | ❌ **explicitly deferred** — `2560 = 2^9 · 5`, hidden not a power of 2 |
-| BERT-base (encoder) | 768 | 64 | n/a | ❌ **explicitly deferred** — `768 = 2^8 · 3`, hidden not a power of 2 |
+| Qwen3-0.6B (decoder) [^qwen3-0.6b] | 1024 | 128 | n/a | ✅ both power of 2 |
+| Qwen3.5-0.8B (hybrid GDN+GQA) [^qwen35-0.8b] | 1024 | 256 | 128 (linear K/V) | ✅ all power of 2 |
+| Qwen3-Embedding-4B (decoder, served by `QwenModel`) [^qwen3-embed-4b] | 2560 | 128 | n/a | ❌ **explicitly deferred** — `2560 = 2^9 · 5`, hidden not a power of 2 |
+| BERT-base (encoder) [^bert-base] | 768 | 64 | n/a | ❌ **explicitly deferred** — `768 = 2^8 · 3`, hidden not a power of 2 |
 
-For non-power-of-2 hidden dims (4B, BERT), v1 cannot use naive zero-pad-then-project — `π ∘ H_N ∘ P` (project up to power of 2, apply Hadamard, drop padded coords) is **not** orthogonal on the original space and breaks the QuaRot invariant. v1 needs one of: (a) the QuaRot paper's online block-diagonal approach (rotates within sub-blocks that are individually power of 2), (b) Paley-construction Hadamard matrices that exist for some specific non-power-of-2 dims, or (c) Givens / Householder products that are orthogonal but not structured. Which path v1 takes is an open question.
+[^qwen3-0.6b]: HuggingFace config: <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json> (`hidden_size: 1024`, `head_dim: 128`). The Qwen3-Embedding-0.6B base shares the decoder backbone with Qwen3-0.6B used as a generation reference here.
+[^qwen35-0.8b]: HuggingFace config: <https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json> (`hidden_size: 1024`, GQA `head_dim: 256`, linear-attention `linear_attn_head_dim: 128`).
+[^qwen3-embed-4b]: HuggingFace config: <https://huggingface.co/Qwen/Qwen3-Embedding-4B/blob/main/config.json> (`hidden_size: 2560`, `head_dim: 128`).
+[^bert-base]: HuggingFace config: <https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json> (`hidden_size: 768`, `num_attention_heads: 12` → `head_dim: 64`).
+
+For non-power-of-2 hidden dims (4B, BERT), v1 cannot use naive zero-pad-then-project — `π ∘ H_N ∘ P` (project up to power of 2, apply Hadamard, drop padded coords) is **not** orthogonal on the original space and breaks the QuaRot invariant. v1 needs one of: (a) the QuaRot paper's online block-diagonal approach for non-power-of-2 dims (rotates within sub-blocks that are individually power of 2; see Ashkboos et al. 2024 §4 "Online Hadamard transformations" [^quarot-paper]), (b) Paley-construction Hadamard matrices that exist for some specific non-power-of-2 dims, or (c) Givens / Householder products that are orthogonal but not structured. Which path v1 takes is an open question.
+
+[^quarot-paper]: Ashkboos et al., *QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs*, NeurIPS 2024. NeurIPS PDF: <https://papers.nips.cc/paper_files/paper/2024/file/b5b939436789f76f08b9d0da5e81af7c-Paper-Conference.pdf>; arxiv:2404.00456: <https://arxiv.org/abs/2404.00456>.
 
 ### Key Design Choices
 
@@ -119,8 +126,12 @@ These are consequences of accepting v0 as the design (across all 4 PRs), not of 
 
 ## References
 
-- Paper: Ashkboos et al., *QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs*, NeurIPS 2024, [arxiv:2404.00456](https://arxiv.org/abs/2404.00456)
-- Related: SpinQuant (Liu 2024), Hadamard transforms in ML (Yu et al. 2017)
+- Paper: Ashkboos et al., *QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs*, NeurIPS 2024, [arxiv:2404.00456](https://arxiv.org/abs/2404.00456). NeurIPS PDF: <https://papers.nips.cc/paper_files/paper/2024/file/b5b939436789f76f08b9d0da5e81af7c-Paper-Conference.pdf>.
+- Related:
+  - SpinQuant — Liu et al., *SpinQuant: LLM Quantization with Learned Rotations*, 2024, [arxiv:2405.16406](https://arxiv.org/abs/2405.16406) (learned rotations, contrasted with QuaRot's random Hadamard).
+  - Hadamard transforms in ML — Yu et al., *Orthogonal Random Features*, NeurIPS 2016 / *Structured Adaptive and Random Spinners*, AISTATS 2017, [arxiv:1610.06209](https://arxiv.org/abs/1610.06209) (cited by QuaRot for the spread-outlier-energy property of Hadamard projections).
+- HuggingFace model configs referenced in the coverage table: Qwen3-Embedding-0.6B <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json>, Qwen3.5-0.8B <https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json>, Qwen3-Embedding-4B <https://huggingface.co/Qwen/Qwen3-Embedding-4B/blob/main/config.json>, BERT-base <https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json>.
+- SafeTensors format reference (used by `quant::quarot::io`): official Rust crate source <https://docs.rs/safetensors/latest/src/safetensors/tensor.rs.html>; HF format docs <https://huggingface.co/docs/safetensors/index>.
 - KG entities: `QuaRot (Ashkboos 2024)` (86ec6a4f), `Rotation-Based Quantization` (d534ca51), `QuantizationRankFlipCondition` (224ef1a7), `HAWQ`, `BRECQ`, `AWQ`, `SmoothQuant`, `HQQ`
 - KG ontology: `.khive/taxonomy.md`
 - Existing code: `crates/inference/src/weights/q4_weights.rs`, `crates/inference/src/bin/quantize_q4.rs`
