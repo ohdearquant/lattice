@@ -126,9 +126,20 @@ struct ParsedEntry {
 /// Returns `None` for any unrecognized dtype string. The caller MUST
 /// reject unknown dtypes rather than treat them as opaque, since they
 /// indicate either a newer SafeTensors revision the reader has not yet
-/// been updated for or a corrupted header — in either case the runtime
-/// loader (or the official `safetensors` crate) would reject the file
-/// too, and the converter should not bless what the runtime wouldn't.
+/// been updated for or a corrupted header.
+///
+/// Strictness note: the official `safetensors` Rust crate rejects
+/// unknown/invalid dtype metadata outright, and this reader follows
+/// that strict contract. Lattice's runtime weights parser
+/// ([`crate::weights::f32_weights::SafetensorsFile`]'s
+/// `parse_tensor_meta` at `f32_weights.rs:1685`) is more permissive —
+/// it maps unknown unsupported dtypes to `Ok(None)` and skips the
+/// entry. The converter is intentionally stricter than the current
+/// runtime parser: a future-dtype string indicates either a format
+/// version this reader has not been updated for or a corrupted
+/// header, and silently rotating around it would be wrong. Aligning
+/// the runtime parser's strictness is a separate concern outside
+/// step 3b's scope.
 ///
 /// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
 /// crate. Kept inline rather than depending on `safetensors` to match
