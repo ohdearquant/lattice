@@ -55,9 +55,13 @@ use crate::model::qwen35_config::Qwen35Config;
 /// `(1 + gamma)` must be folded into one or more downstream linear weight
 /// tensors as a column multiply.
 ///
-/// `downstream_weights` is a non-empty list because a single norm feeds
-/// multiple parallel projections in Qwen3.5 (e.g., `input_layernorm` feeds
-/// `q_proj`, `k_proj`, `v_proj` for full-attention layers).
+/// `downstream_weights` must be non-empty — a single norm feeds multiple
+/// parallel projections in Qwen3.5 (e.g., `input_layernorm` feeds `q_proj`,
+/// `k_proj`, `v_proj` for full-attention layers). The pipeline entry point
+/// [`crate::quant::quarot::pipeline::fuse_rmsnorms`] enforces this
+/// invariant and rejects empty lists before any mutation, because
+/// neutralizing the norm without folding the scale anywhere would silently
+/// change the model's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RmsNormFusionTarget {
     pub norm_tensor: String,

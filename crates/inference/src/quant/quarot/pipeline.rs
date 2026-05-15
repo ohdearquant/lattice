@@ -100,6 +100,11 @@ pub fn load_tensors_f64(
 /// `names` to [`load_tensors_f64`] that did not match this fusion plan,
 /// which is always a converter bug.
 ///
+/// **Empty `downstream_weights` is rejected before any mutation.**
+/// Neutralizing a norm without folding `(1 + gamma)` into a downstream
+/// linear would silently change the model's output, so this is treated as
+/// a converter bug rather than a no-op.
+///
 /// Shape contract: every downstream weight is row-major `[rows × cols]`
 /// where `cols` matches the norm's length. Mismatches return an error.
 pub fn fuse_rmsnorms(
@@ -107,6 +112,14 @@ pub fn fuse_rmsnorms(
     plan: &[RmsNormFusionTarget],
 ) -> Result<(), InferenceError> {
     for target in plan {
+        if target.downstream_weights.is_empty() {
+            return Err(InferenceError::Inference(format!(
+                "fuse_rmsnorms: target for norm `{}` has empty `downstream_weights`; \
+                 neutralizing the norm without folding the `(1 + gamma)` scale into \
+                 a downstream linear would silently change the model's output",
+                target.norm_tensor
+            )));
+        }
         let gamma = tensors.get(&target.norm_tensor).ok_or_else(|| {
             InferenceError::Inference(format!(
                 "fuse_rmsnorms: norm tensor `{}` not in working set",
@@ -344,6 +357,31 @@ mod tests {
         let err = fuse_rmsnorms(&mut tensors, &plan).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not 1-D"), "unexpected error: {msg}");
+    }
+
+    /// Empty `downstream_weights` would mean neutralizing the norm without
+    /// folding `(1 + gamma)` into any linear weight — a silent model
+    /// behavior change. Fail-closed: error before any mutation, and the
+    /// norm data must be untouched.
+    #[test]
+    fn fuse_rmsnorms_rejects_empty_downstream_without_neutralizing_norm() {
+        let mut tensors = HashMap::new();
+        let gamma_original = vec![0.1_f64, -0.2, 0.3, 0.4];
+        insert_tensor(&mut tensors, "n.weight", vec![4], gamma_original.clone());
+
+        let plan = vec![RmsNormFusionTarget {
+            norm_tensor: "n.weight".to_string(),
+            downstream_weights: vec![],
+        }];
+        let err = fuse_rmsnorms(&mut tensors, &plan).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty `downstream_weights`"),
+            "unexpected error: {msg}"
+        );
+
+        // Norm must be untouched — neutralization runs only after successful fusion.
+        assert_eq!(tensors["n.weight"].data, gamma_original);
     }
 
     #[test]
