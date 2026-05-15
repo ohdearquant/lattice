@@ -10,13 +10,18 @@
 //! f32-converted form per tensor and is appropriate for inference paths
 //! that revisit weights repeatedly.
 //!
-//! Layout is auto-detected:
+//! Layout is auto-detected, matching the runtime loader precedence in
+//! [`crate::model::qwen35::Qwen35Model::from_safetensors`] and
+//! [`crate::model::qwen::QwenModel::from_directory`]: when both files are
+//! present, the single-file checkpoint wins. This keeps the converter and
+//! the runtime forward pass reading the same bytes — step 3c's
+//! forward-equivalence assertion depends on this.
 //!
-//! - `model.safetensors.index.json` present → sharded layout. Shards are
-//!   opened lazily on first access to a tensor they contain and re-used
+//! - `model.safetensors` present → single-file layout.
+//! - else `model.safetensors.index.json` present → sharded layout. Shards
+//!   are opened lazily on first access to a tensor they contain and re-used
 //!   for subsequent reads, mirroring
 //!   [`crate::weights::f32_weights::ShardedSafetensors`].
-//! - `model.safetensors` present → single-file layout.
 //! - Otherwise: error at [`QuarotTensorReader::open`].
 //!
 //! On-disk decode for F32 / F16 / BF16 is hand-rolled to keep this module
@@ -305,18 +310,28 @@ pub struct QuarotTensorReader {
 impl QuarotTensorReader {
     /// Open a model directory, auto-detecting single-file vs sharded layout.
     ///
-    /// Detection order:
-    /// 1. `model.safetensors.index.json` present → sharded
-    /// 2. `model.safetensors` present → single file
+    /// Detection order (matches the runtime loaders at
+    /// `crate::model::qwen35::Qwen35Model::from_safetensors` and
+    /// `crate::model::qwen::QwenModel::from_directory`):
+    /// 1. `model.safetensors` present → single file
+    /// 2. else `model.safetensors.index.json` present → sharded
     /// 3. neither → [`InferenceError::InvalidSafetensors`]
     ///
-    /// When both are present (some HuggingFace repos include both) the
-    /// sharded index wins, matching what the runtime loader does.
+    /// When both are present (some HuggingFace repos ship both), the
+    /// single-file checkpoint wins. The converter MUST read the same
+    /// source as the runtime baseline forward pass, or step 3c's
+    /// forward-equivalence assertion would compare against a different
+    /// model than the one Lattice actually serves from that directory.
     pub fn open(model_dir: &Path) -> Result<Self, InferenceError> {
-        let index_path = model_dir.join("model.safetensors.index.json");
         let single_path = model_dir.join("model.safetensors");
+        let index_path = model_dir.join("model.safetensors.index.json");
 
-        if index_path.exists() {
+        if single_path.exists() {
+            let shard = Shard::open(&single_path)?;
+            Ok(Self {
+                backing: Backing::Single { shard },
+            })
+        } else if index_path.exists() {
             let index = parse_index(model_dir)?;
             Ok(Self {
                 backing: Backing::Sharded {
@@ -324,11 +339,6 @@ impl QuarotTensorReader {
                     weight_map: index.weight_map,
                     shards: HashMap::new(),
                 },
-            })
-        } else if single_path.exists() {
-            let shard = Shard::open(&single_path)?;
-            Ok(Self {
-                backing: Backing::Single { shard },
             })
         } else {
             Err(InferenceError::InvalidSafetensors(format!(
@@ -828,22 +838,23 @@ mod tests {
     }
 
     #[test]
-    fn sharded_index_wins_when_both_present() {
-        // If both single-file and sharded index are present, the index path
-        // is honored. Build a sharded layout where the "single" file is
-        // a decoy with wrong content.
+    fn single_file_wins_when_both_layouts_present() {
+        // Mirrors the runtime loaders at qwen35/model.rs:25 and qwen.rs:425,
+        // which both check `model.safetensors` before the sharded index.
+        // The converter must agree, otherwise step 3c's forward-equivalence
+        // check would target a different checkpoint than the runtime serves.
         let dir = tempfile::tempdir().unwrap();
         write_safetensors(
             &dir.path().join("model.safetensors"),
-            &[("decoy", FixtureDType::F32, vec![1], &[999.0])],
+            &[("real", FixtureDType::F32, vec![1], &[1.0])],
         );
         write_safetensors(
             &dir.path().join("model-00001-of-00001.safetensors"),
-            &[("real", FixtureDType::F32, vec![1], &[1.0])],
+            &[("decoy", FixtureDType::F32, vec![1], &[999.0])],
         );
         let index = serde_json::json!({
             "metadata": {"total_size": 4usize},
-            "weight_map": {"real": "model-00001-of-00001.safetensors"},
+            "weight_map": {"decoy": "model-00001-of-00001.safetensors"},
         });
         std::fs::write(
             dir.path().join("model.safetensors.index.json"),
