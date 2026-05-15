@@ -210,6 +210,10 @@ options:
   --max-tokens <USIZE>  Cap total tokens after tokenization (for smoke runs).
   -h, --help            Print this help and exit.
 
-The harness mirrors HuggingFace's fixed-length-model recipe: each global
-token is scored once with up to `window - stride` tokens of prior context.
+The harness mirrors HuggingFace's fixed-length-model recipe: each non-
+first global token is scored exactly once. After the first window, every
+newly scored target has at least `window - stride` and at most
+`window - 1` preceding in-window tokens; the first window ramps from 1
+prior token (target 1) up to `window - 1`. Context never crosses window
+boundaries.
 ";

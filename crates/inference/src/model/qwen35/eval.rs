@@ -6,9 +6,14 @@
 //! Q4 / QuaRot-Q4 measurements (on the Metal runtime).
 //!
 //! The strided methodology matches the [HuggingFace fixed-length-model perplexity
-//! recipe](https://huggingface.co/docs/transformers/en/perplexity): each global
-//! token is scored exactly once with up to `window - stride` tokens of preceding
-//! context, eliminating the cold-start bias of non-overlapping chunks.
+//! recipe](https://huggingface.co/docs/transformers/en/perplexity): each non-first
+//! global token is scored exactly once. After the first window, every newly
+//! scored target has **at least** `window - stride` and at most `window - 1`
+//! preceding in-window tokens — overlap drives the lower bound up so the cold-
+//! start bias of non-overlapping chunks is bounded out. Inside the first window,
+//! targets ramp from 1 preceding token (target 1) to `window - 1`
+//! (target `window - 1`). Context never crosses window boundaries: each window
+//! resets the KV cache + GDN state.
 
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
@@ -133,13 +138,16 @@ impl Qwen35Model {
     ///
     /// Mirrors the HuggingFace fixed-length-model recipe: walk the corpus in
     /// overlapping windows of `cfg.window` tokens, advancing `cfg.stride` tokens
-    /// per step, and aggregate NLLs across windows so each global token is
-    /// scored under the first window whose context covers it. Perplexity is
+    /// per step, and aggregate NLLs across windows so each non-first global
+    /// token is scored exactly once. Perplexity is
     /// `exp(total_nll / num_tokens_scored)`.
     ///
     /// Each window resets the KV cache + GDN state, so context never crosses a
-    /// window boundary — `window - stride` tokens of context precede each
-    /// scored token (zero context for the first `stride` tokens of the corpus).
+    /// window boundary. After the first window, every newly scored target has
+    /// **at least** `window - stride` and at most `window - 1` preceding
+    /// in-window tokens. Inside the first window, targets ramp from 1 preceding
+    /// token (target 1) up to `window - 1` (target `window - 1`); only the
+    /// corpus's very first token is unscored, because it has no predecessor.
     ///
     /// `stride` must be strictly less than `window`. Equal values would
     /// produce disjoint windows whose first token (the global boundary token)
@@ -590,9 +598,12 @@ mod tests {
         let model = build_model(cfg, 0xBEEF_CAFE);
         // 20 tokens, window=10, stride=5
         // → windows starting at [0, 5, 10] (third one ends at 20, covers tail)
-        //   window 0: tokens[0..10],  scores positions 1..9 globally  (9 tokens)
-        //   window 1: tokens[5..15],  scores positions 10..14 globally (5 tokens)
-        //   window 2: tokens[10..20], scores positions 15..19 globally (5 tokens)
+        //   window 0: tokens[0..10],  scores global targets 1..9   (9 tokens; local
+        //     prior counts ramp 1..9)
+        //   window 1: tokens[5..15],  scores global targets 10..14 (5 tokens; local
+        //     prior counts run 5..9 → ≥ window - stride and ≤ window - 1)
+        //   window 2: tokens[10..20], scores global targets 15..19 (5 tokens; local
+        //     prior counts run 5..9)
         // Total: 19 = tokens.len() - 1 (every non-first token scored once)
         let tokens: Vec<u32> = (1u32..=20).collect();
         let report = model
