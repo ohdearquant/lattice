@@ -8912,6 +8912,49 @@ kernel void add_and_copy(
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
+            // Cache-capacity validation, matching `new_session` so a
+            // `from_q4_dir` call cannot construct a runtime whose KV cap
+            // outruns the RoPE table (`partial_rope_interleaved` indexes
+            // `cos_tab` / `sin_tab` by `position`; without this guard a
+            // `--max-cache-len > max_position_embeddings` argument would
+            // race past the precomputed table at decode time).
+            if max_cache_len == 0 {
+                return Err("from_q4_dir: max_cache_len must be > 0".to_string());
+            }
+            if max_cache_len > cfg.max_position_embeddings {
+                return Err(format!(
+                    "from_q4_dir: max_cache_len {max_cache_len} exceeds max_position_embeddings {} \
+                     (the RoPE table is sized to max_position_embeddings; running past it would \
+                     produce out-of-bounds GPU reads or incorrect rotary positions)",
+                    cfg.max_position_embeddings
+                ));
+            }
+
+            // Untied configs (e.g., QuaRot output where step 3c flips
+            // `tie_word_embeddings=false` and materializes a fused
+            // `(1 + γ_final)` + rotation `lm_head.weight`) MUST ship the
+            // rotated head as its own `lm_head.weight.q4` artifact.
+            // Falling back to `embed_tokens` here would silently feed the
+            // wrong matrix into the final logits GEMV — exactly the
+            // contamination ADR-044 §"Step 3c contract" warns against —
+            // and would let `eval_perplexity --quarot-q4-dir` print a
+            // PASS verdict that is measuring the wrong head.
+            //
+            // The tied path is the legitimate "embed_tokens IS the
+            // logits head" case and stays as a fall-through below.
+            if !cfg.tie_word_embeddings {
+                let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
+                if !lm_head_path.exists() {
+                    return Err(format!(
+                        "from_q4_dir: tie_word_embeddings=false but lm_head.q4 is missing at {}; \
+                         the runtime requires the materialized lm_head matrix (ADR-044 step 3c) \
+                         and must not fall back to embed_tokens, which would yield wrong logits \
+                         and a misleading perplexity report",
+                        lm_head_path.display()
+                    ));
+                }
+            }
+
             // Compile shaders (same as new()).
             let opts = CompileOptions::new();
             let library = device
@@ -9270,26 +9313,19 @@ kernel void add_and_copy(
 
             // ----------------------------------------------------------------
             // lm_head: only present when tie_word_embeddings = false.
-            // If present on disk, load it as a Q4 buffer. However the struct does
-            // not have a separate lm_head field — when tie_word_embeddings=false the
-            // existing new() code still uses embed_tokens_q8 for the logits GEMV
-            // (they're different tensors but the same usage slot).
             //
-            // For correctness when tie_word_embeddings=false we load lm_head into
-            // embed_tokens_q8 so the logits projection uses the correct weights.
+            // Step-4b loader contract: when `!cfg.tie_word_embeddings` we
+            // require `lm_head.weight.q4` on disk — the early-return guard
+            // at the top of `from_q4_dir` already rejected the missing-file
+            // case, so this branch only sees a path that exists. We load
+            // it into the `embed_tokens_q8` slot because that buffer is
+            // what the runtime's logits GEMV indexes; the field is shared
+            // between tied (embed_tokens IS the head) and untied
+            // (separate fused-and-rotated head) artifacts.
             // ----------------------------------------------------------------
             let embed_tokens_q8 = if !cfg.tie_word_embeddings {
                 let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                if lm_head_path.exists() {
-                    mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
-                } else {
-                    // Fall back to embed_tokens Q4 if lm_head file is missing.
-                    tracing::warn!(
-                        "lm_head.q4 not found at {}; falling back to embed_tokens for logits",
-                        lm_head_path.display()
-                    );
-                    embed_tokens_q8
-                }
+                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
             } else {
                 embed_tokens_q8
             };
@@ -11175,6 +11211,101 @@ kernel void decode_attention_reference(
                 msg.contains("context capacity") && msg.contains(&format!("{max_cache_len}")),
                 "error must name backend context capacity + cap; got: {msg}"
             );
+        }
+
+        // -------------------------------------------------------------------
+        // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
+            // Round-1 codex Major: `from_q4_dir` was missing the
+            // `max_cache_len <= cfg.max_position_embeddings` guard that
+            // `new_session` enforces. Without it, `--max-cache-len 999999
+            // --window 999999` would slip past the strided-PPL aggregator
+            // (which only knows the KV cap) and panic / read out-of-bounds
+            // GPU memory in `partial_rope_interleaved`. The loader now
+            // matches `new_session` and refuses up-front.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.max_position_embeddings = 64; // small RoPE table
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-mpe-{}", std::process::id()));
+            // The validator runs before any file I/O so an empty / non-
+            // existent dir is fine for this regression.
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                1024,
+            ) {
+                Ok(_) => panic!("max_cache_len > max_position_embeddings must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("max_cache_len") && err.contains("max_position_embeddings"),
+                "error must name both bounds; got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_zero_max_cache_len() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, _weights) = tiny_metal_qwen35_fixture();
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-zero-{}", std::process::id()));
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                0,
+            ) {
+                Ok(_) => panic!("max_cache_len = 0 must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("max_cache_len"),
+                "error must name max_cache_len; got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_untied_config_without_lm_head_artifact() {
+            // Round-1 codex Blocker: the loader silently fell back to
+            // `embed_tokens` when `tie_word_embeddings=false` and
+            // `lm_head.q4` was missing. That is exactly the contamination
+            // ADR-044 step 3c forbids — a QuaRot artifact missing its
+            // materialized fused-and-rotated head would still produce a
+            // PPL and a PASS verdict using the wrong logits matrix. The
+            // loader now refuses before any tensor I/O.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.tie_word_embeddings = false; // make this an untied config
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-untied-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("tempdir create");
+            // Empty dir → lm_head.weight.q4 does not exist.
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                16,
+            ) {
+                Ok(_) => panic!("untied config without lm_head artifact must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("lm_head") && err.contains("tie_word_embeddings"),
+                "error must name both lm_head and tie_word_embeddings; got: {err}"
+            );
+            // Cleanup; ignore errors (the dir may have been removed by other tests).
+            let _ = std::fs::remove_dir_all(&tmp);
         }
     }
 
