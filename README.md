@@ -294,10 +294,13 @@ the *same* way (greedy, median of 5 runs, N₁=32, N₂=256).
 Cross-check: Ollama's slope (84) matches its own `eval_duration` rate (87), confirming the
 methodology is sound.
 
-**Honest caveats.** Lattice here runs **f16** (the `MetalQwen35State` safetensors path); MLX is
-Q8 and Ollama is Q8_0 — so the Lattice↔Ollama gap is *conservative* (Q8 would only widen
-Lattice's lead), while Lattice↔MLX is not quant-matched. **MLX decodes faster than Lattice.**
-Lattice's value is portability plus capabilities no other engine has on this model:
+**Honest caveats.** Lattice's Qwen3.5 decode path is **f16** (`MetalQwen35State::new`); MLX is Q8
+and Ollama is Q8_0, so this is not quant-matched. There is **no end-to-end Q8 path** for Qwen3.5
+in Lattice — the earlier "Q8 139" number was an f16 `forward_step` *micro-benchmark* mislabeled
+"Q8" (the bench's `load_q8_state` builds the same f16 state as the f16 path). 157 tok/s (f16,
+true e2e) is Lattice's actual decode rate for this model; the only other real e2e path is **Q4**
+(`from_q4_dir`). **MLX decodes faster than Lattice.** Lattice's value is portability plus
+capabilities no other engine has on this model:
 
 | Lattice-only capability | MLX | Ollama |
 |---|---|---|
