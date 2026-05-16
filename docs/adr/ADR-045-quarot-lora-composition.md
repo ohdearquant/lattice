@@ -20,7 +20,7 @@ The next step is **LoRA adapter injection on top of the QuaRot Q4 base**. This c
 | `LoraConfig` (rank, alpha, targets) | `crates/tune/src/lora/mod.rs` | Active |
 | CPU forward LoRA injection | `crates/inference/src/model/qwen35/model.rs:17` | Active — `Qwen35Model.lora` field, called per projection |
 | Metal Q4 forward path | `crates/inference/src/forward/metal_qwen35.rs` | Active — **NO LoRA injection** |
-| QuaRot seed in artifact | `config.json` in quantize_quarot output | Stored as conversion metadata |
+| QuaRot seed in artifact | `config.json` in quantize_quarot output | **NOT YET PERSISTED** — caller must supply seed explicitly (see §Prerequisites) |
 | `RandomizedHadamard` reconstruction | `crates/inference/src/quant/quarot/` | Active — deterministic from seed |
 
 ### Gaps
@@ -160,11 +160,12 @@ Two options:
 - Testable independently: LoRA kernel can be validated against CPU reference without touching the Q4 path.
 - Fusion becomes a v2 optimization if profiling shows dispatch overhead matters.
 
-The LoRA Metal kernel computes:
+The LoRA Metal kernels (two-phase separate dispatch):
 ```
-// Phase 1: A_cr @ x → intermediate (rank × 1)
-// Phase 2: B @ intermediate → delta (d_out × 1)
-// Phase 3: output[i] += scale * delta[i]
+// Phase 1 (lora_gemv_a): A' @ x → intermediate (rank × 1)
+// Phase 2 (lora_gemv_b_accum): output[i] += scale * B'[i,:] @ intermediate
+// A' = A_cr for input-side modules; A' = A for output-side modules
+// B' = B for input-side modules; B' = B_rot for output-side modules
 ```
 
 For rank ≤ 64 and d ≤ 4096, this is a small matmul — a single threadgroup can handle it. No tiling needed at these dimensions.
@@ -176,8 +177,8 @@ For rank ≤ 64 and d ≤ 4096, this is a small matmul — a single threadgroup 
 pub fn load_lora_adapter(
     &mut self,
     adapter: &LoraAdapter,      // from lattice-tune
-    quarot_seed: Option<u64>,   // None = no counter-rotation (unrotated base)
-    plan: Option<&RotationPlan>, // which projections were input-absorbed
+    quarot_seed: Option<u64>,   // None = no rotation correction (unrotated base)
+    plan: Option<&RotationPlan>, // which projections need which correction
 ) -> Result<(), String>;
 
 pub fn unload_lora_adapter(&mut self);
@@ -185,11 +186,13 @@ pub fn unload_lora_adapter(&mut self);
 
 When `quarot_seed` is `Some(seed)`:
 1. Reconstruct `R` from seed + hidden_dim.
-2. For each (layer, module) in the adapter where `plan` says input-side absorption: compute `A_cr = A · R^T`.
-3. Upload `B` and `A_cr` (or unmodified `A` for output-side projections) to Metal buffers.
-4. Set internal flag so the forward path dispatches the LoRA kernel after each adapted Q4 GEMV.
+2. Call `rotate_adapter_for_quarot` which, for each (layer, module):
+   - Input-side: computes `A_cr = A · R^T`, uploads `(B, A_cr)` to Metal buffers.
+   - Output-side: computes `B_rot = R · B`, uploads `(B_rot, A)` to Metal buffers.
+   - Unknown module: **errors** (fail-closed).
+3. Set internal flag so the forward path dispatches the LoRA kernel after each adapted Q4 GEMV.
 
-When `quarot_seed` is `None` (unrotated Q4 base): skip counter-rotation, upload A/B directly.
+When `quarot_seed` is `None` (unrotated Q4 base): skip rotation correction, upload A/B directly.
 
 ### Testing strategy
 
@@ -211,23 +214,23 @@ When `quarot_seed` is `None` (unrotated Q4 base): skip counter-rotation, upload 
 
 ## Implementation Steps
 
-| Step | Scope | Blocked by |
-|------|-------|-----------|
-| 1 | Counter-rotation library: `quarot::lora::counter_rotate_adapter(adapter, seed, plan) -> LoraAdapter` | Nothing (pure math, uses existing `RandomizedHadamard`) |
-| 2 | Metal LoRA kernel: `lora_gemv.metal` shader + Rust dispatch wrapper | Nothing (independent of step 1) |
-| 3 | `MetalQwen35State::load_lora_adapter` API: orchestrates counter-rotation + buffer upload | Steps 1 + 2 |
+| Step | Scope | Status |
+|------|-------|--------|
+| 1 | Adapter rotation library: `quarot::lora::rotate_adapter_for_quarot(layers, seed, hidden_dim, plan)` — input-side A counter-rotation + output-side B rotation, fail-closed for unknown targets | **Done** (PR #35) |
+| 2 | Metal LoRA GEMV kernels: `lora_gemv_a` + `lora_gemv_b_accum` MSL shaders, pipeline compilation | **Done** (PR #35) |
+| 3 | `MetalQwen35State::load_lora_adapter` API: orchestrates rotation + buffer upload + Rust dispatch wrapper | Steps 1 + 2 |
 | 4 | Forward path integration: dispatch LoRA kernel after each adapted Q4 GEMV | Step 3 |
 | 5 | End-to-end validation: PPL with adapter vs CPU reference path | Step 4 |
 | 6 | `bin/chat_metal` adapter flag: `--lora-dir <PATH>` for interactive use | Step 4 |
 
-Steps 1 and 2 are independent — parallelize.
+Steps 1 and 2 are independent — parallelized in PR #35.
 
 ## Success Criteria
 
 - PPL with a PEFT adapter on the QuaRot Q4 base matches PPL on the CPU unrotated path with the same adapter (within Q4 quantization noise, < 0.1 PPL).
-- Adapter load time < 500ms for rank-16 adapters on Qwen3.5-0.8B (dominated by the counter-rotation matmul + Metal buffer upload, not I/O).
+- Adapter load time < 500ms for rank-16 adapters on Qwen3.5-0.8B (dominated by the WHT rotation + Metal buffer upload, not I/O).
 - Zero runtime overhead when no adapter is loaded (existing `NoopLoraHook` pattern: the LoRA kernel dispatch is branch-gated on adapter presence).
-- The counter-rotation is invisible to the user: `load_lora_adapter` auto-detects whether the base is QuaRot (from config) and applies the correction internally.
+- The rotation correction is invisible to the user: `load_lora_adapter` applies the correction when `quarot_seed` is provided. Auto-detection from artifact metadata is a future enhancement (requires converter update per §Prerequisites).
 
 ## Alternatives Considered
 

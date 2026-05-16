@@ -110,12 +110,19 @@ impl RotationReport {
 
 /// A single LoRA layer's mutable references for rotation correction.
 pub struct LoraLayerMut<'a> {
+    /// Transformer layer index (0-based).
     pub layer_idx: usize,
+    /// Projection module name (e.g., `"q_proj"`, `"o_proj"`).
     pub module: &'a str,
+    /// A matrix, row-major `(rank × d_in)`. Modified for input-side modules.
     pub a: &'a mut [f32],
+    /// B matrix, row-major `(d_out × rank)`. Modified for output-side modules.
     pub b: &'a mut [f32],
+    /// LoRA rank (inner dimension).
     pub rank: usize,
+    /// Input dimension of the base projection.
     pub d_in: usize,
+    /// Output dimension of the base projection.
     pub d_out: usize,
 }
 

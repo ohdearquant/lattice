@@ -332,8 +332,9 @@ impl RotationPlan {
     /// pattern ends with `"{module}.weight"`, or `None` if the module is not
     /// in the plan (e.g., not a residual-stream projection).
     ///
-    /// Used by the counter-rotation logic (ADR-045) to decide which adapter
-    /// A matrices need `A_cr = A · R^T`.
+    /// Used by the adapter rotation logic (ADR-045) to decide:
+    /// - `InputSide` → counter-rotate A: `A_cr = A · R^T`
+    /// - `OutputSide` → rotate B: `B_rot = R · B`
     pub fn absorption_for_module(&self, module: &str) -> Option<AbsorptionSide> {
         let suffix = format!("{module}.weight");
         self.rules
