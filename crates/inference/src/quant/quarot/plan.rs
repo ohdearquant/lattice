@@ -326,6 +326,22 @@ impl RotationPlan {
             .map(|rule| rule.rotation)
     }
 
+    /// Look up the absorption side for a LoRA module name (e.g., `"q_proj"`).
+    ///
+    /// Returns `Some(InputSide)` or `Some(OutputSide)` if any plan rule's
+    /// pattern ends with `"{module}.weight"`, or `None` if the module is not
+    /// in the plan (e.g., not a residual-stream projection).
+    ///
+    /// Used by the counter-rotation logic (ADR-045) to decide which adapter
+    /// A matrices need `A_cr = A · R^T`.
+    pub fn absorption_for_module(&self, module: &str) -> Option<AbsorptionSide> {
+        let suffix = format!("{module}.weight");
+        self.rules
+            .iter()
+            .find(|rule| rule.pattern.ends_with(&suffix))
+            .map(|rule| rule.rotation.side)
+    }
+
     /// Number of pattern rules in the plan. Useful for dimensional sanity
     /// checks but not for runtime dispatch.
     pub fn rule_count(&self) -> usize {
@@ -818,6 +834,47 @@ mod tests {
             max_abs_diff < 1e-3,
             "MLP pair output should equal R · y_original: max_abs_diff={max_abs_diff}"
         );
+    }
+
+    #[test]
+    fn absorption_for_module_input_side() {
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        for module in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "gate_proj",
+            "up_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+        ] {
+            assert_eq!(
+                plan.absorption_for_module(module),
+                Some(AbsorptionSide::InputSide),
+                "{module} should be InputSide"
+            );
+        }
+    }
+
+    #[test]
+    fn absorption_for_module_output_side() {
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        for module in ["o_proj", "down_proj", "out_proj"] {
+            assert_eq!(
+                plan.absorption_for_module(module),
+                Some(AbsorptionSide::OutputSide),
+                "{module} should be OutputSide"
+            );
+        }
+    }
+
+    #[test]
+    fn absorption_for_module_unknown() {
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        assert_eq!(plan.absorption_for_module("conv1d"), None);
+        assert_eq!(plan.absorption_for_module("norm"), None);
     }
 
     #[test]
