@@ -1,6 +1,6 @@
 //! Perplexity evaluator for Qwen3.5 models on a UTF-8 text corpus.
 //!
-//! Steps 4a + 4b of ADR-044.
+//! ADR-044 step 4 (sub-steps 4a/4b/4c).
 //!
 //! Three measurement modes, mutually exclusive:
 //! - `--model-dir <PATH>`: CPU forward path on a BF16/F16/F32 safetensors
@@ -14,7 +14,7 @@
 //!   `quantize_quarot` directory, prints both reports, then the
 //!   `quarot - unrotated` PPL delta and the ADR-044 acceptance gate
 //!   verdict (< 0.5 PPL by default; override with `--delta-threshold`).
-//!   This is the actual step-4b acceptance measurement.
+//!   This is the ADR-044 step-4 acceptance measurement.
 //! - `--quarot-q4-dir <PATH>` alone: runs only the QuaRot-Q4 forward path
 //!   (rarely useful — typically you want the unrotated baseline alongside).
 //!
@@ -386,8 +386,20 @@ fn tokenize_with(
     max_tokens: Option<usize>,
     corpus_file: &std::path::Path,
 ) -> Result<Vec<u32>, ExitCode> {
+    // `BpeTokenizer::from_tokenizer_json` builds with a default
+    // `max_seq_len = 4_096`, which silently truncates any corpus
+    // longer than that to ~4 K tokens at tokenize time. For PPL
+    // evaluation we strode-walk the corpus in `--window`-sized
+    // slices through the harness, so the tokenizer cap must NOT
+    // bound the corpus. Bump it to a byte-level upper bound on
+    // the token count (byte-level BPE emits ≤ 1 token per UTF-8
+    // byte after the byte-encoder maps every byte to a token).
+    // The pad-to-max-seq-len allocation is temporary — the call
+    // site slices off `..real_length` immediately and drops the
+    // padded buffer.
+    let bumped = tokenizer.with_max_seq_len(text.len().saturating_add(64));
     let t_tok = Instant::now();
-    let tokenized = tokenizer.tokenize(text);
+    let tokenized = bumped.tokenize(text);
     let mut tokens: Vec<u32> = tokenized.input_ids[..tokenized.real_length].to_vec();
     if let Some(cap) = max_tokens {
         if tokens.len() > cap {
@@ -482,7 +494,7 @@ const USAGE: &str = "\
 usage: eval_perplexity [MODE-FLAGS] --corpus-file <PATH> [OPTIONS]
 
 Compute strided sliding-window perplexity of a Qwen3.5 model on a UTF-8
-text corpus (ADR-044 steps 4a + 4b). Three measurement modes:
+text corpus (ADR-044 step 4). Three measurement modes:
 
   CPU safetensors (step 4a):
     --model-dir <PATH>     Directory with config.json + safetensors + tokenizer.json.
@@ -491,7 +503,7 @@ text corpus (ADR-044 steps 4a + 4b). Three measurement modes:
     --q4-dir <PATH>        bin/quantize_q4 output dir (unrotated 4-bit weights).
     --tokenizer-dir <PATH> Source model dir holding tokenizer.json.
 
-  Metal Q4 acceptance gate (step 4b delta):
+  Metal Q4 acceptance gate (step 4 delta):
     --q4-dir <Q4>          bin/quantize_q4 output dir (unrotated baseline).
     --quarot-q4-dir <QR>   bin/quantize_quarot output dir (rotated 4-bit weights).
     --tokenizer-dir <PATH> Source model dir holding tokenizer.json.
@@ -521,3 +533,61 @@ newly scored target has at least `window - stride` and at most
 prior token (target 1) up to `window - 1`. Context never crosses window
 boundaries.
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn tokenize_with_uncaps_long_corpus() {
+        let tok_path = Path::new(concat!(
+            env!("HOME"),
+            "/.lattice/models/qwen3.5-0.8b/tokenizer.json"
+        ));
+        if !tok_path.exists() {
+            eprintln!(
+                "SKIP: tokenizer not at {}; need Qwen3.5-0.8B locally",
+                tok_path.display()
+            );
+            return;
+        }
+        let tokenizer = BpeTokenizer::from_tokenizer_json(tok_path).unwrap();
+        assert_eq!(
+            tokenizer.max_seq_len(),
+            4096,
+            "test assumes BPE default max_seq_len is 4096"
+        );
+
+        let long_text = "a ".repeat(6000);
+        let fake_path = Path::new("/tmp/test_corpus.txt");
+        let tokens = tokenize_with(&tokenizer, &long_text, None, fake_path).unwrap();
+
+        assert!(
+            tokens.len() > 4096,
+            "tokenize_with must not be capped at BPE default max_seq_len 4096; got {} tokens",
+            tokens.len()
+        );
+    }
+
+    #[test]
+    fn tokenize_with_respects_max_tokens_after_uncap() {
+        let tok_path = Path::new(concat!(
+            env!("HOME"),
+            "/.lattice/models/qwen3.5-0.8b/tokenizer.json"
+        ));
+        if !tok_path.exists() {
+            return;
+        }
+        let tokenizer = BpeTokenizer::from_tokenizer_json(tok_path).unwrap();
+        let long_text = "a ".repeat(6000);
+        let fake_path = Path::new("/tmp/test_corpus.txt");
+        let tokens = tokenize_with(&tokenizer, &long_text, Some(100), fake_path).unwrap();
+
+        assert_eq!(
+            tokens.len(),
+            100,
+            "--max-tokens cap must still apply after uncap"
+        );
+    }
+}
