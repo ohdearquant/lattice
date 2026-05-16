@@ -137,8 +137,11 @@ The rotation `R` is the **residual-stream** rotation. It's absorbed input-side i
 | `gate_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
 | `up_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
 | `down_proj` | Yes (output) | Yes | No | **B ← R·B** |
-| `in_proj_qkv` (GDN) | Yes (input) | Possible | **A ← A·R^T** | No |
-| `out_proj` (GDN) | Yes (output) | Possible | No | **B ← R·B** |
+| `in_proj_qkv` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
+| `in_proj_z` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
+| `in_proj_a` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
+| `in_proj_b` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
+| `out_proj` (GDN) | Yes (output) | Yes | No | **B ← R·B** |
 
 Rules:
 - **Input-side** (`W ← W·R^T`): counter-rotate A so `B·(A·R^T)·(R·h) = B·A·h` ✓
@@ -173,24 +176,30 @@ For rank ≤ 64 and d ≤ 4096, this is a small matmul — a single threadgroup 
 ### API surface
 
 ```rust
-// In MetalQwen35State (or a new MetalLoraState wrapper):
+// In MetalQwen35State:
 pub fn load_lora_adapter(
     &mut self,
-    adapter: &LoraAdapter,      // from lattice-tune
-    quarot_seed: Option<u64>,   // None = no rotation correction (unrotated base)
-    plan: Option<&RotationPlan>, // which projections need which correction
-) -> Result<(), String>;
+    layers: Vec<LoraLayerData>,  // raw per-projection A/B matrices
+    scale: f32,                  // LoRA scaling factor (alpha/rank)
+    quarot_seed: Option<u64>,    // None = unrotated base; Some = apply rotation correction
+) -> Result<(), InferenceError>;
 
 pub fn unload_lora_adapter(&mut self);
+pub fn has_lora_adapter(&self) -> bool;
 ```
 
+`LoraLayerData` is defined in `lattice-inference` (not `lattice-tune`) to avoid an
+upward dependency. Each entry names `layer_idx`, `module`, `rank`, `d_in`, `d_out`,
+and the raw `a`/`b` weight vectors. The loader validates module names against the
+layer type (full-attention vs GDN) and checks dimensions against the model config.
+
 When `quarot_seed` is `Some(seed)`:
-1. Reconstruct `R` from seed + hidden_dim.
+1. Reconstruct `R` from seed + hidden_dim using a fixed Qwen3.5 residual-stream plan.
 2. Call `rotate_adapter_for_quarot` which, for each (layer, module):
    - Input-side: computes `A_cr = A · R^T`, uploads `(B, A_cr)` to Metal buffers.
    - Output-side: computes `B_rot = R · B`, uploads `(B_rot, A)` to Metal buffers.
    - Unknown module: **errors** (fail-closed).
-3. Set internal flag so the forward path dispatches the LoRA kernel after each adapted Q4 GEMV.
+3. Store adapter state; forward-path dispatch wired in Step 4.
 
 When `quarot_seed` is `None` (unrotated Q4 base): skip rotation correction, upload A/B directly.
 

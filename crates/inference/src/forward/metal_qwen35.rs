@@ -2790,6 +2790,52 @@ kernel void lora_gemv_b_accum(
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // LoRA adapter state (ADR-045 step 3)
+    // ---------------------------------------------------------------------------
+
+    /// Metal buffers for a single LoRA-adapted projection.
+    struct MetalLoraProjection {
+        a_buf: Buffer,
+        b_buf: Buffer,
+        rank: u32,
+        d_in: u32,
+        d_out: u32,
+    }
+
+    /// Loaded LoRA adapter state on Metal GPU.
+    pub(crate) struct MetalLoraAdapter {
+        /// Nested lookup: layer_idx → module_name → projection. No allocation on lookup.
+        projections: Vec<std::collections::HashMap<String, MetalLoraProjection>>,
+        scale: f32,
+        intermediate: Buffer,
+        max_rank: u32,
+    }
+
+    impl MetalLoraAdapter {
+        fn get_projection(&self, layer_idx: usize, module: &str) -> Option<&MetalLoraProjection> {
+            self.projections.get(layer_idx)?.get(module)
+        }
+    }
+
+    /// Input data for a single LoRA layer to be loaded onto GPU.
+    pub struct LoraLayerData {
+        /// Transformer layer index (0-based).
+        pub layer_idx: usize,
+        /// Projection module name (e.g., `"q_proj"`, `"o_proj"`).
+        pub module: String,
+        /// A matrix, row-major `(rank × d_in)`.
+        pub a: Vec<f32>,
+        /// B matrix, row-major `(d_out × rank)`.
+        pub b: Vec<f32>,
+        /// LoRA rank.
+        pub rank: usize,
+        /// Input dimension.
+        pub d_in: usize,
+        /// Output dimension.
+        pub d_out: usize,
+    }
+
     /// **Unstable**: Metal GPU forward pass for Qwen3.5/3.6; kernel set and weight layout evolving.
     ///
     /// Backward-compatible convenience wrapper bundling one `MetalQwen35Engine` (immutable
@@ -2799,6 +2845,7 @@ kernel void lora_gemv_b_accum(
     pub struct MetalQwen35State {
         pub(crate) engine: MetalQwen35Engine,
         pub(crate) session: InferenceSession,
+        pub(crate) lora: Option<MetalLoraAdapter>,
     }
 
     // ---------------------------------------------------------------------------
@@ -3763,7 +3810,312 @@ kernel void lora_gemv_b_accum(
         ) -> Result<Self, String> {
             let engine = MetalQwen35Engine::new(weights, cfg)?;
             let session = engine.new_session(max_cache_len)?;
-            Ok(Self { engine, session })
+            Ok(Self {
+                engine,
+                session,
+                lora: None,
+            })
+        }
+
+        /// Returns the expected `(d_in, d_out)` for a LoRA projection given the layer type.
+        ///
+        /// Returns an error if `module` is not valid for the layer type at `layer_idx`,
+        /// or if the module name is not recognised.
+        fn expected_lora_shape(
+            cfg: &crate::model::qwen35_config::Qwen35Config,
+            layer_idx: usize,
+            module: &str,
+        ) -> Result<(usize, usize), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let is_full = cfg.is_full_attention(layer_idx);
+
+            match (module, is_full) {
+                // Full-attention projections
+                ("q_proj", true) => Ok((hidden, 2 * cfg.full_q_dim())),
+                ("k_proj", true) => Ok((hidden, cfg.full_kv_dim())),
+                ("v_proj", true) => Ok((hidden, cfg.full_kv_dim())),
+                ("o_proj", true) => Ok((cfg.full_q_dim(), hidden)),
+                // GDN projections
+                ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
+                ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
+                ("in_proj_b", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("in_proj_a", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
+                // MLP projections (shared across both layer types)
+                ("gate_proj", _) => Ok((hidden, inter)),
+                ("up_proj", _) => Ok((hidden, inter)),
+                ("down_proj", _) => Ok((inter, hidden)),
+                // Wrong layer-type combinations
+                ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
+                    Err(InferenceError::Inference(format!(
+                        "module '{}' is a full-attention projection but layer {} is GDN",
+                        module, layer_idx
+                    )))
+                }
+                ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
+                    Err(InferenceError::Inference(format!(
+                        "module '{}' is a GDN projection but layer {} is full-attention",
+                        module, layer_idx
+                    )))
+                }
+                _ => Err(InferenceError::Inference(format!(
+                    "unknown LoRA module '{}'",
+                    module
+                ))),
+            }
+        }
+
+        /// Load a LoRA adapter onto the Metal GPU for inference.
+        ///
+        /// Applies rotation corrections for QuaRot-converted bases when `quarot_seed`
+        /// is provided, then uploads all A/B matrices to Metal shared-memory buffers.
+        ///
+        /// Each `LoraLayerData` must name a valid Qwen3.5 projection module for its
+        /// layer type, and its `(d_in, d_out)` must match the model's actual projection
+        /// shape. Full-attention modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`.
+        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`.
+        /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if:
+        /// - `layers` is empty
+        /// - `scale` is not finite (NaN/inf)
+        /// - An adapter is already loaded (call `unload_lora_adapter` first)
+        /// - A module name is unknown or invalid for the layer type
+        /// - `(d_in, d_out)` does not match the model projection shape
+        /// - A/B vector lengths are inconsistent with rank × dimensions
+        /// - `layer_idx` is out of range
+        /// - Duplicate `(layer_idx, module)` entries exist
+        /// - Any module is not in the rotation plan (when `quarot_seed` is set)
+        /// - Rank or dimensions overflow `u32`
+        pub fn load_lora_adapter(
+            &mut self,
+            mut layers: Vec<LoraLayerData>,
+            scale: f32,
+            quarot_seed: Option<u64>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
+            use crate::quant::quarot::plan::RotationPlan;
+
+            if self.lora.is_some() {
+                return Err(InferenceError::Inference(
+                    "LoRA adapter already loaded; call unload_lora_adapter first".into(),
+                ));
+            }
+            if layers.is_empty() {
+                return Err(InferenceError::Inference(
+                    "load_lora_adapter: layers must not be empty".into(),
+                ));
+            }
+            if !scale.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "load_lora_adapter: scale must be finite, got {}",
+                    scale
+                )));
+            }
+
+            let hidden_dim = self.engine.config.hidden_size;
+
+            if let Some(seed) = quarot_seed {
+                let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+                let lora_muts: Vec<LoraLayerMut<'_>> = layers
+                    .iter_mut()
+                    .map(|l| LoraLayerMut {
+                        layer_idx: l.layer_idx,
+                        module: &l.module,
+                        a: &mut l.a,
+                        b: &mut l.b,
+                        rank: l.rank,
+                        d_in: l.d_in,
+                        d_out: l.d_out,
+                    })
+                    .collect();
+                rotate_adapter_for_quarot(lora_muts, seed, hidden_dim, &plan)?;
+            }
+
+            let device = &self.engine.device;
+            let num_layers = self.engine.config.num_hidden_layers;
+            let mut max_rank = 0u32;
+            let mut projections: Vec<std::collections::HashMap<String, MetalLoraProjection>> = (0
+                ..num_layers)
+                .map(|_| std::collections::HashMap::new())
+                .collect();
+
+            for layer in &layers {
+                if layer.rank == 0 {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has rank=0",
+                        layer.layer_idx, layer.module
+                    )));
+                }
+                if layer.d_in == 0 || layer.d_out == 0 {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has zero dimension \
+                         (d_in={}, d_out={})",
+                        layer.layer_idx, layer.module, layer.d_in, layer.d_out
+                    )));
+                }
+                if layer.layer_idx >= num_layers {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer_idx {} >= num_hidden_layers {}",
+                        layer.layer_idx, num_layers
+                    )));
+                }
+                let (exp_d_in, exp_d_out) =
+                    Self::expected_lora_shape(&self.engine.config, layer.layer_idx, &layer.module)?;
+                if layer.d_in != exp_d_in || layer.d_out != exp_d_out {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has (d_in={}, d_out={}) \
+                         but model expects (d_in={}, d_out={})",
+                        layer.layer_idx, layer.module, layer.d_in, layer.d_out, exp_d_in, exp_d_out
+                    )));
+                }
+                let expected_a = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' rank*d_in overflow",
+                        layer.layer_idx, layer.module
+                    ))
+                })?;
+                let expected_b = layer.d_out.checked_mul(layer.rank).ok_or_else(|| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' d_out*rank overflow",
+                        layer.layer_idx, layer.module
+                    ))
+                })?;
+                if layer.a.len() != expected_a {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' A length {} != rank*d_in {}",
+                        layer.layer_idx,
+                        layer.module,
+                        layer.a.len(),
+                        expected_a
+                    )));
+                }
+                if layer.b.len() != expected_b {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' B length {} != d_out*rank {}",
+                        layer.layer_idx,
+                        layer.module,
+                        layer.b.len(),
+                        expected_b
+                    )));
+                }
+                let rank = u32::try_from(layer.rank).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: rank {} exceeds u32",
+                        layer.rank
+                    ))
+                })?;
+                let d_in = u32::try_from(layer.d_in).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: d_in {} exceeds u32",
+                        layer.d_in
+                    ))
+                })?;
+                let d_out = u32::try_from(layer.d_out).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: d_out {} exceeds u32",
+                        layer.d_out
+                    ))
+                })?;
+                if rank > max_rank {
+                    max_rank = rank;
+                }
+                let a_buf = device.new_buffer_with_data(
+                    layer.a.as_ptr() as *const _,
+                    (layer.a.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let b_buf = device.new_buffer_with_data(
+                    layer.b.as_ptr() as *const _,
+                    (layer.b.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                if projections[layer.layer_idx].contains_key(&layer.module) {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: duplicate projection for layer {} module '{}'",
+                        layer.layer_idx, layer.module
+                    )));
+                }
+                projections[layer.layer_idx].insert(
+                    layer.module.clone(),
+                    MetalLoraProjection {
+                        a_buf,
+                        b_buf,
+                        rank,
+                        d_in,
+                        d_out,
+                    },
+                );
+            }
+
+            let intermediate =
+                device.new_buffer((max_rank as u64) * 4, MTLResourceOptions::StorageModeShared);
+
+            self.lora = Some(MetalLoraAdapter {
+                projections,
+                scale,
+                intermediate,
+                max_rank,
+            });
+
+            Ok(())
+        }
+
+        /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
+        pub fn unload_lora_adapter(&mut self) {
+            self.lora = None;
+        }
+
+        /// Returns true if a LoRA adapter is currently loaded.
+        pub fn has_lora_adapter(&self) -> bool {
+            self.lora.is_some()
+        }
+
+        /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
+        ///
+        /// No-op if no adapter is loaded or no adapter exists for the given layer/module.
+        fn dispatch_lora_if_active(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            y: &Buffer,
+            layer_idx: usize,
+            module: &str,
+        ) {
+            let Some(adapter) = &self.lora else { return };
+            let Some(proj) = adapter.get_projection(layer_idx, module) else {
+                return;
+            };
+
+            // Phase 1: intermediate = A @ x
+            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_a);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(&proj.a_buf), 0);
+            enc.set_buffer(2, Some(&adapter.intermediate), 0);
+            enc.set_bytes(3, 4, &proj.rank as *const u32 as *const _);
+            enc.set_bytes(4, 4, &proj.d_in as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(proj.rank as u64, 1, 1),
+                MTLSize::new(32, 4, 1),
+            );
+
+            // Phase 2: y += scale * B @ intermediate
+            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_b_accum);
+            enc.set_buffer(0, Some(&adapter.intermediate), 0);
+            enc.set_buffer(1, Some(&proj.b_buf), 0);
+            enc.set_buffer(2, Some(y), 0);
+            enc.set_bytes(3, 4, &proj.d_out as *const u32 as *const _);
+            enc.set_bytes(4, 4, &proj.rank as *const u32 as *const _);
+            enc.set_bytes(5, 4, &adapter.scale as *const f32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(proj.d_out.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
         }
 
         /// Copy live GDN conv/S buffers into the given checkpoint slot (blocking GPU blit).
@@ -9602,6 +9954,7 @@ kernel void lora_gemv_b_accum(
                     last_pre_final_hidden: vec![0.0f32; hidden],
                     position: 0,
                 },
+                lora: None,
             })
         }
 
@@ -11060,6 +11413,7 @@ kernel void decode_attention_reference(
             let mut state_a = MetalQwen35State {
                 engine,
                 session: session_a,
+                lora: None,
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
@@ -11544,7 +11898,7 @@ kernel void decode_attention_reference(
             cmd.commit();
             cmd.wait_until_completed();
 
-            // Read back and compare
+            // SAFETY: y_buf is StorageModeShared, GPU work completed, length matches allocation.
             let y_gpu: &[f32] =
                 unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n as usize) };
 
@@ -11556,6 +11910,464 @@ kernel void decode_attention_reference(
             assert!(
                 max_diff < 1e-3,
                 "LoRA GEMV GPU vs CPU diverged: max_abs_diff={max_diff}"
+            );
+        }
+
+        #[test]
+        fn load_adapter_and_dispatch_lora_if_active() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let scale = 2.0f32;
+
+            let mut rng = 0xABCD_u64;
+            let mut rand_f32 = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) - 0.5
+            };
+
+            let a: Vec<f32> = (0..rank * hidden).map(|_| rand_f32()).collect();
+            let b: Vec<f32> = (0..hidden * rank).map(|_| rand_f32()).collect();
+
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden (both 512 in tiny fixture)
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "o_proj".into(),
+                a: a.clone(),
+                b: b.clone(),
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+
+            // Load without QuaRot rotation (unrotated base)
+            state.load_lora_adapter(layers, scale, None).unwrap();
+            assert!(state.has_lora_adapter());
+
+            // Dispatch through the production wrapper
+            let x: Vec<f32> = (0..hidden).map(|_| rand_f32()).collect();
+            let y_init: Vec<f32> = (0..hidden).map(|_| rand_f32()).collect();
+
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_buf = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (y_init.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_lora_if_active(&enc, &x_buf, &y_buf, 0, "o_proj");
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // CPU reference
+            let mut intermediate = vec![0.0f32; rank];
+            for r in 0..rank {
+                intermediate[r] = a[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(ai, xi)| ai * xi)
+                    .sum();
+            }
+            let mut y_expected = y_init.clone();
+            for i in 0..hidden {
+                let dot: f32 = b[i * rank..(i + 1) * rank]
+                    .iter()
+                    .zip(intermediate.iter())
+                    .map(|(bi, ii)| bi * ii)
+                    .sum();
+                y_expected[i] += scale * dot;
+            }
+
+            // SAFETY: y_buf is StorageModeShared, GPU work completed, length matches allocation.
+            let y_gpu: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, hidden) };
+            let max_diff = y_expected
+                .iter()
+                .zip(y_gpu.iter())
+                .map(|(e, g)| (e - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "dispatch_lora_if_active GPU vs CPU: max_abs_diff={max_diff}"
+            );
+
+            // Verify no-op for wrong layer/module
+            let y_buf2 = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (y_init.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let cmd2 = state.engine.queue.new_command_buffer();
+            let enc2 = cmd2.new_compute_command_encoder();
+            state.dispatch_lora_if_active(&enc2, &x_buf, &y_buf2, 0, "v_proj");
+            enc2.end_encoding();
+            cmd2.commit();
+            cmd2.wait_until_completed();
+
+            // SAFETY: y_buf2 is StorageModeShared, GPU work completed, length matches allocation.
+            let y_noop: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf2.contents() as *const f32, hidden) };
+            assert_eq!(
+                y_noop,
+                &y_init[..],
+                "dispatch for non-loaded module should be no-op"
+            );
+
+            // Unload
+            state.unload_lora_adapter();
+            assert!(!state.has_lora_adapter());
+        }
+
+        // ── malformed-load validation tests ──────────────────────────────────
+        // These tests require a Metal device — they return early if none is available.
+        // Each case must return Err, never panic.
+
+        fn make_valid_layer(hidden: usize, rank: usize) -> LoraLayerData {
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden (equal in tiny fixture).
+            // Using o_proj keeps A/B sizes as rank*hidden and hidden*rank while satisfying
+            // shape validation.
+            LoraLayerData {
+                layer_idx: 0,
+                module: "o_proj".into(),
+                a: vec![0.0f32; rank * hidden],
+                b: vec![0.0f32; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_short_a() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.a.pop(); // one element short of rank * d_in
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "short A must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_short_b() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.b.pop(); // one element short of d_out * rank
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "short B must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_zero_rank() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],
+                b: vec![],
+                rank: 0,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "zero rank must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_zero_d_in() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],
+                b: vec![],
+                rank: 4,
+                d_in: 0,
+                d_out: cfg.hidden_size,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "zero d_in must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_out_of_range_layer_idx() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            // cfg.num_hidden_layers == 1, so layer_idx=1 is out of range
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.layer_idx = cfg.num_hidden_layers; // == num_hidden_layers, out of range
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "out-of-range layer_idx must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_a_length_mismatched_dims() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            // Declare rank=4, d_in=hidden, but supply A with wrong inner dim.
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden in tiny fixture.
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "o_proj".into(),
+                a: vec![0.0f32; rank * (hidden + 1)], // extra column — length mismatch
+                b: vec![0.0f32; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "A length != rank*d_in must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_b_length_mismatched_dims() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden in tiny fixture.
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "o_proj".into(),
+                a: vec![0.0f32; rank * hidden],
+                b: vec![0.0f32; (hidden + 1) * rank], // extra row — length mismatch
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "B length != d_out*rank must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_quarot_with_short_a() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.a.pop(); // short A triggers validation error
+            // quarot_seed = Some triggers rotate_adapter_for_quarot path, but
+            // validation after that catches the mismatch.
+            let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
+            assert!(result.is_err(), "quarot path: short A must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_quarot_with_short_b() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.b.pop();
+            let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
+            assert!(result.is_err(), "quarot path: short B must return Err");
+        }
+
+        // ── shape / semantic validation tests ────────────────────────────────
+        // These tests require a Metal device — they return early if none is available.
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_shape_for_module() {
+            // q_proj expects d_out = 2 * full_q_dim() = 1024, not hidden = 512
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank], // d_out=hidden is wrong for q_proj
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject wrong d_out for q_proj");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_gdn_module_on_full_attention_layer() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let qkv_dim = cfg.linear_qkv_dim();
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "in_proj_qkv".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; qkv_dim * rank],
+                rank,
+                d_in: hidden,
+                d_out: qkv_dim,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(
+                result.is_err(),
+                "should reject GDN module on full-attention layer"
+            );
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_unknown_module() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "nonexistent_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject unknown module name");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_duplicate_projection() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let d_out = cfg.intermediate_size; // gate_proj: hidden -> intermediate
+            // Construct two identical layers to trigger duplicate detection.
+            let make_gate = || LoraLayerData {
+                layer_idx: 0,
+                module: "gate_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; d_out * rank],
+                rank,
+                d_in: hidden,
+                d_out,
+            };
+            let layers = vec![make_gate(), make_gate()];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject duplicate layer/module");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_empty_layers() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let result = state.load_lora_adapter(vec![], 1.0, None);
+            assert!(result.is_err(), "should reject empty layers");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_non_finite_scale() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let d_out = cfg.intermediate_size;
+            let make_layer = || {
+                let state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+                let layers = vec![LoraLayerData {
+                    layer_idx: 0,
+                    module: "gate_proj".into(),
+                    a: vec![0.0; rank * hidden],
+                    b: vec![0.0; d_out * rank],
+                    rank,
+                    d_in: hidden,
+                    d_out,
+                }];
+                (state, layers)
+            };
+            let (mut state, layers) = make_layer();
+            assert!(
+                state.load_lora_adapter(layers, f32::NAN, None).is_err(),
+                "should reject NaN scale"
+            );
+            let (mut state, layers) = make_layer();
+            assert!(
+                state
+                    .load_lora_adapter(layers, f32::INFINITY, None)
+                    .is_err(),
+                "should reject +Inf scale"
+            );
+            let (mut state, layers) = make_layer();
+            assert!(
+                state
+                    .load_lora_adapter(layers, f32::NEG_INFINITY, None)
+                    .is_err(),
+                "should reject -Inf scale"
             );
         }
     }
@@ -11586,7 +12398,7 @@ kernel void decode_attention_reference(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    MetalQwen35State, format_chat_template,
+    LoraLayerData, MetalQwen35State, format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
