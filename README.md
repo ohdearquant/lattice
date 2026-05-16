@@ -1,6 +1,6 @@
 # Lattice
 
-Pure Rust inference engine for transformer embedding models.
+Pure Rust inference engine for transformer models on Apple Silicon.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
@@ -8,9 +8,18 @@ Pure Rust inference engine for transformer embedding models.
 
 No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full compute graph
 — weight loading, tokenization, forward pass, and vector operations — in Rust, with hand-written
-SIMD kernels optimized for CPU and Apple Silicon Metal.
+Metal shaders and SIMD kernels.
 
-Built for embedding workloads on CPU and macOS GPU. Optimized for AVX2 (x86), NEON (ARM),
+![Benchmark: Lattice vs MLX vs Ollama on Qwen3.5-0.8B](docs/bench_results/lattice_benchmark.png)
+
+**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit quantization on Apple Silicon.** At Q8 (where all engines work), Lattice matches Apple's MLX and is 60% faster than Ollama/llama.cpp — with LoRA hot-swap that no other engine supports.
+
+```bash
+# Reproduce these numbers on your hardware (requires macOS + ollama + mlx-lm):
+./scripts/bench_q8_vs_ollama.sh
+```
+
+Built for inference on CPU and macOS GPU. Optimized for AVX2 (x86), NEON (ARM),
 and Metal (Apple Silicon) — not CUDA. If you need NVIDIA GPU inference, use
 [candle](https://github.com/huggingface/candle) or [mistral.rs](https://github.com/EricLBuehler/mistral.rs).
 Lattice targets the other 90% of deployments: servers, edge, laptops, and library dependencies
@@ -270,25 +279,34 @@ vectors enough to warrant re-indexing.
 
 ## Benchmarks
 
-Benchmark suites are in `crates/inference/benches/` and `crates/embed/benches/`.
+### Qwen3.5 Decode Throughput (M2 Max, single-token generation)
+
+| Engine | Quant | tok/s | Notes |
+|--------|-------|-------|-------|
+| **Lattice** | QuaRot Q4 | **152** | Only working Q4 implementation |
+| **Lattice** | Q8 | **139** | +8% vs MLX, +60% vs Ollama |
+| **Lattice** | Q4 + LoRA r8 | **118** | Hot-swap adapter, no reload |
+| MLX | Q8 | 128 | Apple's ML framework |
+| Ollama | Q8_0 | 86 | llama.cpp Metal backend |
+
+All three engines implement the full GDN recurrence for Qwen3.5's hybrid architecture
+(18 GatedDeltaNet + 6 GQA layers). Reproducible via `./scripts/bench_q8_vs_ollama.sh`.
+
+### Embedding & Kernel Benchmarks
 
 ```bash
 # Embedding throughput
 cargo bench --package lattice-embed
 
-# Transformer forward pass (f16, CPU)
-cargo bench --package lattice-inference --features f16 --bench inference_bench
+# Metal GPU decode (macOS only, requires model weights)
+cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
 
 # Attention kernel
 cargo bench --package lattice-inference --bench attention_bench
-
-# Metal GPU (macOS only)
-cargo bench --package lattice-inference --features "f16,metal-gpu" --example bench_metal
 ```
 
 Performance depends on hardware, model size, batch size, and sequence length. Run the benchmarks
-on your target hardware to get representative numbers. The SIMD kernels (AVX2/NEON) are the
-primary driver of CPU throughput; Metal provides additional headroom for the Qwen3 decoder path.
+on your target hardware to get representative numbers.
 
 ---
 
