@@ -3872,12 +3872,25 @@ kernel void lora_gemv_b_accum(
         /// Applies rotation corrections for QuaRot-converted bases when `quarot_seed`
         /// is provided, then uploads all A/B matrices to Metal shared-memory buffers.
         ///
+        /// Each `LoraLayerData` must name a valid Qwen3.5 projection module for its
+        /// layer type, and its `(d_in, d_out)` must match the model's actual projection
+        /// shape. Full-attention modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`.
+        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`.
+        /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
+        ///
         /// # Errors
         ///
         /// Returns an error if:
+        /// - `layers` is empty
+        /// - `scale` is not finite (NaN/inf)
         /// - An adapter is already loaded (call `unload_lora_adapter` first)
-        /// - Any module name is not in the rotation plan (when `quarot_seed` is set)
-        /// - Matrix dimensions are inconsistent
+        /// - A module name is unknown or invalid for the layer type
+        /// - `(d_in, d_out)` does not match the model projection shape
+        /// - A/B vector lengths are inconsistent with rank × dimensions
+        /// - `layer_idx` is out of range
+        /// - Duplicate `(layer_idx, module)` entries exist
+        /// - Any module is not in the rotation plan (when `quarot_seed` is set)
+        /// - Rank or dimensions overflow `u32`
         pub fn load_lora_adapter(
             &mut self,
             mut layers: Vec<LoraLayerData>,
@@ -12325,7 +12338,7 @@ kernel void decode_attention_reference(
             let rank = 4usize;
             let d_out = cfg.intermediate_size;
             let make_layer = || {
-                let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+                let state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
                 let layers = vec![LoraLayerData {
                     layer_idx: 0,
                     module: "gate_proj".into(),
