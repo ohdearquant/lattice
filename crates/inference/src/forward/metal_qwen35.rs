@@ -2790,6 +2790,52 @@ kernel void lora_gemv_b_accum(
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // LoRA adapter state (ADR-045 step 3)
+    // ---------------------------------------------------------------------------
+
+    /// Metal buffers for a single LoRA-adapted projection.
+    struct MetalLoraProjection {
+        a_buf: Buffer,
+        b_buf: Buffer,
+        rank: u32,
+        d_in: u32,
+        d_out: u32,
+    }
+
+    /// Loaded LoRA adapter state on Metal GPU.
+    pub(crate) struct MetalLoraAdapter {
+        projections: std::collections::HashMap<(usize, String), MetalLoraProjection>,
+        scale: f32,
+        intermediate: Buffer,
+        max_rank: u32,
+    }
+
+    impl MetalLoraAdapter {
+        fn has_projection(&self, layer_idx: usize, module: &str) -> bool {
+            self.projections
+                .contains_key(&(layer_idx, module.to_string()))
+        }
+    }
+
+    /// Input data for a single LoRA layer to be loaded onto GPU.
+    pub struct LoraLayerData {
+        /// Transformer layer index (0-based).
+        pub layer_idx: usize,
+        /// Projection module name (e.g., `"q_proj"`, `"o_proj"`).
+        pub module: String,
+        /// A matrix, row-major `(rank × d_in)`.
+        pub a: Vec<f32>,
+        /// B matrix, row-major `(d_out × rank)`.
+        pub b: Vec<f32>,
+        /// LoRA rank.
+        pub rank: usize,
+        /// Input dimension.
+        pub d_in: usize,
+        /// Output dimension.
+        pub d_out: usize,
+    }
+
     /// **Unstable**: Metal GPU forward pass for Qwen3.5/3.6; kernel set and weight layout evolving.
     ///
     /// Backward-compatible convenience wrapper bundling one `MetalQwen35Engine` (immutable
@@ -2799,6 +2845,7 @@ kernel void lora_gemv_b_accum(
     pub struct MetalQwen35State {
         pub(crate) engine: MetalQwen35Engine,
         pub(crate) session: InferenceSession,
+        pub(crate) lora: Option<MetalLoraAdapter>,
     }
 
     // ---------------------------------------------------------------------------
@@ -3763,7 +3810,154 @@ kernel void lora_gemv_b_accum(
         ) -> Result<Self, String> {
             let engine = MetalQwen35Engine::new(weights, cfg)?;
             let session = engine.new_session(max_cache_len)?;
-            Ok(Self { engine, session })
+            Ok(Self {
+                engine,
+                session,
+                lora: None,
+            })
+        }
+
+        /// Load a LoRA adapter onto the Metal GPU for inference.
+        ///
+        /// Applies rotation corrections for QuaRot-converted bases when `quarot_seed`
+        /// is provided, then uploads all A/B matrices to Metal shared-memory buffers.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if:
+        /// - An adapter is already loaded (call `unload_lora_adapter` first)
+        /// - Any module name is not in the rotation plan (when `quarot_seed` is set)
+        /// - Matrix dimensions are inconsistent
+        pub fn load_lora_adapter(
+            &mut self,
+            mut layers: Vec<LoraLayerData>,
+            scale: f32,
+            quarot_seed: Option<u64>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
+            use crate::quant::quarot::plan::RotationPlan;
+
+            if self.lora.is_some() {
+                return Err(InferenceError::Inference(
+                    "LoRA adapter already loaded; call unload_lora_adapter first".into(),
+                ));
+            }
+
+            let hidden_dim = self.engine.config.hidden_size;
+
+            if let Some(seed) = quarot_seed {
+                let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+                let lora_muts: Vec<LoraLayerMut<'_>> = layers
+                    .iter_mut()
+                    .map(|l| LoraLayerMut {
+                        layer_idx: l.layer_idx,
+                        module: &l.module,
+                        a: &mut l.a,
+                        b: &mut l.b,
+                        rank: l.rank,
+                        d_in: l.d_in,
+                        d_out: l.d_out,
+                    })
+                    .collect();
+                rotate_adapter_for_quarot(lora_muts, seed, hidden_dim, &plan)?;
+            }
+
+            let device = &self.engine.device;
+            let mut max_rank = 0u32;
+            let mut projections = std::collections::HashMap::new();
+
+            for layer in &layers {
+                let rank = layer.rank as u32;
+                if rank > max_rank {
+                    max_rank = rank;
+                }
+                let a_buf = device.new_buffer_with_data(
+                    layer.a.as_ptr() as *const _,
+                    (layer.a.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let b_buf = device.new_buffer_with_data(
+                    layer.b.as_ptr() as *const _,
+                    (layer.b.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                projections.insert(
+                    (layer.layer_idx, layer.module.clone()),
+                    MetalLoraProjection {
+                        a_buf,
+                        b_buf,
+                        rank,
+                        d_in: layer.d_in as u32,
+                        d_out: layer.d_out as u32,
+                    },
+                );
+            }
+
+            let intermediate =
+                device.new_buffer((max_rank as u64) * 4, MTLResourceOptions::StorageModeShared);
+
+            self.lora = Some(MetalLoraAdapter {
+                projections,
+                scale,
+                intermediate,
+                max_rank,
+            });
+
+            Ok(())
+        }
+
+        /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
+        pub fn unload_lora_adapter(&mut self) {
+            self.lora = None;
+        }
+
+        /// Returns true if a LoRA adapter is currently loaded.
+        pub fn has_lora_adapter(&self) -> bool {
+            self.lora.is_some()
+        }
+
+        /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
+        ///
+        /// No-op if no adapter is loaded or no adapter exists for the given layer/module.
+        fn dispatch_lora_if_active(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            y: &Buffer,
+            layer_idx: usize,
+            module: &str,
+        ) {
+            let Some(adapter) = &self.lora else { return };
+            let key = (layer_idx, module.to_string());
+            let Some(proj) = adapter.projections.get(&key) else {
+                return;
+            };
+
+            // Phase 1: intermediate = A @ x
+            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_a);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(&proj.a_buf), 0);
+            enc.set_buffer(2, Some(&adapter.intermediate), 0);
+            enc.set_bytes(3, 4, &proj.rank as *const u32 as *const _);
+            enc.set_bytes(4, 4, &proj.d_in as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(proj.rank as u64, 1, 1),
+                MTLSize::new(32, 4, 1),
+            );
+
+            // Phase 2: y += scale * B @ intermediate
+            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_b_accum);
+            enc.set_buffer(0, Some(&adapter.intermediate), 0);
+            enc.set_buffer(1, Some(&proj.b_buf), 0);
+            enc.set_buffer(2, Some(y), 0);
+            enc.set_bytes(3, 4, &proj.d_out as *const u32 as *const _);
+            enc.set_bytes(4, 4, &proj.rank as *const u32 as *const _);
+            enc.set_bytes(5, 4, &adapter.scale as *const f32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(proj.d_out.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
         }
 
         /// Copy live GDN conv/S buffers into the given checkpoint slot (blocking GPU blit).
@@ -9602,6 +9796,7 @@ kernel void lora_gemv_b_accum(
                     last_pre_final_hidden: vec![0.0f32; hidden],
                     position: 0,
                 },
+                lora: None,
             })
         }
 
@@ -11060,6 +11255,7 @@ kernel void decode_attention_reference(
             let mut state_a = MetalQwen35State {
                 engine,
                 session: session_a,
+                lora: None,
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
@@ -11557,6 +11753,123 @@ kernel void decode_attention_reference(
                 max_diff < 1e-3,
                 "LoRA GEMV GPU vs CPU diverged: max_abs_diff={max_diff}"
             );
+        }
+
+        #[test]
+        fn load_adapter_and_dispatch_lora_if_active() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let scale = 2.0f32;
+
+            let mut rng = 0xABCD_u64;
+            let mut rand_f32 = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) - 0.5
+            };
+
+            let a: Vec<f32> = (0..rank * hidden).map(|_| rand_f32()).collect();
+            let b: Vec<f32> = (0..hidden * rank).map(|_| rand_f32()).collect();
+
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: a.clone(),
+                b: b.clone(),
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+
+            // Load without QuaRot rotation (unrotated base)
+            state.load_lora_adapter(layers, scale, None).unwrap();
+            assert!(state.has_lora_adapter());
+
+            // Dispatch through the production wrapper
+            let x: Vec<f32> = (0..hidden).map(|_| rand_f32()).collect();
+            let y_init: Vec<f32> = (0..hidden).map(|_| rand_f32()).collect();
+
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_buf = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (y_init.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_lora_if_active(&enc, &x_buf, &y_buf, 0, "q_proj");
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // CPU reference
+            let mut intermediate = vec![0.0f32; rank];
+            for r in 0..rank {
+                intermediate[r] = a[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(ai, xi)| ai * xi)
+                    .sum();
+            }
+            let mut y_expected = y_init.clone();
+            for i in 0..hidden {
+                let dot: f32 = b[i * rank..(i + 1) * rank]
+                    .iter()
+                    .zip(intermediate.iter())
+                    .map(|(bi, ii)| bi * ii)
+                    .sum();
+                y_expected[i] += scale * dot;
+            }
+
+            let y_gpu: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, hidden) };
+            let max_diff = y_expected
+                .iter()
+                .zip(y_gpu.iter())
+                .map(|(e, g)| (e - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "dispatch_lora_if_active GPU vs CPU: max_abs_diff={max_diff}"
+            );
+
+            // Verify no-op for wrong layer/module
+            let y_buf2 = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (y_init.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let cmd2 = state.engine.queue.new_command_buffer();
+            let enc2 = cmd2.new_compute_command_encoder();
+            state.dispatch_lora_if_active(&enc2, &x_buf, &y_buf2, 0, "v_proj");
+            enc2.end_encoding();
+            cmd2.commit();
+            cmd2.wait_until_completed();
+
+            let y_noop: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf2.contents() as *const f32, hidden) };
+            assert_eq!(
+                y_noop,
+                &y_init[..],
+                "dispatch for non-loaded module should be no-op"
+            );
+
+            // Unload
+            state.unload_lora_adapter();
+            assert!(!state.has_lora_adapter());
         }
     }
 
