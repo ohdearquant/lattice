@@ -64,6 +64,12 @@
 //! - `--delta-threshold <F64>`: dual-Q4 mode only. PPL delta threshold for
 //!   the ADR-044 acceptance gate. Default `0.5`. Exit code `1` if the
 //!   measured `quarot - unrotated` delta meets or exceeds this value.
+//! - `--random-lora-rank <N>`: Metal modes only. Generate a random synthetic
+//!   LoRA adapter at rank N and load it, exercising the full
+//!   Metal+QuaRot+LoRA code path end-to-end.
+//! - `--quarot-seed <N>`: u64 seed for QuaRot counter-rotation and random
+//!   A/B matrix generation. Passed as `Some(seed)` to `load_lora_adapter`.
+//! - `--lora-scale <F>`: LoRA scale factor. Default `1.0`.
 //! - `-h, --help`: print usage.
 //!
 //! Exit codes:
@@ -83,7 +89,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use lattice_inference::error::InferenceError;
-use lattice_inference::forward::metal_qwen35::MetalQwen35State;
+use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 use lattice_inference::model::qwen35::{PerplexityConfig, PerplexityReport, Qwen35Model};
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
@@ -102,6 +108,9 @@ fn main() -> ExitCode {
     let mut max_tokens: Option<usize> = None;
     let mut max_cache_len: Option<usize> = None;
     let mut delta_threshold: Option<f64> = None;
+    let mut random_lora_rank: Option<usize> = None;
+    let mut quarot_seed: Option<u64> = None;
+    let mut lora_scale: Option<f32> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -191,6 +200,36 @@ fn main() -> ExitCode {
                     Err(e) => return usage(&format!("--delta-threshold: invalid f64: {e}")),
                 });
             }
+            "--random-lora-rank" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--random-lora-rank requires an argument");
+                };
+                random_lora_rank = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--random-lora-rank: invalid usize: {e}")),
+                });
+            }
+            "--quarot-seed" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--quarot-seed requires an argument");
+                };
+                quarot_seed = Some(match v.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--quarot-seed: invalid u64: {e}")),
+                });
+            }
+            "--lora-scale" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--lora-scale requires an argument");
+                };
+                lora_scale = Some(match v.parse::<f32>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--lora-scale: invalid f32: {e}")),
+                });
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -213,6 +252,9 @@ fn main() -> ExitCode {
     }
     if metal_paths_used && tokenizer_dir.is_none() {
         return usage("--tokenizer-dir is required when using --q4-dir or --quarot-q4-dir");
+    }
+    if random_lora_rank.is_some() && !metal_paths_used {
+        return usage("--random-lora-rank requires --q4-dir or --quarot-q4-dir (Metal mode only)");
     }
 
     let cfg = PerplexityConfig {
@@ -329,6 +371,9 @@ fn main() -> ExitCode {
             &tokens,
             &cfg,
             "unrotated Q4",
+            random_lora_rank,
+            quarot_seed,
+            lora_scale.unwrap_or(1.0),
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -350,6 +395,9 @@ fn main() -> ExitCode {
             &tokens,
             &cfg,
             "QuaRot Q4",
+            random_lora_rank,
+            quarot_seed,
+            lora_scale.unwrap_or(1.0),
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -427,6 +475,7 @@ fn load_cfg_for_q4(dir: &std::path::Path) -> Result<Qwen35Config, ExitCode> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_metal_q4(
     q4_dir: &std::path::Path,
     tokenizer_path: &std::path::Path,
@@ -435,6 +484,9 @@ fn run_metal_q4(
     tokens: &[u32],
     ppl_cfg: &PerplexityConfig,
     label: &str,
+    random_lora_rank: Option<usize>,
+    quarot_seed: Option<u64>,
+    lora_scale: f32,
 ) -> Result<PerplexityReport, ExitCode> {
     let t_load = Instant::now();
     let mut state =
@@ -449,6 +501,21 @@ fn run_metal_q4(
             }
         };
     eprintln!("[{label}] loaded in {}ms", t_load.elapsed().as_millis());
+
+    if let Some(rank) = random_lora_rank {
+        let layers = generate_random_lora_layers(cfg_loaded, rank, quarot_seed.unwrap_or(0));
+        let module_count = layers.len();
+        match state.load_lora_adapter(layers, lora_scale, quarot_seed) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("ERROR ({label}): failed to load random LoRA adapter: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        eprintln!(
+            "[{label}] loaded random LoRA adapter: rank={rank}, modules={module_count}, quarot_seed={quarot_seed:?}"
+        );
+    }
 
     let t_ppl = Instant::now();
     let report = match state.compute_perplexity(tokens, ppl_cfg) {
@@ -482,6 +549,61 @@ fn print_report(label: &str, report: &PerplexityReport, secs: f64) {
         0.0
     };
     println!("Wall time:          {secs:.2}s ({toks_per_sec:.1} tok/s)");
+}
+
+fn generate_random_lora_layers(cfg: &Qwen35Config, rank: usize, seed: u64) -> Vec<LoraLayerData> {
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let mut layers = Vec::new();
+    let mut rng_state = seed;
+
+    let mut next_f32 = || -> f32 {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((rng_state >> 11) as u32 as f32 / u32::MAX as f32) - 0.5
+    };
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let is_full = cfg.is_full_attention(layer_idx);
+
+        let attn_modules: Vec<(&str, usize, usize)> = if is_full {
+            vec![
+                ("q_proj", hidden, 2 * cfg.full_q_dim()),
+                ("k_proj", hidden, cfg.full_kv_dim()),
+                ("v_proj", hidden, cfg.full_kv_dim()),
+                ("o_proj", cfg.full_q_dim(), hidden),
+            ]
+        } else {
+            vec![
+                ("in_proj_qkv", hidden, cfg.linear_qkv_dim()),
+                ("in_proj_z", hidden, cfg.linear_output_dim()),
+                ("out_proj", cfg.linear_output_dim(), hidden),
+            ]
+        };
+
+        let mlp_modules: Vec<(&str, usize, usize)> = vec![
+            ("gate_proj", hidden, inter),
+            ("up_proj", hidden, inter),
+            ("down_proj", inter, hidden),
+        ];
+
+        for (module, d_in, d_out) in attn_modules.into_iter().chain(mlp_modules.into_iter()) {
+            let a: Vec<f32> = (0..rank * d_in).map(|_| next_f32() * 0.02).collect();
+            let b: Vec<f32> = (0..d_out * rank).map(|_| next_f32() * 0.02).collect();
+            layers.push(LoraLayerData {
+                layer_idx,
+                module: module.to_string(),
+                a,
+                b,
+                rank,
+                d_in,
+                d_out,
+            });
+        }
+    }
+
+    layers
 }
 
 fn usage(msg: &str) -> ExitCode {
@@ -524,6 +646,15 @@ options:
                            from_q4_dir. Must be >= --window. Default max(window, 4096).
   --delta-threshold <F64>  Dual-Q4 mode only. PPL delta acceptance threshold.
                            Default 0.5. Exit 1 if measured delta >= threshold.
+  --random-lora-rank <N>   Metal modes only. Generate a random synthetic LoRA
+                           adapter at rank N for all supported modules on all
+                           layers and load it via load_lora_adapter. Exercises
+                           the full Metal+QuaRot+LoRA code path end-to-end.
+  --quarot-seed <N>        u64 seed passed as quarot_seed to load_lora_adapter.
+                           Also seeds the random A/B matrix generation. Default:
+                           omitted (None passed to load_lora_adapter, seed 0 for
+                           matrix generation).
+  --lora-scale <F>         LoRA scale factor (alpha/rank). Default 1.0.
   -h, --help               Print this help and exit.
 
 The harness mirrors HuggingFace's fixed-length-model recipe: each non-

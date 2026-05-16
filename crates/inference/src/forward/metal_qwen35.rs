@@ -12670,6 +12670,18 @@ pub use inner::{
 };
 
 // Stub for non-macOS or non-metal builds.
+/// **Unstable**: LoRA layer data stub; real impl behind metal-gpu feature.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+pub struct LoraLayerData {
+    pub layer_idx: usize,
+    pub module: String,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub rank: usize,
+    pub d_in: usize,
+    pub d_out: usize,
+}
+
 /// **Unstable**: Metal Qwen3.5 forward state; stub on non-macOS; full impl behind metal-gpu feature.
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 pub struct MetalQwen35State;
@@ -12713,6 +12725,18 @@ impl MetalQwen35State {
             prompt_tokens: 0,
             generated_tokens: 0,
         }
+    }
+
+    /// **Unstable**: load LoRA adapter stub; always errors without metal-gpu feature.
+    pub fn load_lora_adapter(
+        &mut self,
+        _layers: Vec<LoraLayerData>,
+        _scale: f32,
+        _quarot_seed: Option<u64>,
+    ) -> Result<(), crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
     }
 
     /// **Unstable**: reset recurrent KV state stub.
