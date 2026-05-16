@@ -11942,6 +11942,187 @@ kernel void decode_attention_reference(
             state.unload_lora_adapter();
             assert!(!state.has_lora_adapter());
         }
+
+        // ── malformed-load validation tests ──────────────────────────────────
+        // These tests exercise the validation gates in load_lora_adapter and do
+        // not require a live GPU device (errors are returned before any buffer
+        // allocation). Each case must return Err, never panic.
+
+        fn make_valid_layer(hidden: usize, rank: usize) -> LoraLayerData {
+            LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * hidden],
+                b: vec![0.0f32; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_short_a() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.a.pop(); // one element short of rank * d_in
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "short A must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_short_b() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.b.pop(); // one element short of d_out * rank
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "short B must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_zero_rank() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],
+                b: vec![],
+                rank: 0,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "zero rank must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_zero_d_in() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],
+                b: vec![],
+                rank: 4,
+                d_in: 0,
+                d_out: cfg.hidden_size,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "zero d_in must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_out_of_range_layer_idx() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            // cfg.num_hidden_layers == 1, so layer_idx=1 is out of range
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.layer_idx = cfg.num_hidden_layers; // == num_hidden_layers, out of range
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "out-of-range layer_idx must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_a_length_mismatched_dims() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            // Declare rank=4, d_in=hidden, but supply A with wrong inner dim
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * (hidden + 1)], // extra column — length mismatch
+                b: vec![0.0f32; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "A length != rank*d_in must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_b_length_mismatched_dims() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * hidden],
+                b: vec![0.0f32; (hidden + 1) * rank], // extra row — length mismatch
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            };
+            let result = state.load_lora_adapter(vec![layer], 1.0, None);
+            assert!(result.is_err(), "B length != d_out*rank must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_quarot_with_short_a() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.a.pop(); // short A triggers validation error
+            // quarot_seed = Some triggers rotate_adapter_for_quarot path, but
+            // validation after that catches the mismatch.
+            let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
+            assert!(result.is_err(), "quarot path: short A must return Err");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_quarot_with_short_b() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let mut layer = make_valid_layer(hidden, rank);
+            layer.b.pop();
+            let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
+            assert!(result.is_err(), "quarot path: short B must return Err");
+        }
     }
 
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
