@@ -1,8 +1,10 @@
 //! Metal Qwen3.5 decode throughput benchmark.
 //!
-//! Measures single-token decode tok/s on M2 Max with QuaRot Q4 weights.
-//! Requires model at `~/.lattice/models/qwen3.5-0.8b-q4-quarot/` and
-//! tokenizer at `~/.lattice/models/qwen3.5-0.8b/tokenizer.json`.
+//! Measures single-token decode tok/s on M2 Max with both QuaRot Q4 and naive Q8 weights.
+//! Requires:
+//! - Q4 model at `~/.lattice/models/qwen3.5-0.8b-q4-quarot/`
+//! - Q8/safetensors at `~/.lattice/models/qwen3.5-0.8b/`
+//! - tokenizer at `~/.lattice/models/qwen3.5-0.8b/tokenizer.json`
 //!
 //! Run: `cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode`
 
@@ -15,11 +17,21 @@ use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
-fn model_dir() -> Option<PathBuf> {
+fn q4_model_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let quarot = PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b-q4-quarot"));
     if quarot.join("config.json").exists() {
         Some(quarot)
+    } else {
+        None
+    }
+}
+
+fn safetensors_model_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let dir = PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b"));
+    if dir.join("config.json").exists() {
+        Some(dir)
     } else {
         None
     }
@@ -34,11 +46,21 @@ fn tokenizer_path() -> Option<PathBuf> {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn load_state() -> Option<(MetalQwen35State, Qwen35Config)> {
-    let dir = model_dir()?;
+fn load_q4_state() -> Option<(MetalQwen35State, Qwen35Config)> {
+    let dir = q4_model_dir()?;
     let tok = tokenizer_path()?;
     let cfg = Qwen35Config::from_config_json(&dir.join("config.json")).ok()?;
     let state = MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).ok()?;
+    Some((state, cfg))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn load_q8_state() -> Option<(MetalQwen35State, Qwen35Config)> {
+    use lattice_inference::model::qwen35::Qwen35Model;
+    let dir = safetensors_model_dir()?;
+    let model = Qwen35Model::from_safetensors(&dir).ok()?;
+    let cfg = model.config().clone();
+    let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
     Some((state, cfg))
 }
 
@@ -98,7 +120,7 @@ fn generate_random_lora(cfg: &Qwen35Config, rank: usize) -> Vec<LoraLayerData> {
     layers
 }
 
-fn bench_metal_decode(c: &mut Criterion) {
+fn bench_metal_decode_q4(c: &mut Criterion) {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
         eprintln!("SKIP: metal_decode bench requires macOS + metal-gpu feature");
@@ -108,21 +130,19 @@ fn bench_metal_decode(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        let Some((mut state, cfg)) = load_state() else {
+        let Some((mut state, cfg)) = load_q4_state() else {
             eprintln!(
-                "SKIP: model not found at ~/.lattice/models/qwen3.5-0.8b-q4-quarot\n\
+                "SKIP: Q4 model not found at ~/.lattice/models/qwen3.5-0.8b-q4-quarot\n\
                  (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
             );
             return;
         };
 
-        let mut group = c.benchmark_group("metal_decode");
+        let mut group = c.benchmark_group("metal_decode_q4");
         group.warm_up_time(Duration::from_secs(3));
         group.measurement_time(Duration::from_secs(10));
         group.sample_size(50);
 
-        // --- Benchmark 1: single-token decode, no adapter ---
-        // Prefill a short prompt, then benchmark individual decode steps.
         let prompt_tokens: Vec<u32> = vec![42, 100, 200, 300, 400];
         state.forward_prefill(&prompt_tokens);
         let mut pos = prompt_tokens.len();
@@ -132,7 +152,6 @@ fn bench_metal_decode(c: &mut Criterion) {
             b.iter(|| {
                 let _logits = state.forward_step(42, pos);
                 pos += 1;
-                // Reset occasionally to avoid cache overflow.
                 if pos > 500 {
                     state.reset_state();
                     state.forward_prefill(&prompt_tokens);
@@ -141,7 +160,6 @@ fn bench_metal_decode(c: &mut Criterion) {
             });
         });
 
-        // --- Benchmark 2: single-token decode with rank-8 LoRA adapter ---
         state.reset_state();
         let lora_layers = generate_random_lora(&cfg, 8);
         state
@@ -166,12 +184,54 @@ fn bench_metal_decode(c: &mut Criterion) {
             });
         });
 
-        // Unload adapter so state is clean after bench.
         state.unload_lora_adapter();
+        group.finish();
+    }
+}
+
+fn bench_metal_decode_q8(c: &mut Criterion) {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        eprintln!("SKIP: metal_decode bench requires macOS + metal-gpu feature");
+        let _ = c;
+        return;
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let Some((mut state, _cfg)) = load_q8_state() else {
+            eprintln!(
+                "SKIP: Q8 model not found at ~/.lattice/models/qwen3.5-0.8b\n\
+                 (needs config.json + model.safetensors)"
+            );
+            return;
+        };
+
+        let mut group = c.benchmark_group("metal_decode_q8");
+        group.warm_up_time(Duration::from_secs(3));
+        group.measurement_time(Duration::from_secs(10));
+        group.sample_size(50);
+
+        let prompt_tokens: Vec<u32> = vec![42, 100, 200, 300, 400];
+        state.forward_prefill(&prompt_tokens);
+        let mut pos = prompt_tokens.len();
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_function(BenchmarkId::new("forward_step", "no_adapter"), |b| {
+            b.iter(|| {
+                let _logits = state.forward_step(42, pos);
+                pos += 1;
+                if pos > 500 {
+                    state.reset_state();
+                    state.forward_prefill(&prompt_tokens);
+                    pos = prompt_tokens.len();
+                }
+            });
+        });
 
         group.finish();
     }
 }
 
-criterion_group!(benches, bench_metal_decode);
+criterion_group!(benches, bench_metal_decode_q4, bench_metal_decode_q8);
 criterion_main!(benches);
