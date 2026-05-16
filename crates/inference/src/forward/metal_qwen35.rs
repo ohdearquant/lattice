@@ -2805,16 +2805,16 @@ kernel void lora_gemv_b_accum(
 
     /// Loaded LoRA adapter state on Metal GPU.
     pub(crate) struct MetalLoraAdapter {
-        projections: std::collections::HashMap<(usize, String), MetalLoraProjection>,
+        /// Nested lookup: layer_idx → module_name → projection. No allocation on lookup.
+        projections: Vec<std::collections::HashMap<String, MetalLoraProjection>>,
         scale: f32,
         intermediate: Buffer,
         max_rank: u32,
     }
 
     impl MetalLoraAdapter {
-        fn has_projection(&self, layer_idx: usize, module: &str) -> bool {
-            self.projections
-                .contains_key(&(layer_idx, module.to_string()))
+        fn get_projection(&self, layer_idx: usize, module: &str) -> Option<&MetalLoraProjection> {
+            self.projections.get(layer_idx)?.get(module)
         }
     }
 
@@ -3864,11 +3864,81 @@ kernel void lora_gemv_b_accum(
             }
 
             let device = &self.engine.device;
+            let num_layers = self.engine.config.num_hidden_layers;
             let mut max_rank = 0u32;
-            let mut projections = std::collections::HashMap::new();
+            let mut projections: Vec<std::collections::HashMap<String, MetalLoraProjection>> = (0
+                ..num_layers)
+                .map(|_| std::collections::HashMap::new())
+                .collect();
 
             for layer in &layers {
-                let rank = layer.rank as u32;
+                if layer.rank == 0 {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has rank=0",
+                        layer.layer_idx, layer.module
+                    )));
+                }
+                if layer.d_in == 0 || layer.d_out == 0 {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has zero dimension \
+                         (d_in={}, d_out={})",
+                        layer.layer_idx, layer.module, layer.d_in, layer.d_out
+                    )));
+                }
+                if layer.layer_idx >= num_layers {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer_idx {} >= num_hidden_layers {}",
+                        layer.layer_idx, num_layers
+                    )));
+                }
+                let expected_a = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' rank*d_in overflow",
+                        layer.layer_idx, layer.module
+                    ))
+                })?;
+                let expected_b = layer.d_out.checked_mul(layer.rank).ok_or_else(|| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' d_out*rank overflow",
+                        layer.layer_idx, layer.module
+                    ))
+                })?;
+                if layer.a.len() != expected_a {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' A length {} != rank*d_in {}",
+                        layer.layer_idx,
+                        layer.module,
+                        layer.a.len(),
+                        expected_a
+                    )));
+                }
+                if layer.b.len() != expected_b {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' B length {} != d_out*rank {}",
+                        layer.layer_idx,
+                        layer.module,
+                        layer.b.len(),
+                        expected_b
+                    )));
+                }
+                let rank = u32::try_from(layer.rank).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: rank {} exceeds u32",
+                        layer.rank
+                    ))
+                })?;
+                let d_in = u32::try_from(layer.d_in).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: d_in {} exceeds u32",
+                        layer.d_in
+                    ))
+                })?;
+                let d_out = u32::try_from(layer.d_out).map_err(|_| {
+                    InferenceError::Inference(format!(
+                        "load_lora_adapter: d_out {} exceeds u32",
+                        layer.d_out
+                    ))
+                })?;
                 if rank > max_rank {
                     max_rank = rank;
                 }
@@ -3882,14 +3952,14 @@ kernel void lora_gemv_b_accum(
                     (layer.b.len() * 4) as u64,
                     MTLResourceOptions::StorageModeShared,
                 );
-                projections.insert(
-                    (layer.layer_idx, layer.module.clone()),
+                projections[layer.layer_idx].insert(
+                    layer.module.clone(),
                     MetalLoraProjection {
                         a_buf,
                         b_buf,
                         rank,
-                        d_in: layer.d_in as u32,
-                        d_out: layer.d_out as u32,
+                        d_in,
+                        d_out,
                     },
                 );
             }
@@ -3929,8 +3999,7 @@ kernel void lora_gemv_b_accum(
             module: &str,
         ) {
             let Some(adapter) = &self.lora else { return };
-            let key = (layer_idx, module.to_string());
-            let Some(proj) = adapter.projections.get(&key) else {
+            let Some(proj) = adapter.get_projection(layer_idx, module) else {
                 return;
             };
 
@@ -11740,7 +11809,7 @@ kernel void decode_attention_reference(
             cmd.commit();
             cmd.wait_until_completed();
 
-            // Read back and compare
+            // SAFETY: y_buf is StorageModeShared, GPU work completed, length matches allocation.
             let y_gpu: &[f32] =
                 unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n as usize) };
 
@@ -11834,6 +11903,7 @@ kernel void decode_attention_reference(
                 y_expected[i] += scale * dot;
             }
 
+            // SAFETY: y_buf is StorageModeShared, GPU work completed, length matches allocation.
             let y_gpu: &[f32] =
                 unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, hidden) };
             let max_diff = y_expected
@@ -11859,6 +11929,7 @@ kernel void decode_attention_reference(
             cmd2.commit();
             cmd2.wait_until_completed();
 
+            // SAFETY: y_buf2 is StorageModeShared, GPU work completed, length matches allocation.
             let y_noop: &[f32] =
                 unsafe { std::slice::from_raw_parts(y_buf2.contents() as *const f32, hidden) };
             assert_eq!(
@@ -11899,7 +11970,7 @@ kernel void decode_attention_reference(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    MetalQwen35State, format_chat_template,
+    LoraLayerData, MetalQwen35State, format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
