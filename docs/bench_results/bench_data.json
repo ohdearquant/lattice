@@ -1,8 +1,10 @@
 {
-  "lattice_q4": 152.02,
-  "lattice_q4_lora": 117.93,
-  "lattice_q8": 138.81,
-  "ollama_q8": 86.40701714012968,
-  "mlx_q8": 128.15456140951244,
-  "mlx_q4": 147.1392368117512
+  "method": "fair_e2e_slope",
+  "machine": "M2 Max",
+  "model": "Qwen3.5-0.8B",
+  "lattice_f16_tok_s": 157.1,
+  "ollama_q8_tok_s": 83.7,
+  "mlx_q8_tok_s": 246.7,
+  "note": "lattice f16 e2e; mlx Q8 g64; ollama Q8_0. MLX fastest. Lattice ~1.9x Ollama.",
+  "date": "2026-05-16"
 }
