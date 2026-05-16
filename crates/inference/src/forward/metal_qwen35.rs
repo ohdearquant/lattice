@@ -3840,8 +3840,11 @@ kernel void lora_gemv_b_accum(
                 // GDN projections
                 ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
                 ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
-                ("in_proj_b", false) => Ok((hidden, cfg.linear_num_key_heads)),
-                ("in_proj_a", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
+                    "module '{}' is not yet supported in Metal forward (consumed inside \
+                     fused GDN recurrence kernel); target other GDN modules instead",
+                    module
+                ))),
                 ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
                 // MLP projections (shared across both layer types)
                 ("gate_proj", _) => Ok((hidden, inter)),
@@ -3854,7 +3857,7 @@ kernel void lora_gemv_b_accum(
                         module, layer_idx
                     )))
                 }
-                ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
+                ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
                     Err(InferenceError::Inference(format!(
                         "module '{}' is a GDN projection but layer {} is full-attention",
                         module, layer_idx
@@ -3875,7 +3878,8 @@ kernel void lora_gemv_b_accum(
         /// Each `LoraLayerData` must name a valid Qwen3.5 projection module for its
         /// layer type, and its `(d_in, d_out)` must match the model's actual projection
         /// shape. Full-attention modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`.
-        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`.
+        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `out_proj`.
+        /// (`in_proj_a`, `in_proj_b` not yet supported — consumed inside fused kernels).
         /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
         ///
         /// # Errors
@@ -5630,8 +5634,8 @@ kernel void lora_gemv_b_accum(
                 let logits = self.forward_step(token_ids[0], 0);
                 return logits;
             }
-            // Fall back to sequential for long prompts
-            if n > self.session.max_prefill {
+            // Fall back to sequential when LoRA adapter is active (no batch LoRA kernel yet)
+            if self.lora.is_some() || n > self.session.max_prefill {
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -7420,10 +7424,7 @@ kernel void lora_gemv_b_accum(
                 layer_idx,
                 "in_proj_z",
             );
-            // NOTE: in_proj_b and in_proj_a LoRA dispatch is deferred — these projections happen
-            // inside the fused gdn_recurrence / gdn_precompute_keys kernels (hidden→num_key_heads,
-            // a tiny shape), so there is no separate matmul dispatch to hook into. Adapters
-            // targeting these modules are valid to load; the forward path just does not apply them.
+            // in_proj_b and in_proj_a: rejected at load time (consumed inside fused kernels).
 
             // Conv1d + SiLU (GPU)
             // SAFETY: Encoder commands reference live Metal buffers owned by
