@@ -12517,6 +12517,93 @@ kernel void decode_attention_reference(
                 "should reject -Inf scale"
             );
         }
+
+        #[test]
+        fn load_lora_adapter_rejects_in_proj_b_and_in_proj_a() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "in_proj_b".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "in_proj_b must be rejected at load time");
+
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "in_proj_a".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "in_proj_a must be rejected at load time");
+        }
+
+        #[test]
+        fn forward_prefill_with_adapter_matches_sequential_forward_step() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+
+            // Sequential path: forward_step(t0, 0) then forward_step(t1, 1)
+            let mut state_seq = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let d_in = cfg.full_q_dim(); // o_proj: d_in=full_q_dim, d_out=hidden
+            let make_layers = || {
+                vec![LoraLayerData {
+                    layer_idx: 0,
+                    module: "o_proj".into(),
+                    a: vec![0.01; rank * d_in],
+                    b: vec![0.01; hidden * rank],
+                    rank,
+                    d_in,
+                    d_out: hidden,
+                }]
+            };
+            state_seq
+                .load_lora_adapter(make_layers(), 2.0, None)
+                .unwrap();
+            let _ = state_seq.forward_step(42, 0);
+            let logits_seq = state_seq.forward_step(7, 1);
+
+            // Prefill path: forward_prefill([t0, t1])
+            let mut state_pre = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_pre
+                .load_lora_adapter(make_layers(), 2.0, None)
+                .unwrap();
+            let logits_pre = state_pre.forward_prefill(&[42, 7]);
+
+            // Must match (both use sequential path when adapter active)
+            assert_eq!(
+                logits_seq.len(),
+                logits_pre.len(),
+                "logit vector length mismatch"
+            );
+            let max_diff: f32 = logits_seq
+                .iter()
+                .zip(logits_pre.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-5,
+                "prefill with adapter must match sequential: max_diff={max_diff}"
+            );
+        }
     }
 
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
