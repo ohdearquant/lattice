@@ -3840,8 +3840,11 @@ kernel void lora_gemv_b_accum(
                 // GDN projections
                 ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
                 ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
-                ("in_proj_b", false) => Ok((hidden, cfg.linear_num_key_heads)),
-                ("in_proj_a", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
+                    "module '{}' is not yet supported in Metal forward (consumed inside \
+                     fused GDN recurrence kernel); target other GDN modules instead",
+                    module
+                ))),
                 ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
                 // MLP projections (shared across both layer types)
                 ("gate_proj", _) => Ok((hidden, inter)),
@@ -3854,7 +3857,7 @@ kernel void lora_gemv_b_accum(
                         module, layer_idx
                     )))
                 }
-                ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
+                ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
                     Err(InferenceError::Inference(format!(
                         "module '{}' is a GDN projection but layer {} is full-attention",
                         module, layer_idx
@@ -3875,7 +3878,8 @@ kernel void lora_gemv_b_accum(
         /// Each `LoraLayerData` must name a valid Qwen3.5 projection module for its
         /// layer type, and its `(d_in, d_out)` must match the model's actual projection
         /// shape. Full-attention modules: `q_proj`, `k_proj`, `v_proj`, `o_proj`.
-        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`.
+        /// GDN modules: `in_proj_qkv`, `in_proj_z`, `out_proj`.
+        /// (`in_proj_a`, `in_proj_b` not yet supported — consumed inside fused kernels).
         /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
         ///
         /// # Errors
@@ -4078,12 +4082,19 @@ kernel void lora_gemv_b_accum(
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
         ///
+        /// `x_byte_offset` is the byte offset into `x` where the input vector starts (usually 0,
+        /// non-zero for sub-slices of fused buffers such as the Z portion of `gdn_qkvz`).
+        /// `y_byte_offset` is the byte offset into `y` where the output vector starts (usually 0,
+        /// non-zero when accumulating into a sub-slice of a fused output buffer).
+        ///
         /// No-op if no adapter is loaded or no adapter exists for the given layer/module.
         fn dispatch_lora_if_active(
             &self,
             enc: &ComputeCommandEncoderRef,
             x: &Buffer,
+            x_byte_offset: u64,
             y: &Buffer,
+            y_byte_offset: u64,
             layer_idx: usize,
             module: &str,
         ) {
@@ -4092,9 +4103,9 @@ kernel void lora_gemv_b_accum(
                 return;
             };
 
-            // Phase 1: intermediate = A @ x
+            // Phase 1: intermediate = A @ x  (x read from x_byte_offset)
             enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_a);
-            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(0, Some(x), x_byte_offset);
             enc.set_buffer(1, Some(&proj.a_buf), 0);
             enc.set_buffer(2, Some(&adapter.intermediate), 0);
             enc.set_bytes(3, 4, &proj.rank as *const u32 as *const _);
@@ -4104,11 +4115,11 @@ kernel void lora_gemv_b_accum(
                 MTLSize::new(32, 4, 1),
             );
 
-            // Phase 2: y += scale * B @ intermediate
+            // Phase 2: y += scale * B @ intermediate  (y written at y_byte_offset)
             enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_b_accum);
             enc.set_buffer(0, Some(&adapter.intermediate), 0);
             enc.set_buffer(1, Some(&proj.b_buf), 0);
-            enc.set_buffer(2, Some(y), 0);
+            enc.set_buffer(2, Some(y), y_byte_offset);
             enc.set_bytes(3, 4, &proj.d_out as *const u32 as *const _);
             enc.set_bytes(4, 4, &proj.rank as *const u32 as *const _);
             enc.set_bytes(5, 4, &adapter.scale as *const f32 as *const _);
@@ -5506,6 +5517,7 @@ kernel void lora_gemv_b_accum(
                         compact_idx,
                         linear_idx,
                         position,
+                        layer_i,
                         &cfg,
                         &mut prof,
                         profiling,
@@ -5518,6 +5530,7 @@ kernel void lora_gemv_b_accum(
                         full_idx,
                         position,
                         kv_dim,
+                        layer_i,
                         &cfg,
                         &mut prof,
                         profiling,
@@ -5621,8 +5634,8 @@ kernel void lora_gemv_b_accum(
                 let logits = self.forward_step(token_ids[0], 0);
                 return logits;
             }
-            // Fall back to sequential for long prompts
-            if n > self.session.max_prefill {
+            // Fall back to sequential when LoRA adapter is active (no batch LoRA kernel yet)
+            if self.lora.is_some() || n > self.session.max_prefill {
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -7319,6 +7332,7 @@ kernel void lora_gemv_b_accum(
             compact_idx: usize,
             linear_idx: usize,
             _position: usize,
+            layer_idx: usize,
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
             profiling: bool,
@@ -7389,6 +7403,28 @@ kernel void lora_gemv_b_accum(
             if let Some(t0) = proj_t0 {
                 prof.projection_us += t0.elapsed().as_micros();
             }
+
+            // LoRA for in_proj_qkv: accumulates into QKV portion (offset 0) of gdn_qkvz.
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.gdn_qkvz,
+                0,
+                layer_idx,
+                "in_proj_qkv",
+            );
+            // LoRA for in_proj_z: accumulates into Z portion (byte offset qkv_d * 4) of gdn_qkvz.
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.gdn_qkvz,
+                (qkv_d as u64) * 4,
+                layer_idx,
+                "in_proj_z",
+            );
+            // in_proj_b and in_proj_a: rejected at load time (consumed inside fused kernels).
 
             // Conv1d + SiLU (GPU)
             // SAFETY: Encoder commands reference live Metal buffers owned by
@@ -7554,6 +7590,18 @@ kernel void lora_gemv_b_accum(
                 prof.projection_us += t0.elapsed().as_micros();
             }
 
+            // LoRA for out_proj: x is the Z-normed portion of gdn_qkvz (at qkv_d * 4 bytes),
+            // y is attn_out (offset 0).
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.gdn_qkvz,
+                (qkv_d as u64) * 4,
+                &self.session.activations.attn_out,
+                0,
+                layer_idx,
+                "out_proj",
+            );
+
             // MLP: fused residual+add+norm replaces 4 dispatches with 1
             // residual = residual + attn_out; hidden = norm(residual)
             let mlp_t0 = profiling.then(|| std::time::Instant::now());
@@ -7576,6 +7624,16 @@ kernel void lora_gemv_b_accum(
                 inter as u32,
                 hidden as u32,
             );
+            // LoRA for gate_proj
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.gate,
+                0,
+                layer_idx,
+                "gate_proj",
+            );
             self.dispatch_matmul(
                 enc,
                 &self.session.activations.hidden,
@@ -7584,6 +7642,16 @@ kernel void lora_gemv_b_accum(
                 1,
                 inter as u32,
                 hidden as u32,
+            );
+            // LoRA for up_proj
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.up,
+                0,
+                layer_idx,
+                "up_proj",
             );
             self.dispatch_silu_mul(enc, inter as u32);
             self.dispatch_matmul(
@@ -7594,6 +7662,16 @@ kernel void lora_gemv_b_accum(
                 1,
                 hidden as u32,
                 inter as u32,
+            );
+            // LoRA for down_proj: x = gate (silu-gated intermediate), y = ffn_out
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.gate,
+                0,
+                &self.session.activations.ffn_out,
+                0,
+                layer_idx,
+                "down_proj",
             );
             // End of layer: residual += ffn_out, hidden = residual (fused)
             self.dispatch_add_and_copy(
@@ -7622,6 +7700,7 @@ kernel void lora_gemv_b_accum(
             full_idx: usize,
             position: usize,
             kv_dim: usize,
+            layer_idx: usize,
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
             profiling: bool,
@@ -7703,6 +7782,34 @@ kernel void lora_gemv_b_accum(
                     hidden as u32,
                 );
             }
+            // LoRA for Q/K/V projections
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.q,
+                0,
+                layer_idx,
+                "q_proj",
+            );
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.k,
+                0,
+                layer_idx,
+                "k_proj",
+            );
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.v,
+                0,
+                layer_idx,
+                "v_proj",
+            );
             if let Some(t0) = gqa_proj_t0 {
                 prof.projection_us += t0.elapsed().as_micros();
             }
@@ -7792,6 +7899,16 @@ kernel void lora_gemv_b_accum(
                     q_dim as u32,
                 );
             }
+            // LoRA for o_proj: x = attn_out (gated attention output), y = ffn_out
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.attn_out,
+                0,
+                &self.session.activations.ffn_out,
+                0,
+                layer_idx,
+                "o_proj",
+            );
             self.dispatch_copy(
                 enc,
                 &self.session.activations.ffn_out,
@@ -7823,6 +7940,16 @@ kernel void lora_gemv_b_accum(
                 inter as u32,
                 hidden as u32,
             );
+            // LoRA for gate_proj
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.gate,
+                0,
+                layer_idx,
+                "gate_proj",
+            );
             self.dispatch_matmul(
                 enc,
                 &self.session.activations.hidden,
@@ -7831,6 +7958,16 @@ kernel void lora_gemv_b_accum(
                 1,
                 inter as u32,
                 hidden as u32,
+            );
+            // LoRA for up_proj
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &self.session.activations.up,
+                0,
+                layer_idx,
+                "up_proj",
             );
             self.dispatch_silu_mul(enc, inter as u32);
             self.dispatch_matmul(
@@ -7841,6 +7978,16 @@ kernel void lora_gemv_b_accum(
                 1,
                 hidden as u32,
                 inter as u32,
+            );
+            // LoRA for down_proj: x = gate (silu-gated intermediate), y = ffn_out
+            self.dispatch_lora_if_active(
+                enc,
+                &self.session.activations.gate,
+                0,
+                &self.session.activations.ffn_out,
+                0,
+                layer_idx,
+                "down_proj",
             );
             // End of layer: residual += ffn_out, hidden = residual (fused)
             self.dispatch_add_and_copy(
@@ -11969,7 +12116,7 @@ kernel void decode_attention_reference(
 
             let cmd = state.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc, &x_buf, &y_buf, 0, "o_proj");
+            state.dispatch_lora_if_active(&enc, &x_buf, 0, &y_buf, 0, 0, "o_proj");
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -12014,7 +12161,7 @@ kernel void decode_attention_reference(
             );
             let cmd2 = state.engine.queue.new_command_buffer();
             let enc2 = cmd2.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc2, &x_buf, &y_buf2, 0, "v_proj");
+            state.dispatch_lora_if_active(&enc2, &x_buf, 0, &y_buf2, 0, 0, "v_proj");
             enc2.end_encoding();
             cmd2.commit();
             cmd2.wait_until_completed();
@@ -12369,6 +12516,127 @@ kernel void decode_attention_reference(
                     .is_err(),
                 "should reject -Inf scale"
             );
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_in_proj_b_and_in_proj_a() {
+            use crate::model::qwen35_config::Qwen35Config;
+            // Test the actual GDN-layer rejection branch (is_full=false)
+            let mut gdn_cfg = Qwen35Config::qwen35_0_8b();
+            gdn_cfg.num_hidden_layers = 1;
+            gdn_cfg.layer_types = vec![LayerType::LinearAttention];
+            gdn_cfg.layer_mask = vec![true];
+
+            let result_b = MetalQwen35State::expected_lora_shape(&gdn_cfg, 0, "in_proj_b");
+            assert!(result_b.is_err(), "in_proj_b must be rejected on GDN layer");
+            let err_msg = result_b.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("not yet supported"),
+                "error should mention 'not yet supported', got: {err_msg}"
+            );
+
+            let result_a = MetalQwen35State::expected_lora_shape(&gdn_cfg, 0, "in_proj_a");
+            assert!(result_a.is_err(), "in_proj_a must be rejected on GDN layer");
+
+            // Also verify they're rejected on full-attention layers (as unknown)
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "in_proj_b".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            assert!(
+                state.load_lora_adapter(layers, 1.0, None).is_err(),
+                "in_proj_b rejected via loader on full-attention layer too"
+            );
+        }
+
+        #[test]
+        fn lora_prefill_fallback_matches_sequential_with_adapter() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let rank = 4usize;
+            // Use gate+up+down together so the delta survives through silu_mul and
+            // produces observable logit change (single-module LoRA is absorbed by
+            // zero downstream weights in this fixture). Larger values (0.1, scale=10)
+            // ensure the cascaded delta is above measurement noise after 3 matmuls.
+            let make_layers = || {
+                vec![
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "gate_proj".into(),
+                        a: vec![0.1; rank * hidden],
+                        b: vec![0.1; inter * rank],
+                        rank,
+                        d_in: hidden,
+                        d_out: inter,
+                    },
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "up_proj".into(),
+                        a: vec![0.1; rank * hidden],
+                        b: vec![0.1; inter * rank],
+                        rank,
+                        d_in: hidden,
+                        d_out: inter,
+                    },
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "down_proj".into(),
+                        a: vec![0.1; rank * inter],
+                        b: vec![0.1; hidden * rank],
+                        rank,
+                        d_in: inter,
+                        d_out: hidden,
+                    },
+                ]
+            };
+
+            // Sequential path with adapter
+            let mut state_seq = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_seq
+                .load_lora_adapter(make_layers(), 10.0, None)
+                .unwrap();
+            let _ = state_seq.forward_step(42, 0);
+            let logits_seq = state_seq.forward_step(7, 1);
+
+            // Prefill path with adapter
+            let mut state_pre = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_pre
+                .load_lora_adapter(make_layers(), 10.0, None)
+                .unwrap();
+            let logits_pre = state_pre.forward_prefill(&[42, 7]);
+
+            // 1. Prefill+adapter must match sequential+adapter (proves fallback works)
+            assert_eq!(logits_seq.len(), logits_pre.len());
+            let max_diff: f32 = logits_seq
+                .iter()
+                .zip(logits_pre.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-5,
+                "prefill with adapter must match sequential: max_diff={max_diff}"
+            );
+
+            // Observability (adapter changes logits) is proven separately by the
+            // load_adapter_and_dispatch_lora_if_active test which verifies GPU LoRA
+            // GEMV on individual buffers. Full-forward observability requires a
+            // non-zero-weight fixture (deferred to step 5 e2e PPL validation).
         }
     }
 

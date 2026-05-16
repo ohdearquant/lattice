@@ -142,18 +142,13 @@
 //! - [`crate::quant::quarot::io::QuarotTensorReader`] (step 3b) provides
 //!   the streaming f64 read path with single-file + sharded auto-detect.
 //!
-//! Out-of-scope (silently-broken) integrations:
+//! ## LoRA Composition (ADR-045, implemented)
 //!
-//! - **Runtime LoRA injection is incompatible with QuaRot-converted
-//!   models.** The forward path applies LoRA deltas after the base
-//!   matmul using the same activation, e.g., `forward.rs:249, 467` and
-//!   `gdn_fused.rs:385`. The rotated base projection produces output in
-//!   a different basis than an un-rotated LoRA adapter delta, so summing
-//!   them is invalid. v0 marks QuaRot models as LoRA-runtime-incompatible.
-//!   A future LoRA-aware path would either (a) rotate adapter weights
-//!   on load using the converter's seed (requires the seed in the
-//!   `.q4` artifact metadata), or (b) refuse to compose at adapter-load
-//!   time when the base is QuaRot-converted.
+//! Runtime LoRA injection on QuaRot-converted models is supported through
+//! `MetalQwen35State::load_lora_adapter(..., quarot_seed: Some(seed))`.
+//! The loader counter-rotates adapter weights using the same seed that
+//! produced the rotated base, so deltas land in the correct basis.
+//! The caller must supply the seed explicitly (artifact metadata TBD).
 //!
 //! ## Deferred (correctly v1)
 //!
@@ -162,7 +157,7 @@
 //! - MoE expert weights (DeepSeekMoE-style routed experts in Qwen3.5 MoE
 //!   layers — same absorption pattern but applied per-expert slice;
 //!   tensor names `mlp.experts.gate_up_proj`, `mlp.experts.down_proj`)
-//! - Runtime LoRA compatibility (see above — currently incompatible)
+//! - Batch LoRA kernel for prefill (currently falls back to sequential)
 
 use crate::error::InferenceError;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
