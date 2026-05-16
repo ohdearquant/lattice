@@ -2,7 +2,7 @@
 
 Global ADR index for the Lattice project. Numbered sequentially, grouped by crate.
 
-## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-044)
+## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-045)
 
 | ADR                                            | Title                                |
 | ---------------------------------------------- | ------------------------------------ |
@@ -22,6 +22,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention              |
 | [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification            |
 | [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization |
+| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition            |
 
 ## lattice-embed (ADR-012 to ADR-019)
 

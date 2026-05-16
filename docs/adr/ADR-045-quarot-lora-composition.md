@@ -1,6 +1,6 @@
 # ADR-045: QuaRot + LoRA Composition at Inference Time
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-16
 **Author**: Ocean (HaiyangLi)
 **Depends on**: ADR-044 (QuaRot rotated quantization, v0 shipped in v0.2.0)
@@ -44,15 +44,25 @@ With a LoRA adapter `(B, A)` trained on the **unrotated** model:
 - **QuaRot runtime (naive)**: `W_rot · (R · h) + s · B · A · (R · h) = W · h + s · B · A · R · h` ✗
 - **Discrepancy**: `B · A · R · h ≠ B · A · h` (the adapter sees the rotated activation)
 
-**Fix — counter-rotate A at load time:**
+**Fix — rotate adapter matrices at load time:**
 
+**Input-side projections** (A receives rotated input `R · h`):
 Replace `A` with `A_cr = A · R^T`. Then at runtime:
 
 ```
 s · B · A_cr · (R · h) = s · B · (A · R^T) · (R · h) = s · B · A · R^T · R · h = s · B · A · h  ✓
 ```
 
-The correction is **exact** (R is orthogonal: `R^T · R = I`). Zero approximation error. Zero runtime overhead — the counter-rotation is absorbed into A at adapter load time.
+**Output-side projections** (output must be in rotated residual basis):
+Replace `B` with `B_rot = R · B`. Then at runtime:
+
+```
+s · B_rot · A · x = s · (R · B) · A · x = R · (s · B · A · x)  ✓
+```
+
+The delta lands in the rotated residual basis, matching the base projection's output.
+
+Both corrections are **exact** (R is orthogonal: `R^T · R = I`). Zero approximation error. Zero runtime overhead — the rotations are absorbed at adapter load time.
 
 ### Cost of counter-rotation
 
@@ -94,19 +104,23 @@ Cost: `rank × d_in × d_in` FLOPs. For rank=16, d=1024: **16.8M FLOPs** — mic
 
 The rotation `R` is the **residual-stream** rotation. It's absorbed input-side into projections that consume the residual stream directly. From the `RotationPlan` (ADR-044 step 3a):
 
-| Projection | Absorbs R? | LoRA target? | Counter-rotate A? |
-|-----------|-----------|-------------|-------------------|
-| `q_proj` | Yes (input) | Yes | **Yes** |
-| `k_proj` | Yes (input) | Yes | **Yes** |
-| `v_proj` | Yes (input) | Yes | **Yes** |
-| `o_proj` | No (output-side absorption) | Yes | **No** — A sees the attention output, not the residual stream |
-| `gate_proj` | Yes (input) | Yes | **Yes** |
-| `up_proj` | Yes (input) | Yes | **Yes** |
-| `down_proj` | No (output-side) | Yes | **No** |
-| `in_proj_qkv` (GDN) | Yes (input) | Possible | **Yes** |
-| `out_proj` (GDN) | No (output-side) | Possible | **No** |
+| Projection | Absorbs R? | LoRA target? | Rotate A? | Rotate B? |
+|-----------|-----------|-------------|-----------|-----------|
+| `q_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
+| `k_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
+| `v_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
+| `o_proj` | Yes (output) | Yes | No | **B ← R·B** |
+| `gate_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
+| `up_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
+| `down_proj` | Yes (output) | Yes | No | **B ← R·B** |
+| `in_proj_qkv` (GDN) | Yes (input) | Possible | **A ← A·R^T** | No |
+| `out_proj` (GDN) | Yes (output) | Possible | No | **B ← R·B** |
 
-Rule: **counter-rotate A if and only if the projection absorbs R on the input side** (i.e., `RotationPlan` has `AbsorbSide::Right` or `AbsorbSide::Input` for that tensor). The plan data structure already encodes this — reuse it at adapter load time.
+Rules:
+- **Input-side** (`W ← W·R^T`): counter-rotate A so `B·(A·R^T)·(R·h) = B·A·h` ✓
+- **Output-side** (`W ← R·W`): rotate B so `(R·B)·A·x = R·(B·A·x)` — delta lands in rotated residual basis ✓
+
+The plan data structure already encodes which side each projection uses — reuse it at adapter load time.
 
 ### Metal LoRA kernel design
 

@@ -1,27 +1,30 @@
-//! Counter-rotation for LoRA adapters on QuaRot-converted models (ADR-045).
+//! Rotation correction for LoRA adapters on QuaRot-converted models (ADR-045).
 //!
 //! When a LoRA adapter trained on an unrotated model is applied to a
-//! QuaRot-converted base, the adapter's A matrices see the rotated
-//! activation `R · h` instead of `h`. The fix is exact: replace A with
-//! `A_cr = A · R^T` at adapter load time. Then at runtime:
+//! QuaRot-converted base, both A and B matrices may need rotation correction
+//! depending on the base projection's absorption side:
 //!
-//! ```text
-//! s · B · A_cr · (R · h) = s · B · (A · R^T) · (R · h) = s · B · A · h  ✓
-//! ```
+//! **Input-side projections** (q/k/v_proj, gate/up_proj, in_proj_*):
+//! The base weight absorbed `W ← W · R^T`, so the input activation is `R · h`.
+//! Fix: `A_cr = A · R^T`. Then `B · A_cr · (R·h) = B · A · h` ✓
 //!
-//! The correction is absorbed once (microseconds) and adds zero runtime cost.
+//! **Output-side projections** (o_proj, down_proj, out_proj):
+//! The base weight absorbed `W ← R · W`, so its output is in the rotated basis.
+//! The LoRA delta must also be in the rotated basis.
+//! Fix: `B_rot = R · B`. Then `B_rot · A · x = R · (B · A · x)` ✓
+//!
+//! Both corrections are exact (R is orthogonal) and absorbed at load time — zero
+//! runtime cost.
 
 use crate::error::InferenceError;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::plan::{AbsorptionSide, RotationPlan};
-use crate::quant::quarot::rotation::absorb_input_rotation;
+use crate::quant::quarot::rotation::{absorb_input_rotation, absorb_output_rotation};
 
-/// Counter-rotate a single LoRA A matrix for a QuaRot-converted base.
+/// Counter-rotate a single LoRA A matrix for an input-side QuaRot projection.
 ///
 /// Computes `A_cr = A · R^T` in-place, where A is row-major `(rank × d_in)`.
-///
-/// Mathematically identical to input-side absorption: applying R to each row
-/// of A yields `A · R^T` (see `rotation.rs` §Implementation for the proof).
+/// Applies R to each row — mathematically identical to input-side absorption.
 ///
 /// # Errors
 ///
@@ -35,15 +38,27 @@ pub fn counter_rotate_a(
     absorb_input_rotation(a, rank, d_in, rotation)
 }
 
-/// Returns `true` if a LoRA module's A matrix needs counter-rotation.
+/// Rotate a single LoRA B matrix for an output-side QuaRot projection.
 ///
-/// A module needs counter-rotation iff the base weight was absorbed on the
-/// input side (`W ← W · R^T`), because the adapter's A matrix then receives
-/// the rotated activation `R · h` instead of `h`.
+/// Computes `B_rot = R · B` in-place, where B is row-major `(d_out × rank)`.
+/// Applies R to each column — mathematically identical to output-side absorption.
 ///
-/// Output-side projections (o_proj, down_proj, out_proj) do NOT need
-/// counter-rotation — their A matrices receive internal state that is
-/// unaffected by the residual-stream rotation.
+/// After this, the LoRA delta `B_rot · A · x = R · (B · A · x)` is in the
+/// rotated residual basis, matching the base projection's rotated output.
+///
+/// # Errors
+///
+/// Returns an error if `b.len() != d_out * rank` or `rotation.dim() != d_out`.
+pub fn rotate_b_output_side(
+    b: &mut [f32],
+    d_out: usize,
+    rank: usize,
+    rotation: &RandomizedHadamard,
+) -> Result<(), InferenceError> {
+    absorb_output_rotation(b, d_out, rank, rotation)
+}
+
+/// Returns `true` if a LoRA module's A matrix needs counter-rotation (input-side).
 pub fn needs_counter_rotation(plan: &RotationPlan, module: &str) -> bool {
     matches!(
         plan.absorption_for_module(module),
@@ -51,61 +66,137 @@ pub fn needs_counter_rotation(plan: &RotationPlan, module: &str) -> bool {
     )
 }
 
-/// Summary of a counter-rotation pass over an adapter's A matrices.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CounterRotationReport {
-    /// (layer_idx, module) pairs that were counter-rotated.
-    pub rotated: Vec<(usize, String)>,
-    /// (layer_idx, module) pairs skipped (output-side or not in plan).
-    pub skipped: Vec<(usize, String)>,
+/// Returns `true` if a LoRA module's B matrix needs output-side rotation.
+pub fn needs_b_rotation(plan: &RotationPlan, module: &str) -> bool {
+    matches!(
+        plan.absorption_for_module(module),
+        Some(AbsorptionSide::OutputSide)
+    )
 }
 
-/// Counter-rotate all A matrices in an adapter that target input-side projections.
+/// What rotation was applied to a LoRA layer's matrices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoraRotationApplied {
+    /// A was counter-rotated: `A ← A · R^T` (input-side projection)
+    CounterRotatedA,
+    /// B was rotated: `B ← R · B` (output-side projection)
+    RotatedB,
+    /// Module not in plan — no rotation applied.
+    NotInPlan,
+}
+
+/// Summary of a rotation pass over an adapter's matrices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationReport {
+    /// (layer_idx, module, what_was_applied) for each processed layer.
+    pub entries: Vec<(usize, String, LoraRotationApplied)>,
+}
+
+impl RotationReport {
+    /// Number of layers where A was counter-rotated (input-side).
+    pub fn num_a_rotated(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, _, r)| *r == LoraRotationApplied::CounterRotatedA)
+            .count()
+    }
+
+    /// Number of layers where B was rotated (output-side).
+    pub fn num_b_rotated(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, _, r)| *r == LoraRotationApplied::RotatedB)
+            .count()
+    }
+
+    /// Number of layers not in plan (no rotation applied).
+    pub fn num_not_in_plan(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(_, _, r)| *r == LoraRotationApplied::NotInPlan)
+            .count()
+    }
+}
+
+/// A single LoRA layer's mutable references for rotation correction.
+pub struct LoraLayerMut<'a> {
+    pub layer_idx: usize,
+    pub module: &'a str,
+    pub a: &'a mut [f32],
+    pub b: &'a mut [f32],
+    pub rank: usize,
+    pub d_in: usize,
+    pub d_out: usize,
+}
+
+/// Apply rotation corrections to all LoRA layers for a QuaRot-converted base.
 ///
-/// Iterates over `layers` (each entry is `(layer_idx, module_name, a_matrix, rank, d_in)`)
-/// and applies `A_cr = A · R^T` to those where the plan indicates input-side absorption.
-///
-/// This is the batch primitive. Callers holding a `LoraAdapter` (in `lattice-tune`)
-/// should extract their layers into this format and call this function.
+/// For each layer:
+/// - **Input-side** module: `A ← A · R^T` (counter-rotate A)
+/// - **Output-side** module: `B ← R · B` (rotate B into residual basis)
+/// - **Not in plan**: no modification
 ///
 /// # Arguments
 ///
-/// * `layers` — mutable iterator of `(layer_idx, module, &mut a, rank, d_in)`
-/// * `seed` — QuaRot seed (from the `.q4` artifact's `config.json`)
+/// * `layers` — mutable references to each LoRA layer's A and B matrices
+/// * `seed` — QuaRot seed (from the `.q4` artifact metadata)
 /// * `hidden_dim` — hidden dimension (must be power of two; determines R's size)
-/// * `plan` — rotation plan identifying which modules are input-side
+/// * `plan` — rotation plan identifying absorption side per module
 ///
 /// # Errors
 ///
 /// Returns an error if `hidden_dim` is not a valid Hadamard dimension or if
-/// any A matrix has inconsistent dimensions.
-pub fn counter_rotate_layers<'a, I>(
-    layers: I,
+/// any matrix has inconsistent dimensions with the rotation.
+pub fn rotate_adapter_for_quarot(
+    layers: Vec<LoraLayerMut<'_>>,
     seed: u64,
     hidden_dim: usize,
     plan: &RotationPlan,
-) -> Result<CounterRotationReport, InferenceError>
-where
-    I: IntoIterator<Item = (usize, &'a str, &'a mut [f32], usize, usize)>,
-{
+) -> Result<RotationReport, InferenceError> {
     let rotation = RandomizedHadamard::new(seed, hidden_dim)?;
-    let mut report = CounterRotationReport {
-        rotated: Vec::new(),
-        skipped: Vec::new(),
+    let mut report = RotationReport {
+        entries: Vec::with_capacity(layers.len()),
     };
 
-    for (layer_idx, module, a, rank, d_in) in layers {
-        if needs_counter_rotation(plan, module) {
-            if d_in != hidden_dim {
-                return Err(InferenceError::Inference(format!(
-                    "counter_rotate_layers: layer {layer_idx} module '{module}' has d_in={d_in} \
-                     but hidden_dim={hidden_dim}"
-                )));
+    for layer in layers {
+        match plan.absorption_for_module(layer.module) {
+            Some(AbsorptionSide::InputSide) => {
+                if layer.d_in != hidden_dim {
+                    return Err(InferenceError::Inference(format!(
+                        "rotate_adapter_for_quarot: layer {} module '{}' has d_in={} \
+                         but hidden_dim={hidden_dim}",
+                        layer.layer_idx, layer.module, layer.d_in
+                    )));
+                }
+                counter_rotate_a(layer.a, layer.rank, layer.d_in, &rotation)?;
+                report.entries.push((
+                    layer.layer_idx,
+                    layer.module.to_string(),
+                    LoraRotationApplied::CounterRotatedA,
+                ));
             }
-            counter_rotate_a(a, rank, d_in, &rotation)?;
-            report.rotated.push((layer_idx, module.to_string()));
-        } else {
-            report.skipped.push((layer_idx, module.to_string()));
+            Some(AbsorptionSide::OutputSide) => {
+                if layer.d_out != hidden_dim {
+                    return Err(InferenceError::Inference(format!(
+                        "rotate_adapter_for_quarot: layer {} module '{}' has d_out={} \
+                         but hidden_dim={hidden_dim}",
+                        layer.layer_idx, layer.module, layer.d_out
+                    )));
+                }
+                rotate_b_output_side(layer.b, layer.d_out, layer.rank, &rotation)?;
+                report.entries.push((
+                    layer.layer_idx,
+                    layer.module.to_string(),
+                    LoraRotationApplied::RotatedB,
+                ));
+            }
+            None => {
+                report.entries.push((
+                    layer.layer_idx,
+                    layer.module.to_string(),
+                    LoraRotationApplied::NotInPlan,
+                ));
+            }
         }
     }
 
@@ -149,10 +240,12 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
+    // --- Input-side tests (A counter-rotation) ---
+
     #[test]
-    fn counter_rotation_correctness() {
-        // Validates: B · (A · R^T) · (R · h) == B · A · h
-        let d_in = 64; // hidden_dim (power of two)
+    fn input_side_counter_rotation_correctness() {
+        // B · (A · R^T) · (R · h) == B · A · h
+        let d_in = 64;
         let d_out = 32;
         let rank = 8;
         let seed = 0xC0FFEE_u64;
@@ -162,11 +255,9 @@ mod tests {
         let b = synthetic_vector(d_out * rank, 2);
         let h = synthetic_vector(d_in, 3);
 
-        // Original: B · (A · h)
         let a_h = matvec(&a, rank, d_in, &h);
         let original = matvec(&b, d_out, rank, &a_h);
 
-        // Counter-rotated path: B · (A_cr · (R · h))
         let mut a_cr = a.clone();
         counter_rotate_a(&mut a_cr, rank, d_in, &r).unwrap();
         let mut h_rot = h.clone();
@@ -182,8 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn counter_rotation_naive_is_wrong() {
-        // Without counter-rotation, B · A · (R · h) ≠ B · A · h
+    fn input_side_naive_is_wrong() {
         let d_in = 64;
         let d_out = 16;
         let rank = 4;
@@ -194,11 +284,9 @@ mod tests {
         let b = synthetic_vector(d_out * rank, 11);
         let h = synthetic_vector(d_in, 12);
 
-        // Original: B · A · h
         let a_h = matvec(&a, rank, d_in, &h);
         let original = matvec(&b, d_out, rank, &a_h);
 
-        // Naive (no counter-rotation): B · A · (R · h)
         let mut h_rot = h.clone();
         r.apply(&mut h_rot).unwrap();
         let a_rh = matvec(&a, rank, d_in, &h_rot);
@@ -211,33 +299,72 @@ mod tests {
         );
     }
 
+    // --- Output-side tests (B rotation) ---
+
     #[test]
-    fn counter_rotation_is_exact_for_orthogonal_r() {
-        // R^T · R = I, so the correction is exact (not approximate)
-        let d_in = 128;
-        let rank = 16;
-        let seed = 0xDEAD_BEEF_u64;
+    fn output_side_b_rotation_correctness() {
+        // For output-side: base does W' = R·W, output is R·(W·x).
+        // LoRA delta must also be rotated: (R·B)·A·x = R·(B·A·x) ✓
+        let d_out = 64; // hidden_dim (output goes to residual stream)
+        let rank = 8;
+        let d_in_internal = 32; // internal dimension (not hidden_dim)
+        let seed = 0xBEEF_u64;
 
-        let r = RandomizedHadamard::new(seed, d_in).unwrap();
-        let a = synthetic_vector(rank * d_in, 20);
-        let h = synthetic_vector(d_in, 21);
+        let r = RandomizedHadamard::new(seed, d_out).unwrap();
+        let a = synthetic_vector(rank * d_in_internal, 50);
+        let b = synthetic_vector(d_out * rank, 51);
+        let x = synthetic_vector(d_in_internal, 52);
 
-        // A · h
-        let a_h = matvec(&a, rank, d_in, &h);
+        // Original unrotated delta: B · A · x
+        let a_x = matvec(&a, rank, d_in_internal, &x);
+        let original_delta = matvec(&b, d_out, rank, &a_x);
 
-        // A_cr · (R · h) = (A · R^T) · (R · h) should equal A · (R^T · R · h) = A · h
-        let mut a_cr = a.clone();
-        counter_rotate_a(&mut a_cr, rank, d_in, &r).unwrap();
-        let mut h_rot = h.clone();
-        r.apply(&mut h_rot).unwrap();
-        let a_cr_rh = matvec(&a_cr, rank, d_in, &h_rot);
+        // Expected: R · (B · A · x)
+        let mut expected = original_delta.clone();
+        r.apply(&mut expected).unwrap();
 
-        let delta = max_abs_diff(&a_h, &a_cr_rh);
+        // With B_rot = R · B: B_rot · A · x should equal R · (B · A · x)
+        let mut b_rot = b.clone();
+        rotate_b_output_side(&mut b_rot, d_out, rank, &r).unwrap();
+        let b_rot_a_x = matvec(&b_rot, d_out, rank, &a_x);
+
+        let delta = max_abs_diff(&expected, &b_rot_a_x);
         assert!(
-            delta < 5e-4,
-            "A_cr·(R·h) should exactly equal A·h (orthogonal R): max_abs_diff={delta}"
+            delta < 1e-4,
+            "(R·B)·A·x should equal R·(B·A·x): max_abs_diff={delta}"
         );
     }
+
+    #[test]
+    fn output_side_naive_skip_is_wrong() {
+        // Without B rotation, the delta is in the wrong basis
+        let d_out = 64;
+        let rank = 4;
+        let d_in_internal = 16;
+        let seed = 123_u64;
+
+        let r = RandomizedHadamard::new(seed, d_out).unwrap();
+        let a = synthetic_vector(rank * d_in_internal, 60);
+        let b = synthetic_vector(d_out * rank, 61);
+        let x = synthetic_vector(d_in_internal, 62);
+
+        // Unrotated delta
+        let a_x = matvec(&a, rank, d_in_internal, &x);
+        let unrotated_delta = matvec(&b, d_out, rank, &a_x);
+
+        // Expected rotated delta
+        let mut expected = unrotated_delta.clone();
+        r.apply(&mut expected).unwrap();
+
+        // The unrotated delta does NOT match the expected rotated delta
+        let delta = max_abs_diff(&unrotated_delta, &expected);
+        assert!(
+            delta > 0.1,
+            "skipping B rotation should produce large error: max_abs_diff={delta}"
+        );
+    }
+
+    // --- Module lookup tests ---
 
     #[test]
     fn needs_counter_rotation_input_side_modules() {
@@ -256,80 +383,157 @@ mod tests {
         for module in input_side {
             assert!(
                 needs_counter_rotation(&plan, module),
-                "{module} should need counter-rotation (input-side)"
+                "{module} should need A counter-rotation (input-side)"
+            );
+            assert!(
+                !needs_b_rotation(&plan, module),
+                "{module} should NOT need B rotation"
             );
         }
     }
 
     #[test]
-    fn needs_counter_rotation_output_side_modules() {
+    fn needs_b_rotation_output_side_modules() {
         let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         let output_side = ["o_proj", "down_proj", "out_proj"];
         for module in output_side {
             assert!(
+                needs_b_rotation(&plan, module),
+                "{module} should need B rotation (output-side)"
+            );
+            assert!(
                 !needs_counter_rotation(&plan, module),
-                "{module} should NOT need counter-rotation (output-side)"
+                "{module} should NOT need A counter-rotation"
             );
         }
     }
 
     #[test]
-    fn needs_counter_rotation_unknown_module() {
+    fn unknown_module_needs_neither() {
         let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         assert!(!needs_counter_rotation(&plan, "some_random_proj"));
-        assert!(!needs_counter_rotation(&plan, "conv1d"));
+        assert!(!needs_b_rotation(&plan, "some_random_proj"));
     }
 
+    // --- Batch API tests ---
+
     #[test]
-    fn counter_rotate_layers_batch() {
-        let d_in = 64;
+    fn rotate_adapter_batch_applies_both_sides() {
+        let hidden_dim = 64;
         let rank = 4;
         let seed = 7_u64;
         let plan = RotationPlan::qwen35_residual_stream_linear_layers();
 
-        let mut a_q = synthetic_vector(rank * d_in, 100);
-        let mut a_o = synthetic_vector(rank * d_in, 101);
-        let mut a_gate = synthetic_vector(rank * d_in, 102);
-        let mut a_down = synthetic_vector(rank * d_in, 103);
+        let mut a_q = synthetic_vector(rank * hidden_dim, 100);
+        let mut b_q = synthetic_vector(hidden_dim * rank, 101); // d_out != hidden for q_proj (2*q_dim), but test uses hidden
+        let mut a_o = synthetic_vector(rank * hidden_dim, 102);
+        let mut b_o = synthetic_vector(hidden_dim * rank, 103);
 
         let a_q_orig = a_q.clone();
+        let b_q_orig = b_q.clone();
         let a_o_orig = a_o.clone();
-        let a_gate_orig = a_gate.clone();
-        let a_down_orig = a_down.clone();
+        let b_o_orig = b_o.clone();
 
-        let layers: Vec<(usize, &str, &mut [f32], usize, usize)> = vec![
-            (0, "q_proj", a_q.as_mut_slice(), rank, d_in),
-            (0, "o_proj", a_o.as_mut_slice(), rank, d_in),
-            (1, "gate_proj", a_gate.as_mut_slice(), rank, d_in),
-            (1, "down_proj", a_down.as_mut_slice(), rank, d_in),
+        let layers = vec![
+            LoraLayerMut {
+                layer_idx: 0,
+                module: "q_proj",
+                a: a_q.as_mut_slice(),
+                b: b_q.as_mut_slice(),
+                rank,
+                d_in: hidden_dim,
+                d_out: hidden_dim,
+            },
+            LoraLayerMut {
+                layer_idx: 0,
+                module: "o_proj",
+                a: a_o.as_mut_slice(),
+                b: b_o.as_mut_slice(),
+                rank,
+                d_in: hidden_dim,
+                d_out: hidden_dim,
+            },
         ];
 
-        let report = counter_rotate_layers(layers, seed, d_in, &plan).unwrap();
+        let report = rotate_adapter_for_quarot(layers, seed, hidden_dim, &plan).unwrap();
 
-        assert_eq!(report.rotated.len(), 2);
-        assert_eq!(report.skipped.len(), 2);
-        assert!(report.rotated.contains(&(0, "q_proj".into())));
-        assert!(report.rotated.contains(&(1, "gate_proj".into())));
-        assert!(report.skipped.contains(&(0, "o_proj".into())));
-        assert!(report.skipped.contains(&(1, "down_proj".into())));
+        assert_eq!(report.num_a_rotated(), 1);
+        assert_eq!(report.num_b_rotated(), 1);
+        assert_eq!(report.num_not_in_plan(), 0);
 
-        // Input-side modules were modified
+        // q_proj: A was modified, B was NOT
         assert_ne!(a_q, a_q_orig);
-        assert_ne!(a_gate, a_gate_orig);
-        // Output-side modules were NOT modified
+        assert_eq!(b_q, b_q_orig);
+        // o_proj: B was modified, A was NOT
         assert_eq!(a_o, a_o_orig);
-        assert_eq!(a_down, a_down_orig);
+        assert_ne!(b_o, b_o_orig);
     }
 
     #[test]
-    fn counter_rotate_layers_dimension_mismatch_rejected() {
+    fn rotate_adapter_unknown_module_is_not_in_plan() {
+        let hidden_dim = 64;
+        let rank = 4;
+        let seed = 7_u64;
         let plan = RotationPlan::qwen35_residual_stream_linear_layers();
-        let mut a = synthetic_vector(4 * 32, 200);
 
-        let layers: Vec<(usize, &str, &mut [f32], usize, usize)> =
-            vec![(0, "q_proj", a.as_mut_slice(), 4, 32)]; // d_in=32 but hidden_dim=64
+        let mut a = synthetic_vector(rank * hidden_dim, 200);
+        let mut b = synthetic_vector(hidden_dim * rank, 201);
+        let a_orig = a.clone();
+        let b_orig = b.clone();
 
-        let result = counter_rotate_layers(layers, 7, 64, &plan);
+        let layers = vec![LoraLayerMut {
+            layer_idx: 0,
+            module: "conv1d",
+            a: a.as_mut_slice(),
+            b: b.as_mut_slice(),
+            rank,
+            d_in: hidden_dim,
+            d_out: hidden_dim,
+        }];
+
+        let report = rotate_adapter_for_quarot(layers, seed, hidden_dim, &plan).unwrap();
+        assert_eq!(report.num_not_in_plan(), 1);
+        assert_eq!(a, a_orig);
+        assert_eq!(b, b_orig);
+    }
+
+    #[test]
+    fn rotate_adapter_input_side_dimension_mismatch_rejected() {
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        let mut a = synthetic_vector(4 * 32, 300);
+        let mut b = synthetic_vector(64 * 4, 301);
+
+        let layers = vec![LoraLayerMut {
+            layer_idx: 0,
+            module: "q_proj",
+            a: a.as_mut_slice(),
+            b: b.as_mut_slice(),
+            rank: 4,
+            d_in: 32, // mismatch: hidden_dim=64 but d_in=32
+            d_out: 64,
+        }];
+
+        let result = rotate_adapter_for_quarot(layers, 7, 64, &plan);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rotate_adapter_output_side_dimension_mismatch_rejected() {
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        let mut a = synthetic_vector(4 * 64, 400);
+        let mut b = synthetic_vector(32 * 4, 401);
+
+        let layers = vec![LoraLayerMut {
+            layer_idx: 0,
+            module: "o_proj",
+            a: a.as_mut_slice(),
+            b: b.as_mut_slice(),
+            rank: 4,
+            d_in: 64,
+            d_out: 32, // mismatch: hidden_dim=64 but d_out=32
+        }];
+
+        let result = rotate_adapter_for_quarot(layers, 7, 64, &plan);
         assert!(result.is_err());
     }
 
@@ -338,7 +542,7 @@ mod tests {
         let d_in = 64;
         let rank = 8;
         let seed = 99_u64;
-        let a = synthetic_vector(rank * d_in, 300);
+        let a = synthetic_vector(rank * d_in, 500);
 
         let r = RandomizedHadamard::new(seed, d_in).unwrap();
         let mut a1 = a.clone();
@@ -350,18 +554,18 @@ mod tests {
     }
 
     #[test]
-    fn counter_rotation_different_seeds_differ() {
-        let d_in = 64;
+    fn b_rotation_deterministic_across_calls() {
+        let d_out = 64;
         let rank = 8;
-        let a = synthetic_vector(rank * d_in, 400);
+        let seed = 99_u64;
+        let b = synthetic_vector(d_out * rank, 600);
 
-        let r1 = RandomizedHadamard::new(1, d_in).unwrap();
-        let r2 = RandomizedHadamard::new(2, d_in).unwrap();
-        let mut a1 = a.clone();
-        let mut a2 = a.clone();
-        counter_rotate_a(&mut a1, rank, d_in, &r1).unwrap();
-        counter_rotate_a(&mut a2, rank, d_in, &r2).unwrap();
+        let r = RandomizedHadamard::new(seed, d_out).unwrap();
+        let mut b1 = b.clone();
+        let mut b2 = b.clone();
+        rotate_b_output_side(&mut b1, d_out, rank, &r).unwrap();
+        rotate_b_output_side(&mut b2, d_out, rank, &r).unwrap();
 
-        assert_ne!(a1, a2, "different seeds should produce different rotations");
+        assert_eq!(b1, b2, "same seed must produce identical B rotation");
     }
 }
