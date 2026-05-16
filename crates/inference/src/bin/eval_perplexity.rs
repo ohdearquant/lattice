@@ -386,8 +386,20 @@ fn tokenize_with(
     max_tokens: Option<usize>,
     corpus_file: &std::path::Path,
 ) -> Result<Vec<u32>, ExitCode> {
+    // `BpeTokenizer::from_tokenizer_json` builds with a default
+    // `max_seq_len = 4_096`, which silently truncates any corpus
+    // longer than that to ~4 K tokens at tokenize time. For PPL
+    // evaluation we strode-walk the corpus in `--window`-sized
+    // slices through the harness, so the tokenizer cap must NOT
+    // bound the corpus. Bump it to a byte-level upper bound on
+    // the token count (byte-level BPE emits ≤ 1 token per UTF-8
+    // byte after the byte-encoder maps every byte to a token).
+    // The pad-to-max-seq-len allocation is temporary — the call
+    // site slices off `..real_length` immediately and drops the
+    // padded buffer.
+    let bumped = tokenizer.with_max_seq_len(text.len().saturating_add(64));
     let t_tok = Instant::now();
-    let tokenized = tokenizer.tokenize(text);
+    let tokenized = bumped.tokenize(text);
     let mut tokens: Vec<u32> = tokenized.input_ids[..tokenized.real_length].to_vec();
     if let Some(cap) = max_tokens {
         if tokens.len() > cap {
