@@ -8912,6 +8912,71 @@ kernel void add_and_copy(
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
+            // Cache-capacity validation, matching `new_session` so a
+            // `from_q4_dir` call cannot construct a runtime whose KV cap
+            // outruns the RoPE table (`partial_rope_interleaved` indexes
+            // `cos_tab` / `sin_tab` by `position`; without this guard a
+            // `--max-cache-len > max_position_embeddings` argument would
+            // race past the precomputed table at decode time).
+            if max_cache_len == 0 {
+                return Err("from_q4_dir: max_cache_len must be > 0".to_string());
+            }
+            if max_cache_len > cfg.max_position_embeddings {
+                return Err(format!(
+                    "from_q4_dir: max_cache_len {max_cache_len} exceeds max_position_embeddings {} \
+                     (the RoPE table is sized to max_position_embeddings; running past it would \
+                     produce out-of-bounds GPU reads or incorrect rotary positions)",
+                    cfg.max_position_embeddings
+                ));
+            }
+
+            // Two-way config/artifact contract for the logits head:
+            //
+            // - `tie_word_embeddings=false` (e.g., QuaRot output where
+            //   step 3c flips the flag and materializes a fused
+            //   `(1 + γ_final)` + rotation `lm_head.weight`) MUST ship
+            //   the rotated head as its own `lm_head.weight.q4`. Falling
+            //   back to `embed_tokens` here would silently feed the wrong
+            //   matrix into the final logits GEMV.
+            // - `tie_word_embeddings=true` (the legitimate "embed_tokens
+            //   IS the head" case) MUST NOT ship `lm_head.weight.q4` —
+            //   if it does, the on-disk config-flip was likely skipped
+            //   (HF Qwen3.5 stores the flag in both `text_config` and
+            //   top level; `Qwen35Config::from_config_json_str` takes
+            //   the top-level value, so a partial update can leave the
+            //   parsed flag stale). The materialized head would then be
+            //   dead weight and the runtime would silently fall back to
+            //   `embed_tokens` — exactly the contamination ADR-044
+            //   §"Step 3c contract" warns against and `quant::quarot::lm_head`
+            //   flags at the converter boundary.
+            //
+            // Both mismatches let `eval_perplexity --quarot-q4-dir`
+            // print a PPL delta and PASS/FAIL verdict on the wrong
+            // logits head, so the loader refuses both directions before
+            // any tensor I/O.
+            let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
+            let lm_head_present = lm_head_path.exists();
+            if !cfg.tie_word_embeddings && !lm_head_present {
+                return Err(format!(
+                    "from_q4_dir: tie_word_embeddings=false but lm_head.q4 is missing at {}; \
+                     the runtime requires the materialized lm_head matrix (ADR-044 step 3c) \
+                     and must not fall back to embed_tokens, which would yield wrong logits \
+                     and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
+            }
+            if cfg.tie_word_embeddings && lm_head_present {
+                return Err(format!(
+                    "from_q4_dir: tie_word_embeddings=true but lm_head.q4 is present at {}; \
+                     the on-disk config likely missed the step-3c `tie_word_embeddings=false` \
+                     flip (HF Qwen3.5 carries the flag in both nested `text_config` and the \
+                     top level — see `Qwen35Config::from_config_json_str`). Loading would \
+                     silently ignore the materialized head and fall back to embed_tokens, \
+                     yielding wrong logits and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
+            }
+
             // Compile shaders (same as new()).
             let opts = CompileOptions::new();
             let library = device
@@ -9270,26 +9335,19 @@ kernel void add_and_copy(
 
             // ----------------------------------------------------------------
             // lm_head: only present when tie_word_embeddings = false.
-            // If present on disk, load it as a Q4 buffer. However the struct does
-            // not have a separate lm_head field — when tie_word_embeddings=false the
-            // existing new() code still uses embed_tokens_q8 for the logits GEMV
-            // (they're different tensors but the same usage slot).
             //
-            // For correctness when tie_word_embeddings=false we load lm_head into
-            // embed_tokens_q8 so the logits projection uses the correct weights.
+            // Step-4b loader contract: when `!cfg.tie_word_embeddings` we
+            // require `lm_head.weight.q4` on disk — the early-return guard
+            // at the top of `from_q4_dir` already rejected the missing-file
+            // case, so this branch only sees a path that exists. We load
+            // it into the `embed_tokens_q8` slot because that buffer is
+            // what the runtime's logits GEMV indexes; the field is shared
+            // between tied (embed_tokens IS the head) and untied
+            // (separate fused-and-rotated head) artifacts.
             // ----------------------------------------------------------------
             let embed_tokens_q8 = if !cfg.tie_word_embeddings {
                 let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                if lm_head_path.exists() {
-                    mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
-                } else {
-                    // Fall back to embed_tokens Q4 if lm_head file is missing.
-                    tracing::warn!(
-                        "lm_head.q4 not found at {}; falling back to embed_tokens for logits",
-                        lm_head_path.display()
-                    );
-                    embed_tokens_q8
-                }
+                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
             } else {
                 embed_tokens_q8
             };
@@ -9513,6 +9571,112 @@ kernel void add_and_copy(
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Perplexity harness (ADR-044 step 4b)
+    // -----------------------------------------------------------------------
+
+    impl MetalQwen35State {
+        /// **Unstable**: largest window length the Metal forward path can serve
+        /// in a single call. Bounded by the KV-cache capacity chosen at session
+        /// construction (`new_session(max_cache_len)` or
+        /// `MetalQwen35State::new(_, _, max_cache_len)`), NOT by the RoPE table
+        /// — `new_session` already rejects `max_cache_len >
+        /// max_position_embeddings`, so the KV cap is always the tighter bound.
+        /// Callers driving the perplexity harness must keep their effective
+        /// window strictly at or below this value; `forward_step` panics
+        /// otherwise (KV-cache full assertion).
+        pub fn max_context(&self) -> usize {
+            self.session.kv_cache.max_cache_len
+        }
+
+        /// **Unstable**: Metal Q4 sibling of [`crate::model::qwen35::Qwen35Model::compute_token_nlls`].
+        ///
+        /// Computes per-position cross-entropy NLLs for an autoregressive
+        /// forward pass over `tokens` on the Metal forward path. Resets all
+        /// recurrent state ([`MetalQwen35State::reset_state`]) before stepping
+        /// so a single call does not depend on the caller's previous KV cache
+        /// / GDN state, and subsequent calls do not contaminate each other —
+        /// this is what makes the function safe to use as the per-window NLL
+        /// kernel inside [`crate::model::qwen35::run_strided_perplexity`].
+        ///
+        /// Returns a `Vec<f32>` of length `tokens.len() - 1`. The value at
+        /// index `i` is `-log p(tokens[i + 1] | tokens[0..=i])`, where the
+        /// softmax runs over the full vocabulary at decode step `i`.
+        ///
+        /// Errors if `tokens.len() < 2`, if `tokens.len() > self.max_context()`
+        /// (the KV cache would overflow during the walk), or if any
+        /// `token_id >= cfg.vocab_size`.
+        pub fn compute_token_nlls(
+            &mut self,
+            tokens: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            if tokens.len() < 2 {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls: need at least 2 tokens, got {}",
+                    tokens.len()
+                )));
+            }
+            let max_context = self.max_context();
+            if tokens.len() > max_context {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls: tokens.len() ({}) exceeds Metal KV-cache capacity ({}); \
+                     use a shorter window or rebuild the session with a larger max_cache_len",
+                    tokens.len(),
+                    max_context
+                )));
+            }
+            let vocab_size = self.engine.config.vocab_size;
+            if let Some((bad_idx, &bad)) = tokens
+                .iter()
+                .enumerate()
+                .find(|&(_, &t)| (t as usize) >= vocab_size)
+            {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls: tokens[{bad_idx}]={bad} >= vocab_size {vocab_size}"
+                )));
+            }
+
+            self.reset_state();
+
+            let mut nlls = Vec::with_capacity(tokens.len() - 1);
+            for (pos, &token_id) in tokens.iter().enumerate() {
+                let logits = self.forward_step(token_id, pos);
+                if pos + 1 < tokens.len() {
+                    let next = tokens[pos + 1] as usize;
+                    nlls.push(crate::model::qwen35::log_softmax_nll(
+                        &logits[..vocab_size],
+                        next,
+                    ));
+                }
+            }
+
+            Ok(nlls)
+        }
+
+        /// **Unstable**: Metal Q4 sibling of [`crate::model::qwen35::Qwen35Model::compute_perplexity`].
+        ///
+        /// Thin wrapper around [`crate::model::qwen35::run_strided_perplexity`]
+        /// driving the shared aggregator with this state's
+        /// [`Self::compute_token_nlls`] as the per-window NLL kernel. Each
+        /// window resets recurrent state, so context never crosses a window
+        /// boundary — identical semantics to the CPU path.
+        ///
+        /// Use this on a [`MetalQwen35State`] loaded via [`Self::from_q4_dir`]
+        /// to measure unrotated-Q4 PPL or rotated-Q4 PPL (the output of
+        /// `bin/quantize_quarot`); the rotated-vs-unrotated delta is the
+        /// acceptance number for ADR-044 step 4.
+        pub fn compute_perplexity(
+            &mut self,
+            tokens: &[u32],
+            cfg: &crate::model::qwen35::PerplexityConfig,
+        ) -> Result<crate::model::qwen35::PerplexityReport, crate::error::InferenceError> {
+            let max_ctx = self.max_context();
+            crate::model::qwen35::run_strided_perplexity(tokens, cfg, max_ctx, |slice| {
+                self.compute_token_nlls(slice)
+            })
         }
     }
 
@@ -10869,6 +11033,349 @@ kernel void decode_attention_reference(
                 "session_b kv_cache untouched"
             );
         }
+
+        // -------------------------------------------------------------------
+        // Perplexity harness (ADR-044 step 4b)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn metal_compute_token_nlls_matches_manual_forward_loop() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+            // Reference: manual reset + forward loop + log_softmax matches what
+            // compute_token_nlls advertises.
+            state.reset_state();
+            let mut expected = Vec::with_capacity(tokens.len() - 1);
+            for (pos, &tok) in tokens.iter().enumerate() {
+                let logits = state.forward_step(tok, pos);
+                if pos + 1 < tokens.len() {
+                    expected.push(crate::model::qwen35::log_softmax_nll(
+                        &logits[..cfg.vocab_size],
+                        tokens[pos + 1] as usize,
+                    ));
+                }
+            }
+
+            // Subject under test — resets internally, returns identical NLLs.
+            let got = state
+                .compute_token_nlls(&tokens)
+                .expect("compute_token_nlls ok on valid tokens");
+            assert_eq!(got.len(), tokens.len() - 1);
+            for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-4,
+                    "metal compute_token_nlls[{i}] diverged from manual loop: got={g} expected={e}"
+                );
+            }
+        }
+
+        #[test]
+        fn metal_compute_token_nlls_is_repeatable_under_self_reset() {
+            // The Metal harness resets recurrent state at the start of each
+            // call. Two back-to-back calls on the same input must therefore
+            // produce identical NLLs even though `forward_step` mutates the
+            // session's KV cache and GDN state in place.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = vec![1, 7, 13, 8, 42];
+
+            let first = state.compute_token_nlls(&tokens).expect("first call ok");
+            let second = state.compute_token_nlls(&tokens).expect("second call ok");
+            assert_eq!(first.len(), second.len());
+            for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "back-to-back NLLs diverged at {i}: {a} vs {b}"
+                );
+            }
+        }
+
+        #[test]
+        fn metal_compute_token_nlls_rejects_oversized_input() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            // KV cap = 4. compute_token_nlls(tokens) with tokens.len() > 4 must
+            // refuse — would otherwise overflow the cache mid-window.
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4)
+                .expect("tiny MetalQwen35State fixture constructs with max_cache_len=4");
+            let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+            let err = state
+                .compute_token_nlls(&tokens)
+                .expect_err("tokens.len() > max_cache_len must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("KV-cache") && msg.contains('4'),
+                "error must name the KV-cache cap; got: {msg}"
+            );
+        }
+
+        #[test]
+        fn metal_compute_token_nlls_rejects_out_of_vocab_token() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let vocab = cfg.vocab_size as u32;
+            let err = state
+                .compute_token_nlls(&[1, vocab, 3])
+                .expect_err("out-of-vocab token must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("{vocab}")),
+                "error must name the bad token id; got: {msg}"
+            );
+        }
+
+        #[test]
+        fn metal_compute_perplexity_equals_exp_mean_nll() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = (1u32..=12).collect();
+            let report = state
+                .compute_perplexity(
+                    &tokens,
+                    &crate::model::qwen35::PerplexityConfig {
+                        window: 6,
+                        stride: 3,
+                    },
+                )
+                .expect("ppl ok");
+            let expected_ppl = report.mean_nll.exp();
+            assert!(
+                (report.ppl - expected_ppl).abs() < 1e-9,
+                "ppl must equal exp(mean_nll); got ppl={}, exp(mean_nll)={}",
+                report.ppl,
+                expected_ppl
+            );
+            assert!(
+                (report.mean_nll - report.total_nll / report.num_tokens_scored as f64).abs() < 1e-9,
+                "mean_nll must equal total_nll / num_tokens_scored"
+            );
+            assert!(report.ppl.is_finite() && report.ppl > 0.0);
+        }
+
+        #[test]
+        fn metal_compute_perplexity_matches_compute_token_nlls_on_single_window() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = (1u32..=8).collect();
+            // window covers the whole corpus → strided harness collapses to a
+            // single window and the aggregated NLL must equal the direct sum.
+            let direct_nlls = state.compute_token_nlls(&tokens).expect("direct ok");
+            let direct_total: f64 = direct_nlls.iter().map(|&x| x as f64).sum();
+
+            let report = state
+                .compute_perplexity(
+                    &tokens,
+                    &crate::model::qwen35::PerplexityConfig {
+                        window: tokens.len(),
+                        stride: tokens.len() - 1,
+                    },
+                )
+                .expect("ppl ok");
+            assert_eq!(report.num_windows, 1);
+            assert_eq!(report.num_tokens_scored, tokens.len() - 1);
+            assert!(
+                (report.total_nll - direct_total).abs() < 1e-5,
+                "single-window strided PPL must agree with compute_token_nlls sum: got {} vs {}",
+                report.total_nll,
+                direct_total
+            );
+        }
+
+        #[test]
+        fn metal_compute_perplexity_rejects_window_above_max_cache_len() {
+            // Counterpart of the CPU test:
+            // `compute_perplexity_rejects_window_above_rope_capacity`. The
+            // Metal-side cap is the KV-cache size, not the RoPE table.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let max_cache_len = 8usize;
+            let mut state = MetalQwen35State::new(&weights, &cfg, max_cache_len)
+                .expect("tiny MetalQwen35State fixture constructs");
+            // Long enough corpus that the effective window > max_cache_len.
+            let tokens: Vec<u32> = (1..=8).cycle().take(max_cache_len + 4).collect();
+            let err = state
+                .compute_perplexity(
+                    &tokens,
+                    &crate::model::qwen35::PerplexityConfig {
+                        window: max_cache_len + 1,
+                        stride: 4,
+                    },
+                )
+                .expect_err("window > max_cache_len must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("context capacity") && msg.contains(&format!("{max_cache_len}")),
+                "error must name backend context capacity + cap; got: {msg}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
+            // Round-1 codex Major: `from_q4_dir` was missing the
+            // `max_cache_len <= cfg.max_position_embeddings` guard that
+            // `new_session` enforces. Without it, `--max-cache-len 999999
+            // --window 999999` would slip past the strided-PPL aggregator
+            // (which only knows the KV cap) and panic / read out-of-bounds
+            // GPU memory in `partial_rope_interleaved`. The loader now
+            // matches `new_session` and refuses up-front.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.max_position_embeddings = 64; // small RoPE table
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-mpe-{}", std::process::id()));
+            // The validator runs before any file I/O so an empty / non-
+            // existent dir is fine for this regression.
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                1024,
+            ) {
+                Ok(_) => panic!("max_cache_len > max_position_embeddings must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("max_cache_len") && err.contains("max_position_embeddings"),
+                "error must name both bounds; got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_zero_max_cache_len() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, _weights) = tiny_metal_qwen35_fixture();
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-zero-{}", std::process::id()));
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                0,
+            ) {
+                Ok(_) => panic!("max_cache_len = 0 must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("max_cache_len"),
+                "error must name max_cache_len; got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_tied_config_with_lm_head_artifact() {
+            // Round-2 codex Blocker: the round-1 fix only caught the
+            // `tie_word_embeddings=false` + missing `lm_head.q4` half of
+            // the artifact contract. The opposite mismatch —
+            // `tie_word_embeddings=true` but a `lm_head_weight.q4`
+            // present on disk — was still accepted, with the loader
+            // silently ignoring the materialized head (the converter's
+            // config-flip was likely skipped because HF Qwen3.5 stores
+            // the flag in both nested `text_config` and the top level).
+            // The loader now refuses both directions before any tensor
+            // I/O.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, _weights) = tiny_metal_qwen35_fixture();
+            assert!(
+                cfg.tie_word_embeddings,
+                "tiny fixture must be tied for this test"
+            );
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-tied-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("tempdir create");
+            // Drop a placeholder lm_head_weight.q4 in the dir; the file
+            // contents don't matter — the preflight only checks
+            // existence, before any loader touches the bytes.
+            let lm_head_file = tmp.join("lm_head_weight.q4");
+            std::fs::write(&lm_head_file, b"placeholder").expect("write lm_head placeholder");
+
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                16,
+            ) {
+                Ok(_) => panic!("tied config with stray lm_head.q4 must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("lm_head") && err.contains("tie_word_embeddings"),
+                "error must name both lm_head and tie_word_embeddings; got: {err}"
+            );
+            // Cleanup; ignore errors.
+            let _ = std::fs::remove_file(&lm_head_file);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_untied_config_without_lm_head_artifact() {
+            // Round-1 codex Blocker: the loader silently fell back to
+            // `embed_tokens` when `tie_word_embeddings=false` and
+            // `lm_head.q4` was missing. That is exactly the contamination
+            // ADR-044 step 3c forbids — a QuaRot artifact missing its
+            // materialized fused-and-rotated head would still produce a
+            // PPL and a PASS verdict using the wrong logits matrix. The
+            // loader now refuses before any tensor I/O.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.tie_word_embeddings = false; // make this an untied config
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-untied-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("tempdir create");
+            // Empty dir → lm_head.weight.q4 does not exist.
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                16,
+            ) {
+                Ok(_) => panic!("untied config without lm_head artifact must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("lm_head") && err.contains("tie_word_embeddings"),
+                "error must name both lm_head and tie_word_embeddings; got: {err}"
+            );
+            // Cleanup; ignore errors (the dir may have been removed by other tests).
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
 
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
@@ -10916,6 +11423,16 @@ impl MetalQwen35State {
         Err("Metal GPU not available (requires macOS + metal-gpu feature)".into())
     }
 
+    /// **Unstable**: load Q4/F16 directly stub; always fails without metal-gpu feature.
+    pub fn from_q4_dir(
+        _q4_dir: &std::path::Path,
+        _tokenizer_path: &std::path::Path,
+        _cfg: &crate::model::qwen35_config::Qwen35Config,
+        _max_cache_len: usize,
+    ) -> Result<Self, String> {
+        Err("Metal GPU not available (requires macOS + metal-gpu feature)".into())
+    }
+
     /// **Unstable**: Metal single-token forward step stub.
     pub fn forward_step(&mut self, _token_id: u32, _position: usize) -> Vec<f32> {
         Vec::new()
@@ -10938,4 +11455,30 @@ impl MetalQwen35State {
 
     /// **Unstable**: reset recurrent KV state stub.
     pub fn reset_state(&mut self) {}
+
+    /// **Unstable**: max context stub; always 0 without metal-gpu feature.
+    pub fn max_context(&self) -> usize {
+        0
+    }
+
+    /// **Unstable**: Metal Q4 per-token NLL stub; always errors without metal-gpu feature.
+    pub fn compute_token_nlls(
+        &mut self,
+        _tokens: &[u32],
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: Metal Q4 perplexity stub; always errors without metal-gpu feature.
+    pub fn compute_perplexity(
+        &mut self,
+        _tokens: &[u32],
+        _cfg: &crate::model::qwen35::PerplexityConfig,
+    ) -> Result<crate::model::qwen35::PerplexityReport, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
 }

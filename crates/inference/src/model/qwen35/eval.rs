@@ -1,9 +1,12 @@
 //! Language-model evaluation primitives for Qwen3.5: per-token NLLs and
 //! strided sliding-window perplexity.
 //!
-//! Step 4a of [ADR-044](../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md).
-//! The CPU forward path here is the baseline that step 4b will compare against
-//! Q4 / QuaRot-Q4 measurements (on the Metal runtime).
+//! Step 4a / 4b of [ADR-044](../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md).
+//! The CPU forward path's [`Qwen35Model::compute_perplexity`] is the baseline
+//! that the Metal Q4 path ([`crate::forward::metal_qwen35::MetalQwen35State::compute_perplexity`])
+//! compares against for the rotated-Q4 vs unrotated-Q4 delta measurement. Both
+//! backends share [`run_strided_perplexity`] for the window walk + aggregation,
+//! and [`log_softmax_nll`] for per-token cross-entropy.
 //!
 //! The strided methodology matches the [HuggingFace fixed-length-model perplexity
 //! recipe](https://huggingface.co/docs/transformers/en/perplexity): each non-first
@@ -160,112 +163,140 @@ impl Qwen35Model {
         tokens: &[u32],
         cfg: &PerplexityConfig,
     ) -> Result<PerplexityReport, InferenceError> {
-        if cfg.window < 2 {
-            return Err(InferenceError::Inference(format!(
-                "compute_perplexity: window ({}) must be >= 2",
-                cfg.window
-            )));
-        }
-        if cfg.stride == 0 {
-            return Err(InferenceError::Inference(
-                "compute_perplexity: stride must be > 0".into(),
-            ));
-        }
-        if cfg.stride >= cfg.window {
-            return Err(InferenceError::Inference(format!(
-                "compute_perplexity: stride ({}) must be < window ({}); \
-                 stride == window silently drops every window-boundary token",
-                cfg.stride, cfg.window
-            )));
-        }
-        if tokens.len() < 2 {
-            return Err(InferenceError::Inference(format!(
-                "compute_perplexity: need at least 2 tokens, got {}",
-                tokens.len()
-            )));
-        }
-        // The longest slice we will ever hand to forward_step is
-        // `min(window, tokens.len())` — long windows are clipped by the
-        // corpus per-iteration via `end = min(begin + window, n)`. So a
-        // configured `window > max_context` is only dangerous when the
-        // corpus is itself long enough to push the slice past the RoPE
-        // table. Mirrors HuggingFace's `min(begin + max_length, seq_len)`
-        // clipping in the fixed-length-PPL recipe.
-        let max_context = self.max_context();
-        let effective_window = cfg.window.min(tokens.len());
-        if effective_window > max_context {
-            return Err(InferenceError::Inference(format!(
-                "compute_perplexity: effective window ({} = min(window {}, tokens.len() {})) \
-                 exceeds RoPE capacity ({}); use a shorter window or load the model \
-                 with a larger context table",
-                effective_window,
-                cfg.window,
-                tokens.len(),
-                max_context
-            )));
-        }
-
-        let n = tokens.len();
-        let mut total_nll: f64 = 0.0;
-        let mut num_scored: usize = 0;
-        let mut num_windows: usize = 0;
-        // Highest global target index already scored (0 = nothing scored yet;
-        // valid token indices are 1..n-1 inclusive, since target 0 is the
-        // unscored first token).
-        let mut last_scored: usize = 0;
-        let mut begin: usize = 0;
-
-        loop {
-            let end = (begin + cfg.window).min(n);
-            if end - begin < 2 {
-                break;
-            }
-
-            let nlls = self.compute_token_nlls(&tokens[begin..end])?;
-            for (i, &nll) in nlls.iter().enumerate() {
-                let global_target = begin + i + 1;
-                if global_target > last_scored {
-                    total_nll += nll as f64;
-                    num_scored += 1;
-                }
-            }
-            // Last NLL in this window predicts global token (end - 1).
-            last_scored = end - 1;
-            num_windows += 1;
-
-            if end >= n {
-                break;
-            }
-            begin += cfg.stride;
-        }
-
-        if num_scored == 0 {
-            return Err(InferenceError::Inference(
-                "compute_perplexity: scored zero tokens (corpus shorter than 2?)".into(),
-            ));
-        }
-
-        let mean_nll = total_nll / (num_scored as f64);
-        let ppl = mean_nll.exp();
-
-        Ok(PerplexityReport {
-            ppl,
-            mean_nll,
-            total_nll,
-            num_tokens_scored: num_scored,
-            num_windows,
-            window: cfg.window,
-            stride: cfg.stride,
+        run_strided_perplexity(tokens, cfg, self.max_context(), |slice| {
+            self.compute_token_nlls(slice)
         })
     }
 }
 
-/// Numerically stable `-log softmax(logits)[target]`.
+/// Backend-agnostic strided sliding-window aggregator. Shared by
+/// [`Qwen35Model::compute_perplexity`] (CPU forward path) and
+/// [`crate::forward::metal_qwen35::MetalQwen35State::compute_perplexity`]
+/// (Metal Q4 forward path) so both backends share the same validation,
+/// window walk, and aggregation semantics.
+///
+/// `nll_fn(slice)` returns one NLL per non-first token of `slice` (i.e.
+/// length `slice.len() - 1`). The aggregator owns the strided iteration,
+/// the "score each non-first global token exactly once" invariant, and
+/// the report construction. Each backend's `compute_token_nlls`
+/// implementation is responsible for resetting recurrent state at the
+/// start of each window — the aggregator hands disjoint slices but does
+/// not touch the model.
+///
+/// `max_context` is the largest slice length the backend can serve in a
+/// single window (the RoPE table size on CPU, the KV-cache capacity on
+/// Metal). The aggregator validates the *effective* window
+/// `min(cfg.window, tokens.len())` against this so an oversized window
+/// on a short corpus still succeeds, matching HuggingFace's
+/// `min(begin + max_length, seq_len)` clipping in the fixed-length-PPL
+/// recipe.
+pub(crate) fn run_strided_perplexity<F>(
+    tokens: &[u32],
+    cfg: &PerplexityConfig,
+    max_context: usize,
+    mut nll_fn: F,
+) -> Result<PerplexityReport, InferenceError>
+where
+    F: FnMut(&[u32]) -> Result<Vec<f32>, InferenceError>,
+{
+    if cfg.window < 2 {
+        return Err(InferenceError::Inference(format!(
+            "compute_perplexity: window ({}) must be >= 2",
+            cfg.window
+        )));
+    }
+    if cfg.stride == 0 {
+        return Err(InferenceError::Inference(
+            "compute_perplexity: stride must be > 0".into(),
+        ));
+    }
+    if cfg.stride >= cfg.window {
+        return Err(InferenceError::Inference(format!(
+            "compute_perplexity: stride ({}) must be < window ({}); \
+             stride == window silently drops every window-boundary token",
+            cfg.stride, cfg.window
+        )));
+    }
+    if tokens.len() < 2 {
+        return Err(InferenceError::Inference(format!(
+            "compute_perplexity: need at least 2 tokens, got {}",
+            tokens.len()
+        )));
+    }
+    let effective_window = cfg.window.min(tokens.len());
+    if effective_window > max_context {
+        return Err(InferenceError::Inference(format!(
+            "compute_perplexity: effective window ({} = min(window {}, tokens.len() {})) \
+             exceeds backend context capacity ({}); use a shorter window or load the model \
+             with a larger context table",
+            effective_window,
+            cfg.window,
+            tokens.len(),
+            max_context
+        )));
+    }
+
+    let n = tokens.len();
+    let mut total_nll: f64 = 0.0;
+    let mut num_scored: usize = 0;
+    let mut num_windows: usize = 0;
+    // Highest global target index already scored (0 = nothing scored yet;
+    // valid token indices are 1..n-1 inclusive, since target 0 is the
+    // unscored first token).
+    let mut last_scored: usize = 0;
+    let mut begin: usize = 0;
+
+    loop {
+        let end = (begin + cfg.window).min(n);
+        if end - begin < 2 {
+            break;
+        }
+
+        let nlls = nll_fn(&tokens[begin..end])?;
+        for (i, &nll) in nlls.iter().enumerate() {
+            let global_target = begin + i + 1;
+            if global_target > last_scored {
+                total_nll += nll as f64;
+                num_scored += 1;
+            }
+        }
+        // Last NLL in this window predicts global token (end - 1).
+        last_scored = end - 1;
+        num_windows += 1;
+
+        if end >= n {
+            break;
+        }
+        begin += cfg.stride;
+    }
+
+    if num_scored == 0 {
+        return Err(InferenceError::Inference(
+            "compute_perplexity: scored zero tokens (corpus shorter than 2?)".into(),
+        ));
+    }
+
+    let mean_nll = total_nll / (num_scored as f64);
+    let ppl = mean_nll.exp();
+
+    Ok(PerplexityReport {
+        ppl,
+        mean_nll,
+        total_nll,
+        num_tokens_scored: num_scored,
+        num_windows,
+        window: cfg.window,
+        stride: cfg.stride,
+    })
+}
+
+/// Numerically stable `-log softmax(logits)[target]`. Shared between the CPU
+/// and Metal Q4 perplexity harnesses.
 ///
 /// Computed as `log_sum_exp(logits) - logits[target]` with the standard
 /// max-subtraction trick, so the running sum stays in `[0, vocab_size]`
 /// even for logits with large magnitudes.
-fn log_softmax_nll(logits: &[f32], target: usize) -> f32 {
+pub(crate) fn log_softmax_nll(logits: &[f32], target: usize) -> f32 {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum_exp: f64 = 0.0;
     for &l in logits {
@@ -766,7 +797,10 @@ mod tests {
     fn compute_perplexity_rejects_window_above_rope_capacity() {
         // Round-1 codex finding: the public Result-returning API was able
         // to panic by indexing the precomputed RoPE table past its end.
-        // The harness now validates window <= max_context up-front.
+        // The harness now validates window <= max_context up-front. After
+        // the step-4b refactor the message comes from the shared aggregator
+        // and uses the generic "backend context capacity" wording so it
+        // covers the Metal KV-cache case too.
         let cfg = test_config();
         let max_context = {
             let model = build_model(cfg.clone(), 0xC0FF_EE42);
@@ -785,8 +819,8 @@ mod tests {
             .expect_err("window > max_context must error");
         let msg = format!("{err}");
         assert!(
-            msg.contains("RoPE") && msg.contains(&format!("{max_context}")),
-            "error must mention the RoPE capacity; got: {msg}"
+            msg.contains("context capacity") && msg.contains(&format!("{max_context}")),
+            "error must mention the backend context capacity and the bound; got: {msg}"
         );
     }
 
