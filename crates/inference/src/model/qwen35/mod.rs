@@ -23,6 +23,11 @@ mod sampling;
 mod weights;
 
 pub use eval::{PerplexityConfig, PerplexityReport};
+/// Re-exported for the Metal Q4 perplexity harness in
+/// [`crate::forward::metal_qwen35`]; the CPU forward path consumes them
+/// directly inside [`eval`].
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 
 #[cfg(test)]
 mod tests;
