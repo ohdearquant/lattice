@@ -2013,6 +2013,60 @@ kernel void add_and_copy(
     residual[gid] = r;
     dst[gid] = r;
 }
+
+// ===== LoRA GEMV Phase 1: intermediate = A @ x (ADR-045 step 2) =====
+// A is row-major float32 [rank, K]. One threadgroup per rank-row.
+// 128 threads (4 simdgroups × 32), simd_sum reduction over K.
+// Dispatch: threadgroups=(rank, 1, 1), threads=(32, 4, 1)
+kernel void lora_gemv_a(
+    device const float* x       [[buffer(0)]],
+    device const float* A       [[buffer(1)]],
+    device float* intermediate  [[buffer(2)]],
+    constant uint& rank_val     [[buffer(3)]],
+    constant uint& K            [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint r = tgpig.x;
+    if (r >= rank_val) return;
+
+    device const float* row = A + r * K;
+    float partial = 0.0f;
+    for (uint k = tiisg + sgitg * 32; k < K; k += 128) {
+        partial += row[k] * x[k];
+    }
+    partial = simd_sum(partial);
+
+    threadgroup float sg_sums[4];
+    if (tiisg == 0) sg_sums[sgitg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        intermediate[r] = sg_sums[0] + sg_sums[1] + sg_sums[2] + sg_sums[3];
+    }
+}
+
+// ===== LoRA GEMV Phase 2: y += scale * B @ intermediate (ADR-045 step 2) =====
+// B is row-major float32 [N, rank]. One thread per output element.
+// rank ≤ 64, so the inner loop is trivially short — no reduction needed.
+// Dispatch: threadgroups=(ceil(N/256), 1, 1), threads=(256, 1, 1)
+kernel void lora_gemv_b_accum(
+    device const float* intermediate  [[buffer(0)]],
+    device const float* B             [[buffer(1)]],
+    device float* y                   [[buffer(2)]],
+    constant uint& N                  [[buffer(3)]],
+    constant uint& rank_val           [[buffer(4)]],
+    constant float& scale             [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    device const float* row = B + gid * rank_val;
+    float sum = 0.0f;
+    for (uint j = 0; j < rank_val; j++) {
+        sum += row[j] * intermediate[j];
+    }
+    y[gid] += scale * sum;
+}
 "#;
 
     const MSL_Q4_TILED_SOURCE: &str = concat!(
@@ -2572,6 +2626,9 @@ kernel void add_and_copy(
         gdn_precompute_keys: Option<ComputePipelineState>,
         gdn_recurrence_sharded: Option<ComputePipelineState>,
         gdn_norm_silu: Option<ComputePipelineState>,
+        // ADR-045: LoRA GEMV kernels (always compiled, zero cost when unused)
+        lora_gemv_a: ComputePipelineState,
+        lora_gemv_b_accum: ComputePipelineState,
     }
 
     // -----------------------------------------------------------------------
@@ -3334,6 +3391,8 @@ kernel void add_and_copy(
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
                 decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+                lora_gemv_a: make_pipeline("lora_gemv_a")?,
+                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
             };
 
             // Upload per-layer weights
@@ -9052,6 +9111,8 @@ kernel void add_and_copy(
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
                 decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+                lora_gemv_a: make_pipeline("lora_gemv_a")?,
+                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
             };
 
             let hidden = cfg.hidden_size;
@@ -11375,6 +11436,127 @@ kernel void decode_attention_reference(
             );
             // Cleanup; ignore errors (the dir may have been removed by other tests).
             let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        #[test]
+        fn lora_gemv_kernel_matches_cpu_reference() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let rank: u32 = 16;
+            let k: u32 = 1024;
+            let n: u32 = 512;
+            let scale: f32 = 0.5;
+
+            // Synthetic data
+            let mut rng_state = 0xCAFE_BABE_u64;
+            let mut rand_f32 = || -> f32 {
+                rng_state = rng_state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng_state >> 11) as u32 as f32 / u32::MAX as f32) - 0.5
+            };
+            let x: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
+            let a: Vec<f32> = (0..(rank * k)).map(|_| rand_f32()).collect();
+            let b: Vec<f32> = (0..(n * rank)).map(|_| rand_f32()).collect();
+            let y_init: Vec<f32> = (0..n).map(|_| rand_f32()).collect();
+
+            // CPU reference: y += scale * B @ (A @ x)
+            let mut intermediate_cpu = vec![0.0f32; rank as usize];
+            for r in 0..rank as usize {
+                let row = &a[r * k as usize..(r + 1) * k as usize];
+                intermediate_cpu[r] = row.iter().zip(x.iter()).map(|(a, b)| a * b).sum();
+            }
+            let mut y_expected = y_init.clone();
+            for i in 0..n as usize {
+                let row = &b[i * rank as usize..(i + 1) * rank as usize];
+                let dot: f32 = row
+                    .iter()
+                    .zip(intermediate_cpu.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                y_expected[i] += scale * dot;
+            }
+
+            // GPU execution
+            let opts = CompileOptions::new();
+            let library = device
+                .new_library_with_source(MSL_SOURCE, &opts)
+                .expect("MSL compile");
+            let pipeline_a = {
+                let f = library
+                    .get_function("lora_gemv_a", None)
+                    .expect("lora_gemv_a");
+                device
+                    .new_compute_pipeline_state_with_function(&f)
+                    .expect("pipeline lora_gemv_a")
+            };
+            let pipeline_b = {
+                let f = library
+                    .get_function("lora_gemv_b_accum", None)
+                    .expect("lora_gemv_b_accum");
+                device
+                    .new_compute_pipeline_state_with_function(&f)
+                    .expect("pipeline lora_gemv_b_accum")
+            };
+
+            let make_buf = |data: &[f32]| -> Buffer {
+                device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    (data.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let x_buf = make_buf(&x);
+            let a_buf = make_buf(&a);
+            let b_buf = make_buf(&b);
+            let y_buf = make_buf(&y_init);
+            let inter_buf =
+                device.new_buffer((rank as u64) * 4, MTLResourceOptions::StorageModeShared);
+
+            let queue = device.new_command_queue();
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+
+            // Phase 1
+            enc.set_compute_pipeline_state(&pipeline_a);
+            enc.set_buffer(0, Some(&x_buf), 0);
+            enc.set_buffer(1, Some(&a_buf), 0);
+            enc.set_buffer(2, Some(&inter_buf), 0);
+            enc.set_bytes(3, 4, &rank as *const u32 as *const _);
+            enc.set_bytes(4, 4, &k as *const u32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(rank as u64, 1, 1), MTLSize::new(32, 4, 1));
+
+            // Phase 2
+            enc.set_compute_pipeline_state(&pipeline_b);
+            enc.set_buffer(0, Some(&inter_buf), 0);
+            enc.set_buffer(1, Some(&b_buf), 0);
+            enc.set_buffer(2, Some(&y_buf), 0);
+            enc.set_bytes(3, 4, &n as *const u32 as *const _);
+            enc.set_bytes(4, 4, &rank as *const u32 as *const _);
+            enc.set_bytes(5, 4, &scale as *const f32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(n.div_ceil(256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // Read back and compare
+            let y_gpu: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n as usize) };
+
+            let max_diff = y_expected
+                .iter()
+                .zip(y_gpu.iter())
+                .map(|(e, g)| (e - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-3,
+                "LoRA GEMV GPU vs CPU diverged: max_abs_diff={max_diff}"
+            );
         }
     }
 
