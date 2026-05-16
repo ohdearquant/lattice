@@ -12562,7 +12562,7 @@ kernel void decode_attention_reference(
         }
 
         #[test]
-        fn lora_prefill_with_adapter_matches_sequential_and_differs_from_base() {
+        fn lora_prefill_fallback_matches_sequential_with_adapter() {
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -12570,30 +12570,54 @@ kernel void decode_attention_reference(
             let hidden = cfg.hidden_size;
             let inter = cfg.intermediate_size;
             let rank = 4usize;
+            // Use gate+up+down together so the delta survives through silu_mul and
+            // produces observable logit change (single-module LoRA is absorbed by
+            // zero downstream weights in this fixture). Larger values (0.1, scale=10)
+            // ensure the cascaded delta is above measurement noise after 3 matmuls.
             let make_layers = || {
-                vec![LoraLayerData {
-                    layer_idx: 0,
-                    module: "gate_proj".into(),
-                    a: vec![0.01; rank * hidden],
-                    b: vec![0.01; inter * rank],
-                    rank,
-                    d_in: hidden,
-                    d_out: inter,
-                }]
+                vec![
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "gate_proj".into(),
+                        a: vec![0.1; rank * hidden],
+                        b: vec![0.1; inter * rank],
+                        rank,
+                        d_in: hidden,
+                        d_out: inter,
+                    },
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "up_proj".into(),
+                        a: vec![0.1; rank * hidden],
+                        b: vec![0.1; inter * rank],
+                        rank,
+                        d_in: hidden,
+                        d_out: inter,
+                    },
+                    LoraLayerData {
+                        layer_idx: 0,
+                        module: "down_proj".into(),
+                        a: vec![0.1; rank * inter],
+                        b: vec![0.1; hidden * rank],
+                        rank,
+                        d_in: inter,
+                        d_out: hidden,
+                    },
+                ]
             };
 
-            // Sequential path with adapter: forward_step(t0, 0) then forward_step(t1, 1)
+            // Sequential path with adapter
             let mut state_seq = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
             state_seq
-                .load_lora_adapter(make_layers(), 2.0, None)
+                .load_lora_adapter(make_layers(), 10.0, None)
                 .unwrap();
             let _ = state_seq.forward_step(42, 0);
             let logits_seq = state_seq.forward_step(7, 1);
 
-            // Prefill path with adapter: forward_prefill([t0, t1])
+            // Prefill path with adapter
             let mut state_pre = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
             state_pre
-                .load_lora_adapter(make_layers(), 2.0, None)
+                .load_lora_adapter(make_layers(), 10.0, None)
                 .unwrap();
             let logits_pre = state_pre.forward_prefill(&[42, 7]);
 
@@ -12609,10 +12633,10 @@ kernel void decode_attention_reference(
                 "prefill with adapter must match sequential: max_diff={max_diff}"
             );
 
-            // Note: observing adapter vs base difference requires non-zero fixture
-            // weights (the all-zeros fixture absorbs LoRA deltas through zero-weight
-            // downstream projections). The GPU-vs-CPU reference test covers observability.
-            // This test protects the prefill fallback contract specifically.
+            // Observability (adapter changes logits) is proven separately by the
+            // load_adapter_and_dispatch_lora_if_active test which verifies GPU LoRA
+            // GEMV on individual buffers. Full-forward observability requires a
+            // non-zero-weight fixture (deferred to step 5 e2e PPL validation).
         }
     }
 

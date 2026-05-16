@@ -239,7 +239,7 @@ Steps 1-4 complete. Prefill falls back to sequential when adapter active (no bat
 
 - PPL with a PEFT adapter on the QuaRot Q4 base matches PPL on the CPU unrotated path with the same adapter (within Q4 quantization noise, < 0.1 PPL).
 - Adapter load time < 500ms for rank-16 adapters on Qwen3.5-0.8B (dominated by the WHT rotation + Metal buffer upload, not I/O).
-- Zero runtime overhead when no adapter is loaded (existing `NoopLoraHook` pattern: the LoRA kernel dispatch is branch-gated on adapter presence).
+- No GPU dispatch and no adapter buffer access when no adapter is loaded (early `None` return in `dispatch_lora_if_active`).
 - The rotation correction is invisible to the user: `load_lora_adapter` applies the correction when `quarot_seed` is provided. Auto-detection from artifact metadata is a future enhancement (requires converter update per §Prerequisites).
 
 ## Alternatives Considered
