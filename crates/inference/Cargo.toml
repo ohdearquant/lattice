@@ -50,6 +50,11 @@ name = "chat_metal"
 path = "src/bin/chat_metal.rs"
 required-features = ["f16", "metal-gpu"]
 
+[[bin]]
+name = "bench_decode_ab"
+path = "src/bin/bench_decode_ab.rs"
+required-features = ["f16", "metal-gpu"]
+
 [[example]]
 name = "bench_metal"
 required-features = ["f16", "metal-gpu"]

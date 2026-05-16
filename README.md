@@ -10,13 +10,13 @@ No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full
 — weight loading, tokenization, forward pass, and vector operations — in Rust, with hand-written
 Metal shaders and SIMD kernels.
 
-![Benchmark: Lattice vs MLX vs Ollama on Qwen3.5-0.8B](docs/bench_results/lattice_benchmark.png)
+![Benchmark: Lattice vs Ollama — fair end-to-end decode on Qwen3.5-0.8B](docs/bench_results/lattice_benchmark.png)
 
-**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit quantization on Apple Silicon.** At Q8 (where all engines work), Lattice matches Apple's MLX and is 60% faster than Ollama/llama.cpp — with LoRA hot-swap that no other engine supports.
+**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit on Apple Silicon** — with QuaRot-Q4 and LoRA hot-swap that neither Ollama nor MLX support. On a fair end-to-end decode measurement it is **~1.9× faster than Ollama/llama.cpp**. Apple's MLX (Metal-native) decodes faster than Lattice at raw throughput — Lattice's edge is portability (pure Rust, no Python/framework) plus those Q4 + adapter capabilities. Full table and methodology below.
 
 ```bash
-# Reproduce these numbers on your hardware (requires macOS + ollama + mlx-lm):
-./scripts/bench_q8_vs_ollama.sh
+# Reproduce on your hardware (macOS + ollama + uv):
+./scripts/bench_apples_to_apples.sh
 ```
 
 Built for inference on CPU and macOS GPU. Optimized for AVX2 (x86), NEON (ARM),
@@ -279,18 +279,37 @@ vectors enough to warrant re-indexing.
 
 ## Benchmarks
 
-### Qwen3.5 Decode Throughput (M2 Max, single-token generation)
+### Qwen3.5-0.8B Decode Throughput (Apple M2 Max)
 
-| Engine | Quant | tok/s | Notes |
-|--------|-------|-------|-------|
-| **Lattice** | QuaRot Q4 | **152** | Only working Q4 implementation |
-| **Lattice** | Q8 | **139** | +8% vs MLX, +60% vs Ollama |
-| **Lattice** | Q4 + LoRA r8 | **118** | Hot-swap adapter, no reload |
-| MLX | Q8 | 128 | Apple's ML framework |
-| Ollama | Q8_0 | 86 | llama.cpp Metal backend |
+Fair end-to-end measurement — **slope method**: `tok/s = (N₂−N₁) / (T(N₂)−T(N₁))` for a fixed
+prompt, so prompt prefill, model load, and per-call overhead cancel and every engine is measured
+the *same* way (greedy, median of 5 runs, N₁=32, N₂=256).
 
-All three engines implement the full GDN recurrence for Qwen3.5's hybrid architecture
-(18 GatedDeltaNet + 6 GQA layers). Reproducible via `./scripts/bench_q8_vs_ollama.sh`.
+| Engine | Quant | decode tok/s | Notes |
+|--------|-------|--------------|-------|
+| MLX | Q8 (g64) | **247** | Apple's Metal-native framework — fastest |
+| **Lattice** | f16 | **157** | Pure Rust + Metal; ~1.9× Ollama |
+| Ollama | Q8_0 | **84** | llama.cpp Metal backend |
+
+Cross-check: Ollama's slope (84) matches its own `eval_duration` rate (87), confirming the
+methodology is sound.
+
+**Honest caveats.** Lattice here runs **f16** (the `MetalQwen35State` safetensors path); MLX is
+Q8 and Ollama is Q8_0 — so the Lattice↔Ollama gap is *conservative* (Q8 would only widen
+Lattice's lead), while Lattice↔MLX is not quant-matched. **MLX decodes faster than Lattice.**
+Lattice's value is portability plus capabilities no other engine has on this model:
+
+| Lattice-only capability | MLX | Ollama |
+|---|---|---|
+| QuaRot 4-bit (rotated quant) | ✗ | ✗ |
+| Q4 + LoRA r8 hot-swap (no reload) | ✗ | ✗ |
+| Pure Rust, zero Python / framework | ✗ | ✗ |
+
+A previous version of this table claimed "+8% vs MLX"; that was a measurement artifact (a
+criterion `forward_step` micro-bench compared against MLX end-to-end with prefill counted in the
+decode rate) and has been corrected. All three engines implement the full GDN recurrence for
+Qwen3.5's hybrid architecture (18 GatedDeltaNet + 6 GQA layers). Reproducible via
+`./scripts/bench_apples_to_apples.sh`.
 
 ### Embedding & Kernel Benchmarks
 
