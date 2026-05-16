@@ -8930,29 +8930,51 @@ kernel void add_and_copy(
                 ));
             }
 
-            // Untied configs (e.g., QuaRot output where step 3c flips
-            // `tie_word_embeddings=false` and materializes a fused
-            // `(1 + γ_final)` + rotation `lm_head.weight`) MUST ship the
-            // rotated head as its own `lm_head.weight.q4` artifact.
-            // Falling back to `embed_tokens` here would silently feed the
-            // wrong matrix into the final logits GEMV — exactly the
-            // contamination ADR-044 §"Step 3c contract" warns against —
-            // and would let `eval_perplexity --quarot-q4-dir` print a
-            // PASS verdict that is measuring the wrong head.
+            // Two-way config/artifact contract for the logits head:
             //
-            // The tied path is the legitimate "embed_tokens IS the
-            // logits head" case and stays as a fall-through below.
-            if !cfg.tie_word_embeddings {
-                let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                if !lm_head_path.exists() {
-                    return Err(format!(
-                        "from_q4_dir: tie_word_embeddings=false but lm_head.q4 is missing at {}; \
-                         the runtime requires the materialized lm_head matrix (ADR-044 step 3c) \
-                         and must not fall back to embed_tokens, which would yield wrong logits \
-                         and a misleading perplexity report",
-                        lm_head_path.display()
-                    ));
-                }
+            // - `tie_word_embeddings=false` (e.g., QuaRot output where
+            //   step 3c flips the flag and materializes a fused
+            //   `(1 + γ_final)` + rotation `lm_head.weight`) MUST ship
+            //   the rotated head as its own `lm_head.weight.q4`. Falling
+            //   back to `embed_tokens` here would silently feed the wrong
+            //   matrix into the final logits GEMV.
+            // - `tie_word_embeddings=true` (the legitimate "embed_tokens
+            //   IS the head" case) MUST NOT ship `lm_head.weight.q4` —
+            //   if it does, the on-disk config-flip was likely skipped
+            //   (HF Qwen3.5 stores the flag in both `text_config` and
+            //   top level; `Qwen35Config::from_config_json_str` takes
+            //   the top-level value, so a partial update can leave the
+            //   parsed flag stale). The materialized head would then be
+            //   dead weight and the runtime would silently fall back to
+            //   `embed_tokens` — exactly the contamination ADR-044
+            //   §"Step 3c contract" warns against and `quant::quarot::lm_head`
+            //   flags at the converter boundary.
+            //
+            // Both mismatches let `eval_perplexity --quarot-q4-dir`
+            // print a PPL delta and PASS/FAIL verdict on the wrong
+            // logits head, so the loader refuses both directions before
+            // any tensor I/O.
+            let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
+            let lm_head_present = lm_head_path.exists();
+            if !cfg.tie_word_embeddings && !lm_head_present {
+                return Err(format!(
+                    "from_q4_dir: tie_word_embeddings=false but lm_head.q4 is missing at {}; \
+                     the runtime requires the materialized lm_head matrix (ADR-044 step 3c) \
+                     and must not fall back to embed_tokens, which would yield wrong logits \
+                     and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
+            }
+            if cfg.tie_word_embeddings && lm_head_present {
+                return Err(format!(
+                    "from_q4_dir: tie_word_embeddings=true but lm_head.q4 is present at {}; \
+                     the on-disk config likely missed the step-3c `tie_word_embeddings=false` \
+                     flip (HF Qwen3.5 carries the flag in both nested `text_config` and the \
+                     top level — see `Qwen35Config::from_config_json_str`). Loading would \
+                     silently ignore the materialized head and fall back to embed_tokens, \
+                     yielding wrong logits and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
             }
 
             // Compile shaders (same as new()).
@@ -11271,6 +11293,53 @@ kernel void decode_attention_reference(
                 err.contains("max_cache_len"),
                 "error must name max_cache_len; got: {err}"
             );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_tied_config_with_lm_head_artifact() {
+            // Round-2 codex Blocker: the round-1 fix only caught the
+            // `tie_word_embeddings=false` + missing `lm_head.q4` half of
+            // the artifact contract. The opposite mismatch —
+            // `tie_word_embeddings=true` but a `lm_head_weight.q4`
+            // present on disk — was still accepted, with the loader
+            // silently ignoring the materialized head (the converter's
+            // config-flip was likely skipped because HF Qwen3.5 stores
+            // the flag in both nested `text_config` and the top level).
+            // The loader now refuses both directions before any tensor
+            // I/O.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, _weights) = tiny_metal_qwen35_fixture();
+            assert!(
+                cfg.tie_word_embeddings,
+                "tiny fixture must be tied for this test"
+            );
+            let tmp =
+                std::env::temp_dir().join(format!("lattice-q4-test-tied-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).expect("tempdir create");
+            // Drop a placeholder lm_head_weight.q4 in the dir; the file
+            // contents don't matter — the preflight only checks
+            // existence, before any loader touches the bytes.
+            let lm_head_file = tmp.join("lm_head_weight.q4");
+            std::fs::write(&lm_head_file, b"placeholder").expect("write lm_head placeholder");
+
+            let err = match MetalQwen35State::from_q4_dir(
+                &tmp,
+                std::path::Path::new("/dev/null"),
+                &cfg,
+                16,
+            ) {
+                Ok(_) => panic!("tied config with stray lm_head.q4 must error"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("lm_head") && err.contains("tie_word_embeddings"),
+                "error must name both lm_head and tie_word_embeddings; got: {err}"
+            );
+            // Cleanup; ignore errors.
+            let _ = std::fs::remove_file(&lm_head_file);
+            let _ = std::fs::remove_dir_all(&tmp);
         }
 
         #[test]
