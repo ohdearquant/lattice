@@ -7787,53 +7787,6 @@ kernel void lora_gemv_b_accum(
             }
         }
 
-        /// Dispatch LoRA GEMV: y += scale * B @ (A @ x).
-        ///
-        /// Two-phase dispatch:
-        /// - Phase 1: intermediate[rank] = A[rank, K] @ x[K]
-        /// - Phase 2: y[N] += scale * B[N, rank] @ intermediate[rank]
-        ///
-        /// `intermediate_buf` must be at least `rank * 4` bytes.
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_lora_gemv(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            a_buf: &Buffer,
-            b_buf: &Buffer,
-            y: &Buffer,
-            intermediate_buf: &Buffer,
-            rank: u32,
-            n: u32,
-            k: u32,
-            scale: f32,
-        ) {
-            // Phase 1: intermediate = A @ x
-            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_a);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(a_buf), 0);
-            enc.set_buffer(2, Some(intermediate_buf), 0);
-            enc.set_bytes(3, 4, &rank as *const u32 as *const _);
-            enc.set_bytes(4, 4, &k as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(rank as u64, 1, 1),
-                MTLSize::new(32, 4, 1), // 128 threads = 4 simdgroups
-            );
-
-            // Phase 2: y += scale * B @ intermediate
-            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_b_accum);
-            enc.set_buffer(0, Some(intermediate_buf), 0);
-            enc.set_buffer(1, Some(b_buf), 0);
-            enc.set_buffer(2, Some(y), 0);
-            enc.set_bytes(3, 4, &n as *const u32 as *const _);
-            enc.set_bytes(4, 4, &rank as *const u32 as *const _);
-            enc.set_bytes(5, 4, &scale as *const f32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(256) as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        }
-
         fn dispatch_rms_norm(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -11506,7 +11459,7 @@ kernel void decode_attention_reference(
             let x: Vec<f32> = (0..k).map(|_| rand_f32()).collect();
             let a: Vec<f32> = (0..(rank * k)).map(|_| rand_f32()).collect();
             let b: Vec<f32> = (0..(n * rank)).map(|_| rand_f32()).collect();
-            let mut y_init: Vec<f32> = (0..n).map(|_| rand_f32()).collect();
+            let y_init: Vec<f32> = (0..n).map(|_| rand_f32()).collect();
 
             // CPU reference: y += scale * B @ (A @ x)
             let mut intermediate_cpu = vec![0.0f32; rank as usize];
@@ -11547,17 +11500,17 @@ kernel void decode_attention_reference(
                     .expect("pipeline lora_gemv_b_accum")
             };
 
-            let make_buf = |data: &[f32], label: &str| -> Buffer {
+            let make_buf = |data: &[f32]| -> Buffer {
                 device.new_buffer_with_data(
                     data.as_ptr() as *const _,
                     (data.len() * 4) as u64,
                     MTLResourceOptions::StorageModeShared,
                 )
             };
-            let x_buf = make_buf(&x, "x");
-            let a_buf = make_buf(&a, "A");
-            let b_buf = make_buf(&b, "B");
-            let y_buf = make_buf(&y_init, "y");
+            let x_buf = make_buf(&x);
+            let a_buf = make_buf(&a);
+            let b_buf = make_buf(&b);
+            let y_buf = make_buf(&y_init);
             let inter_buf =
                 device.new_buffer((rank as u64) * 4, MTLResourceOptions::StorageModeShared);
 

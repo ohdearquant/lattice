@@ -64,29 +64,35 @@ The delta lands in the rotated residual basis, matching the base projection's ou
 
 Both corrections are **exact** (R is orthogonal: `R^T · R = I`). Zero approximation error. Zero runtime overhead — the rotations are absorbed at adapter load time.
 
-### Cost of counter-rotation
+### Cost of adapter rotation
 
-Per LoRA layer: one matmul `A_cr = A · R^T` where:
-- `A` is `(rank × d_in)`, typically rank ∈ {4, 8, 16, 32, 64}
-- `R^T` is `(d_in × d_in)`, for Qwen3.5-0.8B `d_in = 1024`
+The `RandomizedHadamard` operates in-place via Walsh-Hadamard transforms (`O(d log d)` per vector), NOT dense matrix multiplication. No `d × d` matrix is materialized.
 
-Cost: `rank × d_in × d_in` FLOPs. For rank=16, d=1024: **16.8M FLOPs** — microseconds on any hardware. One-time at adapter load.
+Per LoRA layer:
+- **Input-side** (A rotation): `rank` WHT applications of length `d_in`. Cost: `O(rank × d_in × log(d_in))`. For rank=16, d=1024: ~160K FLOPs.
+- **Output-side** (B rotation): `rank` WHT applications of length `d_out`. Cost: `O(rank × d_out × log(d_out))`. Same order.
 
-`R` is not stored — it's reconstructed from the seed via `RandomizedHadamard::new(seed, dim)`. The seed is already in the QuaRot artifact's metadata. Memory for R: `d × d × 4 bytes` = 4 MB for d=1024. Transient (freed after counter-rotation).
+Memory: only a sign vector (`d × 4 bytes` = 4 KB for d=1024) plus the activation buffer being transformed in-place. No dense R matrix.
+
+`R` is reconstructed from the seed via `RandomizedHadamard::new(seed, dim)`. The seed MUST be persisted in the QuaRot artifact metadata (see §Prerequisites below).
 
 ### Architecture
 
 ```
-┌──────────────────────────────────────────────────���──────┐
+┌─────────────────────────────────────────────────────────┐
 │  Adapter Load (one-time, CPU)                           │
 │                                                         │
 │  1. Load PEFT safetensors → LoraAdapter (A, B per layer)│
-│  2. Read seed from QuaRot artifact config.json          │
+│  2. Read seed from QuaRot artifact metadata             │
 │  3. Reconstruct R = RandomizedHadamard(seed, d)         │
-│  4. For each (layer, module) with absorption rule:      │
-│     A_cr = A · R^T    (counter-rotate)                  │
-│  5. Upload B, A_cr to Metal buffers                     │
-│  6. Drop R (transient)                                  │
+│  4. For each (layer, module):                           │
+│     - Input-side:  A_cr = A · R^T  (counter-rotate A)  │
+│     - Output-side: B_rot = R · B   (rotate B)          │
+│     - Not in plan: ERROR (refuse unknown targets)       │
+│  5. Upload corrected matrices to Metal buffers:         │
+│     - Input-side:  upload (B, A_cr)                     │
+│     - Output-side: upload (B_rot, A)                    │
+│  6. Drop sign vector (transient)                        │
 └─────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -95,10 +101,28 @@ Cost: `rank × d_in × d_in` FLOPs. For rank=16, d=1024: **16.8M FLOPs** — mic
 │                                                         │
 │  For each adapted projection in layer:                  │
 │    base_out = Q4_GEMV(W_rot, x)        [existing]      │
-│    lora_out = scale * B @ (A_cr @ x)   [new kernel]    │
+│    lora_out = scale * B' @ (A' @ x)    [new kernel]    │
 │    out = base_out + lora_out                            │
+│  (B' and A' are whichever was rotated at load time)     │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### Prerequisites (dependencies on prior work)
+
+The QuaRot converter (`quantize_quarot`) MUST persist rotation metadata in the output artifact. Without it, the adapter loader cannot reconstruct the correct `RandomizedHadamard`. Required fields (to be added in a converter update):
+
+```json
+{
+  "quarot": {
+    "kind": "randomized_hadamard",
+    "seed": 12648430,
+    "hidden_dim": 1024,
+    "plan": "qwen35_residual_stream_linear_layers"
+  }
+}
+```
+
+Until this metadata exists, the caller must supply the seed explicitly. The `load_lora_adapter` API accepts `quarot_seed: Option<u64>` for this reason — `None` means no rotation correction (unrotated base), `Some(seed)` triggers the correction. A future version will auto-detect from artifact metadata and refuse to load an adapter against a QuaRot base without it.
 
 ### Which projections get counter-rotated?
 

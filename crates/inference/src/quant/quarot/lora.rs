@@ -81,8 +81,6 @@ pub enum LoraRotationApplied {
     CounterRotatedA,
     /// B was rotated: `B ← R · B` (output-side projection)
     RotatedB,
-    /// Module not in plan — no rotation applied.
-    NotInPlan,
 }
 
 /// Summary of a rotation pass over an adapter's matrices.
@@ -108,14 +106,6 @@ impl RotationReport {
             .filter(|(_, _, r)| *r == LoraRotationApplied::RotatedB)
             .count()
     }
-
-    /// Number of layers not in plan (no rotation applied).
-    pub fn num_not_in_plan(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|(_, _, r)| *r == LoraRotationApplied::NotInPlan)
-            .count()
-    }
 }
 
 /// A single LoRA layer's mutable references for rotation correction.
@@ -134,7 +124,8 @@ pub struct LoraLayerMut<'a> {
 /// For each layer:
 /// - **Input-side** module: `A ← A · R^T` (counter-rotate A)
 /// - **Output-side** module: `B ← R · B` (rotate B into residual basis)
-/// - **Not in plan**: no modification
+/// - **Not in plan**: **ERROR** — refuses unknown targets to prevent silent
+///   basis-composition failures on QuaRot bases
 ///
 /// # Arguments
 ///
@@ -145,8 +136,10 @@ pub struct LoraLayerMut<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if `hidden_dim` is not a valid Hadamard dimension or if
-/// any matrix has inconsistent dimensions with the rotation.
+/// Returns an error if:
+/// - `hidden_dim` is not a valid Hadamard dimension
+/// - Any matrix has inconsistent dimensions with the rotation
+/// - Any module is not in the plan (fail-closed: unknown targets are rejected)
 pub fn rotate_adapter_for_quarot(
     layers: Vec<LoraLayerMut<'_>>,
     seed: u64,
@@ -191,11 +184,13 @@ pub fn rotate_adapter_for_quarot(
                 ));
             }
             None => {
-                report.entries.push((
-                    layer.layer_idx,
-                    layer.module.to_string(),
-                    LoraRotationApplied::NotInPlan,
-                ));
+                return Err(InferenceError::Inference(format!(
+                    "rotate_adapter_for_quarot: layer {} targets module '{}' which is \
+                     not in the rotation plan. On a QuaRot base, unknown adapter targets \
+                     risk silent basis-composition failures. Check module name spelling \
+                     or update the plan.",
+                    layer.layer_idx, layer.module
+                )));
             }
         }
     }
@@ -459,7 +454,6 @@ mod tests {
 
         assert_eq!(report.num_a_rotated(), 1);
         assert_eq!(report.num_b_rotated(), 1);
-        assert_eq!(report.num_not_in_plan(), 0);
 
         // q_proj: A was modified, B was NOT
         assert_ne!(a_q, a_q_orig);
@@ -470,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_adapter_unknown_module_is_not_in_plan() {
+    fn rotate_adapter_unknown_module_rejected() {
         let hidden_dim = 64;
         let rank = 4;
         let seed = 7_u64;
@@ -478,8 +472,6 @@ mod tests {
 
         let mut a = synthetic_vector(rank * hidden_dim, 200);
         let mut b = synthetic_vector(hidden_dim * rank, 201);
-        let a_orig = a.clone();
-        let b_orig = b.clone();
 
         let layers = vec![LoraLayerMut {
             layer_idx: 0,
@@ -491,10 +483,39 @@ mod tests {
             d_out: hidden_dim,
         }];
 
-        let report = rotate_adapter_for_quarot(layers, seed, hidden_dim, &plan).unwrap();
-        assert_eq!(report.num_not_in_plan(), 1);
-        assert_eq!(a, a_orig);
-        assert_eq!(b, b_orig);
+        let err = rotate_adapter_for_quarot(layers, seed, hidden_dim, &plan).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("conv1d") && msg.contains("not in the rotation plan"),
+            "should reject unknown module: {msg}"
+        );
+    }
+
+    #[test]
+    fn rotate_adapter_misspelled_target_rejected() {
+        let hidden_dim = 64;
+        let rank = 4;
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+
+        let mut a = synthetic_vector(rank * hidden_dim, 210);
+        let mut b = synthetic_vector(hidden_dim * rank, 211);
+
+        let layers = vec![LoraLayerMut {
+            layer_idx: 3,
+            module: "qproj", // misspelled — should be "q_proj"
+            a: a.as_mut_slice(),
+            b: b.as_mut_slice(),
+            rank,
+            d_in: hidden_dim,
+            d_out: hidden_dim,
+        }];
+
+        let err = rotate_adapter_for_quarot(layers, 7, hidden_dim, &plan).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("qproj") && msg.contains("not in the rotation plan"),
+            "should reject misspelled module: {msg}"
+        );
     }
 
     #[test]
