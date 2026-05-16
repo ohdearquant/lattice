@@ -3817,6 +3817,56 @@ kernel void lora_gemv_b_accum(
             })
         }
 
+        /// Returns the expected `(d_in, d_out)` for a LoRA projection given the layer type.
+        ///
+        /// Returns an error if `module` is not valid for the layer type at `layer_idx`,
+        /// or if the module name is not recognised.
+        fn expected_lora_shape(
+            cfg: &crate::model::qwen35_config::Qwen35Config,
+            layer_idx: usize,
+            module: &str,
+        ) -> Result<(usize, usize), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let is_full = cfg.is_full_attention(layer_idx);
+
+            match (module, is_full) {
+                // Full-attention projections
+                ("q_proj", true) => Ok((hidden, 2 * cfg.full_q_dim())),
+                ("k_proj", true) => Ok((hidden, cfg.full_kv_dim())),
+                ("v_proj", true) => Ok((hidden, cfg.full_kv_dim())),
+                ("o_proj", true) => Ok((cfg.full_q_dim(), hidden)),
+                // GDN projections
+                ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
+                ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
+                ("in_proj_b", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("in_proj_a", false) => Ok((hidden, cfg.linear_num_key_heads)),
+                ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
+                // MLP projections (shared across both layer types)
+                ("gate_proj", _) => Ok((hidden, inter)),
+                ("up_proj", _) => Ok((hidden, inter)),
+                ("down_proj", _) => Ok((inter, hidden)),
+                // Wrong layer-type combinations
+                ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
+                    Err(InferenceError::Inference(format!(
+                        "module '{}' is a full-attention projection but layer {} is GDN",
+                        module, layer_idx
+                    )))
+                }
+                ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
+                    Err(InferenceError::Inference(format!(
+                        "module '{}' is a GDN projection but layer {} is full-attention",
+                        module, layer_idx
+                    )))
+                }
+                _ => Err(InferenceError::Inference(format!(
+                    "unknown LoRA module '{}'",
+                    module
+                ))),
+            }
+        }
+
         /// Load a LoRA adapter onto the Metal GPU for inference.
         ///
         /// Applies rotation corrections for QuaRot-converted bases when `quarot_seed`
@@ -3842,6 +3892,17 @@ kernel void lora_gemv_b_accum(
                 return Err(InferenceError::Inference(
                     "LoRA adapter already loaded; call unload_lora_adapter first".into(),
                 ));
+            }
+            if layers.is_empty() {
+                return Err(InferenceError::Inference(
+                    "load_lora_adapter: layers must not be empty".into(),
+                ));
+            }
+            if !scale.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "load_lora_adapter: scale must be finite, got {}",
+                    scale
+                )));
             }
 
             let hidden_dim = self.engine.config.hidden_size;
@@ -3889,6 +3950,15 @@ kernel void lora_gemv_b_accum(
                     return Err(InferenceError::Inference(format!(
                         "load_lora_adapter: layer_idx {} >= num_hidden_layers {}",
                         layer.layer_idx, num_layers
+                    )));
+                }
+                let (exp_d_in, exp_d_out) =
+                    Self::expected_lora_shape(&self.engine.config, layer.layer_idx, &layer.module)?;
+                if layer.d_in != exp_d_in || layer.d_out != exp_d_out {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: layer {} module '{}' has (d_in={}, d_out={}) \
+                         but model expects (d_in={}, d_out={})",
+                        layer.layer_idx, layer.module, layer.d_in, layer.d_out, exp_d_in, exp_d_out
                     )));
                 }
                 let expected_a = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
@@ -3952,6 +4022,12 @@ kernel void lora_gemv_b_accum(
                     (layer.b.len() * 4) as u64,
                     MTLResourceOptions::StorageModeShared,
                 );
+                if projections[layer.layer_idx].contains_key(&layer.module) {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: duplicate projection for layer {} module '{}'",
+                        layer.layer_idx, layer.module
+                    )));
+                }
                 projections[layer.layer_idx].insert(
                     layer.module.clone(),
                     MetalLoraProjection {
@@ -11848,9 +11924,10 @@ kernel void decode_attention_reference(
             let a: Vec<f32> = (0..rank * hidden).map(|_| rand_f32()).collect();
             let b: Vec<f32> = (0..hidden * rank).map(|_| rand_f32()).collect();
 
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden (both 512 in tiny fixture)
             let layers = vec![LoraLayerData {
                 layer_idx: 0,
-                module: "q_proj".into(),
+                module: "o_proj".into(),
                 a: a.clone(),
                 b: b.clone(),
                 rank,
@@ -11879,7 +11956,7 @@ kernel void decode_attention_reference(
 
             let cmd = state.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc, &x_buf, &y_buf, 0, "q_proj");
+            state.dispatch_lora_if_active(&enc, &x_buf, &y_buf, 0, "o_proj");
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -11944,14 +12021,16 @@ kernel void decode_attention_reference(
         }
 
         // ── malformed-load validation tests ──────────────────────────────────
-        // These tests exercise the validation gates in load_lora_adapter and do
-        // not require a live GPU device (errors are returned before any buffer
-        // allocation). Each case must return Err, never panic.
+        // These tests require a Metal device — they return early if none is available.
+        // Each case must return Err, never panic.
 
         fn make_valid_layer(hidden: usize, rank: usize) -> LoraLayerData {
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden (equal in tiny fixture).
+            // Using o_proj keeps A/B sizes as rank*hidden and hidden*rank while satisfying
+            // shape validation.
             LoraLayerData {
                 layer_idx: 0,
-                module: "q_proj".into(),
+                module: "o_proj".into(),
                 a: vec![0.0f32; rank * hidden],
                 b: vec![0.0f32; hidden * rank],
                 rank,
@@ -12056,10 +12135,11 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
             let hidden = cfg.hidden_size;
             let rank = 4usize;
-            // Declare rank=4, d_in=hidden, but supply A with wrong inner dim
+            // Declare rank=4, d_in=hidden, but supply A with wrong inner dim.
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden in tiny fixture.
             let layer = LoraLayerData {
                 layer_idx: 0,
-                module: "q_proj".into(),
+                module: "o_proj".into(),
                 a: vec![0.0f32; rank * (hidden + 1)], // extra column — length mismatch
                 b: vec![0.0f32; hidden * rank],
                 rank,
@@ -12079,9 +12159,10 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
             let hidden = cfg.hidden_size;
             let rank = 4usize;
+            // o_proj: d_in = full_q_dim() = hidden, d_out = hidden in tiny fixture.
             let layer = LoraLayerData {
                 layer_idx: 0,
-                module: "q_proj".into(),
+                module: "o_proj".into(),
                 a: vec![0.0f32; rank * hidden],
                 b: vec![0.0f32; (hidden + 1) * rank], // extra row — length mismatch
                 rank,
@@ -12122,6 +12203,159 @@ kernel void decode_attention_reference(
             layer.b.pop();
             let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
             assert!(result.is_err(), "quarot path: short B must return Err");
+        }
+
+        // ── shape / semantic validation tests ────────────────────────────────
+        // These tests require a Metal device — they return early if none is available.
+
+        #[test]
+        fn load_lora_adapter_rejects_wrong_shape_for_module() {
+            // q_proj expects d_out = 2 * full_q_dim() = 1024, not hidden = 512
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank], // d_out=hidden is wrong for q_proj
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject wrong d_out for q_proj");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_gdn_module_on_full_attention_layer() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let qkv_dim = cfg.linear_qkv_dim();
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "in_proj_qkv".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; qkv_dim * rank],
+                rank,
+                d_in: hidden,
+                d_out: qkv_dim,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(
+                result.is_err(),
+                "should reject GDN module on full-attention layer"
+            );
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_unknown_module() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let layers = vec![LoraLayerData {
+                layer_idx: 0,
+                module: "nonexistent_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; hidden * rank],
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            }];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject unknown module name");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_duplicate_projection() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let d_out = cfg.intermediate_size; // gate_proj: hidden -> intermediate
+            // Construct two identical layers to trigger duplicate detection.
+            let make_gate = || LoraLayerData {
+                layer_idx: 0,
+                module: "gate_proj".into(),
+                a: vec![0.0; rank * hidden],
+                b: vec![0.0; d_out * rank],
+                rank,
+                d_in: hidden,
+                d_out,
+            };
+            let layers = vec![make_gate(), make_gate()];
+            let result = state.load_lora_adapter(layers, 1.0, None);
+            assert!(result.is_err(), "should reject duplicate layer/module");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_empty_layers() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let result = state.load_lora_adapter(vec![], 1.0, None);
+            assert!(result.is_err(), "should reject empty layers");
+        }
+
+        #[test]
+        fn load_lora_adapter_rejects_non_finite_scale() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let d_out = cfg.intermediate_size;
+            let make_layer = || {
+                let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+                let layers = vec![LoraLayerData {
+                    layer_idx: 0,
+                    module: "gate_proj".into(),
+                    a: vec![0.0; rank * hidden],
+                    b: vec![0.0; d_out * rank],
+                    rank,
+                    d_in: hidden,
+                    d_out,
+                }];
+                (state, layers)
+            };
+            let (mut state, layers) = make_layer();
+            assert!(
+                state.load_lora_adapter(layers, f32::NAN, None).is_err(),
+                "should reject NaN scale"
+            );
+            let (mut state, layers) = make_layer();
+            assert!(
+                state
+                    .load_lora_adapter(layers, f32::INFINITY, None)
+                    .is_err(),
+                "should reject +Inf scale"
+            );
+            let (mut state, layers) = make_layer();
+            assert!(
+                state
+                    .load_lora_adapter(layers, f32::NEG_INFINITY, None)
+                    .is_err(),
+                "should reject -Inf scale"
+            );
         }
     }
 
