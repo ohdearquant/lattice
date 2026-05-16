@@ -160,5 +160,10 @@ name = "kv_cache_layout_bench"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "metal_decode_bench"
+harness = false
+required-features = ["metal-gpu", "f16"]
+
 [lints]
 workspace = true
