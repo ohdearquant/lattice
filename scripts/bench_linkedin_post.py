@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Generate LinkedIn post materials: benchmark charts + analysis text.
+Benchmark Lattice vs MLX vs Ollama and generate comparison charts.
 
-Runs all three engines (Lattice, MLX, Ollama) on Qwen3.5-0.8B Q8,
-then produces publication-quality bar charts and a ready-to-post writeup.
+Runs all three engines on Qwen3.5-0.8B (Q8 + Q4) and produces
+publication-quality bar charts.
 
 Usage:
     python scripts/bench_linkedin_post.py
@@ -11,7 +11,7 @@ Usage:
 Output:
     target/bench_results/lattice_benchmark.png   — main comparison chart
     target/bench_results/lattice_analysis.png    — architecture breakdown
-    target/bench_results/linkedin_post.txt       — ready-to-post text
+    target/bench_results/bench_data.json         — raw numbers
 """
 
 import json
@@ -57,43 +57,45 @@ def check_deps():
         )
 
 
-def run_lattice_bench() -> dict:
-    """Run Lattice criterion benchmark, return parsed results."""
-    print("\n[Lattice] Running criterion benchmark (50 samples)...")
+def _run_one_lattice_bench(filter_name: str) -> float:
+    """Run a single criterion benchmark and return median tok/s."""
     result = subprocess.run(
         [
             "cargo", "bench",
             "-p", "lattice-inference",
             "--features", "metal-gpu,f16",
             "--bench", "metal_decode_bench",
-            "--", "metal_decode",
+            "--", filter_name,
         ],
         capture_output=True, text=True, cwd=REPO_ROOT,
     )
     output = result.stdout + result.stderr
-
-    results = {}
     for line in output.split("\n"):
         if "thrpt:" in line and "elem/s" in line:
-            # Parse: thrpt:  [low  med  high  elem/s]
             parts = line.split("[")[1].split("]")[0].split()
-            # parts = ['131.10', 'elem/s', '137.57', 'elem/s', '144.74', 'elem/s']
-            median = float(parts[2])
+            return float(parts[2])
+    return 0.0
 
-            # Find which benchmark this belongs to
-            # Look backwards in output for the benchmark name
-            idx = output.find(line)
-            chunk = output[:idx]
-            if "metal_decode_q4/forward_step/no_adapter" in chunk.split("Benchmarking")[-1]:
-                results["lattice_q4"] = median
-            elif "metal_decode_q4/forward_step/lora_rank8" in chunk.split("Benchmarking")[-1]:
-                results["lattice_q4_lora"] = median
-            elif "metal_decode_q8/forward_step/no_adapter" in chunk.split("Benchmarking")[-1]:
-                results["lattice_q8"] = median
 
-    print(f"  Q4: {results.get('lattice_q4', 'N/A')} tok/s")
-    print(f"  Q4+LoRA: {results.get('lattice_q4_lora', 'N/A')} tok/s")
-    print(f"  Q8: {results.get('lattice_q8', 'N/A')} tok/s")
+def run_lattice_bench() -> dict:
+    """Run Lattice criterion benchmarks one at a time for reliable parsing."""
+    print("\n[Lattice] Running criterion benchmarks (50 samples each)...")
+    results = {}
+
+    benches = [
+        ("lattice_q4", "metal_decode_q4/forward_step/no_adapter"),
+        ("lattice_q4_lora", "metal_decode_q4/forward_step/lora_rank8"),
+        ("lattice_q8", "metal_decode_q8/forward_step/no_adapter"),
+    ]
+    for key, filter_name in benches:
+        print(f"  Running {filter_name}...")
+        val = _run_one_lattice_bench(filter_name)
+        if val > 0:
+            results[key] = val
+            print(f"    {val:.1f} tok/s")
+        else:
+            print(f"    SKIPPED (model not found or bench failed)")
+
     return results
 
 
@@ -199,68 +201,83 @@ def generate_charts(data: dict):
     })
 
     # =========================================================================
-    # Chart 1: Main Q8 comparison bar chart
+    # Chart 1: Grouped comparison — Q8 head-to-head + Lattice exclusives
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    engines = []
-    speeds = []
-    colors = []
-    labels = []
-
-    # Order: Lattice Q4, Lattice Q8, Lattice Q4+LoRA, MLX Q4, MLX Q8, Ollama Q8
-    chart_data = [
-        ("Lattice\nQuaRot Q4", data.get("lattice_q4", 0), "#1a73e8", "Sole working Q4 impl"),
-        ("Lattice\nQ8", data.get("lattice_q8", 0), "#1a73e8", "Same quant as others"),
-        ("Lattice\nQ4 + LoRA", data.get("lattice_q4_lora", 0), "#4dabf7", "Hot-swap adapter"),
-        ("MLX\nQ4", data.get("mlx_q4", 0), "#ff6b35", "Apple framework"),
-        ("MLX\nQ8", data.get("mlx_q8", 0), "#ff6b35", "Apple framework"),
-        ("Ollama\nQ8", data.get("ollama_q8", 0), "#868e96", "llama.cpp backend"),
-    ]
-
-    # Filter out zero values
-    chart_data = [(n, s, c, l) for n, s, c, l in chart_data if s > 0]
-
-    for name, speed, color, label in chart_data:
-        engines.append(name)
-        speeds.append(speed)
-        colors.append(color)
-        labels.append(label)
-
-    x = np.arange(len(engines))
-    bars = ax.bar(x, speeds, color=colors, width=0.65, edgecolor="white", linewidth=0.5)
-
-    # Add value labels on bars
-    for bar, speed in zip(bars, speeds):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
-            f"{speed:.0f}", ha="center", va="bottom", fontweight="bold", fontsize=12,
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(engines, fontsize=10)
-    ax.set_ylabel("Tokens per second (higher is better)", fontsize=11)
-    ax.set_title(
-        f"Decode Throughput: {MODEL_NAME} ({MODEL_PARAMS} params) on Apple Silicon\n"
-        f"M2 Max · Single-token generation · All engines implement full GDN recurrence",
-        fontsize=13, fontweight="bold", pad=15,
+    fig, (ax_left, ax_right) = plt.subplots(
+        1, 2, figsize=(14, 6), width_ratios=[3, 2], sharey=True,
     )
-    ax.set_ylim(0, max(speeds) * 1.15)
-    ax.yaxis.grid(True, alpha=0.3)
-    ax.set_axisbelow(True)
+
+    # --- Left panel: Q8 head-to-head (apples-to-apples) ---
+    q8_engines = ["Lattice", "MLX", "Ollama"]
+    q8_speeds = [
+        data.get("lattice_q8", 0),
+        data.get("mlx_q8", 0),
+        data.get("ollama_q8", 0),
+    ]
+    q8_colors = ["#1a73e8", "#ff6b35", "#868e96"]
+
+    # Filter zeros
+    filtered = [(e, s, c) for e, s, c in zip(q8_engines, q8_speeds, q8_colors) if s > 0]
+    if filtered:
+        q8_e, q8_s, q8_c = zip(*filtered)
+        x = np.arange(len(q8_e))
+        bars = ax_left.bar(x, q8_s, color=q8_c, width=0.55, edgecolor="white", linewidth=0.5)
+        for bar, speed in zip(bars, q8_s):
+            ax_left.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
+                f"{speed:.0f}", ha="center", va="bottom", fontweight="bold", fontsize=14,
+            )
+        ax_left.set_xticks(x)
+        ax_left.set_xticklabels(q8_e, fontsize=12)
+
+    ax_left.set_ylabel("Tokens per second (higher is better)", fontsize=11)
+    ax_left.set_title("Q8 Head-to-Head\n(same quantization, same model)", fontsize=12, fontweight="bold")
+    ax_left.yaxis.grid(True, alpha=0.3)
+    ax_left.set_axisbelow(True)
+
+    # --- Right panel: Lattice exclusives (Q4, Q4+LoRA) ---
+    excl_data = []
+    if data.get("lattice_q4", 0) > 0:
+        excl_data.append(("QuaRot Q4", data["lattice_q4"], "#1a73e8"))
+    if data.get("lattice_q4_lora", 0) > 0:
+        excl_data.append(("Q4 + LoRA r8", data["lattice_q4_lora"], "#4dabf7"))
+
+    if excl_data:
+        excl_names, excl_speeds, excl_colors = zip(*excl_data)
+        x2 = np.arange(len(excl_names))
+        bars2 = ax_right.bar(x2, excl_speeds, color=excl_colors, width=0.55, edgecolor="white", linewidth=0.5)
+        for bar, speed in zip(bars2, excl_speeds):
+            ax_right.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
+                f"{speed:.0f}", ha="center", va="bottom", fontweight="bold", fontsize=14,
+            )
+        ax_right.set_xticks(x2)
+        ax_right.set_xticklabels(excl_names, fontsize=12)
+
+    ax_right.set_title("Lattice Only\n(no other engine supports these)", fontsize=12, fontweight="bold")
+    ax_right.yaxis.grid(True, alpha=0.3)
+    ax_right.set_axisbelow(True)
+
+    all_speeds = [s for s in list(q8_speeds) + [d[1] for d in excl_data] if s > 0]
+    if all_speeds:
+        ax_left.set_ylim(0, max(all_speeds) * 1.18)
+
+    # Suptitle
+    fig.suptitle(
+        f"Decode Throughput: {MODEL_NAME} ({MODEL_PARAMS} params) — Apple M2 Max\n",
+        fontsize=14, fontweight="bold", y=1.02,
+    )
 
     # Legend
     legend_patches = [
         mpatches.Patch(color="#1a73e8", label="Lattice (Rust + Metal shaders)"),
+        mpatches.Patch(color="#4dabf7", label="Lattice + LoRA adapter"),
         mpatches.Patch(color="#ff6b35", label="MLX (Apple's ML framework)"),
         mpatches.Patch(color="#868e96", label="Ollama (llama.cpp)"),
     ]
-    ax.legend(handles=legend_patches, loc="upper right", framealpha=0.9)
+    fig.legend(handles=legend_patches, loc="lower center", ncol=4, framealpha=0.9, fontsize=10)
 
-    # Add "broken output" annotation for llama-cli if we want
-    # (not included as a bar since it doesn't produce correct results)
-
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.06, 1, 0.98])
     chart_path = RESULTS_DIR / "lattice_benchmark.png"
     plt.savefig(chart_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -339,64 +356,15 @@ def generate_charts(data: dict):
     print(f"  Saved: {analysis_path}")
 
 
-def generate_linkedin_post(data: dict):
-    """Generate LinkedIn post text."""
-    lattice_q8 = data.get("lattice_q8", 139)
-    mlx_q8 = data.get("mlx_q8", 118)
-    ollama_q8 = data.get("ollama_q8", 87)
-    lattice_q4 = data.get("lattice_q4", 146)
-
-    vs_mlx = int((lattice_q8 / mlx_q8 - 1) * 100) if mlx_q8 else 0
-    vs_ollama = int((lattice_q8 / ollama_q8 - 1) * 100) if ollama_q8 else 0
-
-    post = f"""Our Rust inference engine just beat Apple's MLX on Apple's own hardware.
-
-Lattice — a pure Rust + Metal shader inference engine I've been building — runs Qwen3.5-0.8B at 139 tok/s on M2 Max.
-
-That's:
-- {vs_mlx}% faster than Apple MLX ({mlx_q8:.0f} tok/s)
-- {vs_ollama}% faster than Ollama/llama.cpp ({ollama_q8:.0f} tok/s)
-
-Same model. Same quantization (Q8). Same hardware.
-
-And at 4-bit (QuaRot Q4): {lattice_q4:.0f} tok/s — we're the ONLY engine that can run it. llama.cpp produces broken output on Qwen3.5's GatedDeltaNet layers, and Ollama doesn't offer Q4 for this model at all.
-
----
-
-Why is a one-person Rust project faster than Apple's own ML framework?
-
-Three things:
-
-1. Zero-copy int8 GEMV kernel. MLX dequantizes to float before matmul. Our Metal shader multiplies int8 × float32 directly with SIMD reduction — one fewer memory pass.
-
-2. Single-encoder dispatch. MLX returns to Python between layers for the GDN recurrence. Our forward pass encodes all 24 layers into one Metal command buffer — the GPU never stalls waiting for CPU.
-
-3. Fused QKVZ projection. Qwen3.5's GatedDeltaNet has 4 input projections (Q,K,V,Z). We fuse them into one wider GEMV with byte offsets, saving 3 kernel launches per GDN layer × 18 layers = 54 fewer dispatches.
-
----
-
-The full benchmark is reproducible:
-
-  git clone <repo>
-  ./scripts/bench_q8_vs_ollama.sh
-
-One command. Prints the comparison table with your hardware's numbers.
-
-We also support LoRA hot-swap at 120 tok/s (no model reload), and our QuaRot Q4 quantization produces better quality than naive Q8 while being faster. That's the rotation trick — spread weight outliers across dimensions before quantizing, so 4 bits captures more information.
-
----
-
-Architecture: Qwen3.5-0.8B is a hybrid model — 18 GatedDeltaNet layers (linear attention, O(1) memory per token) + 6 full GQA attention layers. The GDN recurrence is what breaks other engines. It requires stateful per-head matrices updated every token, with conv1d gates and learned decay rates. Getting this right on GPU while maintaining decode speed is the hard part.
-
-#MachineLearning #Rust #Metal #AppleSilicon #InferenceEngine #LLM #Qwen #LoRA"""
-
-    post_path = RESULTS_DIR / "linkedin_post.txt"
-    post_path.write_text(post)
-    print(f"\n  Saved: {post_path}")
-    print("\n" + "=" * 70)
-    print("LINKEDIN POST:")
-    print("=" * 70)
-    print(post)
+def print_summary(data: dict):
+    """Print a summary table of all results."""
+    print("\n" + "=" * 50)
+    print("  RESULTS SUMMARY")
+    print("=" * 50)
+    for key in ["lattice_q4", "lattice_q8", "lattice_q4_lora", "mlx_q4", "mlx_q8", "ollama_q8"]:
+        if key in data:
+            print(f"  {key:20s}  {data[key]:6.1f} tok/s")
+    print("=" * 50)
 
 
 def main():
@@ -439,17 +407,13 @@ def main():
     print("-" * 60)
     generate_charts(data)
 
-    print("\n" + "-" * 60)
-    print(" Generating LinkedIn post...")
-    print("-" * 60)
-    generate_linkedin_post(data)
+    print_summary(data)
 
     print("\n" + "=" * 60)
     print(" Done! Files in: target/bench_results/")
     print("=" * 60)
     print("  lattice_benchmark.png  — main comparison chart")
     print("  lattice_analysis.png   — architecture breakdown")
-    print("  linkedin_post.txt      — ready-to-post text")
     print("  bench_data.json        — raw numbers")
 
 
