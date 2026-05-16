@@ -12,6 +12,7 @@
 mod cache;
 mod debug;
 mod detokenize;
+mod eval;
 mod forward;
 mod generation;
 mod loading;
@@ -20,6 +21,8 @@ mod moe;
 mod norm;
 mod sampling;
 mod weights;
+
+pub use eval::{PerplexityConfig, PerplexityReport};
 
 #[cfg(test)]
 mod tests;

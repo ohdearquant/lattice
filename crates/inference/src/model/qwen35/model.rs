@@ -80,6 +80,14 @@ impl Qwen35Model {
         &self.tokenizer
     }
 
+    /// **Unstable**: maximum sequence length the precomputed RoPE table can
+    /// serve. `forward_step(token, position, ..)` panics if `position` is at
+    /// or above this value, so callers driving long-context evaluation must
+    /// keep their per-window position strictly below it.
+    pub fn max_context(&self) -> usize {
+        self.rope.max_positions()
+    }
+
     /// **Unstable**: access raw embedding weights for debugging.
     pub fn embed_weights(&self) -> &[f32] {
         &self.weights.embed_tokens
