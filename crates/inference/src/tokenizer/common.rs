@@ -82,6 +82,17 @@ pub trait Tokenizer: Send + Sync {
             "tokenize_pair is not implemented for this tokenizer".into(),
         ))
     }
+
+    /// **Stable**: decode token IDs back to text.
+    ///
+    /// Returns `None` for tokenizers that do not support detokenization —
+    /// encoder-only embedding tokenizers (WordPiece/SentencePiece for
+    /// BERT/BGE) have no generative decode use. Generative tokenizers
+    /// (`BpeTokenizer`) override this with a real implementation.
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        let _ = ids;
+        None
+    }
 }
 
 /// Pad an ID sequence and explicit token type IDs to a fixed target length.
