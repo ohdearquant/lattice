@@ -227,15 +227,15 @@ pub fn generate(
         }
     }
 
-    // 7. Detokenize.
-    // The Tokenizer trait does not expose a decode method; callers needing decoded text
-    // should use BpeTokenizer::token_for_id + byte_decode_token directly.
-    let _ = tokenizer; // suppress unused-variable warning
-    let text = String::new();
+    // 7. Detokenize via the tokenizer's decode (BpeTokenizer implements
+    // GPT-2 byte-level decode; only non-generative encoder tokenizers
+    // return None, in which case text is empty but token_ids still carry
+    // the result).
+    let decoded = tokenizer.decode(&generated_ids).unwrap_or_default();
     let full_text = if config.include_prompt {
-        prompt.to_string()
+        format!("{prompt}{decoded}")
     } else {
-        text
+        decoded
     };
 
     Ok(GenerateOutput {
