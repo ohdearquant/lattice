@@ -231,11 +231,19 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// **Unstable**: construct sampler.
+    /// **Unstable**: construct sampler with a non-deterministic seed.
+    ///
+    /// Seeded from the system clock so independent samplers (e.g. concurrent
+    /// requests) do not produce identical token streams. Use
+    /// [`with_seed`](Self::with_seed) for reproducible sampling.
     pub fn new(config: SamplingConfig) -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x853c_49e6_748f_ea9b);
         Self {
             config,
-            rng: Rng::new(42),
+            rng: Rng::new(seed),
             recent_tokens: Vec::new(),
             max_recent: 64,
             candidate_scratch: Vec::new(),

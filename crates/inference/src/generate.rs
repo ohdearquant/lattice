@@ -164,7 +164,7 @@ pub fn generate(
     let prompt_len = tokenized.real_length;
 
     if prompt_len == 0 {
-        return Err(InferenceError::ModelNotFound("Empty prompt".into()));
+        return Err(InferenceError::InvalidInput("Empty prompt".into()));
     }
 
     // 2. Initialize KV cache and scratch (allocate once per request)
@@ -285,7 +285,7 @@ fn forward_with_cache<'a>(
     for (i, &tok) in input_ids.iter().enumerate() {
         let tok = tok as usize;
         if tok >= cfg.vocab_size {
-            return Err(InferenceError::ModelNotFound(format!(
+            return Err(InferenceError::InvalidInput(format!(
                 "Token ID {tok} exceeds vocab size {}",
                 cfg.vocab_size
             )));
