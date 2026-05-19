@@ -106,6 +106,32 @@ struct IndexEntry {
     numel: usize,
 }
 
+fn zero_mtp_in_config_json(json: &str) -> Result<String, InferenceError> {
+    let mut value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        InferenceError::Inference(format!("zero_mtp_in_config_json: invalid JSON: {e}"))
+    })?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        InferenceError::Inference(
+            "zero_mtp_in_config_json: top-level JSON must be an object".to_string(),
+        )
+    })?;
+    if let Some(text_config) = obj.get_mut("text_config")
+        && let Some(text_obj) = text_config.as_object_mut()
+    {
+        text_obj.insert(
+            "mtp_num_hidden_layers".to_string(),
+            serde_json::Value::Number(0.into()),
+        );
+    }
+    obj.insert(
+        "mtp_num_hidden_layers".to_string(),
+        serde_json::Value::Number(0.into()),
+    );
+    serde_json::to_string_pretty(&value).map_err(|e| {
+        InferenceError::Inference(format!("zero_mtp_in_config_json: serialize failed: {e}"))
+    })
+}
+
 /// Refuse-on-fail QuaRot Qwen3.5 model conversion (ADR-044 §"Step 3c contract").
 ///
 /// On success, writes the converted model to `output_dir` (created if
@@ -133,6 +159,10 @@ struct IndexEntry {
 /// - Forward-equivalence gate refuses — propagated unchanged.
 /// - Disk I/O error during output write (file create, write,
 ///   directory create).
+///
+/// The emitted `config.json` sets `mtp_num_hidden_layers` to 0 when MTP
+/// weights are skipped, so the runtime loader does not attempt to activate
+/// the MTP path on a QuaRot artifact.
 pub fn convert_quarot_qwen35(
     input_dir: &Path,
     output_dir: &Path,
@@ -324,7 +354,10 @@ pub fn convert_quarot_qwen35(
         ))
     })?;
 
-    let output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
+    let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
+    if cfg.mtp_num_hidden_layers > 0 {
+        output_config_json = zero_mtp_in_config_json(&output_config_json)?;
+    }
     let out_config_path = output_dir.join("config.json");
     fs::write(&out_config_path, &output_config_json).map_err(|e| {
         InferenceError::Inference(format!(
@@ -1660,6 +1693,26 @@ mod tests {
             "QuaRot converter must not emit MTP files (rotation basis mismatch), \
              but found: {:?}",
             mtp_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+
+        // Output config must zero mtp_num_hidden_layers so the runtime
+        // loader does not attempt MTP activation on QuaRot artifacts.
+        let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
+        let out_val: serde_json::Value = serde_json::from_str(&out_cfg_str).unwrap();
+        assert_eq!(
+            out_val
+                .get("text_config")
+                .and_then(|tc| tc.get("mtp_num_hidden_layers"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "output config text_config.mtp_num_hidden_layers must be 0"
+        );
+        assert_eq!(
+            out_val
+                .get("mtp_num_hidden_layers")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "output config top-level mtp_num_hidden_layers must be 0"
         );
     }
 
