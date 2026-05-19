@@ -3787,10 +3787,14 @@ kernel void lora_gemv_b_accum(
             });
 
             let need_checkpoints = mtp.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
+            // tokens through `verify_tokens_batched`, which checkpoints slot 0 (pre-verify)
+            // plus one slot per processed token. Pool size = max_tokens + 1, so we need
+            // `max_tokens >= 1 + SELF_SPEC_MAX_DRAFT` to avoid out-of-bounds slot indexing.
             let checkpoint_max_tokens = if mtp.is_some() {
-                MTP_VERIFY_MAX_TOKENS.max(SELF_SPEC_MAX_DRAFT)
+                MTP_VERIFY_MAX_TOKENS.max(1 + SELF_SPEC_MAX_DRAFT)
             } else {
-                SELF_SPEC_MAX_DRAFT
+                1 + SELF_SPEC_MAX_DRAFT
             };
             let gdn_checkpoints = if need_checkpoints {
                 Some(MetalGdnCheckpointPool::new(
@@ -6750,13 +6754,18 @@ kernel void lora_gemv_b_accum(
 
                 // --- Draft phase: K GDN-only forwards ---
                 let t_draft = std::time::Instant::now();
+                // Self-spec uses slot-based rollback: `verify_tokens_batched` populates one
+                // slot per verify token (slot k = state after k tokens processed by the full
+                // model). We do NOT take a `batch_repair_token` shortcut here — that path
+                // assumes a 2-token MTP verify, and would replay only the pending token on
+                // any rejection, leaving GDN state inconsistent with the KV cache after
+                // partial acceptance.
                 if let Some(ref mut p) = self.session.gdn_checkpoints {
                     p.active_base_seq_len = Some(pos);
                     p.mtp_base_seq_len = None;
-                    p.batch_repair_token = Some((pending_token, pos));
+                    p.batch_repair_token = None;
                 }
-                // Slot 0 = GDN state before the pending token is processed by the full model.
-                if self.checkpoint_gdn_to_slot(0).is_err() {
+                if self.session.gdn_checkpoints.is_none() {
                     // Checkpoint pool not allocated — fall through to single-token decode.
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
@@ -10463,10 +10472,13 @@ kernel void lora_gemv_b_accum(
             });
             let need_checkpoints =
                 mtp_weights_opt.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
+            // tokens through `verify_tokens_batched`; pool size must cover one slot per token
+            // plus the pre-verify base slot.
             let checkpoint_max_tokens = if mtp_weights_opt.is_some() {
-                MTP_VERIFY_MAX_TOKENS.max(SELF_SPEC_MAX_DRAFT)
+                MTP_VERIFY_MAX_TOKENS.max(1 + SELF_SPEC_MAX_DRAFT)
             } else {
-                SELF_SPEC_MAX_DRAFT
+                1 + SELF_SPEC_MAX_DRAFT
             };
             let gdn_checkpoints = if need_checkpoints {
                 Some(MetalGdnCheckpointPool::new(
@@ -13126,13 +13138,15 @@ kernel void decode_attention_reference(
         /// self-speculative draft path (GDN-only forward) and verify path (full).
         fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
             use crate::attention::gdn::GatedDeltaNetWeights;
-            let hidden = 128usize;
-            let intermediate = 32usize;
+            // Metal FlashAttention decode requires head_dim=256 (see
+            // `validate_flash_decode_shape`). Hidden size = num_attention_heads * head_dim
+            // so the Q/K/V projections fit the per-head layout used by the decode kernel.
+            let hidden = 512usize;
+            let intermediate = 64usize;
             let vocab = 32usize;
-            // GDN parameters matching the fixture config below.
             let num_kh = 1usize;
-            let kd = 8usize;
-            let vd = 8usize;
+            let kd = 16usize;
+            let vd = 16usize;
             let qkv_dim = num_kh * kd * 2 + num_kh * vd; // Q+K+V
             let out_dim = num_kh * vd;
             let ks = 4usize;
@@ -13144,7 +13158,7 @@ kernel void decode_attention_reference(
                 rms_norm_eps: 1e-6,
                 num_attention_heads: 2,
                 num_key_value_heads: 1,
-                head_dim: 64,
+                head_dim: 256,
                 rope_theta: 10_000_000.0,
                 partial_rotary_factor: 0.25,
                 rope_parameters: None,
@@ -13171,7 +13185,7 @@ kernel void decode_attention_reference(
                 ],
                 layer_mask: vec![true; 4],
                 eos_token_id: (vocab - 1) as u32,
-                max_position_embeddings: 64,
+                max_position_embeddings: 128,
             };
 
             let make_common = || CommonLayerWeights {
@@ -13277,19 +13291,58 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// Run `f` with `LATTICE_SELF_SPEC=1` in the process environment, then remove it.
+        ///
+        /// Rust 2024 marks `set_var`/`remove_var` as `unsafe` because they can race with
+        /// reads on other threads. We serialize self-spec tests through `ENV_LOCK` so this
+        /// runs single-threaded with respect to the env var; the env var is only consulted
+        /// at session construction (line 3778 / 10374), so no concurrent reads occur during
+        /// the test body itself.
+        fn with_self_spec_env<R>(f: impl FnOnce() -> R) -> R {
+            use std::sync::Mutex;
+            static ENV_LOCK: Mutex<()> = Mutex::new(());
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: only this serialized closure mutates LATTICE_SELF_SPEC. The lock
+            // forbids concurrent test threads from reading or writing it.
+            unsafe {
+                std::env::set_var("LATTICE_SELF_SPEC", "1");
+            }
+            let r = f();
+            // SAFETY: same justification as above.
+            unsafe {
+                std::env::remove_var("LATTICE_SELF_SPEC");
+            }
+            r
+        }
+
+        fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
+            use std::collections::HashMap;
+            let mut vocab: HashMap<String, u32> = HashMap::new();
+            // A handful of canonical specials plus a few bytes — generate_greedy_self_spec
+            // only uses the tokenizer for final decode, so vocab content doesn't need to
+            // cover the model's full id range.
+            vocab.insert("<|endoftext|>".to_string(), 0);
+            vocab.insert("<|im_start|>".to_string(), 1);
+            vocab.insert("<|im_end|>".to_string(), 2);
+            for i in 0..32u32 {
+                vocab.insert(format!("t{i}"), 3 + i);
+            }
+            crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                .expect("minimal tokenizer build")
+        }
+
         #[test]
         fn self_spec_checkpoint_pool_allocated_when_env_set() {
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
 
-            // Temporarily set LATTICE_SELF_SPEC for session construction.
-            std::env::set_var("LATTICE_SELF_SPEC", "1");
-            let (cfg, weights) = tiny_hybrid_fixture();
-            let result = MetalQwen35State::new(&weights, &cfg, 32);
-            std::env::remove_var("LATTICE_SELF_SPEC");
+            let state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32)
+                    .expect("tiny hybrid fixture with LATTICE_SELF_SPEC")
+            });
 
-            let state = result.expect("tiny hybrid fixture with LATTICE_SELF_SPEC");
             assert!(
                 state.session.gdn_checkpoints.is_some(),
                 "gdn_checkpoints must be allocated when LATTICE_SELF_SPEC is set"
@@ -13302,18 +13355,9 @@ kernel void decode_attention_reference(
                 return;
             };
 
-            std::env::set_var("LATTICE_SELF_SPEC", "1");
-            let (cfg, weights) = tiny_hybrid_fixture();
-            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-            std::env::remove_var("LATTICE_SELF_SPEC");
-            let mut state = state;
-
             use crate::model::qwen35_config::GenerateConfig;
-            use crate::tokenizer::bpe::BpeTokenizer;
 
-            // Build a trivial BpeTokenizer from the cfg eos id so we can call generate.
-            // The token IDs produced don't need to decode correctly — we only check count.
-            let tokenizer = BpeTokenizer::for_testing(cfg.vocab_size);
+            let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
                 max_new_tokens: 8,
                 temperature: 0.0,
@@ -13322,21 +13366,26 @@ kernel void decode_attention_reference(
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
             };
 
-            // Tokenize a minimal prompt (single token id=0).
-            let prompt_ids = vec![0u32];
-            state.reset_state();
-            let prefill_logits = state.forward_prefill(&prompt_ids);
+            let out = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
-            std::env::set_var("LATTICE_SELF_SPEC", "1");
-            let out = state.generate_greedy_self_spec(
-                &prefill_logits,
-                prompt_ids.len(),
-                &tokenizer,
-                &gen_cfg,
-            );
-            std::env::remove_var("LATTICE_SELF_SPEC");
+                let prompt_ids = vec![0u32];
+                state.reset_state();
+                let prefill_logits = state.forward_prefill(&prompt_ids);
+
+                state.generate_greedy_self_spec(
+                    &prefill_logits,
+                    prompt_ids.len(),
+                    &tokenizer,
+                    &gen_cfg,
+                )
+            });
 
             assert!(
                 out.generated_tokens <= gen_cfg.max_new_tokens,
@@ -13349,6 +13398,117 @@ kernel void decode_attention_reference(
                 out.generated_tokens,
                 "token_ids.len() must match generated_tokens"
             );
+        }
+
+        #[test]
+        fn self_spec_pool_holds_one_slot_per_verify_token_plus_base() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            let state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+
+            let pool = state
+                .session
+                .gdn_checkpoints
+                .as_ref()
+                .expect("self-spec pool must be allocated");
+            // verify_tokens_batched writes slot 0 (pre-verify) plus one slot per processed
+            // token. Self-spec sends `1 + SELF_SPEC_MAX_DRAFT` tokens, so the pool must
+            // hold `2 + SELF_SPEC_MAX_DRAFT` slots total.
+            assert!(
+                pool.conv_slots.len() >= 2 + SELF_SPEC_MAX_DRAFT,
+                "pool conv_slots = {} must be >= {} (1 base + 1 + SELF_SPEC_MAX_DRAFT verified tokens)",
+                pool.conv_slots.len(),
+                2 + SELF_SPEC_MAX_DRAFT,
+            );
+            assert!(
+                pool.s_slots.len() >= 2 + SELF_SPEC_MAX_DRAFT,
+                "pool s_slots = {} must be >= {}",
+                pool.s_slots.len(),
+                2 + SELF_SPEC_MAX_DRAFT,
+            );
+        }
+
+        #[test]
+        fn snapshot_gdn_states_roundtrips_through_metal_buffers() {
+            use crate::speculative::MtpTargetVerifier;
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+
+            // Write a recognizable pattern into the live GPU GDN buffers.
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: StorageModeShared buffer; no command buffer in flight in the test.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = (li as f32) + (k as f32) * 1e-4;
+                    }
+                }
+            }
+            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = -(li as f32) - (k as f32) * 1e-4;
+                    }
+                }
+            }
+
+            let snap = state.snapshot_gdn_states();
+            assert_eq!(snap.len(), state.session.gdn_gpu_s_matrices.len());
+
+            // Clobber the live buffers.
+            for buf in &state.session.gdn_gpu_s_matrices {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 0.0;
+                    }
+                }
+            }
+            for buf in &state.session.gdn_gpu_conv_bufs {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 0.0;
+                    }
+                }
+            }
+
+            state.restore_gdn_states(&snap);
+
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                let live = unsafe {
+                    let ptr = buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, n)
+                };
+                for (k, &v) in live.iter().enumerate() {
+                    let expected = (li as f32) + (k as f32) * 1e-4;
+                    assert!(
+                        (v - expected).abs() < 1e-6,
+                        "s_matrices[{li}][{k}] = {v} after restore, expected {expected}"
+                    );
+                }
+            }
         }
     }
 
@@ -13371,6 +13531,64 @@ kernel void decode_attention_reference(
         ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
             let out = self.verify_tokens_batched(tokens, start_pos)?;
             Ok(out.logits)
+        }
+
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let mut snap = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                // SAFETY: GPU buffers are StorageModeShared (allocated with
+                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
+                // `contents()` points to host-readable memory. `length()` is the
+                // exact allocated byte length and is divisible by 4 (we always
+                // allocate f32 buffers). Callers of `snapshot_gdn_states` invoke it
+                // outside any in-flight command buffer (in `mtp_verify_draft` before
+                // `target.verify_tokens`), so no GPU write can race with this read.
+                let conv = unsafe {
+                    let ptr = conv_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, conv_floats).to_vec()
+                };
+                let s = unsafe {
+                    let ptr = s_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, s_floats).to_vec()
+                };
+                snap.push((s, conv));
+            }
+            snap
+        }
+
+        fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            if snapshot.is_empty() {
+                return;
+            }
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            debug_assert_eq!(snapshot.len(), num_layers);
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_bytes = conv_snap.len() * 4;
+                let s_bytes = s_snap.len() * 4;
+                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
+                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
+                // the buffer directly; callers invoke this outside any in-flight command
+                // buffer (rejection branch in `mtp_verify_draft`).
+                unsafe {
+                    let dst = conv_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
+                }
+                unsafe {
+                    let dst = s_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(s_snap.as_ptr(), dst, s_snap.len());
+                }
+                if i < self.session.gdn_states.len() {
+                    self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
+                }
+            }
         }
     }
 }

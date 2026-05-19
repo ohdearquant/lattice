@@ -97,6 +97,22 @@ impl GatedDeltaNetState {
         self.conv_buffer.fill(0.0);
     }
 
+    /// Snapshot the live recurrent state for speculative rollback.
+    /// See ADR-052: snapshot-before-draft protocol.
+    pub fn snapshot(&self) -> GdnLayerSnapshot {
+        (self.s_matrices.clone(), self.conv_buffer.clone())
+    }
+
+    /// Restore recurrent state from a prior [`snapshot`]. The snapshot must have been taken
+    /// from a state with the same key/value dims; in debug builds this is enforced via
+    /// `debug_assert_eq!` on buffer lengths.
+    pub fn restore_from(&mut self, snap: &GdnLayerSnapshot) {
+        debug_assert_eq!(self.s_matrices.len(), snap.0.len());
+        debug_assert_eq!(self.conv_buffer.len(), snap.1.len());
+        self.s_matrices.copy_from_slice(&snap.0);
+        self.conv_buffer.copy_from_slice(&snap.1);
+    }
+
     /// Access S matrix for head h as a mutable slice [key_dim, value_dim].
     #[inline]
     fn s_matrix_mut(&mut self, h: usize) -> &mut [f32] {
@@ -104,6 +120,14 @@ impl GatedDeltaNetState {
         &mut self.s_matrices[h * size..(h + 1) * size]
     }
 }
+
+/// Opaque snapshot of one GDN layer's recurrent state.
+///
+/// Layout: `(s_matrices clone, conv_buffer clone)`. See ADR-052.
+pub type GdnLayerSnapshot = (Vec<f32>, Vec<f32>);
+
+/// Snapshot of all GDN layers for a single model instance.
+pub type GdnSnapshot = Vec<GdnLayerSnapshot>;
 
 /// **Unstable**: scratch buffers for the scalar GatedDeltaNet step; buffer set may change.
 #[derive(Debug, Default)]
@@ -826,5 +850,33 @@ mod tests {
     fn test_output_dim_symmetric() {
         let cfg = Qwen35Config::qwen35_2b();
         assert_eq!(cfg.linear_output_dim(), 16 * 128);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_state() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let mut state = GatedDeltaNetState::new(&cfg);
+        for (i, v) in state.s_matrices.iter_mut().enumerate() {
+            *v = (i as f32) * 0.001;
+        }
+        for (i, v) in state.conv_buffer.iter_mut().enumerate() {
+            *v = (i as f32) * 0.01;
+        }
+        let snap = state.snapshot();
+        state.reset();
+        assert!(state.s_matrices.iter().all(|v| *v == 0.0));
+        state.restore_from(&snap);
+        assert_eq!(state.s_matrices[7], 7.0 * 0.001);
+        assert_eq!(state.conv_buffer[3], 3.0 * 0.01);
+    }
+
+    #[test]
+    fn snapshot_independent_after_state_mutation() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let mut state = GatedDeltaNetState::new(&cfg);
+        state.s_matrices[0] = 1.0;
+        let snap = state.snapshot();
+        state.s_matrices[0] = 999.0;
+        assert_eq!(snap.0[0], 1.0, "snapshot must own its buffers");
     }
 }

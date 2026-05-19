@@ -1084,6 +1084,18 @@ pub trait MtpTargetVerifier {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError>;
+
+    /// Snapshot every GDN layer's recurrent state (S matrices + conv buffer). See ADR-052.
+    ///
+    /// Implementors that have no GDN layers (e.g. pure-attention test mocks) return an empty
+    /// `Vec`. Callers must treat the returned snapshot as opaque.
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot;
+
+    /// Restore every GDN layer's recurrent state from a prior [`snapshot_gdn_states`] call.
+    ///
+    /// The snapshot must have been taken from the same model instance. Implementors that
+    /// hold no GDN state accept an empty snapshot and do nothing.
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot);
 }
 
 /// Verify a speculative MTP draft against the target model.
@@ -1122,6 +1134,12 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_start = target.cache_position();
     let mtp_start = verifier.cache.seq_len();
 
+    // ADR-052: snapshot target GDN state before draft generation. The draft itself runs only
+    // through `MtpVerifier`'s separate cache, but `target.verify_tokens` below mutates the
+    // target GDN state through all draft tokens; we must restore it on rejection so that
+    // post-rejection forward steps start from the correct recurrent state.
+    let gdn_snap = target.snapshot_gdn_states();
+
     // Generate draft
     let draft = verifier.draft_tokens(
         current_token_id,
@@ -1156,9 +1174,12 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_first = argmax(initial_target_logits) as u32;
 
     if draft[0] != target_first {
-        // Full rejection before calling verify_tokens
+        // Full rejection before calling verify_tokens. Target GDN was not advanced (no
+        // `verify_tokens` call), so the snapshot is identical to current state — restore is
+        // a no-op for correctness but kept here for parity with the partial-acceptance path.
         verifier.rollback_cache_to(mtp_start)?;
         target.rollback_cache_to(target_start)?;
+        target.restore_gdn_states(&gdn_snap);
         let fallback = target_first;
         return Ok(MtpVerifyResult {
             accepted_count: 0,
@@ -1239,6 +1260,16 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     // Roll back caches to accepted positions
     verifier.rollback_cache_to(mtp_start + accepted_count)?;
     target.rollback_cache_to(target_start + accepted_count)?;
+
+    // ADR-052: target GDN state was advanced through ALL `draft_len` tokens by `verify_tokens`.
+    // If we accepted everything (`accepted_count == draft_len`), the state is correct and the
+    // snapshot is dropped. Otherwise restore the pre-draft snapshot; the target adapter is
+    // responsible for re-running the accepted prefix on the next forward step so that GDN and
+    // KV agree at `target_start + accepted_count`. Implementors that hold no GDN state make
+    // both `rollback_cache_to` and `restore_gdn_states` no-ops on that branch.
+    if accepted_count < draft_len {
+        target.restore_gdn_states(&gdn_snap);
+    }
 
     let acceptance_rate = accepted_count as f64 / draft_len.max(1) as f64;
     let accepted_tokens_per_forward = accepted_count as f64 / target_forwards.max(1) as f64;
@@ -2168,6 +2199,10 @@ mod tests {
             self.cache_pos += tokens.len();
             Ok(self.logits_by_step.clone())
         }
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            Vec::new()
+        }
+        fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
     }
 
     const EOS: u32 = 99;
