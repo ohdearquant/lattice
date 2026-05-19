@@ -37,10 +37,11 @@ allocate and populate separate pages rather than pointing at the same physical p
 Add a **prefix-sharing layer** on top of the existing `PagedKVCache` infrastructure. The design has
 two components:
 
-1. **`PrefixPageCache`**: A bounded LRU hash map keyed by `u64` prefix hash (FxHash of the token
-   slice). On a hit, the caller receives read-only shared `Arc` references to pre-populated physical
-   pages. On a miss, newly computed pages are inserted and shared. This is the path for single-user
-   sessions on Apple Silicon — simpler than a radix tree, covers 90% of the benefit.
+1. **`PrefixPageCache`**: A bounded LRU hash map keyed by `PrefixKey { adapter_id: AdapterId,
+   token_hash: u64 }` (FxHash of the token slice, namespaced by adapter). On a hit, the caller
+   receives read-only shared `Arc` references to pre-populated physical pages. On a miss, newly
+   computed pages are inserted and shared. This is the path for single-user sessions on Apple
+   Silicon — simpler than a radix tree, covers 90% of the benefit.
 
 2. **`SharedPageRef`**: A thin newtype wrapping `Arc<[f32]>` (one arc per page, pointing into a
    shared `PagePool` allocation). Read access is lock-free; write access requires promotion to an
@@ -55,9 +56,8 @@ The radix tree approach (SGLang RadixAttention) is deferred to the server path (
 pub struct PrefixPageCache {
     /// max number of prefix entries retained.
     capacity: usize,
-    /// key: FxHash of token ids for the prefix
-    /// value: (prefix_len, Arc-wrapped physical page slice per layer)
-    entries: IndexMap<u64, PrefixEntry>,
+    /// key: (adapter_id, token_hash) — namespaced to prevent cross-adapter cache poisoning
+    entries: IndexMap<PrefixKey, PrefixEntry>,
 }
 
 pub struct PrefixEntry {

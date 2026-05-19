@@ -139,7 +139,7 @@ fn restore_gdn_states(&mut self, snapshot: &GdnSnapshot);
 // GdnSnapshot = Vec<(Vec<f32>, Vec<f32>)>
 //   index i = layer i: (s_matrices.clone(), conv_buffer.clone())
 // Memory budget: see ADR-052 §Memory Budget for authoritative per-config estimates.
-// For Qwen3.5-0.8B: ~19.3 MiB per snapshot (18 GDN layers, 16 heads, 128×128 state + 6144×3 conv)
+// For Qwen3.5-2B: ~19.3 MiB per snapshot (18 GDN layers, 16 heads, 128×128 state + 6144×3 conv)
 ```
 
 Snapshot frequency: once per speculative step (before draft generation). Not per-token. The
@@ -202,7 +202,7 @@ needed.
 ## Risks
 
 **R1: GDN snapshot memory.** See ADR-052 §Memory Budget for authoritative per-config estimates
-(~19.3 MiB for Qwen3.5-0.8B). For larger models the snapshot scales with `num_heads * key_dim *
+(~19.3 MiB for Qwen3.5-2B). For larger models the snapshot scales with `num_heads * key_dim *
 value_dim * num_gdn_layers`. The snapshot is ephemeral (held for one speculative step, then
 discarded or restored). Mitigation: snapshot is heap-allocated once and reused across steps via
 a `Vec::clear()` + `extend_from_slice` pattern to avoid per-step allocation.

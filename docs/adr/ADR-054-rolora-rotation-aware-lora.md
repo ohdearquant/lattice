@@ -241,7 +241,7 @@ METAL FORWARD (per token, unchanged from ADR-045)
 |-------------|------|------|---------|
 | **ADR-045 counter-rotation only (current)** | No training changes needed; works with existing PEFT adapters | Adapter trained against wrong noise distribution at Q4; SNR gap grows at lower bit-widths | Keep as legacy path; insufficient for new Q4 adapter training |
 | **RoLoRA (this ADR)** | Adapter trained in correct basis; +29.5pp reported on W4A4; zero serving-side overhead for rotation-aware adapters; seed already deterministic | Requires rotation-aware training infra; not compatible with generic PEFT export unless seed metadata added | **Accept** |
-| **QuAILoRA initialization** (arxiv:2410.14713) | Minimizes quantization error at LoRA init; composable with RoLoRA | Orthogonal concern (init strategy, not basis alignment); separate ADR | Defer to ADR-055; composable with this decision |
+| **QuAILoRA initialization** (arxiv:2410.14713) | Minimizes quantization error at LoRA init; composable with RoLoRA | Orthogonal concern (init strategy, not basis alignment); separate ADR | Defer to a future ADR; composable with this decision |
 | **Runtime rotation at each training step** | Avoids modifying frozen weights | Per-step `d×d` WHT overhead on all target projections during training; unnecessary given seed is fixed | Reject — one-time absorption is equivalent and free |
 | **Separate RoLoRA training crate** | Clean separation | Violates `Π_AEP` (FindExisting > Create); `LoraConfig` already has the right extension point | Reject |
 
@@ -277,7 +277,7 @@ METAL FORWARD (per token, unchanged from ADR-045)
 
 - RoLoRA: Zhu et al., EMNLP 2024 — "RoLoRA: Fine-tuning Rotated Outlier-Free LLMs for Effective
   Weight-Activation Quantization", arxiv:2407.08044
-- QuAILoRA: arxiv:2410.14713 — quantization-error-aware LoRA initialization (deferred to ADR-055)
+- QuAILoRA: arxiv:2410.14713 — quantization-error-aware LoRA initialization (deferred to a future ADR)
 - ADR-044: QuaRot Hadamard-rotated 4-bit quantization (rotation math, `RandomizedHadamard`)
 - ADR-045: QuaRot + LoRA composition at inference time (serving-side counter-rotation)
 - ADR-043: LoRA serving verification (correctness framework, `LoraHook` trait)

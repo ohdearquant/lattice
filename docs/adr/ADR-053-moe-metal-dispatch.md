@@ -98,7 +98,7 @@ identical to the existing `gemv_decode_core` kernel (M=1, N=inter or hidden, K=h
 
 **D3: Router (top-k softmax) runs on CPU.**
 For decode-mode (batch size 1), the router matmul is `[1, hidden] × [num_experts, hidden]^T` →
-`[1, num_experts]` — a 7168×256 GEMV. At Q4 this is ~0.9 MB of weight data. CPU NEON handles
+`[1, num_experts]` — a 2048×256 GEMV. At Q4 this is ~0.25 MB of weight data. CPU NEON handles
 this in ~0.05 ms; shipping it to the GPU costs a synchronization boundary before expert
 selection can proceed. More importantly, expert selection is a control-flow branch: the CPU
 must know which experts are active before encoding any of their compute commands into the
@@ -206,7 +206,7 @@ Each routed expert result is scaled by its router weight before accumulation. Tw
 - **CPU accumulation**: GPU writes each expert's down output to a per-expert scratch slot; CPU
   reads back all top_k results after command buffer completion and accumulates with weights.
 
-For top_k=8 and hidden=7168: CPU readback is 8 × 7168 × 4 bytes = 230 KB. At unified memory
+For top_k=8 and hidden=2048: CPU readback is 8 × 2048 × 4 bytes = 64 KB. At unified memory
 this is a pointer dereference, not a PCIe transfer — readback cost is negligible. GPU
 accumulation avoids even this, at the cost of one additional `scale_add` kernel encode per
 expert (8 extra dispatches within the same command buffer — negligible vs. the GEMV dispatches).
@@ -236,7 +236,7 @@ match &layer.common.ffn {
 | MLX backend (call Apple's MPS via MLX Rust bindings) | MLX is 3× faster than llama.cpp on MoE on Apple Silicon (measured: Ollama/MLX 58→112 tok/s on Qwen3.5-35B-A3B). But adding MLX as a dependency contradicts the pure-Rust, no-ONNX constraint in AGENTS.md. Not an option in v1. Track as v2 option if native Metal gap persists. |
 | GPU router (move top-k softmax to Metal) | Eliminates the CPU→GPU branch for expert selection, but requires a GPU→CPU readback of `[num_experts]` logits before command encoding can start. At batch=1 the GEMV cost (~0.05 ms on NEON) does not justify the synchronization. Reconsider if batch>1 becomes the target. |
 | Pre-gated routing (predict expert activations one step ahead) | DeepSeek-V2/V3 uses this to prefetch expert weights. Effective at hiding memory latency for weight-swapping configurations. Unnecessary when all weights are resident in unified memory. Defer to v2 with expert swapping. |
-| Expert weight re-layout at load (token-major) | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~5.6 GB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path. |
+| Expert weight re-layout at load (token-major) | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~15 GiB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path. |
 | Shared expert caching with redundancy elimination | DeepSeek caches the shared expert output across consecutive tokens when input hasn't changed. Valid optimization but requires state tracking that doesn't exist in the current decode loop. Defer. |
 
 ---
@@ -250,7 +250,7 @@ MoE throughput depends on expert weight bandwidth utilization across 8 concurren
 in the same command buffer. Measure after implementation; do not pin the number until verified.
 
 **R2: Expert memory pressure on 32 GB M2 Pro.**
-At ~5.6 GB for routed expert weights plus ~2 GB for attention state and activation buffers, the
+At ~15 GiB for routed expert weights plus ~2 GB for attention state and activation buffers, the
 35B MoE model is borderline on 32 GB. v1 will document the minimum configuration (64 GB
 recommended) and reject at load time with a clear error if total buffer allocation would
 exceed a configurable threshold (default: 0.85 × device.recommendedMaxWorkingSetSize).
@@ -264,7 +264,7 @@ ADR-044 v1 lands. No silent wrong results.
 
 **R4: Router weight dtype mismatch.**
 The router gate weight (`MoeRouter::gate`) is `Vec<f32>`. The existing CPU path reads it
-directly. For Metal, the gate weight is also small enough (256 × 7168 × 4 bytes = 7.3 MB) to
+directly. For Metal, the gate weight is also small enough (256 × 2048 × 4 bytes = 2.1 MB) to
 keep as f32 in its own `MTLBuffer` and run the CPU NEON kernel against the shared-memory pointer,
 avoiding a separate GPU router kernel. Confirm the `contents()` pointer is CPU-readable when
 using `MTLStorageModeShared` — it is, per the existing weight buffer pattern in `metal_qwen35.rs`.

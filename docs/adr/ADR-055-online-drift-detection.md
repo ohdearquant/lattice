@@ -113,7 +113,7 @@ impl OnlineDriftDetector {
 
 `push()` appends to `current_window`, evicts oldest entry if full. Every `check_interval`
 samples, calls `point_set_sinkhorn_divergence` (ADR-039) between `reference_window` and
-`current_window`. If `divergence > threshold`, returns `Some(DriftSignal)`.
+`current_window`. If `divergence > threshold`, returns `Some(OnlineDriftSignal)`.
 
 The reference window is frozen at construction from the first W samples. After an adapter
 refresh, `reset_reference()` promotes `current_window` to `reference_window`, restarting
@@ -134,7 +134,7 @@ pub trait DriftSampler: Send + Sync {
 }
 ```
 
-The monitor hooks into `lattice-inference`'s forward pass via an optional `Arc<InferenceDriftMonitor>`
+The monitor hooks into `lattice-inference`'s forward pass via an optional `Arc<dyn DriftSampler>`
 on `GenerationConfig`. If `None` (the default), zero overhead — no sampling, no allocation.
 When present, every `sample_every_n_tokens` tokens, the monitor receives the hidden states at
 `sample_layer` and pushes a mean-pooled sample vector (dim = hidden_size) to both detectors.
@@ -149,9 +149,8 @@ of sequence length.
 Forward pass (every N tokens)
   → sample hidden states at layer L
   → mean pool → Vec<f32> of dim hidden_size
-  → push to adapter_detector → Option<DriftSignal>
-  → push to router_detector  → Option<DriftSignal>
-  → if Some: call DriftReactor::on_adapter_stale / on_router_stale
+  → DriftSampler::push_sample(hidden_state)
+  → if drift detected: DriftSampler::on_adapter_stale / on_router_stale
 ```
 
 Both detectors share the same sample stream because both adapter staleness and router staleness
@@ -170,9 +169,9 @@ refresh_interval* = sqrt(2 * C_refresh / (δ * rate_of_divergence))
 where `C_refresh` is the cost of retraining/swapping, `δ` is the excess NLL from stale adapter
 use, and `rate_of_divergence` is empirically estimated from the drift signal time series.
 
-In practice, `threshold` in `DriftConfig` is a Sinkhorn divergence value calibrated from a
+In practice, `threshold` in `OnlineDriftConfig` is a Sinkhorn divergence value calibrated from a
 validation set: compute `S(training_dist, held_out_dist)` at known excess NLL levels and pick
-the divergence that corresponds to acceptable degradation. The `DriftSignal.divergence` value
+the divergence that corresponds to acceptable degradation. The `OnlineDriftSignal.divergence` value
 lets the reactor apply graduated responses (warn vs. force-refresh vs. fallback to base model).
 
 ---
@@ -200,7 +199,7 @@ latency noise floor on M-series silicon. W > 512 requires explicit approval and 
 seen after construction (or after `reset_reference()`). If the first W samples are not
 representative — cold start, single user, atypical prompt — the reference is biased and
 divergence will fire spuriously. Mitigation: `reset_reference()` should be called after a
-warm-up phase of at least 2W samples; document this in `DriftConfig`.
+warm-up phase of at least 2W samples; document this in `OnlineDriftConfig`.
 
 **R3: Mean pooling loses distributional shape.** Mean pooling is an order-1 statistic.
 Two very different distributions with the same mean pool to the same sample. For the first

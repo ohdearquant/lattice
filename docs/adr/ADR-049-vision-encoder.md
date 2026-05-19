@@ -100,11 +100,13 @@ pub struct ImageTensor {
     pub patch_hw: usize,  // patch_h == patch_w == 16 (Qwen3-VL)
 }
 
-/// A multimodal prompt: patch embeddings prepended to text tokens.
+/// A multimodal prompt: merged visual tokens prepended to text tokens.
 pub struct MultimodalInput {
-    /// Projected patch vectors: [n_patches, d_model].
+    /// Projected + merged patch vectors: [visual_tokens, d_model].
+    /// After spatial merge: visual_tokens = raw_patches / (spatial_merge_size^2).
     pub patch_embeddings: Vec<f32>,
-    pub n_patches: usize,
+    pub raw_patches: usize,        // before merge (e.g., 784 for 448/16)
+    pub visual_tokens: usize,      // after merge (e.g., 196 for merge_size=2)
     pub d_model: usize,
     /// Text token IDs following the image.
     pub text_tokens: Vec<u32>,
@@ -183,11 +185,19 @@ pub struct MlpMerger {
 }
 
 impl MlpMerger {
-    /// Project ViT output to decoder hidden dimension.
-    /// Input: flat f32 slice [n_patches * d_vit].
-    /// Output: Vec<f32> [n_patches * d_model].
-    pub fn project(&self, vit_out: &[f32], n_patches: usize) -> Vec<f32>;
+    /// Merge + project ViT output to decoder hidden dimension.
+    /// Groups spatial_merge_size^2 adjacent patches, concatenates their features,
+    /// then projects through the two-layer MLP.
+    /// Input: flat f32 slice [raw_patches * d_vit].
+    /// Output: Vec<f32> [merged_patches * d_model] where merged = raw / merge_size^2.
+    pub fn merge_and_project(&self, vit_out: &[f32], raw_patches: usize) -> Vec<f32>;
 }
+
+// Note: v0 implements a simplified Qwen3-VL path without DeepStack visual indexes
+// or visual_pos_masks. This means v0 is NOT reference-equivalent to the full HF
+// Qwen3-VL pipeline. The > 0.999 cosine similarity acceptance criterion applies
+// only to the ViT encoder output, not the full end-to-end VLM. DeepStack support
+// is deferred to v1.
 ```
 
 ### Integration with MetalQwen35State

@@ -176,16 +176,25 @@ are handled by the PDA stack at runtime.
 ### Mask Apply (Hot Path)
 
 ```rust
-// Apply bitmask: O(vocab_size/64) u64 AND operations.
+// Apply bitmask: iterate mask words, set disallowed logits to NEG_INFINITY.
+// The bitmask is a separate bitset — it is NOT overlaid on the float buffer.
 let mask_base = state.grammar_pos * self.mask_stride;
-for (i, word) in logits_u64_view.iter_mut().enumerate() {
-    *word &= self.masks[mask_base + i];  // zero disallowed tokens
+for word_idx in 0..self.mask_stride {
+    let mask_word = self.masks[mask_base + word_idx];
+    for bit in 0..64u32 {
+        let token_idx = word_idx * 64 + bit as usize;
+        if token_idx >= logits.len() { break; }
+        if mask_word & (1u64 << bit) == 0 {
+            logits[token_idx] = f32::NEG_INFINITY; // disallowed
+        }
+        // allowed tokens: logits unchanged
+    }
 }
-// Remaining f32 positions set to NEG_INFINITY where mask bit is 0.
 ```
 
 On a vocab of 248,320 tokens (Qwen3), `mask_stride = ceil(248320/64) = 3880` u64 words.
-The apply loop is ~3880 iterations — well under 40 µs.
+The outer loop is 3880 iterations; the inner bit-scan can be SIMD-vectorized (e.g., `_mm256_movemask_epi8`
++ batch store) but the scalar version is already well under 40 µs.
 
 ## Alternatives Considered
 
