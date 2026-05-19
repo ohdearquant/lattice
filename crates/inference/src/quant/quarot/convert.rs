@@ -284,144 +284,31 @@ pub fn convert_quarot_qwen35(
         }
     }
 
-    // --- MTP (Multi-Token Prediction) weights ---
+    // --- MTP (Multi-Token Prediction) weights: deliberately NOT emitted ---
     //
-    // IMPORTANT: QuaRot rotates embed_tokens and the residual stream via a
-    // random Hadamard matrix R.  The MTP head receives rotated embeddings
-    // and rotated pre-final hidden states, but its norm gammas and projection
+    // QuaRot rotates embed_tokens and the residual stream via a random
+    // Hadamard matrix R.  The MTP head receives rotated embeddings and
+    // rotated pre-final hidden states, but its norm gammas and projection
     // weights were trained in the un-rotated basis.  Per-element RMSNorm
     // gamma does not commute with R (γ·(R·x) ≠ R·(γ·x)), so naively
     // copying MTP weights produces a draft model in the wrong basis —
     // acceptance drops to ~1/|V|.
     //
-    // Until the QuaRot conversion is extended to handle MTP rotation
-    // algebra (counter-rotate inputs or absorb R into MTP weights), we
-    // deliberately SKIP MTP emission for QuaRot outputs.  The MTP pipeline
-    // still activates on the non-rotated Q8 path (MetalQwen35State::new).
+    // The MTP writer will be added when the QuaRot conversion is extended
+    // to handle MTP rotation algebra (counter-rotate inputs via R^T, or
+    // absorb R into MTP weights, or rotation-aware training).  Until then,
+    // MTP activates only on the non-rotated Q8 path via
+    // MetalQwen35State::new().
     //
-    // For non-QuaRot converters that may call this function in the future,
-    // the MTP section below remains reachable when is_quarot is false.
-    let is_quarot = true; // this function IS the QuaRot converter
-    if cfg.mtp_num_hidden_layers > 0 && is_quarot {
+    // See: QuaRot-MTP Interaction Analysis (KG entity c076e9a8),
+    //      deep_research_prompts.md #4.
+    if cfg.mtp_num_hidden_layers > 0 {
         eprintln!(
-            "[mtp] Skipping MTP weights — QuaRot rotation is not yet applied to \
-             MTP head (rotated embeddings/hidden would feed un-rotated MTP weights). \
-             MTP works on the non-rotated Q8 path."
+            "[mtp] Skipping MTP weights (mtp_num_hidden_layers={}) — QuaRot \
+             rotation is not yet applied to MTP head. MTP works on the \
+             non-rotated Q8 path.",
+            cfg.mtp_num_hidden_layers
         );
-    }
-    if cfg.mtp_num_hidden_layers > 0 && !is_quarot {
-        // 8 projection weight matrices to quantize to Q4.
-        let mtp_q4_names: &[&str] = &[
-            "mtp.fc.weight",
-            "mtp.layers.0.self_attn.q_proj.weight",
-            "mtp.layers.0.self_attn.k_proj.weight",
-            "mtp.layers.0.self_attn.v_proj.weight",
-            "mtp.layers.0.self_attn.o_proj.weight",
-            "mtp.layers.0.mlp.gate_proj.weight",
-            "mtp.layers.0.mlp.up_proj.weight",
-            "mtp.layers.0.mlp.down_proj.weight",
-        ];
-        // 7 norm / small vectors to keep as f16.
-        let mtp_f16_names: &[&str] = &[
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.layers.0.post_attention_layernorm.weight",
-            "mtp.layers.0.self_attn.q_norm.weight",
-            "mtp.layers.0.self_attn.k_norm.weight",
-            "mtp.norm.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-        ];
-
-        // Count present MTP tensors. Zero = genuinely MTP-less export (skip).
-        // All present = proceed. Some but not all = corrupt/partial checkpoint (error).
-        let present_count = mtp_q4_names
-            .iter()
-            .chain(mtp_f16_names.iter())
-            .filter(|name| reader.has_tensor(name))
-            .count();
-        let total_mtp = mtp_q4_names.len() + mtp_f16_names.len();
-
-        if present_count > 0 && present_count < total_mtp {
-            let missing: Vec<&str> = mtp_q4_names
-                .iter()
-                .chain(mtp_f16_names.iter())
-                .copied()
-                .filter(|name| !reader.has_tensor(name))
-                .collect();
-            return Err(InferenceError::Inference(format!(
-                "convert_quarot_qwen35: config has mtp_num_hidden_layers={} but \
-                 only {present_count}/{total_mtp} MTP tensors found in checkpoint. \
-                 Missing: {missing:?}",
-                cfg.mtp_num_hidden_layers
-            )));
-        }
-
-        if present_count == total_mtp {
-            eprintln!(
-                "[mtp] Writing MTP weights (mtp_num_hidden_layers={})",
-                cfg.mtp_num_hidden_layers
-            );
-
-            for &name in mtp_q4_names {
-                let (data, shape) = reader.read_tensor_f64(name).map_err(|e| {
-                    InferenceError::Inference(format!(
-                        "convert_quarot_qwen35: failed to read MTP tensor {name}: {e}"
-                    ))
-                })?;
-                if shape.len() != 2 {
-                    return Err(InferenceError::Inference(format!(
-                        "convert_quarot_qwen35: MTP Q4 tensor `{name}` has shape {shape:?}, \
-                         expected 2-D"
-                    )));
-                }
-                let q4 = quantize_f64_to_q4(&data, &shape);
-                let sanitized = sanitize_tensor_name(name);
-                let file_name = format!("{sanitized}.q4");
-                let out_path = output_dir.join(&file_name);
-                save_q4_file(&out_path, &q4).map_err(|e| {
-                    InferenceError::Inference(format!(
-                        "convert_quarot_qwen35: failed to write MTP Q4 file {}: {e}",
-                        out_path.display()
-                    ))
-                })?;
-                let header_bytes = (4 + 4 + 4 + 8 * shape.len() + 8) as u64;
-                total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(18);
-                planned_quantized += 1;
-                index_entries.push(IndexEntry {
-                    name: name.to_string(),
-                    file: file_name,
-                    quantized: true,
-                    shape,
-                    numel: data.len(),
-                });
-            }
-
-            for &name in mtp_f16_names {
-                let (data, shape) = reader.read_tensor_f64(name).map_err(|e| {
-                    InferenceError::Inference(format!(
-                        "convert_quarot_qwen35: failed to read MTP tensor {name}: {e}"
-                    ))
-                })?;
-                let sanitized = sanitize_tensor_name(name);
-                let file_name = format!("{sanitized}.f16");
-                let out_path = output_dir.join(&file_name);
-                let bytes = write_f16_file(&out_path, &data, &shape)?;
-                total_bytes_out += bytes as u64;
-                kept_f16 += 1;
-                index_entries.push(IndexEntry {
-                    name: name.to_string(),
-                    file: file_name,
-                    quantized: false,
-                    shape,
-                    numel: data.len(),
-                });
-            }
-        } else {
-            eprintln!(
-                "[mtp] Skipping MTP weights — 0/{total_mtp} MTP tensors in checkpoint \
-                 (model was exported without MTP)"
-            );
-        }
     }
 
     let index_path = output_dir.join("quantize_index.json");
@@ -1737,9 +1624,9 @@ mod tests {
         write_mtp_tensors_into(&dir.join("model.safetensors"), cfg, seed);
     }
 
-    /// Happy-path: when the checkpoint contains MTP tensors and config has
-    /// `mtp_num_hidden_layers > 0`, the converter must write all 8 Q4 and
-    /// all 7 f16 MTP files to the output directory.
+    /// QuaRot converter must NOT emit MTP files even when the checkpoint
+    /// has all 15 MTP tensors — rotated embeddings/hidden would feed
+    /// un-rotated MTP weights (γ·(R·x) ≠ R·(γ·x)).
     #[test]
     fn convert_quarot_qwen35_skips_mtp_for_quarot_even_when_present() {
         let tmp = tempfile::tempdir().unwrap();
