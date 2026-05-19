@@ -300,8 +300,8 @@ pub fn convert_quarot_qwen35(
     // MTP activates only on the non-rotated Q8 path via
     // MetalQwen35State::new().
     //
-    // See: QuaRot-MTP Interaction Analysis (KG entity c076e9a8),
-    //      deep_research_prompts.md #4.
+    // See: QuaRot (Ashkboos et al., NeurIPS 2024) §3.1 for the
+    //      rotation scheme; Qwen3.5-0.8B config for mtp_num_hidden_layers.
     if cfg.mtp_num_hidden_layers > 0 {
         eprintln!(
             "[mtp] Skipping MTP weights (mtp_num_hidden_layers={}) — QuaRot \
@@ -1710,9 +1710,8 @@ mod tests {
     }
 
     /// When config has `mtp_num_hidden_layers == 0`, the converter must NOT
-    /// write any MTP files even if the safetensors happens to contain mtp.*
-    /// tensors (i.e. a checkpoint that has MTP weights but the config says
-    /// zero MTP layers).
+    /// write any MTP files — the zero-config gate skips MTP regardless of
+    /// whether the checkpoint contains mtp.* tensors.
     #[test]
     fn convert_quarot_qwen35_skips_mtp_when_config_has_zero_layers() {
         let tmp = tempfile::tempdir().unwrap();
