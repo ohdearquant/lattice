@@ -13209,6 +13209,7 @@ kernel void decode_attention_reference(
                 layer_mask: vec![true; 4],
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
+                quarot_rotation_seed: None,
             };
 
             let make_common = || CommonLayerWeights {
@@ -13525,14 +13526,56 @@ kernel void decode_attention_reference(
                 "tiny hybrid fixture must have GDN layers"
             );
 
-            let prefill_logits = state.forward_prefill(&vec![0u32]);
+            let real_prefill = state.forward_prefill(&vec![0u32]);
             // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
             // exact state the self-spec round will see at `pos = kv.seq_len`.
             let snap_pre_round = state.snapshot_gdn_states();
 
-            let _ = with_self_spec_env(|| {
-                state.generate_greedy_self_spec(&prefill_logits, 1, &tokenizer, &gen_cfg)
+            // Precondition for the regression: GDN-only draft forwards must actually
+            // mutate the live GDN buffers so we are checking that slot 0 is restored
+            // to pre-draft state. We don't want to leave the live state perturbed when
+            // generate_greedy_self_spec runs, so snapshot first, run a draft-only
+            // forward to confirm it perturbs GDN, then restore.
+            let observed_drift = {
+                let probe_token = 1u32;
+                let probe_pos = state.session.kv_cache.seq_len;
+                let _ = state.forward_step_gdn_only(probe_token, probe_pos);
+                let post = state.snapshot_gdn_states();
+                let mut max_abs = 0.0f32;
+                for (li, layer) in post.iter().enumerate() {
+                    for (k, &v) in layer.0.iter().enumerate() {
+                        max_abs = max_abs.max((v - snap_pre_round[li].0[k]).abs());
+                    }
+                    for (k, &v) in layer.1.iter().enumerate() {
+                        max_abs = max_abs.max((v - snap_pre_round[li].1[k]).abs());
+                    }
+                }
+                // Restore pre-round baseline so the self-spec round sees the same state
+                // the test sampled into `real_prefill`.
+                state.restore_gdn_states(&snap_pre_round);
+                max_abs
+            };
+            assert!(
+                observed_drift > 0.0,
+                "forward_step_gdn_only must actually perturb live GDN buffers; \
+                 otherwise this test cannot detect slot-0 contamination"
+            );
+
+            // Force a non-stop pending_token via a one-hot logits vector at a non-EOS
+            // id so generate_greedy_self_spec actually enters the round loop. Token 3
+            // is a regular "t0" vocabulary entry in the minimal tokenizer.
+            let mut forced_logits = vec![0.0f32; real_prefill.len()];
+            let target_id = 3usize.min(real_prefill.len() - 1);
+            forced_logits[target_id] = 100.0;
+
+            let out = with_self_spec_env(|| {
+                state.generate_greedy_self_spec(&forced_logits, 1, &tokenizer, &gen_cfg)
             });
+            assert!(
+                out.generated_tokens > 0,
+                "self-spec round must actually execute; got {} generated tokens",
+                out.generated_tokens
+            );
 
             // After running a self-spec round, slot 0 must equal the pre-draft baseline
             // (which we captured AFTER prefill). If slot 0 had been written by the
