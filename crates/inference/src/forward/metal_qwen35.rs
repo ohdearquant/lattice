@@ -2387,26 +2387,31 @@ kernel void lora_gemv_b_accum(
     /// Maximum draft tokens verified in one MTP speculation round (first=target, second=MTP draft).
     const MTP_VERIFY_MAX_TOKENS: usize = 2;
 
+    // ADR-051 §"MTP tensors still safety-skipped in quantize_quarot": Phase 1 keeps
+    // every MTP projection as f16 (unquantized) so the counter-rotation operates on
+    // unquantized weights. Buffers hold raw f16 (u16-on-disk converted via
+    // `make_buffer_f16`); the GEMV path uses `dispatch_matmul_half`. Phase 2 will
+    // rotate and quantize these tensors.
     struct MetalMtpDenseMlpWeights {
-        gate_proj: Q4WeightBuf, // [intermediate, hidden]
-        up_proj: Q4WeightBuf,   // [intermediate, hidden]
-        down_proj: Q4WeightBuf, // [hidden, intermediate]
+        gate_proj: Buffer, // f16, [intermediate, hidden]
+        up_proj: Buffer,   // f16, [intermediate, hidden]
+        down_proj: Buffer, // f16, [hidden, intermediate]
     }
 
     struct MetalMtpLayerWeights {
         input_layernorm: Buffer,          // [hidden]
         post_attention_layernorm: Buffer, // [hidden]
-        q_proj: Q4WeightBuf,              // [2*q_dim, hidden]
-        k_proj: Q4WeightBuf,              // [kv_dim, hidden]
-        v_proj: Q4WeightBuf,              // [kv_dim, hidden]
-        o_proj: Q4WeightBuf,              // [hidden, q_dim]
+        q_proj: Buffer,                   // f16, [2*q_dim, hidden]
+        k_proj: Buffer,                   // f16, [kv_dim, hidden]
+        v_proj: Buffer,                   // f16, [kv_dim, hidden]
+        o_proj: Buffer,                   // f16, [hidden, q_dim]
         q_norm: Buffer,                   // [head_dim]
         k_norm: Buffer,                   // [head_dim]
         mlp: MetalMtpDenseMlpWeights,
     }
 
     struct MetalMtpWeights {
-        fc: Q4WeightBuf,               // [hidden, 2*hidden]
+        fc: Buffer,                    // f16, [hidden, 2*hidden]
         pre_fc_norm_embedding: Buffer, // [hidden]
         pre_fc_norm_hidden: Buffer,    // [hidden]
         layers: Vec<MetalMtpLayerWeights>,
@@ -5053,8 +5058,12 @@ kernel void lora_gemv_b_accum(
             }
 
             if let Some(ref rot) = self.engine.quarot_rotation {
-                rot.apply_inverse(&mut normed_embed)
-                    .expect("QuaRot apply_inverse on embed: dimension mismatch");
+                // Rotation dim is built from `cfg.hidden_size` at session construction
+                // (see `from_q4_dir` line ~10112), and `normed_embed` is `vec![0.0f32; hidden]`,
+                // so dimensions cannot mismatch here. The `Result` API is preserved for
+                // type compatibility; `debug_assert` catches programming errors in tests.
+                debug_assert_eq!(rot.dim(), normed_embed.len());
+                let _ = rot.apply_inverse(&mut normed_embed);
             }
 
             // 2. CPU RMSNorm of embedding using pre_fc_norm_embedding weights.
@@ -5079,8 +5088,9 @@ kernel void lora_gemv_b_accum(
             // 3. CPU RMSNorm of target pre-final hidden using pre_fc_norm_hidden weights.
             let mut normed_hidden = self.session.last_pre_final_hidden.clone();
             if let Some(ref rot) = self.engine.quarot_rotation {
-                rot.apply_inverse(&mut normed_hidden)
-                    .expect("QuaRot apply_inverse on hidden: dimension mismatch");
+                // See note above: rotation dim == hidden_size by construction.
+                debug_assert_eq!(rot.dim(), normed_hidden.len());
+                let _ = rot.apply_inverse(&mut normed_hidden);
             }
             {
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
@@ -5134,18 +5144,18 @@ kernel void lora_gemv_b_accum(
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
                 let lw = &mtp_weights.layers[0];
                 (
-                    &mtp_weights.fc as *const Q4WeightBuf,
+                    &mtp_weights.fc as *const Buffer,
                     &lw.input_layernorm as *const Buffer,
                     &lw.post_attention_layernorm as *const Buffer,
-                    &lw.q_proj as *const Q4WeightBuf,
-                    &lw.k_proj as *const Q4WeightBuf,
-                    &lw.v_proj as *const Q4WeightBuf,
-                    &lw.o_proj as *const Q4WeightBuf,
+                    &lw.q_proj as *const Buffer,
+                    &lw.k_proj as *const Buffer,
+                    &lw.v_proj as *const Buffer,
+                    &lw.o_proj as *const Buffer,
                     &lw.q_norm as *const Buffer,
                     &lw.k_norm as *const Buffer,
-                    &lw.mlp.gate_proj as *const Q4WeightBuf,
-                    &lw.mlp.up_proj as *const Q4WeightBuf,
-                    &lw.mlp.down_proj as *const Q4WeightBuf,
+                    &lw.mlp.gate_proj as *const Buffer,
+                    &lw.mlp.up_proj as *const Buffer,
+                    &lw.mlp.down_proj as *const Buffer,
                     &mtp_weights.norm as *const Buffer,
                 )
             };
@@ -5196,7 +5206,10 @@ kernel void lora_gemv_b_accum(
 
             unsafe {
                 // fc: fused (2*hidden) → hidden
-                self.dispatch_matmul(
+                // ADR-051 Phase 1: MTP projections are f16; `dispatch_matmul_half`
+                // expects (a: f32 act, b: f16 weight, c: f32 out) with the M=1
+                // decode GEMV pipeline (`gemv_decode_m1`).
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_fused,
                     &*w_fc,
@@ -5216,8 +5229,8 @@ kernel void lora_gemv_b_accum(
                     cfg.rms_norm_eps,
                 );
 
-                // Q/K/V projections.
-                self.dispatch_matmul(
+                // Q/K/V projections (f16 weights, Phase 1).
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_hidden,
                     &*w_q_proj,
@@ -5226,7 +5239,7 @@ kernel void lora_gemv_b_accum(
                     (2 * q_dim) as u32,
                     hidden as u32,
                 );
-                self.dispatch_matmul(
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_hidden,
                     &*w_k_proj,
@@ -5235,7 +5248,7 @@ kernel void lora_gemv_b_accum(
                     kv_dim as u32,
                     hidden as u32,
                 );
-                self.dispatch_matmul(
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_hidden,
                     &*w_v_proj,
@@ -5334,8 +5347,8 @@ kernel void lora_gemv_b_accum(
                     MTLSize::new(wg, 1, 1),
                 );
 
-                // O projection: attn_out → ffn_out.
-                self.dispatch_matmul(
+                // O projection: attn_out → ffn_out (f16 weights, Phase 1).
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_attn_out,
                     &*w_o_proj,
@@ -5359,8 +5372,8 @@ kernel void lora_gemv_b_accum(
                     cfg.rms_norm_eps,
                 );
 
-                // Dense MLP.
-                self.dispatch_matmul(
+                // Dense MLP (f16 weights, Phase 1).
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_hidden,
                     &*w_gate_proj,
@@ -5369,7 +5382,7 @@ kernel void lora_gemv_b_accum(
                     inter as u32,
                     hidden as u32,
                 );
-                self.dispatch_matmul(
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_hidden,
                     &*w_up_proj,
@@ -5388,7 +5401,7 @@ kernel void lora_gemv_b_accum(
                     MTLSize::new(div_ceil(inter as u64, wg) * wg, 1, 1),
                     MTLSize::new(wg, 1, 1),
                 );
-                self.dispatch_matmul(
+                self.dispatch_matmul_half(
                     enc,
                     &*buf_gate,
                     &*w_down_proj,
@@ -5423,9 +5436,16 @@ kernel void lora_gemv_b_accum(
             cmd.wait_until_completed();
 
             if let Some(ref rot) = self.engine.quarot_rotation {
+                // SAFETY: `buf_hidden` is the MTP `hidden` activation buffer, allocated
+                // with capacity `hidden` f32 elements at session construction. The
+                // command buffer that wrote it (`cmd`) has been awaited above via
+                // `wait_until_completed()`, so the contents are visible to the host.
                 let mut h_out = unsafe { read_buffer(&*buf_hidden, hidden) };
-                rot.apply(&mut h_out)
-                    .expect("QuaRot apply on mtp_h_out: dimension mismatch");
+                debug_assert_eq!(rot.dim(), h_out.len());
+                let _ = rot.apply(&mut h_out);
+                // SAFETY: same buffer, no other command buffer in flight. We write
+                // back the rotated values before the next command buffer (`cmd2`) is
+                // submitted on the next line.
                 unsafe { write_buffer(&*buf_hidden, &h_out) };
             }
 
@@ -9385,11 +9405,11 @@ kernel void lora_gemv_b_accum(
                 return None;
             }
 
-            let q4p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "q4");
             let f16p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "f16");
 
-            // Helper: load an f16 file as a f32 Metal buffer; return None on missing.
-            let load_f16_buf = |name: &str, label: &str| -> Option<Buffer> {
+            // Helper: load an f16 file as a f32 Metal buffer (for norm gammas / biases
+            // consumed by RMSNorm kernels that read f32 input).
+            let load_f16_buf_as_f32 = |name: &str, label: &str| -> Option<Buffer> {
                 let path = f16p(name);
                 if !path.exists() {
                     return None;
@@ -9398,43 +9418,56 @@ kernel void lora_gemv_b_accum(
                 Some(make_buffer(device, &vals, label))
             };
 
-            // Helper: mmap-load a Q4 file; return None on missing.
-            let load_q4 = |name: &str, label: &str| -> Option<Q4WeightBuf> {
-                let path = q4p(name);
+            // Helper: load an f16 file as a Metal half-precision (f16) buffer for use
+            // by `dispatch_matmul_half` / `gemv_decode_m1`. ADR-051 Phase 1 mandates
+            // f16 storage for the 8 MTP projection matrices so the runtime applies
+            // counter-rotation on unquantized weights.
+            let load_f16_buf_as_half = |name: &str, label: &str| -> Option<Buffer> {
+                let path = f16p(name);
                 if !path.exists() {
                     return None;
                 }
-                mmap_q4_weight(device, &path, label).ok()
+                let (vals, _) = load_f16_tensor_file(&path).ok()?;
+                Some(make_buffer_f16(device, &vals, label))
             };
 
-            // --- Layer 0 weights ---
-            let input_layernorm = load_f16_buf(
+            // --- Layer 0 weights (ADR-051: 8 projections as f16, 7 norms as f32) ---
+            let input_layernorm = load_f16_buf_as_f32(
                 "mtp.layers.0.input_layernorm.weight",
                 "mtp.l0.input_layernorm",
             )?;
-            let post_attention_layernorm = load_f16_buf(
+            let post_attention_layernorm = load_f16_buf_as_f32(
                 "mtp.layers.0.post_attention_layernorm.weight",
                 "mtp.l0.post_attn_layernorm",
             )?;
-            let q_proj = load_q4("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
-            let k_proj = load_q4("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
-            let v_proj = load_q4("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
-            let o_proj = load_q4("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
-            let q_norm = load_f16_buf("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
-            let k_norm = load_f16_buf("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
-            let gate_proj = load_q4("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
-            let up_proj = load_q4("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
-            let down_proj = load_q4("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
+            let q_proj =
+                load_f16_buf_as_half("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
+            let k_proj =
+                load_f16_buf_as_half("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
+            let v_proj =
+                load_f16_buf_as_half("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
+            let o_proj =
+                load_f16_buf_as_half("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
+            let q_norm =
+                load_f16_buf_as_f32("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
+            let k_norm =
+                load_f16_buf_as_f32("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
+            let gate_proj =
+                load_f16_buf_as_half("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
+            let up_proj =
+                load_f16_buf_as_half("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
+            let down_proj =
+                load_f16_buf_as_half("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
 
             // --- Top-level MTP weights ---
-            let fc = load_q4("mtp.fc.weight", "mtp.fc")?;
-            let pre_fc_norm_embedding = load_f16_buf(
+            let fc = load_f16_buf_as_half("mtp.fc.weight", "mtp.fc")?;
+            let pre_fc_norm_embedding = load_f16_buf_as_f32(
                 "mtp.pre_fc_norm_embedding.weight",
                 "mtp.pre_fc_norm_embedding",
             )?;
             let pre_fc_norm_hidden =
-                load_f16_buf("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden")?;
-            let norm = load_f16_buf("mtp.norm.weight", "mtp.norm")?;
+                load_f16_buf_as_f32("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden")?;
+            let norm = load_f16_buf_as_f32("mtp.norm.weight", "mtp.norm")?;
 
             eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
             Some(MetalMtpWeights {
@@ -9458,6 +9491,19 @@ kernel void lora_gemv_b_accum(
                 }],
                 norm,
             })
+        }
+
+        /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
+        ///
+        /// Returns `None` when the file is absent, malformed, or lacks a `quarot_seed`
+        /// key — all three are valid "no rotation" states for backwards compatibility
+        /// with older artifacts. The caller falls back to the legacy `config.json`
+        /// field on `None`.
+        fn read_quarot_seed_from_index(q4_dir: &std::path::Path) -> Option<u64> {
+            let path = q4_dir.join("quantize_index.json");
+            let bytes = std::fs::read(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            v.get("quarot_seed").and_then(|s| s.as_u64())
         }
 
         /// Create a new [`MetalQwen35State`] by loading pre-quantized Q4/F16 files directly
@@ -10107,7 +10153,13 @@ kernel void lora_gemv_b_accum(
             };
 
             let quarot_rotation = if mtp_weights_opt.is_some() {
-                match cfg.quarot_rotation_seed {
+                // ADR-051 contract: `quarot_seed` lives in `quantize_index.json`. Fall back
+                // to the legacy `config.json` field (`quarot_rotation_seed`) for
+                // backwards compatibility with artifacts produced before the contract was
+                // formalized.
+                let index_seed = Self::read_quarot_seed_from_index(q4_dir);
+                let seed_opt = index_seed.or(cfg.quarot_rotation_seed);
+                match seed_opt {
                     Some(seed) => Some(
                         crate::quant::quarot::hadamard::RandomizedHadamard::new(seed, hidden)
                             .map_err(|e| {
@@ -11455,6 +11507,7 @@ kernel void decode_attention_reference(
                 layer_mask: vec![true],
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
+                quarot_rotation_seed: None,
             };
 
             let mut embed_tokens = vec![0.0f32; vocab * hidden];
@@ -11855,6 +11908,49 @@ kernel void decode_attention_reference(
         // -------------------------------------------------------------------
         // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
         // -------------------------------------------------------------------
+
+        #[test]
+        fn read_quarot_seed_from_index_finds_seed() {
+            // ADR-051 contract: `quantize_index.json` carries `quarot_seed`. The runtime
+            // loader's helper must extract it when present, return None when absent or the
+            // file is missing/malformed, and ignore everything else in the index.
+            let tmp = tempfile::tempdir().unwrap();
+
+            // Absent file → None.
+            assert_eq!(
+                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
+                None,
+                "missing quantize_index.json must yield None"
+            );
+
+            // File without `quarot_seed` → None.
+            std::fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
+            assert_eq!(
+                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
+                None,
+                "index without quarot_seed key must yield None"
+            );
+
+            // File with `quarot_seed` → Some(seed).
+            std::fs::write(
+                tmp.path().join("quantize_index.json"),
+                r#"{"quarot_seed":13258600446175248384,"tensors":[]}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
+                Some(13_258_600_446_175_248_384_u64),
+                "index with quarot_seed key must round-trip the u64 exactly"
+            );
+
+            // Malformed JSON → None (silent fallback, never panics).
+            std::fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
+            assert_eq!(
+                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
+                None,
+                "malformed index must yield None (never panic)"
+            );
+        }
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {

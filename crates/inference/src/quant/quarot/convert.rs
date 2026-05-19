@@ -97,13 +97,27 @@ pub struct ConversionReport {
     pub was_tied: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct IndexEntry {
     name: String,
     file: String,
     quantized: bool,
     shape: Vec<usize>,
     numel: usize,
+}
+
+/// Wire format for `quantize_index.json` produced by `convert_quarot_qwen35`.
+///
+/// ADR-051 §"quantize_quarot Binary Change": the rotation seed is the runtime's
+/// authoritative source for reconstructing the QuaRot Hadamard sign vector. It
+/// lives next to the tensor index so a loader can recover it without parsing
+/// `config.json`. `quantize_index.json` from older builds (no `quarot_seed`)
+/// remains compatible — the field is `Option<u64>`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QuantizeIndex {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarot_seed: Option<u64>,
+    tensors: Vec<IndexEntry>,
 }
 
 fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
@@ -136,9 +150,16 @@ fn write_mtp_weights_quarot(
     output_dir: &Path,
     index_entries: &mut Vec<IndexEntry>,
     kept_f16: &mut usize,
-    planned_quantized: &mut usize,
+    _planned_quantized: &mut usize,
     total_bytes_out: &mut u64,
 ) -> Result<(), InferenceError> {
+    // ADR-051 §"MTP tensors still safety-skipped in quantize_quarot": Phase 1 keeps
+    // every MTP tensor as f16 (unquantized). The runtime counter-rotates on
+    // unquantized weights; Phase 2 will rotate and quantize MTP tensors offline.
+    // Splitting projections from norms here mirrors the loader split in
+    // `load_mtp_weights_q4_dir` — projections are loaded as half buffers for
+    // `gemv_decode_m1`, norms as f32 buffers for the RMSNorm kernels — but both
+    // come from `.f16` files on disk.
     let proj_names = [
         "mtp.fc.weight",
         "mtp.layers.0.self_attn.q_proj.weight",
@@ -159,42 +180,9 @@ fn write_mtp_weights_quarot(
         "mtp.pre_fc_norm_hidden.weight",
     ];
 
-    for name in &proj_names {
+    let mut write_as_f16 = |name: &str| -> Result<(), InferenceError> {
         if !reader.has_tensor(name) {
-            continue;
-        }
-        let (data, shape) = reader.read_tensor_f64(name)?;
-        if shape.len() != 2 {
-            return Err(InferenceError::Inference(format!(
-                "write_mtp_weights_quarot: MTP projection `{name}` has shape {shape:?}, \
-                 expected 2-D for Q4 quantization"
-            )));
-        }
-        let q4 = quantize_f64_to_q4(&data, &shape);
-        let sanitized = sanitize_tensor_name(name);
-        let file_name = format!("{sanitized}.q4");
-        let out_path = output_dir.join(&file_name);
-        save_q4_file(&out_path, &q4).map_err(|e| {
-            InferenceError::Inference(format!(
-                "write_mtp_weights_quarot: failed to write {}: {e}",
-                out_path.display()
-            ))
-        })?;
-        let header_bytes = (4 + 4 + 4 + 8 * shape.len() + 8) as u64;
-        *total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(18);
-        *planned_quantized += 1;
-        index_entries.push(IndexEntry {
-            name: (*name).to_string(),
-            file: file_name,
-            quantized: true,
-            shape: shape.clone(),
-            numel: data.len(),
-        });
-    }
-
-    for name in &norm_names {
-        if !reader.has_tensor(name) {
-            continue;
+            return Ok(());
         }
         let (data, shape) = reader.read_tensor_f64(name)?;
         let sanitized = sanitize_tensor_name(name);
@@ -204,12 +192,20 @@ fn write_mtp_weights_quarot(
         *total_bytes_out += bytes as u64;
         *kept_f16 += 1;
         index_entries.push(IndexEntry {
-            name: (*name).to_string(),
+            name: name.to_string(),
             file: file_name,
             quantized: false,
             shape: shape.clone(),
             numel: data.len(),
         });
+        Ok(())
+    };
+
+    for name in &proj_names {
+        write_as_f16(name)?;
+    }
+    for name in &norm_names {
+        write_as_f16(name)?;
     }
 
     Ok(())
@@ -408,7 +404,11 @@ pub fn convert_quarot_qwen35(
     }
 
     let index_path = output_dir.join("quantize_index.json");
-    let index_json = serde_json::to_string_pretty(&index_entries).map_err(|e| {
+    let index_record = QuantizeIndex {
+        quarot_seed: Some(opts.rotation_seed),
+        tensors: index_entries,
+    };
+    let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
         InferenceError::Inference(format!(
             "convert_quarot_qwen35: failed to serialize quantize_index.json: {e}"
         ))
@@ -979,11 +979,18 @@ mod tests {
             "output config must be untied after tied-input conversion"
         );
 
-        // Index json contains every working-set tensor.
+        // Index json contains every working-set tensor and the rotation seed.
         let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
         let idx: serde_json::Value = serde_json::from_str(&idx_str).unwrap();
-        let arr = idx.as_array().expect("index is a JSON array");
-        assert_eq!(arr.len(), report.planned_quantized + report.kept_f16);
+        let tensors = idx
+            .get("tensors")
+            .and_then(|v| v.as_array())
+            .expect("quantize_index.json must have a `tensors` array");
+        assert_eq!(tensors.len(), report.planned_quantized + report.kept_f16);
+        assert!(
+            idx.get("quarot_seed").and_then(|v| v.as_u64()).is_some(),
+            "quantize_index.json must carry quarot_seed (ADR-051 contract)"
+        );
     }
 
     #[test]
@@ -1745,26 +1752,18 @@ mod tests {
         )
         .unwrap();
 
-        // MTP projection files must exist as .q4
-        let expected_q4 = [
-            "mtp_fc_weight.q4",
-            "mtp_layers_0_self_attn_q_proj_weight.q4",
-            "mtp_layers_0_self_attn_k_proj_weight.q4",
-            "mtp_layers_0_self_attn_v_proj_weight.q4",
-            "mtp_layers_0_self_attn_o_proj_weight.q4",
-            "mtp_layers_0_mlp_gate_proj_weight.q4",
-            "mtp_layers_0_mlp_up_proj_weight.q4",
-            "mtp_layers_0_mlp_down_proj_weight.q4",
-        ];
-        for name in &expected_q4 {
-            assert!(
-                output.join(name).exists(),
-                "MTP Q4 file must be emitted: {name}"
-            );
-        }
-
-        // MTP norm files must exist as .f16
+        // ADR-051 Phase 1: ALL 15 MTP tensors emitted as .f16 (no Q4). The runtime
+        // applies counter-rotation on unquantized weights; Phase 2 will rotate and
+        // quantize MTP tensors offline. Cross-check no MTP .q4 file leaked.
         let expected_f16 = [
+            "mtp_fc_weight.f16",
+            "mtp_layers_0_self_attn_q_proj_weight.f16",
+            "mtp_layers_0_self_attn_k_proj_weight.f16",
+            "mtp_layers_0_self_attn_v_proj_weight.f16",
+            "mtp_layers_0_self_attn_o_proj_weight.f16",
+            "mtp_layers_0_mlp_gate_proj_weight.f16",
+            "mtp_layers_0_mlp_up_proj_weight.f16",
+            "mtp_layers_0_mlp_down_proj_weight.f16",
             "mtp_layers_0_input_layernorm_weight.f16",
             "mtp_layers_0_post_attention_layernorm_weight.f16",
             "mtp_layers_0_self_attn_q_norm_weight.f16",
@@ -1779,8 +1778,26 @@ mod tests {
                 "MTP f16 file must be emitted: {name}"
             );
         }
+        // No .q4 MTP file may be emitted in Phase 1.
+        for name in &expected_f16 {
+            let q4_variant = name.replace(".f16", ".q4");
+            assert!(
+                !output.join(&q4_variant).exists(),
+                "MTP Q4 file must NOT be emitted in Phase 1: {q4_variant}"
+            );
+        }
 
-        // Output config must retain mtp_num_hidden_layers=1 and carry quarot_rotation_seed.
+        // quantize_index.json must carry quarot_seed (ADR-051 contract).
+        let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
+        let idx_val: serde_json::Value = serde_json::from_str(&idx_str).unwrap();
+        assert_eq!(
+            idx_val.get("quarot_seed").and_then(|v| v.as_u64()),
+            Some(rotation_seed),
+            "quantize_index.json must carry quarot_seed (ADR-051 contract)"
+        );
+
+        // Output config must retain mtp_num_hidden_layers=1 and carry quarot_rotation_seed
+        // as a backwards-compatible diagnostic mirror of the index seed.
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_val: serde_json::Value = serde_json::from_str(&out_cfg_str).unwrap();
         assert_eq!(
