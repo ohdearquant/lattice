@@ -602,6 +602,11 @@ impl Tokenizer for BpeTokenizer {
             .collect()
     }
 
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        let encoded: String = ids.iter().filter_map(|&id| self.token_for_id(id)).collect();
+        Some(byte_decode_token(&encoded))
+    }
+
     fn vocab_size(&self) -> usize {
         self.inner.id_to_token.len()
     }
@@ -906,5 +911,18 @@ mod tests {
         assert_eq!(batch[1].input_ids.len(), 2);
         assert_eq!(batch[0].attention_mask, vec![1, 0]);
         assert_eq!(batch[1].attention_mask, vec![1, 1]);
+    }
+
+    #[test]
+    fn test_bpe_decode_roundtrip() {
+        let tokenizer = synthetic_bpe();
+        // Mirrors test_bpe_merge_hello_world: "hello world" → [11, 16].
+        let ids = tokenizer.tokenize_to_ids("hello world");
+        assert_eq!(ids, vec![11, 16]);
+        // Regression: decode must reverse the byte-level encoding (the "Ġ"
+        // prefix maps back to a space), not return an empty string — the
+        // prior generate.rs detokenize block discarded the text entirely.
+        assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
+        assert_eq!(tokenizer.decode(&[]), Some(String::new()));
     }
 }

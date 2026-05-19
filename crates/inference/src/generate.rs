@@ -164,7 +164,7 @@ pub fn generate(
     let prompt_len = tokenized.real_length;
 
     if prompt_len == 0 {
-        return Err(InferenceError::ModelNotFound("Empty prompt".into()));
+        return Err(InferenceError::InvalidInput("Empty prompt".into()));
     }
 
     // 2. Initialize KV cache and scratch (allocate once per request)
@@ -227,15 +227,15 @@ pub fn generate(
         }
     }
 
-    // 7. Detokenize.
-    // The Tokenizer trait does not expose a decode method; callers needing decoded text
-    // should use BpeTokenizer::token_for_id + byte_decode_token directly.
-    let _ = tokenizer; // suppress unused-variable warning
-    let text = String::new();
+    // 7. Detokenize via the tokenizer's decode (BpeTokenizer implements
+    // GPT-2 byte-level decode; only non-generative encoder tokenizers
+    // return None, in which case text is empty but token_ids still carry
+    // the result).
+    let decoded = tokenizer.decode(&generated_ids).unwrap_or_default();
     let full_text = if config.include_prompt {
-        prompt.to_string()
+        format!("{prompt}{decoded}")
     } else {
-        text
+        decoded
     };
 
     Ok(GenerateOutput {
@@ -285,7 +285,7 @@ fn forward_with_cache<'a>(
     for (i, &tok) in input_ids.iter().enumerate() {
         let tok = tok as usize;
         if tok >= cfg.vocab_size {
-            return Err(InferenceError::ModelNotFound(format!(
+            return Err(InferenceError::InvalidInput(format!(
                 "Token ID {tok} exceeds vocab size {}",
                 cfg.vocab_size
             )));

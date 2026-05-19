@@ -22,6 +22,9 @@ pub enum InferenceError {
     },
     Io(std::io::Error),
     Inference(String),
+    /// Caller-supplied input was invalid (empty prompt, token ID out of
+    /// range, etc.) — distinct from a missing model or runtime failure.
+    InvalidInput(String),
 }
 
 impl Display for InferenceError {
@@ -51,6 +54,7 @@ impl Display for InferenceError {
             ),
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Inference(msg) => write!(f, "Inference error: {msg}"),
+            Self::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
         }
     }
 }
@@ -67,5 +71,16 @@ impl std::error::Error for InferenceError {
 impl From<std::io::Error> for InferenceError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_input_display() {
+        let e = InferenceError::InvalidInput("Empty prompt".into());
+        assert_eq!(e.to_string(), "Invalid input: Empty prompt");
     }
 }
