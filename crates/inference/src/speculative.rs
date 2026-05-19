@@ -1084,6 +1084,18 @@ pub trait MtpTargetVerifier {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError>;
+
+    /// Snapshot every GDN layer's recurrent state (S matrices + conv buffer). See ADR-052.
+    ///
+    /// Implementors that have no GDN layers (e.g. pure-attention test mocks) return an empty
+    /// `Vec`. Callers must treat the returned snapshot as opaque.
+    fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot;
+
+    /// Restore every GDN layer's recurrent state from a prior [`snapshot_gdn_states`] call.
+    ///
+    /// The snapshot must have been taken from the same model instance. Implementors that
+    /// hold no GDN state accept an empty snapshot and do nothing.
+    fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot);
 }
 
 /// Verify a speculative MTP draft against the target model.
@@ -1122,6 +1134,12 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_start = target.cache_position();
     let mtp_start = verifier.cache.seq_len();
 
+    // ADR-052: snapshot target GDN state before draft generation. The draft itself runs only
+    // through `MtpVerifier`'s separate cache, but `target.verify_tokens` below mutates the
+    // target GDN state through all draft tokens; we must restore it on rejection so that
+    // post-rejection forward steps start from the correct recurrent state.
+    let gdn_snap = target.snapshot_gdn_states();
+
     // Generate draft
     let draft = verifier.draft_tokens(
         current_token_id,
@@ -1156,9 +1174,13 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_first = argmax(initial_target_logits) as u32;
 
     if draft[0] != target_first {
-        // Full rejection before calling verify_tokens
+        // Full rejection before calling `verify_tokens`. Target state was never advanced —
+        // KV is already at `target_start` and GDN matches `gdn_snap` — so we must NOT call
+        // `target.rollback_cache_to(target_start)` here: some implementors (the Metal
+        // adapter is one) need an active speculation checkpoint to roll back into, and
+        // `verify_tokens` was never called to set it.
         verifier.rollback_cache_to(mtp_start)?;
-        target.rollback_cache_to(target_start)?;
+        let _ = gdn_snap;
         let fallback = target_first;
         return Ok(MtpVerifyResult {
             accepted_count: 0,
@@ -1177,10 +1199,13 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         });
     }
 
-    // First token is EOS: accept it and stop
+    // First token is EOS: accept it and stop. Same reasoning as the early full-rejection
+    // branch above — `target.verify_tokens` was not called, so target state is already at
+    // `target_start` and a `rollback_cache_to(target_start)` would tickle the Metal
+    // checkpoint precondition for no good reason.
     if Some(target_first) == eos_token {
         verifier.rollback_cache_to(mtp_start + 1)?;
-        target.rollback_cache_to(target_start)?;
+        let _ = gdn_snap;
         return Ok(MtpVerifyResult {
             accepted_count: 1,
             accepted_tokens: vec![target_first],
@@ -1236,9 +1261,19 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     accepted_count = eos_truncate;
     let accepted_tokens = draft[..accepted_count].to_vec();
 
-    // Roll back caches to accepted positions
+    // Roll back caches to accepted positions. The contract for `rollback_cache_to` requires
+    // an implementation to leave both KV and GDN coherent at `target_start + accepted_count`
+    // — e.g., the Metal implementation does this through its per-token GDN slot pool so
+    // partial-accept rollback restores slot `accepted_count` (state after pending +
+    // `accepted_count - 1` drafts via the full model). We deliberately do NOT call
+    // `restore_gdn_states` on partial accept: that would overwrite the slot-restored GDN
+    // with the pre-draft snapshot and leave GDN behind KV by `accepted_count` tokens.
     verifier.rollback_cache_to(mtp_start + accepted_count)?;
     target.rollback_cache_to(target_start + accepted_count)?;
+
+    // `gdn_snap` is intentionally dropped here. On partial accept the implementor handles
+    // GDN sync inside `rollback_cache_to`; on full accept GDN is already at +draft_len.
+    drop(gdn_snap);
 
     let acceptance_rate = accepted_count as f64 / draft_len.max(1) as f64;
     let accepted_tokens_per_forward = accepted_count as f64 / target_forwards.max(1) as f64;
@@ -2168,6 +2203,10 @@ mod tests {
             self.cache_pos += tokens.len();
             Ok(self.logits_by_step.clone())
         }
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            Vec::new()
+        }
+        fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
     }
 
     const EOS: u32 = 99;
