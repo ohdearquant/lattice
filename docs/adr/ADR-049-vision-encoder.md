@@ -69,8 +69,9 @@ backbones is deferred until the integration pattern is validated.
   adjacent patches, concatenates features, then projects to decoder hidden dim.
   Input: `[raw_patches, d_vit]`. Output: `[visual_tokens, d_model]` where
   `visual_tokens = raw_patches / spatial_merge_size²`.
-- `vision/mod.rs`: `MultimodalInput` (see Architecture §Core Types) and
-  `VisionEncoder::encode(image_bytes) -> Result<MultimodalInput>`.
+- `vision/mod.rs`: `VisionOutput`, `MultimodalInput` (see Architecture §Core Types), and
+  `VisionEncoder::encode(image_bytes) -> Result<VisionOutput>`. Callers combine `VisionOutput`
+  with text token IDs to construct `MultimodalInput`.
 - `metal_qwen35.rs`: `generate_multimodal(input: MultimodalInput, config: GenerateConfig)`
   entry point. Prepends `visual_tokens` patch embeddings before text token embeddings.
 - Weight loading: extend `load_qwen35_weights` to detect and load `vision_model.*` keys from
