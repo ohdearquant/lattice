@@ -106,6 +106,32 @@ struct IndexEntry {
     numel: usize,
 }
 
+fn zero_mtp_in_config_json(json: &str) -> Result<String, InferenceError> {
+    let mut value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        InferenceError::Inference(format!("zero_mtp_in_config_json: invalid JSON: {e}"))
+    })?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        InferenceError::Inference(
+            "zero_mtp_in_config_json: top-level JSON must be an object".to_string(),
+        )
+    })?;
+    if let Some(text_config) = obj.get_mut("text_config")
+        && let Some(text_obj) = text_config.as_object_mut()
+    {
+        text_obj.insert(
+            "mtp_num_hidden_layers".to_string(),
+            serde_json::Value::Number(0.into()),
+        );
+    }
+    obj.insert(
+        "mtp_num_hidden_layers".to_string(),
+        serde_json::Value::Number(0.into()),
+    );
+    serde_json::to_string_pretty(&value).map_err(|e| {
+        InferenceError::Inference(format!("zero_mtp_in_config_json: serialize failed: {e}"))
+    })
+}
+
 /// Refuse-on-fail QuaRot Qwen3.5 model conversion (ADR-044 §"Step 3c contract").
 ///
 /// On success, writes the converted model to `output_dir` (created if
@@ -133,6 +159,10 @@ struct IndexEntry {
 /// - Forward-equivalence gate refuses — propagated unchanged.
 /// - Disk I/O error during output write (file create, write,
 ///   directory create).
+///
+/// The emitted `config.json` sets `mtp_num_hidden_layers` to 0 when MTP
+/// weights are skipped, so the runtime loader does not attempt to activate
+/// the MTP path on a QuaRot artifact.
 pub fn convert_quarot_qwen35(
     input_dir: &Path,
     output_dir: &Path,
@@ -284,6 +314,33 @@ pub fn convert_quarot_qwen35(
         }
     }
 
+    // --- MTP (Multi-Token Prediction) weights: deliberately NOT emitted ---
+    //
+    // QuaRot rotates embed_tokens and the residual stream via a random
+    // Hadamard matrix R.  The MTP head receives rotated embeddings and
+    // rotated pre-final hidden states, but its norm gammas and projection
+    // weights were trained in the un-rotated basis.  Per-element RMSNorm
+    // gamma does not commute with R (γ·(R·x) ≠ R·(γ·x)), so naively
+    // copying MTP weights produces a draft model in the wrong basis —
+    // acceptance drops to ~1/|V|.
+    //
+    // The MTP writer will be added when the QuaRot conversion is extended
+    // to handle MTP rotation algebra (counter-rotate inputs via R^T, or
+    // absorb R into MTP weights, or rotation-aware training).  Until then,
+    // MTP activates only on the non-rotated Q8 path via
+    // MetalQwen35State::new().
+    //
+    // See: QuaRot (Ashkboos et al., NeurIPS 2024) §3.1 for the
+    //      rotation scheme; Qwen3.5-0.8B config for mtp_num_hidden_layers.
+    if cfg.mtp_num_hidden_layers > 0 {
+        eprintln!(
+            "[mtp] Skipping MTP weights (mtp_num_hidden_layers={}) — QuaRot \
+             rotation is not yet applied to MTP head. MTP works on the \
+             non-rotated Q8 path.",
+            cfg.mtp_num_hidden_layers
+        );
+    }
+
     let index_path = output_dir.join("quantize_index.json");
     let index_json = serde_json::to_string_pretty(&index_entries).map_err(|e| {
         InferenceError::Inference(format!(
@@ -297,7 +354,10 @@ pub fn convert_quarot_qwen35(
         ))
     })?;
 
-    let output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
+    let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
+    if cfg.mtp_num_hidden_layers > 0 {
+        output_config_json = zero_mtp_in_config_json(&output_config_json)?;
+    }
     let out_config_path = output_dir.join("config.json");
     fs::write(&out_config_path, &output_config_json).map_err(|e| {
         InferenceError::Inference(format!(
@@ -1281,5 +1341,470 @@ mod tests {
         .unwrap();
         assert!(report.planned_quantized > 0);
         assert!(output.join("config.json").exists());
+    }
+
+    // ------------------------------------------------------------------
+    // MTP weight quantization tests
+    // ------------------------------------------------------------------
+
+    /// Build a `tiny_cfg` that includes one MTP layer and a `config.json`
+    /// that round-trips `mtp_num_hidden_layers = 1`.
+    fn tiny_cfg_with_mtp(tied: bool) -> Qwen35Config {
+        let mut cfg = tiny_cfg(tied);
+        cfg.mtp_num_hidden_layers = 1;
+        cfg
+    }
+
+    /// Build a `config.json` string that includes `mtp_num_hidden_layers`.
+    fn tiny_config_json_with_mtp(cfg: &Qwen35Config) -> String {
+        // Start from the base JSON, then inject `mtp_num_hidden_layers` into
+        // `text_config` via a JSON round-trip.
+        let base = tiny_config_json(cfg);
+        let mut root: serde_json::Value = serde_json::from_str(&base).unwrap();
+        root.get_mut("text_config")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "mtp_num_hidden_layers".into(),
+                serde_json::Value::from(cfg.mtp_num_hidden_layers),
+            );
+        serde_json::to_string_pretty(&root).unwrap()
+    }
+
+    /// Write the minimal MTP tensors (matching the real Qwen3.5-0.8B shapes
+    /// scaled down to the tiny test config's `hidden_size=8`) into `path`.
+    ///
+    /// Shapes are derived from the loader expectations in
+    /// `metal_qwen35.rs:load_mtp_q4_weights`:
+    ///   - fc.weight:              [hidden, 2*hidden]   → fc projects concat(embed, hidden)
+    ///   - q_proj.weight:          [num_heads*head_dim*4, hidden]  — use 4*hidden rows
+    ///   - k_proj.weight:          [num_kv_heads*head_dim, hidden] — use hidden rows
+    ///   - v_proj.weight:          [num_kv_heads*head_dim, hidden] — use hidden rows
+    ///   - o_proj.weight:          [hidden, num_heads*head_dim]    — use hidden rows
+    ///   - gate/up_proj.weight:    [intermediate, hidden]
+    ///   - down_proj.weight:       [hidden, intermediate]
+    ///   - {input,post}_layernorm: [hidden]
+    ///   - {q,k}_norm.weight:      [head_dim]
+    ///   - {norm,pre_fc_norm_*}:   [hidden]
+    ///
+    /// All values are synthetic (same LCG used by `synth_data`).
+    fn write_mtp_tensors_into(path: &Path, cfg: &Qwen35Config, mut seed: u64) {
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let head_dim = cfg.head_dim;
+
+        // The existing tensors in `path` must be extended, not replaced.
+        // SafeTensors are write-once files, so we need to append our MTP
+        // tensors via `write_test_safetensors` on a new temp file, then
+        // concatenate both sets into a single file.
+        //
+        // Simpler approach: read the existing file bytes, rewrite the combined
+        // header+data. But that requires re-parsing SafeTensors.
+        //
+        // Easiest: write a SEPARATE second safetensors file, then merge both
+        // sets of entries into one call to `write_test_safetensors`.
+        // Since `write_required_tensors_for` already created the base file,
+        // we parse it to extract its (name, shape, data) triples, append MTP
+        // entries, and re-write to `path`.
+        //
+        // To avoid reimplementing the SafeTensors parser here we instead
+        // write a NEW single safetensors file containing both main + MTP
+        // tensors from scratch using known shapes. This matches what the
+        // real model file looks like.
+
+        let mut next = |n: usize| -> Vec<f64> {
+            seed = seed.wrapping_add(1);
+            synth_data(n, seed)
+        };
+
+        // Rebuild the main model tensors (same as `write_required_tensors_for`
+        // but we need them to construct the combined file). We generate the
+        // same tensors that `write_required_tensors_for` would, but since
+        // the seed was already consumed we generate fresh synth data here.
+        // The forward-equivalence test reads from the SAME file so the values
+        // don't need to match the ones used in `write_required_tensors_for`
+        // — we're building a combined file from scratch for the MTP test.
+        let vocab = cfg.vocab_size;
+        let full_q_dim = cfg.full_q_dim();
+        let full_kv_dim = cfg.full_kv_dim();
+        let linear_qkv_dim = cfg.linear_qkv_dim();
+        let linear_output_dim = cfg.linear_output_dim();
+        let linear_num_heads = cfg.linear_num_key_heads;
+        let kernel = cfg.linear_conv_kernel_dim;
+
+        let mut entries: Vec<(String, Vec<usize>, Vec<f64>)> = Vec::new();
+
+        entries.push((
+            "model.language_model.embed_tokens.weight".into(),
+            vec![vocab, hidden],
+            next(vocab * hidden),
+        ));
+        entries.push((
+            "model.language_model.norm.weight".into(),
+            vec![hidden],
+            next(hidden),
+        ));
+        if !cfg.tie_word_embeddings {
+            entries.push((
+                "lm_head.weight".into(),
+                vec![vocab, hidden],
+                next(vocab * hidden),
+            ));
+        }
+
+        for i in 0..cfg.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{i}");
+            entries.push((
+                format!("{prefix}.input_layernorm.weight"),
+                vec![hidden],
+                next(hidden),
+            ));
+            entries.push((
+                format!("{prefix}.post_attention_layernorm.weight"),
+                vec![hidden],
+                next(hidden),
+            ));
+
+            if cfg.is_full_attention(i) {
+                entries.push((
+                    format!("{prefix}.self_attn.q_proj.weight"),
+                    vec![2 * full_q_dim, hidden],
+                    next(2 * full_q_dim * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.self_attn.k_proj.weight"),
+                    vec![full_kv_dim, hidden],
+                    next(full_kv_dim * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.self_attn.v_proj.weight"),
+                    vec![full_kv_dim, hidden],
+                    next(full_kv_dim * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.self_attn.o_proj.weight"),
+                    vec![hidden, full_q_dim],
+                    next(hidden * full_q_dim),
+                ));
+                entries.push((
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    vec![head_dim],
+                    next(head_dim),
+                ));
+                entries.push((
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    vec![head_dim],
+                    next(head_dim),
+                ));
+            } else {
+                entries.push((
+                    format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                    vec![linear_qkv_dim, hidden],
+                    next(linear_qkv_dim * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.in_proj_z.weight"),
+                    vec![linear_output_dim, hidden],
+                    next(linear_output_dim * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    vec![linear_num_heads, hidden],
+                    next(linear_num_heads * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.in_proj_a.weight"),
+                    vec![linear_num_heads, hidden],
+                    next(linear_num_heads * hidden),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.A_log"),
+                    vec![linear_num_heads],
+                    next(linear_num_heads),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.dt_bias"),
+                    vec![linear_num_heads],
+                    next(linear_num_heads),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.conv1d.weight"),
+                    vec![linear_qkv_dim, 1, kernel],
+                    next(linear_qkv_dim * kernel),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.norm.weight"),
+                    vec![linear_output_dim],
+                    next(linear_output_dim),
+                ));
+                entries.push((
+                    format!("{prefix}.linear_attn.out_proj.weight"),
+                    vec![hidden, linear_output_dim],
+                    next(hidden * linear_output_dim),
+                ));
+            }
+
+            entries.push((
+                format!("{prefix}.mlp.gate_proj.weight"),
+                vec![intermediate, hidden],
+                next(intermediate * hidden),
+            ));
+            entries.push((
+                format!("{prefix}.mlp.up_proj.weight"),
+                vec![intermediate, hidden],
+                next(intermediate * hidden),
+            ));
+            entries.push((
+                format!("{prefix}.mlp.down_proj.weight"),
+                vec![hidden, intermediate],
+                next(hidden * intermediate),
+            ));
+        }
+
+        // --- MTP tensors (shapes match the real Qwen3.5-0.8B MTP head scaled
+        // to the tiny config's hidden=8, intermediate=16, head_dim=4) ---
+        // fc.weight: [hidden, 2*hidden] — projects concat(embed_hidden, main_hidden)
+        entries.push((
+            "mtp.fc.weight".into(),
+            vec![hidden, 2 * hidden],
+            next(hidden * 2 * hidden),
+        ));
+        // Attention: use simple shapes that are 2-D and divisible by block size 32.
+        // For the tiny test hidden=8 we'd get very small matrices; pad up to 32 elements.
+        // Use hidden=8 as-is — quantize_f64_to_q4 pads the last block with zeros.
+        entries.push((
+            "mtp.layers.0.self_attn.q_proj.weight".into(),
+            vec![4 * hidden, hidden],
+            next(4 * hidden * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.self_attn.k_proj.weight".into(),
+            vec![hidden, hidden],
+            next(hidden * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.self_attn.v_proj.weight".into(),
+            vec![hidden, hidden],
+            next(hidden * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.self_attn.o_proj.weight".into(),
+            vec![hidden, 2 * hidden],
+            next(hidden * 2 * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.mlp.gate_proj.weight".into(),
+            vec![intermediate, hidden],
+            next(intermediate * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.mlp.up_proj.weight".into(),
+            vec![intermediate, hidden],
+            next(intermediate * hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.mlp.down_proj.weight".into(),
+            vec![hidden, intermediate],
+            next(hidden * intermediate),
+        ));
+        // f16 tensors (norms + small vectors)
+        entries.push((
+            "mtp.layers.0.input_layernorm.weight".into(),
+            vec![hidden],
+            next(hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.post_attention_layernorm.weight".into(),
+            vec![hidden],
+            next(hidden),
+        ));
+        entries.push((
+            "mtp.layers.0.self_attn.q_norm.weight".into(),
+            vec![head_dim],
+            next(head_dim),
+        ));
+        entries.push((
+            "mtp.layers.0.self_attn.k_norm.weight".into(),
+            vec![head_dim],
+            next(head_dim),
+        ));
+        entries.push(("mtp.norm.weight".into(), vec![hidden], next(hidden)));
+        entries.push((
+            "mtp.pre_fc_norm_embedding.weight".into(),
+            vec![hidden],
+            next(hidden),
+        ));
+        entries.push((
+            "mtp.pre_fc_norm_hidden.weight".into(),
+            vec![hidden],
+            next(hidden),
+        ));
+
+        let borrowed: Vec<(&str, Vec<usize>, &[f64])> = entries
+            .iter()
+            .map(|(n, s, d)| (n.as_str(), s.clone(), d.as_slice()))
+            .collect();
+        write_test_safetensors(path, &borrowed);
+    }
+
+    /// Write an input dir whose safetensors contains BOTH main model tensors
+    /// and MTP tensors, with config.json that sets mtp_num_hidden_layers=1.
+    fn write_input_dir_with_mtp(cfg: &Qwen35Config, dir: &Path, seed: u64) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("config.json"), tiny_config_json_with_mtp(cfg)).unwrap();
+        // Write combined main+MTP safetensors in one shot.
+        write_mtp_tensors_into(&dir.join("model.safetensors"), cfg, seed);
+    }
+
+    /// QuaRot converter must NOT emit MTP files even when the checkpoint
+    /// has all 15 MTP tensors — rotated embeddings/hidden would feed
+    /// un-rotated MTP weights (γ·(R·x) ≠ R·(γ·x)).
+    #[test]
+    fn convert_quarot_qwen35_skips_mtp_for_quarot_even_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg_with_mtp(true);
+        write_input_dir_with_mtp(&cfg, &input, 70);
+
+        let _report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0DE_BABE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        // QuaRot converter must NOT write MTP files — rotated embeddings/hidden
+        // would feed un-rotated MTP weights, producing a draft model in the
+        // wrong basis.
+        let mtp_files: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("mtp_"))
+            .collect();
+        assert!(
+            mtp_files.is_empty(),
+            "QuaRot converter must not emit MTP files (rotation basis mismatch), \
+             but found: {:?}",
+            mtp_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+
+        // Output config must zero mtp_num_hidden_layers so the runtime
+        // loader does not attempt MTP activation on QuaRot artifacts.
+        let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
+        let out_val: serde_json::Value = serde_json::from_str(&out_cfg_str).unwrap();
+        assert_eq!(
+            out_val
+                .get("text_config")
+                .and_then(|tc| tc.get("mtp_num_hidden_layers"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "output config text_config.mtp_num_hidden_layers must be 0"
+        );
+        assert_eq!(
+            out_val
+                .get("mtp_num_hidden_layers")
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "output config top-level mtp_num_hidden_layers must be 0"
+        );
+    }
+
+    /// When config has `mtp_num_hidden_layers > 0` but the checkpoint
+    /// does NOT contain MTP tensors, the converter must succeed silently
+    /// (skip MTP) without writing any `mtp.*` files.
+    #[test]
+    fn convert_quarot_qwen35_skips_mtp_when_tensors_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        // Use a config that says mtp_num_hidden_layers=1 but only write
+        // main-model tensors (no MTP) to the safetensors file.
+        let cfg = tiny_cfg_with_mtp(true);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
+        // Write only the main model tensors — no MTP tensors in the file.
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71);
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xDEAD_BABE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        // No mtp.* files should exist in the output directory.
+        let entries: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &entries {
+            assert!(
+                !name.starts_with("mtp"),
+                "unexpected MTP file written when tensors were absent: {name}"
+            );
+        }
+
+        // Main model must still have been converted successfully.
+        assert!(report.planned_quantized > 0);
+        assert!(output.join("config.json").exists());
+    }
+
+    /// When config has `mtp_num_hidden_layers == 0`, the converter must NOT
+    /// write any MTP files — the zero-config gate skips MTP regardless of
+    /// whether the checkpoint contains mtp.* tensors.
+    #[test]
+    fn convert_quarot_qwen35_skips_mtp_when_config_has_zero_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        // Force mtp_num_hidden_layers = 0 explicitly (tiny_cfg inherits 1
+        // from qwen35_0_8b; override it here).
+        let mut cfg = tiny_cfg(true);
+        cfg.mtp_num_hidden_layers = 0;
+        assert_eq!(cfg.mtp_num_hidden_layers, 0);
+        // write_required_tensors_for only writes main model tensors (no MTP).
+        // We write a plain config.json (no mtp_num_hidden_layers key so it
+        // defaults to 0 on deserialize) alongside the main safetensors.
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72);
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xCAFE_F00D,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        let entries: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for name in &entries {
+            assert!(
+                !name.starts_with("mtp"),
+                "unexpected MTP file written for zero-MTP-layer config: {name}"
+            );
+        }
+        assert!(report.planned_quantized > 0);
     }
 }
