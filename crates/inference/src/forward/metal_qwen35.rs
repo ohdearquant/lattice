@@ -13457,10 +13457,14 @@ kernel void decode_attention_reference(
         }
 
         /// Regression: self-spec slot 0 must hold the *pre-draft* GDN state, not the
-        /// state after GDN-only draft forwards. If `verify_tokens_batched` were called
-        /// against a contaminated slot 0, the per-token verification slots would compose
-        /// full-model forwards on top of GDN-only draft mutations, and slot-based rollback
-        /// would land on a corrupted state.
+        /// state after GDN-only draft forwards. The tiny fixture has all-zero weights
+        /// which makes GDN-only forwards numerically uninteresting on their own, so we
+        /// seed the live GDN buffers with a recognizable non-zero pattern before the
+        /// round, snapshot that as the pre-draft baseline, then assert slot 0 still
+        /// matches it after a self-spec round. If slot 0 were captured AFTER GDN-only
+        /// draft forwards, the conv buffer's rolling shift (which moves the planted
+        /// pattern even when conv weights are zero) would shift slot 0's contents and
+        /// the check would fail.
         #[test]
         fn self_spec_slot0_holds_pre_draft_state_after_round() {
             let Some(_) = metal::Device::system_default() else {
@@ -13468,6 +13472,7 @@ kernel void decode_attention_reference(
             };
 
             use crate::model::qwen35_config::GenerateConfig;
+            use crate::speculative::MtpTargetVerifier;
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -13487,11 +13492,33 @@ kernel void decode_attention_reference(
                 MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
             });
 
-            // Capture the canonical pre-draft GDN state by snapshotting the freshly-reset
-            // model, then read back the live S buffer of the first GDN layer.
             state.reset_state();
-            let _ = state.forward_prefill(&vec![0u32]);
-            use crate::speculative::MtpTargetVerifier;
+
+            // Plant a recognizable non-zero pattern into the live GDN GPU buffers so the
+            // pre-draft / post-draft slot contents are observably distinct. The exact
+            // values don't matter — only that conv rolling and S-matrix decay would
+            // perturb them if GDN-only draft forwards touched the captured slot.
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: StorageModeShared; no command buffer in flight in the test.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 0.5 + (li as f32) * 0.01 + (k as f32) * 1e-4;
+                    }
+                }
+            }
+            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = -0.7 - (li as f32) * 0.013 - (k as f32) * 2e-4;
+                    }
+                }
+            }
+
             let snap_before = state.snapshot_gdn_states();
             assert!(
                 !snap_before.is_empty(),
@@ -13499,44 +13526,67 @@ kernel void decode_attention_reference(
             );
 
             let prefill_logits = state.forward_prefill(&vec![0u32]);
+            // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
+            // exact state the self-spec round will see at `pos = kv.seq_len`.
+            let snap_pre_round = state.snapshot_gdn_states();
+
             let _ = with_self_spec_env(|| {
                 state.generate_greedy_self_spec(&prefill_logits, 1, &tokenizer, &gen_cfg)
             });
 
-            // After running a self-spec round, the checkpoint pool's slot 0 must equal the
-            // pre-draft GDN snapshot we took before the round started. If self-spec had
-            // saved slot 0 *after* the GDN-only draft forwards, the buffer would differ.
+            // After running a self-spec round, slot 0 must equal the pre-draft baseline
+            // (which we captured AFTER prefill). If slot 0 had been written by the
+            // GDN-only draft forwards or by the verify-loop checkpoint at the *wrong*
+            // time, the conv buffer's rolling shift would have moved our planted
+            // pattern and this check would fail.
             let pool = state
                 .session
                 .gdn_checkpoints
                 .as_ref()
                 .expect("pool must be allocated");
-            for (li, snap_layer) in snap_before.iter().enumerate() {
+            for (li, snap_layer) in snap_pre_round.iter().enumerate() {
                 let slot0_s = &pool.s_slots[0][li];
-                let n = (slot0_s.length() / 4) as usize;
-                // SAFETY: shared-storage Metal buffer; the round has fully completed.
-                let live = unsafe {
+                let slot0_conv = &pool.conv_slots[0][li];
+                let n_s = (slot0_s.length() / 4) as usize;
+                let n_conv = (slot0_conv.length() / 4) as usize;
+                // SAFETY: shared-storage buffers; the round has fully completed.
+                let live_s = unsafe {
                     let ptr = slot0_s.contents() as *const f32;
-                    std::slice::from_raw_parts(ptr, n)
+                    std::slice::from_raw_parts(ptr, n_s)
                 };
-                assert_eq!(
-                    live.len(),
-                    snap_layer.0.len(),
-                    "slot 0 s-matrix length mismatch on layer {li}"
-                );
-                // Both should match the pre-draft baseline (all zeros for a fresh
-                // session, but writing the structural equality check keeps this
-                // robust if the fixture later starts with non-zero state).
-                for k in 0..live.len() {
-                    let delta = (live[k] - snap_layer.0[k]).abs();
+                let live_conv = unsafe {
+                    let ptr = slot0_conv.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, n_conv)
+                };
+                assert_eq!(live_s.len(), snap_layer.0.len());
+                assert_eq!(live_conv.len(), snap_layer.1.len());
+                for k in 0..live_s.len() {
+                    let delta = (live_s[k] - snap_layer.0[k]).abs();
                     assert!(
                         delta < 1e-5,
                         "slot 0 s[{li}][{k}] = {} drifted from pre-draft = {} (delta {})",
-                        live[k],
+                        live_s[k],
                         snap_layer.0[k],
                         delta
                     );
                 }
+                for k in 0..live_conv.len() {
+                    let delta = (live_conv[k] - snap_layer.1[k]).abs();
+                    assert!(
+                        delta < 1e-5,
+                        "slot 0 conv[{li}][{k}] = {} drifted from pre-draft = {} (delta {})",
+                        live_conv[k],
+                        snap_layer.1[k],
+                        delta
+                    );
+                }
+                // Sanity check: the planted pattern should still be non-zero so this
+                // test would detect a bug; if the conv buffer were all zeros the
+                // rolling shift would be invisible.
+                assert!(
+                    snap_layer.1.iter().any(|&v| v.abs() > 0.0),
+                    "test fixture must plant non-zero conv pattern on layer {li}"
+                );
             }
         }
 

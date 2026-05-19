@@ -1174,12 +1174,13 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_first = argmax(initial_target_logits) as u32;
 
     if draft[0] != target_first {
-        // Full rejection before calling verify_tokens. Target GDN was not advanced (no
-        // `verify_tokens` call), so the snapshot is identical to current state — restore is
-        // a no-op for correctness but kept here for parity with the partial-acceptance path.
+        // Full rejection before calling `verify_tokens`. Target state was never advanced —
+        // KV is already at `target_start` and GDN matches `gdn_snap` — so we must NOT call
+        // `target.rollback_cache_to(target_start)` here: some implementors (the Metal
+        // adapter is one) need an active speculation checkpoint to roll back into, and
+        // `verify_tokens` was never called to set it.
         verifier.rollback_cache_to(mtp_start)?;
-        target.rollback_cache_to(target_start)?;
-        target.restore_gdn_states(&gdn_snap);
+        let _ = gdn_snap;
         let fallback = target_first;
         return Ok(MtpVerifyResult {
             accepted_count: 0,
@@ -1198,10 +1199,13 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         });
     }
 
-    // First token is EOS: accept it and stop
+    // First token is EOS: accept it and stop. Same reasoning as the early full-rejection
+    // branch above — `target.verify_tokens` was not called, so target state is already at
+    // `target_start` and a `rollback_cache_to(target_start)` would tickle the Metal
+    // checkpoint precondition for no good reason.
     if Some(target_first) == eos_token {
         verifier.rollback_cache_to(mtp_start + 1)?;
-        target.rollback_cache_to(target_start)?;
+        let _ = gdn_snap;
         return Ok(MtpVerifyResult {
             accepted_count: 1,
             accepted_tokens: vec![target_first],
