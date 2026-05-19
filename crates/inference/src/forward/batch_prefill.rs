@@ -1103,12 +1103,13 @@ fn softplus_prefill(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lora_hook::LoraHook;
     use crate::model::qwen35::ModelWeights;
     use crate::model::qwen35_config::LayerType;
     use crate::rope::RopeTable;
     use crate::tokenizer::bpe::BpeTokenizer;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     /// Verify that batched prompt prefill matches the legacy token-by-token path.
@@ -1293,6 +1294,94 @@ mod tests {
         let (batch_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
 
         assert_allclose("lora_prefill_logits", &seq_logits, &batch_logits, 1e-5);
+    }
+
+    type CallLog = Vec<(usize, String, usize, usize)>;
+
+    struct SpyHook {
+        calls: Arc<Mutex<CallLog>>,
+    }
+    impl LoraHook for SpyHook {
+        fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((layer_idx, module.to_string(), x.len(), output.len()));
+        }
+    }
+
+    #[test]
+    fn test_batch_prefill_lora_hook_invoked_at_every_projection() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0xABCD_EF01_CAFE_1234);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        model.lora = Box::new(SpyHook {
+            calls: Arc::clone(&calls),
+        });
+
+        let prompt_ids = vec![1, 7, 3, 9, 4];
+        let _ = run_batched_prefill(&model, &prompt_ids);
+
+        let recorded = calls.lock().unwrap();
+        let seq_len = prompt_ids.len();
+
+        let mut expected: BTreeSet<(usize, String)> = BTreeSet::new();
+        for (layer_idx, layer_type) in cfg.layer_types.iter().enumerate() {
+            let attn_modules: &[&str] = match layer_type {
+                LayerType::FullAttention => &["q_proj", "k_proj", "v_proj", "o_proj"],
+                LayerType::LinearAttention => &[
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "out_proj",
+                ],
+            };
+            for m in attn_modules
+                .iter()
+                .chain(["gate_proj", "up_proj", "down_proj"].iter())
+            {
+                expected.insert((layer_idx, (*m).to_string()));
+            }
+        }
+
+        let seen: BTreeSet<(usize, String)> = recorded
+            .iter()
+            .map(|(l, m, _, _)| (*l, m.clone()))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "batch prefill LoRA hook must fire at every adapted projection"
+        );
+
+        let projections_per_step = expected.len();
+        assert_eq!(
+            recorded.len(),
+            seq_len * projections_per_step,
+            "hook must fire once per (token, layer, module)"
+        );
+
+        let h = cfg.hidden_size;
+        for (layer_idx, module, x_len, out_len) in recorded.iter() {
+            let (exp_x, exp_out) = match module.as_str() {
+                "q_proj" => (h, 2 * cfg.full_q_dim()),
+                "k_proj" | "v_proj" => (h, cfg.full_kv_dim()),
+                "o_proj" => (cfg.full_q_dim(), h),
+                "gate_proj" | "up_proj" => (h, cfg.intermediate_size),
+                "down_proj" => (cfg.intermediate_size, h),
+                "in_proj_qkv" => (h, cfg.linear_qkv_dim()),
+                "in_proj_z" => (h, cfg.linear_output_dim()),
+                "in_proj_b" | "in_proj_a" => (h, cfg.linear_num_key_heads),
+                "out_proj" => (cfg.linear_output_dim(), h),
+                other => panic!("unexpected module in batch prefill hook: {other}"),
+            };
+            assert_eq!(
+                (*x_len, *out_len),
+                (exp_x, exp_out),
+                "layer {layer_idx} {module}: got (x={x_len}, out={out_len}), expected (x={exp_x}, out={exp_out})"
+            );
+        }
     }
 
     /// Compare prompt prefill throughput for the sequential and batched paths.
@@ -1618,30 +1707,18 @@ mod tests {
         (x >> 32) as u32
     }
 
-    /// Load a minimal byte-level BPE tokenizer for tests that instantiate the model.
+    /// Minimal byte-level BPE tokenizer parsed from a string — no temp file, no
+    /// cross-test races.
     fn dummy_tokenizer() -> BpeTokenizer {
-        let mut path: PathBuf = std::env::temp_dir();
-        path.push("qwen35_batch_prefill_dummy_tokenizer.json");
-
         let json = r#"{
   "version": "1.0",
   "truncation": null,
   "padding": null,
   "added_tokens": [],
   "normalizer": null,
-  "pre_tokenizer": {
-    "type": "ByteLevel",
-    "add_prefix_space": false,
-    "trim_offsets": true,
-    "use_regex": true
-  },
+  "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true },
   "post_processor": null,
-  "decoder": {
-    "type": "ByteLevel",
-    "add_prefix_space": true,
-    "trim_offsets": true,
-    "use_regex": true
-  },
+  "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
   "model": {
     "type": "BPE",
     "dropout": null,
@@ -1651,20 +1728,10 @@ mod tests {
     "fuse_unk": false,
     "byte_fallback": false,
     "ignore_merges": false,
-    "vocab": {
-      "<unk>": 0,
-      "a": 1,
-      "b": 2,
-      "c": 3,
-      "d": 4,
-      "e": 5,
-      " ": 6
-    },
+    "vocab": { "<unk>": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, " ": 6 },
     "merges": []
   }
 }"#;
-
-        fs::write(&path, json).expect("failed to write dummy tokenizer");
-        BpeTokenizer::from_tokenizer_json(&path).expect("failed to load dummy tokenizer")
+        BpeTokenizer::from_tokenizer_json_str(json).expect("test tokenizer parses")
     }
 }
