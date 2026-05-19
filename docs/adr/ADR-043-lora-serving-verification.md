@@ -50,7 +50,7 @@ Both `qwen35_generate` and `generate_lora` binaries now default to `qwen3.5-0.8b
 
 3. **Fixture is the real config.json**: Downloaded verbatim from HuggingFace, not hand-written. This catches real-world serde surprises (nested `rope_parameters`, `mamba_ssm_dtype` field, vision config alongside text config).
 
-4. **Batch prefill LoRA gap documented, not fixed**: `batch_prefill.rs` has no `lora.apply()` calls. The live `generate()` path is unaffected (it prefills via `forward_step` which does apply LoRA), but the batched path's own docs suggest it as a "one-line swap" — that swap would silently drop adapters. A doc comment flags this rather than wiring the hook through, since the batch path is not used in production and the wiring is non-trivial (the batched kernel fuses projections differently).
+4. **Batch prefill LoRA gap closed (PR #43)**: `batch_prefill.rs` originally had no `lora.apply()` calls. PR #43 wires per-token `lora.apply()` at all 12 projection families (4 GQA + 5 GDN + 3 MLP) through the batched path, matching the decode-path contract. A spy-hook test (`test_batch_prefill_lora_hook_invoked_at_every_projection`) guards against regressions.
 
 ---
 
@@ -84,5 +84,5 @@ Both `qwen35_generate` and `generate_lora` binaries now default to `qwen3.5-0.8b
 - `src/model/qwen35/tests.rs` — spy/delta hook tests
 - `src/model/qwen35_config.rs` — `qwen35_0_8b()` preset
 - `tests/fixtures/qwen35_0_8b_config.json` — real 0.8B config fixture
-- `src/forward/batch_prefill.rs` — LoRA gap documentation
+- `src/forward/batch_prefill.rs` — batch prefill LoRA wiring (PR #43)
 - Hu et al. 2021 — "LoRA: Low-Rank Adaptation of Large Language Models" — https://arxiv.org/abs/2106.09685

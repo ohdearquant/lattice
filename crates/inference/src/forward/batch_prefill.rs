@@ -12,12 +12,10 @@
 //! either rename this method to `generate`, or have the existing `generate()`
 //! delegate to it.
 //!
-//! **LoRA limitation**: this batched path does not invoke the `LoraHook` — it has
-//! no `lora.apply()` calls. The live `generate()` in `generation.rs` is unaffected
-//! because it prefills token-by-token via `forward_step`, which does apply the
-//! hook. But the "one-line swap" above would silently drop LoRA adapters during
-//! prompt prefill; wiring the hook through the projections here is a prerequisite
-//! for that swap.
+//! LoRA adapters are applied per-token in all projection steps, matching the
+//! decode path. Each `matmul_bt` over the `[seq_len, dim]` batch is followed by
+//! per-row `lora.apply()` calls so the adapter delta is added to every token's
+//! projection output before downstream processing.
 
 use crate::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
 use crate::attention::gdn::{
@@ -219,6 +217,7 @@ impl Qwen35Model {
         gdn_states: &mut [GatedDeltaNetState],
         kv_cache: &mut KvCache,
         scratch: &mut PrefillScratch,
+        lora: &dyn crate::lora_hook::LoraHook,
     ) -> Result<Vec<f32>, InferenceError> {
         let cfg = &self.config;
         let seq_len = prompt_ids.len();
@@ -265,11 +264,15 @@ impl Qwen35Model {
                         &mut gdn_states[linear_idx],
                         scratch,
                         seq_len,
+                        lora,
+                        layer_i,
                     );
                     linear_idx += 1;
                 }
                 AttentionWeights::Full(full_w) => {
-                    self.prefill_full_attention_layer(full_w, full_idx, kv_cache, scratch, seq_len);
+                    self.prefill_full_attention_layer(
+                        full_w, full_idx, kv_cache, scratch, seq_len, lora, layer_i,
+                    );
                     full_idx += 1;
                 }
             }
@@ -289,7 +292,7 @@ impl Qwen35Model {
             );
 
             // Batched FFN.
-            self.ffn_batch_from_hidden(common, scratch, seq_len)?;
+            self.ffn_batch_from_hidden(common, scratch, seq_len, lora, layer_i)?;
 
             // Residual add.
             for i in 0..token_hidden {
@@ -309,7 +312,7 @@ impl Qwen35Model {
         let last_hidden = &scratch.hidden[(seq_len - 1) * hidden..seq_len * hidden];
         matmul_bt(
             last_hidden,
-            &self.weights.embed_tokens,
+            self.weights.logits_weight(),
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,
@@ -390,8 +393,13 @@ impl Qwen35Model {
         let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
         let mut all_ids = prompt_ids.clone();
 
-        let logits =
-            self.prefill_prompt(&prompt_ids, &mut gdn_states, &mut kv_cache, &mut scratch)?;
+        let logits = self.prefill_prompt(
+            &prompt_ids,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+            self.lora.as_ref(),
+        )?;
 
         // Sample from the final prefill logits.
         let next_id = sample_token(&logits[..cfg.vocab_size], gen_cfg, &all_ids, &mut rng_state);
@@ -457,6 +465,8 @@ impl Qwen35Model {
         kv_cache: &mut KvCache,
         scratch: &mut PrefillScratch,
         seq_len: usize,
+        lora: &dyn crate::lora_hook::LoraHook,
+        layer_idx: usize,
     ) {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
@@ -483,6 +493,14 @@ impl Qwen35Model {
             hidden,
             q_proj_dim,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "q_proj",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.q_batch[t * q_proj_dim..(t + 1) * q_proj_dim],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.k_proj,
@@ -491,6 +509,14 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "k_proj",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.k_batch[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.v_proj,
@@ -499,6 +525,14 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "v_proj",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.v_batch[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
 
         // Unpack interleaved [Q_h, gate_h] blocks into compact Q rows plus a
         // separate gate buffer, matching the decode path exactly.
@@ -590,6 +624,14 @@ impl Qwen35Model {
             q_dim,
             hidden,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "o_proj",
+                &scratch.context_batch[t * q_dim..(t + 1) * q_dim],
+                &mut scratch.attn_out[t * hidden..(t + 1) * hidden],
+            );
+        }
     }
 
     /// Run one GatedDeltaNet layer with batched projections and a sequential
@@ -600,6 +642,8 @@ impl Qwen35Model {
         state: &mut GatedDeltaNetState,
         scratch: &mut PrefillScratch,
         seq_len: usize,
+        lora: &dyn crate::lora_hook::LoraHook,
+        layer_idx: usize,
     ) {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
@@ -626,6 +670,14 @@ impl Qwen35Model {
             hidden,
             qkv_dim,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "in_proj_qkv",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_z,
@@ -634,6 +686,14 @@ impl Qwen35Model {
             hidden,
             output_dim,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "in_proj_z",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.gdn_z_batch[t * output_dim..(t + 1) * output_dim],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_b,
@@ -642,6 +702,14 @@ impl Qwen35Model {
             hidden,
             num_heads,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "in_proj_b",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.gdn_beta_batch[t * num_heads..(t + 1) * num_heads],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_a,
@@ -650,6 +718,14 @@ impl Qwen35Model {
             hidden,
             num_heads,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "in_proj_a",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.gdn_alpha_batch[t * num_heads..(t + 1) * num_heads],
+            );
+        }
 
         // Sigmoid(beta) exactly as in the decode path.
         for beta in &mut scratch.gdn_beta_batch[..seq_len * num_heads] {
@@ -772,6 +848,14 @@ impl Qwen35Model {
             output_dim,
             hidden,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "out_proj",
+                &scratch.gdn_out_batch[t * output_dim..(t + 1) * output_dim],
+                &mut scratch.attn_out[t * hidden..(t + 1) * hidden],
+            );
+        }
     }
 
     /// Batched SwiGLU MLP for all prompt positions in a layer.
@@ -780,10 +864,12 @@ impl Qwen35Model {
         common: &CommonLayerWeights,
         scratch: &mut PrefillScratch,
         seq_len: usize,
+        lora: &dyn crate::lora_hook::LoraHook,
+        layer_idx: usize,
     ) -> Result<(), InferenceError> {
         match &common.ffn {
             FeedForwardWeights::Dense(dense) => {
-                self.dense_ffn_batch_from_hidden(dense, scratch, seq_len);
+                self.dense_ffn_batch_from_hidden(dense, scratch, seq_len, lora, layer_idx);
                 Ok(())
             }
             FeedForwardWeights::Moe(_) => Err(InferenceError::UnsupportedModel(
@@ -798,6 +884,8 @@ impl Qwen35Model {
         dense: &DenseFfnWeights,
         scratch: &mut PrefillScratch,
         seq_len: usize,
+        lora: &dyn crate::lora_hook::LoraHook,
+        layer_idx: usize,
     ) {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
@@ -811,6 +899,14 @@ impl Qwen35Model {
             hidden,
             inter,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "gate_proj",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.gate_batch[t * inter..(t + 1) * inter],
+            );
+        }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &dense.up_proj,
@@ -819,6 +915,14 @@ impl Qwen35Model {
             hidden,
             inter,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "up_proj",
+                &scratch.hidden[t * hidden..(t + 1) * hidden],
+                &mut scratch.up_batch[t * inter..(t + 1) * inter],
+            );
+        }
 
         silu_inplace(&mut scratch.gate_batch[..seq_len * inter]);
         elementwise_mul(
@@ -834,6 +938,14 @@ impl Qwen35Model {
             inter,
             hidden,
         );
+        for t in 0..seq_len {
+            lora.apply(
+                layer_idx,
+                "down_proj",
+                &scratch.gate_batch[t * inter..(t + 1) * inter],
+                &mut scratch.ffn_batch[t * hidden..(t + 1) * hidden],
+            );
+        }
     }
 }
 
@@ -991,12 +1103,13 @@ fn softplus_prefill(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lora_hook::LoraHook;
     use crate::model::qwen35::ModelWeights;
     use crate::model::qwen35_config::LayerType;
     use crate::rope::RopeTable;
     use crate::tokenizer::bpe::BpeTokenizer;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     /// Verify that batched prompt prefill matches the legacy token-by-token path.
@@ -1042,6 +1155,22 @@ mod tests {
     }
 
     #[test]
+    fn test_prefill_matches_sequential_untied_lm_head() {
+        let mut cfg = tiny_test_config();
+        cfg.tie_word_embeddings = false;
+
+        let mut model = build_random_model(cfg.clone(), 0xBEEF_FACE_1234_5678);
+        let lm_head = random_vec(&mut 0xDEAD_C0DE_u64, cfg.vocab_size * cfg.hidden_size, 0.02);
+        model.weights.lm_head = Some(lm_head);
+
+        let prompt_ids = vec![1, 7, 3, 9, 4, 2, 5, 6, 8];
+        let (seq_logits, _, _) = run_sequential_prefill(&model, &prompt_ids);
+        let (batch_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
+
+        assert_allclose("untied_lm_head_logits", &seq_logits, &batch_logits, 1e-5);
+    }
+
+    #[test]
     fn test_batch_prefill_rejects_moe_without_panic() {
         let mut cfg = tiny_test_config();
         cfg.num_experts = Some(2);
@@ -1058,6 +1187,217 @@ mod tests {
         assert!(
             matches!(err, InferenceError::UnsupportedModel(msg) if msg == "MoE batch prefill is not yet implemented")
         );
+    }
+
+    /// A non-trivial LoRA hook that adds a fixed delta to a specific (layer, module) pair.
+    struct FixedDeltaLoraHook {
+        target_layer: usize,
+        target_module: &'static str,
+        delta: f32,
+    }
+
+    impl crate::lora_hook::LoraHook for FixedDeltaLoraHook {
+        fn apply(&self, layer_idx: usize, module: &str, _x: &[f32], output: &mut [f32]) {
+            if layer_idx == self.target_layer && module == self.target_module {
+                for v in output.iter_mut() {
+                    *v += self.delta;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lora_hook_changes_prefill_output() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0xdead_beef_cafe_1234);
+
+        let prompt_ids = vec![1, 7, 3, 9, 4];
+
+        let (baseline_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
+
+        model.lora = Box::new(FixedDeltaLoraHook {
+            target_layer: 0,
+            target_module: "gate_proj",
+            delta: 1.0,
+        });
+
+        let (lora_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
+
+        assert_eq!(baseline_logits.len(), lora_logits.len());
+        let any_different = baseline_logits
+            .iter()
+            .zip(lora_logits.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            any_different,
+            "LoRA hook should change batch prefill logits but all values are identical"
+        );
+    }
+
+    #[test]
+    fn test_lora_hook_changes_decode_output() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0xfeed_1234_abcd_5678);
+
+        let token_id = 3u32;
+        let position = 0usize;
+        let num_linear = cfg.num_linear_attention_layers();
+        let num_full = cfg.num_full_attention_layers();
+
+        let baseline_logits = {
+            let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+                .map(|_| GatedDeltaNetState::new(&cfg))
+                .collect();
+            let mut kv_cache = KvCache::new(num_full);
+            let mut scratch = ForwardScratch::new();
+            model.forward_step(
+                token_id,
+                position,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            scratch.logits[..cfg.vocab_size].to_vec()
+        };
+
+        model.lora = Box::new(FixedDeltaLoraHook {
+            target_layer: 0,
+            target_module: "gate_proj",
+            delta: 1.0,
+        });
+
+        let lora_logits = {
+            let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+                .map(|_| GatedDeltaNetState::new(&cfg))
+                .collect();
+            let mut kv_cache = KvCache::new(num_full);
+            let mut scratch = ForwardScratch::new();
+            model.forward_step(
+                token_id,
+                position,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            scratch.logits[..cfg.vocab_size].to_vec()
+        };
+
+        assert_eq!(baseline_logits.len(), lora_logits.len());
+        let any_different = baseline_logits
+            .iter()
+            .zip(lora_logits.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            any_different,
+            "LoRA hook should change decode logits but all values are identical"
+        );
+    }
+
+    #[test]
+    fn test_lora_hook_prefill_decode_agreement() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0x1111_2222_3333_4444);
+
+        model.lora = Box::new(FixedDeltaLoraHook {
+            target_layer: 0,
+            target_module: "gate_proj",
+            delta: 0.5,
+        });
+
+        let prompt_ids = vec![1, 7, 3, 9, 4, 2, 5, 6, 8];
+
+        let (seq_logits, _, _) = run_sequential_prefill(&model, &prompt_ids);
+        let (batch_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
+
+        assert_allclose("lora_prefill_logits", &seq_logits, &batch_logits, 1e-5);
+    }
+
+    type CallLog = Vec<(usize, String, usize, usize)>;
+
+    struct SpyHook {
+        calls: Arc<Mutex<CallLog>>,
+    }
+    impl LoraHook for SpyHook {
+        fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((layer_idx, module.to_string(), x.len(), output.len()));
+        }
+    }
+
+    #[test]
+    fn test_batch_prefill_lora_hook_invoked_at_every_projection() {
+        let cfg = tiny_test_config();
+        let mut model = build_random_model(cfg.clone(), 0xABCD_EF01_CAFE_1234);
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        model.lora = Box::new(SpyHook {
+            calls: Arc::clone(&calls),
+        });
+
+        let prompt_ids = vec![1, 7, 3, 9, 4];
+        let _ = run_batched_prefill(&model, &prompt_ids);
+
+        let recorded = calls.lock().unwrap();
+        let seq_len = prompt_ids.len();
+
+        let mut expected: BTreeSet<(usize, String)> = BTreeSet::new();
+        for (layer_idx, layer_type) in cfg.layer_types.iter().enumerate() {
+            let attn_modules: &[&str] = match layer_type {
+                LayerType::FullAttention => &["q_proj", "k_proj", "v_proj", "o_proj"],
+                LayerType::LinearAttention => &[
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "out_proj",
+                ],
+            };
+            for m in attn_modules
+                .iter()
+                .chain(["gate_proj", "up_proj", "down_proj"].iter())
+            {
+                expected.insert((layer_idx, (*m).to_string()));
+            }
+        }
+
+        let seen: BTreeSet<(usize, String)> = recorded
+            .iter()
+            .map(|(l, m, _, _)| (*l, m.clone()))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "batch prefill LoRA hook must fire at every adapted projection"
+        );
+
+        let projections_per_step = expected.len();
+        assert_eq!(
+            recorded.len(),
+            seq_len * projections_per_step,
+            "hook must fire once per (token, layer, module)"
+        );
+
+        let h = cfg.hidden_size;
+        for (layer_idx, module, x_len, out_len) in recorded.iter() {
+            let (exp_x, exp_out) = match module.as_str() {
+                "q_proj" => (h, 2 * cfg.full_q_dim()),
+                "k_proj" | "v_proj" => (h, cfg.full_kv_dim()),
+                "o_proj" => (cfg.full_q_dim(), h),
+                "gate_proj" | "up_proj" => (h, cfg.intermediate_size),
+                "down_proj" => (cfg.intermediate_size, h),
+                "in_proj_qkv" => (h, cfg.linear_qkv_dim()),
+                "in_proj_z" => (h, cfg.linear_output_dim()),
+                "in_proj_b" | "in_proj_a" => (h, cfg.linear_num_key_heads),
+                "out_proj" => (cfg.linear_output_dim(), h),
+                other => panic!("unexpected module in batch prefill hook: {other}"),
+            };
+            assert_eq!(
+                (*x_len, *out_len),
+                (exp_x, exp_out),
+                "layer {layer_idx} {module}: got (x={x_len}, out={out_len}), expected (x={exp_x}, out={exp_out})"
+            );
+        }
     }
 
     /// Compare prompt prefill throughput for the sequential and batched paths.
@@ -1159,7 +1499,13 @@ mod tests {
 
         let mut scratch = PrefillScratch::new(cfg);
         let logits = model
-            .prefill_prompt(prompt_ids, &mut gdn_states, &mut kv_cache, &mut scratch)
+            .prefill_prompt(
+                prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                model.lora.as_ref(),
+            )
             .expect("batched dense prefill should succeed");
 
         (logits, gdn_states, kv_cache)
@@ -1377,30 +1723,18 @@ mod tests {
         (x >> 32) as u32
     }
 
-    /// Load a minimal byte-level BPE tokenizer for tests that instantiate the model.
+    /// Minimal byte-level BPE tokenizer parsed from a string — no temp file, no
+    /// cross-test races.
     fn dummy_tokenizer() -> BpeTokenizer {
-        let mut path: PathBuf = std::env::temp_dir();
-        path.push("qwen35_batch_prefill_dummy_tokenizer.json");
-
         let json = r#"{
   "version": "1.0",
   "truncation": null,
   "padding": null,
   "added_tokens": [],
   "normalizer": null,
-  "pre_tokenizer": {
-    "type": "ByteLevel",
-    "add_prefix_space": false,
-    "trim_offsets": true,
-    "use_regex": true
-  },
+  "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true },
   "post_processor": null,
-  "decoder": {
-    "type": "ByteLevel",
-    "add_prefix_space": true,
-    "trim_offsets": true,
-    "use_regex": true
-  },
+  "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
   "model": {
     "type": "BPE",
     "dropout": null,
@@ -1410,20 +1744,10 @@ mod tests {
     "fuse_unk": false,
     "byte_fallback": false,
     "ignore_merges": false,
-    "vocab": {
-      "<unk>": 0,
-      "a": 1,
-      "b": 2,
-      "c": 3,
-      "d": 4,
-      "e": 5,
-      " ": 6
-    },
+    "vocab": { "<unk>": 0, "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, " ": 6 },
     "merges": []
   }
 }"#;
-
-        fs::write(&path, json).expect("failed to write dummy tokenizer");
-        BpeTokenizer::from_tokenizer_json(&path).expect("failed to load dummy tokenizer")
+        BpeTokenizer::from_tokenizer_json_str(json).expect("test tokenizer parses")
     }
 }
