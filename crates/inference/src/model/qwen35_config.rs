@@ -95,6 +95,10 @@ pub struct Qwen35Config {
     /// Whether the MTP module uses dedicated embeddings separate from the main model.
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: bool,
+    /// Rotation seed used during QuaRot conversion. `None` for non-QuaRot artifacts.
+    /// Used at runtime to reconstruct `RandomizedHadamard` for MTP counter-rotation.
+    #[serde(default)]
+    pub quarot_rotation_seed: Option<u64>,
 
     // --- Layer pattern ---
     /// Every Nth layer is full attention (4 = [lin, lin, lin, full]).
@@ -185,6 +189,7 @@ impl Qwen35Config {
             // MTP (absent in Qwen3.5)
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
         }
     }
 
@@ -234,6 +239,7 @@ impl Qwen35Config {
             // MTP: Qwen3.5-0.8B ships 1 MTP layer
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
         }
     }
 
@@ -275,6 +281,7 @@ impl Qwen35Config {
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
         }
     }
 
@@ -324,6 +331,7 @@ impl Qwen35Config {
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
         }
     }
 

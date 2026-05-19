@@ -392,6 +392,7 @@ mod tests {
             max_position_embeddings: 1024,
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
         }
     }
 
