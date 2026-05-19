@@ -2748,6 +2748,11 @@ kernel void lora_gemv_b_accum(
         pub(crate) quant_format: QuantFormat,
         // Immutable MTP weights only; cache/activations live on InferenceSession.
         pub(crate) mtp_weights: Option<MetalMtpWeights>,
+        /// Rotation for QuaRot counter-rotate path. `Some` iff model was loaded from
+        /// a QuaRot q4 artifact (from_q4_dir) and the config carries a rotation seed.
+        /// Used by mtp_forward_one to apply R^T to embed and pre-final-hidden before
+        /// the O-space MTP forward, and R to mtp_h_out before the logits GEMV.
+        pub(crate) quarot_rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
     }
 
     /// Per-request mutable inference state.
@@ -3628,6 +3633,7 @@ kernel void lora_gemv_b_accum(
                 config: cfg.clone(),
                 quant_format,
                 mtp_weights: None,
+                quarot_rotation: None,
             })
         }
 
@@ -5046,6 +5052,11 @@ kernel void lora_gemv_b_accum(
                 }
             }
 
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                rot.apply_inverse(&mut normed_embed)
+                    .expect("QuaRot apply_inverse on embed: dimension mismatch");
+            }
+
             // 2. CPU RMSNorm of embedding using pre_fc_norm_embedding weights.
             {
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
@@ -5067,6 +5078,10 @@ kernel void lora_gemv_b_accum(
 
             // 3. CPU RMSNorm of target pre-final hidden using pre_fc_norm_hidden weights.
             let mut normed_hidden = self.session.last_pre_final_hidden.clone();
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                rot.apply_inverse(&mut normed_hidden)
+                    .expect("QuaRot apply_inverse on hidden: dimension mismatch");
+            }
             {
                 let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
                 let gamma = unsafe {
@@ -5401,10 +5416,25 @@ kernel void lora_gemv_b_accum(
                     1,
                     cfg.rms_norm_eps,
                 );
+            }
 
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                let mut h_out = unsafe { read_buffer(&*buf_hidden, hidden) };
+                rot.apply(&mut h_out)
+                    .expect("QuaRot apply on mtp_h_out: dimension mismatch");
+                unsafe { write_buffer(&*buf_hidden, &h_out) };
+            }
+
+            let cmd2 = self.engine.queue.new_command_buffer();
+            let enc2 = cmd2.new_compute_command_encoder();
+            unsafe {
                 // Logits GEMV using shared lm_head (embed_tokens_q8).
                 self.dispatch_gemm(
-                    enc,
+                    enc2,
                     &*buf_hidden,
                     0,
                     &self.engine.embed_tokens_q8,
@@ -5415,10 +5445,9 @@ kernel void lora_gemv_b_accum(
                     hidden as u32,
                 );
             }
-
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+            enc2.end_encoding();
+            cmd2.commit();
+            cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
             let logits = unsafe { read_buffer(&*buf_logits, cfg.vocab_size) };
@@ -10077,6 +10106,23 @@ kernel void lora_gemv_b_accum(
                 None
             };
 
+            let quarot_rotation = if mtp_weights_opt.is_some() {
+                match cfg.quarot_rotation_seed {
+                    Some(seed) => Some(
+                        crate::quant::quarot::hadamard::RandomizedHadamard::new(seed, hidden)
+                            .map_err(|e| {
+                                format!(
+                                    "from_q4_dir: failed to build QuaRot rotation \
+                                         (seed={seed}, hidden={hidden}): {e}"
+                                )
+                            })?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
             Ok(Self {
                 engine: MetalQwen35Engine {
                     device,
@@ -10091,6 +10137,7 @@ kernel void lora_gemv_b_accum(
                     config: cfg.clone(),
                     quant_format,
                     mtp_weights: mtp_weights_opt,
+                    quarot_rotation,
                 },
                 session: InferenceSession {
                     activations,

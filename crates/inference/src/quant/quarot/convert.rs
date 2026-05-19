@@ -106,30 +106,113 @@ struct IndexEntry {
     numel: usize,
 }
 
-fn zero_mtp_in_config_json(json: &str) -> Result<String, InferenceError> {
-    let mut value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
-        InferenceError::Inference(format!("zero_mtp_in_config_json: invalid JSON: {e}"))
-    })?;
+fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
+    let mut value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| InferenceError::Inference(format!("inject_quarot_seed: invalid JSON: {e}")))?;
     let obj = value.as_object_mut().ok_or_else(|| {
         InferenceError::Inference(
-            "zero_mtp_in_config_json: top-level JSON must be an object".to_string(),
+            "inject_quarot_seed: top-level JSON must be an object".to_string(),
         )
     })?;
     if let Some(text_config) = obj.get_mut("text_config")
         && let Some(text_obj) = text_config.as_object_mut()
     {
         text_obj.insert(
-            "mtp_num_hidden_layers".to_string(),
-            serde_json::Value::Number(0.into()),
+            "quarot_rotation_seed".to_string(),
+            serde_json::Value::Number(seed.into()),
         );
     }
     obj.insert(
-        "mtp_num_hidden_layers".to_string(),
-        serde_json::Value::Number(0.into()),
+        "quarot_rotation_seed".to_string(),
+        serde_json::Value::Number(seed.into()),
     );
     serde_json::to_string_pretty(&value).map_err(|e| {
-        InferenceError::Inference(format!("zero_mtp_in_config_json: serialize failed: {e}"))
+        InferenceError::Inference(format!("inject_quarot_seed: serialize failed: {e}"))
     })
+}
+
+fn write_mtp_weights_quarot(
+    reader: &QuarotTensorReader,
+    output_dir: &Path,
+    index_entries: &mut Vec<IndexEntry>,
+    kept_f16: &mut usize,
+    planned_quantized: &mut usize,
+    total_bytes_out: &mut u64,
+) -> Result<(), InferenceError> {
+    let proj_names = [
+        "mtp.fc.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    ];
+    let norm_names = [
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    ];
+
+    for name in &proj_names {
+        if !reader.has_tensor(name) {
+            continue;
+        }
+        let (data, shape) = reader.read_tensor_f64(name)?;
+        if shape.len() != 2 {
+            return Err(InferenceError::Inference(format!(
+                "write_mtp_weights_quarot: MTP projection `{name}` has shape {shape:?}, \
+                 expected 2-D for Q4 quantization"
+            )));
+        }
+        let q4 = quantize_f64_to_q4(&data, &shape);
+        let sanitized = sanitize_tensor_name(name);
+        let file_name = format!("{sanitized}.q4");
+        let out_path = output_dir.join(&file_name);
+        save_q4_file(&out_path, &q4).map_err(|e| {
+            InferenceError::Inference(format!(
+                "write_mtp_weights_quarot: failed to write {}: {e}",
+                out_path.display()
+            ))
+        })?;
+        let header_bytes = (4 + 4 + 4 + 8 * shape.len() + 8) as u64;
+        *total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(18);
+        *planned_quantized += 1;
+        index_entries.push(IndexEntry {
+            name: (*name).to_string(),
+            file: file_name,
+            quantized: true,
+            shape: shape.clone(),
+            numel: data.len(),
+        });
+    }
+
+    for name in &norm_names {
+        if !reader.has_tensor(name) {
+            continue;
+        }
+        let (data, shape) = reader.read_tensor_f64(name)?;
+        let sanitized = sanitize_tensor_name(name);
+        let file_name = format!("{sanitized}.f16");
+        let out_path = output_dir.join(&file_name);
+        let bytes = write_f16_file(&out_path, &data, &shape)?;
+        *total_bytes_out += bytes as u64;
+        *kept_f16 += 1;
+        index_entries.push(IndexEntry {
+            name: (*name).to_string(),
+            file: file_name,
+            quantized: false,
+            shape: shape.clone(),
+            numel: data.len(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Refuse-on-fail QuaRot Qwen3.5 model conversion (ADR-044 §"Step 3c contract").
@@ -160,9 +243,8 @@ fn zero_mtp_in_config_json(json: &str) -> Result<String, InferenceError> {
 /// - Disk I/O error during output write (file create, write,
 ///   directory create).
 ///
-/// The emitted `config.json` sets `mtp_num_hidden_layers` to 0 when MTP
-/// weights are skipped, so the runtime loader does not attempt to activate
-/// the MTP path on a QuaRot artifact.
+/// The emitted `config.json` carries `quarot_rotation_seed` so the runtime
+/// can reconstruct the Hadamard rotation for MTP counter-rotation.
 pub fn convert_quarot_qwen35(
     input_dir: &Path,
     output_dir: &Path,
@@ -314,31 +396,15 @@ pub fn convert_quarot_qwen35(
         }
     }
 
-    // --- MTP (Multi-Token Prediction) weights: deliberately NOT emitted ---
-    //
-    // QuaRot rotates embed_tokens and the residual stream via a random
-    // Hadamard matrix R.  The MTP head receives rotated embeddings and
-    // rotated pre-final hidden states, but its norm gammas and projection
-    // weights were trained in the un-rotated basis.  Per-element RMSNorm
-    // gamma does not commute with R (γ·(R·x) ≠ R·(γ·x)), so naively
-    // copying MTP weights produces a draft model in the wrong basis —
-    // acceptance drops to ~1/|V|.
-    //
-    // The MTP writer will be added when the QuaRot conversion is extended
-    // to handle MTP rotation algebra (counter-rotate inputs via R^T, or
-    // absorb R into MTP weights, or rotation-aware training).  Until then,
-    // MTP activates only on the non-rotated Q8 path via
-    // MetalQwen35State::new().
-    //
-    // See: QuaRot (Ashkboos et al., NeurIPS 2024) §3.1 for the
-    //      rotation scheme; Qwen3.5-0.8B config for mtp_num_hidden_layers.
     if cfg.mtp_num_hidden_layers > 0 {
-        eprintln!(
-            "[mtp] Skipping MTP weights (mtp_num_hidden_layers={}) — QuaRot \
-             rotation is not yet applied to MTP head. MTP works on the \
-             non-rotated Q8 path.",
-            cfg.mtp_num_hidden_layers
-        );
+        write_mtp_weights_quarot(
+            &reader,
+            output_dir,
+            &mut index_entries,
+            &mut kept_f16,
+            &mut planned_quantized,
+            &mut total_bytes_out,
+        )?;
     }
 
     let index_path = output_dir.join("quantize_index.json");
@@ -355,9 +421,7 @@ pub fn convert_quarot_qwen35(
     })?;
 
     let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
-    if cfg.mtp_num_hidden_layers > 0 {
-        output_config_json = zero_mtp_in_config_json(&output_config_json)?;
-    }
+    output_config_json = inject_quarot_seed(&output_config_json, opts.rotation_seed)?;
     let out_config_path = output_dir.join("config.json");
     fs::write(&out_config_path, &output_config_json).map_err(|e| {
         InferenceError::Inference(format!(
@@ -1657,22 +1721,23 @@ mod tests {
         write_mtp_tensors_into(&dir.join("model.safetensors"), cfg, seed);
     }
 
-    /// QuaRot converter must NOT emit MTP files even when the checkpoint
-    /// has all 15 MTP tensors — rotated embeddings/hidden would feed
-    /// un-rotated MTP weights (γ·(R·x) ≠ R·(γ·x)).
+    /// QuaRot converter emits MTP files in O-space (no rotation absorption).
+    /// The runtime applies R^T to inputs and R to outputs at inference time
+    /// (counter-rotate strategy, ADR-044 §MTP extension).
     #[test]
-    fn convert_quarot_qwen35_skips_mtp_for_quarot_even_when_present() {
+    fn convert_quarot_qwen35_emits_mtp_files_for_quarot() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let output = tmp.path().join("output");
         let cfg = tiny_cfg_with_mtp(true);
         write_input_dir_with_mtp(&cfg, &input, 70);
 
+        let rotation_seed: u64 = 0xC0DE_BABE;
         let _report = convert_quarot_qwen35(
             &input,
             &output,
             &ConversionOptions {
-                rotation_seed: 0xC0DE_BABE,
+                rotation_seed,
                 tolerance: 1e-5,
                 num_probe_tokens: 2,
                 dry_run: false,
@@ -1680,23 +1745,42 @@ mod tests {
         )
         .unwrap();
 
-        // QuaRot converter must NOT write MTP files — rotated embeddings/hidden
-        // would feed un-rotated MTP weights, producing a draft model in the
-        // wrong basis.
-        let mtp_files: Vec<_> = fs::read_dir(&output)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("mtp_"))
-            .collect();
-        assert!(
-            mtp_files.is_empty(),
-            "QuaRot converter must not emit MTP files (rotation basis mismatch), \
-             but found: {:?}",
-            mtp_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
-        );
+        // MTP projection files must exist as .q4
+        let expected_q4 = [
+            "mtp_fc_weight.q4",
+            "mtp_layers_0_self_attn_q_proj_weight.q4",
+            "mtp_layers_0_self_attn_k_proj_weight.q4",
+            "mtp_layers_0_self_attn_v_proj_weight.q4",
+            "mtp_layers_0_self_attn_o_proj_weight.q4",
+            "mtp_layers_0_mlp_gate_proj_weight.q4",
+            "mtp_layers_0_mlp_up_proj_weight.q4",
+            "mtp_layers_0_mlp_down_proj_weight.q4",
+        ];
+        for name in &expected_q4 {
+            assert!(
+                output.join(name).exists(),
+                "MTP Q4 file must be emitted: {name}"
+            );
+        }
 
-        // Output config must zero mtp_num_hidden_layers so the runtime
-        // loader does not attempt MTP activation on QuaRot artifacts.
+        // MTP norm files must exist as .f16
+        let expected_f16 = [
+            "mtp_layers_0_input_layernorm_weight.f16",
+            "mtp_layers_0_post_attention_layernorm_weight.f16",
+            "mtp_layers_0_self_attn_q_norm_weight.f16",
+            "mtp_layers_0_self_attn_k_norm_weight.f16",
+            "mtp_norm_weight.f16",
+            "mtp_pre_fc_norm_embedding_weight.f16",
+            "mtp_pre_fc_norm_hidden_weight.f16",
+        ];
+        for name in &expected_f16 {
+            assert!(
+                output.join(name).exists(),
+                "MTP f16 file must be emitted: {name}"
+            );
+        }
+
+        // Output config must retain mtp_num_hidden_layers=1 and carry quarot_rotation_seed.
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_val: serde_json::Value = serde_json::from_str(&out_cfg_str).unwrap();
         assert_eq!(
@@ -1704,15 +1788,70 @@ mod tests {
                 .get("text_config")
                 .and_then(|tc| tc.get("mtp_num_hidden_layers"))
                 .and_then(|v| v.as_u64()),
-            Some(0),
-            "output config text_config.mtp_num_hidden_layers must be 0"
+            Some(1),
+            "output config text_config.mtp_num_hidden_layers must be 1"
+        );
+        assert_eq!(
+            out_val.get("quarot_rotation_seed").and_then(|v| v.as_u64()),
+            Some(rotation_seed),
+            "output config must carry quarot_rotation_seed at top level"
         );
         assert_eq!(
             out_val
-                .get("mtp_num_hidden_layers")
+                .get("text_config")
+                .and_then(|tc| tc.get("quarot_rotation_seed"))
                 .and_then(|v| v.as_u64()),
-            Some(0),
-            "output config top-level mtp_num_hidden_layers must be 0"
+            Some(rotation_seed),
+            "output config text_config must carry quarot_rotation_seed"
+        );
+    }
+
+    /// Counter-rotation equivalence gate: verify that apply_inverse followed by
+    /// apply recovers the original vector (round-trip) for the hidden dimension
+    /// used by the tiny test config.
+    #[test]
+    fn quarot_mtp_counter_rotation_roundtrip() {
+        use crate::quant::quarot::hadamard::RandomizedHadamard;
+
+        let hidden = 8usize; // tiny_cfg hidden_size
+        let seed: u64 = 0xDEAD_C0DE;
+        let rot = RandomizedHadamard::new(seed, hidden).unwrap();
+
+        // Simulate R-space vector (what the QuaRot runtime would produce).
+        let original: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.31 + 0.7).cos()).collect();
+        let mut data = original.clone();
+
+        // apply_inverse (R^T): R-space → O-space
+        rot.apply_inverse(&mut data).unwrap();
+        // apply (R): O-space → R-space
+        rot.apply(&mut data).unwrap();
+
+        for (i, (got, expected)) in data.iter().zip(original.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "roundtrip failed at index {i}: got={got}, expected={expected}"
+            );
+        }
+    }
+
+    /// Verify inject_quarot_seed writes the seed into both text_config and top level.
+    #[test]
+    fn inject_quarot_seed_roundtrips_in_config_json() {
+        let json = r#"{"text_config": {"hidden_size": 8}, "some_key": 1}"#;
+        let seed: u64 = 0xCAFE_BABE;
+        let output = inject_quarot_seed(json, seed).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            val.get("quarot_rotation_seed").and_then(|v| v.as_u64()),
+            Some(seed),
+            "quarot_rotation_seed must be at top level"
+        );
+        assert_eq!(
+            val.get("text_config")
+                .and_then(|tc| tc.get("quarot_rotation_seed"))
+                .and_then(|v| v.as_u64()),
+            Some(seed),
+            "quarot_rotation_seed must be inside text_config"
         );
     }
 
