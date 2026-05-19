@@ -2,7 +2,7 @@
 
 Global ADR index for the Lattice project. Numbered sequentially, grouped by crate.
 
-## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-045)
+## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-053)
 
 | ADR                                            | Title                                |
 | ---------------------------------------------- | ------------------------------------ |
@@ -23,6 +23,14 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification            |
 | [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization |
 | [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition            |
+| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding) |
+| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                       |
+| [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode |
+| [049](ADR-049-vision-encoder.md)               | Vision Encoder                       |
+| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding |
+| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation   |
+| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback |
+| [053](ADR-053-moe-metal-dispatch.md)            | MoE Metal Dispatch with Expert Coalescing |
 
 ## lattice-embed (ADR-012 to ADR-019)
 
@@ -49,7 +57,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [025](ADR-025-gpu-backend.md)           | GPU Backend               |
 | [026](ADR-026-training-loop.md)         | Training Loop             |
 
-## lattice-tune (ADR-027 to ADR-034)
+## lattice-tune (ADR-027 to ADR-034, ADR-054)
 
 | ADR                                       | Title                           |
 | ----------------------------------------- | ------------------------------- |
@@ -61,8 +69,9 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [032](ADR-032-training-callbacks.md)      | Training Callbacks              |
 | [033](ADR-033-jit-adaptation.md)          | JIT Adaptation                  |
 | [034](ADR-034-dataset-pipeline.md)        | Dataset Pipeline                |
+| [054](ADR-054-rolora-rotation-aware-lora.md) | Rotation-Aware LoRA Training (RoLoRA) |
 
-## lattice-transport (ADR-035 to ADR-039)
+## lattice-transport (ADR-035 to ADR-039, ADR-055)
 
 | ADR                                    | Title                             |
 | -------------------------------------- | --------------------------------- |
@@ -71,3 +80,4 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [037](ADR-037-cost-matrices.md)        | Cost Matrix Abstractions          |
 | [038](ADR-038-barycenters.md)          | Wasserstein Barycenters           |
 | [039](ADR-039-divergence-measures.md)  | Sinkhorn Divergence               |
+| [055](ADR-055-online-drift-detection.md) | Online Distribution Drift Detection |
