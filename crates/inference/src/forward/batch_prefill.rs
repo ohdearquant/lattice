@@ -312,7 +312,7 @@ impl Qwen35Model {
         let last_hidden = &scratch.hidden[(seq_len - 1) * hidden..seq_len * hidden];
         matmul_bt(
             last_hidden,
-            &self.weights.embed_tokens,
+            self.weights.logits_weight(),
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,
@@ -1152,6 +1152,22 @@ mod tests {
                 1e-5,
             );
         }
+    }
+
+    #[test]
+    fn test_prefill_matches_sequential_untied_lm_head() {
+        let mut cfg = tiny_test_config();
+        cfg.tie_word_embeddings = false;
+
+        let mut model = build_random_model(cfg.clone(), 0xBEEF_FACE_1234_5678);
+        let lm_head = random_vec(&mut 0xDEAD_C0DE_u64, cfg.vocab_size * cfg.hidden_size, 0.02);
+        model.weights.lm_head = Some(lm_head);
+
+        let prompt_ids = vec![1, 7, 3, 9, 4, 2, 5, 6, 8];
+        let (seq_logits, _, _) = run_sequential_prefill(&model, &prompt_ids);
+        let (batch_logits, _, _) = run_batched_prefill(&model, &prompt_ids);
+
+        assert_allclose("untied_lm_head_logits", &seq_logits, &batch_logits, 1e-5);
     }
 
     #[test]
