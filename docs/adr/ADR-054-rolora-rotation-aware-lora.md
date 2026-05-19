@@ -182,7 +182,7 @@ artifact and adapter metadata is an error (fail-closed).
 **Out of scope (deferred)**:
 
 - QuAILoRA initialization (quantization-error-minimizing LoRA init, arxiv:2410.14713) — separate
-  concern, compatible with RoLoRA, defer to ADR-055
+  concern, compatible with RoLoRA, defer to a future ADR
 - QA-LoRA 4-bit adapter merging — deferred, no current use case
 - Automatic seed detection from model artifact (requires ADR-045 §Prerequisites to ship first;
   until then, callers supply seed explicitly)

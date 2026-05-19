@@ -51,10 +51,8 @@ At Q4 with the current config dimensions:
 - Total routed expert weights across 40 layers: ~384 MiB × 40 ≈ **15 GiB**
 - Shared expert (dense, 512×2048): negligible (~4 MiB)
 
-> **Note**: the upstream Qwen3.6-35B Hugging Face config uses larger dimensions (hidden=7168,
-> moe_intermediate=2048). If the config fixture is updated to match upstream, the memory budget
-> rises to ~5.6 GB per 40 layers. The memory budget section should be re-verified when the
-> config is finalized.
+> **Note**: the local `Qwen35Config::qwen36_35b_a3b()` fixture matches the current upstream
+> HF `Qwen/Qwen3.6-35B-A3B` config. Re-verify this section if the target model changes.
 
 M2 Max unified memory is 32–96 GB. Loading all expert weights resident (the MLX approach) is
 feasible on 64 GB+ configurations for either dimension set. This ADR targets the resident-all

@@ -82,20 +82,20 @@ No new crates. No Metal kernel changes. No changes to serving hot path.
 ### Layer 0: `lattice-transport` — drift primitive
 
 ```rust
-pub struct DriftConfig {
+pub struct OnlineDriftConfig {
     pub window_size: usize,     // W; minimum 128. O(W²) per divergence call.
     pub check_interval: usize,  // compute divergence every N new samples (amortizes cost)
-    pub threshold: f32,         // S(ref, current) > threshold → emit DriftSignal
+    pub threshold: f32,         // S(ref, current) > threshold → emit OnlineDriftSignal
     pub epsilon: f32,           // Sinkhorn regularization (inherited from SinkhornConfig)
 }
 
-pub struct DriftSignal {
+pub struct OnlineDriftSignal {
     pub divergence: f32,        // S(reference, current) value at detection
     pub window_pos: usize,      // total samples seen when signal fired
 }
 
 pub struct OnlineDriftDetector {
-    config: DriftConfig,
+    config: OnlineDriftConfig,
     reference_window: VecDeque<Vec<f32>>,   // first W samples; frozen as reference
     current_window: VecDeque<Vec<f32>>,     // sliding window of last W samples
     samples_seen: usize,
@@ -106,7 +106,7 @@ pub struct OnlineDriftDetector {
 }
 
 impl OnlineDriftDetector {
-    pub fn push(&mut self, sample: Vec<f32>) -> Option<DriftSignal>;
+    pub fn push(&mut self, sample: Vec<f32>) -> Option<OnlineDriftSignal>;
     pub fn reset_reference(&mut self);  // call after adapter/router refresh
 }
 ```
@@ -122,16 +122,15 @@ the baseline from the updated distribution.
 ### Layer 1: `lattice-inference` — sampling and reaction
 
 ```rust
-pub struct InferenceDriftMonitor {
-    adapter_detector: OnlineDriftDetector,
-    router_detector: OnlineDriftDetector,
-    sample_layer: usize,         // hidden-state layer to sample from (default: middle layer)
-    sample_every_n_tokens: usize, // push to detector every N tokens (default: 16)
-}
+// lattice-inference owns only the trait — no lattice-transport import.
+// The application binary wires the concrete OnlineDriftDetector from transport.
 
-pub trait DriftReactor: Send + Sync {
-    fn on_adapter_stale(&self, signal: DriftSignal);
-    fn on_router_stale(&self, signal: DriftSignal);
+/// Callback trait for inference-side drift reaction. Implemented by the application
+/// binary, not by lattice-inference itself.
+pub trait DriftSampler: Send + Sync {
+    fn push_sample(&mut self, hidden_state: &[f32]);
+    fn on_adapter_stale(&self, divergence: f32);
+    fn on_router_stale(&self, divergence: f32);
 }
 ```
 

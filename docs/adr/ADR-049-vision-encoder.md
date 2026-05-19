@@ -51,8 +51,9 @@ The integration point is `MetalQwen35State`: a new `generate_multimodal` entry p
 `MultimodalInput`, prepends patch embeddings to the token embedding matrix, and delegates to the
 existing decode loop. The existing `generate_greedy` / `generate_sampled` paths are not changed.
 
-**Fixed resolution for v0**: 448 × 448 pixels, 14 × 14 patch size, 1024 patches per image.
-Dynamic resolution (Qwen2.5-VL's native tiling scheme) is deferred to v1.
+**Fixed resolution for v0**: 448 × 448 pixels, 16 × 16 patch size (Qwen3-VL default), yielding
+(448/16)² = 784 raw patches. With `spatial_merge_size=2`, the post-merge decoder receives
+784/4 = 196 visual tokens. Dynamic resolution tiling is deferred to v1.
 
 **Single VLM family for v0**: Qwen3-VL only. Generalizing to SigLIP, InternViT, or other ViT
 backbones is deferred until the integration pattern is validated.
@@ -63,7 +64,7 @@ backbones is deferred until the integration pattern is validated.
 - `vision/preprocess.rs`: CPU-side image resize (bilinear), per-channel normalize, patch grid
   extraction. Output: `Vec<f32>` shaped `[n_patches, patch_h, patch_w, 3]`.
 - `vision/vit.rs`: ViT encoder forward pass on Metal. Implements the Qwen3-VL ViT configuration
-  (patch size 14, window attention, 32 transformer blocks at the 7 B scale).
+  (patch size 16, depth 27, spatial merge size 2 per Qwen3-VL HF defaults).
 - `vision/mlp_merger.rs`: Two-layer MLP projector on CPU (small enough that CPU is adequate).
   Input: `[n_patches, d_vit]`. Output: `[n_patches, d_model]` where `d_model` matches the
   decoder hidden dimension.
@@ -96,7 +97,7 @@ pub struct ImageTensor {
     /// Row-major float32 pixel data: [n_patches, patch_h * patch_w * 3].
     pub patches: Vec<f32>,
     pub n_patches: usize,
-    pub patch_hw: usize,  // patch_h == patch_w == 14
+    pub patch_hw: usize,  // patch_h == patch_w == 16 (Qwen3-VL)
 }
 
 /// A multimodal prompt: patch embeddings prepended to text tokens.
@@ -127,7 +128,7 @@ impl VisionEncoder {
 
 pub struct PreprocessConfig {
     pub image_size: u32,   // 448 for v0
-    pub patch_size: u32,   // 14 for v0
+    pub patch_size: u32,   // 16 for v0 (Qwen3-VL default)
     pub mean: [f32; 3],    // Qwen3-VL normalization constants
     pub std:  [f32; 3],
 }
@@ -227,7 +228,7 @@ file. The existing `load_qwen35_weights` function (ADR-003) is extended with a
 | ViT encoder | ~300 M | ~600 MB |
 | MLP merger | ~10 M | ~20 MB |
 | Decoder (Qwen3.5-7B) | ~7 B | ~14 GB |
-| Patch KV activations (1024 patches) | — | ~50 MB |
+| Patch KV activations (784 raw → 196 merged) | — | ~50 MB |
 | **Total** | | **~15 GB** |
 
 Apple M2/M3/M4 Max with 48 GB unified memory accommodates this. The 16 GB base tier cannot;

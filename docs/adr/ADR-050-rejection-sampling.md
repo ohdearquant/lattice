@@ -187,8 +187,8 @@ speedup over linear drafts by combining tree drafting with context-aware confide
 This is the long-term target architecture. Not adopted here because: (a) `MtpVerifier` produces
 a linear draft sequence, not a tree; (b) tree verification requires parallel logit comparison
 across O(K^depth) paths, needing a Metal kernel rewrite; (c) GDN snapshot cost grows with tree
-width. ADR-051 will address tree-structured drafting once the correctness foundation (this ADR)
-is in place.
+width. Tree-structured drafting will be addressed in a future ADR once the correctness foundation
+(this ADR) is in place.
 
 **C. Speculative rejection sampling only for the MTP path, skip n-gram path.**
 The n-gram path is a retrieval mechanism, not a learned sampler, so its "draft distribution"
@@ -201,11 +201,11 @@ needed.
 
 ## Risks
 
-**R1: GDN snapshot memory.** 46 MB per snapshot for Qwen3.5-2B is acceptable on Apple Silicon
-(unified memory, 16–192 GB). For larger models (72B class) this would be ~400 MB. The snapshot
-is ephemeral (held for one speculative step, then discarded or restored). Mitigation: snapshot
-is heap-allocated once and reused across steps via a `Vec::clear()` + `extend_from_slice` pattern
-to avoid per-step allocation.
+**R1: GDN snapshot memory.** See ADR-052 §Memory Budget for authoritative per-config estimates
+(~19.3 MiB for Qwen3.5-0.8B). For larger models the snapshot scales with `num_heads * key_dim *
+value_dim * num_gdn_layers`. The snapshot is ephemeral (held for one speculative step, then
+discarded or restored). Mitigation: snapshot is heap-allocated once and reused across steps via
+a `Vec::clear()` + `extend_from_slice` pattern to avoid per-step allocation.
 
 **R2: RNG reproducibility.** Strict sampling introduces stochastic behavior. Tests that assert
 exact token sequences must be updated to use seeded RNG or test at temperature=0. The
