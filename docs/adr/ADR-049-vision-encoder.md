@@ -65,13 +65,14 @@ backbones is deferred until the integration pattern is validated.
   extraction. Output: `Vec<f32>` shaped `[n_patches, patch_h, patch_w, 3]`.
 - `vision/vit.rs`: ViT encoder forward pass on Metal. Implements the Qwen3-VL ViT configuration
   (patch size 16, depth 27, spatial merge size 2 per Qwen3-VL HF defaults).
-- `vision/mlp_merger.rs`: Two-layer MLP projector on CPU (small enough that CPU is adequate).
-  Input: `[n_patches, d_vit]`. Output: `[n_patches, d_model]` where `d_model` matches the
-  decoder hidden dimension.
-- `vision/mod.rs`: `MultimodalInput { text_tokens: Vec<u32>, patch_embeddings: Array2<f32> }`
-  and `VisionEncoder::encode(image_bytes) -> Result<Array2<f32>>`.
+- `vision/mlp_merger.rs`: Two-layer MLP with spatial merge. Groups `spatial_merge_size²`
+  adjacent patches, concatenates features, then projects to decoder hidden dim.
+  Input: `[raw_patches, d_vit]`. Output: `[visual_tokens, d_model]` where
+  `visual_tokens = raw_patches / spatial_merge_size²`.
+- `vision/mod.rs`: `MultimodalInput` (see Architecture §Core Types) and
+  `VisionEncoder::encode(image_bytes) -> Result<MultimodalInput>`.
 - `metal_qwen35.rs`: `generate_multimodal(input: MultimodalInput, config: GenerateConfig)`
-  entry point. Splices patch embeddings before position 0 of the token embedding sequence.
+  entry point. Prepends `visual_tokens` patch embeddings before text token embeddings.
 - Weight loading: extend `load_qwen35_weights` to detect and load `vision_model.*` keys from
   the VLM safetensors file. No new loader required.
 
@@ -206,9 +207,9 @@ impl MlpMerger {
 
 ```rust
 impl MetalQwen35State {
-    /// Multimodal generation. Patch embeddings are prepended to the token
-    /// embedding sequence before the first decode step. Position IDs for
-    /// the text tokens are offset by `input.n_patches`. All other decode
+    /// Multimodal generation. Merged visual token embeddings are prepended to the
+    /// text token embedding sequence before the first decode step. Position IDs for
+    /// the text tokens are offset by `input.visual_tokens`. All other decode
     /// parameters (KV cache, sampling, EOS) behave identically to
     /// `generate_greedy` / `generate_sampled`.
     pub fn generate_multimodal(
@@ -220,9 +221,10 @@ impl MetalQwen35State {
 ```
 
 Internally, `generate_multimodal` calls `embed_tokens` for the text portion and concatenates
-the patch embeddings at position 0 before the first prefill call. RoPE position IDs start
-at `n_patches` for the first text token, so image patches occupy positions `[0, n_patches)`.
-This matches the Qwen3-VL positional encoding convention.
+the merged visual token embeddings at position 0 before the first prefill call. RoPE position
+IDs start at `visual_tokens` for the first text token, so visual tokens occupy positions
+`[0, visual_tokens)`. For 448×448 with patch 16 and merge 2: visual_tokens=196, so the first
+text token starts at position 196.
 
 ### Weight Loading
 

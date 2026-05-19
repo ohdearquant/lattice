@@ -81,8 +81,8 @@ The implementation is scoped to three changes:
    parameter; at temperature 0 the sampling path degenerates to the existing argmax behavior with
    no correctness regression.
 
-2. **GDN state snapshot protocol**: extend `MtpTargetVerifier` with `snapshot_gdn_state()` and
-   `restore_gdn_state()` methods. Before draft generation begins, the verifier takes a snapshot of
+2. **GDN state snapshot protocol**: extend `MtpTargetVerifier` with `snapshot_gdn_states()` and
+   `restore_gdn_states()` methods. Before draft generation begins, the verifier takes a snapshot of
    all GDN layers' `s_matrices` and `conv_buffer` fields. On partial or full rejection, restore
    is called before the correction token forward pass.
 

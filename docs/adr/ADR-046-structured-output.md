@@ -113,8 +113,8 @@ impl GrammarEngine {
 
     /// Apply grammar constraints to `logits` in-place.
     /// Sets disallowed token positions to `f32::NEG_INFINITY`.
-    /// Cost: O(vocab_size / 64) for the bitmask AND path;
-    ///       O(k × stack_depth) for the context-dependent token re-check.
+    /// Cost: O(vocab_size) scalar bit-scan per token; vectorizable to O(vocab_size / 64)
+    ///       with SIMD. Plus O(k × stack_depth) for context-dependent token re-check.
     pub fn mask_logits(&self, state: &mut GrammarState, logits: &mut [f32]);
 }
 

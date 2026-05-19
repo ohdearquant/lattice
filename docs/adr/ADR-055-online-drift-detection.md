@@ -128,14 +128,17 @@ the baseline from the updated distribution.
 /// Callback trait for inference-side drift reaction. Implemented by the application
 /// binary, not by lattice-inference itself.
 pub trait DriftSampler: Send + Sync {
-    fn push_sample(&mut self, hidden_state: &[f32]);
+    /// Push a hidden-state sample. Uses &self with interior mutability
+    /// (e.g., Mutex<OnlineDriftDetector>) so the sampler can be stored
+    /// in Arc<dyn DriftSampler> without exclusive access.
+    fn push_sample(&self, hidden_state: &[f32]);
     fn on_adapter_stale(&self, divergence: f32);
     fn on_router_stale(&self, divergence: f32);
 }
 ```
 
 The monitor hooks into `lattice-inference`'s forward pass via an optional `Arc<dyn DriftSampler>`
-on `GenerationConfig`. If `None` (the default), zero overhead — no sampling, no allocation.
+on `GenerateConfig`. If `None` (the default), zero overhead — no sampling, no allocation.
 When present, every `sample_every_n_tokens` tokens, the monitor receives the hidden states at
 `sample_layer` and pushes a mean-pooled sample vector (dim = hidden_size) to both detectors.
 
