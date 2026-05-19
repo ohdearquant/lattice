@@ -1202,22 +1202,27 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let target_logits = target.verify_tokens(&draft, current_position + 1)?;
     let target_forwards = 1;
 
-    // Determine how many additional tokens are accepted
-    // target_logits[i] corresponds to the target output after processing draft[i]
-    // We compare argmax(target_logits[i]) with draft[i+1]
-    let mut accepted_count = 1; // first token already accepted
-    let mut fallback_token = None;
+    // Delegate the accept-loop to `rejection_sample_draft(greedy=true)` so a single
+    // verifier implements both the existing greedy MTP path and the probabilistic
+    // path introduced by ADR-050. Greedy mode does not consume `draft_logits`, so
+    // we pass an empty slice — no `draft_len * vocab_size` placeholder allocation
+    // in the hot path.
+    let rs = rejection_sample_draft(
+        &draft,
+        &[],
+        initial_target_logits,
+        &target_logits,
+        true,
+        None,
+    )?;
+    let mut accepted_count = rs.accepted_count;
+    let mut fallback_token = if rs.had_rejection {
+        rs.bonus_token
+    } else {
+        None
+    };
 
-    for i in 1..draft_len {
-        let model_choice = argmax(&target_logits[i - 1]) as u32;
-        if model_choice != draft[i] {
-            fallback_token = Some(model_choice);
-            break;
-        }
-        accepted_count += 1;
-    }
-
-    // Check for EOS within accepted tokens
+    // EOS truncation: stop at first EOS inside the accepted prefix.
     let mut stopped_by_eos = false;
     let mut eos_truncate = accepted_count;
     for i in 0..accepted_count {
@@ -1387,6 +1392,385 @@ fn mtp_verify_precomputed_draft<T: MtpTargetVerifier>(
 
 // ---------------------------------------------------------------------------
 // End of MTP additions
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Probabilistic rejection sampling for speculative decoding (Leviathan 2023)
+// ---------------------------------------------------------------------------
+
+/// Result of probabilistic rejection sampling verification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RejectionSampleResult {
+    /// Number of draft tokens accepted (probabilistically or greedily).
+    pub accepted_count: usize,
+    /// The accepted draft token IDs.
+    pub accepted_tokens: Vec<u32>,
+    /// Token sampled from the adjusted distribution at the rejection point,
+    /// or from the target distribution after the last accepted token.
+    /// `None` only when `draft_tokens` is empty.
+    pub bonus_token: Option<u32>,
+    /// Whether any draft token was rejected before the end.
+    pub had_rejection: bool,
+}
+
+/// Compute stable softmax over `logits` into `out`.
+///
+/// `out` must have the same length as `logits`. Values are written in-place.
+fn softmax_into(logits: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(logits.len(), out.len());
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for (o, &l) in out.iter_mut().zip(logits.iter()) {
+        let e = (l - max).exp();
+        *o = e;
+        sum += e;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for o in out.iter_mut() {
+            *o *= inv;
+        }
+    }
+}
+
+/// Xorshift64 PRNG local to this module — used only in rejection sampling.
+/// Mirrors the implementation in `sampling.rs` so callers do not need to
+/// expose or import that module's private `Rng`.
+struct SpecRng {
+    state: u64,
+}
+
+impl SpecRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x853c_49e6_748f_ea9b
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn from_clock() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x853c_49e6_748f_ea9b);
+        Self::new(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Returns a uniform f32 in [0, 1).
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+/// Sample one token from the adjusted distribution `max(0, p - q)` (re-normalised).
+///
+/// Called on rejection: the adjusted distribution represents probability mass that
+/// the target model assigns but the draft model under-assigns. Sampling from it
+/// ensures the output distribution exactly matches the target model.
+///
+/// `r` is a uniform draw in [0, 1).
+///
+/// Falls back to argmax of `p` when the adjusted distribution is degenerate
+/// (all zeros after clamping, which can happen when `q >= p` everywhere).
+fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
+    debug_assert_eq!(p.len(), q.len());
+
+    // Build clamped-difference distribution.
+    let mut sum = 0.0f32;
+    let mut max_diff = f32::NEG_INFINITY;
+    let mut max_idx = 0usize;
+    for (i, (&pi, &qi)) in p.iter().zip(q.iter()).enumerate() {
+        let d = (pi - qi).max(0.0);
+        sum += d;
+        if pi > max_diff {
+            max_diff = pi;
+            max_idx = i;
+        }
+    }
+
+    // Degenerate: adjusted mass is zero — fall back to target argmax.
+    if sum <= 0.0 {
+        return max_idx;
+    }
+
+    let inv = 1.0 / sum;
+    let mut cumsum = 0.0f32;
+    for (i, (&pi, &qi)) in p.iter().zip(q.iter()).enumerate() {
+        let d = (pi - qi).max(0.0) * inv;
+        cumsum += d;
+        if r < cumsum {
+            return i;
+        }
+    }
+    // Numerical tail: return last non-zero token.
+    for i in (0..p.len()).rev() {
+        if (p[i] - q[i]).max(0.0) > 0.0 {
+            return i;
+        }
+    }
+    max_idx
+}
+
+/// **Unstable**: probabilistic rejection sampling verifier; algorithm parameters
+/// and return type may change as the generation API evolves.
+///
+/// Verify draft tokens from a speculative decoder against the target model using
+/// the probabilistic rejection sampling algorithm of Leviathan et al. (2023).
+///
+/// # Verification convention
+///
+/// `target_logits[i]` is the target model output produced *after* processing
+/// `draft_tokens[i]`, i.e. it predicts the token at position `i + 1`. To verify
+/// `draft_tokens[i]` we therefore need the target distribution at position `i`:
+///
+/// - `i == 0`: `initial_target_logits` (the caller's distribution for the first
+///   draft slot, typically argmax/sampled by the outer generation loop).
+/// - `i >= 1`: `target_logits[i - 1]`.
+///
+/// `target_logits[n - 1]` is reserved for the bonus token sampled after full
+/// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` is the
+/// off-by-one that codex round 1 flagged (Leviathan Algorithm 1 evaluates
+/// `p_i(x_i)`, not `p_{i+1}(x_i)`).
+///
+/// For each position `i`:
+/// - Compute `p[x_i]` (target probability under the position-`i` distribution)
+///   and `q[x_i]` (draft probability).
+/// - Accept `x_i` with probability `min(1, p[x_i] / q[x_i])`.
+/// - On rejection, sample the bonus token from the adjusted distribution
+///   `norm(max(0, p - q))`, which exactly recovers the target distribution.
+/// - After all tokens accepted, sample one bonus token from
+///   `softmax(target_logits[n - 1])` — the target's prediction for the position
+///   after the last accepted draft token.
+///
+/// When `greedy` is `true` (temperature = 0 / top_k = 1), the function skips
+/// probability computation entirely and falls back to argmax comparison, which is
+/// strictly faster and produces the same result as the standard greedy verifier.
+///
+/// # Arguments
+///
+/// - `draft_tokens`: token IDs proposed by the draft model.
+/// - `draft_logits`: raw logits from the draft model for each position, parallel
+///   to `draft_tokens`. `draft_logits[i]` is `q_i(·)`.
+/// - `initial_target_logits`: target distribution over the first draft slot — the
+///   logits the outer generation loop already used to choose between the draft's
+///   `draft_tokens[0]` and the target's own pick.
+/// - `target_logits`: raw logits from the target model for each draft position.
+///   `target_logits[i]` is the target output *after* processing `draft_tokens[i]`,
+///   i.e. the distribution over what comes *after* position `i`. Slot `n - 1` is
+///   used for the bonus token on full acceptance, never for verification.
+/// - `greedy`: when `true`, use argmax comparison instead of probabilistic sampling.
+/// - `seed`: PRNG seed for reproducibility; pass `None` for non-deterministic.
+///
+/// # Errors
+///
+/// Returns [`crate::error::InferenceError::InvalidInput`] when:
+/// - `draft_tokens` and `target_logits` have different lengths.
+/// - `draft_logits` length or per-row vocabulary disagrees with `draft_tokens` —
+///   checked only when `greedy == false`. Greedy callers may pass an empty
+///   `&[]` (the argument is unused).
+/// - `initial_target_logits` is empty or has a vocabulary size that disagrees
+///   with `target_logits` / `draft_logits` rows.
+pub fn rejection_sample_draft(
+    draft_tokens: &[u32],
+    draft_logits: &[Vec<f32>],
+    initial_target_logits: &[f32],
+    target_logits: &[Vec<f32>],
+    greedy: bool,
+    seed: Option<u64>,
+) -> Result<RejectionSampleResult, crate::error::InferenceError> {
+    use crate::error::InferenceError;
+
+    let n = draft_tokens.len();
+    if target_logits.len() != n {
+        return Err(InferenceError::InvalidInput(format!(
+            "draft_tokens len={n} but target_logits len={}",
+            target_logits.len()
+        )));
+    }
+    // `draft_logits` is only used in probabilistic mode (to evaluate `q(x_i)`); greedy
+    // callers can pass an empty slice to avoid allocating a `draft_len * vocab_size`
+    // placeholder for a value that will never be read. Validate the length only when
+    // we are actually going to consume it.
+    if !greedy && draft_logits.len() != n {
+        return Err(InferenceError::InvalidInput(format!(
+            "probabilistic rejection sampling: draft_tokens len={n} but draft_logits len={}",
+            draft_logits.len()
+        )));
+    }
+
+    if n == 0 {
+        return Ok(RejectionSampleResult {
+            accepted_count: 0,
+            accepted_tokens: vec![],
+            bonus_token: None,
+            had_rejection: false,
+        });
+    }
+
+    // Validate that all logit slices have the same (non-zero) vocabulary size.
+    let vocab = initial_target_logits.len();
+    if vocab == 0 {
+        return Err(InferenceError::InvalidInput(
+            "initial_target_logits vocabulary size is 0".into(),
+        ));
+    }
+    for (i, tl) in target_logits.iter().enumerate() {
+        if tl.len() != vocab {
+            return Err(InferenceError::InvalidInput(format!(
+                "target_logits[{i}] has length {} but expected {vocab}",
+                tl.len()
+            )));
+        }
+    }
+    if !greedy {
+        for (i, dl) in draft_logits.iter().enumerate() {
+            if dl.len() != vocab {
+                return Err(InferenceError::InvalidInput(format!(
+                    "draft_logits[{i}] has length {} but expected {vocab}",
+                    dl.len()
+                )));
+            }
+        }
+    }
+
+    // For verifying `draft_tokens[i]`, pick the target distribution at position
+    // `i`. The convention is documented above the function: `initial_target_logits`
+    // for the first draft slot, `target_logits[i - 1]` after that.
+    let target_dist_for = |i: usize| -> &[f32] {
+        if i == 0 {
+            initial_target_logits
+        } else {
+            &target_logits[i - 1]
+        }
+    };
+
+    if greedy {
+        let mut accepted_tokens = Vec::with_capacity(n);
+        let mut had_rejection = false;
+        let mut bonus_token = None;
+
+        for i in 0..n {
+            let target_choice = argmax(target_dist_for(i)) as u32;
+            if target_choice == draft_tokens[i] {
+                accepted_tokens.push(draft_tokens[i]);
+            } else {
+                had_rejection = true;
+                bonus_token = Some(target_choice);
+                break;
+            }
+        }
+
+        // Bonus token after full acceptance: argmax of the position-after-last-draft
+        // target distribution.
+        if !had_rejection {
+            let last_target_choice = argmax(target_logits.last().expect("n > 0")) as u32;
+            bonus_token = Some(last_target_choice);
+        }
+
+        let accepted_count = accepted_tokens.len();
+        return Ok(RejectionSampleResult {
+            accepted_count,
+            accepted_tokens,
+            bonus_token,
+            had_rejection,
+        });
+    }
+
+    // --- Probabilistic path ---
+    let mut rng = match seed {
+        Some(s) => SpecRng::new(s),
+        None => SpecRng::from_clock(),
+    };
+
+    // Pre-allocate probability buffers for reuse across positions.
+    let mut p_buf = vec![0.0f32; vocab];
+    let mut q_buf = vec![0.0f32; vocab];
+
+    let mut accepted_tokens: Vec<u32> = Vec::with_capacity(n);
+    let mut had_rejection = false;
+    let mut rejection_bonus: Option<u32> = None;
+
+    for i in 0..n {
+        let tok = draft_tokens[i] as usize;
+        if tok >= vocab {
+            return Err(InferenceError::InvalidInput(format!(
+                "draft_tokens[{i}]={tok} >= vocab_size={vocab}"
+            )));
+        }
+
+        softmax_into(target_dist_for(i), &mut p_buf);
+        softmax_into(&draft_logits[i], &mut q_buf);
+
+        let p_x = p_buf[tok];
+        let q_x = q_buf[tok];
+
+        // Acceptance probability: min(1, p(x) / q(x)).
+        // Guard against division by zero: if q_x == 0, the draft model assigns
+        // zero mass to this token yet proposed it — reject immediately and sample
+        // from the full target distribution.
+        let accept_prob = if q_x <= 0.0 {
+            0.0f32
+        } else {
+            (p_x / q_x).min(1.0)
+        };
+
+        let u = rng.next_f32();
+        if u < accept_prob {
+            accepted_tokens.push(draft_tokens[i]);
+        } else {
+            had_rejection = true;
+            // Sample from the adjusted distribution max(0, p - q) normalised.
+            let r = rng.next_f32();
+            let adjusted_tok = sample_adjusted(&p_buf, &q_buf, r) as u32;
+            rejection_bonus = Some(adjusted_tok);
+            break;
+        }
+    }
+
+    // If all draft tokens were accepted, sample one bonus token from the target
+    // distribution at the position *after* the last accepted token.
+    let bonus_token = if had_rejection {
+        rejection_bonus
+    } else {
+        let r = rng.next_f32();
+        // Use target_logits[n-1] — the distribution over what comes after draft[n-1].
+        softmax_into(target_logits.last().expect("n > 0"), &mut p_buf);
+        // Weighted sample from the full target distribution.
+        let mut cumsum = 0.0f32;
+        let mut sampled = argmax(target_logits.last().expect("n > 0")) as u32;
+        for (j, &prob) in p_buf.iter().enumerate() {
+            cumsum += prob;
+            if r < cumsum {
+                sampled = j as u32;
+                break;
+            }
+        }
+        Some(sampled)
+    };
+
+    let accepted_count = accepted_tokens.len();
+    Ok(RejectionSampleResult {
+        accepted_count,
+        accepted_tokens,
+        bonus_token,
+        had_rejection,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// End of rejection sampling additions
 // ---------------------------------------------------------------------------
 
 /// **Unstable**: draft verification loop; signature may change as sampling strategies expand.
@@ -2117,5 +2501,291 @@ mod tests {
 
         // Generated: [2, 3] from normal decode, then EOS hit from draft
         assert_eq!(result.len(), 2);
+    }
+
+    // ── rejection_sample_draft tests ─────────────────────────────────────────
+
+    /// Build uniform logits over `vocab` tokens — after softmax every token
+    /// has probability 1/vocab.
+    fn uniform_logits(vocab: usize) -> Vec<f32> {
+        vec![1.0f32; vocab]
+    }
+
+    /// Build peaked logits where token `tok` dominates.
+    fn peaked_logits(vocab: usize, tok: usize, peak: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; vocab];
+        v[tok] = peak;
+        v
+    }
+
+    #[test]
+    fn rejection_empty_draft_returns_no_bonus() {
+        let result =
+            rejection_sample_draft(&[], &[], &uniform_logits(8), &[], false, Some(42)).unwrap();
+        assert_eq!(result.accepted_count, 0);
+        assert!(result.accepted_tokens.is_empty());
+        assert_eq!(result.bonus_token, None);
+        assert!(!result.had_rejection);
+    }
+
+    #[test]
+    fn rejection_mismatched_lengths_returns_error() {
+        let logits = vec![peaked_logits(10, 3, 5.0)];
+        let initial = uniform_logits(10);
+        let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, Some(1));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejection_identical_distributions_accept_all() {
+        // When draft and target have exactly the same distribution (including the
+        // distribution that predicts draft[0]), p(x)/q(x) = 1 everywhere so all
+        // tokens accept.
+        const VOCAB: usize = 8;
+        let logits = peaked_logits(VOCAB, 2, 10.0);
+
+        let draft_tokens = vec![2u32, 2, 2];
+        let draft_logits = vec![logits.clone(), logits.clone(), logits.clone()];
+        let target_logits = vec![logits.clone(), logits.clone(), logits.clone()];
+        let initial_target = logits.clone();
+
+        for seed in 0u64..20 {
+            let res = rejection_sample_draft(
+                &draft_tokens,
+                &draft_logits,
+                &initial_target,
+                &target_logits,
+                false,
+                Some(seed),
+            )
+            .unwrap();
+            assert_eq!(
+                res.accepted_count, 3,
+                "seed={seed}: identical distributions must accept all tokens"
+            );
+            assert_eq!(res.accepted_tokens, vec![2u32, 2, 2]);
+            assert!(!res.had_rejection, "seed={seed}: no rejection expected");
+        }
+    }
+
+    #[test]
+    fn rejection_known_rejection_samples_adjusted() {
+        // Single draft slot: q peaks exactly at 0, p (== initial_target_logits) peaks
+        // exactly at 1 → accept_prob = min(1, 0/1) = 0, adjusted distribution puts all
+        // mass on token 1, so every bonus draw must be token 1.
+        const VOCAB: usize = 4;
+        let draft_tok = 0u32;
+        let mut draft_logit = vec![f32::NEG_INFINITY; VOCAB];
+        draft_logit[0] = 100.0;
+        let mut target_logit = vec![f32::NEG_INFINITY; VOCAB];
+        target_logit[1] = 100.0;
+
+        let draft_tokens = vec![draft_tok];
+        let draft_logits = vec![draft_logit];
+        // For a single-draft scenario, `target_logits[0]` (bonus position) and the
+        // verification distribution (`initial_target_logits`) carry the same peak.
+        let target_logits = vec![target_logit.clone()];
+        let initial_target = target_logit;
+
+        let mut bonus_counts = [0u32; VOCAB];
+        let trials = 40u64;
+        for seed in 0u64..trials {
+            let res = rejection_sample_draft(
+                &draft_tokens,
+                &draft_logits,
+                &initial_target,
+                &target_logits,
+                false,
+                Some(seed),
+            )
+            .unwrap();
+            assert!(res.had_rejection, "seed={seed}: rejection must occur");
+            assert_eq!(res.accepted_count, 0, "seed={seed}: no tokens accepted");
+            if let Some(b) = res.bonus_token {
+                bonus_counts[b as usize] += 1;
+            }
+        }
+        assert_eq!(
+            bonus_counts[1], trials as u32,
+            "adjusted sampling must produce token 1 in all trials, got counts={bonus_counts:?}"
+        );
+    }
+
+    #[test]
+    fn rejection_greedy_mode_accepts_matching_argmax() {
+        // Verification convention:
+        //   draft[0] verified against initial_target_logits
+        //   draft[i>=1] verified against target_logits[i-1]
+        //   target_logits[n-1] is the bonus on full accept.
+        //
+        // Setup: initial_target peaks at draft[0]=5 → draft[0] accepted. Then
+        // target_logits[0] peaks at 9 ≠ draft[1]=7 → reject. bonus = 9.
+        const VOCAB: usize = 10;
+        let draft_tokens = vec![5u32, 7, 3];
+        let initial_target = peaked_logits(VOCAB, 5, 5.0);
+        let target_logits = vec![
+            peaked_logits(VOCAB, 9, 5.0),
+            peaked_logits(VOCAB, 2, 5.0),
+            peaked_logits(VOCAB, 4, 5.0),
+        ];
+        let draft_logits = vec![
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+        ];
+
+        let res = rejection_sample_draft(
+            &draft_tokens,
+            &draft_logits,
+            &initial_target,
+            &target_logits,
+            true,
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(res.accepted_count, 1, "only position 0 accepted");
+        assert!(res.had_rejection);
+        assert_eq!(
+            res.bonus_token,
+            Some(9),
+            "bonus is argmax of target_logits[0]"
+        );
+    }
+
+    #[test]
+    fn rejection_greedy_all_match() {
+        // Greedy: draft[0]=3 matches initial_target=3; draft[1]=7 matches
+        // target_logits[0]=7; draft[2]=2 matches target_logits[1]=2; bonus from
+        // target_logits[2]=9.
+        const VOCAB: usize = 10;
+        let draft_tokens = vec![3u32, 7, 2];
+        let initial_target = peaked_logits(VOCAB, 3, 5.0);
+        let target_logits = vec![
+            peaked_logits(VOCAB, 7, 5.0),
+            peaked_logits(VOCAB, 2, 5.0),
+            peaked_logits(VOCAB, 9, 5.0),
+        ];
+        let draft_logits = vec![
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+        ];
+
+        let res = rejection_sample_draft(
+            &draft_tokens,
+            &draft_logits,
+            &initial_target,
+            &target_logits,
+            true,
+            Some(7),
+        )
+        .unwrap();
+
+        assert_eq!(res.accepted_count, 3);
+        assert_eq!(res.accepted_tokens, vec![3u32, 7, 2]);
+        assert!(!res.had_rejection);
+        assert_eq!(res.bonus_token, Some(9));
+    }
+
+    #[test]
+    fn rejection_q_zero_causes_rejection() {
+        // q(x) = 0 for the draft token → accept_prob = 0 → always reject. On
+        // rejection, bonus comes from the position-0 target distribution (=
+        // initial_target_logits).
+        const VOCAB: usize = 4;
+        let mut draft_logit = vec![f32::NEG_INFINITY; VOCAB];
+        draft_logit[0] = 10.0; // q peaks at 0
+        let target_logit = peaked_logits(VOCAB, 2, 10.0); // p peaks at 2
+
+        let res = rejection_sample_draft(
+            &[2u32],
+            &[draft_logit],
+            &target_logit,
+            &[target_logit.clone()],
+            false,
+            Some(99),
+        )
+        .unwrap();
+
+        assert!(res.had_rejection);
+        assert_eq!(
+            res.bonus_token,
+            Some(2),
+            "bonus token from adjusted dist should be 2"
+        );
+    }
+
+    #[test]
+    fn rejection_probabilistic_full_accept_has_bonus() {
+        // Identical distributions at every position → all accepted, bonus appended.
+        const VOCAB: usize = 8;
+        let logit = peaked_logits(VOCAB, 5, 15.0);
+        let draft_tokens = vec![5u32, 5];
+        let draft_logits = vec![logit.clone(), logit.clone()];
+        let target_logits = vec![logit.clone(), logit.clone()];
+        let initial_target = logit.clone();
+
+        let res = rejection_sample_draft(
+            &draft_tokens,
+            &draft_logits,
+            &initial_target,
+            &target_logits,
+            false,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(res.accepted_count, 2);
+        assert!(!res.had_rejection);
+        // Bonus is sampled from the strongly peaked target distribution → must be 5.
+        assert_eq!(
+            res.bonus_token,
+            Some(5),
+            "bonus from peaked target must be token 5"
+        );
+    }
+
+    #[test]
+    fn softmax_into_sums_to_one() {
+        let logits = vec![1.0f32, 2.0, 3.0, 0.5, -1.0];
+        let mut out = vec![0.0f32; logits.len()];
+        softmax_into(&logits, &mut out);
+        let sum: f32 = out.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "softmax must sum to 1.0, got {sum}"
+        );
+        for &p in &out {
+            assert!(p >= 0.0, "all softmax outputs must be non-negative");
+        }
+    }
+
+    #[test]
+    fn softmax_into_peaked_distribution() {
+        // A very large logit gap should produce ≈1.0 for the argmax.
+        let mut logits = vec![0.0f32; 10];
+        logits[3] = 100.0;
+        let mut out = vec![0.0f32; 10];
+        softmax_into(&logits, &mut out);
+        assert!(
+            out[3] > 0.999,
+            "heavily peaked logit should dominate softmax"
+        );
+    }
+
+    #[test]
+    fn sample_adjusted_concentrates_on_target_mass() {
+        // p = [0.9, 0.1], q = [0.1, 0.9]
+        // adjusted = max(0, p-q) = [0.8, 0.0], renormalised = [1.0, 0.0]
+        // All samples should return token 0.
+        let p = vec![0.9f32, 0.1];
+        let q = vec![0.1f32, 0.9];
+        for seed in 0u64..20 {
+            let mut rng = SpecRng::new(seed + 1);
+            let r = rng.next_f32();
+            let tok = sample_adjusted(&p, &q, r);
+            assert_eq!(tok, 0, "seed={seed}: all mass on token 0");
+        }
     }
 }
