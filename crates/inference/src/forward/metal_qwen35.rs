@@ -6454,16 +6454,36 @@ kernel void lora_gemv_b_accum(
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
 
-                // Target's prediction for position pos+1 (conditioned on pending_token).
-                let target_token1 = verify_out.logits[0]
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0);
+                // Route the accept/reject decision through `rejection_sample_draft` so
+                // the live MTP loop and the trait-level `mtp_verify_draft` share the
+                // same verifier implementation (ADR-050). For greedy 1-draft MTP the
+                // mapping is:
+                //   draft_tokens          = [draft.token_id]
+                //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
+                //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
+                //
+                // Greedy mode does not consume `draft_logits`, so we pass an empty slice
+                // — no full-vocab placeholder allocation in the hot path.
+                let rs = match crate::speculative::rejection_sample_draft(
+                    &[draft.token_id],
+                    &[],
+                    &verify_out.logits[0],
+                    std::slice::from_ref(&verify_out.logits[1]),
+                    true,
+                    None,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Fallback: accept pending, advance normally.
+                        self.session.kv_cache.seq_len = pos + 1;
+                        generated_ids.push(pending_token);
+                        metrics.fallback_tokens += 1;
+                        pending_token = draft.token_id;
+                        continue;
+                    }
+                };
 
-                if draft.token_id == target_token1 {
+                if rs.accepted_count == 1 {
                     // Draft accepted: output pending + draft, advance by 2.
                     // Clear batch repair token — rollback won't be called this round.
                     if let Some(ref mut p) = self.session.gdn_checkpoints {
@@ -6473,15 +6493,8 @@ kernel void lora_gemv_b_accum(
                     generated_ids.push(draft.token_id);
                     metrics.accepted_extra_tokens += 1;
 
-                    let next_token = verify_out.logits[1]
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i as u32)
-                        .unwrap_or(0);
+                    // `bonus_token` on full accept is `argmax(verify_out.logits[1])`.
+                    let next_token = rs.bonus_token.unwrap_or(0);
 
                     // State is already at pos+2 after verify.
                     if is_stop(next_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -6495,7 +6508,9 @@ kernel void lora_gemv_b_accum(
                     let _ = self.rollback_speculative_state_to(pos + 1);
                     metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
 
-                    pending_token = target_token1;
+                    // `bonus_token` on rejection is `argmax(verify_out.logits[0])` =
+                    // the target's own prediction at the draft position.
+                    pending_token = rs.bonus_token.unwrap_or(0);
                     if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
                         break;
                     }

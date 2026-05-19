@@ -1204,16 +1204,12 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
 
     // Delegate the accept-loop to `rejection_sample_draft(greedy=true)` so a single
     // verifier implements both the existing greedy MTP path and the probabilistic
-    // path introduced by ADR-050. The `draft_logits` argument is unused in greedy
-    // mode (target argmax decides everything) but the function validates lengths,
-    // so pass an `n`-length placeholder of the right vocabulary size.
-    let placeholder_vocab = target_logits[0].len();
-    let draft_logits_placeholder: Vec<Vec<f32>> = (0..draft_len)
-        .map(|_| vec![0.0f32; placeholder_vocab])
-        .collect();
+    // path introduced by ADR-050. Greedy mode does not consume `draft_logits`, so
+    // we pass an empty slice — no `draft_len * vocab_size` placeholder allocation
+    // in the hot path.
     let rs = rejection_sample_draft(
         &draft,
-        &draft_logits_placeholder,
+        &[],
         initial_target_logits,
         &target_logits,
         true,
@@ -1594,11 +1590,20 @@ pub fn rejection_sample_draft(
     use crate::error::InferenceError;
 
     let n = draft_tokens.len();
-    if draft_logits.len() != n || target_logits.len() != n {
+    if target_logits.len() != n {
         return Err(InferenceError::InvalidInput(format!(
-            "draft_tokens len={n} but draft_logits len={} and target_logits len={}",
-            draft_logits.len(),
+            "draft_tokens len={n} but target_logits len={}",
             target_logits.len()
+        )));
+    }
+    // `draft_logits` is only used in probabilistic mode (to evaluate `q(x_i)`); greedy
+    // callers can pass an empty slice to avoid allocating a `draft_len * vocab_size`
+    // placeholder for a value that will never be read. Validate the length only when
+    // we are actually going to consume it.
+    if !greedy && draft_logits.len() != n {
+        return Err(InferenceError::InvalidInput(format!(
+            "probabilistic rejection sampling: draft_tokens len={n} but draft_logits len={}",
+            draft_logits.len()
         )));
     }
 
@@ -1626,12 +1631,14 @@ pub fn rejection_sample_draft(
             )));
         }
     }
-    for (i, dl) in draft_logits.iter().enumerate() {
-        if dl.len() != vocab {
-            return Err(InferenceError::InvalidInput(format!(
-                "draft_logits[{i}] has length {} but expected {vocab}",
-                dl.len()
-            )));
+    if !greedy {
+        for (i, dl) in draft_logits.iter().enumerate() {
+            if dl.len() != vocab {
+                return Err(InferenceError::InvalidInput(format!(
+                    "draft_logits[{i}] has length {} but expected {vocab}",
+                    dl.len()
+                )));
+            }
         }
     }
 
