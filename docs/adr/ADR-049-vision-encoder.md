@@ -121,8 +121,17 @@ pub struct VisionEncoder {
 
 impl VisionEncoder {
     pub fn new(weights: &VisionWeights, config: &ViTConfig) -> Result<Self, VisionError>;
-    /// Encode raw image bytes (JPEG or PNG). Returns [n_patches, d_model].
-    pub fn encode(&self, image_bytes: &[u8]) -> Result<Vec<f32>, VisionError>;
+    /// Encode raw image bytes (JPEG or PNG) through ViT + spatial merge + MLP.
+    /// Returns projected embeddings shaped [visual_tokens, d_model] along with
+    /// raw_patches and visual_tokens counts for MultimodalInput construction.
+    pub fn encode(&self, image_bytes: &[u8]) -> Result<VisionOutput, VisionError>;
+}
+
+pub struct VisionOutput {
+    pub patch_embeddings: Vec<f32>, // [visual_tokens * d_model]
+    pub raw_patches: usize,         // before merge (e.g., 784)
+    pub visual_tokens: usize,       // after merge (e.g., 196)
+    pub d_model: usize,
 }
 ```
 
