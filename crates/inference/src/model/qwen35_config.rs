@@ -514,6 +514,10 @@ pub struct GenerateConfig {
     pub stop_token_ids: Vec<u32>,
     /// When false, caller prepends `QWEN3_NO_THINK_SYSTEM_MSG` to disable chain-of-thought.
     pub enable_thinking: bool,
+    /// Enable multi-token prediction when the model has MTP weights loaded.
+    /// Replaces the `LATTICE_MTP` env var for programmatic control.
+    /// `None` = defer to `LATTICE_MTP` env var (backwards-compatible default).
+    pub enable_mtp: Option<bool>,
 }
 
 impl Default for GenerateConfig {
@@ -527,6 +531,7 @@ impl Default for GenerateConfig {
             seed: None,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
             enable_thinking: true,
+            enable_mtp: None,
         }
     }
 }

@@ -117,6 +117,7 @@ fn bench_baseline(c: &mut Criterion) {
             seed: Some(42),
             stop_token_ids: vec![],
             enable_thinking: false,
+            enable_mtp: Some(false),
         };
 
         let history = vec![ChatMessage::user(BENCH_PROMPT)];
@@ -214,13 +215,10 @@ fn bench_mtp(c: &mut Criterion) {
             seed: Some(42),
             stop_token_ids: vec![],
             enable_thinking: false,
+            enable_mtp: Some(true),
         };
 
         let history = vec![ChatMessage::user(BENCH_PROMPT)];
-
-        // SAFETY: set once before measurement, cleared after. Criterion runs
-        // bench functions sequentially in the main thread; no concurrent readers.
-        unsafe { std::env::set_var("LATTICE_MTP", "1") };
 
         state.reset_state();
         let warmup = state.chat_completion(&history, &tokenizer, &gen_cfg);
@@ -247,9 +245,6 @@ fn bench_mtp(c: &mut Criterion) {
         });
 
         group.finish();
-
-        // SAFETY: same single-threaded context as the set_var above.
-        unsafe { std::env::remove_var("LATTICE_MTP") };
     }
 }
 

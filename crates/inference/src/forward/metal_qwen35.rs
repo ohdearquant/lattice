@@ -6609,9 +6609,12 @@ kernel void lora_gemv_b_accum(
             // Batch prefill: process all prompt tokens at once (GEMM)
             let prefill_logits = self.forward_prefill(&prompt_ids);
 
-            // MTP greedy path: env-gated, greedy (top_k<=1) only.
+            // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
+            let mtp_enabled = gen_cfg
+                .enable_mtp
+                .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
             let use_mtp = self.session.mtp.is_some()
-                && std::env::var("LATTICE_MTP").is_ok()
+                && mtp_enabled
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
                 && !use_compact;
