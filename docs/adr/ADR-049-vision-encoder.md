@@ -10,16 +10,22 @@ Lattice currently processes only text: `BpeTokenizer` converts strings to token 
 `MetalQwen35State` runs a text-only decoder. There is no image ingestion path, no vision encoder,
 and no mechanism to prepend patch tokens to the text sequence.
 
-The natural extension is the Qwen-VL family. Lattice already targets Qwen3.5 for text — Qwen3-VL
-(arxiv:2502.13923) is the corresponding multimodal model and shares the same decoder weights.
-The Qwen-VL architecture is three components: (1) a ViT vision encoder, (2) a two-layer MLP
-merger that compresses patch embeddings, and (3) the decoder LLM, which is unchanged. The MLP
-merger is approximately 10 M parameters — negligible relative to the 7 B+ decoder.
+The natural extension is the Qwen-VL family. Lattice already targets Qwen3.5 for text; the
+corresponding multimodal variants are Qwen2.5-VL (arxiv:2502.13923) and Qwen3-VL.
 
-Qwen2.5-VL uses window attention in the ViT for efficiency; Qwen3-VL drops the cross-attention
-adapter of earlier versions and uses a purely MLP-based merger, which simplifies integration.
+**Qwen2.5-VL** (arxiv:2502.13923): ViT with window attention + 2D RoPE, MLP merger, decoder LLM.
+Depth 32, patch size 14, temporal_patch_size 2.
+
+**Qwen3-VL** (Hugging Face `Qwen3VLVisionConfig` defaults): ViT depth 27, patch size 16,
+spatial_merge_size 2, MLP-based merger (no cross-attention adapter). Shares the Qwen3.5 decoder
+backbone.
+
 Both variants output a flat sequence of patch embedding vectors that are prepended to the text
-token embeddings in the decoder's residual stream.
+token embeddings in the decoder's residual stream. The MLP merger is approximately 10 M parameters
+— negligible relative to the decoder.
+
+This ADR targets **Qwen3-VL** as v0, using its actual Hugging Face config (depth 27, patch 16),
+not the Qwen2.5-VL architecture.
 
 The competitive baseline is mature: llama.cpp ships `libmtmd` supporting Qwen2.5-VL, Qwen3 Omni,
 Gemma3/4, Mistral Small 3.1, and Pixtral. Ollama exposes vision via its existing API. MLX has
@@ -74,7 +80,8 @@ backbones is deferred until the integration pattern is validated.
 - Video frame input
 - SigLIP or InternViT as alternative ViT backends
 - Image caching across decode steps (KV-cache for the ViT output)
-- CPU fallback path for the ViT (Metal is assumed available on all Lattice targets)
+- CPU fallback path for the ViT (v0 is Metal-only as an experimental feature; a CPU ViT
+  forward pass is straightforward to add as a follow-up since all ops are standard linear algebra)
 - Vision fine-tuning or LoRA injection into the ViT
 
 ## Architecture
@@ -145,12 +152,12 @@ pub struct ViT {
 
 pub struct ViTConfig {
     pub image_size: u32,         // 448
-    pub patch_size: u32,         // 14
-    pub n_patches: usize,        // (448/14)^2 = 1024
+    pub patch_size: u32,         // 16 (Qwen3-VL default)
+    pub n_patches: usize,        // (448/16)^2 = 784
     pub d_model: usize,          // 1152 for Qwen3-VL 7B
     pub n_heads: usize,          // 16
-    pub n_layers: usize,         // 32
-    pub window_size: usize,      // 4 (window attention, Qwen2.5-VL convention)
+    pub n_layers: usize,         // 27 (Qwen3-VL default)
+    pub spatial_merge_size: usize, // 2 (Qwen3-VL default)
     pub global_attn_every: usize,// every 4 blocks uses global attention
 }
 

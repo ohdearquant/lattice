@@ -38,17 +38,26 @@ applies symmetrically to both mechanisms. This ADR formalizes the dual-use desig
 ## Decision
 
 Add an `OnlineDriftDetector` to `lattice-transport` that computes Sinkhorn divergence over
-a sliding window of hidden-state samples. Expose a `DriftSignal` event type that `lattice-inference`
-subscribes to for triggering adapter and router staleness checks.
+a sliding window of hidden-state samples. Expose an `OnlineDriftSignal` event type that
+`lattice-inference` subscribes to for triggering adapter and router staleness checks.
+
+**Existing drift API**: `crates/transport/src/drift.rs` already provides `DriftConfig`,
+`DriftReport`, and `detect_drift_records` for batch embedding drift analysis. The new online
+detector is a distinct mechanism — streaming, sample-by-sample, with a sliding window — and
+uses non-conflicting names (`OnlineDriftDetector`, `OnlineDriftConfig`, `OnlineDriftSignal`)
+to coexist with the existing batch API.
 
 The boundary is explicit:
 - `lattice-transport` owns: the sliding window, divergence computation, threshold comparison,
   and signal emission. It is distribution-agnostic — it does not know what the samples represent.
 - `lattice-inference` owns: sampling from the inference pipeline (which layer, how often),
-  reacting to `DriftSignal` (which component to refresh, how to refresh it).
+  reacting to `OnlineDriftSignal` (which component to refresh, how to refresh it).
 
-This preserves the existing dependency direction: `inference` depends on `transport`, never
-the reverse.
+**Crate dependency note**: `lattice-inference` does not currently depend on `lattice-transport`.
+Rather than adding that edge (which would break the leaf-crate invariant), the integration uses
+a callback boundary: `lattice-inference` defines a `DriftSampler` trait, and the application
+binary (`bin/chat_metal` or the serving layer) wires the concrete `OnlineDriftDetector` from
+`lattice-transport` into the `DriftSampler` impl. Neither crate imports the other.
 
 ---
 
@@ -56,13 +65,13 @@ the reverse.
 
 New files:
 
-- `crates/transport/src/drift.rs` — `OnlineDriftDetector`, `DriftConfig`, `DriftSignal`
+- `crates/transport/src/online_drift.rs` — `OnlineDriftDetector`, `OnlineDriftConfig`, `OnlineDriftSignal`
 
 Modified files:
 
-- `crates/transport/src/lib.rs` — re-export `drift` module
-- `crates/inference/src/monitor.rs` — `InferenceDriftMonitor` wiring hidden-state samples to
-  the detector; `DriftReactor` trait with `on_adapter_stale()` and `on_router_stale()` methods
+- `crates/transport/src/lib.rs` — re-export `online_drift` module (existing `drift` module unchanged)
+- `crates/inference/src/monitor.rs` — `DriftSampler` trait with `on_adapter_stale()` and
+  `on_router_stale()` callbacks; no import of `lattice-transport`
 
 No new crates. No Metal kernel changes. No changes to serving hot path.
 

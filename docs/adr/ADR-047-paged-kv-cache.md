@@ -67,10 +67,15 @@ pub struct PrefixEntry {
     pub last_used: std::time::Instant,
 }
 
+/// Adapter ID for LoRA-aware prefix namespacing.
+/// AdapterId(0) = base model (no adapter). Non-zero = content hash of loaded adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdapterId(pub u64);
+
 impl PrefixPageCache {
     pub fn new(capacity: usize) -> Self;
-    pub fn lookup(&mut self, token_ids: &[u32]) -> Option<&PrefixEntry>;
-    pub fn insert(&mut self, token_ids: &[u32], entry: PrefixEntry);
+    pub fn lookup(&mut self, adapter_id: AdapterId, token_ids: &[u32]) -> Option<&PrefixEntry>;
+    pub fn insert(&mut self, adapter_id: AdapterId, token_ids: &[u32], entry: PrefixEntry);
     /// Evict LRU entries until at or below capacity.
     fn evict(&mut self);
 }

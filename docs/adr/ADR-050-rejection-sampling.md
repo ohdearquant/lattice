@@ -40,7 +40,15 @@ p'(x) = normalize(max(0, p(x) - q(x)))
 
 This guarantees the joint output distribution is exactly `p`, regardless of the draft quality.
 The per-token acceptance probability is `β(θ) = 1 - TV(q, p)` where TV is total variation
-distance. Speedup is `1 / (1 - β·K)` for K draft tokens.
+distance. Expected accepted tokens per speculative step is `(1 - β^(K+1)) / (1 - β)` for K
+draft tokens (capped geometric, Leviathan et al. ICML 2023, Algorithm 1). Wallclock speedup
+depends on the draft/target cost ratio `c`: `speedup = E[accepted] / (1 + K·c)`.
+
+| β | K | E[accepted] | speedup (c=0.05) |
+|---|---|-------------|------------------|
+| 0.5 | 2 | 1.75 | 1.59 |
+| 0.8 | 5 | 3.69 | 2.95 |
+| 0.9 | 5 | 4.10 | 2.73 |
 
 **GDN complication.** Qwen3.5-2B's 18 GatedDeltaNet layers maintain a recurrent state matrix
 `S[key_dim × value_dim]` per head (see `GatedDeltaNetState::s_matrices`). Unlike KV cache,
@@ -130,9 +138,8 @@ fn restore_gdn_states(&mut self, snapshot: &GdnSnapshot);
 
 // GdnSnapshot = Vec<(Vec<f32>, Vec<f32>)>
 //   index i = layer i: (s_matrices.clone(), conv_buffer.clone())
-// Allocation: num_gdn_layers * (key_dim * value_dim * num_heads + conv_dim * (kernel_size - 1))
-// For Qwen3.5-2B (18 GDN layers, key_dim=64, value_dim=64, 16 heads, conv_dim=512, kernel_size=4):
-//   18 * (64 * 64 * 16 + 512 * 3) * 4 bytes ≈ 46 MB per snapshot
+// Memory budget: see ADR-052 §Memory Budget for authoritative per-config estimates.
+// For Qwen3.5-0.8B: ~19.3 MiB per snapshot (18 GDN layers, 16 heads, 128×128 state + 6144×3 conv)
 ```
 
 Snapshot frequency: once per speculative step (before draft generation). Not per-token. The

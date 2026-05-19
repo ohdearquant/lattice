@@ -182,28 +182,36 @@ variant absorbs. Therefore:
 H_d · H_d · x = x    [exact, no separate R^T needed]
 ```
 
-R = diag(s) · H_d where s_i ∈ {+1,-1} are the random sign flips from the seed. R^T = H_d · diag(s)
-(since diag(s)^T = diag(s) for ±1 signs and H_d^T = H_d).
+The code convention (see `quant::quarot::hadamard.rs:120-127`) defines `R = H · diag(s)` where
+`s_i ∈ {+1,-1}` are the random sign flips from the seed. `apply()` performs sign flip then WHT.
+Therefore `R^T = diag(s) · H` (since `diag(s)^T = diag(s)` and `H^T = H`), and `apply_inverse()`
+performs WHT then sign flip.
 
 The counter-rotation procedure for a vector x in the rotated basis:
 
 ```rust
 // Recover original: x_original = R^T · x_rotated
-// R = diag(s) · H  =>  R^T = H · diag(s)
-apply_sign_flip(&mut x, &signs);          // diag(s) · x
-walsh_hadamard_orthonormal_in_place(&mut x)?; // H · (diag(s) · x)
+// R = H · diag(s)  =>  R^T = diag(s) · H
+// This is RandomizedHadamard::apply_inverse()
+hadamard.apply_inverse(&mut x)?;
+// Internally: walsh_hadamard_orthonormal_in_place(&mut x) then apply_sign_flip(&mut x, &signs)
 ```
 
-The re-rotation (original -> rotated) reverses the order:
+The re-rotation (original -> rotated) uses the forward direction:
 
 ```rust
-// x_rotated = R · x_original = diag(s) · H · x_original
-walsh_hadamard_orthonormal_in_place(&mut x)?; // H · x
-apply_sign_flip(&mut x, &signs);              // diag(s) · (H · x)
+// x_rotated = R · x_original = H · diag(s) · x_original
+// This is RandomizedHadamard::apply()
+hadamard.apply(&mut x)?;
+// Internally: apply_sign_flip(&mut x, &signs) then walsh_hadamard_orthonormal_in_place(&mut x)
 ```
 
 Sign flip vectors are deterministic from the seed via the same `RandomizedHadamard` generator used
-in `quantize_quarot`. The engine holds a `signs: Vec<i8>` derived once at load time.
+in `quantize_quarot`. The engine holds a `RandomizedHadamard` instance derived once at load time.
+
+**Verification**: any implementation must pass a round-trip test: `apply(apply_inverse(x)) == x` and
+`apply_inverse(apply(x)) == x` for a fixed seed, plus an MTP draft-logit equivalence test comparing
+counter-rotated MTP logits against the unquantized reference model.
 
 ### Complexity
 

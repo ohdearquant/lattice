@@ -41,8 +41,11 @@ separate workers.
 
 ### Lattice-specific constraints
 
-- `PagedKVCache` (ADR-004/047) provides the memory substrate: 256-token pages, LRU eviction,
-  shared across sequences.
+- `PagedKVCache` (ADR-004/047) provides the per-sequence memory substrate: 256-token pages, LRU
+  eviction. Note: current `PagedKVCache` owns a single `PageTable`; multi-sequence support
+  requires managing multiple page tables externally (see `paged.rs:247-251`). This ADR defines
+  `SequenceManager` as that external owner. ADR-047's prefix cache also needs `AdapterId`-aware
+  lookup (defined there) before continuous batching can reuse prefixes across sequences.
 - GDN attention (`src/attention/gdn.rs`) carries a per-sequence recurrent state matrix
   (`S ∈ R^{d_model × d_model}`), not just KV pairs. This state must be batched and routed
   alongside KV pages.
@@ -113,8 +116,7 @@ timeline for Phase 2, and does not touch the CPU inference path (`generate.rs`).
        token → stream to caller (tokio::sync::oneshot or watch channel)
             │ (if EOS or max_len)
             ▼
-       PagedKvCache::release(seq_id)
-       GdnStatePool::release(seq_id)
+       SequenceManager::release(seq_id)  // drops PageTable + GDN state for this sequence
 ```
 
 ### Core types

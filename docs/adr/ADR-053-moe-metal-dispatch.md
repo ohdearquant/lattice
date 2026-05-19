@@ -42,15 +42,23 @@ compute-command encoders within a single commit. This reduces dispatch overhead 
 
 ### Expert weight memory for Qwen3.6-35B-A3B
 
-At Q4 with hidden=7168 and moe_intermediate_size=2048:
-- `gate_up_proj`: 256 experts × 2 × 2048 × 7168 × 0.5 bytes = ~3.7 GB
-- `down_proj`: 256 experts × 7168 × 2048 × 0.5 bytes = ~1.85 GB
-- Shared expert (dense): negligible (~0.05 GB)
-- Total routed expert weights: ~5.6 GB across 40 layers
+**Current `Qwen35Config::qwen36_35b_a3b()`** sets `hidden_size: 2048`, `moe_intermediate_size: 512`,
+`shared_expert_intermediate_size: 512` with 256 routed experts across 40 layers.
+
+At Q4 with the current config dimensions:
+- `gate_up_proj`: 256 experts × 2 × 512 × 2048 × 0.5 bytes = ~256 MiB per layer
+- `down_proj`: 256 experts × 2048 × 512 × 0.5 bytes = ~128 MiB per layer
+- Total routed expert weights across 40 layers: ~384 MiB × 40 ≈ **15 GiB**
+- Shared expert (dense, 512×2048): negligible (~4 MiB)
+
+> **Note**: the upstream Qwen3.6-35B Hugging Face config uses larger dimensions (hidden=7168,
+> moe_intermediate=2048). If the config fixture is updated to match upstream, the memory budget
+> rises to ~5.6 GB per 40 layers. The memory budget section should be re-verified when the
+> config is finalized.
 
 M2 Max unified memory is 32–96 GB. Loading all expert weights resident (the MLX approach) is
-feasible on 64 GB+ configurations. On 32 GB, expert weight swapping becomes necessary. This ADR
-targets the resident-all path as v1; swapping is deferred.
+feasible on 64 GB+ configurations for either dimension set. This ADR targets the resident-all
+path as v1; swapping is deferred.
 
 ### QuaRot interaction
 
