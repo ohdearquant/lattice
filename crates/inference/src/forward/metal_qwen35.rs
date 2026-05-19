@@ -3817,6 +3817,11 @@ kernel void lora_gemv_b_accum(
             })
         }
 
+        /// Returns `true` if MTP weights were loaded and the session has an active MTP state.
+        pub fn has_mtp(&self) -> bool {
+            self.session.mtp.is_some()
+        }
+
         /// Returns the expected `(d_in, d_out)` for a LoRA projection given the layer type.
         ///
         /// Returns an error if `module` is not valid for the layer type at `layer_idx`,
@@ -6604,9 +6609,12 @@ kernel void lora_gemv_b_accum(
             // Batch prefill: process all prompt tokens at once (GEMM)
             let prefill_logits = self.forward_prefill(&prompt_ids);
 
-            // MTP greedy path: env-gated, greedy (top_k<=1) only.
+            // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
+            let mtp_enabled = gen_cfg
+                .enable_mtp
+                .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
             let use_mtp = self.session.mtp.is_some()
-                && std::env::var("LATTICE_MTP").is_ok()
+                && mtp_enabled
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
                 && !use_compact;
@@ -12705,6 +12713,11 @@ impl MetalQwen35State {
         _max_cache_len: usize,
     ) -> Result<Self, String> {
         Err("Metal GPU not available (requires macOS + metal-gpu feature)".into())
+    }
+
+    /// Stub: always returns false without metal-gpu feature.
+    pub fn has_mtp(&self) -> bool {
+        false
     }
 
     /// **Unstable**: Metal single-token forward step stub.
