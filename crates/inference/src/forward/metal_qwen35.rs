@@ -2387,6 +2387,9 @@ kernel void lora_gemv_b_accum(
     /// Maximum draft tokens verified in one MTP speculation round (first=target, second=MTP draft).
     const MTP_VERIFY_MAX_TOKENS: usize = 2;
 
+    /// Maximum GDN-only draft tokens per self-speculative round.
+    const SELF_SPEC_MAX_DRAFT: usize = 4;
+
     // ADR-051 §"MTP tensors still safety-skipped in quantize_quarot": Phase 1 keeps
     // every MTP projection as f16 (unquantized) so the counter-rotation operates on
     // unquantized weights. Buffers hold raw f16 (u16-on-disk converted via
@@ -2544,6 +2547,19 @@ kernel void lora_gemv_b_accum(
         accepted_extra_tokens: usize,
         fallback_tokens: usize,
         mtp_ms: f64,
+        verify_ms: f64,
+        rollback_ms: f64,
+    }
+
+    /// Decoding metrics emitted when LATTICE_SELF_SPEC_VERBOSE=1.
+    #[derive(Default)]
+    struct SelfSpecMetrics {
+        rounds: usize,
+        draft_forwards: usize,
+        verify_calls: usize,
+        accepted_extra_tokens: usize,
+        fallback_tokens: usize,
+        draft_ms: f64,
         verify_ms: f64,
         rollback_ms: f64,
     }
@@ -3770,10 +3786,16 @@ kernel void lora_gemv_b_accum(
                 }
             });
 
-            let gdn_checkpoints = if mtp.is_some() {
+            let need_checkpoints = mtp.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            let checkpoint_max_tokens = if mtp.is_some() {
+                MTP_VERIFY_MAX_TOKENS.max(SELF_SPEC_MAX_DRAFT)
+            } else {
+                SELF_SPEC_MAX_DRAFT
+            };
+            let gdn_checkpoints = if need_checkpoints {
                 Some(MetalGdnCheckpointPool::new(
                     device,
-                    MTP_VERIFY_MAX_TOKENS,
+                    checkpoint_max_tokens,
                     &gdn_gpu_conv_bufs,
                     &gdn_gpu_s_matrices,
                 ))
@@ -5670,6 +5692,79 @@ kernel void lora_gemv_b_accum(
             self.forward_step_inner(token_id, position, false).logits
         }
 
+        /// Run a token through GDN layers only, skipping all GQA layers.
+        ///
+        /// GQA layers are bypassed: the residual stream passes through unmodified,
+        /// the KV cache is NOT advanced, and `session.kv_cache.seq_len` is NOT
+        /// incremented. The function returns full-vocab logits computed from the
+        /// GDN-only hidden state via final-norm + lm_head.
+        ///
+        /// Caller is responsible for checkpointing GDN state before calling.
+        fn forward_step_gdn_only(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            let cfg = self.engine.config.clone();
+            let hidden = cfg.hidden_size;
+
+            // Embedding lookup — identical to forward_step_inner.
+            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
+            // token_id validated < vocab_size by the generate loop above.
+            unsafe {
+                let src = (self.engine.embed_tokens.contents() as *const u16)
+                    .add(token_id as usize * hidden);
+                let dst = self.session.activations.hidden.contents() as *mut f32;
+                for i in 0..hidden {
+                    *dst.add(i) = f16_to_f32(*src.add(i));
+                }
+            }
+
+            let mut active_layer_idx = 0usize;
+            let mut linear_idx = 0usize;
+
+            // Single command buffer for all GDN layers (GQA layers produce no encoder work).
+            // Raw pointer breaks the borrow chain; identical idiom to forward_step_inner.
+            let cmd = unsafe {
+                &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+            };
+            let enc = cmd.new_compute_command_encoder();
+
+            let mut prof = StepProfile::default();
+            for layer_i in 0..cfg.num_hidden_layers {
+                if !cfg.is_layer_active(layer_i) {
+                    continue;
+                }
+                let compact_idx = active_layer_idx;
+                active_layer_idx += 1;
+                let is_linear = matches!(
+                    &self.engine.layer_weights[compact_idx].0,
+                    MetalLayerAttnWeights::Linear(_)
+                );
+                if is_linear {
+                    self.encode_gdn_layer(
+                        enc,
+                        compact_idx,
+                        linear_idx,
+                        position,
+                        layer_i,
+                        &cfg,
+                        &mut prof,
+                        false,
+                    );
+                    linear_idx += 1;
+                }
+                // GQA layers: residual stream passes through without modification.
+            }
+
+            // Final head (RMSNorm + lm_head) — capture_hidden=false, no MTP side-effect.
+            self.encode_final_head(enc, &cfg, false, &mut prof, false);
+
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // Read logits — do NOT increment kv_cache.seq_len.
+            // SAFETY: GPU completed, buffer is StorageModeShared.
+            unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
+        }
+
         /// **Unstable**: batch prompt prefill; prefill kernel and fallback threshold may change.
         ///
         /// Batch prefill: process all prompt tokens at once using GEMM.
@@ -6603,6 +6698,200 @@ kernel void lora_gemv_b_accum(
             }
         }
 
+        /// GDN-first self-speculative decode loop.
+        ///
+        /// Drafts K tokens via GDN-only forwards (cheap O(n) recurrence, no KV cache
+        /// writes), then verifies with the full model (GDN+GQA) in batch. Accepts the
+        /// longest agreeing prefix and rolls back GDN state on partial rejection.
+        ///
+        /// Activated by `LATTICE_SELF_SPEC=1`. Requires greedy decode (temperature ≤ 0,
+        /// top_k ≤ 1). Requires `gdn_checkpoints` to be allocated in the session.
+        fn generate_greedy_self_spec(
+            &mut self,
+            prefill_logits: &[f32],
+            prompt_len: usize,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+        ) -> GenerateOutput {
+            let cfg = self.engine.config.clone();
+
+            let argmax_logits = |logits: &[f32]| -> u32 {
+                logits
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32)
+                    .unwrap_or(0)
+            };
+
+            let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
+
+            let pending_first = argmax_logits(prefill_logits);
+            if is_stop(pending_first) {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                };
+            }
+
+            let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+            let mut pending_token = pending_first;
+            let mut metrics = SelfSpecMetrics::default();
+
+            'round: while generated_ids.len() < gen_cfg.max_new_tokens {
+                let pos = self.session.kv_cache.seq_len;
+                if pos + SELF_SPEC_MAX_DRAFT + 1 >= self.session.kv_cache.max_cache_len {
+                    generated_ids.push(pending_token);
+                    break;
+                }
+
+                // --- Draft phase: K GDN-only forwards ---
+                let t_draft = std::time::Instant::now();
+                if let Some(ref mut p) = self.session.gdn_checkpoints {
+                    p.active_base_seq_len = Some(pos);
+                    p.mtp_base_seq_len = None;
+                    p.batch_repair_token = Some((pending_token, pos));
+                }
+                // Slot 0 = GDN state before the pending token is processed by the full model.
+                if self.checkpoint_gdn_to_slot(0).is_err() {
+                    // Checkpoint pool not allocated — fall through to single-token decode.
+                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let next = argmax_logits(&logits);
+                    generated_ids.push(pending_token);
+                    if is_stop(next) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                    pending_token = next;
+                    metrics.fallback_tokens += 1;
+                    continue 'round;
+                }
+
+                let mut draft_tokens: Vec<u32> = Vec::with_capacity(SELF_SPEC_MAX_DRAFT);
+                let first_draft_logits = self.forward_step_gdn_only(pending_token, pos);
+                let first_draft = argmax_logits(&first_draft_logits);
+                metrics.draft_forwards += 1;
+                if !is_stop(first_draft) {
+                    draft_tokens.push(first_draft);
+                    let mut cur_draft = first_draft;
+                    for _ in 1..SELF_SPEC_MAX_DRAFT {
+                        if is_stop(cur_draft) {
+                            break;
+                        }
+                        let d_pos = pos + draft_tokens.len();
+                        let logits = self.forward_step_gdn_only(cur_draft, d_pos);
+                        let next = argmax_logits(&logits);
+                        metrics.draft_forwards += 1;
+                        draft_tokens.push(next);
+                        cur_draft = next;
+                    }
+                }
+                metrics.draft_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
+
+                // --- Verify phase: full model over [pending_token] ++ draft_tokens ---
+                let mut verify_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
+                verify_input.push(pending_token);
+                verify_input.extend_from_slice(&draft_tokens);
+
+                let t_verify = std::time::Instant::now();
+                let verify_out = match self.verify_tokens_batched(&verify_input, pos) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Verification failed: accept pending, use draft as next pending.
+                        self.session.kv_cache.seq_len = pos + 1;
+                        generated_ids.push(pending_token);
+                        metrics.fallback_tokens += 1;
+                        pending_token = argmax_logits(&first_draft_logits);
+                        if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                            break;
+                        }
+                        continue 'round;
+                    }
+                };
+                metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
+                metrics.verify_calls += 1;
+
+                // verify_out.logits[i] = full-model output after processing verify_input[i].
+                // Logits[0] predicts what comes after pending_token.
+                // Compare logits[i] argmax with draft_tokens[i] for i in 0..draft_len.
+
+                // pending_token is always accepted (full model processed it above).
+                generated_ids.push(pending_token);
+
+                let mut accepted_drafts = 0usize;
+                let mut rejection_next: Option<u32> = None;
+
+                for (i, &draft) in draft_tokens.iter().enumerate() {
+                    if generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                    let target = argmax_logits(&verify_out.logits[i]);
+                    if target == draft {
+                        generated_ids.push(draft);
+                        accepted_drafts += 1;
+                        metrics.accepted_extra_tokens += 1;
+                        if is_stop(draft) {
+                            break;
+                        }
+                    } else {
+                        rejection_next = Some(target);
+                        break;
+                    }
+                }
+
+                if let Some(next_token) = rejection_next {
+                    // Partial or full rejection: roll back GDN/KV to accepted prefix boundary.
+                    let t_rb = std::time::Instant::now();
+                    let _ = self.rollback_speculative_state_to(pos + accepted_drafts + 1);
+                    metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
+                    if is_stop(next_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                    pending_token = next_token;
+                    metrics.rounds += 1;
+                    continue 'round;
+                }
+
+                // Full acceptance: next pending = full-model prediction after last verified token.
+                if let Some(ref mut p) = self.session.gdn_checkpoints {
+                    p.batch_repair_token = None;
+                }
+                let last_idx = draft_tokens
+                    .len()
+                    .min(verify_out.logits.len().saturating_sub(1));
+                let next_pending = argmax_logits(&verify_out.logits[last_idx]);
+                metrics.rounds += 1;
+                if is_stop(next_pending) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                    break;
+                }
+                pending_token = next_pending;
+            }
+
+            if std::env::var("LATTICE_SELF_SPEC_VERBOSE").is_ok() {
+                eprintln!(
+                    "[SELF_SPEC] rounds={} draft_fwd={} verify={} accepted_extra={} fallbacks={} draft_ms={:.1} verify_ms={:.1} rb_ms={:.1}",
+                    metrics.rounds,
+                    metrics.draft_forwards,
+                    metrics.verify_calls,
+                    metrics.accepted_extra_tokens,
+                    metrics.fallback_tokens,
+                    metrics.draft_ms,
+                    metrics.verify_ms,
+                    metrics.rollback_ms,
+                );
+            }
+
+            let text = decode_tokens(tokenizer, &generated_ids);
+            GenerateOutput {
+                text,
+                token_ids: generated_ids.clone(),
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+            }
+        }
+
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -6688,6 +6977,22 @@ kernel void lora_gemv_b_accum(
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
                 return self.generate_greedy_mtp(&prefill_logits, prompt_len, tokenizer, gen_cfg);
+            }
+
+            // GDN-first self-speculative greedy path: env-gated, greedy only.
+            let use_self_spec = self.session.gdn_checkpoints.is_some()
+                && std::env::var("LATTICE_SELF_SPEC").is_ok()
+                && gen_cfg.top_k <= 1
+                && gen_cfg.temperature <= 0.0
+                && !use_compact
+                && cfg.num_active_linear_attention_layers() > 0;
+            if use_self_spec {
+                return self.generate_greedy_self_spec(
+                    &prefill_logits,
+                    prompt_len,
+                    tokenizer,
+                    gen_cfg,
+                );
             }
 
             let next_id = if use_compact {
@@ -10156,10 +10461,17 @@ kernel void lora_gemv_b_accum(
                     activations: mtp_activations,
                 }
             });
-            let gdn_checkpoints = if mtp_weights_opt.is_some() {
+            let need_checkpoints =
+                mtp_weights_opt.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            let checkpoint_max_tokens = if mtp_weights_opt.is_some() {
+                MTP_VERIFY_MAX_TOKENS.max(SELF_SPEC_MAX_DRAFT)
+            } else {
+                SELF_SPEC_MAX_DRAFT
+            };
+            let gdn_checkpoints = if need_checkpoints {
                 Some(MetalGdnCheckpointPool::new(
                     &device,
-                    MTP_VERIFY_MAX_TOKENS,
+                    checkpoint_max_tokens,
                     &gdn_gpu_conv_bufs,
                     &gdn_gpu_s_matrices,
                 ))
@@ -12803,6 +13115,240 @@ kernel void decode_attention_reference(
             // load_adapter_and_dispatch_lora_if_active test which verifies GPU LoRA
             // GEMV on individual buffers. Full-forward observability requires a
             // non-zero-weight fixture (deferred to step 5 e2e PPL validation).
+        }
+
+        // -----------------------------------------------------------------------
+        // GDN-first self-speculative decoding tests
+        // -----------------------------------------------------------------------
+
+        /// Minimal 4-layer hybrid fixture: [GDN, GDN, GDN, GQA] mirroring the
+        /// Qwen3.5 pattern at small dimension. Sufficient to exercise the
+        /// self-speculative draft path (GDN-only forward) and verify path (full).
+        fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
+            use crate::attention::gdn::GatedDeltaNetWeights;
+            let hidden = 128usize;
+            let intermediate = 32usize;
+            let vocab = 32usize;
+            // GDN parameters matching the fixture config below.
+            let num_kh = 1usize;
+            let kd = 8usize;
+            let vd = 8usize;
+            let qkv_dim = num_kh * kd * 2 + num_kh * vd; // Q+K+V
+            let out_dim = num_kh * vd;
+            let ks = 4usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 4,
+                vocab_size: vocab,
+                intermediate_size: intermediate,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 64,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: num_kh,
+                linear_num_value_heads: Some(num_kh),
+                linear_key_head_dim: kd,
+                linear_value_head_dim: vd,
+                linear_conv_kernel_dim: ks,
+                num_experts: None,
+                num_experts_per_tok: None,
+                moe_intermediate_size: None,
+                shared_expert_intermediate_size: None,
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 4,
+                layer_types: vec![
+                    LayerType::LinearAttention,
+                    LayerType::LinearAttention,
+                    LayerType::LinearAttention,
+                    LayerType::FullAttention,
+                ],
+                layer_mask: vec![true; 4],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 64,
+            };
+
+            let make_common = || CommonLayerWeights {
+                input_layernorm: vec![1.0; hidden],
+                post_attention_layernorm: vec![1.0; hidden],
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: vec![0.0; intermediate * hidden],
+                    up_proj: vec![0.0; intermediate * hidden],
+                    down_proj: vec![0.0; hidden * intermediate],
+                }),
+            };
+
+            let make_gdn = || {
+                AttentionWeights::Linear(GatedDeltaNetWeights {
+                    in_proj_qkv: vec![0.0; qkv_dim * hidden],
+                    in_proj_qkv_rows: qkv_dim,
+                    in_proj_qkv_cols: hidden,
+                    in_proj_z: vec![0.0; out_dim * hidden],
+                    in_proj_z_rows: out_dim,
+                    in_proj_z_cols: hidden,
+                    in_proj_b: vec![0.0; num_kh * hidden],
+                    in_proj_b_rows: num_kh,
+                    in_proj_b_cols: hidden,
+                    in_proj_a: vec![0.0; num_kh * hidden],
+                    in_proj_a_rows: num_kh,
+                    in_proj_a_cols: hidden,
+                    a_log: vec![-1.0; num_kh],
+                    dt_bias: vec![0.0; num_kh],
+                    conv1d_weight: vec![0.0; qkv_dim * ks],
+                    conv_dim: qkv_dim,
+                    kernel_size: ks,
+                    norm_weight: vec![1.0; out_dim],
+                    out_proj: vec![0.0; hidden * out_dim],
+                    out_proj_rows: hidden,
+                    out_proj_cols: out_dim,
+                })
+            };
+
+            let make_full = || {
+                AttentionWeights::Full(FullAttentionLayerWeights {
+                    q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
+                    k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                    v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                    o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+                    q_norm: vec![1.0; cfg.head_dim],
+                    k_norm: vec![1.0; cfg.head_dim],
+                })
+            };
+
+            let mut embed = vec![0.0f32; vocab * hidden];
+            for tok in 0..vocab {
+                embed[tok * hidden] = if tok % 2 == 0 { 1.0 } else { -1.0 };
+            }
+
+            let weights = ModelWeights {
+                embed_tokens: embed,
+                lm_head: None,
+                final_norm: vec![1.0; hidden],
+                layers: vec![
+                    (make_gdn(), make_common()),
+                    (make_gdn(), make_common()),
+                    (make_gdn(), make_common()),
+                    (make_full(), make_common()),
+                ],
+            };
+            (cfg, weights)
+        }
+
+        #[test]
+        fn forward_step_gdn_only_does_not_advance_kv_cache() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let logits = state.forward_step_gdn_only(0, 0);
+
+            assert_eq!(
+                state.session.kv_cache.seq_len, seq_len_before,
+                "forward_step_gdn_only must not advance KV cache"
+            );
+            assert_eq!(
+                logits.len(),
+                cfg.vocab_size,
+                "forward_step_gdn_only must return vocab_size logits"
+            );
+        }
+
+        #[test]
+        fn forward_step_gdn_only_returns_finite_logits() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let logits = state.forward_step_gdn_only(1, 0);
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "all GDN-only logits must be finite"
+            );
+        }
+
+        #[test]
+        fn self_spec_checkpoint_pool_allocated_when_env_set() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            // Temporarily set LATTICE_SELF_SPEC for session construction.
+            std::env::set_var("LATTICE_SELF_SPEC", "1");
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let result = MetalQwen35State::new(&weights, &cfg, 32);
+            std::env::remove_var("LATTICE_SELF_SPEC");
+
+            let state = result.expect("tiny hybrid fixture with LATTICE_SELF_SPEC");
+            assert!(
+                state.session.gdn_checkpoints.is_some(),
+                "gdn_checkpoints must be allocated when LATTICE_SELF_SPEC is set"
+            );
+        }
+
+        #[test]
+        fn generate_greedy_self_spec_output_token_count_within_budget() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            std::env::set_var("LATTICE_SELF_SPEC", "1");
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            std::env::remove_var("LATTICE_SELF_SPEC");
+            let mut state = state;
+
+            use crate::model::qwen35_config::GenerateConfig;
+            use crate::tokenizer::bpe::BpeTokenizer;
+
+            // Build a trivial BpeTokenizer from the cfg eos id so we can call generate.
+            // The token IDs produced don't need to decode correctly — we only check count.
+            let tokenizer = BpeTokenizer::for_testing(cfg.vocab_size);
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 8,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+            };
+
+            // Tokenize a minimal prompt (single token id=0).
+            let prompt_ids = vec![0u32];
+            state.reset_state();
+            let prefill_logits = state.forward_prefill(&prompt_ids);
+
+            std::env::set_var("LATTICE_SELF_SPEC", "1");
+            let out = state.generate_greedy_self_spec(
+                &prefill_logits,
+                prompt_ids.len(),
+                &tokenizer,
+                &gen_cfg,
+            );
+            std::env::remove_var("LATTICE_SELF_SPEC");
+
+            assert!(
+                out.generated_tokens <= gen_cfg.max_new_tokens,
+                "self-spec must not exceed max_new_tokens: got {} > {}",
+                out.generated_tokens,
+                gen_cfg.max_new_tokens
+            );
+            assert_eq!(
+                out.token_ids.len(),
+                out.generated_tokens,
+                "token_ids.len() must match generated_tokens"
+            );
         }
     }
 
