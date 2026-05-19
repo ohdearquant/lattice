@@ -1576,9 +1576,12 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 /// # Errors
 ///
 /// Returns [`crate::error::InferenceError::InvalidInput`] when:
-/// - `draft_tokens`, `draft_logits`, and `target_logits` have different lengths.
-/// - `initial_target_logits` has a different vocabulary size from the others.
-/// - Any logits slice is empty (vocabulary must be at least 1).
+/// - `draft_tokens` and `target_logits` have different lengths.
+/// - `draft_logits` length or per-row vocabulary disagrees with `draft_tokens` —
+///   checked only when `greedy == false`. Greedy callers may pass an empty
+///   `&[]` (the argument is unused).
+/// - `initial_target_logits` is empty or has a vocabulary size that disagrees
+///   with `target_logits` / `draft_logits` rows.
 pub fn rejection_sample_draft(
     draft_tokens: &[u32],
     draft_logits: &[Vec<f32>],
