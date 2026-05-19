@@ -286,16 +286,30 @@ pub fn convert_quarot_qwen35(
 
     // --- MTP (Multi-Token Prediction) weights ---
     //
-    // MTP weights are read directly from SafeTensors and written without
-    // rotation absorption — the MTP head is a separate 1-layer transformer
-    // whose residual stream is not part of the main model's QuaRot rotation
-    // plan. Projection matrices → Q4; norms and small vectors → f16.
+    // IMPORTANT: QuaRot rotates embed_tokens and the residual stream via a
+    // random Hadamard matrix R.  The MTP head receives rotated embeddings
+    // and rotated pre-final hidden states, but its norm gammas and projection
+    // weights were trained in the un-rotated basis.  Per-element RMSNorm
+    // gamma does not commute with R (γ·(R·x) ≠ R·(γ·x)), so naively
+    // copying MTP weights produces a draft model in the wrong basis —
+    // acceptance drops to ~1/|V|.
     //
-    // This section runs only when cfg.mtp_num_hidden_layers > 0 and all 15
-    // MTP tensors are present in the checkpoint. If any tensor is missing
-    // (model was exported without MTP) we skip silently so the converter
-    // doesn't break on MTP-less checkpoints.
-    if cfg.mtp_num_hidden_layers > 0 {
+    // Until the QuaRot conversion is extended to handle MTP rotation
+    // algebra (counter-rotate inputs or absorb R into MTP weights), we
+    // deliberately SKIP MTP emission for QuaRot outputs.  The MTP pipeline
+    // still activates on the non-rotated Q8 path (MetalQwen35State::new).
+    //
+    // For non-QuaRot converters that may call this function in the future,
+    // the MTP section below remains reachable when is_quarot is false.
+    let is_quarot = true; // this function IS the QuaRot converter
+    if cfg.mtp_num_hidden_layers > 0 && is_quarot {
+        eprintln!(
+            "[mtp] Skipping MTP weights — QuaRot rotation is not yet applied to \
+             MTP head (rotated embeddings/hidden would feed un-rotated MTP weights). \
+             MTP works on the non-rotated Q8 path."
+        );
+    }
+    if cfg.mtp_num_hidden_layers > 0 && !is_quarot {
         // 8 projection weight matrices to quantize to Q4.
         let mtp_q4_names: &[&str] = &[
             "mtp.fc.weight",
@@ -318,15 +332,31 @@ pub fn convert_quarot_qwen35(
             "mtp.pre_fc_norm_hidden.weight",
         ];
 
-        // Only proceed when every MTP tensor is present. If any is missing
-        // (checkpoint exported without MTP) log a notice and skip — the
-        // runtime loader already soft-fails on missing MTP files.
-        let all_present = mtp_q4_names
+        // Count present MTP tensors. Zero = genuinely MTP-less export (skip).
+        // All present = proceed. Some but not all = corrupt/partial checkpoint (error).
+        let present_count = mtp_q4_names
             .iter()
             .chain(mtp_f16_names.iter())
-            .all(|name| reader.has_tensor(name));
+            .filter(|name| reader.has_tensor(name))
+            .count();
+        let total_mtp = mtp_q4_names.len() + mtp_f16_names.len();
 
-        if all_present {
+        if present_count > 0 && present_count < total_mtp {
+            let missing: Vec<&str> = mtp_q4_names
+                .iter()
+                .chain(mtp_f16_names.iter())
+                .copied()
+                .filter(|name| !reader.has_tensor(name))
+                .collect();
+            return Err(InferenceError::Inference(format!(
+                "convert_quarot_qwen35: config has mtp_num_hidden_layers={} but \
+                 only {present_count}/{total_mtp} MTP tensors found in checkpoint. \
+                 Missing: {missing:?}",
+                cfg.mtp_num_hidden_layers
+            )));
+        }
+
+        if present_count == total_mtp {
             eprintln!(
                 "[mtp] Writing MTP weights (mtp_num_hidden_layers={})",
                 cfg.mtp_num_hidden_layers
@@ -387,16 +417,9 @@ pub fn convert_quarot_qwen35(
                 });
             }
         } else {
-            let missing: Vec<&str> = mtp_q4_names
-                .iter()
-                .chain(mtp_f16_names.iter())
-                .copied()
-                .filter(|name| !reader.has_tensor(name))
-                .collect();
             eprintln!(
-                "[mtp] Skipping MTP weights — {} tensor(s) missing from checkpoint: {:?}",
-                missing.len(),
-                missing
+                "[mtp] Skipping MTP weights — 0/{total_mtp} MTP tensors in checkpoint \
+                 (model was exported without MTP)"
             );
         }
     }
@@ -1718,14 +1741,14 @@ mod tests {
     /// `mtp_num_hidden_layers > 0`, the converter must write all 8 Q4 and
     /// all 7 f16 MTP files to the output directory.
     #[test]
-    fn convert_quarot_qwen35_writes_mtp_q4_files_when_present() {
+    fn convert_quarot_qwen35_skips_mtp_for_quarot_even_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let output = tmp.path().join("output");
         let cfg = tiny_cfg_with_mtp(true);
         write_input_dir_with_mtp(&cfg, &input, 70);
 
-        let report = convert_quarot_qwen35(
+        let _report = convert_quarot_qwen35(
             &input,
             &output,
             &ConversionOptions {
@@ -1737,69 +1760,19 @@ mod tests {
         )
         .unwrap();
 
-        // 8 MTP Q4 files must exist on disk.
-        let mtp_q4_files = [
-            "mtp_fc_weight.q4",
-            "mtp_layers_0_self_attn_q_proj_weight.q4",
-            "mtp_layers_0_self_attn_k_proj_weight.q4",
-            "mtp_layers_0_self_attn_v_proj_weight.q4",
-            "mtp_layers_0_self_attn_o_proj_weight.q4",
-            "mtp_layers_0_mlp_gate_proj_weight.q4",
-            "mtp_layers_0_mlp_up_proj_weight.q4",
-            "mtp_layers_0_mlp_down_proj_weight.q4",
-        ];
-        for fname in &mtp_q4_files {
-            let p = output.join(fname);
-            assert!(p.exists(), "expected MTP Q4 file missing: {p:?}");
-        }
-
-        // 7 MTP f16 files must exist on disk.
-        let mtp_f16_files = [
-            "mtp_layers_0_input_layernorm_weight.f16",
-            "mtp_layers_0_post_attention_layernorm_weight.f16",
-            "mtp_layers_0_self_attn_q_norm_weight.f16",
-            "mtp_layers_0_self_attn_k_norm_weight.f16",
-            "mtp_norm_weight.f16",
-            "mtp_pre_fc_norm_embedding_weight.f16",
-            "mtp_pre_fc_norm_hidden_weight.f16",
-        ];
-        for fname in &mtp_f16_files {
-            let p = output.join(fname);
-            assert!(p.exists(), "expected MTP f16 file missing: {p:?}");
-        }
-
-        // Report counts include MTP tensors: 8 more Q4 + 7 more f16.
+        // QuaRot converter must NOT write MTP files — rotated embeddings/hidden
+        // would feed un-rotated MTP weights, producing a draft model in the
+        // wrong basis.
+        let mtp_files: Vec<_> = fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("mtp_"))
+            .collect();
         assert!(
-            report.planned_quantized >= 8,
-            "planned_quantized={} must include at least 8 MTP Q4 tensors",
-            report.planned_quantized
-        );
-        assert!(
-            report.kept_f16 >= 7,
-            "kept_f16={} must include at least 7 MTP f16 tensors",
-            report.kept_f16
-        );
-
-        // quantize_index.json must list all MTP tensors by name.
-        let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
-        let idx: serde_json::Value = serde_json::from_str(&idx_str).unwrap();
-        let arr = idx.as_array().expect("index must be a JSON array");
-        let names: Vec<&str> = arr.iter().map(|e| e["name"].as_str().unwrap()).collect();
-        for mtp_tensor in [
-            "mtp.fc.weight",
-            "mtp.layers.0.self_attn.q_proj.weight",
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.norm.weight",
-        ] {
-            assert!(
-                names.contains(&mtp_tensor),
-                "quantize_index.json must contain MTP tensor `{mtp_tensor}`; got: {names:?}"
-            );
-        }
-        assert_eq!(
-            arr.len(),
-            report.planned_quantized + report.kept_f16,
-            "index entry count must match report counts"
+            mtp_files.is_empty(),
+            "QuaRot converter must not emit MTP files (rotation basis mismatch), \
+             but found: {:?}",
+            mtp_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
         );
     }
 
