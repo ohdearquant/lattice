@@ -6756,10 +6756,9 @@ kernel void lora_gemv_b_accum(
                 let t_draft = std::time::Instant::now();
                 // Self-spec uses slot-based rollback: `verify_tokens_batched` populates one
                 // slot per verify token (slot k = state after k tokens processed by the full
-                // model). We do NOT take a `batch_repair_token` shortcut here — that path
-                // assumes a 2-token MTP verify, and would replay only the pending token on
-                // any rejection, leaving GDN state inconsistent with the KV cache after
-                // partial acceptance.
+                // model from the *pre-draft* base). We do NOT take a `batch_repair_token`
+                // shortcut here — that path replays only the pending token on rejection,
+                // leaving GDN state inconsistent with the KV cache after partial acceptance.
                 if let Some(ref mut p) = self.session.gdn_checkpoints {
                     p.active_base_seq_len = Some(pos);
                     p.mtp_base_seq_len = None;
@@ -6767,6 +6766,22 @@ kernel void lora_gemv_b_accum(
                 }
                 if self.session.gdn_checkpoints.is_none() {
                     // Checkpoint pool not allocated — fall through to single-token decode.
+                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let next = argmax_logits(&logits);
+                    generated_ids.push(pending_token);
+                    if is_stop(next) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                    pending_token = next;
+                    metrics.fallback_tokens += 1;
+                    continue 'round;
+                }
+                // Slot 0 reserves the pre-draft GDN state. `forward_step_gdn_only` below
+                // mutates the live GDN buffers; if we did not capture pre-draft state here,
+                // the slot-based rollback (which expects verify_tokens_batched's slots
+                // 1..=K to be full-model forwards from this pre-draft base) would be
+                // computed against a contaminated reference.
+                if self.checkpoint_gdn_to_slot(0).is_err() {
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
@@ -6803,6 +6818,14 @@ kernel void lora_gemv_b_accum(
                 let mut verify_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
                 verify_input.push(pending_token);
                 verify_input.extend_from_slice(&draft_tokens);
+
+                // Restore the pre-draft GDN state from slot 0 before verification. The
+                // GDN-only draft forwards above mutated the live GDN buffers; without
+                // this restore, `verify_tokens_batched` would compose full-model forwards
+                // on top of the GDN-only draft mutations, producing slots that do NOT
+                // match the canonical "pre-draft + N full-model tokens" semantics that
+                // slot-based rollback relies on.
+                self.restore_gdn_slot_blocking(0);
 
                 let t_verify = std::time::Instant::now();
                 let verify_out = match self.verify_tokens_batched(&verify_input, pos) {
@@ -13431,6 +13454,90 @@ kernel void decode_attention_reference(
                 pool.s_slots.len(),
                 2 + SELF_SPEC_MAX_DRAFT,
             );
+        }
+
+        /// Regression: self-spec slot 0 must hold the *pre-draft* GDN state, not the
+        /// state after GDN-only draft forwards. If `verify_tokens_batched` were called
+        /// against a contaminated slot 0, the per-token verification slots would compose
+        /// full-model forwards on top of GDN-only draft mutations, and slot-based rollback
+        /// would land on a corrupted state.
+        #[test]
+        fn self_spec_slot0_holds_pre_draft_state_after_round() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(7),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+            };
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+
+            // Capture the canonical pre-draft GDN state by snapshotting the freshly-reset
+            // model, then read back the live S buffer of the first GDN layer.
+            state.reset_state();
+            let _ = state.forward_prefill(&vec![0u32]);
+            use crate::speculative::MtpTargetVerifier;
+            let snap_before = state.snapshot_gdn_states();
+            assert!(
+                !snap_before.is_empty(),
+                "tiny hybrid fixture must have GDN layers"
+            );
+
+            let prefill_logits = state.forward_prefill(&vec![0u32]);
+            let _ = with_self_spec_env(|| {
+                state.generate_greedy_self_spec(&prefill_logits, 1, &tokenizer, &gen_cfg)
+            });
+
+            // After running a self-spec round, the checkpoint pool's slot 0 must equal the
+            // pre-draft GDN snapshot we took before the round started. If self-spec had
+            // saved slot 0 *after* the GDN-only draft forwards, the buffer would differ.
+            let pool = state
+                .session
+                .gdn_checkpoints
+                .as_ref()
+                .expect("pool must be allocated");
+            for (li, snap_layer) in snap_before.iter().enumerate() {
+                let slot0_s = &pool.s_slots[0][li];
+                let n = (slot0_s.length() / 4) as usize;
+                // SAFETY: shared-storage Metal buffer; the round has fully completed.
+                let live = unsafe {
+                    let ptr = slot0_s.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, n)
+                };
+                assert_eq!(
+                    live.len(),
+                    snap_layer.0.len(),
+                    "slot 0 s-matrix length mismatch on layer {li}"
+                );
+                // Both should match the pre-draft baseline (all zeros for a fresh
+                // session, but writing the structural equality check keeps this
+                // robust if the fixture later starts with non-zero state).
+                for k in 0..live.len() {
+                    let delta = (live[k] - snap_layer.0[k]).abs();
+                    assert!(
+                        delta < 1e-5,
+                        "slot 0 s[{li}][{k}] = {} drifted from pre-draft = {} (delta {})",
+                        live[k],
+                        snap_layer.0[k],
+                        delta
+                    );
+                }
+            }
         }
 
         #[test]

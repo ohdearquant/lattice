@@ -1257,19 +1257,19 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     accepted_count = eos_truncate;
     let accepted_tokens = draft[..accepted_count].to_vec();
 
-    // Roll back caches to accepted positions
+    // Roll back caches to accepted positions. The contract for `rollback_cache_to` requires
+    // an implementation to leave both KV and GDN coherent at `target_start + accepted_count`
+    // — e.g., the Metal implementation does this through its per-token GDN slot pool so
+    // partial-accept rollback restores slot `accepted_count` (state after pending +
+    // `accepted_count - 1` drafts via the full model). We deliberately do NOT call
+    // `restore_gdn_states` on partial accept: that would overwrite the slot-restored GDN
+    // with the pre-draft snapshot and leave GDN behind KV by `accepted_count` tokens.
     verifier.rollback_cache_to(mtp_start + accepted_count)?;
     target.rollback_cache_to(target_start + accepted_count)?;
 
-    // ADR-052: target GDN state was advanced through ALL `draft_len` tokens by `verify_tokens`.
-    // If we accepted everything (`accepted_count == draft_len`), the state is correct and the
-    // snapshot is dropped. Otherwise restore the pre-draft snapshot; the target adapter is
-    // responsible for re-running the accepted prefix on the next forward step so that GDN and
-    // KV agree at `target_start + accepted_count`. Implementors that hold no GDN state make
-    // both `rollback_cache_to` and `restore_gdn_states` no-ops on that branch.
-    if accepted_count < draft_len {
-        target.restore_gdn_states(&gdn_snap);
-    }
+    // `gdn_snap` is intentionally dropped here. On partial accept the implementor handles
+    // GDN sync inside `rollback_cache_to`; on full accept GDN is already at +draft_len.
+    drop(gdn_snap);
 
     let acceptance_rate = accepted_count as f64 / draft_len.max(1) as f64;
     let accepted_tokens_per_forward = accepted_count as f64 / target_forwards.max(1) as f64;
