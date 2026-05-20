@@ -381,8 +381,8 @@ Backward — row-batch convention (B = batch, T = seq, H = hidden, R = rank):
 ```text
 Y      = X W^T + scale * (X A^T) B^T
 G      = dL/dY
-dL/dB  = scale * (X A^T)^T G
-dL/dA  = scale * X^T (G B)
+dL/dB  = scale * G^T (X A^T)     — shape (out_dim × rank) matching B
+dL/dA  = scale * (G B)^T X       — shape (rank × in_dim) matching A
 ```
 
 Accumulated `grad_a` and `grad_b` in `TrainableLoraLayer` are clipped by L2 norm
@@ -489,6 +489,115 @@ The roundtrip gate: `safetensors_export` → `load_peft_safetensors` →
 `Qwen35Model::set_lora(Box<dyn LoraHook>)` → non-zero generation delta. This
 closes the import-only gap at `crates/tune/src/lora/safetensors.rs:213`.
 
+### Supporting Types
+
+```rust
+pub struct AdamWConfig {
+    pub lr: f32,           // default: 2.0e-4
+    pub beta1: f32,        // default: 0.9
+    pub beta2: f32,        // default: 0.999
+    pub weight_decay: f32, // default: 0.0
+    pub epsilon: f32,      // default: 1.0e-8
+    pub max_grad_norm: Option<f32>,
+}
+
+pub struct ActivationCapture {
+    pub layer_idx: usize,
+    pub module: String,
+    pub x: Vec<f32>, // input activation cached for backward
+}
+
+pub struct LossGradient {
+    pub layer_idx: usize,
+    pub module: String,
+    pub grad: Vec<f32>, // dL/dy at LoRA output
+}
+
+pub struct BaseModelWeights {
+    // Read-only projection tensors keyed by (layer_idx, module).
+    pub tensors: std::collections::HashMap<(usize, String), Vec<f32>>,
+}
+
+pub struct ModelOutput {
+    pub logits: Vec<f32>,
+    pub loss: Option<f32>,
+}
+
+pub struct TrainStepOutput {
+    pub loss: f32,
+    pub grad_norm: f32,
+    pub tokens: usize,
+    pub step: u64,
+}
+
+pub struct LoraTrainState {
+    pub epoch: usize,
+    pub global_step: u64,
+    pub best_eval_loss: f32,
+    pub tokens_seen: u64,
+    pub current_lr: f32,
+}
+
+pub struct LoraTrainReport {
+    pub total_steps: u64,
+    pub total_epochs: usize,
+    pub final_loss: f32,
+    pub best_eval_loss: f32,
+    pub loss_history: Vec<MetricPoint>,
+    pub duration_secs: f64,
+}
+
+pub struct DatasetStats {
+    pub examples: usize,
+    pub tokens: usize,
+    pub max_seq_len: usize,
+    pub average_seq_len: f32,
+}
+
+pub struct LrSchedulerState {
+    pub current_lr: f32,
+    pub warmup_steps_remaining: usize,
+    pub decay_factor: f32,
+    pub step: u64,
+}
+
+pub struct MetricPoint {
+    pub step: u64,
+    pub name: String,
+    pub value: f64,
+    pub epoch: usize,
+}
+
+pub struct LoraAdapterState {
+    pub rank: usize,
+    pub alpha: f32,
+    pub target_modules: Vec<String>,
+    pub layers: Vec<LoraLayerState>,
+}
+
+pub struct LoraLayerState {
+    pub layer_idx: usize,
+    pub module: String,
+    pub a: Vec<f32>,
+    pub b: Vec<f32>,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+pub struct EarlyStoppingConfig {
+    pub metric: String,  // default: "eval_loss"
+    pub patience: usize, // default: 3
+    pub min_delta: f32,  // default: 0.0
+}
+
+pub enum LrScheduleConfig {
+    Constant,
+    CosineAnnealing { min_lr: f32, total_steps: usize },
+    LinearWarmup { warmup_steps: usize },
+    WarmupCosine { warmup_steps: usize, min_lr: f32, total_steps: usize },
+}
+```
+
 ---
 
 ## 5. Implementation Plan
@@ -547,6 +656,8 @@ error. This test becomes a required CI target for `lattice-tune`.
 | `end_to_end_smoke_loss_decreases`                | Fixed seed 42, 50 steps, synthetic JSONL, two-layer toy model: `final_loss < 0.5 * initial_loss`.                                              |
 | `dataset_reset_reproduces_same_first_batch`      | After iterating to exhaustion and calling `reset()`, the first batch is identical to the original first batch (no-shuffle deterministic mode). |
 | `adamw_zero_grad_clears_accumulation`            | After accumulating non-zero gradients across two `train_step` calls, `zero_grad` sets every `grad_a` and `grad_b` element to exactly zero.     |
+| `eval_hook_on_step_end_receives_correct_metrics` | `EvalHook::on_eval_end` is called with an `EvalReport` whose `step` matches `global_step` and loss value matches the batch CE loss.            |
+| `peft_adapter_config_export_valid_json`          | `peft_adapter_config_export` writes valid JSON containing `r`, `lora_alpha`, and `target_modules` matching `LoraConfig` fields.                |
 
 ---
 
