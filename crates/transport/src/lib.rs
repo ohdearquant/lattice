@@ -62,6 +62,7 @@ pub mod divergence;
 pub mod drift;
 pub mod logsumexp;
 mod math;
+pub mod online_drift;
 pub mod sinkhorn;
 pub mod sinkhorn_log;
 pub mod transport_plan;
@@ -113,3 +114,6 @@ pub use drift::{
     DriftConfig, DriftMetricKind, DriftReport, DriftSolverMode, DriftSummary, DriftWeighting,
     EmbeddingRecord, MemoryLike, PerEntryDisplacement, detect_drift_memories, detect_drift_records,
 };
+
+// Online streaming drift detection
+pub use online_drift::{OnlineDriftConfig, OnlineDriftDetector, OnlineDriftSignal};

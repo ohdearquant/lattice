@@ -1,6 +1,6 @@
 # ADR-055: Online Distribution Drift Detection via Sinkhorn Divergence
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: `lattice-transport` + `lattice-inference`
 
