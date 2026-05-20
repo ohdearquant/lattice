@@ -11910,6 +11910,161 @@ kernel void decode_attention_reference(
             (cfg, weights)
         }
 
+        fn rotate_embedding_rows_for_test(
+            weights: &mut ModelWeights,
+            hidden: usize,
+            rot: &crate::quant::quarot::hadamard::RandomizedHadamard,
+        ) {
+            for row in weights.embed_tokens.chunks_exact_mut(hidden) {
+                rot.apply(row).unwrap();
+            }
+        }
+
+        fn synthetic_mtp_weights_for_test(device: &Device, cfg: &Qwen35Config) -> MetalMtpWeights {
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+
+            // fc shape: [hidden, 2*hidden]; identity on the embedding half so MTP
+            // output equals the normed embedding when attention/MLP weights are zero.
+            let mut fc = vec![0.0f32; hidden * 2 * hidden];
+            for i in 0..hidden {
+                fc[i * (2 * hidden) + i] = 1.0;
+            }
+
+            MetalMtpWeights {
+                fc: make_buffer_f16(device, &fc, "test.mtp.fc"),
+                pre_fc_norm_embedding: make_buffer(
+                    device,
+                    &vec![1.0; hidden],
+                    "test.mtp.pre_fc_norm_embedding",
+                ),
+                pre_fc_norm_hidden: make_buffer(
+                    device,
+                    &vec![1.0; hidden],
+                    "test.mtp.pre_fc_norm_hidden",
+                ),
+                layers: vec![MetalMtpLayerWeights {
+                    input_layernorm: make_buffer(device, &vec![1.0; hidden], "test.mtp.input_ln"),
+                    post_attention_layernorm: make_buffer(
+                        device,
+                        &vec![1.0; hidden],
+                        "test.mtp.post_attn_ln",
+                    ),
+                    q_proj: make_buffer_f16(
+                        device,
+                        &vec![0.0; 2 * q_dim * hidden],
+                        "test.mtp.q_proj",
+                    ),
+                    k_proj: make_buffer_f16(device, &vec![0.0; kv_dim * hidden], "test.mtp.k_proj"),
+                    v_proj: make_buffer_f16(device, &vec![0.0; kv_dim * hidden], "test.mtp.v_proj"),
+                    o_proj: make_buffer_f16(device, &vec![0.0; hidden * q_dim], "test.mtp.o_proj"),
+                    q_norm: make_buffer(device, &vec![1.0; cfg.head_dim], "test.mtp.q_norm"),
+                    k_norm: make_buffer(device, &vec![1.0; cfg.head_dim], "test.mtp.k_norm"),
+                    mlp: MetalMtpDenseMlpWeights {
+                        gate_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; inter * hidden],
+                            "test.mtp.gate_proj",
+                        ),
+                        up_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; inter * hidden],
+                            "test.mtp.up_proj",
+                        ),
+                        down_proj: make_buffer_f16(
+                            device,
+                            &vec![0.0; hidden * inter],
+                            "test.mtp.down_proj",
+                        ),
+                    },
+                }],
+                norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
+            }
+        }
+
+        fn metal_state_with_synthetic_mtp_for_test(
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+            rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
+        ) -> MetalQwen35State {
+            let mut engine = MetalQwen35Engine::new(weights, cfg)
+                .expect("tiny MetalQwen35Engine with MTP fixture constructs");
+            engine.mtp_weights = Some(synthetic_mtp_weights_for_test(&engine.device, cfg));
+            engine.quarot_rotation = rotation;
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+            }
+        }
+
+        // ADR-051 §"Verification" line 213: MTP draft-logit equivalence test.
+        // Verifies that counter-rotating MTP inputs (apply_inverse) and re-rotating the
+        // MTP output (apply) before the shared lm_head produces logits identical to the
+        // unrotated reference path, within Metal f16/Q8 quantization tolerance.
+        #[test]
+        fn mtp_draft_logit_equivalence_with_quarot_counter_rotation() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, reference_weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let seed = 0x51_51_51_u64;
+            let rotation =
+                crate::quant::quarot::hadamard::RandomizedHadamard::new(seed, cfg.hidden_size)
+                    .unwrap();
+
+            // Build rotated weights independently (ModelWeights has no Clone).
+            let (_, mut rotated_weights) = tiny_metal_qwen35_fixture();
+            rotate_embedding_rows_for_test(&mut rotated_weights, cfg.hidden_size, &rotation);
+
+            let mut reference_state =
+                metal_state_with_synthetic_mtp_for_test(&reference_weights, &cfg, None);
+            let mut rotated_state = metal_state_with_synthetic_mtp_for_test(
+                &rotated_weights,
+                &cfg,
+                Some(rotation.clone()),
+            );
+
+            // Inject a realistic pre-final hidden state. Both paths get the same
+            // mathematical vector; the rotated path gets R applied so that
+            // apply_inverse inside mtp_forward_one recovers the original.
+            let h_original: Vec<f32> = (0..cfg.hidden_size)
+                .map(|i| ((i as f32) * 0.013).sin() * 0.25)
+                .collect();
+            let mut h_rotated = h_original.clone();
+            rotation.apply(&mut h_rotated).unwrap();
+            reference_state.session.last_pre_final_hidden = h_original;
+            rotated_state.session.last_pre_final_hidden = h_rotated;
+
+            let reference = reference_state.mtp_forward_one(42_u32, 0_usize);
+            let rotated = rotated_state.mtp_forward_one(42_u32, 0_usize);
+
+            assert_eq!(reference.logits.len(), cfg.vocab_size);
+            assert_eq!(rotated.logits.len(), cfg.vocab_size);
+            let max_abs_diff = reference
+                .logits
+                .iter()
+                .zip(rotated.logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            // Tolerance is wider than the non-rotated golden-logit tests (1e-4) because
+            // the Hadamard rotation spreads each embedding row across all 512 dimensions,
+            // and the subsequent f16 roundtrip in embed_tokens + RMSNorm amplification
+            // (~sqrt(hidden)) introduces ~0.02 per-logit error on the rotated path.
+            // A missing or wrong counter-rotation would produce O(10) error, so 0.05
+            // is tight enough to catch implementation defects.
+            assert!(
+                max_abs_diff < 0.05,
+                "MTP draft logits diverged after QuaRot counter-rotation: max_abs_diff={max_abs_diff}"
+            );
+        }
+
         #[test]
         fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
             let Some(_) = Device::system_default() else {

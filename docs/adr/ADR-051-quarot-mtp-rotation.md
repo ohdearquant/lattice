@@ -1,6 +1,6 @@
 # ADR-051: QuaRot-MTP Rotation Reconciliation
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
 
