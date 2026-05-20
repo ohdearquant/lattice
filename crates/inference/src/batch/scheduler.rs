@@ -130,7 +130,7 @@ impl Scheduler for FifoScheduler {
         waiting: &[SeqId],
         running: &[SeqId],
         kv_free_pages: usize,
-        gdn_free_slots: usize,
+        _gdn_free_slots: usize,
     ) -> SchedulerDecision {
         let mut decision = SchedulerDecision::default();
 
@@ -154,10 +154,13 @@ impl Scheduler for FifoScheduler {
             }
         }
 
-        // Schedule decode for all running sequences that have a GDN slot.
-        // In Phase 1 we admit all running sequences; Phase 2 may add priority.
-        let decode_limit = gdn_free_slots.min(running.len());
-        for &seq_id in &running[..decode_limit] {
+        // Schedule decode for all running sequences.
+        //
+        // Running sequences already hold allocated GDN slots (allocated during
+        // their first prefill chunk). `gdn_free_slots` gates NEW admissions
+        // above, not existing decode sequences. Phase 2 may add priority-based
+        // decode scheduling; Phase 1 decodes all running sequences each iteration.
+        for &seq_id in running {
             decision.decode.push(seq_id);
         }
 
@@ -297,12 +300,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_bounded_by_gdn_free_slots() {
+    fn all_running_sequences_decode_regardless_of_free_gdn_slots() {
         let mut sched = default_sched();
-        // Only 1 GDN slot free but 3 sequences running.
-        let dec = sched.select_batch(&[], &[SeqId(1), SeqId(2), SeqId(3)], 100, 1);
-        assert_eq!(dec.decode.len(), 1);
-        assert_eq!(dec.decode[0], SeqId(1)); // first in slice
+        // Running sequences already hold allocated GDN slots. Free slot count
+        // should NOT throttle decode — it only gates new admissions.
+        let dec = sched.select_batch(&[], &[SeqId(1), SeqId(2), SeqId(3)], 100, 0);
+        assert_eq!(dec.decode.len(), 3);
+        assert!(dec.decode.contains(&SeqId(1)));
+        assert!(dec.decode.contains(&SeqId(2)));
+        assert!(dec.decode.contains(&SeqId(3)));
     }
 
     // --- Prefill continuation ---
