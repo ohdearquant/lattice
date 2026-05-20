@@ -785,6 +785,86 @@ mod tests {
         assert_eq!(k_buf[2 * kv_dim], 20.0);
     }
 
+    #[test]
+    fn test_restore_prefix_with_different_page_sizes() {
+        // page_size=8 (live), prefix_page_size=2 — forces copy_token_between_page_layouts
+        // to run with different src/dst strides: the production case where prefix pages
+        // are finer-grained than live pages.
+        let config = PagedKVCacheConfig {
+            page_size: 8,
+            max_pages: 4,
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+            eviction: EvictionPolicy::None,
+        };
+        let kv_dim = config.kv_dim(); // 8
+        let prefix_cache = Arc::new(Mutex::new(PrefixPageCache::new(PrefixPageCacheConfig {
+            capacity: 4,
+            prefix_page_size: 2, // Different from page_size=8.
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+        })));
+        let tokens: [u32; 5] = [10, 20, 30, 40, 50];
+
+        // Append 5 tokens with deterministic K/V values keyed by step and layer.
+        let mut source =
+            PagedKVCache::with_prefix_cache(config.clone(), Some(Arc::clone(&prefix_cache)));
+        for (step, _) in tokens.iter().enumerate() {
+            for layer in 0..2 {
+                let k_val = (step * 100 + layer * 10) as f32;
+                let k = vec![k_val; kv_dim];
+                let v = vec![k_val + 0.5; kv_dim];
+                source.append_kv_layer(layer, &k, &v);
+            }
+            source.advance();
+        }
+        assert_eq!(source.seq_len(), 5);
+
+        // 5 tokens / prefix_page_size=2 → ceil(5/2) = 3 prefix pages.
+        let page_count = source
+            .promote_to_prefix(AdapterId::BASE, &tokens)
+            .expect("promote should succeed")
+            .expect("promote should insert pages");
+        assert_eq!(page_count, 3);
+
+        // Restore into fresh cache with page_size=8 (all 5 tokens in 1 live page).
+        let mut restored = PagedKVCache::with_prefix_cache(config.clone(), Some(prefix_cache));
+        let prefix_len = restored
+            .restore_prefix(AdapterId::BASE, &tokens)
+            .expect("restore should succeed")
+            .expect("restore should hit");
+        assert_eq!(prefix_len, 5);
+        assert_eq!(restored.seq_len(), 5);
+
+        // Verify K and V for all tokens, all layers — exact float equality since these
+        // are copies, not computations.
+        for layer in 0..2 {
+            let mut k_buf = vec![0.0f32; tokens.len() * kv_dim];
+            let mut v_buf = vec![0.0f32; tokens.len() * kv_dim];
+            restored.gather_k(layer, &mut k_buf);
+            restored.gather_v(layer, &mut v_buf);
+
+            for (step, _) in tokens.iter().enumerate() {
+                let k_expected = (step * 100 + layer * 10) as f32;
+                let v_expected = k_expected + 0.5;
+                for i in 0..kv_dim {
+                    assert_eq!(
+                        k_buf[step * kv_dim + i],
+                        k_expected,
+                        "K mismatch at step={step}, layer={layer}, i={i}"
+                    );
+                    assert_eq!(
+                        v_buf[step * kv_dim + i],
+                        v_expected,
+                        "V mismatch at step={step}, layer={layer}, i={i}"
+                    );
+                }
+            }
+        }
+    }
+
     fn make_config(max_pages: usize) -> PagedKVCacheConfig {
         PagedKVCacheConfig {
             page_size: 4, // Small pages for testing.
