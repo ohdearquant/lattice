@@ -31,6 +31,7 @@ pub mod attention;
 pub mod forward;
 pub mod model;
 pub mod tokenizer;
+pub mod vision;
 pub mod weights;
 
 // Standalone modules

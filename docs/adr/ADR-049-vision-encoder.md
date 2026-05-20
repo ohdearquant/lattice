@@ -1,6 +1,6 @@
 # ADR-049: Vision Encoder Integration (Qwen-VL Path)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
