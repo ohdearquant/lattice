@@ -6604,20 +6604,17 @@ kernel void lora_gemv_b_accum(
 
                 // Route the accept/reject decision through `rejection_sample_draft` so
                 // the live MTP loop and the trait-level `mtp_verify_draft` share the
-                // same verifier implementation (ADR-050). For greedy 1-draft MTP the
-                // mapping is:
+                // same verifier implementation (ADR-050). For probabilistic 1-draft MTP:
                 //   draft_tokens          = [draft.token_id]
+                //   draft_logits          = [draft.logits]   (q(·) for draft position)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
-                //
-                // Greedy mode does not consume `draft_logits`, so we pass an empty slice
-                // — no full-vocab placeholder allocation in the hot path.
                 let rs = match crate::speculative::rejection_sample_draft(
                     &[draft.token_id],
-                    &[],
+                    std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
-                    true,
+                    false,
                     None,
                 ) {
                     Ok(r) => r,

@@ -1,6 +1,6 @@
 # ADR-050: Rejection Sampling for Speculative Decoding
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
 
