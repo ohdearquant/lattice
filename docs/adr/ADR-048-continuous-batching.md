@@ -1,6 +1,6 @@
 # ADR-048: Continuous Batching with Disaggregated Prefill/Decode
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
 **Depends on**: ADR-004 (KV Cache), ADR-008 (LoRA Injection), ADR-047 (Paged KV Cache)
