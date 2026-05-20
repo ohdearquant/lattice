@@ -7220,8 +7220,10 @@ kernel void moe_shared_gate_add(
                 std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
             );
             // Repetition penalty requires full logits — disable compact mode when active.
+            // Grammar-constrained decoding also requires full logits (CpuFallback).
             let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty());
+                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
+                && gen_cfg.grammar.is_none();
             self.session.compact_route = if use_compact {
                 route
             } else {
@@ -7231,8 +7233,16 @@ kernel void moe_shared_gate_add(
                 self.session.compact_topk = gen_cfg.top_k;
             }
 
+            // Initialise grammar state for grammar-constrained decoding (ADR-046).
+            let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
             // Batch prefill: process all prompt tokens at once (GEMM)
-            let prefill_logits = self.forward_prefill(&prompt_ids);
+            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+
+            // Apply grammar masking to prefill logits before sampling.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                engine.mask_logits(gs, &mut prefill_logits);
+            }
 
             // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
             let mtp_enabled = gen_cfg
@@ -7242,7 +7252,8 @@ kernel void moe_shared_gate_add(
                 && mtp_enabled
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
-                && !use_compact;
+                && !use_compact
+                && gen_cfg.grammar.is_none();
             if use_mtp {
                 if use_compact {
                     self.session.compact_topk = 0;
@@ -7257,6 +7268,7 @@ kernel void moe_shared_gate_add(
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
                 && !use_compact
+                && gen_cfg.grammar.is_none()
                 && cfg.num_active_linear_attention_layers() > 0;
             if use_self_spec {
                 return self.generate_greedy_self_spec(
@@ -7277,6 +7289,13 @@ kernel void moe_shared_gate_add(
             } else {
                 sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
             };
+
+            // Advance grammar state after sampling the prefill token.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                if !engine.advance(gs, next_id) {
+                    return generated_ids;
+                }
+            }
 
             let is_stop = |id: u32| -> bool {
                 id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id)
@@ -7308,7 +7327,13 @@ kernel void moe_shared_gate_add(
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
 
-                let step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step(last_token, pos);
+
+                // Apply grammar masking before sampling (ADR-046).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    engine.mask_logits(gs, &mut step_logits);
+                }
+
                 let next_id = if use_compact {
                     sample_from_candidates(
                         &self.session.compact_result,
@@ -7319,6 +7344,13 @@ kernel void moe_shared_gate_add(
                 } else {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
+
+                // Advance grammar state after sampling.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    if !engine.advance(gs, next_id) {
+                        break;
+                    }
+                }
 
                 if is_stop(next_id) {
                     break;
@@ -10394,7 +10426,8 @@ kernel void moe_shared_gate_add(
                 std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
             );
             let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty());
+                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
+                && gen_cfg.grammar.is_none();
             self.session.compact_route = if use_compact {
                 route
             } else {
@@ -10404,8 +10437,17 @@ kernel void moe_shared_gate_add(
                 self.session.compact_topk = gen_cfg.top_k;
             }
 
+            // Initialise grammar state for grammar-constrained decoding (ADR-046).
+            let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
             // Batch prefill
-            let prefill_logits = self.forward_prefill(&prompt_ids);
+            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+
+            // Apply grammar masking to prefill logits before sampling.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                engine.mask_logits(gs, &mut prefill_logits);
+            }
+
             let next_id = if use_compact {
                 sample_from_candidates(
                     &self.session.compact_result,
@@ -10416,6 +10458,13 @@ kernel void moe_shared_gate_add(
             } else {
                 sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
             };
+
+            // Advance grammar state after sampling the prefill token.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                if !engine.advance(gs, next_id) {
+                    break;
+                }
+            }
 
             let is_stop = |id: u32| -> bool {
                 id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id)
@@ -10460,7 +10509,13 @@ kernel void moe_shared_gate_add(
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step(last_token, pos);
+
+                // Apply grammar masking before sampling (ADR-046).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    engine.mask_logits(gs, &mut step_logits);
+                }
+
                 let next_id = if use_compact {
                     sample_from_candidates(
                         &self.session.compact_result,
@@ -10471,6 +10526,13 @@ kernel void moe_shared_gate_add(
                 } else {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
+
+                // Advance grammar state after sampling.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    if !engine.advance(gs, next_id) {
+                        break;
+                    }
+                }
 
                 if is_stop(next_id) {
                     break;

@@ -15,13 +15,15 @@
 use crate::attention::gqa::GqaConfig;
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, rms_norm, silu_inplace};
+use crate::grammar::GrammarEngine;
 use crate::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 use crate::model::qwen::{QwenConfig, QwenModel};
 use crate::sampling::{Sampler, SamplingConfig};
+use std::sync::Arc;
 
 /// **Unstable**: text generation configuration; fields and defaults are
 /// subject to change as the generation API matures.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GenerateConfig {
     /// Maximum number of new tokens to generate.
     pub max_new_tokens: usize,
@@ -31,6 +33,24 @@ pub struct GenerateConfig {
     pub eos_token_id: Option<u32>,
     /// Whether to include the prompt in the output.
     pub include_prompt: bool,
+    /// Optional grammar-constrained decoding engine (ADR-046).
+    ///
+    /// When set, `mask_logits` is called before sampling on every step.
+    /// The `GrammarEngine` is shared via `Arc` so it can be reused across
+    /// requests with the same schema without re-compilation.
+    pub grammar: Option<Arc<GrammarEngine>>,
+}
+
+impl std::fmt::Debug for GenerateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerateConfig")
+            .field("max_new_tokens", &self.max_new_tokens)
+            .field("sampling", &self.sampling)
+            .field("eos_token_id", &self.eos_token_id)
+            .field("include_prompt", &self.include_prompt)
+            .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
+            .finish()
+    }
 }
 
 impl Default for GenerateConfig {
@@ -40,6 +60,7 @@ impl Default for GenerateConfig {
             sampling: SamplingConfig::default(),
             eos_token_id: None,
             include_prompt: false,
+            grammar: None,
         }
     }
 }
@@ -184,9 +205,13 @@ pub fn generate(
     // 3. Initialize sampler
     let mut sampler = Sampler::new(config.sampling.clone());
 
-    // 4. Prefill: run all prompt tokens through the model, populate KV cache.
-    // logits borrows scratch; borrow ends after sampler.sample(logits) below.
-    let logits = forward_with_cache(
+    // 4. Initialise grammar state if grammar-constrained decoding is requested.
+    let mut grammar_state = config.grammar.as_ref().map(|g| g.initial_state());
+
+    // 5. Prefill: run all prompt tokens through the model, populate KV cache.
+    // The borrow of scratch.logits ends before sampling, so we can apply
+    // grammar masking on scratch.logits directly before passing it to sample().
+    forward_with_cache(
         model,
         &prompt_ids[..prompt_len],
         &mut cache,
@@ -195,29 +220,56 @@ pub fn generate(
         max_seq,
     )?;
 
-    // 5. Sample first token from the last position's logits
+    // Apply grammar masking on the logit buffer in-place before sampling.
+    if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
+        engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+    }
+
+    // 6. Sample first token from the last position's logits
     let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens);
-    let first_token = sampler.sample(logits);
-    // logits borrow on scratch ends here (NLL: last use above)
+    let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
     generated_ids.push(first_token);
+
+    // Advance grammar state after sampling.
+    if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
+        if !engine.advance(gs, first_token) {
+            let text = tokenizer.decode(&generated_ids).unwrap_or_default();
+            return Ok(GenerateOutput {
+                text,
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+                token_ids: generated_ids,
+                stopped_by_eos: false,
+            });
+        }
+    }
 
     let mut stopped_by_eos = false;
     if config.eos_token_id == Some(first_token) {
         stopped_by_eos = true;
     }
 
-    // 6. Decode loop: one token at a time
+    // 7. Decode loop: one token at a time
     if !stopped_by_eos {
         for step in 0..config.max_new_tokens.saturating_sub(1) {
             let pos = prompt_len + step + 1; // +1 because first token already generated
             let input = [*generated_ids
                 .last()
                 .expect("invariant: first generated token exists before decode loop")];
-            let logits =
-                forward_with_cache(model, &input, &mut cache, pos - 1, &mut scratch, max_seq)?;
+            forward_with_cache(model, &input, &mut cache, pos - 1, &mut scratch, max_seq)?;
 
-            let token = sampler.sample(logits);
-            // logits borrow ends here; scratch re-borrowed next iteration
+            // Apply grammar masking before sampling.
+            if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
+                engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            }
+
+            let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
+            // Advance grammar state after sampling.
+            if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
+                if !engine.advance(gs, token) {
+                    break;
+                }
+            }
             generated_ids.push(token);
 
             if config.eos_token_id == Some(token) {

@@ -39,6 +39,7 @@ pub mod batch;
 pub mod download;
 pub mod error;
 pub mod generate;
+pub mod grammar;
 pub mod kv_cache;
 pub mod lora_hook;
 pub mod pool;

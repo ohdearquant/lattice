@@ -8,7 +8,9 @@
 //! 256 routed experts, top-8 selection, 1 shared expert, separate lm_head.
 
 use crate::error::InferenceError;
+use crate::grammar::GrammarEngine;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Chat turn end token for Qwen models.
 pub const QWEN_CHAT_IM_END_TOKEN_ID: u32 = 248_046;
@@ -509,7 +511,7 @@ impl Qwen35Config {
 }
 
 /// **Unstable**: sampling configuration for text generation; temperature/top-k/top-p may expand.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub temperature: f32,
@@ -526,6 +528,28 @@ pub struct GenerateConfig {
     /// Replaces the `LATTICE_MTP` env var for programmatic control.
     /// `None` = defer to `LATTICE_MTP` env var (backwards-compatible default).
     pub enable_mtp: Option<bool>,
+    /// Optional grammar-constrained decoding engine (ADR-046).
+    ///
+    /// When set, `mask_logits` is called on CPU logits before sampling on every step.
+    /// The Metal path copies logits to CPU before sampling — no additional GPU transfer needed.
+    pub grammar: Option<Arc<GrammarEngine>>,
+}
+
+impl std::fmt::Debug for GenerateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerateConfig")
+            .field("max_new_tokens", &self.max_new_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_k", &self.top_k)
+            .field("top_p", &self.top_p)
+            .field("repetition_penalty", &self.repetition_penalty)
+            .field("seed", &self.seed)
+            .field("stop_token_ids", &self.stop_token_ids)
+            .field("enable_thinking", &self.enable_thinking)
+            .field("enable_mtp", &self.enable_mtp)
+            .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
+            .finish()
+    }
 }
 
 impl Default for GenerateConfig {
@@ -540,6 +564,7 @@ impl Default for GenerateConfig {
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
             enable_thinking: true,
             enable_mtp: None,
+            grammar: None,
         }
     }
 }
