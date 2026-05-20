@@ -6,7 +6,6 @@
 
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
-use std::collections::VecDeque;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
 
@@ -164,11 +163,14 @@ impl PrefixEntry {
 }
 
 /// A hash-keyed LRU cache of immutable prefix pages.
+///
+/// LRU ordering is maintained via `IndexMap` insertion order: lookups
+/// re-insert the entry at the back, eviction removes from the front.
+/// This bounds memory to O(capacity) with no auxiliary deque.
 #[derive(Debug)]
 pub struct PrefixPageCache {
     config: PrefixPageCacheConfig,
     entries: FxIndexMap<PrefixKey, PrefixEntry>,
-    lru_order: VecDeque<(PrefixKey, u64)>,
     clock: u64,
 }
 
@@ -188,7 +190,6 @@ impl PrefixPageCache {
                 config.capacity,
                 BuildHasherDefault::<FxHasher>::default(),
             ),
-            lru_order: VecDeque::new(),
             clock: 0,
         }
     }
@@ -220,10 +221,11 @@ impl PrefixPageCache {
     /// data into a live `PagePool`.
     pub fn lookup(&mut self, key: &PrefixKey) -> Option<PrefixEntry> {
         let last_used = self.next_clock();
-        let entry = self.entries.get_mut(key)?;
+        let mut entry = self.entries.swap_remove(key)?;
         entry.last_used = last_used;
-        self.lru_order.push_back((*key, last_used));
-        Some(entry.clone())
+        let cloned = entry.clone();
+        self.entries.insert(*key, entry);
+        Some(cloned)
     }
 
     /// Insert prefix pages for `key`.
@@ -248,8 +250,8 @@ impl PrefixPageCache {
         self.validate_entry(&entry);
         let last_used = self.next_clock();
         entry.last_used = last_used;
-        let replaced = self.entries.insert(key, entry);
-        self.lru_order.push_back((key, last_used));
+        let replaced = self.entries.swap_remove(&key);
+        self.entries.insert(key, entry);
         self.evict_until_within_capacity();
         replaced
     }
@@ -261,25 +263,15 @@ impl PrefixPageCache {
     /// eviction. Entries with external clones are still removed from the cache,
     /// but their memory is released only after those clones drop.
     pub fn evict_lru(&mut self) -> usize {
-        while let Some((key, last_used)) = self.lru_order.pop_front() {
-            let current = match self.entries.get(&key) {
-                Some(entry) => entry.last_used == last_used,
-                None => false,
-            };
-            if !current {
-                continue;
-            }
-
-            let Some(entry) = self.entries.swap_remove(&key) else {
-                continue;
-            };
-            return entry
-                .pages
-                .iter()
-                .filter(|page| page.strong_count() == 1)
-                .count();
+        if self.entries.is_empty() {
+            return 0;
         }
-        0
+        let (_key, entry) = self.entries.shift_remove_index(0).expect("non-empty");
+        entry
+            .pages
+            .iter()
+            .filter(|page| page.strong_count() == 1)
+            .count()
     }
 
     /// Remove every retained prefix entry.
@@ -288,7 +280,6 @@ impl PrefixPageCache {
     /// alive until their `Arc` references drop.
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.lru_order.clear();
         self.clock = 0;
     }
 
