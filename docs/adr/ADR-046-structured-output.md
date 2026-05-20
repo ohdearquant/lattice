@@ -1,6 +1,6 @@
 # ADR-046: XGrammar Structured Output Engine
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 

@@ -338,6 +338,27 @@ impl BpeTokenizer {
         self.inner.special_tokens.get(name).copied()
     }
 
+    /// **Unstable**: return the byte representation of every token in the vocabulary.
+    ///
+    /// `vocab_bytes()[i]` is the UTF-8 byte sequence that token `i` decodes to,
+    /// after applying the GPT-2 byte-level encoding reversal.
+    ///
+    /// Used by [`GrammarEngine::new`](crate::grammar::GrammarEngine::new) to build
+    /// the precomputed vocabulary partition for grammar-constrained decoding (ADR-046).
+    ///
+    /// Cost: O(vocab_size) — called once at engine initialisation.
+    pub fn vocab_bytes(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .id_to_token
+            .iter()
+            .map(|token_str| {
+                // Apply GPT-2 byte-level encoding reversal (same as byte_decode_token).
+                let decoded = byte_decode_token(token_str);
+                decoded.into_bytes()
+            })
+            .collect()
+    }
+
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
         let mut scratch = TokenizeScratch::default();
         self.tokenize_to_ids_into(text, &mut scratch)
