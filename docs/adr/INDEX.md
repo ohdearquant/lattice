@@ -57,19 +57,20 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [025](ADR-025-gpu-backend.md)           | GPU Backend               |
 | [026](ADR-026-training-loop.md)         | Training Loop             |
 
-## lattice-tune (ADR-027 to ADR-034, ADR-054)
+## lattice-tune (ADR-027 to ADR-034, ADR-054, ADR-056)
 
-| ADR                                       | Title                           |
-| ----------------------------------------- | ------------------------------- |
-| [027](ADR-027-finetuning-pipeline.md)     | Fine-Tuning Pipeline            |
-| [028](ADR-028-teacher-providers.md)       | Multi-Provider Teacher Strategy |
-| [029](ADR-029-model-registry.md)          | Model Registry with Lineage     |
-| [030](ADR-030-knowledge-distillation.md)  | Knowledge Distillation Pipeline |
-| [031](ADR-031-lora-adapter-management.md) | LoRA Adapter Management         |
-| [032](ADR-032-training-callbacks.md)      | Training Callbacks              |
-| [033](ADR-033-jit-adaptation.md)          | JIT Adaptation                  |
-| [034](ADR-034-dataset-pipeline.md)        | Dataset Pipeline                |
+| ADR                                          | Title                                 |
+| -------------------------------------------- | ------------------------------------- |
+| [027](ADR-027-finetuning-pipeline.md)        | Fine-Tuning Pipeline                  |
+| [028](ADR-028-teacher-providers.md)          | Multi-Provider Teacher Strategy       |
+| [029](ADR-029-model-registry.md)             | Model Registry with Lineage           |
+| [030](ADR-030-knowledge-distillation.md)     | Knowledge Distillation Pipeline       |
+| [031](ADR-031-lora-adapter-management.md)    | LoRA Adapter Management               |
+| [032](ADR-032-training-callbacks.md)         | Training Callbacks                    |
+| [033](ADR-033-jit-adaptation.md)             | JIT Adaptation                        |
+| [034](ADR-034-dataset-pipeline.md)           | Dataset Pipeline                      |
 | [054](ADR-054-rolora-rotation-aware-lora.md) | Rotation-Aware LoRA Training (RoLoRA) |
+| [056](ADR-056-lora-tuning-pipeline.md)       | LoRA Tuning Pipeline                  |
 
 ## lattice-transport (ADR-035 to ADR-039, ADR-055)
 
