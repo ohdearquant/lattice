@@ -25,6 +25,9 @@ pub enum InferenceError {
     /// Caller-supplied input was invalid (empty prompt, token ID out of
     /// range, etc.) — distinct from a missing model or runtime failure.
     InvalidInput(String),
+    /// Prefix cache operation failed (restore, promote, lock poisoned, or
+    /// geometry mismatch).
+    PrefixCache(String),
 }
 
 impl Display for InferenceError {
@@ -55,6 +58,7 @@ impl Display for InferenceError {
             Self::Io(err) => write!(f, "IO error: {err}"),
             Self::Inference(msg) => write!(f, "Inference error: {msg}"),
             Self::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
+            Self::PrefixCache(msg) => write!(f, "Prefix cache error: {msg}"),
         }
     }
 }

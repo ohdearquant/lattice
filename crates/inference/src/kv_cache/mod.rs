@@ -8,6 +8,10 @@
 
 pub(crate) mod flat;
 pub(crate) mod paged;
+pub(crate) mod prefix;
 
 pub use flat::{FlatKVCache, FlatKVCacheConfig};
 pub use paged::{EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
+pub use prefix::{
+    AdapterId, PrefixEntry, PrefixKey, PrefixPageCache, PrefixPageCacheConfig, SharedPageRef,
+};

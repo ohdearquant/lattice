@@ -1,6 +1,6 @@
 # ADR-047: Paged KV Cache with Prefix Reuse
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
 

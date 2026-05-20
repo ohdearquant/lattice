@@ -14,6 +14,12 @@
 //!   Stored as a flat `Vec<f32>` of size `num_layers * 2 * page_size * kv_dim`.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+use super::prefix::PrefixPageCacheConfig;
+use super::prefix::{AdapterId, PrefixEntry, PrefixKey, PrefixPageCache, SharedPageRef};
+use crate::error::InferenceError;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -254,14 +260,28 @@ pub struct PagedKVCache {
     pool: PagePool,
     table: PageTable,
     config: PagedKVCacheConfig,
+    /// Optional shared prefix cache injected by the caller/session.
+    prefix_cache: Option<Arc<Mutex<PrefixPageCache>>>,
     /// LRU order: front = least recently used, back = most recently used.
     /// Contains physical page indices.
     lru_order: VecDeque<usize>,
 }
 
 impl PagedKVCache {
-    /// **Unstable**: create a new paged KV cache.
+    /// **Unstable**: create a new paged KV cache without prefix sharing.
     pub fn new(config: PagedKVCacheConfig) -> Self {
+        Self::with_prefix_cache(config, None)
+    }
+
+    /// **Unstable**: create a new paged KV cache with optional prefix sharing.
+    ///
+    /// Passing `None` preserves existing behavior. Passing `Some(cache)` enables
+    /// `restore_prefix` and `promote_to_prefix` without changing the hot append
+    /// and gather paths.
+    pub fn with_prefix_cache(
+        config: PagedKVCacheConfig,
+        prefix_cache: Option<Arc<Mutex<PrefixPageCache>>>,
+    ) -> Self {
         let fpp = config.floats_per_page();
         let pool = PagePool::new(config.max_pages, fpp);
         let table = PageTable::new(config.page_size);
@@ -269,7 +289,249 @@ impl PagedKVCache {
             pool,
             table,
             config,
+            prefix_cache,
             lru_order: VecDeque::new(),
+        }
+    }
+
+    /// **Unstable**: restore a cached prefix into owned `PagePool` pages.
+    ///
+    /// Returns `Ok(Some(prefix_len))` on hit and `Ok(None)` when prefix sharing
+    /// is disabled or the key is absent. The cache must be empty (`seq_len == 0`)
+    /// because restore fast-forwards the sequence before the first append.
+    pub fn restore_prefix(
+        &mut self,
+        adapter_id: AdapterId,
+        token_ids: &[u32],
+    ) -> Result<Option<usize>, InferenceError> {
+        if self.seq_len() != 0 {
+            return Err(InferenceError::PrefixCache(
+                "restore_prefix requires an empty PagedKVCache".into(),
+            ));
+        }
+
+        let key = PrefixKey::from_token_ids(adapter_id, token_ids);
+        let entry = match &self.prefix_cache {
+            Some(prefix_cache) => {
+                let mut guard = prefix_cache.lock().map_err(|_| {
+                    InferenceError::PrefixCache("prefix cache lock poisoned".into())
+                })?;
+                guard.lookup(&key)
+            }
+            None => None,
+        };
+
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+
+        if entry.prefix_len != token_ids.len() {
+            return Err(InferenceError::PrefixCache(format!(
+                "prefix hash collision or invalid entry length: key length {}, entry length {}",
+                token_ids.len(),
+                entry.prefix_len
+            )));
+        }
+
+        let restored = self.restore_prefix_entry(&entry)?;
+        Ok(Some(restored))
+    }
+
+    /// **Unstable**: promote the current owned pages into the shared prefix cache.
+    ///
+    /// Returns `Ok(Some(page_count))` when inserted, `Ok(None)` when prefix
+    /// sharing is disabled or the sequence is empty. `token_ids` must exactly
+    /// match the current sequence length so the hash key corresponds to the
+    /// copied KV pages.
+    pub fn promote_to_prefix(
+        &mut self,
+        adapter_id: AdapterId,
+        token_ids: &[u32],
+    ) -> Result<Option<usize>, InferenceError> {
+        let prefix_len = self.seq_len();
+        if prefix_len == 0 {
+            return Ok(None);
+        }
+        if token_ids.len() != prefix_len {
+            return Err(InferenceError::PrefixCache(format!(
+                "promote_to_prefix token length {} does not match seq_len {}",
+                token_ids.len(),
+                prefix_len
+            )));
+        }
+
+        let Some(prefix_cache) = self.prefix_cache.as_ref().cloned() else {
+            return Ok(None);
+        };
+
+        let prefix_page_size = {
+            let guard = prefix_cache
+                .lock()
+                .map_err(|_| InferenceError::PrefixCache("prefix cache lock poisoned".into()))?;
+            guard.config().prefix_page_size
+        };
+
+        let pages = self.copy_owned_pages_to_shared(prefix_page_size)?;
+        let page_count = pages.len();
+        let key = PrefixKey::from_token_ids(adapter_id, token_ids);
+
+        let mut guard = prefix_cache
+            .lock()
+            .map_err(|_| InferenceError::PrefixCache("prefix cache lock poisoned".into()))?;
+        guard.insert(key, prefix_len, pages);
+        Ok(Some(page_count))
+    }
+
+    fn restore_prefix_entry(&mut self, entry: &PrefixEntry) -> Result<usize, InferenceError> {
+        self.validate_prefix_entry(entry)?;
+
+        let live_page_count =
+            PrefixEntry::pages_for_tokens(entry.prefix_len, self.config.page_size);
+        let mut owned_pages = Vec::with_capacity(live_page_count);
+
+        for _ in 0..live_page_count {
+            let Some(phys) = self.pool.alloc() else {
+                for allocated in owned_pages {
+                    self.pool.free(allocated);
+                }
+                return Err(InferenceError::PrefixCache(format!(
+                    "not enough free pages to restore prefix: needed {}, free {}",
+                    live_page_count,
+                    self.pool.free_count()
+                )));
+            };
+            self.pool.page_data_mut(phys).fill(0.0);
+            owned_pages.push(phys);
+        }
+
+        for token_pos in 0..entry.prefix_len {
+            let src_page_idx = token_pos / entry.prefix_page_size;
+            let src_offset = token_pos % entry.prefix_page_size;
+            let dst_page_idx = token_pos / self.config.page_size;
+            let dst_offset = token_pos % self.config.page_size;
+
+            let src_page = entry.pages[src_page_idx].as_slice();
+            let dst_page = self.pool.page_data_mut(owned_pages[dst_page_idx]);
+            Self::copy_token_between_page_layouts(
+                src_page,
+                entry.prefix_page_size,
+                src_offset,
+                dst_page,
+                self.config.page_size,
+                dst_offset,
+                self.config.num_layers,
+                self.config.kv_dim(),
+            );
+        }
+
+        for phys in owned_pages.iter().copied() {
+            self.table.push_page(phys);
+            self.touch_page(phys);
+        }
+        self.table.set_seq_len(entry.prefix_len);
+        Ok(entry.prefix_len)
+    }
+
+    fn copy_owned_pages_to_shared(
+        &self,
+        prefix_page_size: usize,
+    ) -> Result<Vec<SharedPageRef>, InferenceError> {
+        if prefix_page_size == 0 {
+            return Err(InferenceError::PrefixCache(
+                "prefix_page_size must be non-zero".into(),
+            ));
+        }
+
+        let prefix_len = self.seq_len();
+        let prefix_page_count = PrefixEntry::pages_for_tokens(prefix_len, prefix_page_size);
+        let kv_dim = self.config.kv_dim();
+        let floats_per_prefix_page = self.config.num_layers * 2 * prefix_page_size * kv_dim;
+        let mut pages = Vec::with_capacity(prefix_page_count);
+
+        for prefix_page_idx in 0..prefix_page_count {
+            let mut page = vec![0.0f32; floats_per_prefix_page];
+            let start = prefix_page_idx * prefix_page_size;
+            let end = (start + prefix_page_size).min(prefix_len);
+
+            for token_pos in start..end {
+                let (src_phys, src_offset) = self.table.resolve(token_pos);
+                let src_page = self.pool.page_data(src_phys);
+                let dst_offset = token_pos - start;
+                Self::copy_token_between_page_layouts(
+                    src_page,
+                    self.config.page_size,
+                    src_offset,
+                    &mut page,
+                    prefix_page_size,
+                    dst_offset,
+                    self.config.num_layers,
+                    kv_dim,
+                );
+            }
+
+            pages.push(SharedPageRef::from_vec(page));
+        }
+
+        Ok(pages)
+    }
+
+    fn validate_prefix_entry(&self, entry: &PrefixEntry) -> Result<(), InferenceError> {
+        if entry.prefix_page_size == 0 {
+            return Err(InferenceError::PrefixCache(
+                "prefix entry page size must be non-zero".into(),
+            ));
+        }
+
+        let expected_pages =
+            PrefixEntry::pages_for_tokens(entry.prefix_len, entry.prefix_page_size);
+        if entry.pages.len() != expected_pages {
+            return Err(InferenceError::PrefixCache(format!(
+                "prefix entry page count {} does not match expected {}",
+                entry.pages.len(),
+                expected_pages
+            )));
+        }
+
+        let expected_page_len =
+            self.config.num_layers * 2 * entry.prefix_page_size * self.config.kv_dim();
+        for page in &entry.pages {
+            if page.len() != expected_page_len {
+                return Err(InferenceError::PrefixCache(format!(
+                    "prefix page has {} floats, expected {}",
+                    page.len(),
+                    expected_page_len
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_token_between_page_layouts(
+        src_page: &[f32],
+        src_page_size: usize,
+        src_offset: usize,
+        dst_page: &mut [f32],
+        dst_page_size: usize,
+        dst_offset: usize,
+        num_layers: usize,
+        kv_dim: usize,
+    ) {
+        let src_layer_stride = 2 * src_page_size * kv_dim;
+        let dst_layer_stride = 2 * dst_page_size * kv_dim;
+
+        for layer in 0..num_layers {
+            let src_k_base = layer * src_layer_stride + src_offset * kv_dim;
+            let src_v_base =
+                layer * src_layer_stride + src_page_size * kv_dim + src_offset * kv_dim;
+            let dst_k_base = layer * dst_layer_stride + dst_offset * kv_dim;
+            let dst_v_base =
+                layer * dst_layer_stride + dst_page_size * kv_dim + dst_offset * kv_dim;
+
+            dst_page[dst_k_base..dst_k_base + kv_dim]
+                .copy_from_slice(&src_page[src_k_base..src_k_base + kv_dim]);
+            dst_page[dst_v_base..dst_v_base + kv_dim]
+                .copy_from_slice(&src_page[src_v_base..src_v_base + kv_dim]);
         }
     }
 
@@ -448,6 +710,80 @@ impl PagedKVCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_prefix_cache(capacity: usize) -> Arc<Mutex<PrefixPageCache>> {
+        Arc::new(Mutex::new(PrefixPageCache::new(PrefixPageCacheConfig {
+            capacity,
+            prefix_page_size: 4,
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+        })))
+    }
+
+    #[test]
+    fn test_prefix_cache_miss_fallthrough() {
+        let config = make_config(4);
+        let kv_dim = config.kv_dim();
+        let prefix_cache = make_prefix_cache(4);
+        let mut cache = PagedKVCache::with_prefix_cache(config, Some(prefix_cache));
+
+        let restored = cache
+            .restore_prefix(AdapterId::BASE, &[1, 2, 3])
+            .expect("restore miss should not fail");
+        assert_eq!(restored, None);
+
+        let k = vec![1.0; kv_dim];
+        let v = vec![2.0; kv_dim];
+        for layer in 0..2 {
+            cache.append_kv_layer(layer, &k, &v);
+        }
+        cache.advance();
+
+        assert_eq!(cache.seq_len(), 1);
+        assert_eq!(cache.num_pages(), 1);
+    }
+
+    #[test]
+    fn test_restore_prefix_hit_fast_forwards_seq_len() {
+        let config = make_config(4);
+        let kv_dim = config.kv_dim();
+        let prefix_cache = make_prefix_cache(4);
+        let tokens: [u32; 3] = [1, 2, 3];
+
+        let mut source =
+            PagedKVCache::with_prefix_cache(config.clone(), Some(Arc::clone(&prefix_cache)));
+        for step in 0..tokens.len() {
+            for layer in 0..2 {
+                let marker = (step * 10 + layer) as f32;
+                let k = vec![marker; kv_dim];
+                let v = vec![marker + 0.5; kv_dim];
+                source.append_kv_layer(layer, &k, &v);
+            }
+            source.advance();
+        }
+        assert_eq!(
+            source
+                .promote_to_prefix(AdapterId::BASE, &tokens)
+                .expect("promotion should succeed"),
+            Some(1)
+        );
+
+        let mut restored = PagedKVCache::with_prefix_cache(config, Some(prefix_cache));
+        assert_eq!(
+            restored
+                .restore_prefix(AdapterId::BASE, &tokens)
+                .expect("restore should succeed"),
+            Some(tokens.len())
+        );
+        assert_eq!(restored.seq_len(), tokens.len());
+
+        let mut k_buf = vec![0.0f32; tokens.len() * kv_dim];
+        restored.gather_k(0, &mut k_buf);
+        assert_eq!(k_buf[0], 0.0);
+        assert_eq!(k_buf[kv_dim], 10.0);
+        assert_eq!(k_buf[2 * kv_dim], 20.0);
+    }
 
     fn make_config(max_pages: usize) -> PagedKVCacheConfig {
         PagedKVCacheConfig {
