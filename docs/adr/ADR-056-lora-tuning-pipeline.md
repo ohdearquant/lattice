@@ -1,6 +1,7 @@
 ---
 status: Proposed
 date: 2026-05-19
+supersedes: []
 depends_on: [ADR-008, ADR-027]
 related: [ADR-043, ADR-045, ADR-054]
 ---
