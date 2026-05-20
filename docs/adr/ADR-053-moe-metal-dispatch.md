@@ -1,6 +1,6 @@
 # ADR-053: MoE Metal Dispatch with Expert Coalescing
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 

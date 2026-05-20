@@ -2067,6 +2067,74 @@ kernel void lora_gemv_b_accum(
     }
     y[gid] += scale * sum;
 }
+
+// ===== MoE: zero a float buffer =====
+// Used to clear scratch_out before accumulating expert outputs.
+kernel void zero_buf(
+    device float* buf   [[buffer(0)]],
+    constant uint& count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    buf[gid] = 0.0f;
+}
+
+// ===== MoE expert GEMV with expert-major f16 weight layout =====
+// W layout: [num_experts, N, K] f16 contiguous.
+// Expert e's weight matrix starts at element offset: e * N * K.
+// This is the same gemv_decode_core template but takes an element-offset into W.
+// buffer(0): x          [K] f32 activation
+// buffer(1): W          [num_experts * N * K] f16
+// buffer(2): out        [N] f32 output
+// buffer(3): GemmParams  {M=1, N, K, lda=K, ldb=K, ldc=N}
+// buffer(4): W_elem_offset  uint — element index of this expert's weight start
+// Dispatch: threadgroups=(N,1,1), threads=(256,1,1)
+kernel void moe_expert_gemv(
+    device const float* x             [[buffer(0)]],
+    device const half*  W             [[buffer(1)]],
+    device float*       out           [[buffer(2)]],
+    constant GemmParams& p            [[buffer(3)]],
+    constant uint&       W_elem_off   [[buffer(4)]],
+    uint n            [[threadgroup_position_in_grid]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[8]; // 256/32 simdgroups
+    gemv_decode_core<256>(x, W + W_elem_off, out, p, n, tid,
+                          simd_lane, simdgroup_id, simd_width, sg_partials);
+}
+
+// ===== MoE: scale-and-accumulate =====
+// Accumulates a scaled expert output into the running sum.
+// scratch_out[i] += router_weight * expert_out[i]
+// Dispatch: threadgroups=1, threads=hidden (one thread per output element)
+kernel void moe_scale_add(
+    device float* scratch_out         [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    constant float& router_weight     [[buffer(2)]],
+    constant uint& hidden             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(router_weight, expert_out[gid], scratch_out[gid]);
+}
+
+// ===== MoE: sigmoid-gated shared expert accumulate =====
+// gate_val = sigmoid(dot(x, shared_gate_w))
+// scratch_out[i] += gate_val * shared_out[i]
+// Runs after shared expert down-projection result lands in expert_out.
+kernel void moe_shared_gate_add(
+    device float* scratch_out         [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    constant float& gate_val          [[buffer(2)]],
+    constant uint& hidden             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(gate_val, expert_out[gid], scratch_out[gid]);
+}
 "#;
 
     const MSL_Q4_TILED_SOURCE: &str = concat!(
@@ -2375,13 +2443,59 @@ kernel void lora_gemv_b_accum(
         Full(MetalFullLayerWeights),
     }
 
+    /// Pre-allocated Metal buffers for one MoE layer (ADR-053).
+    ///
+    /// Holds f16 expert weight buffers and f32 scratch buffers reused across tokens.
+    /// All weights are resident in unified memory (StorageModeShared).
+    struct MoeMetalBuffers {
+        /// Routed expert gate+up projections: [num_experts * 2 * inter * hidden] f16.
+        /// Expert e gate starts at element `e * 2 * inter * hidden`.
+        /// Expert e up starts at element `e * 2 * inter * hidden + inter * hidden`.
+        routed_gate_up: Buffer,
+        /// Routed expert down projections: [num_experts * hidden * inter] f16.
+        /// Expert e starts at element `e * hidden * inter`.
+        routed_down: Buffer,
+        /// Shared expert gate projection: [shared_inter * hidden] f16.
+        shared_gate_proj: Buffer,
+        /// Shared expert up projection: [shared_inter * hidden] f16.
+        shared_up_proj: Buffer,
+        /// Shared expert down projection: [hidden * shared_inter] f16.
+        shared_down_proj: Buffer,
+        /// Router gate weight: [num_experts * hidden] f32 (CPU-read for routing).
+        router_gate: Buffer,
+        /// Shared expert scalar gate weights: [hidden] f32 (CPU-read).
+        shared_expert_gate: Buffer,
+        /// Scratch: per-expert gate activation [inter] f32.
+        scratch_gate: Buffer,
+        /// Scratch: per-expert up activation [inter] f32 (reused across experts).
+        scratch_up: Buffer,
+        /// Scratch: single expert down output [hidden] f32 (before scale+accumulate).
+        scratch_expert_out: Buffer,
+        /// Accumulator: weighted sum of all expert outputs [hidden] f32.
+        scratch_out: Buffer,
+        /// Model dimensions, cached to avoid recomputing at dispatch time.
+        num_experts: usize,
+        inter: usize,
+        shared_inter: usize,
+        hidden: usize,
+        top_k: usize,
+    }
+
+    /// Per-layer FFN weights on GPU: either dense SwiGLU or MoE.
+    enum MetalFfnWeights {
+        Dense {
+            gate_proj: Q4WeightBuf, // [intermediate, hidden] — Q4/Q8
+            up_proj: Q4WeightBuf,   // [intermediate, hidden] — Q4/Q8
+            down_proj: Q4WeightBuf, // [hidden, intermediate] — Q4/Q8
+        },
+        Moe(Box<MoeMetalBuffers>),
+    }
+
     /// Common per-layer weights (norms + MLP) on GPU.
     struct MetalCommonLayerWeights {
         input_layernorm: Buffer,          // [hidden] — f32 (norm)
         post_attention_layernorm: Buffer, // [hidden] — f32 (norm)
-        gate_proj: Q4WeightBuf,           // [intermediate, hidden] — Q4/Q8
-        up_proj: Q4WeightBuf,             // [intermediate, hidden] — Q4/Q8
-        down_proj: Q4WeightBuf,           // [hidden, intermediate] — Q4/Q8
+        ffn: MetalFfnWeights,
     }
 
     /// Maximum draft tokens verified in one MTP speculation round (first=target, second=MTP draft).
@@ -2650,6 +2764,11 @@ kernel void lora_gemv_b_accum(
         // ADR-045: LoRA GEMV kernels (always compiled, zero cost when unused)
         lora_gemv_a: ComputePipelineState,
         lora_gemv_b_accum: ComputePipelineState,
+        // ADR-053: MoE Metal dispatch kernels
+        moe_expert_gemv: ComputePipelineState,
+        moe_scale_add: ComputePipelineState,
+        moe_shared_gate_add: ComputePipelineState,
+        moe_zero_buf: ComputePipelineState,
     }
 
     // -----------------------------------------------------------------------
@@ -3466,6 +3585,11 @@ kernel void lora_gemv_b_accum(
                 decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
                 lora_gemv_a: make_pipeline("lora_gemv_a")?,
                 lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+                // ADR-053: MoE Metal dispatch kernels
+                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+                moe_scale_add: make_pipeline("moe_scale_add")?,
+                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+                moe_zero_buf: make_pipeline("zero_buf")?,
             };
 
             // Upload per-layer weights
@@ -3482,14 +3606,120 @@ kernel void lora_gemv_b_accum(
 
             let mut layer_weights = Vec::with_capacity(cfg.num_hidden_layers);
             for (i, (attn_w, common_w)) in weights.layers.iter().enumerate() {
-                let dense_ffn = match &common_w.ffn {
-                    crate::model::qwen35::FeedForwardWeights::Dense(d) => d,
-                    crate::model::qwen35::FeedForwardWeights::Moe(_) => {
-                        return Err(format!(
-                            "Metal forward pass does not support MoE FFN at layer {i}"
-                        ));
+                // Build the FFN weight variant for this layer (Dense or MoE).
+                let metal_ffn = match &common_w.ffn {
+                    crate::model::qwen35::FeedForwardWeights::Dense(d) => MetalFfnWeights::Dense {
+                        gate_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            &device,
+                            &d.gate_proj,
+                            &format!("L{i}.gate.{quant_tag}"),
+                        )),
+                        up_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            &device,
+                            &d.up_proj,
+                            &format!("L{i}.up.{quant_tag}"),
+                        )),
+                        down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            &device,
+                            &d.down_proj,
+                            &format!("L{i}.down.{quant_tag}"),
+                        )),
+                    },
+                    crate::model::qwen35::FeedForwardWeights::Moe(m) => {
+                        let num_exp = m.experts.num_experts;
+                        let inter = m.experts.intermediate_size;
+                        let s_inter = m.shared_expert.intermediate_size;
+                        let hid = m.experts.hidden_size;
+                        let top_k = m.router.num_experts_per_tok;
+
+                        // Validate memory headroom: routed experts alone must fit comfortably.
+                        // Each f16 element is 2 bytes. Use 0.85 × recommendedMaxWorkingSetSize.
+                        let routed_bytes = num_exp * (2 * inter * hid + hid * inter) * 2;
+                        let max_working = device.recommended_max_working_set_size();
+                        let threshold = (max_working as f64 * 0.85) as u64;
+                        if (routed_bytes as u64) > threshold {
+                            return Err(format!(
+                                "MoE layer {i}: routed expert weights ({} MiB) exceed \
+                                 0.85 × recommendedMaxWorkingSetSize ({} MiB). \
+                                 Use a 64 GB+ configuration.",
+                                routed_bytes / (1024 * 1024),
+                                threshold / (1024 * 1024)
+                            ));
+                        }
+
+                        // gate_up_proj: [num_experts, 2*inter, hidden] stored as f32 in CPU memory.
+                        // Convert to f16 for GPU — halves bandwidth.
+                        let routed_gate_up = make_buffer_f16(
+                            &device,
+                            &m.experts.gate_up_proj,
+                            &format!("L{i}.moe.gate_up.f16"),
+                        );
+                        let routed_down = make_buffer_f16(
+                            &device,
+                            &m.experts.down_proj,
+                            &format!("L{i}.moe.down.f16"),
+                        );
+                        let shared_gate_proj = make_buffer_f16(
+                            &device,
+                            &m.shared_expert.gate_proj,
+                            &format!("L{i}.moe.sh_gate.f16"),
+                        );
+                        let shared_up_proj = make_buffer_f16(
+                            &device,
+                            &m.shared_expert.up_proj,
+                            &format!("L{i}.moe.sh_up.f16"),
+                        );
+                        let shared_down_proj = make_buffer_f16(
+                            &device,
+                            &m.shared_expert.down_proj,
+                            &format!("L{i}.moe.sh_down.f16"),
+                        );
+                        // Router gate kept as f32 — CPU reads this for routing.
+                        let router_gate =
+                            make_buffer(&device, &m.router.gate, &format!("L{i}.moe.router.f32"));
+                        let shared_expert_gate = make_buffer(
+                            &device,
+                            &m.shared_expert.shared_expert_gate,
+                            &format!("L{i}.moe.sh_gate_scalar.f32"),
+                        );
+
+                        // Scratch buffers reused per token.
+                        let scratch_gate = make_zero_buffer(
+                            &device,
+                            s_inter.max(inter),
+                            &format!("L{i}.moe.scr_gate"),
+                        );
+                        let scratch_up = make_zero_buffer(
+                            &device,
+                            s_inter.max(inter),
+                            &format!("L{i}.moe.scr_up"),
+                        );
+                        let scratch_expert_out =
+                            make_zero_buffer(&device, hid, &format!("L{i}.moe.scr_exp_out"));
+                        let scratch_out =
+                            make_zero_buffer(&device, hid, &format!("L{i}.moe.scr_out"));
+
+                        MetalFfnWeights::Moe(Box::new(MoeMetalBuffers {
+                            routed_gate_up,
+                            routed_down,
+                            shared_gate_proj,
+                            shared_up_proj,
+                            shared_down_proj,
+                            router_gate,
+                            shared_expert_gate,
+                            scratch_gate,
+                            scratch_up,
+                            scratch_expert_out,
+                            scratch_out,
+                            num_experts: num_exp,
+                            inter,
+                            shared_inter: s_inter,
+                            hidden: hid,
+                            top_k,
+                        }))
                     }
                 };
+
                 let common = MetalCommonLayerWeights {
                     // Norms stay f32 (small, precision-sensitive)
                     input_layernorm: make_buffer(
@@ -3502,22 +3732,7 @@ kernel void lora_gemv_b_accum(
                         &common_w.post_attention_layernorm,
                         &format!("L{i}.post_norm"),
                     ),
-                    // FFN projections to q8_0 (large, bandwidth-bound)
-                    gate_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                        &device,
-                        &dense_ffn.gate_proj,
-                        &format!("L{i}.gate.{quant_tag}"),
-                    )),
-                    up_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                        &device,
-                        &dense_ffn.up_proj,
-                        &format!("L{i}.up.{quant_tag}"),
-                    )),
-                    down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                        &device,
-                        &dense_ffn.down_proj,
-                        &format!("L{i}.down.{quant_tag}"),
-                    )),
+                    ffn: metal_ffn,
                 };
 
                 let attn = match attn_w {
@@ -4446,9 +4661,23 @@ kernel void lora_gemv_b_accum(
                 let (_, common_w) = &self.engine.layer_weights[compact_idx];
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let w_gate = &common_w.gate_proj as *const Q4WeightBuf;
-                let w_up = &common_w.up_proj as *const Q4WeightBuf;
-                let w_down = &common_w.down_proj as *const Q4WeightBuf;
+                let (w_gate, w_up, w_down) = match &common_w.ffn {
+                    MetalFfnWeights::Dense {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    } => (
+                        gate_proj as *const Q4WeightBuf,
+                        up_proj as *const Q4WeightBuf,
+                        down_proj as *const Q4WeightBuf,
+                    ),
+                    MetalFfnWeights::Moe(_) => {
+                        panic!(
+                            "verify_tokens_batch_gemm: MoE layers are not supported in batch \
+                                prefill (M>1). ADR-053 v1 targets decode-mode only."
+                        );
+                    }
+                };
 
                 if is_linear {
                     // GDN layer: batch projections + sequential recurrence (causal dependency).
@@ -5856,9 +6085,23 @@ kernel void lora_gemv_b_accum(
                 let (_, common_w) = &self.engine.layer_weights[compact_idx];
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let w_gate = &common_w.gate_proj as *const Q4WeightBuf;
-                let w_up = &common_w.up_proj as *const Q4WeightBuf;
-                let w_down = &common_w.down_proj as *const Q4WeightBuf;
+                let (w_gate, w_up, w_down) = match &common_w.ffn {
+                    MetalFfnWeights::Dense {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    } => (
+                        gate_proj as *const Q4WeightBuf,
+                        up_proj as *const Q4WeightBuf,
+                        down_proj as *const Q4WeightBuf,
+                    ),
+                    MetalFfnWeights::Moe(_) => {
+                        panic!(
+                            "forward_prefill batch GEMM: MoE layers are not supported in batch \
+                                prefill (M>1). ADR-053 v1 targets decode-mode only."
+                        );
+                    }
+                };
 
                 if is_linear {
                     // ========= GDN layer: batch projections + sequential recurrence =========
@@ -8259,64 +8502,87 @@ kernel void lora_gemv_b_accum(
                 hidden as u32,
                 cfg.rms_norm_eps,
             );
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.hidden,
-                &common_w.gate_proj,
-                &self.session.activations.gate,
-                1,
-                inter as u32,
-                hidden as u32,
-            );
-            // LoRA for gate_proj
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.gate,
-                0,
-                layer_idx,
-                "gate_proj",
-            );
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.hidden,
-                &common_w.up_proj,
-                &self.session.activations.up,
-                1,
-                inter as u32,
-                hidden as u32,
-            );
-            // LoRA for up_proj
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.up,
-                0,
-                layer_idx,
-                "up_proj",
-            );
-            self.dispatch_silu_mul(enc, inter as u32);
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.gate,
-                &common_w.down_proj,
-                &self.session.activations.ffn_out,
-                1,
-                hidden as u32,
-                inter as u32,
-            );
-            // LoRA for down_proj: x = gate (silu-gated intermediate), y = ffn_out
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.gate,
-                0,
-                &self.session.activations.ffn_out,
-                0,
-                layer_idx,
-                "down_proj",
-            );
+            // Dispatch FFN (Dense SwiGLU or MoE).
+            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
+            match &common_w.ffn {
+                MetalFfnWeights::Dense {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                } => {
+                    let w_gate = gate_proj as *const Q4WeightBuf;
+                    let w_up = up_proj as *const Q4WeightBuf;
+                    let w_down = down_proj as *const Q4WeightBuf;
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_gate,
+                            &self.session.activations.gate,
+                            1,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        0,
+                        layer_idx,
+                        "gate_proj",
+                    );
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_up,
+                            &self.session.activations.up,
+                            1,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.up,
+                        0,
+                        layer_idx,
+                        "up_proj",
+                    );
+                    self.dispatch_silu_mul(enc, inter as u32);
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.gate,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            1,
+                            hidden as u32,
+                            inter as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.gate,
+                        0,
+                        &self.session.activations.ffn_out,
+                        0,
+                        layer_idx,
+                        "down_proj",
+                    );
+                }
+                MetalFfnWeights::Moe(moe_bufs) => {
+                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
+                    // SAFETY: moe_bufs is owned by layer_weights which is live.
+                    unsafe {
+                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
+                    }
+                }
+            }
             // End of layer: residual += ffn_out, hidden = residual (fused)
             self.dispatch_add_and_copy(
                 enc,
@@ -8575,64 +8841,87 @@ kernel void lora_gemv_b_accum(
                 hidden as u32,
                 cfg.rms_norm_eps,
             );
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.hidden,
-                &common_w.gate_proj,
-                &self.session.activations.gate,
-                1,
-                inter as u32,
-                hidden as u32,
-            );
-            // LoRA for gate_proj
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.gate,
-                0,
-                layer_idx,
-                "gate_proj",
-            );
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.hidden,
-                &common_w.up_proj,
-                &self.session.activations.up,
-                1,
-                inter as u32,
-                hidden as u32,
-            );
-            // LoRA for up_proj
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.up,
-                0,
-                layer_idx,
-                "up_proj",
-            );
-            self.dispatch_silu_mul(enc, inter as u32);
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.gate,
-                &common_w.down_proj,
-                &self.session.activations.ffn_out,
-                1,
-                hidden as u32,
-                inter as u32,
-            );
-            // LoRA for down_proj: x = gate (silu-gated intermediate), y = ffn_out
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.gate,
-                0,
-                &self.session.activations.ffn_out,
-                0,
-                layer_idx,
-                "down_proj",
-            );
+            // Dispatch FFN (Dense SwiGLU or MoE).
+            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
+            match &common_w.ffn {
+                MetalFfnWeights::Dense {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                } => {
+                    let w_gate = gate_proj as *const Q4WeightBuf;
+                    let w_up = up_proj as *const Q4WeightBuf;
+                    let w_down = down_proj as *const Q4WeightBuf;
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_gate,
+                            &self.session.activations.gate,
+                            1,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        0,
+                        layer_idx,
+                        "gate_proj",
+                    );
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_up,
+                            &self.session.activations.up,
+                            1,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.up,
+                        0,
+                        layer_idx,
+                        "up_proj",
+                    );
+                    self.dispatch_silu_mul(enc, inter as u32);
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.gate,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            1,
+                            hidden as u32,
+                            inter as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.gate,
+                        0,
+                        &self.session.activations.ffn_out,
+                        0,
+                        layer_idx,
+                        "down_proj",
+                    );
+                }
+                MetalFfnWeights::Moe(moe_bufs) => {
+                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
+                    // SAFETY: moe_bufs is owned by layer_weights which is live.
+                    unsafe {
+                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
+                    }
+                }
+            }
             // End of layer: residual += ffn_out, hidden = residual (fused)
             self.dispatch_add_and_copy(
                 enc,
@@ -8644,6 +8933,328 @@ kernel void lora_gemv_b_accum(
             if let Some(t0) = gqa_mlp_t0 {
                 prof.mlp_us += t0.elapsed().as_micros();
             }
+        }
+
+        /// Encode a MoE FFN step into an already-open compute command encoder.
+        ///
+        /// Implements ADR-053 D1–D4: CPU routing + single-encoder GPU dispatch for
+        /// all routed experts plus the shared expert, accumulating with router weights
+        /// via `moe_scale_add` / `moe_shared_gate_add` kernels.
+        ///
+        /// # Preconditions
+        /// - `moe` is a live reference to a `MoeMetalBuffers` owned by `self.engine.layer_weights`.
+        /// - `self.session.activations.hidden` holds the post-RMSNorm hidden state ([hidden] f32).
+        /// - The encoder `enc` is open and NOT yet committed.
+        ///
+        /// # Postconditions
+        /// - `self.session.activations.ffn_out` holds the MoE FFN output ([hidden] f32)
+        ///   ready for residual accumulation by the caller.
+        ///
+        /// # Safety
+        /// Reads `moe.router_gate.contents()` and `moe.shared_expert_gate.contents()` as
+        /// `*const f32` for CPU routing. Valid because both buffers use `StorageModeShared`
+        /// and no GPU work on those buffers is in flight (router runs before encoding starts).
+        /// Reads `self.session.activations.hidden.contents()` similarly (GPU idle at this point
+        /// — this is called before the encoder dispatches any hidden-state kernel).
+        unsafe fn encode_moe_ffn(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            moe: &MoeMetalBuffers,
+            _cfg: &Qwen35Config,
+        ) {
+            let hidden = moe.hidden;
+            let inter = moe.inter;
+            let shared_inter = moe.shared_inter;
+            let num_experts = moe.num_experts;
+            let top_k = moe.top_k;
+
+            // ── Step 0: Zero the accumulator on GPU ───────────────────────────────
+            let hidden_u32 = hidden as u32;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.moe_zero_buf);
+            enc.set_buffer(0, Some(&moe.scratch_out), 0);
+            enc.set_bytes(1, 4, &hidden_u32 as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+
+            // ── Step 1: CPU routing ───────────────────────────────────────────────
+            // Read hidden activation (post-RMSNorm, CPU-accessible StorageModeShared).
+            let hidden_ptr = self.session.activations.hidden.contents() as *const f32;
+            let hidden_slice = std::slice::from_raw_parts(hidden_ptr, hidden);
+
+            // Read router gate weights [num_experts, hidden] f32.
+            let gate_ptr = moe.router_gate.contents() as *const f32;
+            let gate_slice = std::slice::from_raw_parts(gate_ptr, num_experts * hidden);
+
+            // Compute router logits: logits[e] = dot(hidden, gate_w[e])
+            let mut logits = vec![0.0f32; num_experts];
+            for e in 0..num_experts {
+                let row = &gate_slice[e * hidden..(e + 1) * hidden];
+                let mut acc = 0.0f32;
+                for i in 0..hidden {
+                    acc += hidden_slice[i] * row[i];
+                }
+                logits[e] = acc;
+            }
+
+            // Softmax over all experts (numerically stable).
+            let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for v in logits.iter_mut() {
+                *v = (*v - max_logit).exp();
+                denom += *v;
+            }
+            if denom > 0.0 {
+                for v in logits.iter_mut() {
+                    *v /= denom;
+                }
+            }
+
+            // Select top-k experts (insertion-sort into fixed-size array).
+            let mut selected: Vec<(usize, f32)> = vec![(usize::MAX, f32::NEG_INFINITY); top_k];
+            for (e, &prob) in logits.iter().enumerate() {
+                for rank in 0..top_k {
+                    if prob > selected[rank].1 {
+                        for shift in (rank + 1..top_k).rev() {
+                            selected[shift] = selected[shift - 1];
+                        }
+                        selected[rank] = (e, prob);
+                        break;
+                    }
+                }
+            }
+
+            // Renormalize selected weights to sum=1.
+            let top_sum: f32 = selected.iter().map(|(_, p)| *p).sum();
+            if top_sum > 0.0 {
+                for (_, prob) in selected.iter_mut() {
+                    *prob /= top_sum;
+                }
+            }
+
+            // ── Step 2: Shared expert (always active) ─────────────────────────────
+            // Compute scalar sigmoid gate on CPU.
+            let sg_ptr = moe.shared_expert_gate.contents() as *const f32;
+            let sg_slice = std::slice::from_raw_parts(sg_ptr, hidden);
+            let gate_logit: f32 = hidden_slice
+                .iter()
+                .zip(sg_slice.iter())
+                .map(|(x, g)| x * g)
+                .sum();
+            let shared_gate_val = 1.0f32 / (1.0 + (-gate_logit).exp());
+
+            // Shared expert gate projection GEMV: scratch_gate[shared_inter] = W_gate * hidden
+            let shared_inter_u32 = shared_inter as u32;
+            let params_gate_up_sh = GemmParams {
+                m: 1,
+                n: shared_inter_u32,
+                k: hidden_u32,
+                lda: hidden_u32,
+                ldb: hidden_u32,
+                ldc: shared_inter_u32,
+            };
+            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+            enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+            enc.set_buffer(1, Some(&moe.shared_gate_proj), 0);
+            enc.set_buffer(2, Some(&moe.scratch_gate), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<GemmParams>() as u64,
+                &params_gate_up_sh as *const GemmParams as *const _,
+            );
+            enc.dispatch_thread_groups(
+                MTLSize::new(shared_inter as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+
+            // Shared expert up projection GEMV: scratch_up[shared_inter] = W_up * hidden
+            let params_up_sh = GemmParams {
+                m: 1,
+                n: shared_inter_u32,
+                k: hidden_u32,
+                lda: hidden_u32,
+                ldb: hidden_u32,
+                ldc: shared_inter_u32,
+            };
+            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+            enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+            enc.set_buffer(1, Some(&moe.shared_up_proj), 0);
+            enc.set_buffer(2, Some(&moe.scratch_up), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<GemmParams>() as u64,
+                &params_up_sh as *const GemmParams as *const _,
+            );
+            enc.dispatch_thread_groups(
+                MTLSize::new(shared_inter as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+
+            // SiLU-mul in-place on scratch_gate (gate[i] = silu(gate[i]) * up[i]).
+            let count_sh = shared_inter as u32;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
+            enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+            enc.set_buffer(1, Some(&moe.scratch_up), 0);
+            enc.set_bytes(2, 4, &count_sh as *const u32 as *const _);
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(shared_inter as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+
+            // Shared expert down projection GEMV: scratch_expert_out[hidden] = W_down * scratch_gate
+            let params_down_sh = GemmParams {
+                m: 1,
+                n: hidden_u32,
+                k: shared_inter_u32,
+                lda: shared_inter_u32,
+                ldb: shared_inter_u32,
+                ldc: hidden_u32,
+            };
+            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+            enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+            enc.set_buffer(1, Some(&moe.shared_down_proj), 0);
+            enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
+            enc.set_bytes(
+                3,
+                std::mem::size_of::<GemmParams>() as u64,
+                &params_down_sh as *const GemmParams as *const _,
+            );
+            enc.dispatch_thread_groups(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+
+            // Accumulate: scratch_out += shared_gate_val * scratch_expert_out.
+            enc.set_compute_pipeline_state(&self.engine.pipelines.moe_shared_gate_add);
+            enc.set_buffer(0, Some(&moe.scratch_out), 0);
+            enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
+            enc.set_bytes(2, 4, &shared_gate_val as *const f32 as *const _);
+            enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+
+            // ── Step 3: Routed experts ────────────────────────────────────────────
+            let inter_u32 = inter as u32;
+
+            for &(expert_id, router_weight) in selected.iter() {
+                if expert_id == usize::MAX {
+                    // Unfilled slot (fewer than top_k experts passed threshold).
+                    continue;
+                }
+
+                // Expert e gate half starts at element: e * 2 * inter * hidden
+                // Expert e up half starts at element:  e * 2 * inter * hidden + inter * hidden
+                let gate_elem_off = (expert_id * 2 * inter * hidden) as u32;
+                let up_elem_off = (expert_id * 2 * inter * hidden + inter * hidden) as u32;
+                // Expert e down half starts at element: e * hidden * inter
+                let down_elem_off = (expert_id * hidden * inter) as u32;
+
+                // Gate GEMV: scratch_gate[inter] = W_gate[e] * hidden
+                let params_gate = GemmParams {
+                    m: 1,
+                    n: inter_u32,
+                    k: hidden_u32,
+                    lda: hidden_u32,
+                    ldb: hidden_u32,
+                    ldc: inter_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
+                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+                enc.set_buffer(1, Some(&moe.routed_gate_up), 0);
+                enc.set_buffer(2, Some(&moe.scratch_gate), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_gate as *const GemmParams as *const _,
+                );
+                enc.set_bytes(4, 4, &gate_elem_off as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(inter as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // Up GEMV: scratch_up[inter] = W_up[e] * hidden
+                let params_up = GemmParams {
+                    m: 1,
+                    n: inter_u32,
+                    k: hidden_u32,
+                    lda: hidden_u32,
+                    ldb: hidden_u32,
+                    ldc: inter_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
+                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+                enc.set_buffer(1, Some(&moe.routed_gate_up), 0);
+                enc.set_buffer(2, Some(&moe.scratch_up), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_up as *const GemmParams as *const _,
+                );
+                enc.set_bytes(4, 4, &up_elem_off as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(inter as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // SiLU-mul in-place on scratch_gate.
+                let count_r = inter as u32;
+                enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
+                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+                enc.set_buffer(1, Some(&moe.scratch_up), 0);
+                enc.set_bytes(2, 4, &count_r as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(inter as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+
+                // Down GEMV: scratch_expert_out[hidden] = W_down[e] * scratch_gate
+                let params_down = GemmParams {
+                    m: 1,
+                    n: hidden_u32,
+                    k: inter_u32,
+                    lda: inter_u32,
+                    ldb: inter_u32,
+                    ldc: hidden_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
+                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+                enc.set_buffer(1, Some(&moe.routed_down), 0);
+                enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_down as *const GemmParams as *const _,
+                );
+                enc.set_bytes(4, 4, &down_elem_off as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(hidden as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // Scale-and-accumulate: scratch_out += router_weight * scratch_expert_out.
+                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_scale_add);
+                enc.set_buffer(0, Some(&moe.scratch_out), 0);
+                enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
+                enc.set_bytes(2, 4, &router_weight as *const f32 as *const _);
+                enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+            }
+
+            // ── Step 4: Copy accumulator → ffn_out ───────────────────────────────
+            // `dispatch_copy` uses session.activations buffers; dispatch manually here.
+            enc.set_compute_pipeline_state(&self.engine.pipelines.copy);
+            enc.set_buffer(0, Some(&moe.scratch_out), 0);
+            enc.set_buffer(1, Some(&self.session.activations.ffn_out), 0);
+            enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const _);
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
         }
 
         /// Encode the final head: optional pre-final hidden capture, RMS norm,
@@ -10282,6 +10893,11 @@ kernel void lora_gemv_b_accum(
                 decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
                 lora_gemv_a: make_pipeline("lora_gemv_a")?,
                 lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+                // ADR-053: MoE Metal dispatch kernels
+                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+                moe_scale_add: make_pipeline("moe_scale_add")?,
+                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+                moe_zero_buf: make_pipeline("zero_buf")?,
             };
 
             let hidden = cfg.hidden_size;
