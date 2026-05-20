@@ -1,11 +1,3 @@
----
-status: Proposed
-date: 2026-05-19
-supersedes: []
-depends_on: [ADR-008, ADR-027]
-related: [ADR-043, ADR-045, ADR-054]
----
-
 # ADR-056: LoRA Tuning Pipeline
 
 **Status**: Proposed\
@@ -14,7 +6,7 @@ related: [ADR-043, ADR-045, ADR-054]
 
 ---
 
-## 1. Context
+## Context
 
 Lattice has a complete LoRA _serving_ stack. ADR-008 defines `LoraHook` as a
 `Send + Sync` trait in `lattice-inference`; `platform/tune` implements it so that
@@ -66,7 +58,7 @@ export path.
 
 ---
 
-## 2. Decision
+## Decision
 
 We will implement an end-to-end LoRA supervised fine-tuning pipeline inside
 `lattice-tune`, building on existing scaffolding rather than adopting an external
@@ -91,7 +83,7 @@ and the exported adapter loads cleanly in `lattice-inference`.
 
 ---
 
-## 3. Scope
+## Scope
 
 **In scope**:
 
@@ -135,7 +127,7 @@ and the exported adapter loads cleanly in `lattice-inference`.
 
 ---
 
-## 4. Design
+## Architecture
 
 ### Training Configuration
 
@@ -601,7 +593,7 @@ pub enum LrScheduleConfig {
 
 ---
 
-## 5. Implementation Plan
+## Implementation Plan
 
 **Phase 1 — CPU correctness path (1 week)**
 
@@ -643,7 +635,7 @@ error. This test becomes a required CI target for `lattice-tune`.
 
 ---
 
-## 6. Test Matrix
+## Test Matrix
 
 | Test name                                        | Assertion                                                                                                                                      |
 | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -662,7 +654,7 @@ error. This test becomes a required CI target for `lattice-tune`.
 
 ---
 
-## 7. Alternatives
+## Alternatives Considered
 
 | Alternative                     | Pros                                                                                                                        | Cons                                                                                                                                                                                      | Rejection rationale                                                                                                                                                                                      |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -672,7 +664,7 @@ error. This test becomes a required CI target for `lattice-tune`.
 
 ---
 
-## 8. Risks and Mitigation
+## Risks
 
 **Manual gradient equations are wrong for some projection shape or batch
 convention** → Add synthetic finite-difference tests for A and B gradients per
