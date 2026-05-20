@@ -34,6 +34,7 @@ pub mod tokenizer;
 pub mod weights;
 
 // Standalone modules
+pub mod batch;
 pub mod download;
 pub mod error;
 pub mod generate;
