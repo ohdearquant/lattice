@@ -139,10 +139,6 @@ pub struct GrammarEngine {
     vocab_bytes: Vec<Vec<u8>>,
 }
 
-// SAFETY: GrammarEngine contains only Vec<...> and is Send + Sync.
-unsafe impl Send for GrammarEngine {}
-unsafe impl Sync for GrammarEngine {}
-
 impl GrammarEngine {
     /// Build a `GrammarEngine` from a `GrammarSpec` and the model vocabulary.
     ///

@@ -7012,7 +7012,8 @@ kernel void lora_gemv_b_accum(
                 && mtp_enabled
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
-                && !use_compact;
+                && !use_compact
+                && gen_cfg.grammar.is_none();
             if use_mtp {
                 if use_compact {
                     self.session.compact_topk = 0;
@@ -7027,6 +7028,7 @@ kernel void lora_gemv_b_accum(
                 && gen_cfg.top_k <= 1
                 && gen_cfg.temperature <= 0.0
                 && !use_compact
+                && gen_cfg.grammar.is_none()
                 && cfg.num_active_linear_attention_layers() > 0;
             if use_self_spec {
                 return self.generate_greedy_self_spec(
@@ -7050,7 +7052,9 @@ kernel void lora_gemv_b_accum(
 
             // Advance grammar state after sampling the prefill token.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.advance(gs, next_id);
+                if !engine.advance(gs, next_id) {
+                    return generated_ids;
+                }
             }
 
             let is_stop = |id: u32| -> bool {
@@ -7103,7 +7107,9 @@ kernel void lora_gemv_b_accum(
 
                 // Advance grammar state after sampling.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.advance(gs, next_id);
+                    if !engine.advance(gs, next_id) {
+                        break;
+                    }
                 }
 
                 if is_stop(next_id) {
@@ -9609,7 +9615,9 @@ kernel void lora_gemv_b_accum(
 
             // Advance grammar state after sampling the prefill token.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.advance(gs, next_id);
+                if !engine.advance(gs, next_id) {
+                    break;
+                }
             }
 
             let is_stop = |id: u32| -> bool {
@@ -9675,7 +9683,9 @@ kernel void lora_gemv_b_accum(
 
                 // Advance grammar state after sampling.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.advance(gs, next_id);
+                    if !engine.advance(gs, next_id) {
+                        break;
+                    }
                 }
 
                 if is_stop(next_id) {

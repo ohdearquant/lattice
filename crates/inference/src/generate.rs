@@ -232,7 +232,16 @@ pub fn generate(
 
     // Advance grammar state after sampling.
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-        engine.advance(gs, first_token);
+        if !engine.advance(gs, first_token) {
+            let text = tokenizer.decode(&generated_ids).unwrap_or_default();
+            return Ok(GenerateOutput {
+                text,
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+                token_ids: generated_ids,
+                stopped_by_eos: false,
+            });
+        }
     }
 
     let mut stopped_by_eos = false;
@@ -257,7 +266,9 @@ pub fn generate(
             let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
             // Advance grammar state after sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-                engine.advance(gs, token);
+                if !engine.advance(gs, token) {
+                    break;
+                }
             }
             generated_ids.push(token);
 
