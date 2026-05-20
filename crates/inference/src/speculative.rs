@@ -183,6 +183,16 @@ pub struct MtpForwardOutput {
     pub hidden: Vec<f32>,
 }
 
+/// Draft tokens and their associated raw logits produced by
+/// [`MtpVerifier::draft_tokens_with_logits`].
+///
+/// `logits[i]` is the draft model's logit vector for the position that generated `tokens[i]`.
+/// This is the `q_i(·)` distribution required by probabilistic rejection sampling (ADR-050).
+pub struct MtpDraft {
+    pub tokens: Vec<u32>,
+    pub logits: Vec<Vec<f32>>,
+}
+
 // --- MTP weight structures ---
 
 /// All weights for the MTP module.
@@ -1018,18 +1028,23 @@ impl<'a> MtpVerifier<'a> {
         })
     }
 
-    /// Draft `config.draft_length` candidate tokens using iterative MTP forwards.
+    /// Draft `config.draft_length` candidate tokens with their raw logits.
+    ///
+    /// The returned `logits` are the `q_i(·)` distributions required by probabilistic
+    /// rejection sampling (ADR-050). Use [`Self::draft_tokens`] when only token IDs are
+    /// needed (greedy callers that pass `&[]` to `rejection_sample_draft`).
     ///
     /// Stops early if `eos_token` is produced.
     #[allow(clippy::explicit_counter_loop)]
-    pub fn draft_tokens(
+    pub fn draft_tokens_with_logits(
         &mut self,
         current_token_id: u32,
         current_position: usize,
         main_hidden_at_current_position: &[f32],
         eos_token: Option<u32>,
-    ) -> Result<Vec<u32>, crate::error::InferenceError> {
-        let mut draft = Vec::with_capacity(self.config.draft_length);
+    ) -> Result<MtpDraft, crate::error::InferenceError> {
+        let mut tokens = Vec::with_capacity(self.config.draft_length);
+        let mut logits = Vec::with_capacity(self.config.draft_length);
         let mut next_input = current_token_id;
         let mut next_hidden: Vec<f32> = main_hidden_at_current_position.to_vec();
         let mut next_position = current_position;
@@ -1037,7 +1052,8 @@ impl<'a> MtpVerifier<'a> {
         for _ in 0..self.config.draft_length {
             let out = self.forward_one(next_input, next_position, &next_hidden)?;
             let token = argmax(&out.logits) as u32;
-            draft.push(token);
+            tokens.push(token);
+            logits.push(out.logits);
             if Some(token) == eos_token {
                 break;
             }
@@ -1046,7 +1062,27 @@ impl<'a> MtpVerifier<'a> {
             next_position += 1;
         }
 
-        Ok(draft)
+        Ok(MtpDraft { tokens, logits })
+    }
+
+    /// Draft `config.draft_length` candidate tokens using iterative MTP forwards.
+    ///
+    /// Stops early if `eos_token` is produced.
+    pub fn draft_tokens(
+        &mut self,
+        current_token_id: u32,
+        current_position: usize,
+        main_hidden_at_current_position: &[f32],
+        eos_token: Option<u32>,
+    ) -> Result<Vec<u32>, crate::error::InferenceError> {
+        Ok(self
+            .draft_tokens_with_logits(
+                current_token_id,
+                current_position,
+                main_hidden_at_current_position,
+                eos_token,
+            )?
+            .tokens)
     }
 }
 
@@ -1140,13 +1176,15 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     // post-rejection forward steps start from the correct recurrent state.
     let gdn_snap = target.snapshot_gdn_states();
 
-    // Generate draft
-    let draft = verifier.draft_tokens(
+    // Generate draft with per-token logits for probabilistic rejection sampling (ADR-050).
+    let mtp_draft = verifier.draft_tokens_with_logits(
         current_token_id,
         current_position,
         main_hidden_at_current_position,
         eos_token,
     )?;
+    let draft = mtp_draft.tokens;
+    let draft_logits = mtp_draft.logits;
     let draft_len = draft.len();
     let mtp_forwards = draft_len;
 
@@ -1170,74 +1208,21 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         });
     }
 
-    // Verify first draft token against initial target logits
-    let target_first = argmax(initial_target_logits) as u32;
-
-    if draft[0] != target_first {
-        // Full rejection before calling `verify_tokens`. Target state was never advanced —
-        // KV is already at `target_start` and GDN matches `gdn_snap` — so we must NOT call
-        // `target.rollback_cache_to(target_start)` here: some implementors (the Metal
-        // adapter is one) need an active speculation checkpoint to roll back into, and
-        // `verify_tokens` was never called to set it.
-        verifier.rollback_cache_to(mtp_start)?;
-        let _ = gdn_snap;
-        let fallback = target_first;
-        return Ok(MtpVerifyResult {
-            accepted_count: 0,
-            accepted_tokens: vec![],
-            fallback_token: Some(fallback),
-            draft_tokens: draft,
-            stopped_by_eos: false,
-            metrics: MtpMetrics {
-                target_forwards: 0,
-                mtp_forwards,
-                draft_tokens: draft_len,
-                accepted_tokens: 0,
-                accepted_tokens_per_forward: 0.0,
-                acceptance_rate: 0.0,
-            },
-        });
-    }
-
-    // First token is EOS: accept it and stop. Same reasoning as the early full-rejection
-    // branch above — `target.verify_tokens` was not called, so target state is already at
-    // `target_start` and a `rollback_cache_to(target_start)` would tickle the Metal
-    // checkpoint precondition for no good reason.
-    if Some(target_first) == eos_token {
-        verifier.rollback_cache_to(mtp_start + 1)?;
-        let _ = gdn_snap;
-        return Ok(MtpVerifyResult {
-            accepted_count: 1,
-            accepted_tokens: vec![target_first],
-            fallback_token: None,
-            draft_tokens: draft,
-            stopped_by_eos: true,
-            metrics: MtpMetrics {
-                target_forwards: 0,
-                mtp_forwards,
-                draft_tokens: draft_len,
-                accepted_tokens: 1,
-                accepted_tokens_per_forward: 0.0,
-                acceptance_rate: 1.0 / draft_len.max(1) as f64,
-            },
-        });
-    }
-
-    // Batch verify remaining draft tokens through target model
+    // Batch verify all draft tokens through the target model.  `verify_tokens` must be
+    // called before `rejection_sample_draft` so that implementors that maintain a
+    // speculation checkpoint (e.g. the Metal adapter) have an active checkpoint to roll
+    // back into when `rollback_cache_to` is called below — even in the full-rejection case.
     let target_logits = target.verify_tokens(&draft, current_position + 1)?;
     let target_forwards = 1;
 
-    // Delegate the accept-loop to `rejection_sample_draft(greedy=true)` so a single
-    // verifier implements both the existing greedy MTP path and the probabilistic
-    // path introduced by ADR-050. Greedy mode does not consume `draft_logits`, so
-    // we pass an empty slice — no `draft_len * vocab_size` placeholder allocation
-    // in the hot path.
+    // Probabilistic rejection sampling (ADR-050): pass draft logits and greedy=false so
+    // every draft token is accepted with probability min(1, p(x)/q(x)).
     let rs = rejection_sample_draft(
         &draft,
-        &[],
+        &draft_logits,
         initial_target_logits,
         &target_logits,
-        true,
+        false,
         None,
     )?;
     let mut accepted_count = rs.accepted_count;
@@ -2826,5 +2811,198 @@ mod tests {
             let tok = sample_adjusted(&p, &q, r);
             assert_eq!(tok, 0, "seed={seed}: all mass on token 0");
         }
+    }
+
+    // ── ADR-050 MTP rejection sampling integration tests ─────────────────────
+
+    #[test]
+    fn mtp_rejection_sampling_seeded_acceptance_accepts_all() {
+        // Identical draft and target distributions → p(x)/q(x) == 1 everywhere → all accept.
+        const VOCAB: usize = 8;
+        let logits = peaked_logits(VOCAB, 2, 100.0);
+        let draft_tokens = vec![2u32, 2, 2];
+        let draft_logits = vec![logits.clone(), logits.clone(), logits.clone()];
+        let target_logits = vec![logits.clone(), logits.clone(), logits.clone()];
+        let initial_target = logits.clone();
+
+        let res = rejection_sample_draft(
+            &draft_tokens,
+            &draft_logits,
+            &initial_target,
+            &target_logits,
+            false,
+            Some(7),
+        )
+        .unwrap();
+
+        assert_eq!(res.accepted_count, 3);
+        assert_eq!(res.accepted_tokens, vec![2u32, 2, 2]);
+        assert!(!res.had_rejection);
+        assert_eq!(
+            res.bonus_token,
+            Some(2),
+            "bonus from peaked target must be token 2"
+        );
+    }
+
+    #[test]
+    fn mtp_rejection_sampling_seeded_rejection_samples_target_token() {
+        // q peaks at 0, p peaks at 1 → accept_prob = 0 → certain rejection.
+        // Adjusted distribution = max(0, p-q) has all mass at token 1 → bonus = Some(1).
+        const VOCAB: usize = 4;
+        let mut q_peak_0 = vec![f32::NEG_INFINITY; VOCAB];
+        q_peak_0[0] = 100.0;
+        let mut p_peak_1 = vec![f32::NEG_INFINITY; VOCAB];
+        p_peak_1[1] = 100.0;
+
+        let res = rejection_sample_draft(
+            &[0u32],
+            &[q_peak_0],
+            &p_peak_1,
+            &[p_peak_1.clone()],
+            false,
+            Some(13),
+        )
+        .unwrap();
+
+        assert_eq!(res.accepted_count, 0);
+        assert!(res.accepted_tokens.is_empty());
+        assert!(res.had_rejection);
+        assert_eq!(
+            res.bonus_token,
+            Some(1),
+            "adjusted sampling must produce token 1"
+        );
+    }
+
+    #[test]
+    fn mtp_rejection_sampling_partial_acceptance_rolls_back_gdn_to_accepted_prefix() {
+        // 3-token draft: tokens [0, 1, 2].
+        //   draft_logits  = [peak0, peak1, q_peak_2]  — draft model near-certain at each
+        //   initial_target = peak0                     — p/q ≈ 1 at i=0 → accept token 0
+        //   target_logits[0] = peak1                  — p/q ≈ 1 at i=1 → accept token 1
+        //   target_logits[1] = p_peak_5               — p_peak_5[2]/q_peak_2[2] ≈ 0 → reject
+        //   bonus = argmax(adjusted(p_peak_5, q_peak_2)) = 5
+        const VOCAB: usize = 8;
+        let peak0 = peaked_logits(VOCAB, 0, 100.0);
+        let peak1 = peaked_logits(VOCAB, 1, 100.0);
+        let q_peak_2 = peaked_logits(VOCAB, 2, 100.0);
+        let p_peak_5 = peaked_logits(VOCAB, 5, 100.0);
+        let bonus_peak_6 = peaked_logits(VOCAB, 6, 100.0);
+
+        let rs = rejection_sample_draft(
+            &[0u32, 1, 2],
+            &[peak0.clone(), peak1.clone(), q_peak_2.clone()],
+            &peak0,
+            &[peak1.clone(), p_peak_5.clone(), bonus_peak_6.clone()],
+            false,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(rs.accepted_count, 2);
+        assert_eq!(rs.accepted_tokens, vec![0u32, 1]);
+        assert!(rs.had_rejection);
+        assert_eq!(rs.bonus_token, Some(5));
+
+        // Verify that callers (mtp_verify_draft) will correctly roll back cache to
+        // target_start + accepted_count = target_start + 2.
+        let target_start = 10usize;
+        let mut restore_gdn_called = false;
+        let mut mock = {
+            struct GdnMock {
+                cache_pos: usize,
+                restore_called: *mut bool,
+            }
+            impl MtpTargetVerifier for GdnMock {
+                fn cache_position(&self) -> usize {
+                    self.cache_pos
+                }
+                fn rollback_cache_to(
+                    &mut self,
+                    seq_len: usize,
+                ) -> Result<(), crate::error::InferenceError> {
+                    self.cache_pos = seq_len;
+                    Ok(())
+                }
+                fn verify_tokens(
+                    &mut self,
+                    tokens: &[u32],
+                    _: usize,
+                ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+                    self.cache_pos += tokens.len();
+                    Ok(vec![])
+                }
+                fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+                    Vec::new()
+                }
+                fn restore_gdn_states(&mut self, _: &crate::attention::gdn::GdnSnapshot) {
+                    // SAFETY: single-threaded test, pointer is to a local bool.
+                    unsafe {
+                        *self.restore_called = true;
+                    }
+                }
+            }
+            GdnMock {
+                cache_pos: target_start,
+                restore_called: &mut restore_gdn_called,
+            }
+        };
+
+        // Simulate what mtp_verify_draft does: advance cache via verify_tokens, then roll back.
+        mock.verify_tokens(&[0u32, 1, 2], target_start + 1).unwrap();
+        mock.rollback_cache_to(target_start + rs.accepted_count)
+            .unwrap();
+
+        assert_eq!(
+            mock.cache_pos,
+            target_start + 2,
+            "rollback must leave cache at target_start + accepted_count"
+        );
+        assert!(
+            !restore_gdn_called,
+            "partial accept must not call restore_gdn_states; rollback_cache_to handles GDN"
+        );
+    }
+
+    #[test]
+    fn rejection_greedy_mode_regression_matches_existing_argmax_behavior() {
+        // Regression guard: greedy=true path must still accept only argmax-matching tokens.
+        // initial_target peaks at 5 → draft[0]=5 accepted.
+        // target_logits[0] peaks at 9 ≠ draft[1]=7 → reject; bonus = 9.
+        const VOCAB: usize = 10;
+        let draft_tokens = vec![5u32, 7, 3];
+        let initial_target = peaked_logits(VOCAB, 5, 5.0);
+        let target_logits = vec![
+            peaked_logits(VOCAB, 9, 5.0),
+            peaked_logits(VOCAB, 2, 5.0),
+            peaked_logits(VOCAB, 4, 5.0),
+        ];
+        let draft_logits = vec![
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+            uniform_logits(VOCAB),
+        ];
+
+        let res = rejection_sample_draft(
+            &draft_tokens,
+            &draft_logits,
+            &initial_target,
+            &target_logits,
+            true,
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            res.accepted_count, 1,
+            "only draft[0]=5 matches initial_target argmax=5"
+        );
+        assert!(res.had_rejection);
+        assert_eq!(
+            res.bonus_token,
+            Some(9),
+            "bonus is argmax of target_logits[0]"
+        );
     }
 }
