@@ -30,10 +30,12 @@
 //! ```
 
 mod apply;
+pub mod online;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 
 pub use apply::apply_lora;
+pub use online::{AdaptStepResult, adapt_step};
 
 use std::collections::HashMap;
 use std::path::Path;
