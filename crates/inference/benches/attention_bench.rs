@@ -3,6 +3,7 @@ use lattice_inference::attention::flash::{
     tiled_multi_head_attention,
 };
 use lattice_inference::attention::standard::{AttentionBuffers, multi_head_attention};
+use lattice_inference::lora_hook::NoopLoraHook;
 use lattice_inference::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 use std::hint::black_box;
 use std::time::Instant;
@@ -261,6 +262,8 @@ fn run_case(model: &ModelCase, seq_len: usize) {
         model.num_heads,
         model.head_dim,
         &mut materialized_buffers,
+        &NoopLoraHook,
+        0,
     );
     let tiled_once = tiled_multi_head_attention(
         &hidden_states,
@@ -294,6 +297,8 @@ fn run_case(model: &ModelCase, seq_len: usize) {
         model.num_heads,
         model.head_dim,
         &mut materialized_buffers,
+        &NoopLoraHook,
+        0,
     ));
     let _ = black_box(tiled_multi_head_attention(
         &hidden_states,
@@ -320,6 +325,8 @@ fn run_case(model: &ModelCase, seq_len: usize) {
             model.num_heads,
             model.head_dim,
             &mut materialized_buffers,
+            &NoopLoraHook,
+            0,
         );
         black_box(output);
     });

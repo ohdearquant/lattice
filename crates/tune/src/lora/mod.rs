@@ -14,6 +14,10 @@
 //! - **Attention**: `q_proj`, `k_proj`, `v_proj`, `o_proj`
 //! - **MLP**: `gate_proj`, `up_proj`, `down_proj`
 //!
+//! For BERT/CrossEncoder models:
+//! - **Attention**: `query`, `key`, `value`, `attn_output`
+//! - **FFN**: `ffn_intermediate`, `ffn_output`
+//!
 //! # Example
 //!
 //! ```ignore
@@ -36,6 +40,8 @@ mod safetensors;
 
 pub use apply::apply_lora;
 pub use online::{AdaptStepResult, adapt_step};
+#[cfg(feature = "safetensors")]
+pub use safetensors::{load_peft_safetensors, save_peft_safetensors};
 
 use std::collections::HashMap;
 use std::path::Path;

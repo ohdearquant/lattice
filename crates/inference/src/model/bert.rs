@@ -7,7 +7,7 @@
 use crate::attention::{AttentionBuffers, multi_head_attention_in_place};
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
-use crate::forward::cpu::{add_bias, add_bias_gelu, layer_norm, matmul_bt};
+use crate::forward::cpu::{add_bias, gelu, layer_norm, matmul_bt};
 use crate::lora_hook::{LoraHook, NoopLoraHook};
 use crate::pool::{l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
@@ -402,12 +402,13 @@ impl BertModel {
                     hidden_size,
                     intermediate_size,
                 );
-                add_bias_gelu(
+                add_bias(
                     ffn_intermediate,
                     layer.ffn_intermediate_bias.data,
                     intermediate_size,
                 );
                 lora.apply(layer_idx, "ffn_intermediate", &hidden, ffn_intermediate);
+                gelu(ffn_intermediate);
             }
 
             {
