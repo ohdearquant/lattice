@@ -88,6 +88,7 @@ Semantics:
 - `block` inferred from module name: attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_*`, `out_proj`) → `self_attn`; MLP projections (`gate_proj`, `up_proj`, `down_proj`) → `mlp`
 - All tensors written as F32 (matching the in-memory representation)
 - Symmetric with `load_peft_safetensors`: `save(load(file)) ≈ file` up to metadata ordering
+- **Scope**: LLaMA-family PEFT key format only (`base_model.model.model.layers.{i}.{block}.{module}`). BERT PEFT keys use a different hierarchy (`encoder.layer.{i}.attention.self.{module}`) which neither `save_peft_safetensors` nor the existing `parse_peft_key` / `load_peft_safetensors` handle. BERT PEFT format support is a follow-up tracked alongside the D1 implementation
 
 The `LoraAdapter` method facade:
 
