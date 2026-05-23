@@ -30,10 +30,12 @@
 //! ```
 
 mod apply;
+pub mod online;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 
 pub use apply::apply_lora;
+pub use online::{AdaptStepResult, adapt_step};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -109,6 +111,16 @@ impl LoraAdapter {
         safetensors::load_peft_safetensors(path)
     }
 
+    /// Save this LoRA adapter to a PEFT-format safetensors file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tensor serialization fails or the file cannot be written.
+    #[cfg(feature = "safetensors")]
+    pub fn save_safetensors(&self, path: &Path) -> crate::error::Result<()> {
+        safetensors::save_peft_safetensors(self, path)
+    }
+
     /// Construct an adapter from pre-built components (for testing or
     /// when loading from a custom format).
     pub fn new(config: LoraConfig, layers: HashMap<(usize, String), LoraLayer>) -> Self {
@@ -147,6 +159,17 @@ impl LoraAdapter {
     /// Return the total number of LoRA parameters (A + B matrices).
     pub fn num_parameters(&self) -> usize {
         self.layers.values().map(|l| l.a.len() + l.b.len()).sum()
+    }
+
+    /// Return `(layer_idx, module_name)` pairs whose module is not in `known`.
+    ///
+    /// Useful for detecting typos in adapter target modules before inference.
+    pub fn validate_modules(&self, known: &[&str]) -> Vec<(usize, String)> {
+        self.layers
+            .keys()
+            .filter(|(_, m)| !known.iter().any(|k| k == m))
+            .cloned()
+            .collect()
     }
 }
 
@@ -277,5 +300,48 @@ mod tests {
     fn test_num_adapted_layers() {
         let adapter = make_test_adapter();
         assert_eq!(adapter.num_adapted_layers(), 1);
+    }
+
+    #[test]
+    fn test_validate_modules_all_known() {
+        let adapter = make_test_adapter();
+        let unknown = adapter.validate_modules(&["q_proj", "v_proj", "k_proj"]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn test_validate_modules_typo() {
+        let config = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec!["q_porj".into()],
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_porj".into()),
+            LoraLayer {
+                a: vec![1.0; 8],
+                b: vec![1.0; 8],
+                d_in: 4,
+                d_out: 4,
+                rank: 2,
+            },
+        );
+        let adapter = LoraAdapter::new(config, layers);
+        let unknown = adapter.validate_modules(&["q_proj", "v_proj"]);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0], (0, "q_porj".to_string()));
+    }
+
+    #[test]
+    fn test_validate_modules_empty_adapter() {
+        let config = LoraConfig {
+            rank: 2,
+            alpha: 4.0,
+            target_modules: vec![],
+        };
+        let adapter = LoraAdapter::new(config, HashMap::new());
+        let unknown = adapter.validate_modules(&["q_proj"]);
+        assert!(unknown.is_empty());
     }
 }
