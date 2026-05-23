@@ -29,20 +29,29 @@ khive's brain pack (ADR-032, ADR-042) consumes lattice as its inference and fine
 
 ### D1: LoraHook injection in BertModel and CrossEncoderModel
 
-Add a `&dyn LoraHook` parameter to the BERT forward path. The hook is called after each encoder-layer linear projection (`query`, `key`, `value`, `output`, `intermediate`, `output_dense`) — the same call pattern as the Qwen path.
+Add a `&dyn LoraHook` parameter to the BERT forward path. The hook is called after each encoder-layer linear projection, using BERT-convention module names (not Qwen-convention).
 
-Two new methods, leaving existing API intact:
+**Structural prerequisite**: today, BERT's Q/K/V and output projections are computed inside the opaque `multi_head_attention_in_place()` function (`crates/inference/src/attention/standard.rs`). This function takes layer weights and buffers but has no LoraHook parameter. To inject hooks at per-projection granularity, `multi_head_attention_in_place` must be extended with a `lora: &dyn LoraHook` parameter and `layer_idx: usize` so the hook can be called after each `matmul_bt`. The existing no-hook call sites pass `&NoopLoraHook` — zero behavioral change for non-LoRA paths.
+
+The FFN projections (`intermediate.dense`, `output.dense`) are already individual `matmul_bt` calls in `BertModel::forward` (`bert.rs:363`, `bert.rs:381`) and can accept hook calls directly without refactoring.
+
+**BERT module names for LoraHook** (matching actual BERT safetensors weight keys, NOT Qwen/LLaMA convention):
+
+| Hook module name | BERT weight key | Struct field |
+|---|---|---|
+| `"query"` | `encoder.layer.{i}.attention.self.query.weight` | `query_weight` |
+| `"key"` | `encoder.layer.{i}.attention.self.key.weight` | `key_weight` |
+| `"value"` | `encoder.layer.{i}.attention.self.value.weight` | `value_weight` |
+| `"attn_output"` | `encoder.layer.{i}.attention.output.dense.weight` | `attn_output_weight` |
+| `"ffn_intermediate"` | `encoder.layer.{i}.intermediate.dense.weight` | `ffn_intermediate_weight` |
+| `"ffn_output"` | `encoder.layer.{i}.output.dense.weight` | `ffn_output_weight` |
+
+These differ from the Qwen path (`q_proj`, `k_proj`, etc.). PEFT adapters trained on BERT checkpoints use BERT-convention names; adapters trained on Qwen use Qwen-convention names. The `LoraHook` trait already dispatches by string — no conflict as long as consumers load the right adapter for the right model.
+
+Two new methods on `CrossEncoderModel`, plus the internal `multi_head_attention_in_place` refactor:
 
 ```rust
-// BertModel — new method, existing forward_tokenized unchanged
-pub fn forward_tokenized_with_hook(
-    &self,
-    input: &TokenizedInput,
-    buffers: &mut AttentionBuffers,
-    lora: &dyn LoraHook,
-) -> Vec<f32>;
-
-// CrossEncoderModel — new method, existing score/score_batch unchanged
+// CrossEncoderModel — new methods, existing score/score_batch unchanged
 pub fn score_with_hook(
     &self,
     query: &str,
@@ -58,13 +67,13 @@ pub fn score_batch_with_hook(
 ) -> Vec<f32>;
 ```
 
-The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook`). This is additive, not breaking.
+`BertModel::forward_tokenized` is `pub(crate)` today. The hook-aware variant stays `pub(crate)` — downstream consumers access hooks through `CrossEncoderModel::score_with_hook` (which is `pub`), not through the internal BERT forward method directly.
 
-BERT module names for LoraHook: `"q_proj"`, `"k_proj"`, `"v_proj"`, `"o_proj"`, `"intermediate"`, `"output_dense"`. These map to the standard BERT encoder layer projections. Documented in the `LoraHook` trait doc comment.
+The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook`). This is additive, not breaking.
 
 ### D2: Public SafeTensors save
 
-Promote the test helper to a public function in `crates/tune/src/lora/safetensors.rs`:
+Implement a public save function in `crates/tune/src/lora/safetensors.rs`, using the existing test fixture (`write_test_peft_safetensors`, line 529) as a reference for the safetensors serialization API. The test helper writes hardcoded synthetic data for two layers; the public function must iterate an arbitrary `&LoraAdapter`'s layers, infer block names from module names, and write proper metadata:
 
 ```rust
 pub fn save_peft_safetensors(
@@ -108,15 +117,19 @@ pub fn adapt_step(
     input: &[f32],
     target_delta: &[f32],
     learning_rate: f32,
-) -> Option<AdaptStepResult>;
+) -> Result<AdaptStepResult, TuneError>;
 ```
 
 Semantics:
 - One SGD step for a single `(layer_idx, module)` LoRA layer
 - `target_delta`: desired change to the base projection output (the error signal)
-- Computes `loss = ||current_delta - target_delta||²` where `current_delta = scale * B @ (A @ input)`
-- Backpropagates through B and A via the chain rule, updates weights in-place
-- Returns `None` if the adapter has no layer for `(layer_idx, module)`
+- Computes `loss = ||current_delta - target_delta||²` where `current_delta = scale * B @ (A @ x)`
+- Gradient expressions (pinned to prevent implementation drift):
+  - Let `residual = scale * B @ (A @ x) - target_delta`
+  - `dL/dB = 2 * scale * residual @ (A @ x)^T` — outer product of residual with intermediate
+  - `dL/dA = 2 * scale * B^T @ residual @ x^T` — backprop through B then outer product with input
+  - SGD update: `B -= lr * dL/dB`, `A -= lr * dL/dA`
+- Returns `Err(TuneError::InvalidInput(...))` if the adapter has no layer for `(layer_idx, module)`, or if `input.len() != d_in` / `target_delta.len() != d_out` (dimension mismatch)
 - Deterministic: identical inputs + starting weights → identical outputs
 - No async, no IO — same purity contract as `apply_lora`
 - Per-parameter Adam state is a follow-up (this ADR scopes to vanilla SGD)
@@ -140,7 +153,7 @@ impl LoraAdapter {
 }
 ```
 
-Consumers call `validate_modules(&["q_proj", "k_proj", ...])` at load time and handle unknowns (warn, error, or ignore) per their policy. khive maintains its own `ModuleName` enum on its side for serde/compile-time safety and maps through `validate_modules` at the lattice boundary.
+Consumers call `validate_modules(&["query", "key", "value", ...])` (BERT) or `validate_modules(&["q_proj", "k_proj", ...])` (Qwen) at load time and handle unknowns (warn, error, or ignore) per their policy. khive maintains its own `ModuleName` enum on its side for serde/compile-time safety and maps through `validate_modules` at the lattice boundary.
 
 This preserves lattice's open extensibility while giving consumers an opt-in validation hook.
 
@@ -164,11 +177,16 @@ lattice-inference = "0.2"  # Required for LoraHook trait
 
 ```rust
 use lattice_tune::lora::LoraAdapter;
-use lattice_inference::LoraHook;
+use lattice_inference::lora_hook::LoraHook;  // not re-exported at crate root
 
 let adapter = LoraAdapter::from_safetensors(path)?;
-let hook: Box<dyn LoraHook> = Box::new(adapter);
-model.set_lora(hook);
+
+// Qwen (decoder) — set_lora stores the hook on the model
+let hook: Box<dyn LoraHook> = Box::new(adapter.clone());
+qwen_model.set_lora(hook);
+
+// BERT/cross-encoder — pass hook per call (D1, this ADR)
+let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
 ```
 
 ### Alternatives Considered
@@ -192,7 +210,7 @@ model.set_lora(hook);
 
 ### Negative
 
-- `forward_tokenized_with_hook` adds a method to `BertModel`'s public API — if the LoraHook trait shape changes (unlikely post-stabilization), both Qwen and BERT paths need updating
+- `multi_head_attention_in_place` gains a `&dyn LoraHook` + `layer_idx` parameter — all existing call sites must be updated to pass `&NoopLoraHook` (mechanical but wide-reaching across BERT forward paths)
 - `adapt_step` is vanilla SGD — consumers expecting Adam/AdamW must wait for a follow-up or wrap with their own optimizer state
 - `save_peft_safetensors` produces F32-only output — no f16/bf16 quantized save (acceptable: adapters are small, ~1-10 MB)
 
@@ -203,7 +221,7 @@ model.set_lora(hook);
 | 1 | D5: Consumer docs for inference-hook | #63 | ~30 min |
 | 2 | D2: SafeTensors save | #60 | ~2 hours |
 | 3 | D4: validate_modules | #62 | ~1 hour |
-| 4 | D1: LoraHook in BertModel + CrossEncoderModel | #59 | ~4 hours |
+| 4 | D1: LoraHook in BertModel + CrossEncoderModel (includes `multi_head_attention_in_place` refactor) | #59 | ~6 hours |
 | 5 | D3: Online adapt_step | #61 | ~4 hours |
 
 Phases 1-3 are independent and can run in parallel. Phase 4 requires reading the BERT forward path. Phase 5 is independent of phase 4.
@@ -215,7 +233,7 @@ Phases 1-3 are independent and can run in parallel. Phase 4 requires reading the
 - Issue #61: adapt_step for online single-event gradient steps
 - Issue #62: Typed ModuleName enum discussion
 - Issue #63: Downstream consumer Cargo.toml example
-- ADR-008: LoRA hooks (trait shape, String key rationale)
+- ADR-008: LoRA Injection via Trait Hook (`ADR-008-lora-injection.md`; trait shape, String key rationale)
 - ADR-031: LoRA adapter management (load/apply)
 - ADR-033: JIT adaptation (placeholder gap)
 - `crates/inference/src/lora_hook.rs` — LoraHook trait
