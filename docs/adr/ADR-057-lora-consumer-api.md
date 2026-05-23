@@ -1,4 +1,4 @@
-# ADR-056: LoRA Full-Lifecycle Consumer API
+# ADR-057: LoRA Full-Lifecycle Consumer API
 
 **Status**: Draft
 **Date**: 2026-05-23
@@ -69,7 +69,9 @@ pub fn score_batch_with_hook(
 
 `BertModel::forward_tokenized` is `pub(crate)` today. The hook-aware variant stays `pub(crate)` — downstream consumers access hooks through `CrossEncoderModel::score_with_hook` (which is `pub`), not through the internal BERT forward method directly.
 
-The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook`). This is additive, not breaking.
+The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook` from `lattice_inference::lora_hook::NoopLoraHook`). This is additive, not breaking.
+
+**Implementation note**: when D1 lands, the `LoraHook` trait doc comment (`crates/inference/src/lora_hook.rs:19-21`) and `LoraAdapter` module doc (`crates/tune/src/lora/mod.rs:12-15`) must be updated to include the BERT module names alongside the existing Qwen/GDN names.
 
 ### D2: Public SafeTensors save
 
@@ -127,8 +129,8 @@ Semantics:
 - Computes `loss = ||current_delta - target_delta||²` where `current_delta = scale * B @ (A @ x)`
 - Gradient expressions (pinned to prevent implementation drift):
   - Let `residual = scale * B @ (A @ x) - target_delta`
-  - `dL/dB = 2 * scale * residual @ (A @ x)^T` — outer product of residual with intermediate
-  - `dL/dA = 2 * scale * B^T @ residual @ x^T` — backprop through B then outer product with input
+  - `dL/dB = 2 * scale * outer(residual, A @ x)` — outer product, shape `(d_out, rank)`
+  - `dL/dA = 2 * scale * outer(B^T @ residual, x)` — backprop through B, then outer product with input, shape `(rank, d_in)`
   - SGD update: `B -= lr * dL/dB`, `A -= lr * dL/dA`
 - Returns `Err(TuneError::InvalidInput(...))` if the adapter has no layer for `(layer_idx, module)`, or if `input.len() != d_in` / `target_delta.len() != d_out` (dimension mismatch)
 - Deterministic: identical inputs + starting weights → identical outputs
@@ -157,6 +159,8 @@ impl LoraAdapter {
 Consumers call `validate_modules(&["query", "key", "value", ...])` (BERT) or `validate_modules(&["q_proj", "k_proj", ...])` (Qwen) at load time and handle unknowns (warn, error, or ignore) per their policy. khive maintains its own `ModuleName` enum on its side for serde/compile-time safety and maps through `validate_modules` at the lattice boundary.
 
 This preserves lattice's open extensibility while giving consumers an opt-in validation hook.
+
+Tests: `validate_modules` with all-known modules returns empty vec; with a typo (`"q_porj"`) returns that entry; with an empty adapter returns empty vec.
 
 ### D5: Consumer documentation for inference-hook
 
