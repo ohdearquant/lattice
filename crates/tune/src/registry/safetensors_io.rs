@@ -136,7 +136,7 @@ pub fn save_tensors(tensors: &HashMap<String, Vec<f32>>) -> Result<Vec<u8>> {
     // Create tensor views
     let mut tensor_views: HashMap<String, safetensors::tensor::TensorView<'_>> = HashMap::new();
     for (name, bytes) in byte_data.iter() {
-        let original_len = tensors.get(name).map(|v| v.len()).unwrap_or(0);
+        let original_len = tensors.get(name).map(Vec::len).unwrap_or(0);
         let shape = vec![original_len];
         let view = safetensors::tensor::TensorView::new(Dtype::F32, shape, bytes).map_err(|e| {
             TuneError::Storage(format!("Failed to create tensor view for {name}: {e}"))
@@ -179,7 +179,7 @@ pub fn load_tensors(data: &[u8]) -> Result<HashMap<String, Vec<f32>>> {
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
 
-        result.insert(name.to_string(), weights);
+        result.insert(name.clone(), weights);
     }
 
     Ok(result)

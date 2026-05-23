@@ -109,6 +109,16 @@ impl LoraAdapter {
         safetensors::load_peft_safetensors(path)
     }
 
+    /// Save this LoRA adapter to a PEFT-format safetensors file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tensor serialization fails or the file cannot be written.
+    #[cfg(feature = "safetensors")]
+    pub fn save_safetensors(&self, path: &Path) -> crate::error::Result<()> {
+        safetensors::save_peft_safetensors(self, path)
+    }
+
     /// Construct an adapter from pre-built components (for testing or
     /// when loading from a custom format).
     pub fn new(config: LoraConfig, layers: HashMap<(usize, String), LoraLayer>) -> Self {
