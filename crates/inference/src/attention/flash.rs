@@ -747,6 +747,7 @@ mod tests {
     use super::*;
     use crate::attention::{AttentionBuffers, multi_head_attention};
     use crate::forward::cpu::{matmul_bt, softmax_attention};
+    use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 
     #[derive(Clone)]
@@ -1085,6 +1086,8 @@ mod tests {
             num_heads,
             head_dim,
             &mut materialized_buffers,
+            &NoopLoraHook,
+            0,
         );
         let tiled = tiled_multi_head_attention(
             &hidden_states,

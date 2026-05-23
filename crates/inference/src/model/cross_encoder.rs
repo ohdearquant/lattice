@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::attention::AttentionBuffers;
 use crate::error::InferenceError;
+use crate::lora_hook::LoraHook;
 use crate::model::bert::BertModel;
 use crate::pool::cls_pool;
 use crate::weights::{CrossEncoderWeights, SafetensorsFile};
@@ -69,6 +70,41 @@ impl CrossEncoderModel {
     /// Score a query against a batch of documents; returns one sigmoid per document.
     pub fn score_batch(&self, query: &str, documents: &[&str]) -> Vec<f32> {
         documents.iter().map(|doc| self.score(query, doc)).collect()
+    }
+
+    /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
+    pub fn score_with_hook(&self, query: &str, document: &str, lora: &dyn LoraHook) -> f32 {
+        let input = self.bert.tokenizer().tokenize_pair(query, document);
+        let seq_len = input.real_length;
+        if seq_len == 0 {
+            return 0.5;
+        }
+        let hidden_size = self.bert.config().hidden_size;
+        let mut buffers = AttentionBuffers::new(
+            seq_len,
+            hidden_size,
+            self.bert.config().num_attention_heads,
+            self.bert.config().intermediate_size,
+        );
+        let hidden = self
+            .bert
+            .forward_tokenized_with_hook(&input, &mut buffers, lora);
+        let pooled = cls_pool(&hidden, seq_len, hidden_size);
+        let logit = self.classifier.logit(&pooled);
+        sigmoid(logit)
+    }
+
+    /// Score a query against a batch of documents with a LoRA hook applied during each forward pass.
+    pub fn score_batch_with_hook(
+        &self,
+        query: &str,
+        documents: &[&str],
+        lora: &dyn LoraHook,
+    ) -> Vec<f32> {
+        documents
+            .iter()
+            .map(|doc| self.score_with_hook(query, doc, lora))
+            .collect()
     }
 
     /// Access the underlying `BertModel` (for config and tokenizer inspection).

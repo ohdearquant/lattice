@@ -1,4 +1,5 @@
 use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
+use crate::lora_hook::LoraHook;
 use crate::weights::TransformerLayerWeights;
 
 /// **Unstable**: pre-allocated buffers for multi-head attention computation; field layout may change.
@@ -61,6 +62,8 @@ pub fn multi_head_attention(
     num_heads: usize,
     head_dim: usize,
     buffers: &mut AttentionBuffers,
+    lora: &dyn LoraHook,
+    layer_idx: usize,
 ) -> Vec<f32> {
     multi_head_attention_in_place(
         hidden_states,
@@ -71,6 +74,8 @@ pub fn multi_head_attention(
         num_heads,
         head_dim,
         buffers,
+        lora,
+        layer_idx,
     );
     buffers.temp[..seq_len * hidden_size].to_vec()
 }
@@ -85,6 +90,8 @@ pub(crate) fn multi_head_attention_in_place(
     num_heads: usize,
     head_dim: usize,
     buffers: &mut AttentionBuffers,
+    lora: &dyn LoraHook,
+    layer_idx: usize,
 ) {
     debug_assert_eq!(hidden_states.len(), seq_len * hidden_size);
     debug_assert_eq!(attention_mask.len(), seq_len);
@@ -105,6 +112,7 @@ pub(crate) fn multi_head_attention_in_place(
             hidden_size,
         );
         add_bias(q, layer_weights.query_bias.data, hidden_size);
+        lora.apply(layer_idx, "query", hidden_states, q);
     }
 
     {
@@ -118,6 +126,7 @@ pub(crate) fn multi_head_attention_in_place(
             hidden_size,
         );
         add_bias(k, layer_weights.key_bias.data, hidden_size);
+        lora.apply(layer_idx, "key", hidden_states, k);
     }
 
     {
@@ -131,6 +140,7 @@ pub(crate) fn multi_head_attention_in_place(
             hidden_size,
         );
         add_bias(v, layer_weights.value_bias.data, hidden_size);
+        lora.apply(layer_idx, "value", hidden_states, v);
     }
 
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -265,12 +275,14 @@ pub(crate) fn multi_head_attention_in_place(
             hidden_size,
         );
         add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+        lora.apply(layer_idx, "attn_output", concat, output);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 
     /// Build identity-like weights and run multi_head_attention on a small
@@ -388,6 +400,8 @@ mod tests {
             num_heads,
             head_dim,
             &mut buffers,
+            &NoopLoraHook,
+            0,
         );
 
         // With identity Q/K/V weights, zero biases, and mask=all-1:
@@ -417,6 +431,8 @@ mod tests {
             num_heads,
             head_dim,
             &mut buffers2,
+            &NoopLoraHook,
+            0,
         );
         assert_eq!(result, result2, "attention must be deterministic");
     }
@@ -526,6 +542,8 @@ mod tests {
             num_heads,
             head_dim,
             &mut buf1,
+            &NoopLoraHook,
+            0,
         );
         let result_masked = multi_head_attention(
             &hidden_states,
@@ -536,6 +554,8 @@ mod tests {
             num_heads,
             head_dim,
             &mut buf2,
+            &NoopLoraHook,
+            0,
         );
 
         // With different masks, the outputs must differ
