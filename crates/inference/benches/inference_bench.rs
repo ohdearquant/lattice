@@ -8,6 +8,7 @@ use lattice_inference::attention::standard::{AttentionBuffers, multi_head_attent
 use lattice_inference::forward::cpu::{
     add_bias, add_bias_gelu, gelu, layer_norm, matmul_bt, softmax_attention,
 };
+use lattice_inference::lora_hook::NoopLoraHook;
 use lattice_inference::pool::{l2_normalize, mean_pool};
 use lattice_inference::weights::{BertWeights, Tensor1D, Tensor2D, TransformerLayerWeights};
 use lattice_inference::{BertConfig, WordPieceTokenizer};
@@ -452,6 +453,8 @@ fn forward_pass(
             config.num_attention_heads,
             hidden_size / config.num_attention_heads,
             buffers,
+            &NoopLoraHook,
+            0,
         );
 
         for i in 0..used_hidden {
@@ -976,6 +979,8 @@ fn bench_attention_kernel(c: &mut Criterion) {
                     NUM_HEADS,
                     HEAD_DIM,
                     &mut buffers,
+                    &NoopLoraHook,
+                    0,
                 );
                 black_box(output);
             });

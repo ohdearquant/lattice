@@ -7,7 +7,8 @@
 use crate::attention::{AttentionBuffers, multi_head_attention_in_place};
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
-use crate::forward::cpu::{add_bias, add_bias_gelu, layer_norm, matmul_bt};
+use crate::forward::cpu::{add_bias, gelu, layer_norm, matmul_bt};
+use crate::lora_hook::{LoraHook, NoopLoraHook};
 use crate::pool::{l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{BertWeights, SafetensorsFile};
@@ -268,17 +269,28 @@ impl BertModel {
         input: &crate::tokenizer::TokenizedInput,
         buffers: &mut AttentionBuffers,
     ) -> Vec<f32> {
+        self.forward_tokenized_with_hook(input, buffers, &NoopLoraHook)
+    }
+
+    /// Hook-aware forward pass for a pre-tokenized input; used by `CrossEncoderModel`.
+    pub(crate) fn forward_tokenized_with_hook(
+        &self,
+        input: &crate::tokenizer::TokenizedInput,
+        buffers: &mut AttentionBuffers,
+        lora: &dyn LoraHook,
+    ) -> Vec<f32> {
         let seq_len = input.real_length;
-        self.forward(
+        self.forward_with_hook(
             &input.input_ids[..seq_len],
             &input.attention_mask[..seq_len],
             &input.token_type_ids[..seq_len],
             seq_len,
             buffers,
+            lora,
         )
     }
 
-    /// Internal full transformer forward pass.
+    /// Internal full transformer forward pass (no-op hook).
     fn forward(
         &self,
         input_ids: &[u32],
@@ -286,6 +298,26 @@ impl BertModel {
         token_type_ids: &[u32],
         seq_len: usize,
         buffers: &mut AttentionBuffers,
+    ) -> Vec<f32> {
+        self.forward_with_hook(
+            input_ids,
+            attention_mask,
+            token_type_ids,
+            seq_len,
+            buffers,
+            &NoopLoraHook,
+        )
+    }
+
+    /// Hook-aware internal full transformer forward pass.
+    fn forward_with_hook(
+        &self,
+        input_ids: &[u32],
+        attention_mask: &[u32],
+        token_type_ids: &[u32],
+        seq_len: usize,
+        buffers: &mut AttentionBuffers,
+        lora: &dyn LoraHook,
     ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
@@ -340,6 +372,8 @@ impl BertModel {
                 self.config.num_attention_heads,
                 self.config.head_dim(),
                 buffers,
+                lora,
+                layer_idx,
             );
 
             {
@@ -368,11 +402,13 @@ impl BertModel {
                     hidden_size,
                     intermediate_size,
                 );
-                add_bias_gelu(
+                add_bias(
                     ffn_intermediate,
                     layer.ffn_intermediate_bias.data,
                     intermediate_size,
                 );
+                lora.apply(layer_idx, "ffn_intermediate", &hidden, ffn_intermediate);
+                gelu(ffn_intermediate);
             }
 
             {
@@ -387,6 +423,7 @@ impl BertModel {
                     hidden_size,
                 );
                 add_bias(temp, layer.ffn_output_bias.data, hidden_size);
+                lora.apply(layer_idx, "ffn_output", ffn_intermediate, temp);
                 for i in 0..used_hidden {
                     temp[i] += hidden[i];
                 }

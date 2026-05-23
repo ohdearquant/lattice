@@ -93,6 +93,33 @@ This delegates to `LoraAdapter::apply`. The inference forward pass calls `hook.a
 - The `inference-hook` feature creates a compile-time dependency on `lattice-inference`. If `lattice-inference`'s `LoraHook` trait changes signature, `lattice-tune` must update. The trait boundary should be stabilized before the feature is enabled in production builds.
 - Rank validation enforces all layers use the same rank (extracted from the first A matrix encountered). If PEFT ever exports mixed-rank adapters, existing validation will reject them with an error that may be confusing ("inconsistent LoRA ranks").
 
+## Downstream Usage
+
+To use `LoraAdapter` as a `LoraHook` for inference model injection, enable the `inference-hook` feature:
+
+```toml
+# Cargo.toml
+[dependencies]
+lattice-tune = { version = "0.2", features = ["inference-hook"] }
+lattice-inference = "0.2"  # Required for LoraHook trait
+```
+
+```rust
+use lattice_tune::lora::LoraAdapter;
+use lattice_inference::lora_hook::LoraHook;  // not re-exported at crate root
+
+let adapter = LoraAdapter::from_safetensors(path)?;
+
+// Qwen (decoder) — set_lora stores the hook on the model
+let hook: Box<dyn LoraHook> = Box::new(adapter.clone());
+qwen_model.set_lora(hook);
+
+// BERT/cross-encoder — pass hook per call (ADR-057 D1)
+let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
+```
+
+The `LoraHook` trait is defined in `lattice_inference::lora_hook` (not re-exported at the crate root). The `inference-hook` feature on `lattice-tune` provides `impl LoraHook for LoraAdapter` behind `#[cfg(feature = "inference-hook")]`.
+
 ## References
 
 - `crates/tune/src/lora/mod.rs` — `LoraConfig`, `LoraLayer`, `LoraAdapter`, `apply`, `inference-hook` impl

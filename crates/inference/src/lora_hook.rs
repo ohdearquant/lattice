@@ -20,6 +20,7 @@ pub trait LoraHook: Send + Sync {
     ///   `"v_proj"`, `"o_proj"`. Linear-attention layers (GDN): `"in_proj_qkv"`,
     ///   `"in_proj_z"`, `"in_proj_b"`, `"in_proj_a"`, `"out_proj"`.
     ///   MLP (all layers): `"gate_proj"`, `"up_proj"`, `"down_proj"`.
+    ///   BERT: `"query"`, `"key"`, `"value"`, `"attn_output"`, `"ffn_intermediate"`, `"ffn_output"`.
     /// * `x` - Input activation (the same input that was passed to the base projection)
     /// * `output` - Base projection output to modify in-place
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]);

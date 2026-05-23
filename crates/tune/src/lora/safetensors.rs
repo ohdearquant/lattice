@@ -14,7 +14,7 @@
 use super::{LoraAdapter, LoraConfig, LoraLayer};
 use crate::error::TuneError;
 use safetensors::Dtype;
-use safetensors::tensor::SafeTensors;
+use safetensors::tensor::{SafeTensors, TensorView, serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -397,6 +397,70 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
         },
         layers,
     })
+}
+
+/// Save a LoRA adapter to a PEFT-format safetensors file.
+///
+/// Writes one `lora_A` and one `lora_B` tensor per `(layer_idx, module)` pair
+/// using the standard PEFT key format:
+/// `base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`
+///
+/// Metadata stored in the safetensors header: `rank`, `alpha`, `target_modules`.
+///
+/// # Errors
+///
+/// Returns an error if tensor views cannot be created or the file cannot be written.
+pub fn save_peft_safetensors(adapter: &LoraAdapter, path: &Path) -> Result<(), TuneError> {
+    // Collect owned byte buffers first; TensorView borrows from these.
+    let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+
+    for ((layer_idx, module), layer) in &adapter.layers {
+        let block = match module.as_str() {
+            "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
+            "gate_proj" | "up_proj" | "down_proj" => "mlp",
+            _ => "self_attn",
+        };
+
+        let a_key =
+            format!("base_model.model.model.layers.{layer_idx}.{block}.{module}.lora_A.weight");
+        let b_key =
+            format!("base_model.model.model.layers.{layer_idx}.{block}.{module}.lora_B.weight");
+
+        let a_bytes: Vec<u8> = layer.a.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = layer.b.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        byte_data.push((a_key, vec![layer.rank, layer.d_in], a_bytes));
+        byte_data.push((b_key, vec![layer.d_out, layer.rank], b_bytes));
+    }
+
+    let mut tensor_views: HashMap<String, TensorView<'_>> = HashMap::new();
+    for (name, shape, bytes) in &byte_data {
+        let view = TensorView::new(Dtype::F32, shape.clone(), bytes).map_err(|e| {
+            TuneError::Serialization(format!("failed to create tensor view for '{name}': {e}"))
+        })?;
+        tensor_views.insert(name.clone(), view);
+    }
+
+    let mut metadata_map = HashMap::new();
+    metadata_map.insert("rank".to_string(), adapter.config.rank.to_string());
+    metadata_map.insert("alpha".to_string(), adapter.config.alpha.to_string());
+    metadata_map.insert(
+        "target_modules".to_string(),
+        adapter.config.target_modules.join(","),
+    );
+    let metadata = Some(metadata_map);
+
+    let bytes = serialize(&tensor_views, &metadata)
+        .map_err(|e| TuneError::Serialization(format!("failed to serialize LoRA adapter: {e}")))?;
+
+    std::fs::write(path, bytes).map_err(|e| {
+        TuneError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to write LoRA adapter to {}: {e}", path.display()),
+        ))
+    })?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -794,5 +858,77 @@ mod tests {
 
         let err = load_peft_safetensors(&path).unwrap_err();
         assert!(err.to_string().contains("non-finite"));
+    }
+
+    #[test]
+    fn test_save_load_round_trip() {
+        use tempfile::NamedTempFile;
+
+        let rank = 4;
+        let d_in = 8;
+        let d_out = 16;
+
+        // alpha == rank as f32 so the assertion holds: loader always sets alpha = rank as f32
+        let config = LoraConfig {
+            rank,
+            alpha: rank as f32,
+            target_modules: vec!["q_proj".to_string(), "gate_proj".to_string()],
+        };
+
+        let a_data: Vec<f32> = (0..rank * d_in).map(|i| i as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..d_out * rank).map(|i| i as f32 * 0.1).collect();
+        let a2_data: Vec<f32> = (0..rank * d_in).map(|i| i as f32 * -0.01).collect();
+        let b2_data: Vec<f32> = (0..d_out * rank).map(|i| i as f32 * -0.1).collect();
+
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0usize, "q_proj".to_string()),
+            LoraLayer {
+                a: a_data.clone(),
+                b: b_data.clone(),
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        layers.insert(
+            (2usize, "gate_proj".to_string()),
+            LoraLayer {
+                a: a2_data.clone(),
+                b: b2_data.clone(),
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+
+        let adapter = LoraAdapter::new(config, layers);
+
+        let temp = NamedTempFile::new().unwrap();
+        save_peft_safetensors(&adapter, temp.path()).unwrap();
+
+        let loaded = load_peft_safetensors(temp.path()).unwrap();
+
+        assert_eq!(loaded.layers.len(), adapter.layers.len());
+        assert_eq!(loaded.config.rank, adapter.config.rank);
+        assert_eq!(loaded.config.alpha, adapter.config.rank as f32);
+
+        for (key, orig) in &adapter.layers {
+            let got = loaded
+                .layers
+                .get(key)
+                .expect("layer key missing after round-trip");
+            assert_eq!(got.rank, orig.rank);
+            assert_eq!(got.d_in, orig.d_in);
+            assert_eq!(got.d_out, orig.d_out);
+            assert_eq!(got.a.len(), orig.a.len());
+            assert_eq!(got.b.len(), orig.b.len());
+            for (g, w) in got.a.iter().zip(&orig.a) {
+                assert!((g - w).abs() < f32::EPSILON, "A mismatch: {g} vs {w}");
+            }
+            for (g, w) in got.b.iter().zip(&orig.b) {
+                assert!((g - w).abs() < f32::EPSILON, "B mismatch: {g} vs {w}");
+            }
+        }
     }
 }
