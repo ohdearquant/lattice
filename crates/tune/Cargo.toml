@@ -17,7 +17,9 @@ gpu = ["lattice-fann/gpu", "dep:wgpu", "dep:bytemuck"]
 gpu-tests = ["gpu"]
 # Safe checkpoint serialization (recommended for production)
 safetensors = ["dep:safetensors"]
-# Implement LoraHook trait from lattice-inference for adapter injection
+# Enable `impl LoraHook for LoraAdapter` — lets lattice-tune adapters be passed
+# directly to inference model hooks. Requires lattice-inference as a dependency.
+# See ADR-031 §Downstream Usage and ADR-057 §D5.
 inference-hook = ["dep:lattice-inference"]
 # SQLite-backed model registry storage
 sqlite = ["dep:rusqlite", "serde"]
