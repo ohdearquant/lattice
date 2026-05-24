@@ -390,7 +390,7 @@ fn bench_memory_usage(c: &mut Criterion) {
         let v_q = QuantizedVector::from_f32(&v);
 
         let f32_bytes = v.len() * std::mem::size_of::<f32>();
-        let i8_bytes = v_q.data.len() * std::mem::size_of::<i8>() + 16; // + overhead
+        let i8_bytes = v_q.len() * std::mem::size_of::<i8>() + 16; // + overhead
 
         println!(
             "dim={}: float32={}B, int8={}B, ratio={:.1}x",
@@ -692,8 +692,8 @@ fn bench_dot_product_i8_raw(c: &mut Criterion) {
             |bench, _| {
                 bench.iter(|| {
                     black_box(simd::dot_product_i8_raw(
-                        black_box(&a_q.data),
-                        black_box(&b_q.data),
+                        black_box(a_q.data()),
+                        black_box(b_q.data()),
                     ))
                 });
             },
