@@ -295,41 +295,30 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
         let a0 = vld1q_s8(a.as_ptr().add(base));
         let b0 = vld1q_s8(b.as_ptr().add(base));
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) sum0,
-            a = in(vreg) a0,
-            b = in(vreg) b0,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-
         let a1 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH));
         let b1 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH));
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) sum1,
-            a = in(vreg) a1,
-            b = in(vreg) b1,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-
         let a2 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 2));
         let b2 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 2));
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) sum2,
-            a = in(vreg) a2,
-            b = in(vreg) b2,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-
         let a3 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 3));
         let b3 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 3));
+
         core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) sum3,
-            a = in(vreg) a3,
-            b = in(vreg) b3,
+            "sdot {s0:v}.4s, {a0:v}.16b, {b0:v}.16b",
+            "sdot {s1:v}.4s, {a1:v}.16b, {b1:v}.16b",
+            "sdot {s2:v}.4s, {a2:v}.16b, {b2:v}.16b",
+            "sdot {s3:v}.4s, {a3:v}.16b, {b3:v}.16b",
+            s0 = inout(vreg) sum0,
+            a0 = in(vreg) a0,
+            b0 = in(vreg) b0,
+            s1 = inout(vreg) sum1,
+            a1 = in(vreg) a1,
+            b1 = in(vreg) b1,
+            s2 = inout(vreg) sum2,
+            a2 = in(vreg) a2,
+            b2 = in(vreg) b2,
+            s3 = inout(vreg) sum3,
+            a3 = in(vreg) a3,
+            b3 = in(vreg) b3,
             options(pure, nomem, nostack, preserves_flags)
         );
     }
