@@ -112,7 +112,18 @@ pub fn train_lora(
 
     match &config.optimizer {
         None => train_lora_sgd(adapter, samples, config),
-        Some(opt_cfg) => train_lora_adam(adapter, samples, config, opt_cfg),
+        Some(opt_cfg) => {
+            use crate::train::Optimizer;
+            match &opt_cfg.optimizer {
+                Optimizer::Adam | Optimizer::AdamW => {
+                    train_lora_adam(adapter, samples, config, opt_cfg)
+                }
+                unsupported => Err(TuneError::InvalidConfig(format!(
+                    "optimizer variant '{unsupported}' is not supported by train_lora; \
+                     use Adam or AdamW, or set optimizer to None for SGD"
+                ))),
+            }
+        }
     }
 }
 
@@ -393,5 +404,44 @@ mod tests {
 
         assert_eq!(result.total_steps, 15, "3 epochs × 5 samples = 15 steps");
         assert_eq!(result.epoch_losses.len(), 3, "one loss entry per epoch");
+    }
+
+    #[test]
+    fn test_unsupported_optimizer_returns_invalid_config() {
+        use crate::train::{Optimizer, OptimizerConfig};
+
+        let mut adapter = make_small_adapter();
+        let samples = make_samples(2);
+
+        for variant in [
+            OptimizerConfig {
+                optimizer: Optimizer::SGD,
+                ..OptimizerConfig::default()
+            },
+            OptimizerConfig {
+                optimizer: Optimizer::SGDMomentum,
+                ..OptimizerConfig::default()
+            },
+            OptimizerConfig {
+                optimizer: Optimizer::RMSprop,
+                ..OptimizerConfig::default()
+            },
+        ] {
+            let name = variant.optimizer.to_string();
+            let config = LoraTrainConfig {
+                learning_rate: 0.01,
+                num_epochs: 1,
+                batch_size: 1,
+                optimizer: Some(variant),
+                lr_schedule: None,
+                grad_clip_norm: None,
+            };
+            let err = train_lora(&mut adapter, &samples, &config)
+                .expect_err("unsupported optimizer must return Err");
+            assert!(
+                matches!(err, TuneError::InvalidConfig(_)),
+                "expected InvalidConfig for optimizer '{name}', got {err:?}"
+            );
+        }
     }
 }
