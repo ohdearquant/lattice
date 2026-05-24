@@ -68,6 +68,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         seed: Some(42),
         stop_token_ids: vec![],
         enable_thinking: false,
+        enable_mtp: None,
+        grammar: None,
     };
 
     // Same continuation prompt as the original bench, single user turn.
