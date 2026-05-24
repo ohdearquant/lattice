@@ -37,11 +37,13 @@ mod apply;
 pub mod online;
 #[cfg(feature = "safetensors")]
 mod safetensors;
+pub mod train;
 
 pub use apply::apply_lora;
 pub use online::{AdaptStepResult, adapt_step};
 #[cfg(feature = "safetensors")]
 pub use safetensors::{load_peft_safetensors, save_peft_safetensors};
+pub use train::{LoraTrainConfig, TrainResult, TrainSample, train_lora};
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -149,7 +149,9 @@ pub use train::{
 pub use train::{GpuTrainer, GpuTrainerBuilder};
 
 // LoRA re-exports
-pub use lora::{LoraAdapter, LoraConfig, LoraLayer};
+pub use lora::{
+    LoraAdapter, LoraConfig, LoraLayer, LoraTrainConfig, TrainResult, TrainSample, train_lora,
+};
 
 // Registry re-exports
 pub use registry::{
@@ -168,7 +170,9 @@ pub mod prelude {
         LabelingResult, TeacherConfig, TeacherProvider,
     };
     pub use crate::error::{Result, TuneError};
-    pub use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
+    pub use crate::lora::{
+        LoraAdapter, LoraConfig, LoraLayer, LoraTrainConfig, TrainResult, TrainSample, train_lora,
+    };
     pub use crate::registry::{
         LiveModel, ModelMetadata, ModelRegistry, ModelStatus, RegisteredModel, RollbackController,
         RollbackRecord, ShadowComparison, ShadowConfig, ShadowSession, ShadowState, StorageBackend,
