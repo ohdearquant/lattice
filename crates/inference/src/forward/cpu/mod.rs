@@ -28,6 +28,8 @@ pub use softmax::softmax_attention;
 #[cfg(test)]
 pub use activation::{add_bias_gelu_scalar, fast_tanh, gelu_scalar};
 #[cfg(test)]
+pub use elementwise::{elementwise_mul_scalar, rms_norm_scalar, silu_inplace_scalar};
+#[cfg(test)]
 pub use matmul::matmul_bt_scalar;
 #[cfg(test)]
 pub use norm::layer_norm_scalar;

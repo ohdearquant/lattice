@@ -531,7 +531,7 @@ fn test_quantization_zero_vector() {
     let quantized = QuantizedVector::from_f32(&zero);
 
     // All quantized values should be 0
-    for val in &quantized.data {
+    for val in quantized.data() {
         assert_eq!(*val, 0, "Zero vector should quantize to all zeros");
     }
 
@@ -551,8 +551,8 @@ fn test_quantization_single_value_vector() {
     let quantized = QuantizedVector::from_f32(&uniform);
 
     // All quantized values should be the same
-    let first = quantized.data[0];
-    for val in &quantized.data {
+    let first = quantized.data()[0];
+    for val in quantized.data() {
         assert_eq!(*val, first, "Uniform vector should quantize uniformly");
     }
 }
@@ -564,7 +564,7 @@ fn test_quantization_max_values() {
     let quantized = QuantizedVector::from_f32(&max_val);
 
     // All should quantize to 127 (max int8 for symmetric quantization)
-    for val in &quantized.data {
+    for val in quantized.data() {
         assert_eq!(*val, 127, "Max values should quantize to 127");
     }
 }
@@ -575,7 +575,7 @@ fn test_quantization_min_values() {
     let quantized = QuantizedVector::from_f32(&min_val);
 
     // All should quantize to -127 (min int8 for symmetric quantization)
-    for val in &quantized.data {
+    for val in quantized.data() {
         assert_eq!(*val, -127, "Min values should quantize to -127");
     }
 }
@@ -588,7 +588,7 @@ fn test_quantization_with_nan() {
     let quantized = QuantizedVector::from_f32(&with_nan);
 
     // NaN should be treated as 0
-    assert_eq!(quantized.data[100], 0, "NaN should quantize to 0");
+    assert_eq!(quantized.data()[100], 0, "NaN should quantize to 0");
 
     // Norm should exclude NaN
     assert!(
@@ -605,7 +605,7 @@ fn test_quantization_with_infinity() {
     let quantized = QuantizedVector::from_f32(&with_inf);
 
     // Infinity should be treated as 0
-    assert_eq!(quantized.data[100], 0, "Infinity should quantize to 0");
+    assert_eq!(quantized.data()[100], 0, "Infinity should quantize to 0");
 }
 
 #[test]

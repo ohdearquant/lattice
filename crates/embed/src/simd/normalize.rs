@@ -315,7 +315,6 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     let norm_vec = vaddq_f32(vaddq_f32(norm0, norm1), vaddq_f32(norm2, norm3));
     let mut norm_sq = horizontal_sum_neon(norm_vec);
 
-    // Remainder for norm calculation
     for val in vector.iter().skip(chunks * CHUNK_SIZE) {
         norm_sq += val * val;
     }

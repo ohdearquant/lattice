@@ -35,11 +35,13 @@
 
 mod apply;
 pub mod online;
+pub mod optimizer;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 
 pub use apply::apply_lora;
 pub use online::{AdaptStepResult, adapt_step};
+pub use optimizer::{AdamState, LoraGradients, compute_lora_gradients};
 #[cfg(feature = "safetensors")]
 pub use safetensors::{load_peft_safetensors, save_peft_safetensors};
 

@@ -182,5 +182,13 @@ required-features = ["metal-gpu", "f16"]
 name = "elementwise_cpu_bench"
 harness = false
 
+[[bench]]
+name = "elementwise_bench"
+harness = false
+
+[[bench]]
+name = "attn_opt_bench"
+harness = false
+
 [lints]
 workspace = true

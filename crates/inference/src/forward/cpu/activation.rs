@@ -105,27 +105,74 @@ unsafe fn gelu_neon(x: &mut [f32]) {
     let half = vdupq_n_f32(0.5);
     let one = vdupq_n_f32(1.0);
 
-    let chunks = x.len() / 4;
+    let n = x.len();
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL;
+    let chunks = n / CHUNK;
     let ptr = x.as_mut_ptr();
 
     for c in 0..chunks {
-        let off = c * 4;
+        let base = c * CHUNK;
+
+        let v0 = vld1q_f32(ptr.add(base) as *const f32);
+        let v1 = vld1q_f32(ptr.add(base + 4) as *const f32);
+        let v2 = vld1q_f32(ptr.add(base + 8) as *const f32);
+        let v3 = vld1q_f32(ptr.add(base + 12) as *const f32);
+
+        let i0 = vmulq_f32(
+            sqrt_2_over_pi,
+            vfmaq_f32(v0, coeff, vmulq_f32(vmulq_f32(v0, v0), v0)),
+        );
+        let i1 = vmulq_f32(
+            sqrt_2_over_pi,
+            vfmaq_f32(v1, coeff, vmulq_f32(vmulq_f32(v1, v1), v1)),
+        );
+        let i2 = vmulq_f32(
+            sqrt_2_over_pi,
+            vfmaq_f32(v2, coeff, vmulq_f32(vmulq_f32(v2, v2), v2)),
+        );
+        let i3 = vmulq_f32(
+            sqrt_2_over_pi,
+            vfmaq_f32(v3, coeff, vmulq_f32(vmulq_f32(v3, v3), v3)),
+        );
+
+        let t0 = fast_tanh_neon(i0);
+        let t1 = fast_tanh_neon(i1);
+        let t2 = fast_tanh_neon(i2);
+        let t3 = fast_tanh_neon(i3);
+
+        vst1q_f32(
+            ptr.add(base),
+            vmulq_f32(vmulq_f32(half, v0), vaddq_f32(one, t0)),
+        );
+        vst1q_f32(
+            ptr.add(base + 4),
+            vmulq_f32(vmulq_f32(half, v1), vaddq_f32(one, t1)),
+        );
+        vst1q_f32(
+            ptr.add(base + 8),
+            vmulq_f32(vmulq_f32(half, v2), vaddq_f32(one, t2)),
+        );
+        vst1q_f32(
+            ptr.add(base + 12),
+            vmulq_f32(vmulq_f32(half, v3), vaddq_f32(one, t3)),
+        );
+    }
+
+    let remaining = chunks * CHUNK;
+    let simd_tail = (n - remaining) / 4;
+    for c in 0..simd_tail {
+        let off = remaining + c * 4;
         let v = vld1q_f32(ptr.add(off) as *const f32);
-        let v2 = vmulq_f32(v, v);
-        let v3 = vmulq_f32(v2, v);
-
-        // inner = sqrt_2_over_pi * (v + coeff * v^3)
-        let inner = vmulq_f32(sqrt_2_over_pi, vfmaq_f32(v, coeff, v3));
-
-        let tanh_val = fast_tanh_neon(inner);
-
-        // gelu = 0.5 * v * (1 + tanh(inner))
-        let result = vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, tanh_val));
+        let inner = vmulq_f32(
+            sqrt_2_over_pi,
+            vfmaq_f32(v, coeff, vmulq_f32(vmulq_f32(v, v), v)),
+        );
+        let result = vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, fast_tanh_neon(inner)));
         vst1q_f32(ptr.add(off), result);
     }
 
-    // Scalar remainder
-    for i in (chunks * 4)..x.len() {
+    for i in (remaining + simd_tail * 4)..n {
         let v = *ptr.add(i);
         let x3 = v * v * v;
         let inner = 0.797_884_6 * (v + 0.044_715 * x3);
@@ -282,31 +329,92 @@ unsafe fn add_bias_gelu_neon(x: &mut [f32], bias: &[f32], dim: usize) {
     let half = vdupq_n_f32(0.5);
     let one = vdupq_n_f32(1.0);
 
-    let chunks4 = dim / 4;
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL;
+    let chunks = dim / CHUNK;
 
     for row in x.chunks_exact_mut(dim) {
         let ptr = row.as_mut_ptr();
         let b_ptr = bias.as_ptr();
 
-        for c in 0..chunks4 {
-            let off = c * 4;
-            // Load x and bias, fuse add
+        for c in 0..chunks {
+            let base = c * CHUNK;
+            let v0 = vaddq_f32(
+                vld1q_f32(ptr.add(base) as *const f32),
+                vld1q_f32(b_ptr.add(base)),
+            );
+            let v1 = vaddq_f32(
+                vld1q_f32(ptr.add(base + 4) as *const f32),
+                vld1q_f32(b_ptr.add(base + 4)),
+            );
+            let v2 = vaddq_f32(
+                vld1q_f32(ptr.add(base + 8) as *const f32),
+                vld1q_f32(b_ptr.add(base + 8)),
+            );
+            let v3 = vaddq_f32(
+                vld1q_f32(ptr.add(base + 12) as *const f32),
+                vld1q_f32(b_ptr.add(base + 12)),
+            );
+
+            let i0 = vmulq_f32(
+                sqrt_2_over_pi,
+                vfmaq_f32(v0, coeff, vmulq_f32(vmulq_f32(v0, v0), v0)),
+            );
+            let i1 = vmulq_f32(
+                sqrt_2_over_pi,
+                vfmaq_f32(v1, coeff, vmulq_f32(vmulq_f32(v1, v1), v1)),
+            );
+            let i2 = vmulq_f32(
+                sqrt_2_over_pi,
+                vfmaq_f32(v2, coeff, vmulq_f32(vmulq_f32(v2, v2), v2)),
+            );
+            let i3 = vmulq_f32(
+                sqrt_2_over_pi,
+                vfmaq_f32(v3, coeff, vmulq_f32(vmulq_f32(v3, v3), v3)),
+            );
+
+            let t0 = fast_tanh_neon(i0);
+            let t1 = fast_tanh_neon(i1);
+            let t2 = fast_tanh_neon(i2);
+            let t3 = fast_tanh_neon(i3);
+
+            vst1q_f32(
+                ptr.add(base),
+                vmulq_f32(vmulq_f32(half, v0), vaddq_f32(one, t0)),
+            );
+            vst1q_f32(
+                ptr.add(base + 4),
+                vmulq_f32(vmulq_f32(half, v1), vaddq_f32(one, t1)),
+            );
+            vst1q_f32(
+                ptr.add(base + 8),
+                vmulq_f32(vmulq_f32(half, v2), vaddq_f32(one, t2)),
+            );
+            vst1q_f32(
+                ptr.add(base + 12),
+                vmulq_f32(vmulq_f32(half, v3), vaddq_f32(one, t3)),
+            );
+        }
+
+        let remaining = chunks * CHUNK;
+        let simd_tail = (dim - remaining) / 4;
+        for c in 0..simd_tail {
+            let off = remaining + c * 4;
             let v = vaddq_f32(
                 vld1q_f32(ptr.add(off) as *const f32),
                 vld1q_f32(b_ptr.add(off)),
             );
-
-            // GELU: 0.5 * v * (1 + tanh(sqrt(2/pi) * (v + 0.044715 * v^3)))
-            let v2 = vmulq_f32(v, v);
-            let v3 = vmulq_f32(v2, v);
-            let inner = vmulq_f32(sqrt_2_over_pi, vfmaq_f32(v, coeff, v3));
-            let tanh_val = fast_tanh_neon(inner);
-            let result = vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, tanh_val));
-            vst1q_f32(ptr.add(off), result);
+            let inner = vmulq_f32(
+                sqrt_2_over_pi,
+                vfmaq_f32(v, coeff, vmulq_f32(vmulq_f32(v, v), v)),
+            );
+            vst1q_f32(
+                ptr.add(off),
+                vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, fast_tanh_neon(inner))),
+            );
         }
 
-        // Scalar remainder
-        for i in (chunks4 * 4)..dim {
+        for i in (remaining + simd_tail * 4)..dim {
             let v = *ptr.add(i) + *b_ptr.add(i);
             let x3 = v * v * v;
             let inner = 0.797_884_6 * (v + 0.044_715 * x3);

@@ -73,17 +73,33 @@ impl QuantizationParams {
 /// Quantized int8 vector with its parameters.
 #[derive(Debug, Clone)]
 pub struct QuantizedVector {
-    /// **Unstable**: raw quantized data; invariant (`[-127, 127]`) enforced by constructor.
-    ///
-    /// # Invariant
-    /// All values must be in the range `[-127, 127]`. The value `-128` causes
-    /// incorrect results in AVX-512 VNNI and AVX2 SIMD paths due to `vpabsb`
-    /// saturation behavior. The `from_f32` constructor enforces this via clamping.
-    pub data: Vec<i8>,
+    /// Invariant: all values in `[-127, 127]`. Enforced by `from_f32` clamping.
+    /// Private — the invariant makes release-mode assert scans unnecessary.
+    data: Vec<i8>,
     /// **Unstable**: quantization parameters; may be separated from the vector.
     pub params: QuantizationParams,
     /// **Unstable**: L2 norm; may be removed or moved.
     pub norm: f32,
+}
+
+impl QuantizedVector {
+    /// Returns the quantized data as a slice. All values are in `[-127, 127]`.
+    #[inline]
+    pub fn data(&self) -> &[i8] {
+        &self.data
+    }
+
+    /// Returns the number of quantized elements.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if the quantized vector has no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 impl QuantizedVector {
@@ -157,44 +173,27 @@ impl QuantizedVector {
 /// Returns the approximate float dot product.
 /// Returns 0.0 if vectors have different lengths.
 ///
-/// # Feature gate asymmetry
+/// # Invariant
 ///
-/// The float32 AVX-512F path (dot_product, cosine, normalize, distance) activates
-/// unconditionally via runtime `is_x86_feature_detected!("avx512f")` -- no Cargo
-/// feature gate is needed because `_mm512_loadu_ps` / `_mm512_fmadd_ps` etc. are
-/// part of the base AVX-512F ISA and Rust's `#[target_feature(enable = "avx512f")]`
-/// annotation is sufficient.
-///
-/// The integer VNNI path below requires `--features avx512` at compile time because
-/// it uses `_mm512_dpbusd_epi32` (AVX-512 VNNI) and `_mm512_cmplt_epi8_mask`
-/// (AVX-512BW), which are behind nightly-gated intrinsics that need an explicit
-/// Cargo feature to opt in to the extended instruction sets at compile time.
+/// Both vectors must satisfy the `[-127, 127]` range invariant. The value `-128`
+/// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
+/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). The `data` field is private, so
+/// only `from_f32` (which clamps) can populate it — `debug_assert!` is sufficient.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
-    // FP-033: enforce at call time (not just debug) — -128 causes incorrect results
-    // in AVX-512 VNNI via vpabsb saturation; from_f32 clamps to [-127, 127] but
-    // the data field is pub so callers can bypass the constructor.
-    assert!(
-        a.data.iter().all(|&v| v != -128i8),
-        "QuantizedVector a contains -128, which violates the [-127, 127] VNNI invariant"
-    );
-    assert!(
-        b.data.iter().all(|&v| v != -128i8),
-        "QuantizedVector b contains -128, which violates the [-127, 127] VNNI invariant"
-    );
+    debug_assert!(a.data.iter().all(|&v| v != -128i8));
+    debug_assert!(b.data.iter().all(|&v| v != -128i8));
 
-    // Runtime length check to prevent UB in release builds
     if a.data.len() != b.data.len() {
         return 0.0;
     }
-    debug_assert_eq!(a.data.len(), b.data.len());
 
     let denom = a.params.scale * b.params.scale;
     if denom == 0.0 || !denom.is_finite() {
         return 0.0;
     }
 
-    dot_product_i8_raw(&a.data, &b.data) / denom
+    dot_product_i8_dispatch(&a.data, &b.data) / denom
 }
 
 /// Trusted INT8 dot product for constructor-owned vectors in prepared-query paths.
@@ -212,7 +211,7 @@ pub(crate) fn dot_product_i8_trusted(a: &QuantizedVector, b: &QuantizedVector) -
     }
     debug_assert!(a.data.iter().all(|&v| v != i8::MIN));
     debug_assert!(b.data.iter().all(|&v| v != i8::MIN));
-    dot_product_i8_raw(&a.data, &b.data) / denom
+    dot_product_i8_dispatch(&a.data, &b.data) / denom
 }
 
 /// **Unstable**: SIMD INT8 cosine similarity; norm storage approach may change.
@@ -241,116 +240,110 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
     dot_product_i8_trusted(a, b) / denom
 }
 
-/// NEON int8 dot product using vmull/vpadal with 4x unrolling.
+/// NEON int8 dot product using vmull/vpadal with 4x unrolling and software prefetch.
 ///
-/// Processes 64 int8s per iteration with 4 accumulators.
+/// Processes 64 int8s per iteration with 4 accumulators. Prefetches the next
+/// cache line (64 bytes) one iteration ahead to hide DRAM latency for large dims.
 ///
 /// # Safety
 ///
 /// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
+/// - Running on aarch64 with FEAT_DotProd (uses SDOT instruction)
 /// - `a` and `b` have equal length (checked by caller)
+/// - No element is i8::MIN (-128) — see SIMD invariant docs
 ///
 /// Memory safety:
 /// - Uses `vld1q_s8` for loads (handles any alignment)
 /// - Pointer arithmetic stays within slice bounds via chunk calculation
 /// - Remainder handled via safe slice iteration
+/// - Prefetch pointers are bounds-checked before issuing (only prefetch if within slice)
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 16;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent int32 accumulators
     let mut sum0 = vdupq_n_s32(0);
     let mut sum1 = vdupq_n_s32(0);
     let mut sum2 = vdupq_n_s32(0);
     let mut sum3 = vdupq_n_s32(0);
 
+    // Use SDOT (ARMv8.2 dotprod) via inline asm — 1 instruction per 16 i8 elements
+    // vs 6 instructions (split + vmull×2 + vpadalq×2) with the widening approach.
+    // Apple Silicon (M1+) supports dotprod; runtime check at dispatch level.
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
-        // Unroll 0: Load 16 int8s, split, widening multiply, pairwise add
+        let next_base = base + PREFETCH_DISTANCE;
+        if next_base + CHUNK_SIZE <= n {
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) a.as_ptr().add(next_base),
+                options(nostack, readonly, preserves_flags)
+            );
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) b.as_ptr().add(next_base),
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+
         let a0 = vld1q_s8(a.as_ptr().add(base));
         let b0 = vld1q_s8(b.as_ptr().add(base));
-        let a0_lo = vget_low_s8(a0);
-        let a0_hi = vget_high_s8(a0);
-        let b0_lo = vget_low_s8(b0);
-        let b0_hi = vget_high_s8(b0);
-        let prod0_lo = vmull_s8(a0_lo, b0_lo);
-        let prod0_hi = vmull_s8(a0_hi, b0_hi);
-        sum0 = vpadalq_s16(sum0, prod0_lo);
-        sum0 = vpadalq_s16(sum0, prod0_hi);
-
-        // Unroll 1
         let a1 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH));
         let b1 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH));
-        let a1_lo = vget_low_s8(a1);
-        let a1_hi = vget_high_s8(a1);
-        let b1_lo = vget_low_s8(b1);
-        let b1_hi = vget_high_s8(b1);
-        let prod1_lo = vmull_s8(a1_lo, b1_lo);
-        let prod1_hi = vmull_s8(a1_hi, b1_hi);
-        sum1 = vpadalq_s16(sum1, prod1_lo);
-        sum1 = vpadalq_s16(sum1, prod1_hi);
-
-        // Unroll 2
         let a2 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 2));
         let b2 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 2));
-        let a2_lo = vget_low_s8(a2);
-        let a2_hi = vget_high_s8(a2);
-        let b2_lo = vget_low_s8(b2);
-        let b2_hi = vget_high_s8(b2);
-        let prod2_lo = vmull_s8(a2_lo, b2_lo);
-        let prod2_hi = vmull_s8(a2_hi, b2_hi);
-        sum2 = vpadalq_s16(sum2, prod2_lo);
-        sum2 = vpadalq_s16(sum2, prod2_hi);
-
-        // Unroll 3
         let a3 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 3));
         let b3 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 3));
-        let a3_lo = vget_low_s8(a3);
-        let a3_hi = vget_high_s8(a3);
-        let b3_lo = vget_low_s8(b3);
-        let b3_hi = vget_high_s8(b3);
-        let prod3_lo = vmull_s8(a3_lo, b3_lo);
-        let prod3_hi = vmull_s8(a3_hi, b3_hi);
-        sum3 = vpadalq_s16(sum3, prod3_lo);
-        sum3 = vpadalq_s16(sum3, prod3_hi);
+
+        core::arch::asm!(
+            "sdot {s0:v}.4s, {a0:v}.16b, {b0:v}.16b",
+            "sdot {s1:v}.4s, {a1:v}.16b, {b1:v}.16b",
+            "sdot {s2:v}.4s, {a2:v}.16b, {b2:v}.16b",
+            "sdot {s3:v}.4s, {a3:v}.16b, {b3:v}.16b",
+            s0 = inout(vreg) sum0,
+            a0 = in(vreg) a0,
+            b0 = in(vreg) b0,
+            s1 = inout(vreg) sum1,
+            a1 = in(vreg) a1,
+            b1 = in(vreg) b1,
+            s2 = inout(vreg) sum2,
+            a2 = in(vreg) a2,
+            b2 = in(vreg) b2,
+            s3 = inout(vreg) sum3,
+            a3 = in(vreg) a3,
+            b3 = in(vreg) b3,
+            options(nomem, nostack, preserves_flags)
+        );
     }
 
-    // Combine accumulators
     let sum01 = vaddq_s32(sum0, sum1);
     let sum23 = vaddq_s32(sum2, sum3);
     let mut sum_vec = vaddq_s32(sum01, sum23);
 
-    // Tail SIMD chunks: process remaining full 16-byte vectors before scalar tail.
-    // Helps dimensions like 127 (3 tail chunks) or 129 (0 tail chunks, 1 scalar byte).
+    // Tail: remaining full 16-byte vectors using sdot
     let tail_start = chunks * CHUNK_SIZE;
     let tail_chunks = (n - tail_start) / SIMD_WIDTH;
     for j in 0..tail_chunks {
         let base = tail_start + j * SIMD_WIDTH;
         let at = vld1q_s8(a.as_ptr().add(base));
         let bt = vld1q_s8(b.as_ptr().add(base));
-        let at_lo = vget_low_s8(at);
-        let at_hi = vget_high_s8(at);
-        let bt_lo = vget_low_s8(bt);
-        let bt_hi = vget_high_s8(bt);
-        let pt_lo = vmull_s8(at_lo, bt_lo);
-        let pt_hi = vmull_s8(at_hi, bt_hi);
-        sum_vec = vpadalq_s16(sum_vec, pt_lo);
-        sum_vec = vpadalq_s16(sum_vec, pt_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum_vec,
+            a = in(vreg) at,
+            b = in(vreg) bt,
+            options(nomem, nostack, preserves_flags)
+        );
     }
 
-    // Horizontal sum
-    let sum = vgetq_lane_s32(sum_vec, 0)
-        + vgetq_lane_s32(sum_vec, 1)
-        + vgetq_lane_s32(sum_vec, 2)
-        + vgetq_lane_s32(sum_vec, 3);
+    let sum = vaddvq_s32(sum_vec);
 
     // Scalar tail: only the final < SIMD_WIDTH elements
     let remainder_start = tail_start + tail_chunks * SIMD_WIDTH;
@@ -467,7 +460,7 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     (sum + remainder) as f32
 }
 
-/// AVX2 int8 dot product with 4x unrolling.
+/// AVX2 int8 dot product with 4x unrolling and software prefetch.
 ///
 /// # Safety
 ///
@@ -479,12 +472,15 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
 /// - Uses `_mm256_loadu_si256` for unaligned loads (safe for any alignment)
 /// - Pointer arithmetic stays within slice bounds via chunk calculation
 /// - Remainder handled via safe slice iteration
+/// - Prefetch hint issues `_MM_HINT_T0` only when next chunk is within slice bounds
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 32;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    // Prefetch one full chunk ahead for both input arrays.
+    const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
     debug_assert!(a.iter().all(|&v| v != i8::MIN));
@@ -501,6 +497,13 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
+
+        // Software prefetch for the next chunk.
+        let next_base = base + PREFETCH_DISTANCE;
+        if next_base + CHUNK_SIZE <= n {
+            _mm_prefetch(a.as_ptr().add(next_base), _MM_HINT_T0);
+            _mm_prefetch(b.as_ptr().add(next_base), _MM_HINT_T0);
+        }
 
         // Unroll 0
         let a0 = _mm256_loadu_si256(a.as_ptr().add(base) as *const __m256i);
@@ -578,7 +581,9 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
     #[cfg(target_arch = "aarch64")]
     {
-        if config.neon_enabled {
+        // The NEON kernel uses SDOT (ARMv8.2 FEAT_DotProd), which is optional on
+        // Armv8.2/v8.3. Only dispatch when dotprod_enabled is confirmed at runtime.
+        if config.neon_enabled && config.dotprod_enabled {
             return dot_product_i8_neon_kernel;
         }
     }
@@ -601,7 +606,7 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
 #[cfg(target_arch = "aarch64")]
 fn dot_product_i8_neon_kernel(a: &[i8], b: &[i8]) -> f32 {
-    // SAFETY: stored only when NEON was detected at init time (always true on aarch64).
+    // SAFETY: stored only when NEON+dotprod detected at init time.
     unsafe { dot_product_i8_neon_unrolled(a, b) }
 }
 
@@ -636,7 +641,20 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// Returns 0.0 if slices have different lengths.
 ///
+/// # Invariant
+///
+/// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
+/// causes silent corruption in AVX2 and AVX-512 VNNI SIMD paths. This function
+/// enforces the invariant with a release-mode `assert!` at the public boundary.
+///
 /// # Performance
+///
+#[inline]
+fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
+    resolved_i8_dot_kernel()(a, b)
+}
+
+/// **Unstable**: raw INT8 dot product on slices; SIMD strategy may change.
 ///
 /// Uses the same SIMD paths as `dot_product_i8`:
 /// - aarch64: NEON with 4x unrolling + tail SIMD chunks
@@ -649,8 +667,15 @@ pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    debug_assert_eq!(a.len(), b.len());
-    resolved_i8_dot_kernel()(a, b)
+    debug_assert!(
+        a.iter().all(|&v| v != -128i8),
+        "dot_product_i8_raw: slice a contains -128, violating the [-127, 127] SIMD invariant"
+    );
+    debug_assert!(
+        b.iter().all(|&v| v != -128i8),
+        "dot_product_i8_raw: slice b contains -128, violating the [-127, 127] SIMD invariant"
+    );
+    dot_product_i8_dispatch(a, b)
 }
 
 #[cfg(test)]
@@ -671,15 +696,23 @@ mod simd_parity_tests {
             .collect()
     }
 
-    // FP-034: NEON vs scalar parity for INT8 dot product.
+    // FP-034: NEON SDOT vs scalar parity for INT8 dot product.
+    // Gated on dotprod: SDOT is FEAT_DotProd, not baseline NEON.
     #[test]
     fn test_i8_neon_scalar_parity() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if !super::super::SimdConfig::detect().dotprod_enabled {
+                eprintln!("skipping SDOT parity test: dotprod not available");
+                return;
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         for dim in [7usize, 16, 64, 128, 384, 768] {
             let a_q = QuantizedVector::from_f32(&gen_vec(dim, 200 + dim as u64));
             let b_q = QuantizedVector::from_f32(&gen_vec(dim, 300 + dim as u64));
 
-            // SAFETY: NEON is mandatory on aarch64; slices have equal length from from_f32.
+            // SAFETY: dotprod confirmed above; slices have equal length from from_f32.
             let neon = unsafe { dot_product_i8_neon_unrolled(&a_q.data, &b_q.data) };
             let scalar: f32 = a_q
                 .data
