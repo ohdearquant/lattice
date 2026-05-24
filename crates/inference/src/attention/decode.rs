@@ -4,6 +4,7 @@
 //! NEON SIMD path accelerates QK dot products, softmax, and V accumulation.
 
 use crate::attention::gqa::GqaConfig;
+#[cfg(target_arch = "aarch64")]
 use crate::forward::cpu::simd_config;
 
 /// **Unstable**: compute decode-time attention scores for one query token.

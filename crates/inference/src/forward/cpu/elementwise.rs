@@ -407,8 +407,8 @@ unsafe fn rms_norm_avx2(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
         for c in 0..chunks {
             let off = c * 8;
             // SAFETY: off + 7 < chunks * 8 <= hidden, within both row and gamma bounds.
-            let v = _mm256_loadu_ps(row_ptr.add(off) as *const f32);
-            let g = _mm256_loadu_ps(gamma_ptr.add(off) as *const f32);
+            let v = _mm256_loadu_ps(row_ptr.add(off));
+            let g = _mm256_loadu_ps(gamma_ptr.add(off));
             let result = _mm256_mul_ps(_mm256_mul_ps(v, vinv_rms), g);
             _mm256_storeu_ps(row_ptr.add(off), result);
         }
@@ -473,8 +473,8 @@ unsafe fn elementwise_mul_avx2(a: &mut [f32], b: &[f32]) {
     for c in 0..chunks {
         let off = c * 8;
         // SAFETY: off + 7 < chunks * 8 <= n, within both slice bounds.
-        let av = _mm256_loadu_ps(a_ptr.add(off) as *const f32);
-        let bv = _mm256_loadu_ps(b_ptr.add(off) as *const f32);
+        let av = _mm256_loadu_ps(a_ptr.add(off));
+        let bv = _mm256_loadu_ps(b_ptr.add(off));
         _mm256_storeu_ps(a_ptr.add(off), _mm256_mul_ps(av, bv));
     }
     for i in (chunks * 8)..n {
