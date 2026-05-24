@@ -89,8 +89,8 @@ Apply PRs in this order to avoid conflicts:
 6. **PR #72** — `feat(tune): Adam/AdamW optimizer for LoRA training`
 7. **PR #68** — `feat(tune): end-to-end LoRA lifecycle integration tests`
 8. **PR #69** — `test(perf): add performance regression tests for CI`
-9. **PR #74** — `perf(inference): attention throughput optimizations` (pending)
-10. **PR #75** — `docs(bench): performance optimization report` (this PR)
+9. **PR #75** — `perf(inference): decode attention kernel + benchmark`
+10. **PR #74** — `docs(bench): performance optimization report` (this PR, merge last)
 
 ### Optimization Summary
 
@@ -103,7 +103,7 @@ Apply PRs in this order to avoid conflicts:
 | elementwise_mul  | #71 | NEON/AVX2 SIMD dispatch                      |
 | int8 dot product | #70 | Optimized SIMD path for i8 distance ops      |
 | f32 cosine       | #70 | Fused single-pass cosine similarity          |
-| attention        | #74 | Decode-path throughput optimization          |
+| attention        | #75 | Decode-path throughput optimization          |
 | LoRA train loop  | #67 | Batch training with per-epoch loss tracking  |
 | LoRA optimizer   | #72 | Adam/AdamW with bias correction, lr schedule |
 | LoRA lifecycle   | #68 | End-to-end integration tests                 |
