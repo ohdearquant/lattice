@@ -161,8 +161,6 @@ fn test_train_convergence_quality() {
 #[cfg(feature = "safetensors")]
 #[test]
 fn test_save_load_roundtrip() {
-    use lattice_tune::lora::{load_peft_safetensors, save_peft_safetensors};
-
     let mut adapter = make_test_adapter();
 
     // Train briefly so weights are non-trivial.
