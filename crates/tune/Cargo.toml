@@ -56,6 +56,11 @@ required-features = ["safetensors", "inference-hook"]
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "train_bench"
+harness = false
 
 [lints]
 workspace = true
