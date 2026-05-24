@@ -27,7 +27,9 @@ mod tests;
 
 // Re-export public API
 pub use binary::BinaryVector;
-pub use cosine::{batch_cosine_similarity, cosine_similarity};
+pub use cosine::{
+    batch_cosine_one_vs_many, batch_cosine_similarity, cosine_similarity, cosine_similarity_fused,
+};
 pub use distance::{euclidean_distance, squared_euclidean_distance};
 pub use dot_product::{
     DotBatch4Kernel, DotKernel, batch_dot_product, dot_product, dot_product_batch4,
@@ -66,6 +68,11 @@ pub struct SimdConfig {
     pub avx512vnni_enabled: bool,
     /// **Unstable**: NEON support available (aarch64/ARM64).
     pub neon_enabled: bool,
+    /// **Unstable**: ARM FEAT_DotProd (SDOT/UDOT instructions) available (aarch64).
+    ///
+    /// Mandatory on Armv8.4+; optional on Armv8.2/v8.3. Always false on non-aarch64.
+    /// SDOT kernels must only be dispatched when this is `true`.
+    pub dotprod_enabled: bool,
 }
 
 impl Default for SimdConfig {
@@ -89,17 +96,21 @@ impl SimdConfig {
                     && is_x86_feature_detected!("avx512bw")
                     && is_x86_feature_detected!("avx512vnni"),
                 neon_enabled: false,
+                dotprod_enabled: false,
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             // NEON is mandatory on aarch64, always available.
+            // FEAT_DotProd (dotprod) is optional: required on Armv8.4+,
+            // optional on Armv8.2/v8.3. Detect at runtime.
             Self {
                 avx512f_enabled: false,
                 avx2_enabled: false,
                 fma_enabled: false,
                 avx512vnni_enabled: false,
                 neon_enabled: true,
+                dotprod_enabled: std::arch::is_aarch64_feature_detected!("dotprod"),
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -110,6 +121,7 @@ impl SimdConfig {
                 fma_enabled: false,
                 avx512vnni_enabled: false,
                 neon_enabled: false,
+                dotprod_enabled: false,
             }
         }
     }
@@ -129,6 +141,7 @@ impl SimdConfig {
             fma_enabled: false,
             avx512vnni_enabled: false,
             neon_enabled: false,
+            dotprod_enabled: false,
         }
     }
 }
