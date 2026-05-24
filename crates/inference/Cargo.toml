@@ -118,6 +118,10 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]
+name = "elementwise_bench"
+harness = false
+
+[[bench]]
 name = "attention_bench"
 harness = true
 
