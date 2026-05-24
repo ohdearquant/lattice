@@ -69,50 +69,55 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
     let inv_n = 1.0 / hidden as f32;
 
     for row in x.chunks_exact_mut(hidden) {
-        // --- Fused pass: compute sum AND sum-of-squares simultaneously ---
-        // Saves one full read of the row vs separate mean then variance passes.
-        // variance = E[x²] - E[x]² (numerically safe for typical hidden-state magnitudes)
+        let chunks = hidden / 16;
+        let ptr = row.as_ptr();
+
+        // --- Pass 1: compute sum → mean with 4x unrolled accumulators ---
         let mut sum0 = vdupq_n_f32(0.0);
         let mut sum1 = vdupq_n_f32(0.0);
         let mut sum2 = vdupq_n_f32(0.0);
         let mut sum3 = vdupq_n_f32(0.0);
+        for c in 0..chunks {
+            let off = c * 16;
+            sum0 = vaddq_f32(sum0, vld1q_f32(ptr.add(off)));
+            sum1 = vaddq_f32(sum1, vld1q_f32(ptr.add(off + 4)));
+            sum2 = vaddq_f32(sum2, vld1q_f32(ptr.add(off + 8)));
+            sum3 = vaddq_f32(sum3, vld1q_f32(ptr.add(off + 12)));
+        }
+        let combined_sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+        let mut total_sum = vaddvq_f32(combined_sum);
+        for i in (chunks * 16)..hidden {
+            total_sum += *ptr.add(i);
+        }
+        let mean = total_sum * inv_n;
+
+        // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
+        let vmean = vdupq_n_f32(mean);
         let mut sq0 = vdupq_n_f32(0.0);
         let mut sq1 = vdupq_n_f32(0.0);
         let mut sq2 = vdupq_n_f32(0.0);
         let mut sq3 = vdupq_n_f32(0.0);
-
-        let chunks = hidden / 16;
-        let ptr = row.as_ptr();
         for c in 0..chunks {
             let off = c * 16;
-            let v0 = vld1q_f32(ptr.add(off));
-            let v1 = vld1q_f32(ptr.add(off + 4));
-            let v2 = vld1q_f32(ptr.add(off + 8));
-            let v3 = vld1q_f32(ptr.add(off + 12));
-            sum0 = vaddq_f32(sum0, v0);
-            sum1 = vaddq_f32(sum1, v1);
-            sum2 = vaddq_f32(sum2, v2);
-            sum3 = vaddq_f32(sum3, v3);
-            sq0 = vfmaq_f32(sq0, v0, v0);
-            sq1 = vfmaq_f32(sq1, v1, v1);
-            sq2 = vfmaq_f32(sq2, v2, v2);
-            sq3 = vfmaq_f32(sq3, v3, v3);
+            let d0 = vsubq_f32(vld1q_f32(ptr.add(off)), vmean);
+            let d1 = vsubq_f32(vld1q_f32(ptr.add(off + 4)), vmean);
+            let d2 = vsubq_f32(vld1q_f32(ptr.add(off + 8)), vmean);
+            let d3 = vsubq_f32(vld1q_f32(ptr.add(off + 12)), vmean);
+            sq0 = vfmaq_f32(sq0, d0, d0);
+            sq1 = vfmaq_f32(sq1, d1, d1);
+            sq2 = vfmaq_f32(sq2, d2, d2);
+            sq3 = vfmaq_f32(sq3, d3, d3);
         }
-        let combined_sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
-        let mut total_sum = vaddvq_f32(combined_sum);
         let combined_sq = vaddq_f32(vaddq_f32(sq0, sq1), vaddq_f32(sq2, sq3));
         let mut total_sq = vaddvq_f32(combined_sq);
         for i in (chunks * 16)..hidden {
-            let v = *ptr.add(i);
-            total_sum += v;
-            total_sq += v * v;
+            let d = *ptr.add(i) - mean;
+            total_sq += d * d;
         }
-        let mean = total_sum * inv_n;
-        let variance = total_sq * inv_n - mean * mean;
+        let variance = total_sq * inv_n;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
-        // --- Pass 2: normalize using SIMD: (x - mean) * inv_std * gamma + beta ---
-        let vmean = vdupq_n_f32(mean);
+        // --- Pass 3: normalize using SIMD: (x - mean) * inv_std * gamma + beta ---
         let vinv_std = vdupq_n_f32(inv_std);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();
@@ -166,48 +171,55 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
     let inv_n = 1.0 / hidden as f32;
 
     for row in x.chunks_exact_mut(hidden) {
-        // --- Fused pass: compute sum AND sum-of-squares simultaneously ---
+        let chunks = hidden / 32;
+        let ptr = row.as_ptr();
+
+        // --- Pass 1: compute sum → mean with 4x unrolled accumulators ---
         let mut sum0 = _mm256_setzero_ps();
         let mut sum1 = _mm256_setzero_ps();
         let mut sum2 = _mm256_setzero_ps();
         let mut sum3 = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let off = c * 32;
+            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(ptr.add(off)));
+            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(ptr.add(off + 8)));
+            sum2 = _mm256_add_ps(sum2, _mm256_loadu_ps(ptr.add(off + 16)));
+            sum3 = _mm256_add_ps(sum3, _mm256_loadu_ps(ptr.add(off + 24)));
+        }
+        let combined_sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
+        let mut total_sum = hsum_m256(combined_sum);
+        for i in (chunks * 32)..hidden {
+            total_sum += *ptr.add(i);
+        }
+        let mean = total_sum * inv_n;
+
+        // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
+        let vmean = _mm256_set1_ps(mean);
         let mut sq0 = _mm256_setzero_ps();
         let mut sq1 = _mm256_setzero_ps();
         let mut sq2 = _mm256_setzero_ps();
         let mut sq3 = _mm256_setzero_ps();
-
-        let chunks = hidden / 32;
-        let ptr = row.as_ptr();
         for c in 0..chunks {
             let off = c * 32;
-            let v0 = _mm256_loadu_ps(ptr.add(off));
-            let v1 = _mm256_loadu_ps(ptr.add(off + 8));
-            let v2 = _mm256_loadu_ps(ptr.add(off + 16));
-            let v3 = _mm256_loadu_ps(ptr.add(off + 24));
-            sum0 = _mm256_add_ps(sum0, v0);
-            sum1 = _mm256_add_ps(sum1, v1);
-            sum2 = _mm256_add_ps(sum2, v2);
-            sum3 = _mm256_add_ps(sum3, v3);
-            sq0 = _mm256_fmadd_ps(v0, v0, sq0);
-            sq1 = _mm256_fmadd_ps(v1, v1, sq1);
-            sq2 = _mm256_fmadd_ps(v2, v2, sq2);
-            sq3 = _mm256_fmadd_ps(v3, v3, sq3);
+            let d0 = _mm256_sub_ps(_mm256_loadu_ps(ptr.add(off)), vmean);
+            let d1 = _mm256_sub_ps(_mm256_loadu_ps(ptr.add(off + 8)), vmean);
+            let d2 = _mm256_sub_ps(_mm256_loadu_ps(ptr.add(off + 16)), vmean);
+            let d3 = _mm256_sub_ps(_mm256_loadu_ps(ptr.add(off + 24)), vmean);
+            sq0 = _mm256_fmadd_ps(d0, d0, sq0);
+            sq1 = _mm256_fmadd_ps(d1, d1, sq1);
+            sq2 = _mm256_fmadd_ps(d2, d2, sq2);
+            sq3 = _mm256_fmadd_ps(d3, d3, sq3);
         }
-        let combined_sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-        let mut total_sum = hsum_m256(combined_sum);
         let combined_sq = _mm256_add_ps(_mm256_add_ps(sq0, sq1), _mm256_add_ps(sq2, sq3));
         let mut total_sq = hsum_m256(combined_sq);
         for i in (chunks * 32)..hidden {
-            let v = *ptr.add(i);
-            total_sum += v;
-            total_sq += v * v;
+            let d = *ptr.add(i) - mean;
+            total_sq += d * d;
         }
-        let mean = total_sum * inv_n;
-        let variance = total_sq * inv_n - mean * mean;
+        let variance = total_sq * inv_n;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
-        // --- Pass 2: normalize ---
-        let vmean = _mm256_set1_ps(mean);
+        // --- Pass 3: normalize ---
         let vinv_std = _mm256_set1_ps(inv_std);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();

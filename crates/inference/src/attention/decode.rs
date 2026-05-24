@@ -592,4 +592,131 @@ mod tests {
         let mut scores = vec![0.0f32; 4 * 4];
         decode_attention(&q, &[], &[], &mut out, &mut scores, 0, cfg, 1);
     }
+
+    /// FP-NEON-SOFTMAX: NEON decode path (Schraudolph fast_exp) vs scalar path parity.
+    ///
+    /// The NEON softmax uses the Schraudolph bit-trick exp (~5% per-element error).
+    /// Bias cancels approximately in normalization, so the final attention output
+    /// should agree with the scalar path within 5% relative tolerance.
+    ///
+    /// Tested with adversarial score patterns: uniform, monotonic ramp, one-hot spike.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_decode_softmax_neon_vs_scalar_parity() {
+        // LCG data generator matching the pattern used elsewhere in this file.
+        fn lcg_data(n: usize, seed: u32) -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let mut x = (i as u32)
+                        .wrapping_mul(seed)
+                        .wrapping_add(1_013_904_223 ^ seed.wrapping_mul(0x9E37_79B9));
+                    x ^= x >> 16;
+                    x = x.wrapping_mul(0x7FEB_352D);
+                    x ^= x >> 16;
+                    ((x & 0x00FF_FFFF) as f32 / 16_777_216.0 - 0.5) * 2.0
+                })
+                .collect()
+        }
+
+        let cfg = GqaConfig {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 32,
+        };
+
+        // Adversarial score patterns: uniform, monotonic ramp, one-hot spike.
+        let kv_seq_lens: &[(usize, &str)] = &[(16, "uniform"), (32, "ramp"), (8, "one-hot")];
+
+        for &(kv_seq_len, pattern_name) in kv_seq_lens {
+            let q = lcg_data(cfg.q_dim(), 42);
+            let v = lcg_data(kv_seq_len * cfg.kv_dim(), 44);
+
+            // Construct adversarial Q/K pairs for each score pattern.
+            // We run both paths end-to-end from Q/K/V to exercise the full pipeline.
+            let (q_patched, k_patched) = match pattern_name {
+                "uniform" => {
+                    // All-equal scores: uniform Q so all QK dots are equal.
+                    let q_eq = vec![1.0f32 / (cfg.head_dim as f32).sqrt(); cfg.q_dim()];
+                    let k_eq = vec![1.0f32; kv_seq_len * cfg.kv_dim()];
+                    (q_eq, k_eq)
+                }
+                "ramp" => {
+                    // Monotonic ramp: K[i] increases with i so scores are monotone.
+                    let q_r = q.clone();
+                    let k_r: Vec<f32> = (0..kv_seq_len * cfg.kv_dim())
+                        .map(|i| (i / cfg.kv_dim()) as f32 * 0.1)
+                        .collect();
+                    (q_r, k_r)
+                }
+                _ => {
+                    // One-hot spike: only position 0 has a large K, rest are zero.
+                    let q_s = q.clone();
+                    let mut k_s = vec![0.0f32; kv_seq_len * cfg.kv_dim()];
+                    for d in 0..cfg.kv_dim() {
+                        k_s[d] = 10.0;
+                    }
+                    (q_s, k_s)
+                }
+            };
+
+            // Run NEON path (dispatches to NEON on aarch64 when neon_enabled).
+            let mut out_neon = vec![0.0f32; cfg.q_dim()];
+            let mut scores_neon = vec![0.0f32; cfg.num_heads * kv_seq_len];
+            decode_attention(
+                &q_patched,
+                &k_patched,
+                &v,
+                &mut out_neon,
+                &mut scores_neon,
+                kv_seq_len,
+                cfg,
+                kv_seq_len,
+            );
+
+            // Run scalar path directly.
+            let mut out_scalar = vec![0.0f32; cfg.q_dim()];
+            let mut scores_scalar = vec![0.0f32; cfg.num_heads * kv_seq_len];
+            decode_scores_scalar(
+                &q_patched,
+                &k_patched,
+                &mut scores_scalar,
+                kv_seq_len,
+                cfg,
+                kv_seq_len,
+            );
+            softmax_decode_scores(&mut scores_scalar, cfg.num_heads, kv_seq_len, kv_seq_len);
+            out_scalar.fill(0.0);
+            accumulate_decode_v_scalar(
+                &mut out_scalar,
+                &scores_scalar,
+                &v,
+                kv_seq_len,
+                cfg,
+                kv_seq_len,
+            );
+
+            // Assert outputs match within a mixed tolerance budget:
+            //   atol=5e-3 (absolute floor; Schraudolph fast_exp ~5% error on [-1, 1] weights
+            //              contributes an absolute error floor ≈ max_weight * 5%)
+            //   rtol=0.05 (5% relative, accounting for Schraudolph fast_exp error)
+            //
+            // We use |a-b| <= atol + rtol * max(|a|, |b|) which avoids division-by-zero
+            // instability when both values are near zero (e.g. tail positions after softmax).
+            let atol = 5e-3f32;
+            let rtol = 0.05f32;
+            for (i, (&n, &s)) in out_neon.iter().zip(out_scalar.iter()).enumerate() {
+                assert!(
+                    n.is_finite() && s.is_finite(),
+                    "decode_attention pattern={pattern_name} idx={i}: non-finite output neon={n} scalar={s}"
+                );
+                let abs_err = (n - s).abs();
+                let tol = atol + rtol * n.abs().max(s.abs());
+                assert!(
+                    abs_err <= tol,
+                    "decode_attention NEON vs scalar parity failure: pattern={pattern_name} \
+                     idx={i} neon={n:.6} scalar={s:.6} abs_err={abs_err:.6} tol={tol:.6}"
+                );
+            }
+        }
+    }
 }

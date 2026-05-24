@@ -157,6 +157,16 @@ impl QuantizedVector {
 /// Returns the approximate float dot product.
 /// Returns 0.0 if vectors have different lengths.
 ///
+/// # Invariant
+///
+/// Both vectors must satisfy the `[-127, 127]` range invariant. The value `-128`
+/// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
+/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). This function enforces the invariant
+/// with a release-mode `assert!` at the public boundary so callers that bypass
+/// `QuantizedVector::from_f32` (which clamps correctly) are caught immediately.
+///
+/// Hot inner kernels use `debug_assert!` only — the O(N) scan is paid once here.
+///
 /// # Feature gate asymmetry
 ///
 /// The float32 AVX-512F path (dot_product, cosine, normalize, distance) activates
@@ -171,13 +181,15 @@ impl QuantizedVector {
 /// Cargo feature to opt in to the extended instruction sets at compile time.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
-    // FP-033: -128 causes incorrect results in AVX-512 VNNI via vpabsb saturation.
-    // from_f32 clamps to [-127, 127]; debug_assert catches misuse without O(N) overhead.
-    debug_assert!(
+    // FP-033: -128 causes incorrect results in AVX-512 VNNI via vpabsb saturation
+    // and in AVX2 via _mm256_sign_epi8 saturation. Release-mode assert at the public
+    // boundary — callers that produce data outside from_f32 are caught here.
+    // Inner hot-path kernels use debug_assert! only (scan cost paid once, here).
+    assert!(
         a.data.iter().all(|&v| v != -128i8),
         "QuantizedVector a contains -128, which violates the [-127, 127] VNNI invariant"
     );
-    debug_assert!(
+    assert!(
         b.data.iter().all(|&v| v != -128i8),
         "QuantizedVector b contains -128, which violates the [-127, 127] VNNI invariant"
     );
@@ -580,7 +592,9 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
     #[cfg(target_arch = "aarch64")]
     {
-        if config.neon_enabled {
+        // The NEON kernel uses SDOT (ARMv8.2 FEAT_DotProd), which is optional on
+        // Armv8.2/v8.3. Only dispatch when dotprod_enabled is confirmed at runtime.
+        if config.neon_enabled && config.dotprod_enabled {
             return dot_product_i8_neon_kernel;
         }
     }
@@ -638,6 +652,12 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// Returns 0.0 if slices have different lengths.
 ///
+/// # Invariant
+///
+/// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
+/// causes silent corruption in AVX2 and AVX-512 VNNI SIMD paths. This function
+/// enforces the invariant with a release-mode `assert!` at the public boundary.
+///
 /// # Performance
 ///
 /// Uses the same SIMD paths as `dot_product_i8`:
@@ -651,7 +671,15 @@ pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    debug_assert_eq!(a.len(), b.len());
+    // FP-033: Release-mode guard at public boundary. Inner kernels use debug_assert!.
+    assert!(
+        a.iter().all(|&v| v != -128i8),
+        "dot_product_i8_raw: slice a contains -128, violating the [-127, 127] SIMD invariant"
+    );
+    assert!(
+        b.iter().all(|&v| v != -128i8),
+        "dot_product_i8_raw: slice b contains -128, violating the [-127, 127] SIMD invariant"
+    );
     resolved_i8_dot_kernel()(a, b)
 }
 

@@ -232,6 +232,13 @@ unsafe fn rms_norm_neon(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
     }
 }
 
+/// NEON polynomial exp approximation.
+///
+/// Accuracy: max ~10-15 ULP error over the clamped input range `[-87.33, 88.0]`.
+///
+/// Upper clamp is 88.0 (not 88.72) to keep the biased exponent `n + 127 <= 255`,
+/// avoiding the infinity exponent that occurs when `n = 128` at x = 88.72.
+/// Lower clamp of -87.33 matches the smallest normal f32 exponent.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -242,7 +249,7 @@ unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64
     const LN2_HI: f32 = 0.693_145_75_f32;
     const LN2_LO: f32 = 1.428_606_8e-6_f32;
 
-    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(88.72)), vdupq_n_f32(-87.33));
+    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(88.0)), vdupq_n_f32(-87.33));
 
     // Range reduction: x = n*ln(2) + r, |r| <= ln(2)/2
     // Round to nearest via magic-number trick (avoids unstable intrinsics)
