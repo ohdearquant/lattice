@@ -27,7 +27,9 @@ mod tests;
 
 // Re-export public API
 pub use binary::BinaryVector;
-pub use cosine::{batch_cosine_similarity, cosine_similarity};
+pub use cosine::{
+    batch_cosine_one_vs_many, batch_cosine_similarity, cosine_similarity, cosine_similarity_fused,
+};
 pub use distance::{euclidean_distance, squared_euclidean_distance};
 pub use dot_product::{
     DotBatch4Kernel, DotKernel, batch_dot_product, dot_product, dot_product_batch4,
