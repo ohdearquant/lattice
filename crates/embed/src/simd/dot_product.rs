@@ -683,6 +683,17 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
+        let next_base = base + CHUNK_SIZE;
+        if next_base + CHUNK_SIZE <= n {
+            core::arch::asm!(
+                "prfm pldl1keep, [{a}]",
+                "prfm pldl1keep, [{b}]",
+                a = in(reg) a.as_ptr().add(next_base),
+                b = in(reg) b.as_ptr().add(next_base),
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+
         let a0 = vld1q_f32(a.as_ptr().add(base));
         let b0 = vld1q_f32(b.as_ptr().add(base));
         sum0 = vfmaq_f32(sum0, a0, b0);

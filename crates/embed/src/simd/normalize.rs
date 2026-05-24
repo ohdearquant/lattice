@@ -315,18 +315,21 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     let norm_vec = vaddq_f32(vaddq_f32(norm0, norm1), vaddq_f32(norm2, norm3));
     let mut norm_sq = horizontal_sum_neon(norm_vec);
 
-    // Remainder for norm calculation
     for val in vector.iter().skip(chunks * CHUNK_SIZE) {
         norm_sq += val * val;
     }
 
-    let norm = norm_sq.sqrt();
-    if norm == 0.0 {
+    if norm_sq == 0.0 {
         return;
     }
 
-    let inv_norm = 1.0 / norm;
-    let inv_norm_vec = vdupq_n_f32(inv_norm);
+    // Fast reciprocal sqrt: 1/sqrt(norm_sq) via NEON estimate + 2 Newton-Raphson steps
+    let nsq = vdupq_n_f32(norm_sq);
+    let mut est = vrsqrteq_f32(nsq);
+    est = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(nsq, est), est));
+    est = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(nsq, est), est));
+    let inv_norm = vgetq_lane_f32::<0>(est);
+    let inv_norm_vec = est;
 
     // Second pass: divide by norm with 4x unrolling
     for i in 0..chunks {
