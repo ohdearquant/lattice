@@ -1,0 +1,155 @@
+name: bench-regression
+# ADR-058 — PR gate: run CPU benches against the perf-baselines branch and
+# fail if any bench regresses >7% with 95% CI confirmation.
+#
+# Bypass via PR label `bench-allow-regression` (the gate job is skipped).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/inference/src/forward/cpu/**'
+      - 'crates/inference/src/attention/**'
+      - 'crates/inference/benches/elementwise_cpu_bench.rs'
+      - 'crates/inference/benches/attention_bench.rs'
+      - 'crates/inference/Cargo.toml'
+      - 'crates/embed/src/simd/**'
+      - 'crates/embed/benches/simd.rs'
+      - 'crates/embed/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bench-regression.yml'
+      - 'scripts/perf-bench-gate.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write  # to post the report comment
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  gate:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'bench-allow-regression') }}
+    name: gate (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # ADR-058 step 3: keep in advisory mode for the first 7 days, then remove.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-linux
+    steps:
+      - name: Checkout PR HEAD
+        uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-${{ matrix.arch }}
+
+      - name: Fetch perf-baselines (or skip if missing)
+        id: fetch_baseline
+        run: |
+          if git ls-remote --exit-code https://github.com/${{ github.repository }} perf-baselines >/dev/null 2>&1; then
+            git fetch --depth=1 https://github.com/${{ github.repository }} perf-baselines:perf-baselines
+            mkdir -p .perf-baselines
+            git --work-tree=.perf-baselines checkout perf-baselines -- "${{ matrix.arch }}" 2>/dev/null || true
+            if [ -d ".perf-baselines/${{ matrix.arch }}" ]; then
+              echo "have_baseline=true" >> "$GITHUB_OUTPUT"
+              mkdir -p target/criterion
+              cp -r ".perf-baselines/${{ matrix.arch }}/." target/criterion/
+            else
+              echo "have_baseline=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "have_baseline=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build benches
+        run: |
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench --no-run
+          cargo bench -p lattice-embed --bench simd --no-run
+
+      - name: Run benches against baseline
+        if: steps.fetch_baseline.outputs.have_baseline == 'true'
+        run: |
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --baseline base --noplot
+          cargo bench -p lattice-embed --bench simd -- --baseline base --noplot
+
+      - name: Run benches without baseline (seed)
+        if: steps.fetch_baseline.outputs.have_baseline == 'false'
+        run: |
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline base --noplot
+          cargo bench -p lattice-embed --bench simd -- --save-baseline base --noplot
+
+      - name: Apply gate
+        id: gate
+        if: steps.fetch_baseline.outputs.have_baseline == 'true'
+        run: |
+          python3 scripts/perf-bench-gate.py target/criterion "${{ matrix.arch }}" \
+            --out report-${{ matrix.arch }}.md \
+          && echo "gate=pass" >> "$GITHUB_OUTPUT" \
+          || echo "gate=fail" >> "$GITHUB_OUTPUT"
+
+      - name: Note seed run
+        if: steps.fetch_baseline.outputs.have_baseline == 'false'
+        run: |
+          mkdir -p .
+          cat > report-${{ matrix.arch }}.md <<EOF
+          ### \`${{ matrix.arch }}\` — no baseline available
+
+          The \`perf-baselines\` branch has no data for this arch yet. Run
+          \`bench-update.yml\` on \`main\` to seed it. This PR is not gated.
+          EOF
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.arch }}
+          path: report-${{ matrix.arch }}.md
+
+      - name: Fail if gate failed
+        if: steps.gate.outputs.gate == 'fail'
+        run: exit 1
+
+  comment:
+    name: post PR comment
+    needs: gate
+    if: ${{ always() && !contains(github.event.pull_request.labels.*.name, 'bench-allow-regression') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: reports/
+          pattern: bench-report-*
+
+      - name: Compose comment
+        id: compose
+        run: |
+          {
+            echo "## Perf regression report (ADR-058)"
+            echo
+            for f in reports/bench-report-*/report-*.md; do
+              [ -f "$f" ] && cat "$f" && echo
+            done
+            echo
+            echo "_Gate is in advisory mode (Rollout step 3, ADR-058 §Rollout). Failures do not block merge for the first 7 days._"
+          } > body.md
+          {
+            echo "body<<EOF"
+            cat body.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post / update comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: bench-regression
+          message: ${{ steps.compose.outputs.body }}

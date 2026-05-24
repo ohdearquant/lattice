@@ -215,6 +215,14 @@ feature branch → PR → CI green → review → merge to main
 
 GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
+### Performance Regression Gate (ADR-058)
+
+PRs touching `crates/inference/src/forward/cpu/`, `crates/embed/src/simd/`, or `crates/inference/src/attention/` trigger `bench-regression.yml`. It runs Criterion benchmarks on both `x86_64-linux` (AVX2) and `aarch64-linux` (NEON), comparing against baselines stored on the orphan `perf-baselines` branch.
+
+Gate rule: 95%-CI-lower-bound of change >7% = **FAIL**. 3-7% = warn. Override via PR label `bench-allow-regression` (must include rationale).
+
+The `perf-baselines` branch is auto-updated by `bench-update.yml` on every push to main. Its `README.md` shows sparkline trend tables per bench per arch.
+
 ## Commands
 
 ```bash
@@ -223,11 +231,18 @@ make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
 make publish-dry     # verify crates.io packaging
 make publish         # publish (leaf crates first, sleeps for indexing)
+
+# Perf benchmarking (ADR-058)
+make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)
+make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
+scripts/bench-compare.sh --full main     # A/B with tight CIs (~15 min)
+make bench-ci                            # save local Criterion baseline
+make bench-gate                          # compare against perf-baselines branch
 ```
 
 ## ADRs
 
-39 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
+58 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
 
 Write when: new model, SIMD dispatch change, weight format change, new backend, public API change.
 
@@ -251,7 +266,8 @@ Format: `# ADR-NNN: Title` + `**Status**: Accepted`, `**Date**: YYYY-MM-DD`, `**
 4. `# Safety` doc section on every `pub unsafe fn`
 5. Equivalence test: `assert!((simd - scalar).abs() < epsilon)`
 6. Bench in `benches/` comparing scalar vs SIMD
-7. Update `docs/safety.md` unsafe block count
+7. **Before/after numbers via `make bench-compare`** — paste output in PR description
+8. Update `docs/safety.md` unsafe block count
 
 ## Environment Variables
 
