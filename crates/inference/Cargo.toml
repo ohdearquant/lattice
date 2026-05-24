@@ -122,6 +122,10 @@ name = "elementwise_bench"
 harness = false
 
 [[bench]]
+name = "attn_opt_bench"
+harness = false
+
+[[bench]]
 name = "attention_bench"
 harness = true
 
