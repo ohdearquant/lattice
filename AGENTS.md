@@ -253,6 +253,23 @@ Format: `# ADR-NNN: Title` + `**Status**: Accepted`, `**Date**: YYYY-MM-DD`, `**
 6. Bench in `benches/` comparing scalar vs SIMD
 7. Update `docs/safety.md` unsafe block count
 
+## Performance
+
+Baseline numbers measured on Apple Silicon (aarch64). See `benches/BASELINE.md`
+for full tables.
+
+Key throughput:
+
+- **matmul_bt** (SIMD): 42.4 ms / 11.99 Gelem/s (10.5x over scalar)
+- **Attention kernel**: 96.6 us (seq=16) to 495 us (seq=128)
+- **f32 cosine SIMD**: 31-35 ns (19.8-25.7x over scalar)
+- **int8 dot product**: 273-287 ns (2.2x over scalar)
+- **LoRA train_lora**: ~7 us/sample (SGD, rank=2)
+
+Run benchmarks: `./scripts/bench_all.sh`
+
+Run individual bench: `RUSTC_WRAPPER= cargo bench -p lattice-inference --bench inference_bench`
+
 ## Environment Variables
 
 | Var                   | Default             | Purpose                       |
