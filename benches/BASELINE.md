@@ -1,7 +1,7 @@
 # Lattice Performance Baseline
 
 **Date**: 2026-05-23
-**Commit**: ac38f20 (main, post ADR-057 LoRA lifecycle merge)
+**Commit**: 8ac486d (main, `feat: implement ADR-057 LoRA full-lifecycle consumer API (D1-D5) (#65)`)
 **Platform**: Apple Silicon (aarch64 / Darwin)
 **Rust**: stable (release profile, LTO)
 
