@@ -74,17 +74,16 @@ pub fn fast_exp(x: f32) -> f32 {
 
 /// NEON fast exp approximation for 4 lanes using the Schraudolph bit trick.
 /// exp(x) ~ reinterpret_float(int(x * 2^23/ln2 + 127*2^23))
+/// Intentionally kept instead of the more accurate polynomial exp from elementwise — the
+/// Schraudolph systematic bias cancels in softmax normalization, and it's ~3x faster.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
-    // Clamp to [-87, 88] to avoid overflow/underflow
     let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
     let x = vminq_f32(x, vdupq_n_f32(88.0));
-    // t = x * (2^23 / ln2) + 127 * 2^23
     let t = vfmaq_f32(vdupq_n_f32(1_065_353_216.0), x, vdupq_n_f32(12_102_203.0));
-    // Reinterpret float bits as int, then back to float
     vreinterpretq_f32_s32(vcvtq_s32_f32(t))
 }
 
@@ -147,16 +146,16 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
             let mut s3 = s0;
             for c in 0..chunks {
                 let base = c * CHUNK;
-                let e0 = fast_exp_neon(vsubq_f32(vld1q_f32(ptr.add(base) as *const f32), vmax_val));
-                let e1 = fast_exp_neon(vsubq_f32(
+                let e0 = neon_exp_f32(vsubq_f32(vld1q_f32(ptr.add(base) as *const f32), vmax_val));
+                let e1 = neon_exp_f32(vsubq_f32(
                     vld1q_f32(ptr.add(base + 4) as *const f32),
                     vmax_val,
                 ));
-                let e2 = fast_exp_neon(vsubq_f32(
+                let e2 = neon_exp_f32(vsubq_f32(
                     vld1q_f32(ptr.add(base + 8) as *const f32),
                     vmax_val,
                 ));
-                let e3 = fast_exp_neon(vsubq_f32(
+                let e3 = neon_exp_f32(vsubq_f32(
                     vld1q_f32(ptr.add(base + 12) as *const f32),
                     vmax_val,
                 ));

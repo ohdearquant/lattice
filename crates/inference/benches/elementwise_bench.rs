@@ -10,8 +10,10 @@
 //!   cargo bench -p lattice-inference --bench elementwise_bench
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use lattice_inference::attention::decode::decode_attention;
+use lattice_inference::attention::gqa::GqaConfig;
 use lattice_inference::forward::cpu::{
-    add_bias_gelu, elementwise_mul, gelu, rms_norm, silu_inplace, softmax_attention,
+    add_bias_gelu, elementwise_mul, gelu, layer_norm, rms_norm, silu_inplace, softmax_attention,
 };
 
 // ---------------------------------------------------------------------------
@@ -166,6 +168,73 @@ fn bench_add_bias_gelu(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_layer_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("layer_norm");
+    let eps = 1e-6f32;
+    let num_tokens = 8usize;
+
+    for &hidden in &[896usize, 2048, 4096] {
+        let gamma = lcg_f32_vec(hidden, 0xA200_0000_0000_0001);
+        let beta = lcg_f32_vec(hidden, 0xA300_0000_0000_0001);
+        let bytes = num_tokens * hidden * std::mem::size_of::<f32>();
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(BenchmarkId::new("dispatch", hidden), &hidden, |b, &h| {
+            let mut x = lcg_f32_vec(num_tokens * h, 0xA400_0000_0000_0001);
+            b.iter(|| {
+                layer_norm(
+                    std::hint::black_box(&mut x),
+                    std::hint::black_box(&gamma),
+                    std::hint::black_box(&beta),
+                    std::hint::black_box(h),
+                    std::hint::black_box(eps),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_decode_attention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decode_attention");
+    let cfg = GqaConfig {
+        num_heads: 16,
+        num_kv_heads: 2,
+        head_dim: 128,
+    };
+
+    for &kv_len in &[128usize, 512, 2048] {
+        let q = lcg_f32_vec(cfg.q_dim(), 0xDA00_0000_0000_0001);
+        let k = lcg_f32_vec(kv_len * cfg.kv_dim(), 0xDB00_0000_0000_0001);
+        let v = lcg_f32_vec(kv_len * cfg.kv_dim(), 0xDC00_0000_0000_0001);
+
+        let bytes = (cfg.q_dim() + 2 * kv_len * cfg.kv_dim()) * std::mem::size_of::<f32>();
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("gqa_16h2kv_hd128", kv_len),
+            &kv_len,
+            |b, &kl| {
+                let mut out = vec![0.0f32; cfg.q_dim()];
+                let mut scores = vec![0.0f32; cfg.num_heads * kl];
+                b.iter(|| {
+                    decode_attention(
+                        std::hint::black_box(&q),
+                        std::hint::black_box(&k),
+                        std::hint::black_box(&v),
+                        std::hint::black_box(&mut out),
+                        std::hint::black_box(&mut scores),
+                        std::hint::black_box(kl),
+                        std::hint::black_box(cfg),
+                        std::hint::black_box(kl),
+                    );
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_rms_norm,
@@ -173,6 +242,8 @@ criterion_group!(
     bench_elementwise_mul,
     bench_gelu,
     bench_softmax,
-    bench_add_bias_gelu
+    bench_add_bias_gelu,
+    bench_layer_norm,
+    bench_decode_attention
 );
 criterion_main!(benches);
