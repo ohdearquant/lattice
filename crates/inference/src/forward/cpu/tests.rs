@@ -333,6 +333,118 @@ fn make_deterministic_vec(len: usize, seed: u32) -> Vec<f32> {
     out
 }
 
+// ===================================================================
+// Elementwise SIMD vs. scalar comparison tests
+// ===================================================================
+
+#[test]
+fn test_rms_norm_known_values() {
+    // Single token, hidden=4, gamma=all-ones, eps=0.
+    // rms = sqrt(mean([1,2,3,4]^2)) = sqrt(7.5) ≈ 2.7386.
+    // Expected: [1/2.7386, 2/2.7386, 3/2.7386, 4/2.7386]
+    let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+    let gamma = vec![1.0f32; 4];
+    rms_norm(&mut x, &gamma, 4, 1e-8);
+    let expected_rms = (7.5f32 + 1e-8).sqrt();
+    for (i, &v) in x.iter().enumerate() {
+        let expected = (i + 1) as f32 / expected_rms;
+        assert_relative_eq!(v, expected, epsilon = 1e-5);
+    }
+}
+
+#[test]
+fn test_rms_norm_simd_matches_scalar() {
+    // Two sizes: one that exercises SIMD main loops, one with a remainder tail.
+    for &hidden in &[896usize, 2048, 4096, 13] {
+        let rows = 4;
+        let mut x_simd = make_deterministic_vec(rows * hidden, 0xC0DE);
+        let mut x_scalar = x_simd.clone();
+        let gamma = make_deterministic_vec_range(hidden, 0xC0DF, 0.9, 1.1);
+        let eps = 1e-6;
+
+        rms_norm(&mut x_simd, &gamma, hidden, eps);
+        rms_norm_scalar(&mut x_scalar, &gamma, hidden, eps);
+
+        for i in 0..(rows * hidden) {
+            let diff = (x_simd[i] - x_scalar[i]).abs();
+            assert!(
+                diff <= 1e-4,
+                "rms_norm mismatch at hidden={hidden} index={i}: simd={} scalar={} diff={diff}",
+                x_simd[i],
+                x_scalar[i],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_silu_known_values() {
+    // silu(0) = 0 * 0.5 = 0.
+    // silu(1) = 1 * sigmoid(1) ≈ 0.7311.
+    // silu(-1) = -1 * sigmoid(-1) ≈ -0.2689.
+    let mut x = vec![0.0f32, 1.0, -1.0];
+    silu_inplace(&mut x);
+    assert_relative_eq!(x[0], 0.0, epsilon = 1e-5);
+    // Use a loose tolerance because we use fast_exp (Schraudolph) in SIMD paths.
+    assert_relative_eq!(x[1], 0.731_059_f32, epsilon = 5e-2);
+    assert_relative_eq!(x[2], -0.268_941_f32, epsilon = 5e-2);
+}
+
+#[test]
+fn test_silu_simd_matches_scalar() {
+    for &n in &[896usize, 2048, 4096, 17] {
+        let mut x_simd = make_deterministic_vec(n, 0x51C0);
+        let mut x_scalar = x_simd.clone();
+
+        silu_inplace(&mut x_simd);
+        silu_inplace_scalar(&mut x_scalar);
+
+        for i in 0..n {
+            let diff = (x_simd[i] - x_scalar[i]).abs();
+            assert!(
+                diff <= 5e-2,
+                "silu mismatch at n={n} index={i}: simd={} scalar={} diff={diff}",
+                x_simd[i],
+                x_scalar[i],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_elementwise_mul_known_values() {
+    let mut a = vec![2.0f32, 3.0, -1.0, 0.0];
+    let b = vec![4.0f32, -2.0, 5.0, 7.0];
+    elementwise_mul(&mut a, &b);
+    assert_relative_eq!(a[0], 8.0, epsilon = 1e-6);
+    assert_relative_eq!(a[1], -6.0, epsilon = 1e-6);
+    assert_relative_eq!(a[2], -5.0, epsilon = 1e-6);
+    assert_relative_eq!(a[3], 0.0, epsilon = 1e-6);
+}
+
+#[test]
+fn test_elementwise_mul_simd_matches_scalar() {
+    for &n in &[896usize, 2048, 4096, 11] {
+        let mut a_simd = make_deterministic_vec(n, 0xE1A1);
+        let b = make_deterministic_vec(n, 0xE1A2);
+        let mut a_scalar = a_simd.clone();
+
+        elementwise_mul(&mut a_simd, &b);
+        elementwise_mul_scalar(&mut a_scalar, &b);
+
+        for i in 0..n {
+            // elementwise_mul is exact (single multiply), tolerance is floating-point rounding.
+            let diff = (a_simd[i] - a_scalar[i]).abs();
+            assert!(
+                diff <= 1e-6,
+                "elementwise_mul mismatch at n={n} index={i}: simd={} scalar={} diff={diff}",
+                a_simd[i],
+                a_scalar[i],
+            );
+        }
+    }
+}
+
 /// Deterministic pseudo-random vector in a custom range.
 fn make_deterministic_vec_range(len: usize, seed: u32, lo: f32, hi: f32) -> Vec<f32> {
     let mut state = seed ^ (len as u32).wrapping_mul(0x9E37_79B9);
