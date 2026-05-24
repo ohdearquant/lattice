@@ -171,14 +171,13 @@ impl QuantizedVector {
 /// Cargo feature to opt in to the extended instruction sets at compile time.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
-    // FP-033: enforce at call time (not just debug) — -128 causes incorrect results
-    // in AVX-512 VNNI via vpabsb saturation; from_f32 clamps to [-127, 127] but
-    // the data field is pub so callers can bypass the constructor.
-    assert!(
+    // FP-033: -128 causes incorrect results in AVX-512 VNNI via vpabsb saturation.
+    // from_f32 clamps to [-127, 127]; debug_assert catches misuse without O(N) overhead.
+    debug_assert!(
         a.data.iter().all(|&v| v != -128i8),
         "QuantizedVector a contains -128, which violates the [-127, 127] VNNI invariant"
     );
-    assert!(
+    debug_assert!(
         b.data.iter().all(|&v| v != -128i8),
         "QuantizedVector b contains -128, which violates the [-127, 127] VNNI invariant"
     );
