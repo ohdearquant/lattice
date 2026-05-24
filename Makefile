@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare
 
 check:
 	cargo check --workspace
@@ -56,3 +56,9 @@ bench-gate:
 		cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --baseline base --noplot; \
 		cargo bench -p lattice-embed --bench simd -- --baseline base --noplot; \
 		python3 scripts/perf-bench-gate.py target/criterion "$$arch-local"
+
+# A/B benchmark across git refs. Uses worktree for base, leaves working tree untouched.
+# Usage: make bench-compare                     (origin/main vs HEAD)
+#        make bench-compare BASE=main HEAD=pr/x (explicit refs)
+bench-compare:
+	./scripts/bench-compare.sh $(or $(BASE),origin/main) $(or $(HEAD),HEAD)
