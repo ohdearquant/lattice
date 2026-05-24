@@ -1,0 +1,1 @@
+{"group_id":"simd_batch_cosine_normalized_query","function_id":"pair_loop_dot","value_str":"768d_4c","throughput":{"Elements":4},"full_id":"simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c","directory_name":"simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c","title":"simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c"}

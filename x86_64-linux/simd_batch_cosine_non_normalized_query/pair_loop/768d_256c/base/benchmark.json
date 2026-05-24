@@ -1,0 +1,1 @@
+{"group_id":"simd_batch_cosine_non_normalized_query","function_id":"pair_loop","value_str":"768d_256c","throughput":{"Elements":256},"full_id":"simd_batch_cosine_non_normalized_query/pair_loop/768d_256c","directory_name":"simd_batch_cosine_non_normalized_query/pair_loop/768d_256c","title":"simd_batch_cosine_non_normalized_query/pair_loop/768d_256c"}

@@ -1,0 +1,1 @@
+{"group_id":"simd_batch_cosine_non_normalized_query","function_id":"pair_loop","value_str":"1024d_1000c","throughput":{"Elements":1000},"full_id":"simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c","directory_name":"simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c","title":"simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c"}

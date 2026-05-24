@@ -1,0 +1,1 @@
+{"group_id":"softmax_attention","function_id":null,"value_str":"128","throughput":{"Elements":16384},"full_id":"softmax_attention/128","directory_name":"softmax_attention/128","title":"softmax_attention/128"}

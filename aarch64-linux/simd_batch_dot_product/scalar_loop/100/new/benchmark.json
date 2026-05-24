@@ -1,0 +1,1 @@
+{"group_id":"simd_batch_dot_product","function_id":"scalar_loop","value_str":"100","throughput":{"Elements":100},"full_id":"simd_batch_dot_product/scalar_loop/100","directory_name":"simd_batch_dot_product/scalar_loop/100","title":"simd_batch_dot_product/scalar_loop/100"}

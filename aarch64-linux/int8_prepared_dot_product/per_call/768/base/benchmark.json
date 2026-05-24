@@ -1,0 +1,1 @@
+{"group_id":"int8_prepared_dot_product","function_id":"per_call","value_str":"768","throughput":{"Elements":768},"full_id":"int8_prepared_dot_product/per_call/768","directory_name":"int8_prepared_dot_product/per_call/768","title":"int8_prepared_dot_product/per_call/768"}
