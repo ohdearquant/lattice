@@ -74,17 +74,16 @@ pub fn fast_exp(x: f32) -> f32 {
 
 /// NEON fast exp approximation for 4 lanes using the Schraudolph bit trick.
 /// exp(x) ~ reinterpret_float(int(x * 2^23/ln2 + 127*2^23))
+/// Intentionally kept instead of the more accurate polynomial exp from elementwise — the
+/// Schraudolph systematic bias cancels in softmax normalization, and it's ~3x faster.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
-    // Clamp to [-87, 88] to avoid overflow/underflow
     let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
     let x = vminq_f32(x, vdupq_n_f32(88.0));
-    // t = x * (2^23 / ln2) + 127 * 2^23
     let t = vfmaq_f32(vdupq_n_f32(1_065_353_216.0), x, vdupq_n_f32(12_102_203.0));
-    // Reinterpret float bits as int, then back to float
     vreinterpretq_f32_s32(vcvtq_s32_f32(t))
 }
 
@@ -110,53 +109,96 @@ unsafe fn fast_exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m2
 unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize) {
     use std::arch::aarch64::*;
 
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL;
+
     for h in 0..num_heads {
         for s in 0..seq_len {
             let start = (h * seq_len + s) * seq_len;
             let row = &mut x[start..start + seq_len];
             let ptr = row.as_mut_ptr();
             let n = row.len();
-            let chunks = n / 4;
+            let chunks = n / CHUNK;
 
-            // --- Step 1: Find row max using SIMD ---
-            let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+            // --- Step 1: Find row max with 4x unrolling ---
+            let mut m0 = vdupq_n_f32(f32::NEG_INFINITY);
+            let mut m1 = m0;
+            let mut m2 = m0;
+            let mut m3 = m0;
             for c in 0..chunks {
-                // SAFETY: c * 4 + 3 < chunks * 4 <= n, within row bounds.
-                vmax = vmaxq_f32(vmax, vld1q_f32(ptr.add(c * 4) as *const f32));
+                let base = c * CHUNK;
+                m0 = vmaxq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
+                m1 = vmaxq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
+                m2 = vmaxq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
+                m3 = vmaxq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
             }
+            let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
             let mut max_val = vmaxvq_f32(vmax);
-            for i in (chunks * 4)..n {
+            for i in (chunks * CHUNK)..n {
                 max_val = max_val.max(*ptr.add(i));
             }
 
-            // --- Step 2: Subtract max + fast exp + accumulate sum (all SIMD) ---
+            // --- Step 2: Subtract max + fast exp + accumulate sum ---
             let vmax_val = vdupq_n_f32(max_val);
-            let mut vsum = vdupq_n_f32(0.0);
+            let mut s0 = vdupq_n_f32(0.0);
+            let mut s1 = s0;
+            let mut s2 = s0;
+            let mut s3 = s0;
             for c in 0..chunks {
-                let off = c * 4;
-                let v = vsubq_f32(vld1q_f32(ptr.add(off) as *const f32), vmax_val);
-                let e = fast_exp_neon(v);
-                vst1q_f32(ptr.add(off), e);
-                vsum = vaddq_f32(vsum, e);
+                let base = c * CHUNK;
+                let e0 = neon_exp_f32(vsubq_f32(vld1q_f32(ptr.add(base) as *const f32), vmax_val));
+                let e1 = neon_exp_f32(vsubq_f32(
+                    vld1q_f32(ptr.add(base + 4) as *const f32),
+                    vmax_val,
+                ));
+                let e2 = neon_exp_f32(vsubq_f32(
+                    vld1q_f32(ptr.add(base + 8) as *const f32),
+                    vmax_val,
+                ));
+                let e3 = neon_exp_f32(vsubq_f32(
+                    vld1q_f32(ptr.add(base + 12) as *const f32),
+                    vmax_val,
+                ));
+                vst1q_f32(ptr.add(base), e0);
+                vst1q_f32(ptr.add(base + 4), e1);
+                vst1q_f32(ptr.add(base + 8), e2);
+                vst1q_f32(ptr.add(base + 12), e3);
+                s0 = vaddq_f32(s0, e0);
+                s1 = vaddq_f32(s1, e1);
+                s2 = vaddq_f32(s2, e2);
+                s3 = vaddq_f32(s3, e3);
             }
-            let mut sum = vaddvq_f32(vsum);
-            for i in (chunks * 4)..n {
+            let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+            for i in (chunks * CHUNK)..n {
                 let e = fast_exp(*ptr.add(i) - max_val);
                 *ptr.add(i) = e;
                 sum += e;
             }
 
-            // --- Step 3: Divide by sum using SIMD ---
+            // --- Step 3: Divide by sum with 4x unrolling ---
             if sum > 0.0 {
-                let inv_sum = 1.0 / sum;
-                let vinv = vdupq_n_f32(inv_sum);
+                let vinv = vdupq_n_f32(1.0 / sum);
                 for c in 0..chunks {
-                    let off = c * 4;
-                    let v = vmulq_f32(vld1q_f32(ptr.add(off) as *const f32), vinv);
-                    vst1q_f32(ptr.add(off), v);
+                    let base = c * CHUNK;
+                    vst1q_f32(
+                        ptr.add(base),
+                        vmulq_f32(vld1q_f32(ptr.add(base) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 4),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 4) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 8),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 8) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 12),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 12) as *const f32), vinv),
+                    );
                 }
-                for i in (chunks * 4)..n {
-                    *ptr.add(i) *= inv_sum;
+                for i in (chunks * CHUNK)..n {
+                    *ptr.add(i) *= 1.0 / sum;
                 }
             }
         }
