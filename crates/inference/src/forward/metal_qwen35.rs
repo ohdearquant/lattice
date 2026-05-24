@@ -237,6 +237,66 @@ kernel void gemv_q8_decode(
     }
 }
 
+// ===== Q8_0 GEMV Decode (wide): NR=4 variant for large-N matmuls (lm_head) =====
+// Halves threadgroup count vs NR=2, better for N > 8192 where scheduling dominates.
+// Dispatch: threadgroups=(ceil(N/4), 1, 1), threads=(32, 4, 1)
+kernel void gemv_q8_decode_wide(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;
+    const uint NSG = 4;
+    const uint nb = K / 32;
+    const uint row_bytes = nb * 34;
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+    device const float* yb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float yl[8];
+        for (uint i = 0; i < 8; i++) yl[i] = yb[i];
+        yb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const char* base = qweight + r * row_bytes + ib * 34;
+            device const char* qs = base + 2 + il * 8;
+            half d = *((device const half*)base);
+            float sumq = 0.0f;
+            for (uint i = 0; i < 8; i++) sumq += float(qs[i]) * yl[i];
+            sumf[row] += sumq * float(d);
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
 // ===== Qwen3.5 RMS Norm: x = x * (1 + gamma) / sqrt(mean(x^2) + eps) =====
 // Shifted norm: (1 + gamma) instead of plain gamma.
 // One threadgroup per row.
@@ -2725,6 +2785,7 @@ kernel void moe_shared_gate_add(
     struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
         gemv_q8: ComputePipelineState,
+        gemv_q8_wide: ComputePipelineState,
         rms_norm: ComputePipelineState,
         partial_rope: ComputePipelineState,
         per_head_rms_norm: ComputePipelineState,
@@ -3539,6 +3600,7 @@ kernel void moe_shared_gate_add(
             let pipelines = MetalQwen35Pipelines {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
+                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -5756,6 +5818,16 @@ kernel void moe_shared_gate_add(
             position: usize,
             capture_hidden: bool,
         ) -> MetalStepOutput {
+            self.forward_step_inner_impl(token_id, position, capture_hidden, false)
+        }
+
+        fn forward_step_inner_impl(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            capture_hidden: bool,
+            skip_logits_readback: bool,
+        ) -> MetalStepOutput {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -5898,7 +5970,9 @@ kernel void moe_shared_gate_add(
                 Vec::new()
             };
 
-            let logits = if let Some(which) = topk_which {
+            let logits = if skip_logits_readback {
+                vec![]
+            } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
                 let k = self.session.compact_topk;
@@ -5923,6 +5997,30 @@ kernel void moe_shared_gate_add(
         /// Run a single token through the full model. Returns logits [vocab_size].
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.forward_step_inner(token_id, position, false).logits
+        }
+
+        /// Zero-copy greedy argmax: run forward pass then scan GPU shared buffer
+        /// directly for the argmax token ID, avoiding 993KB allocation+copy.
+        fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
+            let cfg = self.engine.config.clone();
+            self.forward_step_inner_impl(token_id, position, false, true);
+
+            // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
+            // logits buffer is StorageModeShared — CPU can read it directly.
+            unsafe {
+                let ptr = self.session.activations.logits.contents() as *const f32;
+                let vocab_size = cfg.vocab_size;
+                let mut best_id = 0u32;
+                let mut best_val = f32::NEG_INFINITY;
+                for i in 0..vocab_size {
+                    let v = *ptr.add(i);
+                    if v > best_val {
+                        best_val = v;
+                        best_id = i as u32;
+                    }
+                }
+                best_id
+            }
         }
 
         /// Run a token through GDN layers only, skipping all GQA layers.
@@ -7293,7 +7391,13 @@ kernel void moe_shared_gate_add(
             // Advance grammar state after sampling the prefill token.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 if !engine.advance(gs, next_id) {
-                    return generated_ids;
+                    let text = tokenizer.decode(&generated_ids).unwrap_or_default();
+                    return GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                    };
                 }
             }
 
@@ -7317,6 +7421,13 @@ kernel void moe_shared_gate_add(
             generated_ids.push(next_id);
             all_ids.push(next_id);
 
+            // Greedy fast path: zero-copy argmax avoids 993KB alloc+copy per step.
+            let greedy_fast = gen_cfg.temperature <= 0.0
+                && gen_cfg.top_k <= 1
+                && gen_cfg.repetition_penalty == 1.0
+                && gen_cfg.grammar.is_none()
+                && !use_compact;
+
             // Autoregressive decode
             for _ in 1..gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -7327,22 +7438,26 @@ kernel void moe_shared_gate_add(
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
 
-                let mut step_logits = self.forward_step(last_token, pos);
-
-                // Apply grammar masking before sampling (ADR-046).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut step_logits);
-                }
-
-                let next_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
-                        gen_cfg,
-                        &all_ids,
-                        &mut rng_state,
-                    )
+                let next_id = if greedy_fast {
+                    self.forward_step_greedy_argmax(last_token, pos)
                 } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                    let mut step_logits = self.forward_step(last_token, pos);
+
+                    // Apply grammar masking before sampling (ADR-046).
+                    if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                        engine.mask_logits(gs, &mut step_logits);
+                    }
+
+                    if use_compact {
+                        sample_from_candidates(
+                            &self.session.compact_result,
+                            gen_cfg,
+                            &all_ids,
+                            &mut rng_state,
+                        )
+                    } else {
+                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                    }
                 };
 
                 // Advance grammar state after sampling.
@@ -9472,7 +9587,7 @@ kernel void moe_shared_gate_add(
             enc.set_bytes(3, 4, &n as *const u32 as *const _);
             enc.set_bytes(4, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(2) as u64, 1, 1),
+                MTLSize::new(n.div_ceil(4) as u64, 1, 1), // NR=4
                 MTLSize::new(32, 4, 1),
             );
         }
@@ -10462,7 +10577,13 @@ kernel void moe_shared_gate_add(
             // Advance grammar state after sampling the prefill token.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 if !engine.advance(gs, next_id) {
-                    break;
+                    let text = decode_tokens(tokenizer, &generated_ids);
+                    return GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                    };
                 }
             }
 
@@ -10909,6 +11030,7 @@ kernel void moe_shared_gate_add(
             let pipelines = MetalQwen35Pipelines {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
+                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -11082,18 +11204,20 @@ kernel void moe_shared_gate_add(
                         &format!("{prefix}.post_attention_layernorm.weight"),
                         &format!("L{i}.post_norm"),
                     )?,
-                    gate_proj: load_q4_buf(
-                        &format!("{prefix}.mlp.gate_proj.weight"),
-                        &format!("L{i}.gate.q4"),
-                    )?,
-                    up_proj: load_q4_buf(
-                        &format!("{prefix}.mlp.up_proj.weight"),
-                        &format!("L{i}.up.q4"),
-                    )?,
-                    down_proj: load_q4_buf(
-                        &format!("{prefix}.mlp.down_proj.weight"),
-                        &format!("L{i}.down.q4"),
-                    )?,
+                    ffn: MetalFfnWeights::Dense {
+                        gate_proj: load_q4_buf(
+                            &format!("{prefix}.mlp.gate_proj.weight"),
+                            &format!("L{i}.gate.q4"),
+                        )?,
+                        up_proj: load_q4_buf(
+                            &format!("{prefix}.mlp.up_proj.weight"),
+                            &format!("L{i}.up.q4"),
+                        )?,
+                        down_proj: load_q4_buf(
+                            &format!("{prefix}.mlp.down_proj.weight"),
+                            &format!("L{i}.down.q4"),
+                        )?,
+                    },
                 };
 
                 let attn = if cfg.is_full_attention(i) {
