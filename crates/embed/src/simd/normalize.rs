@@ -319,18 +319,13 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
         norm_sq += val * val;
     }
 
-    if norm_sq == 0.0 {
+    let norm = norm_sq.sqrt();
+    if norm == 0.0 {
         return;
     }
 
-    // Fast reciprocal sqrt via NEON estimate + 2 Newton-Raphson steps (~24-bit precision).
-    // Differs from x86 path (IEEE 1.0/sqrt) by up to 1 ULP in the inverted norm.
-    let nsq = vdupq_n_f32(norm_sq);
-    let mut est = vrsqrteq_f32(nsq);
-    est = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(nsq, est), est));
-    est = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(nsq, est), est));
-    let inv_norm = vgetq_lane_f32::<0>(est);
-    let inv_norm_vec = est;
+    let inv_norm = 1.0 / norm;
+    let inv_norm_vec = vdupq_n_f32(inv_norm);
 
     // Second pass: divide by norm with 4x unrolling
     for i in 0..chunks {
