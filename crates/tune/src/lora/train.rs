@@ -34,9 +34,9 @@ pub struct TrainSample {
 /// Summary statistics from a completed [`train_lora`] run.
 #[derive(Debug, Clone)]
 pub struct TrainResult {
-    /// Average MSE loss recorded in the final epoch.
+    /// Average per-sample SSE loss recorded in the final epoch.
     pub final_loss: f32,
-    /// Average MSE loss per epoch (length == `num_epochs`).
+    /// Average per-sample SSE loss per epoch (length == `num_epochs`).
     pub epoch_losses: Vec<f32>,
     /// Total number of [`adapt_step`] calls executed (`num_epochs * samples.len()`).
     pub total_steps: usize,
@@ -72,6 +72,11 @@ pub fn train_lora(
             "no training samples provided".to_string(),
         ));
     }
+    if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
+        return Err(TuneError::InvalidConfig(
+            "learning_rate must be finite and positive".to_string(),
+        ));
+    }
     if config.batch_size == 0 {
         return Err(TuneError::InvalidConfig(
             "batch_size must be > 0".to_string(),
@@ -104,9 +109,10 @@ pub fn train_lora(
         epoch_losses.push(avg);
     }
 
-    let final_loss = *epoch_losses
+    let final_loss = epoch_losses
         .last()
-        .expect("num_epochs > 0 guaranteed above");
+        .copied()
+        .ok_or_else(|| TuneError::InvalidConfig("num_epochs produced no losses".into()))?;
     let total_steps = config.num_epochs * samples.len();
 
     Ok(TrainResult {
@@ -248,5 +254,25 @@ mod tests {
 
         assert_eq!(result.total_steps, 15, "3 epochs × 5 samples = 15 steps");
         assert_eq!(result.epoch_losses.len(), 3, "one loss entry per epoch");
+    }
+
+    #[test]
+    fn test_train_rejects_invalid_learning_rate() {
+        let mut adapter = make_small_adapter();
+        let samples = make_samples(3);
+
+        for bad_lr in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = LoraTrainConfig {
+                learning_rate: bad_lr,
+                num_epochs: 1,
+                batch_size: 1,
+            };
+            let err = train_lora(&mut adapter, &samples, &config)
+                .expect_err(&format!("lr={bad_lr} must be rejected"));
+            assert!(
+                matches!(err, TuneError::InvalidConfig(_)),
+                "expected InvalidConfig for lr={bad_lr}, got {err:?}"
+            );
+        }
     }
 }
