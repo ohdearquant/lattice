@@ -4,33 +4,33 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 
 ## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-053)
 
-| ADR                                            | Title                                |
-| ---------------------------------------------- | ------------------------------------ |
-| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine         |
-| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy               |
-| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading           |
-| [004](ADR-004-kv-cache.md)                     | KV Cache Design                      |
-| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture               |
-| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                 |
-| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)    |
-| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook        |
-| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3) |
-| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                 |
-| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                  |
-| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)     |
-| [041](ADR-041-differential-attention.md)       | Differential Attention               |
-| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention              |
-| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification            |
-| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization |
-| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition            |
-| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding) |
-| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                       |
+| ADR                                            | Title                                                 |
+| ---------------------------------------------- | ----------------------------------------------------- |
+| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine                          |
+| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy                                |
+| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading                            |
+| [004](ADR-004-kv-cache.md)                     | KV Cache Design                                       |
+| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture                                |
+| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                                  |
+| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)                     |
+| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook                         |
+| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3)                  |
+| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                                  |
+| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                                   |
+| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)                      |
+| [041](ADR-041-differential-attention.md)       | Differential Attention                                |
+| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention                               |
+| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification                             |
+| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization                  |
+| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition                             |
+| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding)  |
+| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                                        |
 | [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode |
-| [049](ADR-049-vision-encoder.md)               | Vision Encoder                       |
-| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding |
-| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation   |
-| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback |
-| [053](ADR-053-moe-metal-dispatch.md)            | MoE Metal Dispatch with Expert Coalescing |
+| [049](ADR-049-vision-encoder.md)               | Vision Encoder                                        |
+| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding           |
+| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation                    |
+| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback         |
+| [053](ADR-053-moe-metal-dispatch.md)           | MoE Metal Dispatch with Expert Coalescing             |
 
 ## lattice-embed (ADR-012 to ADR-019)
 
@@ -75,11 +75,17 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 
 ## lattice-transport (ADR-035 to ADR-039, ADR-055)
 
-| ADR                                    | Title                             |
-| -------------------------------------- | --------------------------------- |
-| [035](ADR-035-sinkhorn-solver.md)      | Sinkhorn-Knopp Balanced OT Solver |
-| [036](ADR-036-log-domain-stability.md) | Log-Domain Numerical Stability    |
-| [037](ADR-037-cost-matrices.md)        | Cost Matrix Abstractions          |
-| [038](ADR-038-barycenters.md)          | Wasserstein Barycenters           |
-| [039](ADR-039-divergence-measures.md)  | Sinkhorn Divergence               |
+| ADR                                      | Title                               |
+| ---------------------------------------- | ----------------------------------- |
+| [035](ADR-035-sinkhorn-solver.md)        | Sinkhorn-Knopp Balanced OT Solver   |
+| [036](ADR-036-log-domain-stability.md)   | Log-Domain Numerical Stability      |
+| [037](ADR-037-cost-matrices.md)          | Cost Matrix Abstractions            |
+| [038](ADR-038-barycenters.md)            | Wasserstein Barycenters             |
+| [039](ADR-039-divergence-measures.md)    | Sinkhorn Divergence                 |
 | [055](ADR-055-online-drift-detection.md) | Online Distribution Drift Detection |
+
+## workspace / CI (ADR-058)
+
+| ADR                                      | Title                                     |
+| ---------------------------------------- | ----------------------------------------- |
+| [058](ADR-058-cpu-perf-regression-ci.md) | CPU Performance Regression Tracking in CI |
