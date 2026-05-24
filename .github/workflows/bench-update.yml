@@ -1,0 +1,170 @@
+name: bench-update
+# ADR-058 — runs CPU benches on `main` and updates the `perf-baselines` orphan branch.
+# Triggers:
+#   - push to main with relevant path changes
+#   - weekly cron (Mon 06:00 UTC) to refresh baselines even without code change
+#   - manual workflow_dispatch (used to seed the branch the first time)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/inference/src/forward/cpu/**'
+      - 'crates/inference/src/attention/**'
+      - 'crates/inference/benches/elementwise_cpu_bench.rs'
+      - 'crates/inference/benches/attention_bench.rs'
+      - 'crates/inference/Cargo.toml'
+      - 'crates/embed/src/simd/**'
+      - 'crates/embed/benches/simd.rs'
+      - 'crates/embed/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bench-update.yml'
+      - 'scripts/perf-bench-snapshot.py'
+      - 'scripts/perf-baselines-readme.py'
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required to push the orphan perf-baselines branch
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  bench:
+    name: bench (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-linux
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history for commit SHA + dates
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: bench-${{ matrix.arch }}
+
+      - name: Build benches
+        run: |
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench --no-run
+          cargo bench -p lattice-embed --bench simd --no-run
+
+      - name: Run benches (save baseline)
+        run: |
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline base --noplot
+          cargo bench -p lattice-embed --bench simd -- --save-baseline base --noplot
+
+      - name: Snapshot to history JSON
+        run: |
+          mkdir -p artifacts
+          python3 scripts/perf-bench-snapshot.py \
+            target/criterion \
+            "${{ matrix.arch }}" \
+            "${{ github.sha }}" \
+            --out artifacts/snapshot.json
+
+      - name: Upload baseline + snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-data-${{ matrix.arch }}
+          path: |
+            target/criterion/**
+            artifacts/snapshot.json
+          retention-days: 14
+
+  publish:
+    name: publish to perf-baselines
+    needs: bench
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (for scripts)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Save scripts from main
+        run: |
+          mkdir -p .keep
+          cp scripts/perf-bench-snapshot.py scripts/perf-baselines-readme.py .keep/
+
+      - name: Fetch or create perf-baselines (separate checkout)
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git ls-remote --exit-code origin perf-baselines >/dev/null 2>&1; then
+            git clone --depth=200 --branch=perf-baselines \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              .perf-baselines
+          else
+            git clone --depth=1 \
+              "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+              .perf-baselines
+            cd .perf-baselines
+            git checkout --orphan perf-baselines
+            git rm -rf . 2>/dev/null || true
+            mkdir -p history
+            echo "# perf-baselines (auto-managed by bench-update.yml)" > README.md
+            git add README.md history
+            git commit -m "init perf-baselines orphan branch"
+            git push origin perf-baselines
+            cd ..
+          fi
+
+      - name: Download all bench artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bench-artifacts/
+
+      - name: Stage baselines + history snapshots
+        run: |
+          set -e
+          for arch in x86_64-linux aarch64-linux; do
+            src="bench-artifacts/bench-data-$arch"
+            if [ ! -d "$src" ]; then
+              echo "no artifacts for $arch — skipping"
+              continue
+            fi
+
+            # Copy criterion baseline data into <arch>/<bench>/<test>/base/
+            mkdir -p ".perf-baselines/$arch"
+            if [ -d "$src/target/criterion" ]; then
+              rsync -a --delete "$src/target/criterion/" ".perf-baselines/$arch/"
+            fi
+
+            # Append history snapshot
+            ts=$(date -u +%Y%m%dT%H%M%S)
+            short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+            cp "$src/artifacts/snapshot.json" \
+               ".perf-baselines/history/${ts}_${short_sha}_${arch}.json"
+          done
+
+      - name: Regenerate README
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 .keep/perf-baselines-readme.py .perf-baselines
+
+      - name: Commit + push perf-baselines
+        run: |
+          cd .perf-baselines
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to perf-baselines"
+            exit 0
+          fi
+          short_sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          git commit -m "bench: baseline update for main@${short_sha}"
+          git push origin perf-baselines
