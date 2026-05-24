@@ -10,6 +10,13 @@ use super::simd::simd_config;
 ///
 /// Unlike LayerNorm, RMSNorm does not center (no beta/mean subtraction).
 pub fn rms_norm(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
+    assert!(hidden > 0, "hidden must be > 0");
+    assert!(
+        x.len() % hidden == 0,
+        "x.len() must be a multiple of hidden"
+    );
+    assert!(gamma.len() == hidden, "gamma.len() must equal hidden");
+
     let config = simd_config();
 
     #[cfg(target_arch = "aarch64")]
@@ -72,6 +79,8 @@ pub fn silu_inplace(x: &mut [f32]) {
 ///
 /// Element-wise multiply: a *= b.
 pub fn elementwise_mul(a: &mut [f32], b: &[f32]) {
+    assert!(a.len() == b.len(), "a.len() must equal b.len()");
+
     let config = simd_config();
 
     #[cfg(target_arch = "aarch64")]
@@ -142,38 +151,6 @@ pub fn elementwise_mul_scalar(a: &mut [f32], b: &[f32]) {
 }
 
 // ===================================================================
-// NEON fast exp (Schraudolph bit trick) — 4-wide float32x4_t
-// ===================================================================
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn fast_exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
-    use std::arch::aarch64::*;
-    let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
-    let x = vminq_f32(x, vdupq_n_f32(88.0));
-    let t = vfmaq_f32(vdupq_n_f32(1_065_353_216.0), x, vdupq_n_f32(12_102_203.0));
-    vreinterpretq_f32_s32(vcvtq_s32_f32(t))
-}
-
-// ===================================================================
-// AVX2 fast exp (Schraudolph bit trick) — 8-wide __m256
-// ===================================================================
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2")]
-unsafe fn fast_exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
-    use std::arch::x86_64::*;
-    let x = _mm256_max_ps(x, _mm256_set1_ps(-87.0));
-    let x = _mm256_min_ps(x, _mm256_set1_ps(88.0));
-    let scale = _mm256_set1_ps(12_102_203.0);
-    let bias = _mm256_set1_ps(1_065_353_216.0);
-    let t = _mm256_add_ps(_mm256_mul_ps(x, scale), bias);
-    _mm256_castsi256_ps(_mm256_cvtps_epi32(t))
-}
-
-// ===================================================================
 // NEON implementations — 4-wide float32x4_t
 // ===================================================================
 
@@ -241,9 +218,16 @@ unsafe fn silu_inplace_neon(x: &mut [f32]) {
         let off = c * 4;
         // SAFETY: off + 3 < chunks * 4 <= n, within slice bounds.
         let v = vld1q_f32(ptr.add(off) as *const f32);
-        // sigmoid(v) = 1 / (1 + exp(-v))
+        // sigmoid(v) = 1 / (1 + exp(-v)); use accurate exp for numerical correctness.
         let neg_v = vnegq_f32(v);
-        let exp_neg_v = fast_exp_neon(neg_v);
+        let neg_arr: [f32; 4] = core::mem::transmute(neg_v);
+        let exp_arr = [
+            neg_arr[0].exp(),
+            neg_arr[1].exp(),
+            neg_arr[2].exp(),
+            neg_arr[3].exp(),
+        ];
+        let exp_neg_v: float32x4_t = core::mem::transmute(exp_arr);
         let sigmoid = vdivq_f32(vone, vaddq_f32(vone, exp_neg_v));
         // silu = v * sigmoid(v)
         let result = vmulq_f32(v, sigmoid);
@@ -353,9 +337,20 @@ unsafe fn silu_inplace_avx2(x: &mut [f32]) {
         let off = c * 8;
         // SAFETY: off + 7 < chunks * 8 <= n, within slice bounds.
         let v = _mm256_loadu_ps(ptr.add(off) as *const f32);
-        // sigmoid(v) = 1 / (1 + exp(-v))
+        // sigmoid(v) = 1 / (1 + exp(-v)); use accurate exp for numerical correctness.
         let neg_v = _mm256_xor_ps(v, _mm256_set1_ps(-0.0));
-        let exp_neg_v = fast_exp_avx2(neg_v);
+        let neg_arr: [f32; 8] = core::mem::transmute(neg_v);
+        let exp_arr = [
+            neg_arr[0].exp(),
+            neg_arr[1].exp(),
+            neg_arr[2].exp(),
+            neg_arr[3].exp(),
+            neg_arr[4].exp(),
+            neg_arr[5].exp(),
+            neg_arr[6].exp(),
+            neg_arr[7].exp(),
+        ];
+        let exp_neg_v: __m256 = core::mem::transmute(exp_arr);
         let sigmoid = _mm256_div_ps(vone, _mm256_add_ps(vone, exp_neg_v));
         // silu = v * sigmoid(v)
         let result = _mm256_mul_ps(v, sigmoid);
