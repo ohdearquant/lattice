@@ -390,7 +390,7 @@ fn test_i8_memory_savings() {
     // float32: 384 * 4 = 1536 bytes
     // int8: 384 * 1 = 384 bytes
     assert_eq!(v.len() * 4, 1536, "float32 should be 1536 bytes");
-    assert_eq!(q.data.len(), 384, "int8 should be 384 bytes");
+    assert_eq!(q.len(), 384, "int8 should be 384 bytes");
     // 4x memory reduction
 }
 
@@ -839,14 +839,14 @@ fn test_i8_dot_unrolled_matches_original() {
 
         // Scalar reference: direct i32 accumulation over raw i8 slices.
         let scalar: f32 = a_q
-            .data
+            .data()
             .iter()
-            .zip(b_q.data.iter())
+            .zip(b_q.data().iter())
             .map(|(&x, &y)| x as i32 * y as i32)
             .sum::<i32>() as f32;
 
         // SIMD path (with prefetch via dot_product_i8_raw).
-        let simd = dot_product_i8_raw(&a_q.data, &b_q.data);
+        let simd = dot_product_i8_raw(a_q.data(), b_q.data());
 
         let diff = (simd - scalar).abs();
         assert!(

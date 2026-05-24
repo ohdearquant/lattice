@@ -73,17 +73,33 @@ impl QuantizationParams {
 /// Quantized int8 vector with its parameters.
 #[derive(Debug, Clone)]
 pub struct QuantizedVector {
-    /// **Unstable**: raw quantized data; invariant (`[-127, 127]`) enforced by constructor.
-    ///
-    /// # Invariant
-    /// All values must be in the range `[-127, 127]`. The value `-128` causes
-    /// incorrect results in AVX-512 VNNI and AVX2 SIMD paths due to `vpabsb`
-    /// saturation behavior. The `from_f32` constructor enforces this via clamping.
-    pub data: Vec<i8>,
+    /// Invariant: all values in `[-127, 127]`. Enforced by `from_f32` clamping.
+    /// Private — the invariant makes release-mode assert scans unnecessary.
+    data: Vec<i8>,
     /// **Unstable**: quantization parameters; may be separated from the vector.
     pub params: QuantizationParams,
     /// **Unstable**: L2 norm; may be removed or moved.
     pub norm: f32,
+}
+
+impl QuantizedVector {
+    /// Returns the quantized data as a slice. All values are in `[-127, 127]`.
+    #[inline]
+    pub fn data(&self) -> &[i8] {
+        &self.data
+    }
+
+    /// Returns the number of quantized elements.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if the quantized vector has no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 impl QuantizedVector {
@@ -161,44 +177,16 @@ impl QuantizedVector {
 ///
 /// Both vectors must satisfy the `[-127, 127]` range invariant. The value `-128`
 /// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
-/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). This function enforces the invariant
-/// with a release-mode `assert!` at the public boundary so callers that bypass
-/// `QuantizedVector::from_f32` (which clamps correctly) are caught immediately.
-///
-/// Hot inner kernels use `debug_assert!` only — the O(N) scan is paid once here.
-///
-/// # Feature gate asymmetry
-///
-/// The float32 AVX-512F path (dot_product, cosine, normalize, distance) activates
-/// unconditionally via runtime `is_x86_feature_detected!("avx512f")` -- no Cargo
-/// feature gate is needed because `_mm512_loadu_ps` / `_mm512_fmadd_ps` etc. are
-/// part of the base AVX-512F ISA and Rust's `#[target_feature(enable = "avx512f")]`
-/// annotation is sufficient.
-///
-/// The integer VNNI path below requires `--features avx512` at compile time because
-/// it uses `_mm512_dpbusd_epi32` (AVX-512 VNNI) and `_mm512_cmplt_epi8_mask`
-/// (AVX-512BW), which are behind nightly-gated intrinsics that need an explicit
-/// Cargo feature to opt in to the extended instruction sets at compile time.
+/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). The `data` field is private, so
+/// only `from_f32` (which clamps) can populate it — `debug_assert!` is sufficient.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
-    // FP-033: -128 causes incorrect results in AVX-512 VNNI via vpabsb saturation
-    // and in AVX2 via _mm256_sign_epi8 saturation. Release-mode assert at the public
-    // boundary — callers that produce data outside from_f32 are caught here.
-    // Inner hot-path kernels use debug_assert! only (scan cost paid once, here).
-    assert!(
-        a.data.iter().all(|&v| v != -128i8),
-        "QuantizedVector a contains -128, which violates the [-127, 127] VNNI invariant"
-    );
-    assert!(
-        b.data.iter().all(|&v| v != -128i8),
-        "QuantizedVector b contains -128, which violates the [-127, 127] VNNI invariant"
-    );
+    debug_assert!(a.data.iter().all(|&v| v != -128i8));
+    debug_assert!(b.data.iter().all(|&v| v != -128i8));
 
-    // Runtime length check to prevent UB in release builds
     if a.data.len() != b.data.len() {
         return 0.0;
     }
-    debug_assert_eq!(a.data.len(), b.data.len());
 
     let denom = a.params.scale * b.params.scale;
     if denom == 0.0 || !denom.is_finite() {
@@ -679,11 +667,11 @@ pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    assert!(
+    debug_assert!(
         a.iter().all(|&v| v != -128i8),
         "dot_product_i8_raw: slice a contains -128, violating the [-127, 127] SIMD invariant"
     );
-    assert!(
+    debug_assert!(
         b.iter().all(|&v| v != -128i8),
         "dot_product_i8_raw: slice b contains -128, violating the [-127, 127] SIMD invariant"
     );
