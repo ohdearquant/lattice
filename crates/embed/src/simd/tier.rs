@@ -126,7 +126,7 @@ impl QuantizedData {
     pub fn dims(&self) -> usize {
         match self {
             Self::Full(v) => v.len(),
-            Self::Int8(q) => q.data.len(),
+            Self::Int8(q) => q.len(),
             Self::Int4(q) => q.dims,
             Self::Binary(q) => q.dims,
         }
@@ -136,7 +136,7 @@ impl QuantizedData {
     pub fn storage_bytes(&self) -> usize {
         match self {
             Self::Full(v) => v.len() * 4,
-            Self::Int8(q) => q.data.len(),
+            Self::Int8(q) => q.len(),
             Self::Int4(q) => q.data.len(),
             Self::Binary(q) => q.data.len(),
         }
@@ -223,7 +223,7 @@ impl PreparedQuery {
     pub fn dims(&self) -> usize {
         match self {
             Self::Full(v) => v.len(),
-            Self::Int8(q) => q.data.len(),
+            Self::Int8(q) => q.len(),
             Self::Int4(q) => q.dims,
             Self::Binary(q) => q.dims,
         }

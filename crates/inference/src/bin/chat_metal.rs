@@ -135,6 +135,8 @@ fn run_chat() -> Result<(), Box<dyn std::error::Error>> {
         seed: None,
         stop_token_ids: vec![],
         enable_thinking: true,
+        enable_mtp: None,
+        grammar: None,
     };
 
     let system_msg = ChatMessage::system("You are a helpful assistant. Be concise and direct.");
