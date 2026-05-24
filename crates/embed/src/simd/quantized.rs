@@ -258,7 +258,7 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
 /// - Remainder handled via safe slice iteration
 /// - Prefetch pointers are bounds-checked before issuing (only prefetch if within slice)
 #[cfg(target_arch = "aarch64")]
-#[inline]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 16;
     const UNROLL: usize = 4;
