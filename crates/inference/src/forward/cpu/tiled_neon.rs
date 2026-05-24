@@ -84,6 +84,31 @@ pub(super) unsafe fn matmul_bt_tiled_neon(
                     for kp in 0..k_pairs {
                         let ko = k_start + kp * 8;
 
+                        // Prefetch the next k-chunk's B-rows into L1 cache while
+                        // the current chunk is being processed by the FMA units.
+                        if kp + 1 < k_pairs {
+                            let next_ko = ko + 8;
+                            core::arch::asm!(
+                                "prfm pldl1keep, [{0}]",
+                                "prfm pldl1keep, [{1}]",
+                                "prfm pldl1keep, [{2}]",
+                                "prfm pldl1keep, [{3}]",
+                                "prfm pldl1keep, [{4}]",
+                                "prfm pldl1keep, [{5}]",
+                                "prfm pldl1keep, [{6}]",
+                                "prfm pldl1keep, [{7}]",
+                                in(reg) b0_base.add(next_ko),
+                                in(reg) b1_base.add(next_ko),
+                                in(reg) b2_base.add(next_ko),
+                                in(reg) b3_base.add(next_ko),
+                                in(reg) b4_base.add(next_ko),
+                                in(reg) b5_base.add(next_ko),
+                                in(reg) b6_base.add(next_ko),
+                                in(reg) b7_base.add(next_ko),
+                                options(nostack, preserves_flags, readonly),
+                            );
+                        }
+
                         // --- First group of 4 k-values ---
                         let bv0a = vld1q_f32(b0_base.add(ko));
                         let bv1a = vld1q_f32(b1_base.add(ko));
@@ -273,18 +298,28 @@ pub(super) unsafe fn matmul_bt_tiled_neon(
                     }
                 } else {
                     // Edge tiles: partial I or J count, or k_len < 8.
-                    // Use scalar accumulation for correctness at tile boundaries.
+                    // Still use NEON for the dot product along k where possible.
                     for ii in 0..i_count {
                         let i = i_start + ii;
+                        let a_base = a_ptr.add(i * k + k_start);
                         for jj in 0..j_count {
                             let j = j_start + jj;
-                            let mut sum = 0.0f32;
-                            for p in k_start..k_end {
-                                // SAFETY: i < m, p < k so i*k+p < m*k = a.len().
-                                // j < n, p < k so j*k+p < n*k = b.len().
-                                sum += *a_ptr.add(i * k + p) * *b_ptr.add(j * k + p);
+                            let b_base = b_ptr.add(j * k + k_start);
+                            let kl = k_end - k_start;
+
+                            let mut acc = vdupq_n_f32(0.0);
+                            let k_vec = kl / 4;
+                            for kk in 0..k_vec {
+                                let off = kk * 4;
+                                let av = vld1q_f32(a_base.add(off));
+                                let bv = vld1q_f32(b_base.add(off));
+                                acc = vfmaq_f32(acc, av, bv);
                             }
-                            // SAFETY: i < m, j < n so i*n+j < m*n = c.len().
+                            let mut sum = vaddvq_f32(acc);
+
+                            for p in (k_vec * 4)..kl {
+                                sum += *a_base.add(p) * *b_base.add(p);
+                            }
                             *c_ptr.add(i * n + j) += sum;
                         }
                     }
