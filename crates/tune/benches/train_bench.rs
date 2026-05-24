@@ -4,10 +4,12 @@
 //! parameter is informational; the loop is sequential).
 //!
 //! Groups:
-//!   lora/train_loop — num_epochs=5, batch_size ∈ {10, 50, 100}
+//!   lora/train_loop    — num_epochs=5, batch_size ∈ {10, 50, 100}, SGD
+//!   lora/optimizer_cmp — SGD vs Adam vs AdamW at 50 samples, 5 epochs
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
+use lattice_tune::train::OptimizerConfig;
 use lattice_tune::{LoraTrainConfig, TrainSample, train_lora};
 use std::collections::HashMap;
 
@@ -84,6 +86,9 @@ fn bench_train_loop(c: &mut Criterion) {
                         learning_rate: 0.01,
                         num_epochs: NUM_EPOCHS,
                         batch_size: n_samples,
+                        optimizer: None,
+                        lr_schedule: None,
+                        grad_clip_norm: None,
                     };
                     train_lora(
                         black_box(&mut adapter),
@@ -99,5 +104,75 @@ fn bench_train_loop(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_train_loop);
+fn bench_optimizer_cmp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lora/optimizer_cmp");
+    let samples = make_samples(50);
+
+    // SGD
+    group.bench_function("sgd", |b| {
+        b.iter(|| {
+            let mut adapter = make_adapter();
+            let config = LoraTrainConfig {
+                learning_rate: 0.01,
+                num_epochs: NUM_EPOCHS,
+                batch_size: 50,
+                optimizer: None,
+                lr_schedule: None,
+                grad_clip_norm: None,
+            };
+            train_lora(
+                black_box(&mut adapter),
+                black_box(&samples),
+                black_box(&config),
+            )
+            .expect("train_lora must not fail in bench")
+        });
+    });
+
+    // Adam
+    group.bench_function("adam", |b| {
+        b.iter(|| {
+            let mut adapter = make_adapter();
+            let config = LoraTrainConfig {
+                learning_rate: 0.01,
+                num_epochs: NUM_EPOCHS,
+                batch_size: 50,
+                optimizer: Some(OptimizerConfig::adam(0.01)),
+                lr_schedule: None,
+                grad_clip_norm: None,
+            };
+            train_lora(
+                black_box(&mut adapter),
+                black_box(&samples),
+                black_box(&config),
+            )
+            .expect("train_lora must not fail in bench")
+        });
+    });
+
+    // AdamW
+    group.bench_function("adamw", |b| {
+        b.iter(|| {
+            let mut adapter = make_adapter();
+            let config = LoraTrainConfig {
+                learning_rate: 0.01,
+                num_epochs: NUM_EPOCHS,
+                batch_size: 50,
+                optimizer: Some(OptimizerConfig::adamw(0.01, 0.01)),
+                lr_schedule: None,
+                grad_clip_norm: None,
+            };
+            train_lora(
+                black_box(&mut adapter),
+                black_box(&samples),
+                black_box(&config),
+            )
+            .expect("train_lora must not fail in bench")
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_train_loop, bench_optimizer_cmp);
 criterion_main!(benches);
