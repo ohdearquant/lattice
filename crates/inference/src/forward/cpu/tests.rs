@@ -333,6 +333,330 @@ fn make_deterministic_vec(len: usize, seed: u32) -> Vec<f32> {
     out
 }
 
+// ===================================================================
+// Elementwise SIMD vs. scalar comparison tests
+// ===================================================================
+
+#[test]
+fn test_rms_norm_known_values() {
+    // Single token, hidden=4, gamma=all-ones, eps=0.
+    // rms = sqrt(mean([1,2,3,4]^2)) = sqrt(7.5) ≈ 2.7386.
+    // Expected: [1/2.7386, 2/2.7386, 3/2.7386, 4/2.7386]
+    let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+    let gamma = vec![1.0f32; 4];
+    rms_norm(&mut x, &gamma, 4, 1e-8);
+    let expected_rms = (7.5f32 + 1e-8).sqrt();
+    for (i, &v) in x.iter().enumerate() {
+        let expected = (i + 1) as f32 / expected_rms;
+        assert_relative_eq!(v, expected, epsilon = 1e-5);
+    }
+}
+
+#[test]
+fn test_rms_norm_simd_matches_scalar() {
+    // Two sizes: one that exercises SIMD main loops, one with a remainder tail.
+    for &hidden in &[896usize, 2048, 4096, 13] {
+        let rows = 4;
+        let mut x_simd = make_deterministic_vec(rows * hidden, 0xC0DE);
+        let mut x_scalar = x_simd.clone();
+        let gamma = make_deterministic_vec_range(hidden, 0xC0DF, 0.9, 1.1);
+        let eps = 1e-6;
+
+        rms_norm(&mut x_simd, &gamma, hidden, eps);
+        rms_norm_scalar(&mut x_scalar, &gamma, hidden, eps);
+
+        for i in 0..(rows * hidden) {
+            let diff = (x_simd[i] - x_scalar[i]).abs();
+            assert!(
+                diff <= 1e-4,
+                "rms_norm mismatch at hidden={hidden} index={i}: simd={} scalar={} diff={diff}",
+                x_simd[i],
+                x_scalar[i],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_silu_known_values() {
+    // silu(0) = 0 * 0.5 = 0.
+    // silu(1) = 1 * sigmoid(1) ≈ 0.7311.
+    // silu(-1) = -1 * sigmoid(-1) ≈ -0.2689.
+    let mut x = vec![0.0f32, 1.0, -1.0];
+    silu_inplace(&mut x);
+    assert_relative_eq!(x[0], 0.0, epsilon = 1e-5);
+    // Use a loose tolerance because we use fast_exp (Schraudolph) in SIMD paths.
+    assert_relative_eq!(x[1], 0.731_059_f32, epsilon = 5e-2);
+    assert_relative_eq!(x[2], -0.268_941_f32, epsilon = 5e-2);
+}
+
+#[test]
+fn test_silu_simd_matches_scalar() {
+    for &n in &[896usize, 2048, 4096, 17] {
+        let mut x_simd = make_deterministic_vec(n, 0x51C0);
+        let mut x_scalar = x_simd.clone();
+
+        silu_inplace(&mut x_simd);
+        silu_inplace_scalar(&mut x_scalar);
+
+        for i in 0..n {
+            let diff = (x_simd[i] - x_scalar[i]).abs();
+            assert!(
+                diff <= 5e-2,
+                "silu mismatch at n={n} index={i}: simd={} scalar={} diff={diff}",
+                x_simd[i],
+                x_scalar[i],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_elementwise_mul_known_values() {
+    let mut a = vec![2.0f32, 3.0, -1.0, 0.0];
+    let b = vec![4.0f32, -2.0, 5.0, 7.0];
+    elementwise_mul(&mut a, &b);
+    assert_relative_eq!(a[0], 8.0, epsilon = 1e-6);
+    assert_relative_eq!(a[1], -6.0, epsilon = 1e-6);
+    assert_relative_eq!(a[2], -5.0, epsilon = 1e-6);
+    assert_relative_eq!(a[3], 0.0, epsilon = 1e-6);
+}
+
+#[test]
+fn test_elementwise_mul_simd_matches_scalar() {
+    for &n in &[896usize, 2048, 4096, 11] {
+        let mut a_simd = make_deterministic_vec(n, 0xE1A1);
+        let b = make_deterministic_vec(n, 0xE1A2);
+        let mut a_scalar = a_simd.clone();
+
+        elementwise_mul(&mut a_simd, &b);
+        elementwise_mul_scalar(&mut a_scalar, &b);
+
+        for i in 0..n {
+            // elementwise_mul is exact (single multiply), tolerance is floating-point rounding.
+            let diff = (a_simd[i] - a_scalar[i]).abs();
+            assert!(
+                diff <= 1e-6,
+                "elementwise_mul mismatch at n={n} index={i}: simd={} scalar={} diff={diff}",
+                a_simd[i],
+                a_scalar[i],
+            );
+        }
+    }
+}
+
+// ===================================================================
+// SIMD/scalar parity regression tests — LCG generator + relative error
+// ===================================================================
+//
+// These tests use a second independent generator (LCG) and a proper
+// relative-error comparison to catch silent numerical regressions when
+// NEON SIMD kernels are modified.  They are intentionally separate from
+// the xorshift-based tests above so that both data-generation paths are
+// exercised.
+
+/// LCG-based deterministic f32 vector in the range [-0.02, 0.02].
+/// Uses a different bit-mixing strategy than `make_deterministic_vec`
+/// so the two generators produce uncorrelated data at the same index.
+fn lcg_f32_vec(len: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed ^ 0x6c62_272e_07bb_0142;
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let unit = (state >> 32) as f32 / u32::MAX as f32;
+        out.push(unit * 0.04 - 0.02);
+    }
+    out
+}
+
+/// Mixed absolute + relative error comparison.
+///
+/// Passes when `|a - b| <= rtol * max(|a|, |b|) + atol`.
+///
+/// Using a non-zero `atol` prevents near-zero elements from triggering
+/// false failures when the *absolute* error is within f32 precision but
+/// the *relative* error is large simply because both values approach zero.
+fn assert_close_mixed(a: &[f32], b: &[f32], rtol: f32, atol: f32, label: &str) {
+    assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+    for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+        let abs_diff = (x - y).abs();
+        let threshold = rtol * x.abs().max(y.abs()) + atol;
+        assert!(
+            abs_diff <= threshold,
+            "{label}[{i}]: {x} vs {y}, abs_err={abs_diff:.3e} > rtol*mag+atol={threshold:.3e}"
+        );
+    }
+}
+
+/// Pure relative-error comparison (atol=0).  For each element the
+/// denominator is `max(|a|, |b|, 1e-8)` to avoid division by zero.
+fn assert_close(a: &[f32], b: &[f32], rtol: f32, label: &str) {
+    assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+    for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+        let denom = x.abs().max(y.abs()).max(1e-8);
+        let rel = (x - y).abs() / denom;
+        assert!(
+            rel <= rtol,
+            "{label}[{i}]: {x} vs {y}, rel_err={rel} > {rtol}"
+        );
+    }
+}
+
+#[test]
+fn test_silu_simd_scalar_parity() {
+    // Verify silu_inplace() (SIMD dispatch) matches silu_inplace_scalar()
+    // at hidden sizes representative of real model widths.
+    // Tolerance 1e-4 relative — silu uses fast_exp (Schraudolph) in NEON.
+    for &n in &[896usize, 2048, 4096] {
+        let mut x_simd = lcg_f32_vec(n, 0x5100_0001_u64 ^ (n as u64));
+        let mut x_scalar = x_simd.clone();
+
+        silu_inplace(&mut x_simd);
+        silu_inplace_scalar(&mut x_scalar);
+
+        assert_close(&x_simd, &x_scalar, 1e-4, &format!("silu_parity n={n}"));
+    }
+}
+
+#[test]
+fn test_gelu_simd_scalar_parity() {
+    // Verify gelu() (SIMD dispatch) matches gelu_scalar().
+    // Tolerance 1e-4 relative — NEON uses vdivq_f32 so error is only FMA order.
+    for &n in &[896usize, 2048, 4096] {
+        let mut x_simd = lcg_f32_vec(n, 0x9E10_0001_u64 ^ (n as u64));
+        let mut x_scalar = x_simd.clone();
+
+        gelu(&mut x_simd);
+        gelu_scalar(&mut x_scalar);
+
+        assert_close(&x_simd, &x_scalar, 1e-4, &format!("gelu_parity n={n}"));
+    }
+}
+
+#[test]
+fn test_rms_norm_simd_scalar_parity() {
+    // 8 tokens × three hidden sizes.  Tolerance 1e-5 relative —
+    // rms_norm uses ieee-accurate rsqrt so error is only sum-reduction order.
+    let rows = 8usize;
+    for &hidden in &[896usize, 2048, 4096] {
+        let mut x_simd = lcg_f32_vec(rows * hidden, 0xC0DE_0001_u64 ^ (hidden as u64));
+        let mut x_scalar = x_simd.clone();
+        let gamma = {
+            let raw = lcg_f32_vec(hidden, 0xC0DE_0002_u64 ^ (hidden as u64));
+            // Shift into [0.9, 1.1] for realistic scale factors.
+            raw.into_iter().map(|v| 1.0 + v * 5.0).collect::<Vec<_>>()
+        };
+        let eps = 1e-6_f32;
+
+        rms_norm(&mut x_simd, &gamma, hidden, eps);
+        rms_norm_scalar(&mut x_scalar, &gamma, hidden, eps);
+
+        assert_close(
+            &x_simd,
+            &x_scalar,
+            1e-5,
+            &format!("rms_norm_parity hidden={hidden}"),
+        );
+    }
+}
+
+#[test]
+fn test_layer_norm_simd_scalar_parity() {
+    // 8 tokens × three hidden sizes.  Tolerance 1e-5 relative.
+    let rows = 8usize;
+    for &hidden in &[896usize, 2048, 4096] {
+        let mut x_simd = lcg_f32_vec(rows * hidden, 0xF00D_0001_u64 ^ (hidden as u64));
+        let mut x_scalar = x_simd.clone();
+        let gamma = {
+            let raw = lcg_f32_vec(hidden, 0xF00D_0002_u64 ^ (hidden as u64));
+            raw.into_iter().map(|v| 1.0 + v * 5.0).collect::<Vec<_>>()
+        };
+        let beta = lcg_f32_vec(hidden, 0xF00D_0003_u64 ^ (hidden as u64));
+        let eps = 1e-12_f32;
+
+        layer_norm(&mut x_simd, &gamma, &beta, hidden, eps);
+        layer_norm_scalar(&mut x_scalar, &gamma, &beta, hidden, eps);
+
+        // layer_norm involves two horizontal reductions (mean + variance)
+        // whose NEON pairwise-summation order diverges from scalar sequential
+        // sum at large hidden sizes.  Near-zero output elements (gamma×z+beta≈0)
+        // can have large *relative* error from tiny absolute differences.
+        // We use a mixed criterion: |a-b| <= 1e-4*max(|a|,|b|) + 1e-5
+        // so near-zero outputs fall back to absolute tolerance (1e-5 >> f32 ULP).
+        assert_close_mixed(
+            &x_simd,
+            &x_scalar,
+            1e-4,
+            1e-5,
+            &format!("layer_norm_parity hidden={hidden}"),
+        );
+    }
+}
+
+#[test]
+fn test_softmax_simd_scalar_parity() {
+    // seq_len in {32, 64, 128} with 8 heads.
+    // Tolerance 1e-3 relative — fast_exp approximation introduces ~1-2% error
+    // per row; normalisation cancels systematic bias but relative error remains.
+    let num_heads = 8usize;
+    for &seq_len in &[32usize, 64, 128] {
+        let n = num_heads * seq_len * seq_len;
+        let mut x_simd = lcg_f32_vec(n, 0x50F7_0001_u64 ^ (seq_len as u64));
+        // Scale to realistic attention logit magnitudes [-2, 2].
+        for v in &mut x_simd {
+            *v *= 100.0;
+        }
+        let mut x_scalar = x_simd.clone();
+
+        softmax_attention(&mut x_simd, seq_len, num_heads);
+        softmax_attention_scalar(&mut x_scalar, seq_len, num_heads);
+
+        assert_close(
+            &x_simd,
+            &x_scalar,
+            1e-3,
+            &format!("softmax_parity seq_len={seq_len}"),
+        );
+
+        // Sanity: every row must still sum to 1.0.
+        for h in 0..num_heads {
+            for s in 0..seq_len {
+                let start = (h * seq_len + s) * seq_len;
+                let row_sum: f32 = x_simd[start..start + seq_len].iter().sum();
+                assert!(
+                    (row_sum - 1.0).abs() < 1e-3,
+                    "softmax_parity seq_len={seq_len} head={h} row={s}: sum={row_sum}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_elementwise_mul_simd_scalar_parity() {
+    // elementwise_mul is a single multiply per element — expect exact match
+    // (both paths issue the same FP operation, just via SIMD registers vs scalar).
+    // Using rtol=0 would be fragile across compilers; use 1e-7 for rounding
+    // differences between vmulq_f32 and scalar `*`.
+    for &n in &[896usize, 2048, 4096] {
+        let mut a_simd = lcg_f32_vec(n, 0xE1A1_0001_u64 ^ (n as u64));
+        let b = lcg_f32_vec(n, 0xE1A2_0001_u64 ^ (n as u64));
+        let mut a_scalar = a_simd.clone();
+
+        elementwise_mul(&mut a_simd, &b);
+        elementwise_mul_scalar(&mut a_scalar, &b);
+
+        assert_close(
+            &a_simd,
+            &a_scalar,
+            1e-7,
+            &format!("elementwise_mul_parity n={n}"),
+        );
+    }
+}
+
 /// Deterministic pseudo-random vector in a custom range.
 fn make_deterministic_vec_range(len: usize, seed: u32, lo: f32, hi: f32) -> Vec<f32> {
     let mut state = seed ^ (len as u32).wrapping_mul(0x9E37_79B9);

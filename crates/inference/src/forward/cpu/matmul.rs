@@ -125,16 +125,64 @@ pub fn matmul_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn matmul_bt_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    if m == 1 {
+        matmul_bt_scalar_m1(a, b, c, k, n);
+        return;
+    }
     for i in 0..m {
         let a_row = &a[i * k..(i + 1) * k];
         let c_row = &mut c[i * n..(i + 1) * n];
         for j in 0..n {
             let b_row = &b[j * k..(j + 1) * k];
-            let mut sum = 0.0f32;
-            for p in 0..k {
-                sum += a_row[p] * b_row[p];
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            let mut s2 = 0.0f32;
+            let mut s3 = 0.0f32;
+            let unrolled = k / 4;
+            for p in 0..unrolled {
+                let off = p * 4;
+                s0 += a_row[off] * b_row[off];
+                s1 += a_row[off + 1] * b_row[off + 1];
+                s2 += a_row[off + 2] * b_row[off + 2];
+                s3 += a_row[off + 3] * b_row[off + 3];
             }
-            c_row[j] = sum;
+            for p in (unrolled * 4)..k {
+                s0 += a_row[p] * b_row[p];
+            }
+            c_row[j] = (s0 + s1) + (s2 + s3);
         }
+    }
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[inline]
+fn matmul_bt_scalar_m1(a: &[f32], b: &[f32], c: &mut [f32], k: usize, n: usize) {
+    let a_row = &a[..k];
+    let unrolled8 = k / 8;
+    for j in 0..n {
+        let b_row = &b[j * k..(j + 1) * k];
+        let mut s0 = 0.0f32;
+        let mut s1 = 0.0f32;
+        let mut s2 = 0.0f32;
+        let mut s3 = 0.0f32;
+        let mut s4 = 0.0f32;
+        let mut s5 = 0.0f32;
+        let mut s6 = 0.0f32;
+        let mut s7 = 0.0f32;
+        for p in 0..unrolled8 {
+            let off = p * 8;
+            s0 += a_row[off] * b_row[off];
+            s1 += a_row[off + 1] * b_row[off + 1];
+            s2 += a_row[off + 2] * b_row[off + 2];
+            s3 += a_row[off + 3] * b_row[off + 3];
+            s4 += a_row[off + 4] * b_row[off + 4];
+            s5 += a_row[off + 5] * b_row[off + 5];
+            s6 += a_row[off + 6] * b_row[off + 6];
+            s7 += a_row[off + 7] * b_row[off + 7];
+        }
+        for p in (unrolled8 * 8)..k {
+            s0 += a_row[p] * b_row[p];
+        }
+        c[j] = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
     }
 }
