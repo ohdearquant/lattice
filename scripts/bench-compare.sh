@@ -2,15 +2,24 @@
 # bench-compare.sh — A/B benchmark comparison across two git refs.
 #
 # Usage:
-#   scripts/bench-compare.sh                  # origin/main vs HEAD
-#   scripts/bench-compare.sh main pr/embed    # explicit base vs head
-#   scripts/bench-compare.sh HEAD~3           # HEAD~3 vs HEAD
+#   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
+#   scripts/bench-compare.sh main pr/embed           # explicit base vs head
+#   scripts/bench-compare.sh --full main pr/embed    # full Criterion (slow, tight CIs)
+#   scripts/bench-compare.sh HEAD~3                  # HEAD~3 vs HEAD
 #
-# Produces a markdown table of before/after with Δ% for every bench in scope.
+# Defaults to --quick (~2 min). Use --full (~15 min) for tight confidence intervals.
 # Uses a git worktree for the base ref so your working tree stays untouched.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
+
+# Parse --full flag
+if [ "${1:-}" = "--full" ]; then
+  QUICK_FLAGS=""  # 100 samples, ~15 min total
+  shift
+fi
+
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
 
@@ -43,11 +52,11 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
   cd "$WT"
   # Only bench what exists — some benches may not exist on older refs
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --save-baseline compare-base --noplot 2>&1 | grep -E "time:" || true
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
   else
     echo "  (elementwise_cpu_bench not present on $BASE_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --save-baseline compare-base --noplot 2>&1 | grep -E "time:" || true
+  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
 )
 
 # --- Copy base criterion data to HEAD's target ---
@@ -80,11 +89,11 @@ fi
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --baseline compare-base --noplot 2>&1 | grep -E "time:|change:" || true
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
   else
     echo "  (elementwise_cpu_bench not present on $HEAD_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --baseline compare-base --noplot 2>&1 | grep -E "time:|change:" || true
+  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
 # --- Report ---
