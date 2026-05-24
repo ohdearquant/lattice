@@ -62,5 +62,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "train_bench"
 harness = false
 
+[[bench]]
+name = "e2e_bench"
+harness = false
+
 [lints]
 workspace = true
