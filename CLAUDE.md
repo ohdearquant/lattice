@@ -1,6 +1,44 @@
 # Lattice — Claude Code Instructions
 
-Read `AGENTS.md` first. It contains all coding conventions, crate structure, design principles, and workflow rules. Everything below is additional context for Claude Code sessions.
+Read `AGENTS.md` first for coding conventions, crate structure, and design principles.
+
+## Development Process
+
+### Measure First, Code Second
+
+Every PR that touches `crates/inference/` or `crates/embed/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like.
+
+```bash
+make bench-compare                         # origin/main vs HEAD (~2 min, default)
+make bench-compare BASE=main HEAD=pr/x     # explicit refs
+scripts/bench-compare.sh --full main       # tight CIs (~15 min)
+```
+
+Paste the output in the PR description. If nothing changed, say "bench-compare showed no change (p > 0.05 on all groups)." If something regressed, explain why it's acceptable or revert it.
+
+This process caught a 15% decode throughput regression (157 → 130 tok/s) that had been attributed to "GPU contention noise" for days. The f32 dot_product unrolling that caused it was identified in under 2 minutes via A/B comparison.
+
+### Bench by Group, Not All at Once
+
+The full Criterion suite takes 15-30 min. Never run it all. Filter to the groups your PR touches:
+
+```bash
+cargo bench -p lattice-embed --bench simd -- "simd_dot_product"     # one group
+cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"   # multiple groups
+cargo bench -p lattice-inference --bench elementwise_cpu_bench      # inference CPU ops
+```
+
+Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
+
+### Regression Gate (ADR-058)
+
+PRs touching CPU kernel paths trigger `bench-regression.yml` in CI. It runs on both `x86_64-linux` (AVX2) and `aarch64-linux` (NEON) against baselines stored on the orphan `perf-baselines` branch.
+
+- **>7% regression** (95% CI lower bound): blocks merge
+- **3-7%**: warning comment, doesn't block
+- **Override**: PR label `bench-allow-regression` with rationale
+
+The `perf-baselines` branch auto-updates on every push to main via `bench-update.yml`.
 
 ## Session Protocol
 
@@ -24,6 +62,9 @@ Read `AGENTS.md` first. It contains all coding conventions, crate structure, des
 - Do not add comments explaining WHAT the code does.
 - Do not create new crates without explicit approval.
 - Do not modify the dependency direction (leaf crates must stay leaf).
+- Do not claim "X% faster" without a bench measurement from this session.
+- Do not run the full Criterion suite when you can filter to relevant groups.
+- Do not submit a perf PR without `make bench-compare` output.
 
 ## Performance Workflow (ADR-058)
 
