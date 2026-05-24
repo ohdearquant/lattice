@@ -530,8 +530,8 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
         // Software prefetch for the next chunk.
         let next_base = base + PREFETCH_DISTANCE;
         if next_base + CHUNK_SIZE <= n {
-            _mm_prefetch(a.as_ptr().add(next_base) as *const i8, _MM_HINT_T0);
-            _mm_prefetch(b.as_ptr().add(next_base) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a.as_ptr().add(next_base), _MM_HINT_T0);
+            _mm_prefetch(b.as_ptr().add(next_base), _MM_HINT_T0);
         }
 
         // Unroll 0
