@@ -178,5 +178,9 @@ name = "mtp_decode"
 harness = false
 required-features = ["metal-gpu", "f16"]
 
+[[bench]]
+name = "matmul_opt_bench"
+harness = false
+
 [lints]
 workspace = true
