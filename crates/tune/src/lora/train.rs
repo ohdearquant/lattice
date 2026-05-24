@@ -72,6 +72,11 @@ pub fn train_lora(
             "no training samples provided".to_string(),
         ));
     }
+    if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
+        return Err(TuneError::InvalidConfig(
+            "learning_rate must be finite and positive".to_string(),
+        ));
+    }
     if config.batch_size == 0 {
         return Err(TuneError::InvalidConfig(
             "batch_size must be > 0".to_string(),
@@ -104,9 +109,10 @@ pub fn train_lora(
         epoch_losses.push(avg);
     }
 
-    let final_loss = *epoch_losses
+    let final_loss = epoch_losses
         .last()
-        .expect("num_epochs > 0 guaranteed above");
+        .copied()
+        .ok_or_else(|| TuneError::InvalidConfig("num_epochs produced no losses".into()))?;
     let total_steps = config.num_epochs * samples.len();
 
     Ok(TrainResult {
