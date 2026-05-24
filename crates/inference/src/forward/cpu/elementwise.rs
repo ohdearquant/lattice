@@ -234,34 +234,86 @@ unsafe fn rms_norm_neon(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[inline]
+unsafe fn neon_exp_f32(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const LN2_HI: f32 = 0.693_145_75_f32;
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+
+    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(88.72)), vdupq_n_f32(-87.33));
+
+    // Range reduction: x = n*ln(2) + r, |r| <= ln(2)/2
+    // Round to nearest via magic-number trick (avoids unstable intrinsics)
+    let magic = vdupq_n_f32(12_582_912.0); // 1.5 * 2^23
+    let biased = vaddq_f32(vmulq_f32(x, vdupq_n_f32(LOG2E)), magic);
+    let n = vsubq_f32(biased, magic);
+    let n_int = vcvtq_s32_f32(n);
+
+    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(LN2_HI)), n, vdupq_n_f32(LN2_LO));
+
+    // exp(r) via Horner: 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r*(1/120 + r/720)))))
+    let p = vdupq_n_f32(1.0 / 720.0);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 120.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+
+    // Reconstruct: exp(x) = 2^n * exp(r)
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n_int, vdupq_n_s32(127))));
+    vmulq_f32(p, pow2n)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn silu_inplace_neon(x: &mut [f32]) {
     use std::arch::aarch64::*;
 
     let n = x.len();
-    let chunks = n / 4;
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL;
+    let chunks = n / CHUNK;
     let ptr = x.as_mut_ptr();
     let vone = vdupq_n_f32(1.0);
 
     for c in 0..chunks {
-        let off = c * 4;
-        // SAFETY: off + 3 < chunks * 4 <= n, within slice bounds.
-        let v = vld1q_f32(ptr.add(off) as *const f32);
-        // sigmoid(v) = 1 / (1 + exp(-v)); use accurate exp for numerical correctness.
-        let neg_v = vnegq_f32(v);
-        let neg_arr: [f32; 4] = core::mem::transmute(neg_v);
-        let exp_arr = [
-            neg_arr[0].exp(),
-            neg_arr[1].exp(),
-            neg_arr[2].exp(),
-            neg_arr[3].exp(),
-        ];
-        let exp_neg_v: float32x4_t = core::mem::transmute(exp_arr);
-        let sigmoid = vdivq_f32(vone, vaddq_f32(vone, exp_neg_v));
-        // silu = v * sigmoid(v)
-        let result = vmulq_f32(v, sigmoid);
-        vst1q_f32(ptr.add(off), result);
+        let base = c * CHUNK;
+
+        let v0 = vld1q_f32(ptr.add(base) as *const f32);
+        let v1 = vld1q_f32(ptr.add(base + 4) as *const f32);
+        let v2 = vld1q_f32(ptr.add(base + 8) as *const f32);
+        let v3 = vld1q_f32(ptr.add(base + 12) as *const f32);
+
+        let e0 = neon_exp_f32(vnegq_f32(v0));
+        let e1 = neon_exp_f32(vnegq_f32(v1));
+        let e2 = neon_exp_f32(vnegq_f32(v2));
+        let e3 = neon_exp_f32(vnegq_f32(v3));
+
+        let s0 = vdivq_f32(vone, vaddq_f32(vone, e0));
+        let s1 = vdivq_f32(vone, vaddq_f32(vone, e1));
+        let s2 = vdivq_f32(vone, vaddq_f32(vone, e2));
+        let s3 = vdivq_f32(vone, vaddq_f32(vone, e3));
+
+        vst1q_f32(ptr.add(base), vmulq_f32(v0, s0));
+        vst1q_f32(ptr.add(base + 4), vmulq_f32(v1, s1));
+        vst1q_f32(ptr.add(base + 8), vmulq_f32(v2, s2));
+        vst1q_f32(ptr.add(base + 12), vmulq_f32(v3, s3));
     }
-    for i in (chunks * 4)..n {
+
+    // 4-wide SIMD remainder
+    let remaining = chunks * CHUNK;
+    let simd_tail = (n - remaining) / 4;
+    for c in 0..simd_tail {
+        let off = remaining + c * 4;
+        let v = vld1q_f32(ptr.add(off) as *const f32);
+        let sig = vdivq_f32(vone, vaddq_f32(vone, neon_exp_f32(vnegq_f32(v))));
+        vst1q_f32(ptr.add(off), vmulq_f32(v, sig));
+    }
+
+    for i in (remaining + simd_tail * 4)..n {
         let v = *ptr.add(i);
         *ptr.add(i) = v * (1.0 / (1.0 + (-v).exp()));
     }
