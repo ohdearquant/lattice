@@ -472,19 +472,13 @@ pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32
         return vec![0.0_f32; candidates.len()];
     }
 
-    // Compute query norm once and reuse across all candidates.
-    let norm_q_sq: f32 = query.iter().map(|x| x * x).sum();
-    if norm_q_sq == 0.0 {
-        return vec![0.0_f32; candidates.len()];
-    }
-    let norm_q = norm_q_sq.sqrt();
-
-    // Use the resolved kernel for the per-pair dot+norm_c computation.
-    // We bypass the full cosine_kernel (which also computes norm_q) by using
-    // the dot_product kernel for dot(q, c) and computing norm_c inline.
-    // This saves one sqrt and one accumulation pass per pair.
     use super::dot_product::resolved_dot_product_kernel;
     let dot_kernel = resolved_dot_product_kernel();
+
+    let norm_q = dot_kernel(query, query).sqrt();
+    if norm_q == 0.0 {
+        return vec![0.0_f32; candidates.len()];
+    }
 
     candidates
         .iter()
@@ -492,10 +486,8 @@ pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32
             if c.len() != query.len() {
                 return 0.0;
             }
-            // Compute dot(query, c) via SIMD.
             let dot_qc = dot_kernel(query, c);
-            // Compute |c| inline (scalar — hot path for HNSW uses pre-stored norms).
-            let norm_c: f32 = c.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_c = dot_kernel(c, c).sqrt();
             let denom = norm_q * norm_c;
             if denom == 0.0 { 0.0 } else { dot_qc / denom }
         })
