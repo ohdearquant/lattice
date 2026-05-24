@@ -10,7 +10,9 @@
 //!   cargo bench -p lattice-inference --bench elementwise_bench
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lattice_inference::forward::cpu::{elementwise_mul, rms_norm, silu_inplace};
+use lattice_inference::forward::cpu::{
+    add_bias_gelu, elementwise_mul, gelu, rms_norm, silu_inplace, softmax_attention,
+};
 
 // ---------------------------------------------------------------------------
 // Deterministic test-data generator (LCG, avoids pulling in random crates)
@@ -102,5 +104,75 @@ fn bench_elementwise_mul(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rms_norm, bench_silu, bench_elementwise_mul);
+fn bench_gelu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gelu");
+
+    for &hidden in &[896usize, 2048, 4096] {
+        let bytes = hidden * std::mem::size_of::<f32>();
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(BenchmarkId::new("dispatch", hidden), &hidden, |b, &h| {
+            let mut x = lcg_f32_vec(h, 0xF000_0000_0000_0001);
+            b.iter(|| {
+                gelu(std::hint::black_box(&mut x));
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_softmax(c: &mut Criterion) {
+    let mut group = c.benchmark_group("softmax_attention");
+    let num_heads = 8usize;
+
+    for &seq_len in &[32usize, 64, 128] {
+        let size = num_heads * seq_len * seq_len;
+        let bytes = size * std::mem::size_of::<f32>();
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(BenchmarkId::new("dispatch", seq_len), &seq_len, |b, &s| {
+            let mut x = lcg_f32_vec(num_heads * s * s, 0xA100_0000_0000_0001);
+            b.iter(|| {
+                softmax_attention(
+                    std::hint::black_box(&mut x),
+                    std::hint::black_box(s),
+                    std::hint::black_box(num_heads),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_add_bias_gelu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("add_bias_gelu");
+
+    for &hidden in &[896usize, 2048, 4096] {
+        let bytes = hidden * std::mem::size_of::<f32>();
+        group.throughput(Throughput::Bytes(bytes as u64));
+
+        group.bench_with_input(BenchmarkId::new("dispatch", hidden), &hidden, |b, &h| {
+            let mut x = lcg_f32_vec(h, 0xF100_0000_0000_0001);
+            let bias = lcg_f32_vec(h, 0xF200_0000_0000_0001);
+            b.iter(|| {
+                add_bias_gelu(
+                    std::hint::black_box(&mut x),
+                    std::hint::black_box(&bias),
+                    std::hint::black_box(h),
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_rms_norm,
+    bench_silu,
+    bench_elementwise_mul,
+    bench_gelu,
+    bench_softmax,
+    bench_add_bias_gelu
+);
 criterion_main!(benches);
