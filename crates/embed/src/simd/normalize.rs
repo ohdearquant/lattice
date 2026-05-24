@@ -323,7 +323,8 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
         return;
     }
 
-    // Fast reciprocal sqrt: 1/sqrt(norm_sq) via NEON estimate + 2 Newton-Raphson steps
+    // Fast reciprocal sqrt via NEON estimate + 2 Newton-Raphson steps (~24-bit precision).
+    // Differs from x86 path (IEEE 1.0/sqrt) by up to 1 ULP in the inverted norm.
     let nsq = vdupq_n_f32(norm_sq);
     let mut est = vrsqrteq_f32(nsq);
     est = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(nsq, est), est));

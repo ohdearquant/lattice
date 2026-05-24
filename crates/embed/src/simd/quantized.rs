@@ -331,7 +331,7 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
             s3 = inout(vreg) sum3,
             a3 = in(vreg) a3,
             b3 = in(vreg) b3,
-            options(pure, nomem, nostack, preserves_flags)
+            options(nomem, nostack, preserves_flags)
         );
     }
 
@@ -351,7 +351,7 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
             acc = inout(vreg) sum_vec,
             a = in(vreg) at,
             b = in(vreg) bt,
-            options(pure, nomem, nostack, preserves_flags)
+            options(nomem, nostack, preserves_flags)
         );
     }
 
