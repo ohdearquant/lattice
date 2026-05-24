@@ -25,6 +25,14 @@ Read `AGENTS.md` first. It contains all coding conventions, crate structure, des
 - Do not create new crates without explicit approval.
 - Do not modify the dependency direction (leaf crates must stay leaf).
 
+## Performance Workflow (ADR-058)
+
+- **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
+- Default to `--quick` (~2 min). Use `--full` only when CIs are too wide to tell.
+- After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch. PRs touching CPU paths are gated by `bench-regression.yml` (>7% CI-lower = fail).
+- For local baseline tracking: `make bench-ci` saves a local baseline, `make bench-gate` compares against the `perf-baselines` branch.
+- Do not claim "X% faster" without a measurement from this session. Stale numbers from prior sessions are not evidence.
+
 ## Crate Ownership
 
 Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `tune`. Changes to `transport`, `fann`, or `inference` alone are safe — they're leaf crates.
