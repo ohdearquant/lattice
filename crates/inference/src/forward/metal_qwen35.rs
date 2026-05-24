@@ -805,6 +805,19 @@ kernel void silu_mul(
     gate[gid] = s * up[gid];
 }
 
+// Dense decode fused gate||up kernel: first half = gate, second half = up.
+kernel void silu_mul_fused(
+    device float* data    [[buffer(0)]],
+    constant uint& count  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    float gate = data[gid];
+    float up   = data[gid + count];
+    float s    = gate / (1.0f + exp(-gate));
+    data[gid]  = s * up;
+}
+
 // ===== Copy: dst = src =====
 kernel void copy_buf(
     device const float* src [[buffer(0)]],
@@ -2544,9 +2557,8 @@ kernel void moe_shared_gate_add(
     /// Per-layer FFN weights on GPU: either dense SwiGLU or MoE.
     enum MetalFfnWeights {
         Dense {
-            gate_proj: Q4WeightBuf, // [intermediate, hidden] — Q4/Q8
-            up_proj: Q4WeightBuf,   // [intermediate, hidden] — Q4/Q8
-            down_proj: Q4WeightBuf, // [hidden, intermediate] — Q4/Q8
+            gate_up_proj: Q4WeightBuf, // [2 * intermediate, hidden] — gate || up, Q4/Q8
+            down_proj: Q4WeightBuf,    // [hidden, intermediate] — Q4/Q8
         },
         Moe(Box<MoeMetalBuffers>),
     }
@@ -2748,9 +2760,9 @@ kernel void moe_shared_gate_add(
         gate_z: Buffer,      // [q_dim] gate after scatter
         k: Buffer,           // [kv_dim]
         v: Buffer,           // [kv_dim]
-        gate: Buffer,        // [intermediate_size]
-        up: Buffer,          // [intermediate_size]
-        ffn_out: Buffer,     // [hidden_size]
+        gate: Buffer, // [2 * intermediate_size] for Dense decode gate||up; batch uses first bp rows
+        up: Buffer,   // [intermediate_size] kept for batch separate-buffer paths
+        ffn_out: Buffer, // [hidden_size]
         // GDN projection buffers
         gdn_qkv: Buffer,         // [qkv_dim]  — used by batch/prefill and CPU paths
         gdn_z: Buffer,           // [output_dim] — used by batch/prefill and CPU paths
@@ -2793,6 +2805,7 @@ kernel void moe_shared_gate_add(
         sigmoid_gate: ComputePipelineState,
         scatter_q_gate: ComputePipelineState,
         silu_mul: ComputePipelineState,
+        silu_mul_fused: ComputePipelineState,
         copy: ComputePipelineState,
         copy_offset: ComputePipelineState,
         add: ComputePipelineState,
@@ -3611,6 +3624,7 @@ kernel void moe_shared_gate_add(
                 sigmoid_gate: make_pipeline("sigmoid_gate")?,
                 scatter_q_gate: make_pipeline("scatter_q_gate")?,
                 silu_mul: make_pipeline("silu_mul")?,
+                silu_mul_fused: make_pipeline("silu_mul_fused")?,
                 copy: make_pipeline("copy_buf")?,
                 copy_offset: make_pipeline("copy_buf_offset")?,
                 add: make_pipeline("add_buf")?,
@@ -3659,6 +3673,44 @@ kernel void moe_shared_gate_add(
                 QuantFormat::Q8_0 => "q8",
                 QuantFormat::Q4_0 => "q4",
             };
+            let block_bytes = match quant_format {
+                QuantFormat::Q8_0 => Q8_0_BLOCK_SIZE,
+                QuantFormat::Q4_0 => Q4_0_BLOCK_SIZE,
+            };
+            let pack_quant = |data: &[f32]| -> Vec<u8> {
+                match quant_format {
+                    QuantFormat::Q8_0 => {
+                        assert_eq!(data.len() % QK8_0, 0);
+                        quantize_row_q8_0(data)
+                    }
+                    QuantFormat::Q4_0 => {
+                        assert_eq!(
+                            data.len() % QK4_0,
+                            0,
+                            "pack_quant: data length {} not divisible by {QK4_0}",
+                            data.len()
+                        );
+                        quantize_row_q4_0(data)
+                    }
+                }
+            };
+            let make_fused_quant_buffer =
+                |device: &Device, gate_bytes: &[u8], up_bytes: &[u8], label: &str| -> Buffer {
+                    let combined_size = gate_bytes.len() + up_bytes.len();
+                    let buf = device
+                        .new_buffer(combined_size as u64, MTLResourceOptions::StorageModeShared);
+                    unsafe {
+                        let dst = buf.contents() as *mut u8;
+                        std::ptr::copy_nonoverlapping(gate_bytes.as_ptr(), dst, gate_bytes.len());
+                        std::ptr::copy_nonoverlapping(
+                            up_bytes.as_ptr(),
+                            dst.add(gate_bytes.len()),
+                            up_bytes.len(),
+                        );
+                    }
+                    buf.set_label(label);
+                    buf
+                };
             let make_buffer_quant = |device: &Device, data: &[f32], label: &str| -> Buffer {
                 match quant_format {
                     QuantFormat::Q8_0 => make_buffer_q8_0(device, data, label),
@@ -3670,23 +3722,33 @@ kernel void moe_shared_gate_add(
             for (i, (attn_w, common_w)) in weights.layers.iter().enumerate() {
                 // Build the FFN weight variant for this layer (Dense or MoE).
                 let metal_ffn = match &common_w.ffn {
-                    crate::model::qwen35::FeedForwardWeights::Dense(d) => MetalFfnWeights::Dense {
-                        gate_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                            &device,
-                            &d.gate_proj,
-                            &format!("L{i}.gate.{quant_tag}"),
-                        )),
-                        up_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                            &device,
-                            &d.up_proj,
-                            &format!("L{i}.up.{quant_tag}"),
-                        )),
-                        down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
-                            &device,
-                            &d.down_proj,
-                            &format!("L{i}.down.{quant_tag}"),
-                        )),
-                    },
+                    crate::model::qwen35::FeedForwardWeights::Dense(d) => {
+                        let gate_bytes = pack_quant(&d.gate_proj);
+                        let up_bytes = pack_quant(&d.up_proj);
+                        debug_assert_eq!(
+                            d.gate_proj.len(),
+                            cfg.intermediate_size * cfg.hidden_size
+                        );
+                        debug_assert_eq!(d.up_proj.len(), cfg.intermediate_size * cfg.hidden_size);
+                        debug_assert_eq!(
+                            gate_bytes.len(),
+                            cfg.intermediate_size * (cfg.hidden_size / 32) * block_bytes
+                        );
+                        debug_assert_eq!(up_bytes.len(), gate_bytes.len());
+                        MetalFfnWeights::Dense {
+                            gate_up_proj: Q4WeightBuf::from_buffer(make_fused_quant_buffer(
+                                &device,
+                                &gate_bytes,
+                                &up_bytes,
+                                &format!("L{i}.gate_up.{quant_tag}"),
+                            )),
+                            down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                                &device,
+                                &d.down_proj,
+                                &format!("L{i}.down.{quant_tag}"),
+                            )),
+                        }
+                    }
                     crate::model::qwen35::FeedForwardWeights::Moe(m) => {
                         let num_exp = m.experts.num_experts;
                         let inter = m.experts.intermediate_size;
@@ -3966,7 +4028,7 @@ kernel void moe_shared_gate_add(
                 gate_z: make_zero_buffer(device, bp * q_dim, "act_gate_z"),
                 k: make_zero_buffer(device, bp * kv_dim, "act_k"),
                 v: make_zero_buffer(device, bp * kv_dim, "act_v"),
-                gate: make_zero_buffer(device, bp * inter, "act_gate"),
+                gate: make_zero_buffer(device, bp * 2 * inter, "act_gate"),
                 up: make_zero_buffer(device, bp * inter, "act_up"),
                 ffn_out: make_zero_buffer(device, bp * hidden, "act_ffn_out"),
                 gdn_qkv: make_zero_buffer(device, bp * qkv_dim, "act_gdn_qkv"),
@@ -4723,16 +4785,25 @@ kernel void moe_shared_gate_add(
                 let (_, common_w) = &self.engine.layer_weights[compact_idx];
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate, w_up, w_down) = match &common_w.ffn {
+                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
                     MetalFfnWeights::Dense {
-                        gate_proj,
-                        up_proj,
+                        gate_up_proj,
                         down_proj,
-                    } => (
-                        gate_proj as *const Q4WeightBuf,
-                        up_proj as *const Q4WeightBuf,
-                        down_proj as *const Q4WeightBuf,
-                    ),
+                    } => {
+                        let byte_size: u64 = match self.engine.quant_format {
+                            QuantFormat::Q8_0 => {
+                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
+                            }
+                            QuantFormat::Q4_0 => {
+                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
+                            }
+                        };
+                        (
+                            gate_up_proj as *const Q4WeightBuf,
+                            down_proj as *const Q4WeightBuf,
+                            byte_size,
+                        )
+                    }
                     MetalFfnWeights::Moe(_) => {
                         panic!(
                             "verify_tokens_batch_gemm: MoE layers are not supported in batch \
@@ -4888,7 +4959,7 @@ kernel void moe_shared_gate_add(
                     }
 
                     // Batch: out_proj + residual + post-norm + MLP.
-                    // SAFETY: w_out, w_gate, w_up, w_down are live layer-owned buffers.
+                    // SAFETY: w_out, w_gate_up, w_down are live layer-owned buffers.
                     unsafe {
                         self.dispatch_gemm(
                             enc,
@@ -4923,22 +4994,24 @@ kernel void moe_shared_gate_add(
                             m,
                             cfg.rms_norm_eps,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_gate,
+                            &*w_gate_up,
+                            0,
                             &self.session.activations.gate,
                             0,
                             m,
                             inter as u32,
                             hidden as u32,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_up,
+                            &*w_gate_up,
+                            gate_byte_size,
                             &self.session.activations.up,
                             0,
                             m,
@@ -5181,7 +5254,7 @@ kernel void moe_shared_gate_add(
                     }
 
                     // Batch: O projection + residual + post-norm + MLP.
-                    // SAFETY: w_o, w_gate, w_up, w_down are live layer-owned buffers.
+                    // SAFETY: w_o, w_gate_up, w_down are live layer-owned buffers.
                     unsafe {
                         self.dispatch_gemm(
                             enc,
@@ -5216,22 +5289,24 @@ kernel void moe_shared_gate_add(
                             m,
                             cfg.rms_norm_eps,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_gate,
+                            &*w_gate_up,
+                            0,
                             &self.session.activations.gate,
                             0,
                             m,
                             inter as u32,
                             hidden as u32,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_up,
+                            &*w_gate_up,
+                            gate_byte_size,
                             &self.session.activations.up,
                             0,
                             m,
@@ -6183,16 +6258,25 @@ kernel void moe_shared_gate_add(
                 let (_, common_w) = &self.engine.layer_weights[compact_idx];
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate, w_up, w_down) = match &common_w.ffn {
+                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
                     MetalFfnWeights::Dense {
-                        gate_proj,
-                        up_proj,
+                        gate_up_proj,
                         down_proj,
-                    } => (
-                        gate_proj as *const Q4WeightBuf,
-                        up_proj as *const Q4WeightBuf,
-                        down_proj as *const Q4WeightBuf,
-                    ),
+                    } => {
+                        let byte_size: u64 = match self.engine.quant_format {
+                            QuantFormat::Q8_0 => {
+                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
+                            }
+                            QuantFormat::Q4_0 => {
+                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
+                            }
+                        };
+                        (
+                            gate_up_proj as *const Q4WeightBuf,
+                            down_proj as *const Q4WeightBuf,
+                            byte_size,
+                        )
+                    }
                     MetalFfnWeights::Moe(_) => {
                         panic!(
                             "forward_prefill batch GEMM: MoE layers are not supported in batch \
@@ -6400,25 +6484,27 @@ kernel void moe_shared_gate_add(
                     }
 
                     // Batch: MLP (gate + up + silu_mul + down)
-                    // SAFETY: Gate/up pointers are live layer-owned buffers; GEMM
+                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
                     // dimensions match [m, hidden] by [inter, hidden].
                     unsafe {
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_gate,
+                            &*w_gate_up,
+                            0,
                             &self.session.activations.gate,
                             0,
                             m,
                             inter as u32,
                             hidden as u32,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_up,
+                            &*w_gate_up,
+                            gate_byte_size,
                             &self.session.activations.up,
                             0,
                             m,
@@ -6730,25 +6816,27 @@ kernel void moe_shared_gate_add(
                     }
 
                     // Batch: MLP
-                    // SAFETY: Gate/up pointers are live layer-owned buffers; GEMM
+                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
                     // dimensions match [m, hidden] by [inter, hidden].
                     unsafe {
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_gate,
+                            &*w_gate_up,
+                            0,
                             &self.session.activations.gate,
                             0,
                             m,
                             inter as u32,
                             hidden as u32,
                         );
-                        self.dispatch_gemm(
+                        self.dispatch_gemm_at(
                             enc,
                             &self.session.activations.hidden,
                             0,
-                            &*w_up,
+                            &*w_gate_up,
+                            gate_byte_size,
                             &self.session.activations.up,
                             0,
                             m,
@@ -8653,24 +8741,24 @@ kernel void moe_shared_gate_add(
             // SAFETY: FFN weight buffers are live for the command buffer lifetime.
             match &common_w.ffn {
                 MetalFfnWeights::Dense {
-                    gate_proj,
-                    up_proj,
+                    gate_up_proj,
                     down_proj,
                 } => {
-                    let w_gate = gate_proj as *const Q4WeightBuf;
-                    let w_up = up_proj as *const Q4WeightBuf;
+                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
                     let w_down = down_proj as *const Q4WeightBuf;
+                    // Single fused GEMV: hidden × gate_up_proj[2*inter, hidden] → gate[0..2*inter]
                     unsafe {
                         self.dispatch_matmul(
                             enc,
                             &self.session.activations.hidden,
-                            &*w_gate,
+                            &*w_gate_up,
                             &self.session.activations.gate,
                             1,
-                            inter as u32,
+                            (2 * inter) as u32,
                             hidden as u32,
                         );
                     }
+                    // LoRA: gate half at offset 0, up half at offset inter*sizeof(f32)
                     self.dispatch_lora_if_active(
                         enc,
                         &self.session.activations.hidden,
@@ -8680,27 +8768,17 @@ kernel void moe_shared_gate_add(
                         layer_idx,
                         "gate_proj",
                     );
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.hidden,
-                            &*w_up,
-                            &self.session.activations.up,
-                            1,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
                     self.dispatch_lora_if_active(
                         enc,
                         &self.session.activations.hidden,
                         0,
-                        &self.session.activations.up,
-                        0,
+                        &self.session.activations.gate,
+                        (inter * std::mem::size_of::<f32>()) as u64,
                         layer_idx,
                         "up_proj",
                     );
-                    self.dispatch_silu_mul(enc, inter as u32);
+                    // silu_mul_fused: gate[0..inter] = silu(gate[0..inter]) * gate[inter..2*inter]
+                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
                     unsafe {
                         self.dispatch_matmul(
                             enc,
@@ -8992,24 +9070,24 @@ kernel void moe_shared_gate_add(
             // SAFETY: FFN weight buffers are live for the command buffer lifetime.
             match &common_w.ffn {
                 MetalFfnWeights::Dense {
-                    gate_proj,
-                    up_proj,
+                    gate_up_proj,
                     down_proj,
                 } => {
-                    let w_gate = gate_proj as *const Q4WeightBuf;
-                    let w_up = up_proj as *const Q4WeightBuf;
+                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
                     let w_down = down_proj as *const Q4WeightBuf;
+                    // Single fused GEMV: hidden × gate_up_proj[2*inter, hidden] → gate[0..2*inter]
                     unsafe {
                         self.dispatch_matmul(
                             enc,
                             &self.session.activations.hidden,
-                            &*w_gate,
+                            &*w_gate_up,
                             &self.session.activations.gate,
                             1,
-                            inter as u32,
+                            (2 * inter) as u32,
                             hidden as u32,
                         );
                     }
+                    // LoRA: gate half at offset 0, up half at offset inter*sizeof(f32)
                     self.dispatch_lora_if_active(
                         enc,
                         &self.session.activations.hidden,
@@ -9019,27 +9097,17 @@ kernel void moe_shared_gate_add(
                         layer_idx,
                         "gate_proj",
                     );
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.hidden,
-                            &*w_up,
-                            &self.session.activations.up,
-                            1,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
                     self.dispatch_lora_if_active(
                         enc,
                         &self.session.activations.hidden,
                         0,
-                        &self.session.activations.up,
-                        0,
+                        &self.session.activations.gate,
+                        (inter * std::mem::size_of::<f32>()) as u64,
                         layer_idx,
                         "up_proj",
                     );
-                    self.dispatch_silu_mul(enc, inter as u32);
+                    // silu_mul_fused: gate[0..inter] = silu(gate[0..inter]) * gate[inter..2*inter]
+                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
                     unsafe {
                         self.dispatch_matmul(
                             enc,
@@ -9873,6 +9941,166 @@ kernel void moe_shared_gate_add(
                 MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
+        }
+
+        // Dense decode fused: data[0..count] = silu(data[0..count]) * data[count..2*count]
+        fn dispatch_silu_mul_fused(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            data: &Buffer,
+            count: u32,
+        ) {
+            enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul_fused);
+            enc.set_buffer(0, Some(data), 0);
+            enc.set_bytes(2, 4, &count as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        // Variant of dispatch_gemm that adds qw_extra_offset bytes to the weight buffer binding.
+        // Used by batch Dense paths to access gate (offset=0) or up (offset=gate_byte_size)
+        // within the fused gate_up_proj buffer without modifying the MSL kernels.
+        fn dispatch_gemm_at(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            x_offset: u64,
+            qw: &Q4WeightBuf,
+            qw_extra_offset: u64,
+            y: &Buffer,
+            y_offset: u64,
+            m: u32,
+            n: u32,
+            k: u32,
+        ) {
+            match self.engine.quant_format {
+                QuantFormat::Q8_0 => self.dispatch_gemm_q8_at(
+                    enc,
+                    x,
+                    x_offset,
+                    qw,
+                    qw_extra_offset,
+                    y,
+                    y_offset,
+                    m,
+                    n,
+                    k,
+                ),
+                QuantFormat::Q4_0 => self.dispatch_gemm_q4_at(
+                    enc,
+                    x,
+                    x_offset,
+                    qw,
+                    qw_extra_offset,
+                    y,
+                    y_offset,
+                    m,
+                    n,
+                    k,
+                ),
+            }
+        }
+
+        fn dispatch_gemm_q8_at(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            x_offset: u64,
+            qw: &Q4WeightBuf,
+            qw_extra_offset: u64,
+            y: &Buffer,
+            y_offset: u64,
+            m: u32,
+            n: u32,
+            k: u32,
+        ) {
+            let wq_offset = qw.payload_offset + qw_extra_offset;
+            if m <= 1 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
+                enc.set_buffer(0, Some(x), x_offset);
+                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &n as *const u32 as *const _);
+                enc.set_bytes(4, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            } else {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q8);
+                enc.set_buffer(0, Some(x), x_offset);
+                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            }
+        }
+
+        fn dispatch_gemm_q4_at(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            x_offset: u64,
+            qw: &Q4WeightBuf,
+            qw_extra_offset: u64,
+            y: &Buffer,
+            y_offset: u64,
+            m: u32,
+            n: u32,
+            k: u32,
+        ) {
+            if m == 0 || n == 0 {
+                return;
+            }
+            assert!(
+                k > 0 && k % 32 == 0,
+                "dispatch_gemm_q4_at requires K to be non-zero and divisible by 32, got {k}"
+            );
+            let wq_offset = qw.payload_offset + qw_extra_offset;
+            if m == 1 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q4);
+                enc.set_buffer(0, Some(x), x_offset);
+                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &n as *const u32 as *const _);
+                enc.set_bytes(4, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            } else if let Some(tiled) = self.engine.pipelines.gemm_q4_tiled.as_ref() {
+                enc.set_compute_pipeline_state(tiled);
+                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(1, Some(x), x_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            } else {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
+                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(1, Some(x), x_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            }
         }
 
         fn dispatch_copy(
@@ -11041,6 +11269,7 @@ kernel void moe_shared_gate_add(
                 sigmoid_gate: make_pipeline("sigmoid_gate")?,
                 scatter_q_gate: make_pipeline("scatter_q_gate")?,
                 silu_mul: make_pipeline("silu_mul")?,
+                silu_mul_fused: make_pipeline("silu_mul_fused")?,
                 copy: make_pipeline("copy_buf")?,
                 copy_offset: make_pipeline("copy_buf_offset")?,
                 add: make_pipeline("add_buf")?,
@@ -11109,6 +11338,29 @@ kernel void moe_shared_gate_add(
                 let result = mmap_q4_weight(&device, &path, label);
                 dur_c_cell.set(dur_c_cell.get() + t.elapsed());
                 result
+            };
+            let load_q4_raw_timed = |name: &str| -> Result<(Vec<u8>, usize), String> {
+                let t = std::time::Instant::now();
+                let path = Self::q4_tensor_path(q4_dir, name, "q4");
+                let result = Self::load_q4_raw_bytes(&path);
+                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                result
+            };
+            let make_fused_q4_buf = |gate_raw: &[u8], up_raw: &[u8], label: &str| -> Q4WeightBuf {
+                let combined_size = gate_raw.len() + up_raw.len();
+                let buf =
+                    device.new_buffer(combined_size as u64, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let dst = buf.contents() as *mut u8;
+                    std::ptr::copy_nonoverlapping(gate_raw.as_ptr(), dst, gate_raw.len());
+                    std::ptr::copy_nonoverlapping(
+                        up_raw.as_ptr(),
+                        dst.add(gate_raw.len()),
+                        up_raw.len(),
+                    );
+                }
+                buf.set_label(label);
+                Q4WeightBuf::from_buffer(buf)
             };
 
             // ----------------------------------------------------------------
@@ -11204,19 +11456,25 @@ kernel void moe_shared_gate_add(
                         &format!("{prefix}.post_attention_layernorm.weight"),
                         &format!("L{i}.post_norm"),
                     )?,
-                    ffn: MetalFfnWeights::Dense {
-                        gate_proj: load_q4_buf(
-                            &format!("{prefix}.mlp.gate_proj.weight"),
-                            &format!("L{i}.gate.q4"),
-                        )?,
-                        up_proj: load_q4_buf(
-                            &format!("{prefix}.mlp.up_proj.weight"),
-                            &format!("L{i}.up.q4"),
-                        )?,
-                        down_proj: load_q4_buf(
-                            &format!("{prefix}.mlp.down_proj.weight"),
-                            &format!("L{i}.down.q4"),
-                        )?,
+                    ffn: {
+                        let (gate_raw, gate_len) =
+                            load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
+                        let (up_raw, up_len) =
+                            load_q4_raw_timed(&format!("{prefix}.mlp.up_proj.weight"))?;
+                        debug_assert_eq!(gate_len, cfg.intermediate_size * cfg.hidden_size);
+                        debug_assert_eq!(up_len, cfg.intermediate_size * cfg.hidden_size);
+                        debug_assert_eq!(up_raw.len(), gate_raw.len());
+                        MetalFfnWeights::Dense {
+                            gate_up_proj: make_fused_q4_buf(
+                                &gate_raw,
+                                &up_raw,
+                                &format!("L{i}.gate_up.q4"),
+                            ),
+                            down_proj: load_q4_buf(
+                                &format!("{prefix}.mlp.down_proj.weight"),
+                                &format!("L{i}.down.q4"),
+                            )?,
+                        }
                     },
                 };
 
@@ -11407,7 +11665,7 @@ kernel void moe_shared_gate_add(
                 gate_z: make_zero_buffer(&device, bp * q_dim, "act_gate_z"),
                 k: make_zero_buffer(&device, bp * kv_dim, "act_k"),
                 v: make_zero_buffer(&device, bp * kv_dim, "act_v"),
-                gate: make_zero_buffer(&device, bp * inter, "act_gate"),
+                gate: make_zero_buffer(&device, bp * 2 * inter, "act_gate"),
                 up: make_zero_buffer(&device, bp * inter, "act_up"),
                 ffn_out: make_zero_buffer(&device, bp * hidden, "act_ffn_out"),
                 gdn_qkv: make_zero_buffer(&device, bp * qkv_dim, "act_gdn_qkv"),
