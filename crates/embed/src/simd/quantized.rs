@@ -223,7 +223,7 @@ pub(crate) fn dot_product_i8_trusted(a: &QuantizedVector, b: &QuantizedVector) -
     }
     debug_assert!(a.data.iter().all(|&v| v != i8::MIN));
     debug_assert!(b.data.iter().all(|&v| v != i8::MIN));
-    dot_product_i8_raw(&a.data, &b.data) / denom
+    dot_product_i8_dispatch(&a.data, &b.data) / denom
 }
 
 /// **Unstable**: SIMD INT8 cosine similarity; norm storage approach may change.
@@ -260,8 +260,9 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
 /// # Safety
 ///
 /// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
+/// - Running on aarch64 with FEAT_DotProd (uses SDOT instruction)
 /// - `a` and `b` have equal length (checked by caller)
+/// - No element is i8::MIN (-128) — see SIMD invariant docs
 ///
 /// Memory safety:
 /// - Uses `vld1q_s8` for loads (handles any alignment)
@@ -617,7 +618,7 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
 #[cfg(target_arch = "aarch64")]
 fn dot_product_i8_neon_kernel(a: &[i8], b: &[i8]) -> f32 {
-    // SAFETY: stored only when NEON was detected at init time (always true on aarch64).
+    // SAFETY: stored only when NEON+dotprod detected at init time.
     unsafe { dot_product_i8_neon_unrolled(a, b) }
 }
 
@@ -660,6 +661,13 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// # Performance
 ///
+#[inline]
+fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
+    resolved_i8_dot_kernel()(a, b)
+}
+
+/// **Unstable**: raw INT8 dot product on slices; SIMD strategy may change.
+///
 /// Uses the same SIMD paths as `dot_product_i8`:
 /// - aarch64: NEON with 4x unrolling + tail SIMD chunks
 /// - x86_64: AVX-512 VNNI > AVX2 > scalar
@@ -671,7 +679,6 @@ pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
-    // FP-033: Release-mode guard at public boundary. Inner kernels use debug_assert!.
     assert!(
         a.iter().all(|&v| v != -128i8),
         "dot_product_i8_raw: slice a contains -128, violating the [-127, 127] SIMD invariant"
@@ -680,7 +687,7 @@ pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
         b.iter().all(|&v| v != -128i8),
         "dot_product_i8_raw: slice b contains -128, violating the [-127, 127] SIMD invariant"
     );
-    resolved_i8_dot_kernel()(a, b)
+    dot_product_i8_dispatch(a, b)
 }
 
 #[cfg(test)]
@@ -701,15 +708,23 @@ mod simd_parity_tests {
             .collect()
     }
 
-    // FP-034: NEON vs scalar parity for INT8 dot product.
+    // FP-034: NEON SDOT vs scalar parity for INT8 dot product.
+    // Gated on dotprod: SDOT is FEAT_DotProd, not baseline NEON.
     #[test]
     fn test_i8_neon_scalar_parity() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if !super::super::SimdConfig::detect().dotprod_enabled {
+                eprintln!("skipping SDOT parity test: dotprod not available");
+                return;
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         for dim in [7usize, 16, 64, 128, 384, 768] {
             let a_q = QuantizedVector::from_f32(&gen_vec(dim, 200 + dim as u64));
             let b_q = QuantizedVector::from_f32(&gen_vec(dim, 300 + dim as u64));
 
-            // SAFETY: NEON is mandatory on aarch64; slices have equal length from from_f32.
+            // SAFETY: dotprod confirmed above; slices have equal length from from_f32.
             let neon = unsafe { dot_product_i8_neon_unrolled(&a_q.data, &b_q.data) };
             let scalar: f32 = a_q
                 .data
