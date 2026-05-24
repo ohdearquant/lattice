@@ -241,9 +241,10 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
     dot_product_i8_trusted(a, b) / denom
 }
 
-/// NEON int8 dot product using vmull/vpadal with 4x unrolling.
+/// NEON int8 dot product using vmull/vpadal with 4x unrolling and software prefetch.
 ///
-/// Processes 64 int8s per iteration with 4 accumulators.
+/// Processes 64 int8s per iteration with 4 accumulators. Prefetches the next
+/// cache line (64 bytes) one iteration ahead to hide DRAM latency for large dims.
 ///
 /// # Safety
 ///
@@ -255,12 +256,15 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
 /// - Uses `vld1q_s8` for loads (handles any alignment)
 /// - Pointer arithmetic stays within slice bounds via chunk calculation
 /// - Remainder handled via safe slice iteration
+/// - Prefetch pointers are bounds-checked before issuing (only prefetch if within slice)
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 16;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    // Prefetch one full chunk ahead (next iteration's data).
+    const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
@@ -273,6 +277,24 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
+
+        // Software prefetch for the next chunk to hide memory latency.
+        // Only issue if the prefetch target stays within the slice bounds.
+        // On aarch64 we emit an inline assembly PRFM instruction (stable Rust, no nightly needed).
+        let next_base = base + PREFETCH_DISTANCE;
+        if next_base + CHUNK_SIZE <= n {
+            // PRFM PLDL1KEEP: prefetch for load into L1, keep (retained locality).
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) a.as_ptr().add(next_base),
+                options(nostack, readonly, preserves_flags)
+            );
+            core::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) b.as_ptr().add(next_base),
+                options(nostack, readonly, preserves_flags)
+            );
+        }
 
         // Unroll 0: Load 16 int8s, split, widening multiply, pairwise add
         let a0 = vld1q_s8(a.as_ptr().add(base));
@@ -467,7 +489,7 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     (sum + remainder) as f32
 }
 
-/// AVX2 int8 dot product with 4x unrolling.
+/// AVX2 int8 dot product with 4x unrolling and software prefetch.
 ///
 /// # Safety
 ///
@@ -479,12 +501,15 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
 /// - Uses `_mm256_loadu_si256` for unaligned loads (safe for any alignment)
 /// - Pointer arithmetic stays within slice bounds via chunk calculation
 /// - Remainder handled via safe slice iteration
+/// - Prefetch hint issues `_MM_HINT_T0` only when next chunk is within slice bounds
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 32;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    // Prefetch one full chunk ahead for both input arrays.
+    const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
     debug_assert!(a.iter().all(|&v| v != i8::MIN));
@@ -501,6 +526,13 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
+
+        // Software prefetch for the next chunk.
+        let next_base = base + PREFETCH_DISTANCE;
+        if next_base + CHUNK_SIZE <= n {
+            _mm_prefetch(a.as_ptr().add(next_base) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(b.as_ptr().add(next_base) as *const i8, _MM_HINT_T0);
+        }
 
         // Unroll 0
         let a0 = _mm256_loadu_si256(a.as_ptr().add(base) as *const __m256i);

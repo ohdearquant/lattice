@@ -731,3 +731,127 @@ mod proptests {
         }
     }
 }
+
+// ============================================================================
+// OPTIMIZATION CORRECTNESS TESTS (added with perf(embed) optimizations)
+// ============================================================================
+
+/// Verify that `cosine_similarity_fused` produces the same result as `cosine_similarity`.
+///
+/// Both routes through the same SIMD kernel; this test documents the guarantee
+/// that the fused single-pass path matches the dispatch path at every dimension.
+#[test]
+fn test_cosine_fused_matches_separate() {
+    for &dim in &[7usize, 15, 64, 128, 384, 768, 1536] {
+        let a = generate_random_vector_seeded(dim, 0xf00d_dead + dim as u64);
+        let b = generate_random_vector_seeded(dim, 0xbeef_cafe + dim as u64);
+
+        let separate = cosine_similarity(&a, &b);
+        let fused = cosine_similarity_fused(&a, &b);
+
+        let diff = (separate - fused).abs();
+        assert!(
+            diff < 1e-6,
+            "cosine_similarity_fused vs cosine_similarity at dim={dim}: separate={separate}, fused={fused}, diff={diff}"
+        );
+    }
+}
+
+/// Edge cases for `cosine_similarity_fused`: zero vectors, mismatched lengths, identical vectors.
+#[test]
+fn test_cosine_fused_edge_cases() {
+    // Empty input
+    let result = cosine_similarity_fused(&[], &[]);
+    assert_eq!(result, 0.0, "fused: empty slices should return 0.0");
+
+    // Length mismatch
+    let a = vec![1.0_f32, 2.0, 3.0];
+    let b = vec![1.0_f32, 2.0];
+    assert_eq!(
+        cosine_similarity_fused(&a, &b),
+        0.0,
+        "fused: length mismatch should return 0.0"
+    );
+
+    // Identical non-zero vector -> similarity 1.0
+    let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let sim = cosine_similarity_fused(&v, &v);
+    assert!(
+        (sim - 1.0).abs() < 1e-6,
+        "fused: identical vectors should have similarity 1.0, got {sim}"
+    );
+}
+
+/// Verify that `batch_cosine_one_vs_many` matches per-pair `cosine_similarity` calls.
+#[test]
+fn test_batch_cosine_one_vs_many_matches_per_pair() {
+    let query = generate_random_vector_seeded(384, 0x1111_2222);
+    let candidates: Vec<Vec<f32>> = (0..8)
+        .map(|i| generate_random_vector_seeded(384, 0x3333_0000 + i as u64))
+        .collect();
+    let candidate_refs: Vec<&[f32]> = candidates.iter().map(|c| c.as_slice()).collect();
+
+    let batch = batch_cosine_one_vs_many(&query, &candidate_refs);
+    assert_eq!(batch.len(), 8);
+
+    for (i, c) in candidates.iter().enumerate() {
+        let expected = cosine_similarity(&query, c);
+        let diff = (batch[i] - expected).abs();
+        assert!(
+            diff < 1e-5,
+            "batch_cosine_one_vs_many[{i}] at dim=384: batch={}, per-pair={}, diff={}",
+            batch[i],
+            expected,
+            diff
+        );
+    }
+}
+
+/// `batch_cosine_one_vs_many` returns zeros for mismatched dimensions, not panics.
+#[test]
+fn test_batch_cosine_one_vs_many_dim_mismatch() {
+    let query = vec![1.0_f32, 2.0, 3.0];
+    let good = vec![4.0_f32, 5.0, 6.0];
+    let bad = vec![1.0_f32, 2.0]; // wrong length
+    let refs: Vec<&[f32]> = vec![good.as_slice(), bad.as_slice()];
+
+    let results = batch_cosine_one_vs_many(&query, &refs);
+    assert_eq!(results.len(), 2);
+    // good candidate should produce a valid similarity
+    assert!(
+        results[0].is_finite(),
+        "good candidate should produce finite similarity"
+    );
+    // bad candidate (dim mismatch) should return 0.0
+    assert_eq!(results[1], 0.0, "dim-mismatch candidate should return 0.0");
+}
+
+/// Verify that the i8 dot product raw kernel (with prefetch) produces the same result
+/// as the scalar reference across all standard embedding dimensions.
+#[test]
+fn test_i8_dot_unrolled_matches_original() {
+    for &dim in &[7usize, 15, 16, 64, 128, 384, 768, 1536] {
+        let a_f32 = generate_random_vector_seeded(dim, 0xaaaa_0000 + dim as u64);
+        let b_f32 = generate_random_vector_seeded(dim, 0xbbbb_0000 + dim as u64);
+
+        let a_q = QuantizedVector::from_f32(&a_f32);
+        let b_q = QuantizedVector::from_f32(&b_f32);
+
+        // Scalar reference: direct i32 accumulation over raw i8 slices.
+        let scalar: f32 = a_q
+            .data
+            .iter()
+            .zip(b_q.data.iter())
+            .map(|(&x, &y)| x as i32 * y as i32)
+            .sum::<i32>() as f32;
+
+        // SIMD path (with prefetch via dot_product_i8_raw).
+        let simd = dot_product_i8_raw(&a_q.data, &b_q.data);
+
+        let diff = (simd - scalar).abs();
+        assert!(
+            diff <= 1.0,
+            "i8 dot product (SIMD with prefetch) vs scalar at dim={dim}: simd={simd}, scalar={scalar}, diff={diff}"
+        );
+    }
+}
