@@ -263,27 +263,24 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 16;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
-    // Prefetch one full chunk ahead (next iteration's data).
     const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent int32 accumulators
     let mut sum0 = vdupq_n_s32(0);
     let mut sum1 = vdupq_n_s32(0);
     let mut sum2 = vdupq_n_s32(0);
     let mut sum3 = vdupq_n_s32(0);
 
+    // Use SDOT (ARMv8.2 dotprod) via inline asm — 1 instruction per 16 i8 elements
+    // vs 6 instructions (split + vmull×2 + vpadalq×2) with the widening approach.
+    // Apple Silicon (M1+) supports dotprod; runtime check at dispatch level.
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
-        // Software prefetch for the next chunk to hide memory latency.
-        // Only issue if the prefetch target stays within the slice bounds.
-        // On aarch64 we emit an inline assembly PRFM instruction (stable Rust, no nightly needed).
         let next_base = base + PREFETCH_DISTANCE;
         if next_base + CHUNK_SIZE <= n {
-            // PRFM PLDL1KEEP: prefetch for load into L1, keep (retained locality).
             core::arch::asm!(
                 "prfm pldl1keep, [{ptr}]",
                 ptr = in(reg) a.as_ptr().add(next_base),
@@ -296,83 +293,68 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
             );
         }
 
-        // Unroll 0: Load 16 int8s, split, widening multiply, pairwise add
         let a0 = vld1q_s8(a.as_ptr().add(base));
         let b0 = vld1q_s8(b.as_ptr().add(base));
-        let a0_lo = vget_low_s8(a0);
-        let a0_hi = vget_high_s8(a0);
-        let b0_lo = vget_low_s8(b0);
-        let b0_hi = vget_high_s8(b0);
-        let prod0_lo = vmull_s8(a0_lo, b0_lo);
-        let prod0_hi = vmull_s8(a0_hi, b0_hi);
-        sum0 = vpadalq_s16(sum0, prod0_lo);
-        sum0 = vpadalq_s16(sum0, prod0_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum0,
+            a = in(vreg) a0,
+            b = in(vreg) b0,
+            options(pure, nomem, nostack, preserves_flags)
+        );
 
-        // Unroll 1
         let a1 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH));
         let b1 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH));
-        let a1_lo = vget_low_s8(a1);
-        let a1_hi = vget_high_s8(a1);
-        let b1_lo = vget_low_s8(b1);
-        let b1_hi = vget_high_s8(b1);
-        let prod1_lo = vmull_s8(a1_lo, b1_lo);
-        let prod1_hi = vmull_s8(a1_hi, b1_hi);
-        sum1 = vpadalq_s16(sum1, prod1_lo);
-        sum1 = vpadalq_s16(sum1, prod1_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum1,
+            a = in(vreg) a1,
+            b = in(vreg) b1,
+            options(pure, nomem, nostack, preserves_flags)
+        );
 
-        // Unroll 2
         let a2 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 2));
         let b2 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 2));
-        let a2_lo = vget_low_s8(a2);
-        let a2_hi = vget_high_s8(a2);
-        let b2_lo = vget_low_s8(b2);
-        let b2_hi = vget_high_s8(b2);
-        let prod2_lo = vmull_s8(a2_lo, b2_lo);
-        let prod2_hi = vmull_s8(a2_hi, b2_hi);
-        sum2 = vpadalq_s16(sum2, prod2_lo);
-        sum2 = vpadalq_s16(sum2, prod2_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum2,
+            a = in(vreg) a2,
+            b = in(vreg) b2,
+            options(pure, nomem, nostack, preserves_flags)
+        );
 
-        // Unroll 3
         let a3 = vld1q_s8(a.as_ptr().add(base + SIMD_WIDTH * 3));
         let b3 = vld1q_s8(b.as_ptr().add(base + SIMD_WIDTH * 3));
-        let a3_lo = vget_low_s8(a3);
-        let a3_hi = vget_high_s8(a3);
-        let b3_lo = vget_low_s8(b3);
-        let b3_hi = vget_high_s8(b3);
-        let prod3_lo = vmull_s8(a3_lo, b3_lo);
-        let prod3_hi = vmull_s8(a3_hi, b3_hi);
-        sum3 = vpadalq_s16(sum3, prod3_lo);
-        sum3 = vpadalq_s16(sum3, prod3_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum3,
+            a = in(vreg) a3,
+            b = in(vreg) b3,
+            options(pure, nomem, nostack, preserves_flags)
+        );
     }
 
-    // Combine accumulators
     let sum01 = vaddq_s32(sum0, sum1);
     let sum23 = vaddq_s32(sum2, sum3);
     let mut sum_vec = vaddq_s32(sum01, sum23);
 
-    // Tail SIMD chunks: process remaining full 16-byte vectors before scalar tail.
-    // Helps dimensions like 127 (3 tail chunks) or 129 (0 tail chunks, 1 scalar byte).
+    // Tail: remaining full 16-byte vectors using sdot
     let tail_start = chunks * CHUNK_SIZE;
     let tail_chunks = (n - tail_start) / SIMD_WIDTH;
     for j in 0..tail_chunks {
         let base = tail_start + j * SIMD_WIDTH;
         let at = vld1q_s8(a.as_ptr().add(base));
         let bt = vld1q_s8(b.as_ptr().add(base));
-        let at_lo = vget_low_s8(at);
-        let at_hi = vget_high_s8(at);
-        let bt_lo = vget_low_s8(bt);
-        let bt_hi = vget_high_s8(bt);
-        let pt_lo = vmull_s8(at_lo, bt_lo);
-        let pt_hi = vmull_s8(at_hi, bt_hi);
-        sum_vec = vpadalq_s16(sum_vec, pt_lo);
-        sum_vec = vpadalq_s16(sum_vec, pt_hi);
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) sum_vec,
+            a = in(vreg) at,
+            b = in(vreg) bt,
+            options(pure, nomem, nostack, preserves_flags)
+        );
     }
 
-    // Horizontal sum
-    let sum = vgetq_lane_s32(sum_vec, 0)
-        + vgetq_lane_s32(sum_vec, 1)
-        + vgetq_lane_s32(sum_vec, 2)
-        + vgetq_lane_s32(sum_vec, 3);
+    let sum = vaddvq_s32(sum_vec);
 
     // Scalar tail: only the final < SIMD_WIDTH elements
     let remainder_start = tail_start + tail_chunks * SIMD_WIDTH;

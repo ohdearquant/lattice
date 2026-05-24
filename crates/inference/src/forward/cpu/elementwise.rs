@@ -163,22 +163,34 @@ unsafe fn rms_norm_neon(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
     debug_assert_eq!(x.len(), num_tokens * hidden);
     debug_assert_eq!(gamma.len(), hidden);
 
-    let chunks = hidden / 4;
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL; // 16 floats per unrolled iteration
+    let chunks = hidden / CHUNK;
     let inv_hidden = 1.0f32 / hidden as f32;
 
     for t in 0..num_tokens {
         let row_ptr = x.as_mut_ptr().add(t * hidden);
         let gamma_ptr = gamma.as_ptr();
 
-        // --- Step 1: Sum of squares via SIMD ---
-        let mut vsum_sq = vdupq_n_f32(0.0);
+        // --- Step 1: Sum of squares with 4 independent accumulators ---
+        let mut sq0 = vdupq_n_f32(0.0);
+        let mut sq1 = vdupq_n_f32(0.0);
+        let mut sq2 = vdupq_n_f32(0.0);
+        let mut sq3 = vdupq_n_f32(0.0);
         for c in 0..chunks {
-            // SAFETY: c * 4 + 3 < chunks * 4 <= hidden, within row bounds.
-            let v = vld1q_f32(row_ptr.add(c * 4) as *const f32);
-            vsum_sq = vfmaq_f32(vsum_sq, v, v);
+            let base = c * CHUNK;
+            let v0 = vld1q_f32(row_ptr.add(base) as *const f32);
+            sq0 = vfmaq_f32(sq0, v0, v0);
+            let v1 = vld1q_f32(row_ptr.add(base + 4) as *const f32);
+            sq1 = vfmaq_f32(sq1, v1, v1);
+            let v2 = vld1q_f32(row_ptr.add(base + 8) as *const f32);
+            sq2 = vfmaq_f32(sq2, v2, v2);
+            let v3 = vld1q_f32(row_ptr.add(base + 12) as *const f32);
+            sq3 = vfmaq_f32(sq3, v3, v3);
         }
-        let mut sum_sq = vaddvq_f32(vsum_sq);
-        for i in (chunks * 4)..hidden {
+        let combined = vaddq_f32(vaddq_f32(sq0, sq1), vaddq_f32(sq2, sq3));
+        let mut sum_sq = vaddvq_f32(combined);
+        for i in (chunks * CHUNK)..hidden {
             let v = *row_ptr.add(i);
             sum_sq += v * v;
         }
@@ -187,16 +199,32 @@ unsafe fn rms_norm_neon(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
         let inv_rms = 1.0 / rms;
         let vinv_rms = vdupq_n_f32(inv_rms);
 
-        // --- Step 2: Scale by gamma / rms using SIMD ---
+        // --- Step 2: Scale by gamma / rms with 4x unrolling ---
         for c in 0..chunks {
-            let off = c * 4;
-            // SAFETY: off + 3 < chunks * 4 <= hidden, within both row and gamma bounds.
-            let v = vld1q_f32(row_ptr.add(off) as *const f32);
-            let g = vld1q_f32(gamma_ptr.add(off));
-            let result = vmulq_f32(vmulq_f32(v, vinv_rms), g);
-            vst1q_f32(row_ptr.add(off), result);
+            let base = c * CHUNK;
+            let v0 = vld1q_f32(row_ptr.add(base) as *const f32);
+            let g0 = vld1q_f32(gamma_ptr.add(base));
+            vst1q_f32(row_ptr.add(base), vmulq_f32(vmulq_f32(v0, vinv_rms), g0));
+            let v1 = vld1q_f32(row_ptr.add(base + 4) as *const f32);
+            let g1 = vld1q_f32(gamma_ptr.add(base + 4));
+            vst1q_f32(
+                row_ptr.add(base + 4),
+                vmulq_f32(vmulq_f32(v1, vinv_rms), g1),
+            );
+            let v2 = vld1q_f32(row_ptr.add(base + 8) as *const f32);
+            let g2 = vld1q_f32(gamma_ptr.add(base + 8));
+            vst1q_f32(
+                row_ptr.add(base + 8),
+                vmulq_f32(vmulq_f32(v2, vinv_rms), g2),
+            );
+            let v3 = vld1q_f32(row_ptr.add(base + 12) as *const f32);
+            let g3 = vld1q_f32(gamma_ptr.add(base + 12));
+            vst1q_f32(
+                row_ptr.add(base + 12),
+                vmulq_f32(vmulq_f32(v3, vinv_rms), g3),
+            );
         }
-        for i in (chunks * 4)..hidden {
+        for i in (chunks * CHUNK)..hidden {
             let v = *row_ptr.add(i);
             let g = *gamma_ptr.add(i);
             *row_ptr.add(i) = v * inv_rms * g;
@@ -246,18 +274,28 @@ unsafe fn elementwise_mul_neon(a: &mut [f32], b: &[f32]) {
 
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
-    let chunks = n / 4;
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL; // 16 floats per iteration
+    let chunks = n / CHUNK;
     let a_ptr = a.as_mut_ptr();
     let b_ptr = b.as_ptr();
 
     for c in 0..chunks {
-        let off = c * 4;
-        // SAFETY: off + 3 < chunks * 4 <= n, within both slice bounds.
-        let av = vld1q_f32(a_ptr.add(off) as *const f32);
-        let bv = vld1q_f32(b_ptr.add(off));
-        vst1q_f32(a_ptr.add(off), vmulq_f32(av, bv));
+        let base = c * CHUNK;
+        let a0 = vld1q_f32(a_ptr.add(base) as *const f32);
+        let b0 = vld1q_f32(b_ptr.add(base));
+        vst1q_f32(a_ptr.add(base), vmulq_f32(a0, b0));
+        let a1 = vld1q_f32(a_ptr.add(base + 4) as *const f32);
+        let b1 = vld1q_f32(b_ptr.add(base + 4));
+        vst1q_f32(a_ptr.add(base + 4), vmulq_f32(a1, b1));
+        let a2 = vld1q_f32(a_ptr.add(base + 8) as *const f32);
+        let b2 = vld1q_f32(b_ptr.add(base + 8));
+        vst1q_f32(a_ptr.add(base + 8), vmulq_f32(a2, b2));
+        let a3 = vld1q_f32(a_ptr.add(base + 12) as *const f32);
+        let b3 = vld1q_f32(b_ptr.add(base + 12));
+        vst1q_f32(a_ptr.add(base + 12), vmulq_f32(a3, b3));
     }
-    for i in (chunks * 4)..n {
+    for i in (chunks * CHUNK)..n {
         *a_ptr.add(i) *= *b_ptr.add(i);
     }
 }
