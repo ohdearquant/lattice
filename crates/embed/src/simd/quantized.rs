@@ -205,7 +205,7 @@ pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
         return 0.0;
     }
 
-    dot_product_i8_raw(&a.data, &b.data) / denom
+    dot_product_i8_dispatch(&a.data, &b.data) / denom
 }
 
 /// Trusted INT8 dot product for constructor-owned vectors in prepared-query paths.
