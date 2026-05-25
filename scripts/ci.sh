@@ -17,6 +17,9 @@ fi
 echo "=== Tests ==="
 cargo test --workspace
 
+echo "=== Embedding Parity vs HF ==="
+cargo test -p lattice-embed --test embed_parity_vs_hf
+
 echo "=== Build (release) ==="
 cargo build --workspace --release
 
