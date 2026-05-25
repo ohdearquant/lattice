@@ -30,6 +30,30 @@ cargo bench -p lattice-inference --bench elementwise_cpu_bench      # inference 
 
 Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
 
+### Differential Test First (Cross-Framework Bugs)
+
+When lattice produces different output than a reference framework (MLX, HF transformers, llama.cpp), write a self-contained Python script that runs the same primitive in both frameworks and compares max-diff **before** reading lattice code or spawning investigation agents. A 20-line script gives a definitive answer in seconds; code-reading and agent analysis take hours and can converge on wrong conclusions.
+
+```python
+# Template: /tmp/test_<primitive>_conv.py
+import numpy as np, mlx.core as mx, mlx.nn as nn
+# 1. Construct minimal input
+# 2. Run via MLX (reference)
+# 3. Run via each candidate lattice convention (as numpy)
+# 4. Compare: which candidate has max-diff < 1e-4?
+```
+
+This process closed a 0.77 PPL gap on Qwen3.5-0.8B that had been misdiagnosed as "f32-vs-bf16 precision drift" for days. The actual bug was a RoPE pairing convention mismatch — interleaved `(2i, 2i+1)` vs stride-half `(i, half+i)`. Verified in 5 seconds: stride-half max-diff `8e-6`, interleaved `67.5`. PPL dropped from 16.62 → 15.89 (MLX gold 15.86).
+
+**Quantitative bounds reject hypotheses cheaply.** Before chasing "FP precision drift" or other plausible-sounding causes, check the literature for typical magnitude:
+- f16 vs f32 PPL delta: `~0.00x` (llama.cpp community)
+- bf16 vs f32 PPL delta: `<0.05` (arxiv:2510.26788)
+- Q4 quantization PPL delta: `0.1-0.3` (llama.cpp #406)
+
+If the gap you're investigating exceeds these bounds, the cause is structural (algorithm, layout, convention), not numerical. Reject the precision hypothesis on quantitative grounds and look for a real bug.
+
+**Be skeptical of comments that paraphrase config fields.** A comment that says "X uses field=true" without explaining what the field actually controls in the reference implementation is a footgun. The lattice RoPE comment said "Qwen3.5 uses mrope_interleaved=true" — technically matched config, but `mrope_interleaved` controls multimodal M-RoPE section interleaving (video/image tokens), not 1-D text RoPE pairing. The bug existed for months because nobody verified the comment against HF's `rotate_half` or MLX's `nn.RoPE`.
+
 ### Regression Gate (ADR-058)
 
 PRs touching CPU kernel paths trigger `bench-regression.yml` in CI. It runs on both `x86_64-linux` (AVX2) and `aarch64-linux` (NEON) against baselines stored on the orphan `perf-baselines` branch.
@@ -80,4 +104,14 @@ Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `tune
 
 ## Publishing
 
-Leaf crates publish first: inference → fann → transport → (wait 30s) → embed → (wait 30s) → tune. Use `make publish`. Internal path deps must have `version = "0.1.0"`.
+Leaf crates publish first: inference → fann → transport → (wait 30s) → embed → (wait 30s) → tune. Use `make publish`. Internal path deps' `version = ` field must match the current workspace version (bump them in lockstep when bumping `[workspace.package].version`).
+
+**Shipped-bug recovery (bump-and-yank).** crates.io versions are immutable. When a published release has a correctness bug:
+
+1. Bump workspace + path-dep versions to the next patch
+2. Update release notes file (rename if needed); add a "Note on v<broken>" section explaining the yank
+3. Tag + GH release + `make publish`
+4. `for c in lattice-inference lattice-fann lattice-transport lattice-embed lattice-tune; do cargo yank --version <broken> "$c"; done`
+5. Verify: `curl -s https://crates.io/api/v1/crates/<crate>` should show `latest_unyanked=<new>`, `yanked=[<broken>]`
+
+Done in v0.2.3 (yanked broken 0.2.2 which shipped with the RoPE bug). New `cargo add` users get the fix; existing pinned users get a yank warning on next `cargo update`.
