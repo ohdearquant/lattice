@@ -197,6 +197,17 @@ fn multilingual_e5_small_sentencepiece_parity() {
                     13, 2,
                 ],
             },
+            // Whitespace regression cases — HF ref collected with AutoTokenizer
+            // (transformers==4.x) on 2026-05-25.  These cover the trailing-space bug
+            // where lattice used to emit an extra ▁ (token 6) before EOS.
+            Case {
+                input: "   leading whitespace and    multiple    spaces   ",
+                expected: &[0, 105207, 35011, 65421, 136, 48716, 32628, 7, 2],
+            },
+            Case {
+                input: "trailing space ",
+                expected: &[0, 141037, 214, 32628, 2],
+            },
         ],
     );
 }

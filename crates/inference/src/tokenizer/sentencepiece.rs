@@ -429,6 +429,21 @@ impl SentencePieceTokenizer {
             }
         }
 
+        // HF Metaspace semantics: a space-piece (▁ or ' ') represents the space
+        // *before* a word.  Trailing whitespace in the input has no following word,
+        // so no space-piece should be emitted for it.  Strip any trailing space
+        // character(s) added during the loop.
+        if prev_was_space && self.inner.escape_whitespaces {
+            while out.ends_with(META_SPACE) {
+                let trim_len = META_SPACE.len_utf8();
+                out.truncate(out.len() - trim_len);
+            }
+        } else if prev_was_space && !self.inner.escape_whitespaces {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+        }
+
         out
     }
 
@@ -895,5 +910,32 @@ mod tests {
     fn test_parse_byte_piece() {
         assert_eq!(parse_byte_piece("<0x41>"), Some(0x41));
         assert_eq!(parse_byte_piece("not-a-byte"), None);
+    }
+
+    // HF Metaspace semantics: trailing whitespace in input must not produce a
+    // trailing space-piece token.  These unit tests cover the normalize() fix.
+
+    #[test]
+    fn test_normalize_strips_trailing_metaspace() {
+        let tokenizer = synthetic_tokenizer();
+        // Trailing whitespace → no trailing ▁ in normalized form.
+        assert_eq!(tokenizer.normalize("hello world   "), "▁hello▁world");
+        // Single trailing space.
+        assert_eq!(tokenizer.normalize("hello "), "▁hello");
+    }
+
+    #[test]
+    fn test_normalize_leading_whitespace_no_duplicate_prefix() {
+        let tokenizer = synthetic_tokenizer();
+        // Leading whitespace: dummy_prefix already sets prev_was_space=true, so
+        // the leading space is collapsed; no extra ▁ before the first word.
+        assert_eq!(tokenizer.normalize("   hello world"), "▁hello▁world");
+    }
+
+    #[test]
+    fn test_normalize_trailing_and_leading_whitespace() {
+        let tokenizer = synthetic_tokenizer();
+        // Both leading and trailing whitespace — strip trailing, collapse leading.
+        assert_eq!(tokenizer.normalize("   hello world   "), "▁hello▁world");
     }
 }
