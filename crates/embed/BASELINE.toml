@@ -4,21 +4,21 @@
 version = "0.1.0"
 module = "foundation/embed"
 created = "2026-04-29"
-updated = "2026-04-29"
+updated = "2026-05-25"
 
 [performance]
-cold_start_latency = "pending_measurement"  # needs: delete cache, time first encode()
-cache_hit_latency = "pending_measurement"   # needs: time encode() with warm cache
+cold_start_latency = "n/a — model files not downloaded in CI worktree"  # needs: delete cache, time first encode()
+cache_hit_latency = "n/a — model files not downloaded in CI worktree"   # needs: time encode() with warm cache
 model_cache_path = "~/.lattice/cache/embed_{model}_{dim}d.bin"  # source: implicit_contracts.md section 2
 model_cache_creation_trigger = "shutdown"    # source: implicit_contracts.md section 2
 regression_tolerance_pct = 20               # source: Bencher/SLO convention
 
 [quality]
-simd_parity_avx2_neon_scalar = "pending_measurement"  # needs: /simd-parity differential tests
+simd_parity_avx2_neon_scalar = "pass_neon_19_of_19 — AVX2/AVX-512 not exercised on arm64 host"  # measured: cargo test -p lattice-embed --test simd_precision 2026-05-25
 neon_alignment_2560d = true                 # source: verdict.md PASS item 4
 qwen3_4b_native_dims = 2560                # source: summary_20260429_150820
 qwen3_0_6b_native_dims = 1024              # source: summary_20260429_150820
-mrl_wiring_status = "not_wired"            # source: summary_20260429_150820
+mrl_wiring_status = "wired_qwen3_only"     # source: landscape.md:169 (research-embed-quality); prior entry was stale
 batch_encoding_status = "shipped"           # source: summary_20260429_194409
 
 [security]
