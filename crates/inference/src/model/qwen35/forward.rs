@@ -385,8 +385,11 @@ impl Qwen35Model {
         let _ = q_dim; // used by caller for gate_z
     }
 
-    /// Apply partial RoPE with INTERLEAVED pairing.
-    /// Qwen3.5 uses mrope_interleaved=true: pairs are (0,1), (2,3), (4,5), ...
+    /// Apply partial RoPE with STRIDE-HALF (HF rotate_half / MLX traditional=False) pairing.
+    /// Pairs are (i, half+i) for i in 0..half. The `mrope_interleaved` flag in config
+    /// applies only to multimodal-position interleaving (M-RoPE sections); for 1-D text
+    /// positions, Qwen3.5 uses standard stride-half pairing (verified empirically against
+    /// MLX nn.RoPE(traditional=False) — diff ~1e-5 with stride-half, ~70 with interleaved).
     /// Only the first `rope_dim` dimensions are rotated.
     pub(crate) fn apply_partial_rope(
         &self,
@@ -399,10 +402,10 @@ impl Qwen35Model {
         for i in 0..half {
             let cos_val = self.rope.cos_at(base + i);
             let sin_val = self.rope.sin_at(base + i);
-            let x0 = head_vec[2 * i];
-            let x1 = head_vec[2 * i + 1];
-            head_vec[2 * i] = x0 * cos_val - x1 * sin_val;
-            head_vec[2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = head_vec[i];
+            let x1 = head_vec[half + i];
+            head_vec[i] = x0 * cos_val - x1 * sin_val;
+            head_vec[half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
 
