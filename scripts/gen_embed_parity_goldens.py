@@ -150,6 +150,127 @@ def generate_e5_small_goldens() -> list[dict]:
     return goldens
 
 
+def find_hf_cache_snapshot(model_id: str) -> Path | None:
+    """Return the first existing snapshot dir for a HF model ID, or None."""
+    # e.g. "sentence-transformers/all-MiniLM-L6-v2"
+    # → "~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots/<hash>/"
+    slug = "models--" + model_id.replace("/", "--")
+    snapshots_dir = Path(HOME) / ".cache" / "huggingface" / "hub" / slug / "snapshots"
+    if snapshots_dir.exists():
+        children = sorted(snapshots_dir.iterdir())
+        if children:
+            return children[-1]  # latest snapshot
+    return None
+
+
+def generate_all_minilm_l6_v2_goldens() -> list[dict]:
+    """
+    sentence-transformers/all-MiniLM-L6-v2: mean pooling + L2 normalize, no prompt prefix.
+
+    Reference: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+    "Map sentences & paragraphs to a 384-dimensional dense vector space."
+    WordPiece tokenizer (BERT-base-uncased style), mean pooling with attention mask.
+    """
+    model_id = "sentence-transformers/all-MiniLM-L6-v2"
+    # Use the HF cache snapshot for full tokenizer config; weights are there too.
+    model_path = find_hf_cache_snapshot(model_id)
+    if model_path is None or not (model_path / "model.safetensors").exists():
+        # Fallback: .lattice/models/ (weights only — will fail without tokenizer config)
+        model_path = Path(HOME) / ".lattice" / "models" / "all-minilm-l6-v2"
+        if not (model_path / "model.safetensors").exists():
+            print(f"ERROR: all-MiniLM-L6-v2 not found in HF cache or .lattice/models/")
+            sys.exit(1)
+
+    print(f"Loading {model_id} from {model_path}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+    model = AutoModel.from_pretrained(str(model_path))
+    model.eval()
+
+    print(f"  model type: {type(model).__name__}, hidden_size: {model.config.hidden_size}")
+
+    prompt_prefix = ""
+    goldens = []
+    for text in INPUTS:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # Masked mean pool (sentence-transformers convention)
+        last_hidden = outputs.last_hidden_state  # [1, seq_len, hidden]
+        attention_mask = inputs["attention_mask"].unsqueeze(-1).float()  # [1, seq_len, 1]
+        pooled = (last_hidden * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
+        mean_vec = pooled[0].numpy()
+        embedding = l2_normalize(mean_vec)
+
+        goldens.append({
+            "model_id": model_id,
+            "pooling": "mean",
+            "prompt_prefix": prompt_prefix,
+            "input": text,
+            "input_ids": inputs["input_ids"][0].tolist(),
+            "embedding": embedding.tolist(),
+            "embedding_dim": len(embedding),
+        })
+        print(f"  [{len(goldens)}/5] '{text[:40]}...' → dim={len(embedding)}, norm={np.linalg.norm(embedding):.6f}")
+
+    return goldens
+
+
+def generate_paraphrase_multilingual_minilm_l12_v2_goldens() -> list[dict]:
+    """
+    sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2: mean pooling + L2 normalize.
+
+    Reference: https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    "Maps sentences & paragraphs to a 384 dimensional dense vector space."
+    SentencePiece tokenizer (XLM-R style), mean pooling with attention mask, no prompt prefix.
+    """
+    model_id = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    # Use the HF cache snapshot for full tokenizer config; weights are there too.
+    model_path = find_hf_cache_snapshot(model_id)
+    if model_path is None or not (model_path / "model.safetensors").exists():
+        # Fallback: .lattice/models/
+        model_path = Path(HOME) / ".lattice" / "models" / "paraphrase-multilingual-minilm-l12-v2"
+        if not (model_path / "model.safetensors").exists():
+            print(f"ERROR: paraphrase-multilingual-MiniLM-L12-v2 not found in HF cache or .lattice/models/")
+            sys.exit(1)
+
+    print(f"Loading {model_id} from {model_path}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+    model = AutoModel.from_pretrained(str(model_path))
+    model.eval()
+
+    print(f"  model type: {type(model).__name__}, hidden_size: {model.config.hidden_size}")
+
+    prompt_prefix = ""
+    goldens = []
+    for text in INPUTS:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # Masked mean pool (sentence-transformers convention)
+        last_hidden = outputs.last_hidden_state  # [1, seq_len, hidden]
+        attention_mask = inputs["attention_mask"].unsqueeze(-1).float()  # [1, seq_len, 1]
+        pooled = (last_hidden * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
+        mean_vec = pooled[0].numpy()
+        embedding = l2_normalize(mean_vec)
+
+        goldens.append({
+            "model_id": model_id,
+            "pooling": "mean",
+            "prompt_prefix": prompt_prefix,
+            "input": text,
+            "input_ids": inputs["input_ids"][0].tolist(),
+            "embedding": embedding.tolist(),
+            "embedding_dim": len(embedding),
+        })
+        print(f"  [{len(goldens)}/5] '{text[:40]}...' → dim={len(embedding)}, norm={np.linalg.norm(embedding):.6f}")
+
+    return goldens
+
+
 def generate_qwen_goldens() -> list[dict]:
     """
     Qwen/Qwen3-Embedding-0.6B: last-token pooling + L2 normalize.
@@ -229,6 +350,18 @@ def main() -> None:
     write_fixture("multilingual_e5_small.json", e5_goldens)
     print()
 
+    # all-MiniLM-L6-v2
+    print("--- all-MiniLM-L6-v2 (mean + L2 norm, no prefix) ---")
+    minilm_l6_goldens = generate_all_minilm_l6_v2_goldens()
+    write_fixture("all_minilm_l6_v2.json", minilm_l6_goldens)
+    print()
+
+    # paraphrase-multilingual-MiniLM-L12-v2
+    print("--- paraphrase-multilingual-MiniLM-L12-v2 (mean + L2 norm, no prefix) ---")
+    paraphrase_goldens = generate_paraphrase_multilingual_minilm_l12_v2_goldens()
+    write_fixture("paraphrase_multilingual_minilm_l12_v2.json", paraphrase_goldens)
+    print()
+
     # Qwen3-Embedding-0.6B
     print("--- Qwen3-Embedding-0.6B (last-token + L2 norm, no prefix) ---")
     qwen_goldens = generate_qwen_goldens()
@@ -239,6 +372,8 @@ def main() -> None:
     for fname, goldens in [
         ("bge_small_en_v15.json", bge_goldens),
         ("multilingual_e5_small.json", e5_goldens),
+        ("all_minilm_l6_v2.json", minilm_l6_goldens),
+        ("paraphrase_multilingual_minilm_l12_v2.json", paraphrase_goldens),
         ("qwen3_embedding_0_6b.json", qwen_goldens),
     ]:
         path = FIXTURE_DIR / fname
