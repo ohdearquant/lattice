@@ -339,8 +339,9 @@ kernel void rms_norm_qwen35(
     }
 }
 
-// ===== Interleaved Partial RoPE for Qwen3.5 full-attention layers =====
-// Pairs are (2i, 2i+1) for i in 0..half_rope_dim.
+// ===== Stride-Half Partial RoPE for Qwen3.5 full-attention layers =====
+// Pairs are (i, half+i) for i in 0..half_rope_dim — HF rotate_half convention,
+// matching MLX nn.RoPE(traditional=False). Kernel name kept for ABI continuity.
 // Only first rope_dim dimensions are rotated; the rest are untouched.
 // Operates on x[num_heads * head_dim] for a single position.
 kernel void partial_rope_interleaved(
@@ -365,9 +366,9 @@ kernel void partial_rope_interleaved(
     float cos_val = cos_tab[cs_base + pair];
     float sin_val = sin_tab[cs_base + pair];
 
-    // Interleaved: rotate (2*pair, 2*pair+1) within each head
-    uint idx0 = base + 2 * pair;
-    uint idx1 = base + 2 * pair + 1;
+    // Stride-half: rotate (pair, half_rope_dim + pair) within each head
+    uint idx0 = base + pair;
+    uint idx1 = base + half_rope_dim + pair;
     float x0 = x[idx0];
     float x1 = x[idx1];
     x[idx0] = x0 * cos_val - x1 * sin_val;
@@ -13554,17 +13555,23 @@ kernel void decode_attention_reference(
             let logits = state.forward_step(42, 0);
             assert_eq!(logits.len(), cfg.vocab_size);
             let actual = &logits[..10];
+            // Math: token 42's embedding has a single non-zero element (=1.0). After
+            // input_layernorm (qwen35_rms_norm uses 1+gamma weights), the norm output
+            // is x * sqrt(hidden)/||x|| * (1 + gamma) = 1 * sqrt(512) * 2 = 45.2543.
+            // All attention and FFN weights are zero, so the residual stream stays at
+            // the input embedding. final_norm produces the same 45.2543 magnitude.
+            // Tied lm_head: logit[v] = embed[v, 0] * 45.2543 → -45.25, 0, 45.25 pattern.
             let expected = [
-                -22.6216266_f32,
+                -45.243256_f32,
                 0.0,
-                22.6216266,
-                -22.6216266,
+                45.243256,
+                -45.243256,
                 0.0,
-                22.6216266,
-                -22.6216266,
+                45.243256,
+                -45.243256,
                 0.0,
-                22.6216266,
-                -22.6216266,
+                45.243256,
+                -45.243256,
             ];
             let max_abs_diff = actual
                 .iter()
@@ -15024,6 +15031,7 @@ kernel void decode_attention_reference(
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
+                grammar: None,
             };
 
             let out = with_self_spec_env(|| {
@@ -15118,6 +15126,7 @@ kernel void decode_attention_reference(
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
+                grammar: None,
             };
 
             let mut state = with_self_spec_env(|| {

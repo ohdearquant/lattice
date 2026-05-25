@@ -1086,7 +1086,7 @@ impl<'a> MtpVerifier<'a> {
     }
 }
 
-/// Interleaved partial RoPE: rotate pairs (2i, 2i+1) for i in 0..rope_dim/2.
+/// Stride-half partial RoPE: rotate pairs (i, half+i) for i in 0..rope_dim/2 — matches HF rotate_half / MLX traditional=False.
 fn mtp_apply_partial_rope(
     head_vec: &mut [f32],
     position: usize,
@@ -1098,10 +1098,10 @@ fn mtp_apply_partial_rope(
     for i in 0..half {
         let cos_val = rope.cos_at(base + i);
         let sin_val = rope.sin_at(base + i);
-        let x0 = head_vec[2 * i];
-        let x1 = head_vec[2 * i + 1];
-        head_vec[2 * i] = x0 * cos_val - x1 * sin_val;
-        head_vec[2 * i + 1] = x0 * sin_val + x1 * cos_val;
+        let x0 = head_vec[i];
+        let x1 = head_vec[half + i];
+        head_vec[i] = x0 * cos_val - x1 * sin_val;
+        head_vec[half + i] = x0 * sin_val + x1 * cos_val;
     }
 }
 
