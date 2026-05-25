@@ -251,8 +251,12 @@ impl SentencePieceTokenizer {
         let model = ParsedSentencePieceModel {
             pieces,
             unk_id,
-            bos_id: bos_id.or(pp.bos_id),
-            eos_id: eos_id.or(pp.eos_id),
+            // TemplateProcessing IDs are authoritative when present — the template
+            // declares its own special tokens (which may be e.g. [CLS]/[SEP] even when
+            // <s>/</s> also exist in vocab). Only fall back to vocab-name guesses
+            // when the template did not supply explicit IDs.
+            bos_id: pp.bos_id.or(bos_id),
+            eos_id: pp.eos_id.or(eos_id),
             pad_id,
             add_bos: pp.add_bos,
             add_eos: pp.add_eos,
