@@ -266,9 +266,22 @@ impl EmbeddingModel {
     /// Some models use different prompts for documents vs queries.
     /// Returns `Some(prefix)` if the document text should be wrapped as
     /// `"{prefix}{text}"` before embedding at storage time.
+    ///
+    /// - **E5 models**: trained with `"passage: "` prefix on document/passage inputs.
+    ///   Omitting the prefix on the document side degrades retrieval quality because
+    ///   the model's embedding space was conditioned on this asymmetry during fine-tuning.
+    /// - **BGE / MiniLM**: no document prefix required (contrastive training on raw text).
+    /// - **Qwen3-Embedding**: raw passage text is used without an instruction prefix;
+    ///   only the query side carries the task instruction.
     #[inline]
     pub const fn document_instruction(&self) -> Option<&'static str> {
-        None
+        match self {
+            EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
+                // E5 asymmetric retrieval: "passage: " prefix for documents/passages.
+                Some("passage: ")
+            }
+            _ => None,
+        }
     }
 
     /// **Stable**: get the model identifier (HuggingFace ID or provider/model).
