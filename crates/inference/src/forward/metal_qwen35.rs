@@ -6022,6 +6022,26 @@ kernel void moe_shared_gate_add(
             cmd.commit();
             cmd.wait_until_completed();
 
+            // Diagnostic: dump post-final-norm hidden state magnitudes for
+            // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
+            if let Ok(dump_path) = std::env::var("LATTICE_HIDDEN_DUMP") {
+                // SAFETY: hidden buffer is StorageModeShared, GPU completed (just waited).
+                // Reads `cfg.hidden_size` f32 values starting at offset 0 (post-RMSNorm hidden
+                // for position 0 — only valid for decode/single-token forward_step).
+                let hidden_vec: Vec<f32> = unsafe {
+                    let ptr = self.session.activations.hidden.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, cfg.hidden_size).to_vec()
+                };
+                let mag = hidden_vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let max = hidden_vec.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                let mean = hidden_vec.iter().sum::<f32>() / hidden_vec.len() as f32;
+                eprintln!(
+                    "[hidden-dump] token={token_id} pos={position} L2_norm={mag:.4} max_abs={max:.4} mean={mean:.4}"
+                );
+                let bytes: Vec<u8> = hidden_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(&dump_path, &bytes).expect("failed to dump hidden");
+            }
+
             debug_assert_eq!(
                 gdn_gpu_dispatches, expected_gdn_dispatches,
                 "GDN GPU recurrence dispatch count mismatch"
@@ -6983,8 +7003,57 @@ kernel void moe_shared_gate_add(
                 enc.dispatch_thread_groups(MTLSize::new(nr as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
 
-            // lm_head — GEMV (last only) or GEMM (all n).
-            if let Some(ref pb) = ppl_buf {
+            // lm_head — for Q8 format (auto-quantized from F16 source), use the
+            // FP16 embed_tokens buffer to avoid the ~0.79 PPL gap from per-row
+            // symmetric Q8 quantization (which can't represent outlier rows
+            // cleanly, corrupting hidden·embed dot products vs MLX).
+            // For Q4 format (from .q4 dirs), keep using the Q4 path because
+            // the FP16 buffer was dequantized from Q4 and the original Q4
+            // matmul kernel is faster + handles QuaRot rotations correctly.
+            let use_fp16_lm_head = matches!(self.engine.quant_format, QuantFormat::Q8_0);
+            if use_fp16_lm_head {
+                let gemm_params = GemmParams {
+                    m: 1,
+                    n: cfg.vocab_size as u32,
+                    k: hidden as u32,
+                    lda: hidden as u32,
+                    ldb: hidden as u32,
+                    ldc: cfg.vocab_size as u32,
+                };
+                if let Some(ref pb) = ppl_buf {
+                    for p in 0..n {
+                        let hidden_off = (p * hidden) as u64 * 4;
+                        let logits_off = (p * cfg.vocab_size) as u64 * 4;
+                        enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+                        enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_off);
+                        enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                        enc.set_buffer(2, Some(pb), logits_off);
+                        enc.set_bytes(
+                            3,
+                            std::mem::size_of::<GemmParams>() as u64,
+                            &gemm_params as *const GemmParams as *const _,
+                        );
+                        enc.dispatch_thread_groups(
+                            MTLSize::new(cfg.vocab_size as u64, 1, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                } else {
+                    enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+                    enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
+                    enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                    enc.set_buffer(2, Some(&self.session.activations.logits), 0);
+                    enc.set_bytes(
+                        3,
+                        std::mem::size_of::<GemmParams>() as u64,
+                        &gemm_params as *const GemmParams as *const _,
+                    );
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(cfg.vocab_size as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            } else if let Some(ref pb) = ppl_buf {
                 self.dispatch_gemm(
                     enc,
                     &self.session.activations.hidden,
@@ -9600,15 +9669,33 @@ kernel void moe_shared_gate_add(
                 1,
                 cfg.rms_norm_eps,
             );
-            self.dispatch_matmul(
-                enc,
-                &self.session.activations.hidden,
-                &self.engine.embed_tokens_q8,
-                &self.session.activations.logits,
-                1,
-                cfg.vocab_size as u32,
-                hidden as u32,
-            );
+            // lm_head: for Q8 format use FP16 (matches MLX), for Q4 use Q4 path.
+            // Q8 per-row symmetric quantization of embeddings causes ~0.79 PPL
+            // gap from per-row scale not capturing outlier embeddings cleanly.
+            match self.engine.quant_format {
+                QuantFormat::Q8_0 => {
+                    self.dispatch_matmul_half(
+                        enc,
+                        &self.session.activations.hidden,
+                        &self.engine.embed_tokens,
+                        &self.session.activations.logits,
+                        1,
+                        cfg.vocab_size as u32,
+                        hidden as u32,
+                    );
+                }
+                QuantFormat::Q4_0 => {
+                    self.dispatch_matmul(
+                        enc,
+                        &self.session.activations.hidden,
+                        &self.engine.embed_tokens_q8,
+                        &self.session.activations.logits,
+                        1,
+                        cfg.vocab_size as u32,
+                        hidden as u32,
+                    );
+                }
+            }
             if let Some(t0) = final_t0 {
                 prof.final_us += t0.elapsed().as_micros();
             }

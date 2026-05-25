@@ -1,5 +1,5 @@
-lattice	q4	19.266338	2048
-lattice	q4-quarot	19.950485	2048
+lattice	q4	19.266360	2048
+lattice	q4-quarot	19.950607	2048
   q8: PPL = 15.8218 (2041 tokens)
   q4: PPL = 18.1839 (2041 tokens)
 mlx	q8	15.8218	2041
