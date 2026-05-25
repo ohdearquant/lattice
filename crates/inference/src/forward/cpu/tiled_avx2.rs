@@ -6,12 +6,12 @@
 // Inner k-loop unrolled 2× (processes 16 k-values per iteration).
 //
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 use super::arch_kernels::hsum_m256;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 use super::tiled::{TILE_I, TILE_J, TILE_K};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub(super) unsafe fn matmul_bt_tiled_avx2(
     a: &[f32],
