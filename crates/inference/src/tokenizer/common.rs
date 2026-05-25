@@ -1021,4 +1021,54 @@ mod tests {
         push_eos_preserving_limit(&mut ids, 99, 0);
         assert!(ids.is_empty());
     }
+
+    #[test]
+    fn test_parse_post_processor_template_special_ids() {
+        // Synthetic TemplateProcessing where the template uses [CLS]/[SEP]
+        // (e.g. BERT-style) but the model also happens to have <s>/</s> in vocab.
+        // The IDs in special_tokens are the authoritative source for prefix/suffix.
+        let raw = r#"{
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+                ],
+                "special_tokens": {
+                    "[CLS]": {"id": "[CLS]", "ids": [101], "tokens": ["[CLS]"]},
+                    "[SEP]": {"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}
+                }
+            }
+        }"#;
+        let root = parse_json(raw).unwrap();
+        let pp = parse_post_processor_flags(&root);
+        assert!(pp.add_bos, "template starts with SpecialToken → add_bos");
+        assert!(pp.add_eos, "template ends with SpecialToken → add_eos");
+        assert_eq!(pp.bos_id, Some(101), "[CLS] id authoritative");
+        assert_eq!(pp.eos_id, Some(102), "[SEP] id authoritative");
+    }
+
+    #[test]
+    fn test_parse_post_processor_xlm_roberta_style() {
+        // XLM-RoBERTa-style: <s>/</s> in template AND in special_tokens.
+        let raw = r#"{
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "</s>", "type_id": 0}}
+                ],
+                "special_tokens": {
+                    "<s>": {"id": "<s>", "ids": [0], "tokens": ["<s>"]},
+                    "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+                }
+            }
+        }"#;
+        let root = parse_json(raw).unwrap();
+        let pp = parse_post_processor_flags(&root);
+        assert_eq!(pp.bos_id, Some(0));
+        assert_eq!(pp.eos_id, Some(2));
+    }
 }
