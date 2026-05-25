@@ -332,7 +332,8 @@ kernel void rms_norm_qwen35(
 
     float rms = rsqrt(shared[0] / float(row_len) + eps);
 
-    // Qwen3.5: (1 + gamma) shifted normalization
+    // Qwen3.5: shifted RMSNorm (1 + gamma). Empirically required — plain
+    // gamma produces garbage logits on this model.
     for (uint i = lid; i < row_len; i += tgs) {
         x[base + i] = x[base + i] * rms * (1.0f + gamma[i]);
     }
@@ -407,6 +408,7 @@ kernel void per_head_rms_norm(
 
     float rms = rsqrt(shared[0] / float(head_dim) + eps);
 
+    // Qwen3.5: shifted RMSNorm (1 + gamma) — per-head variant for q_norm/k_norm.
     for (uint i = lid; i < head_dim; i += tgs) {
         x[base + i] = x[base + i] * rms * (1.0f + gamma[i]);
     }
@@ -875,7 +877,7 @@ kernel void fused_residual_add_norm(
     }
     float rms = rsqrt(shared[0] / float(row_len) + eps);
 
-    // Phase 2: normed_out = residual_out * rms * (1 + gamma)
+    // Phase 2: normed_out = residual_out * rms * (1 + gamma) (Qwen3.5 shifted RMSNorm).
     for (uint i = lid; i < row_len; i += tgs) {
         normed_out[i] = residual_out[i] * rms * (1.0f + gamma[i]);
     }
@@ -910,8 +912,8 @@ kernel void gemv_q4_decode(
 {
     const uint NR = 2;
     const uint NSG = 4;
-    const uint nb = K / 32;           // number of Q4_0 blocks per row
-    const uint row_bytes = nb * 18;   // 18 bytes per block
+    const uint nb = K / 32;           // number of Q4 blocks per row
+    const uint row_bytes = nb * 20;   // 20 bytes per asymmetric block (scale + bias + 16 nibbles)
     const uint first_row = tgpig.x * NR;
     const uint ix = tiisg / 4;        // block sub-index (0..7)
     const uint il = tiisg % 4;        // lane within block (0..3)
@@ -925,24 +927,28 @@ kernel void gemv_q4_decode(
 
     for (uint ib = ib_start; ib < nb; ib += ib_stride) {
         float yl[8];
-        for (uint i = 0; i < 8; i++) yl[i] = yb[i];
+        float yl_sum = 0.0f;
+        for (uint i = 0; i < 8; i++) { yl[i] = yb[i]; yl_sum += yb[i]; }
         yb += ib_stride * 32;
 
         for (uint row = 0; row < NR; row++) {
             uint r = first_row + row;
             if (r >= N) continue;
-            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 18);
-            half d = *((device const half*)base);
-            device const uchar* qs = base + 2 + il * 4;  // 4 bytes = 8 nibbles
+            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 20);
+            float d = float(*((device const half*)base));         // scale
+            float b = float(*((device const half*)(base + 2)));   // bias (min)
+            device const uchar* qs = base + 4 + il * 4;  // 4 bytes = 8 nibbles
 
-            float sumq = 0.0f;
+            // Asymmetric dequant: w = nibble * d + b. The bias contribution
+            // factors out of the inner loop: sum(nibble*x)*d + sum(x)*b.
+            float sumq_dot = 0.0f;
             for (uint i = 0; i < 4; i++) {
                 uchar byte_val = qs[i];
-                float v0 = float(int(byte_val & 0xF) - 8);
-                float v1 = float(int(byte_val >> 4) - 8);
-                sumq += v0 * yl[i * 2] + v1 * yl[i * 2 + 1];
+                float n0 = float(byte_val & 0xF);
+                float n1 = float(byte_val >> 4);
+                sumq_dot += n0 * yl[i * 2] + n1 * yl[i * 2 + 1];
             }
-            sumf[row] += sumq * float(d);
+            sumf[row] += sumq_dot * d + b * yl_sum;
         }
     }
 
@@ -1517,9 +1523,10 @@ kernel void gemm_q8(
     }
 }
 
-// ===== Q4_0 batch GEMM: Y[M,N] = X[M,K] @ Q4_W[N, K/32*18]^T =====
+// ===== Q4 (asymmetric) batch GEMM: Y[M,N] = X[M,K] @ Q4_W[N, K/32*20]^T =====
 // Scalar fallback cloned from gemm_q8: NM=4 M rows, NR=2 output columns,
-// NSG=4 SIMD groups. Q4_0 blocks are [f16 scale][16 packed nibble bytes].
+// NSG=4 SIMD groups. Q4 blocks are [f16 scale][f16 bias][16 packed nibble bytes].
+// Dequantization: w = nibble * scale + bias (asymmetric min-max).
 // Dispatch: thread_groups=(ceil(N/2), ceil(M/4), 1), threads=(32, 4, 1)
 kernel void gemm_q4(
     device const uchar* QW   [[buffer(0)]],
@@ -1536,7 +1543,7 @@ kernel void gemm_q4(
     const uint NM = 4;
     const uint NSG = 4;
     const uint nb = K / 32;
-    const uint row_bytes = nb * 18;
+    const uint row_bytes = nb * 20;
     const uint first_col = tgpig.x * NR;
     const uint first_row = tgpig.y * NM;
     const uint ix = tiisg / 4;
@@ -1555,28 +1562,33 @@ kernel void gemm_q4(
 
             device const float* xb = X + m * K + ib * 32 + il * 8;
             float xv[8];
-            for (uint i = 0; i < 8; i++) xv[i] = xb[i];
+            float xv_sum = 0.0f;
+            for (uint i = 0; i < 8; i++) { xv[i] = xb[i]; xv_sum += xb[i]; }
 
             for (uint ri = 0; ri < NR; ri++) {
                 uint col = first_col + ri;
                 if (col >= N) continue;
 
-                uint block_start = col * row_bytes + ib * 18;
+                uint block_start = col * row_bytes + ib * 20;
                 ushort scale_bits = ushort(QW[block_start]) |
                     (ushort(QW[block_start + 1]) << 8);
-                half dh = as_type<half>(scale_bits);
-                float d = float(dh);
+                ushort bias_bits = ushort(QW[block_start + 2]) |
+                    (ushort(QW[block_start + 3]) << 8);
+                float d = float(as_type<half>(scale_bits));
+                float b = float(as_type<half>(bias_bits));
 
-                float sumq = 0.0f;
+                // Asymmetric: w = nibble * d + b. The bias contribution
+                // factors out as b * sum(x[8]).
+                float sumq_dot = 0.0f;
                 for (uint byte_i = 0; byte_i < 4; byte_i++) {
-                    uchar packed = QW[block_start + 2 + il * 4 + byte_i];
-                    int q0 = int(packed & 0x0f) - 8;
-                    int q1 = int(packed >> 4) - 8;
-                    sumq += (float(q0) * d) * xv[byte_i * 2] +
-                            (float(q1) * d) * xv[byte_i * 2 + 1];
+                    uchar packed = QW[block_start + 4 + il * 4 + byte_i];
+                    int q0 = int(packed & 0x0f);
+                    int q1 = int(packed >> 4);
+                    sumq_dot += float(q0) * xv[byte_i * 2] +
+                                float(q1) * xv[byte_i * 2 + 1];
                 }
 
-                sumf[mi * NR + ri] += sumq;
+                sumf[mi * NR + ri] += sumq_dot * d + b * xv_sum;
             }
         }
     }
@@ -2064,7 +2076,7 @@ kernel void copy_and_rms_norm(
     }
     float rms = rsqrt(shared[0] / float(row_len) + eps);
 
-    // Phase 2: normalize src in-place (src still holds original values)
+    // Phase 2: normalize src in-place with Qwen3.5 shifted RMSNorm (1 + gamma).
     for (uint i = lid; i < row_len; i += tgs) {
         src[i] = src[i] * rms * (1.0f + gamma[i]);
     }
@@ -2236,7 +2248,7 @@ kernel void moe_shared_gate_add(
         "    const uint m0 = tg.y * BM;\n",
         "    const uint n0 = tg.x * BN;\n",
         "    const uint nb = K / 32;\n",
-        "    const uint row_bytes = nb * 18;\n",
+        "    const uint row_bytes = nb * 20;\n",
         "    threadgroup float Xtg[64][32];\n",
         "    threadgroup uchar Qraw[32][32];\n",
         "    threadgroup float Wtg[32][40];\n",
@@ -2258,15 +2270,17 @@ kernel void moe_shared_gate_add(
         "            Xtg[mi][kk]=(gm<M&&gk<K)?X[gm*K+gk]:0.0f; }\n",
         "        for (uint i = tid; i < BN*Q4_PAD; i += THREADS) {\n",
         "            uint ni=i/Q4_PAD; uint off=i%Q4_PAD; uint gn=n0+ni; uchar v=0;\n",
-        "            if(gn<N&&off<18){v=QW[gn*row_bytes+kb*18+off];} Qraw[ni][off]=v; }\n",
+        "            if(gn<N&&off<20){v=QW[gn*row_bytes+kb*20+off];} Qraw[ni][off]=v; }\n",
         "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
         "        for (uint i = tid; i < BN*16; i += THREADS) {\n",
         "            uint ni=i/16; uint byte_i=i%16;\n",
         "            ushort sb=ushort(Qraw[ni][0])|(ushort(Qraw[ni][1])<<8);\n",
+        "            ushort bb=ushort(Qraw[ni][2])|(ushort(Qraw[ni][3])<<8);\n",
         "            float d=float(as_type<half>(sb));\n",
-        "            uchar packed=Qraw[ni][2+byte_i];\n",
-        "            Wtg[2*byte_i+0][ni]=float(int(packed&0x0f)-8)*d;\n",
-        "            Wtg[2*byte_i+1][ni]=float(int(packed>>4)-8)*d; }\n",
+        "            float b=float(as_type<half>(bb));\n",
+        "            uchar packed=Qraw[ni][4+byte_i];\n",
+        "            Wtg[2*byte_i+0][ni]=float(packed&0x0f)*d+b;\n",
+        "            Wtg[2*byte_i+1][ni]=float(packed>>4)*d+b; }\n",
         "        for (uint i = tid; i < BK*8; i += THREADS) {\n",
         "            uint kk=i/8; uint pn=BN+(i%8); Wtg[kk][pn]=0.0f; }\n",
         "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
@@ -2460,7 +2474,8 @@ kernel void moe_shared_gate_add(
             );
             // KHQ4 header: magic(4) + version(4) + ndim=2(4) + shape[0](8) + shape[1](8) + original_len(8)
             f.write_all(b"KHQ4").map_err(|e| e.to_string())?;
-            f.write_all(&1u32.to_le_bytes())
+            // Version 2: asymmetric Q4 blocks (20 bytes each: scale + bias + 16 nibbles).
+            f.write_all(&2u32.to_le_bytes())
                 .map_err(|e| e.to_string())?;
             f.write_all(&2u32.to_le_bytes())
                 .map_err(|e| e.to_string())?;
@@ -3157,7 +3172,7 @@ kernel void moe_shared_gate_add(
     const QK8_0: usize = 32;
     const Q8_0_BLOCK_SIZE: usize = 2 + QK8_0;
     const QK4_0: usize = 32;
-    const Q4_0_BLOCK_SIZE: usize = 18;
+    const Q4_0_BLOCK_SIZE: usize = 20;
 
     /// Quantize a row of f32 weights to Q8_0 blocks.
     fn quantize_row_q8_0(src: &[f32]) -> Vec<u8> {
@@ -3415,6 +3430,11 @@ kernel void moe_shared_gate_add(
     /// Build interleaved partial RoPE cos/sin tables.
     /// For Qwen3.5: partial_rotary_factor=0.25, head_dim=256 => rope_dim=64, half=32.
     /// Tables: [max_pos, half_rope_dim] each.
+    ///
+    /// Qwen3.5 uses `theta^(-2i/rope_dim)` in the denominator (verified
+    /// empirically by PPL regression when using head_dim). The partial-RoPE
+    /// frequency spectrum is compressed into the first `rope_dim` dimensions
+    /// rather than sliced from a wider head_dim spectrum.
     fn build_rope_interleaved(rope_dim: usize, max_pos: usize, theta: f64) -> (Vec<f32>, Vec<f32>) {
         let half = rope_dim / 2;
         let mut cos_data = Vec::with_capacity(max_pos * half);
@@ -3422,7 +3442,6 @@ kernel void moe_shared_gate_add(
 
         for pos in 0..max_pos {
             for i in 0..half {
-                // freq for interleaved pair i: theta^(-2i/rope_dim)
                 let freq = 1.0 / theta.powf(2.0 * i as f64 / rope_dim as f64);
                 let angle = pos as f64 * freq;
                 cos_data.push(angle.cos() as f32);
@@ -6181,16 +6200,45 @@ kernel void moe_shared_gate_add(
         ///
         /// Falls back to sequential forward_step for prompts longer than max_prefill.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.forward_prefill_impl(token_ids, false)
+        }
+
+        /// **Unstable**: prefill that returns logits for ALL `n` positions, not
+        /// just the last. Output is `n * vocab_size` f32 values, row-major:
+        /// `logits[i * vocab_size .. (i+1) * vocab_size]` predicts `tokens[i+1]`.
+        ///
+        /// Used by perplexity evaluation. Allocates a per-call buffer of size
+        /// `n * vocab_size * 4` bytes — for `vocab_size=248K` and `n=128` that's
+        /// ~127MB. Callers should cap `n` accordingly (typical PPL window: 128).
+        pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.forward_prefill_impl(token_ids, true)
+        }
+
+        fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
             let n = token_ids.len();
+            let vocab = self.engine.config.vocab_size;
             if n == 0 {
-                return vec![0.0; self.engine.config.vocab_size];
+                return if all_positions {
+                    vec![]
+                } else {
+                    vec![0.0; vocab]
+                };
             }
             if n == 1 {
                 let logits = self.forward_step(token_ids[0], 0);
                 return logits;
             }
-            // Fall back to sequential when LoRA adapter is active (no batch LoRA kernel yet)
+            // Sequential fallback (LoRA or oversize) — only supports last-token mode.
+            // For all_positions mode under these conditions, caller must reduce window
+            // or quantize a Q4 dir without LoRA.
             if self.lora.is_some() || n > self.session.max_prefill {
+                if all_positions {
+                    panic!(
+                        "forward_prefill_all_logits: n={n} exceeds max_prefill ({}) or LoRA active — \
+                         reduce window or run without LoRA",
+                        self.session.max_prefill
+                    );
+                }
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -6879,10 +6927,30 @@ kernel void moe_shared_gate_add(
                 }
             }
 
-            // Final: RMS norm + logits for LAST token only
+            // ---------- Final: RMSNorm + lm_head ----------
+            // Two modes:
+            //   - all_positions=false: RMSNorm + lm_head GEMV for last token only
+            //     (default — used by chat/decode prefill, returns vocab_size f32)
+            //   - all_positions=true:  RMSNorm + lm_head GEMM for all n tokens
+            //     (used by perplexity eval, returns n*vocab_size f32, allocates a
+            //     per-call buffer of n*vocab*4 bytes)
             let last_off = ((n - 1) * hidden) as u64 * 4;
-            // Capture pre-final hidden for last token before RMSNorm overwrites it.
-            if self.session.mtp.is_some() {
+
+            // Per-call output buffer for all-positions mode (n * vocab f32).
+            // Allocated lazily to keep the chat path zero-overhead.
+            let ppl_buf = if all_positions {
+                let bytes = (n * cfg.vocab_size * 4) as u64;
+                Some(
+                    self.engine
+                        .device
+                        .new_buffer(bytes, MTLResourceOptions::StorageModeShared),
+                )
+            } else {
+                None
+            };
+
+            // MTP pre-final-hidden capture (last-token only; not needed for ppl).
+            if !all_positions && self.session.mtp.is_some() {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
                 enc.set_buffer(1, Some(&self.session.activations.pre_final_hidden), 0);
@@ -6896,32 +6964,54 @@ kernel void moe_shared_gate_add(
                     MTLSize::new(wg, 1, 1),
                 );
             }
+
+            // RMSNorm — single-token (last) or all n tokens.
             {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.rms_norm);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
+                let (off, nr) = if all_positions {
+                    (0u64, n as u32)
+                } else {
+                    (last_off, 1u32)
+                };
+                enc.set_buffer(0, Some(&self.session.activations.hidden), off);
                 enc.set_buffer(1, Some(&self.engine.final_norm), 0);
                 let rl = hidden as u32;
-                let nr = 1u32;
                 enc.set_bytes(2, 4, &rl as *const u32 as *const _);
                 enc.set_bytes(3, 4, &nr as *const u32 as *const _);
                 enc.set_bytes(4, 4, &cfg.rms_norm_eps as *const f32 as *const _);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                // One threadgroup per row in batched mode, one for single-row mode.
+                enc.dispatch_thread_groups(MTLSize::new(nr as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
-            // Logits: GEMV on last token
-            self.dispatch_gemm(
-                enc,
-                &self.session.activations.hidden,
-                last_off,
-                &self.engine.embed_tokens_q8,
-                &self.session.activations.logits,
-                0,
-                1,
-                cfg.vocab_size as u32,
-                hidden as u32,
-            );
 
-            // Append top-k in the same encoder when compact mode is active.
-            let topk_which = if self.session.compact_topk > 0 {
+            // lm_head — GEMV (last only) or GEMM (all n).
+            if let Some(ref pb) = ppl_buf {
+                self.dispatch_gemm(
+                    enc,
+                    &self.session.activations.hidden,
+                    0,
+                    &self.engine.embed_tokens_q8,
+                    pb,
+                    0,
+                    n as u32,
+                    cfg.vocab_size as u32,
+                    hidden as u32,
+                );
+            } else {
+                self.dispatch_gemm(
+                    enc,
+                    &self.session.activations.hidden,
+                    last_off,
+                    &self.engine.embed_tokens_q8,
+                    &self.session.activations.logits,
+                    0,
+                    1,
+                    cfg.vocab_size as u32,
+                    hidden as u32,
+                );
+            }
+
+            // Append top-k in the same encoder when compact mode is active (last-token only).
+            let topk_which = if !all_positions && self.session.compact_topk > 0 {
                 let k = self.session.compact_topk as u32;
                 Some(self.dispatch_topk_enc(enc, cfg.vocab_size as u32, k))
             } else {
@@ -6932,14 +7022,17 @@ kernel void moe_shared_gate_add(
             cmd.commit();
             cmd.wait_until_completed();
 
-            if self.session.mtp.is_some() {
+            if !all_positions && self.session.mtp.is_some() {
                 // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
                 self.session.last_pre_final_hidden =
                     unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
             }
             self.session.kv_cache.seq_len = n;
 
-            if let Some(which) = topk_which {
+            if let Some(pb) = ppl_buf {
+                // SAFETY: GPU completed, ppl_buf is StorageModeShared and sized n*vocab.
+                unsafe { read_buffer(&pb, n * cfg.vocab_size) }
+            } else if let Some(which) = topk_which {
                 // SAFETY: GPU completed, buffers are StorageModeShared.
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
@@ -10989,11 +11082,12 @@ kernel void moe_shared_gate_add(
             let tensor = load_q4_file(path)
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
             let n_blocks = tensor.blocks.len();
-            // Re-serialise the blocks into raw bytes (18 bytes each, Q4Block is #[repr(C)]).
-            // SAFETY: Q4Block is #[repr(C)] size 18, alignment 2 (from leading
+            // Re-serialise the blocks into raw bytes (20 bytes each, Q4Block is
+            // #[repr(C)] with scale + bias + 16 packed nibbles).
+            // SAFETY: Q4Block is #[repr(C)] size 20, alignment 2 (from leading
             // `scale: u16`); byte-cast is valid because target element type is u8.
             let raw: Vec<u8> = unsafe {
-                std::slice::from_raw_parts(tensor.blocks.as_ptr().cast::<u8>(), n_blocks * 18)
+                std::slice::from_raw_parts(tensor.blocks.as_ptr().cast::<u8>(), n_blocks * 20)
                     .to_vec()
             };
             Ok((raw, tensor.original_len))
@@ -11964,20 +12058,21 @@ kernel void moe_shared_gate_add(
                 )));
             }
 
+            // Single batch prefill producing logits at all n positions, then
+            // pick out the n-1 next-token NLLs. Same code path as production
+            // decode prefill (forward_prefill) — extended to emit per-position
+            // lm_head outputs via dispatch_gemm with m=n instead of m=1.
+            // Sequential forward_step from pos=0 with reset_state does NOT
+            // produce usable next-token distributions and is not used here.
             self.reset_state();
-
+            let flat = self.forward_prefill_all_logits(tokens);
+            debug_assert_eq!(flat.len(), tokens.len() * vocab_size);
             let mut nlls = Vec::with_capacity(tokens.len() - 1);
-            for (pos, &token_id) in tokens.iter().enumerate() {
-                let logits = self.forward_step(token_id, pos);
-                if pos + 1 < tokens.len() {
-                    let next = tokens[pos + 1] as usize;
-                    nlls.push(crate::model::qwen35::log_softmax_nll(
-                        &logits[..vocab_size],
-                        next,
-                    ));
-                }
+            for i in 0..tokens.len() - 1 {
+                let logits = &flat[i * vocab_size..(i + 1) * vocab_size];
+                let target = tokens[i + 1] as usize;
+                nlls.push(crate::model::qwen35::log_softmax_nll(logits, target));
             }
-
             Ok(nlls)
         }
 

@@ -58,6 +58,11 @@ name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
 required-features = ["f16", "metal-gpu"]
 
+[[bin]]
+name = "bench_logit_dump"
+path = "src/bin/bench_logit_dump.rs"
+required-features = ["f16", "metal-gpu"]
+
 [[example]]
 name = "bench_metal"
 required-features = ["f16", "metal-gpu"]

@@ -53,12 +53,15 @@
 pub struct Q4Block {
     /// f16 bit pattern for the per-block scale — 2 bytes.
     pub scale: u16,
+    /// f16 bit pattern for the per-block minimum (bias) — 2 bytes.
+    /// Dequantization: `weight = nibble * scale + bias`.
+    pub bias: u16,
     /// 32 nibbles packed as 16 bytes in sequential-pairs layout.
     pub packed: [u8; 16],
 }
 
-// Compile-time size assertion — must be exactly 18 bytes (2 + 16, no padding).
-const _: () = assert!(std::mem::size_of::<Q4Block>() == 18);
+// Compile-time size assertion — must be exactly 20 bytes (2 + 2 + 16, no padding).
+const _: () = assert!(std::mem::size_of::<Q4Block>() == 20);
 
 /// A Q4_0 quantized tensor.
 ///
@@ -218,25 +221,53 @@ fn bf16_to_f32(v: u16) -> f32 {
 /// Nibble layout: sequential pairs — `byte[b] = (q[2b+1] << 4) | q[2b]`.
 #[inline]
 fn quantize_block(vals: &[f32; 32]) -> Q4Block {
-    let abs_max = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-    let scale = if abs_max == 0.0 {
-        1.0f32
+    quantize_block_with_mode(vals, false)
+}
+
+/// Quantize one block; symmetric mode is optimal for Hadamard-rotated weights
+/// (which are zero-mean by construction), asymmetric is optimal for raw weights
+/// with non-zero distributional center. Both modes share the same on-disk
+/// format: `dequant = nibble * scale + bias`. Symmetric mode sets
+/// `bias = -8 * scale` so that nibble=8 maps to exactly 0.
+#[inline]
+pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4Block {
+    if symmetric {
+        let abs_max = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let scale = if abs_max == 0.0 {
+            1.0f32
+        } else {
+            abs_max / 7.0
+        };
+        let inv_scale = 1.0 / scale;
+        let bias = -8.0 * scale;
+        let mut packed = [0u8; 16];
+        for b in 0..16 {
+            let q0 = ((vals[2 * b] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
+            let q1 = ((vals[2 * b + 1] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
+            packed[b] = (q1 << 4) | (q0 & 0x0f);
+        }
+        Q4Block {
+            scale: q4_f32_to_f16(scale),
+            bias: q4_f32_to_f16(bias),
+            packed,
+        }
     } else {
-        abs_max / 7.0
-    };
-    let inv_scale = 1.0 / scale;
-
-    let mut packed = [0u8; 16];
-    for b in 0..16 {
-        let q0 = ((vals[2 * b] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
-        let q1 = ((vals[2 * b + 1] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
-        // Sequential-pairs: low nibble = even-indexed weight, high nibble = odd-indexed weight.
-        packed[b] = (q1 << 4) | (q0 & 0x0f);
-    }
-
-    Q4Block {
-        scale: q4_f32_to_f16(scale),
-        packed,
+        let min_val = vals.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_val = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
+        let inv_scale = 1.0 / scale;
+        let mut packed = [0u8; 16];
+        for b in 0..16 {
+            let q0 = (((vals[2 * b] - min_val) * inv_scale).round()).clamp(0.0, 15.0) as u8;
+            let q1 = (((vals[2 * b + 1] - min_val) * inv_scale).round()).clamp(0.0, 15.0) as u8;
+            packed[b] = (q1 << 4) | (q0 & 0x0f);
+        }
+        Q4Block {
+            scale: q4_f32_to_f16(scale),
+            bias: q4_f32_to_f16(min_val),
+            packed,
+        }
     }
 }
 
@@ -252,17 +283,17 @@ fn quantize_block(vals: &[f32; 32]) -> Q4Block {
 /// Returns raw bytes containing tightly-packed [`Q4Block`]s (18 bytes each).
 pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
     let n_blocks = src.len().div_ceil(32);
-    let mut out = Vec::with_capacity(n_blocks * 18);
+    let mut out = Vec::with_capacity(n_blocks * 20);
     for chunk in src.chunks(32) {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
         let block = quantize_block(&vals);
-        // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+        // SAFETY: Q4Block is #[repr(C)] with size 20; its alignment is 2 (the
         // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
-        // rule). Casting to `&[u8; 18]` is valid because the target element type
+        // rule). Casting to `&[u8; 20]` is valid because the target element type
         // is `u8` (alignment 1 ≤ source alignment 2) and the source byte length
         // matches the destination length exactly.
-        let bytes: &[u8; 18] = unsafe { &*std::ptr::from_ref(&block).cast() };
+        let bytes: &[u8; 20] = unsafe { &*std::ptr::from_ref(&block).cast() };
         out.extend_from_slice(bytes);
     }
     out
@@ -272,21 +303,21 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
 ///
 /// `data` must be a multiple of 18 bytes (one block per 18 bytes).
 /// Returns exactly `n_weights` values; the caller is responsible for ensuring
-/// `n_weights <= (data.len() / 18) * 32`.
+/// `n_weights <= (data.len() / 20) * 32`.
 pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
     assert_eq!(
-        data.len() % 18,
+        data.len() % 20,
         0,
-        "data length must be a multiple of 18 (Q4Block size)"
+        "data length must be a multiple of 20 (Q4Block size with bias)"
     );
     let mut out = Vec::with_capacity(n_weights);
-    for chunk in data.chunks_exact(18) {
-        let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
-        let scale = q4_f16_to_f32(scale_bits);
+    for chunk in data.chunks_exact(20) {
+        let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
+        let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
         for b in 0..16 {
-            let byte_val = chunk[2 + b];
-            out.push(((byte_val & 0x0f) as f32 - 8.0) * scale);
-            out.push(((byte_val >> 4) as f32 - 8.0) * scale);
+            let byte_val = chunk[4 + b];
+            out.push((byte_val & 0x0f) as f32 * scale + bias);
+            out.push((byte_val >> 4) as f32 * scale + bias);
         }
     }
     out.truncate(n_weights);
@@ -304,7 +335,7 @@ pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
         "src length does not match rows * cols"
     );
     let blocks_per_row = cols.div_ceil(32);
-    let mut out = Vec::with_capacity(rows * blocks_per_row * 18);
+    let mut out = Vec::with_capacity(rows * blocks_per_row * 20);
     for row_idx in 0..rows {
         let row = &src[row_idx * cols..(row_idx + 1) * cols];
         out.extend_from_slice(&quantize_row_q4_0(row));
@@ -425,6 +456,17 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
 ///
 /// Panics if `shape.iter().product()` does not equal `data.len()`.
 pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
+    quantize_f64_to_q4_mode(data, shape, true) // symmetric — QuaRot-rotated weights are zero-mean
+}
+
+/// Quantize an `f64` tensor with explicit symmetry mode.
+///
+/// `symmetric=true` is required for Hadamard-rotated tensors (the rotation
+/// makes them zero-mean, and asymmetric encoding wastes bits on a bias that
+/// is approximately zero anyway, producing a 0.067·abs_max error on the zero
+/// representation). Use `false` for raw weights with non-zero distributional
+/// center.
+pub fn quantize_f64_to_q4_mode(data: &[f64], shape: &[usize], symmetric: bool) -> Q4Tensor {
     assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
@@ -435,7 +477,7 @@ pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = v as f32;
         }
-        blocks.push(quantize_block(&vals));
+        blocks.push(quantize_block_with_mode(&vals, symmetric));
     }
 
     Q4Tensor {
@@ -452,10 +494,11 @@ pub fn dequantize_q4_to_f32(tensor: &Q4Tensor) -> Vec<f32> {
     let mut out = Vec::with_capacity(tensor.original_len);
     for block in &tensor.blocks {
         let scale = q4_f16_to_f32(block.scale);
+        let bias = q4_f16_to_f32(block.bias);
         for b in 0..16 {
             let byte_val = block.packed[b];
-            out.push(((byte_val & 0x0f) as f32 - 8.0) * scale);
-            out.push(((byte_val >> 4) as f32 - 8.0) * scale);
+            out.push((byte_val & 0x0f) as f32 * scale + bias);
+            out.push((byte_val >> 4) as f32 * scale + bias);
         }
     }
     out.truncate(tensor.original_len);
@@ -512,7 +555,7 @@ pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Resul
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
     f.write_all(b"KHQ4")?;
-    f.write_all(&1u32.to_le_bytes())?;
+    f.write_all(&2u32.to_le_bytes())?;
     f.write_all(&(tensor.shape.len() as u32).to_le_bytes())?;
     for &dim in &tensor.shape {
         f.write_all(&(dim as u64).to_le_bytes())?;
@@ -522,11 +565,11 @@ pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Resul
     // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
     // rule). Casting to a `&[u8]` is valid because the target element type is
     // `u8` (alignment 1 ≤ source alignment 2). The resulting slice has length
-    // `blocks.len() * 18` matching the source contiguous storage.
+    // `blocks.len() * 20` matching the source contiguous storage.
     let block_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             tensor.blocks.as_ptr().cast::<u8>(),
-            tensor.blocks.len() * 18,
+            tensor.blocks.len() * 20,
         )
     };
     f.write_all(block_bytes)
@@ -561,8 +604,12 @@ pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std:
 
     let mut b4 = [0u8; 4];
     f.read_exact(&mut b4)?;
-    if u32::from_le_bytes(b4) != 1 {
-        return Err("unsupported .q4 file version".into());
+    let ver = u32::from_le_bytes(b4);
+    if ver == 1 {
+        return Err("legacy .q4 file (v1 symmetric format) — re-quantize with current quantize_q4 to produce v2 asymmetric blocks".into());
+    }
+    if ver != 2 {
+        return Err(format!("unsupported .q4 file version: {ver}").into());
     }
 
     f.read_exact(&mut b4)?;
@@ -604,8 +651,12 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 
     let mut b4 = [0u8; 4];
     f.read_exact(&mut b4)?;
-    if u32::from_le_bytes(b4) != 1 {
-        return Err("unsupported .q4 file version".into());
+    let ver = u32::from_le_bytes(b4);
+    if ver == 1 {
+        return Err("legacy .q4 file (v1 symmetric format) — re-quantize with current quantize_q4 to produce v2 asymmetric blocks".into());
+    }
+    if ver != 2 {
+        return Err(format!("unsupported .q4 file version: {ver}").into());
     }
 
     f.read_exact(&mut b4)?;
@@ -621,14 +672,15 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
     let original_len = u64::from_le_bytes(b8) as usize;
     let n_blocks = original_len.div_ceil(32);
 
-    let mut raw = vec![0u8; n_blocks * 18];
+    let mut raw = vec![0u8; n_blocks * 20];
     f.read_exact(&mut raw)?;
 
     let blocks: Vec<Q4Block> = raw
-        .chunks_exact(18)
+        .chunks_exact(20)
         .map(|c| Q4Block {
             scale: u16::from_ne_bytes([c[0], c[1]]),
-            packed: c[2..18].try_into().expect("slice is exactly 16 bytes"),
+            bias: u16::from_ne_bytes([c[2], c[3]]),
+            packed: c[4..20].try_into().expect("slice is exactly 16 bytes"),
         })
         .collect();
 
@@ -712,20 +764,21 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // Test 1: Q4Block is exactly 18 bytes with no padding after scale.
+    // Test 1: Q4Block is exactly 20 bytes (scale + bias + 16 nibble bytes).
     // -----------------------------------------------------------------------
     #[test]
     fn test_q4_block_size() {
-        assert_eq!(std::mem::size_of::<Q4Block>(), 18);
+        assert_eq!(std::mem::size_of::<Q4Block>(), 20);
         let b = Q4Block {
             scale: 0,
+            bias: 0,
             packed: [0u8; 16],
         };
         let base = std::ptr::from_ref(&b) as usize;
         let packed_off = std::ptr::from_ref(&b.packed) as usize - base;
         assert_eq!(
-            packed_off, 2,
-            "packed field must start at byte offset 2 (no padding after scale)"
+            packed_off, 4,
+            "packed field must start at byte offset 4 (after scale + bias, no padding)"
         );
     }
 
@@ -781,29 +834,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 5: Values at ±max_abs are quantized to nibble 15 / nibble 1.
+    // Test 5: max/min values map to nibbles 15/0 under asymmetric quantization.
     // -----------------------------------------------------------------------
     #[test]
     fn test_quantize_max_range() {
-        // Block with w[0] = 7.0 (max, nibble 15) and w[1] = -7.0 (min, nibble 1), rest 0.
+        // Block with w[0] = 7.0 (max, nibble 15) and w[1] = -7.0 (min, nibble 0), rest 0.
         let mut src = vec![0.0f32; 32];
         src[0] = 7.0;
         src[1] = -7.0;
         let data = quantize_row_q4_0(&src);
-        // scale = 7.0 / 7 = 1.0
-        // q[0] = round(7.0/1.0) + 8 = 15 → low nibble of byte[0]
-        // q[1] = round(-7.0/1.0) + 8 = 1  → high nibble of byte[0]
-        // byte[0] = (1 << 4) | 15 = 0x1F
-        let block_byte0 = data[2]; // bytes 0..2 = scale u16, byte 2 = packed[0]
+        // Asymmetric: min=-7, max=7, scale = 14/15 ≈ 0.933
+        // q[0] = round((7.0 - (-7.0)) / scale) = round(15) = 15 → low nibble
+        // q[1] = round((-7.0 - (-7.0)) / scale) = round(0)  = 0  → high nibble
+        // byte[0] = (0 << 4) | 15 = 0x0F.
+        // Block layout: bytes 0..2 = scale, bytes 2..4 = bias, byte 4 = packed[0].
+        let block_byte0 = data[4];
         assert_eq!(
             block_byte0 & 0x0f,
             15,
-            "w[0]=7.0 should produce low nibble 15"
+            "w[0]=7.0 (max) should produce low nibble 15"
         );
         assert_eq!(
             block_byte0 >> 4,
-            1,
-            "w[1]=-7.0 should produce high nibble 1"
+            0,
+            "w[1]=-7.0 (min) should produce high nibble 0"
         );
     }
 
@@ -816,7 +870,7 @@ mod tests {
         // Use values in [-7, 7] so scale = 7/7 = 1.0 and max quantization error = 0.5.
         let src: Vec<f32> = (0..32).map(|i| (i as f32 / 31.0) * 14.0 - 7.0).collect();
         let data = quantize_row_q4_0(&src);
-        assert_eq!(data.len(), 18, "single block must be 18 bytes");
+        assert_eq!(data.len(), 20, "single block must be 20 bytes");
         let out = dequantize_row_q4_0(&data, 32);
         assert_eq!(out.len(), 32);
         // With scale = 1.0 the max quantization error is 0.5 (half a step).
@@ -839,7 +893,7 @@ mod tests {
     fn test_quantize_multiple_blocks() {
         let src: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) / 10.0).collect();
         let data = quantize_row_q4_0(&src);
-        assert_eq!(data.len(), 4 * 18, "4 blocks must be 72 bytes");
+        assert_eq!(data.len(), 4 * 20, "4 blocks must be 80 bytes");
         let out = dequantize_row_q4_0(&data, 128);
         assert_eq!(out.len(), 128);
         let max_err = src
@@ -914,33 +968,34 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_nibble_packing_order() {
-        // Block: w[0]=0.0, w[1]=7.0, rest 0.0
-        // abs_max = 7.0, scale = 1.0
-        // q[0] = round(0.0/1.0) + 8 = 8  → nibble 0x8
-        // q[1] = round(7.0/1.0) + 8 = 15 → nibble 0xF
-        // byte[0] = (0xF << 4) | (0x8 & 0x0F) = 0xF8
+        // Asymmetric block: w[0]=0.0, w[1]=7.0, rest 0.0.
+        // min = 0, max = 7, scale = 7/15 ≈ 0.467, bias = 0.
+        // q[0] = round((0-0)/scale) = 0  → low nibble 0
+        // q[1] = round((7-0)/scale) = 15 → high nibble 15
+        // byte[0] = (15 << 4) | 0 = 0xF0.
+        // Layout: bytes 0..2 = scale, 2..4 = bias, 4 = packed[0].
         let mut src = vec![0.0f32; 32];
         src[0] = 0.0;
         src[1] = 7.0;
         let data = quantize_row_q4_0(&src);
-        let byte0 = data[2]; // packed[0] starts at offset 2 (after scale u16)
+        let byte0 = data[4];
         assert_eq!(
-            byte0, 0xF8,
-            "byte[0] should be 0xF8 for w[0]=0.0 (nibble=8), w[1]=7.0 (nibble=15)"
+            byte0, 0xF0,
+            "byte[0] should be 0xF0 for w[0]=0.0 (nibble=0), w[1]=7.0 (nibble=15)"
         );
 
-        // Verify dequant matches sequential pairs convention
-        // low nibble → weight[0]: (0x8 - 8) * 1.0 = 0.0
-        // high nibble → weight[1]: (0xF - 8) * 1.0 = 7.0
+        // Dequant: nibble * scale + bias.
         let out = dequantize_row_q4_0(&data, 32);
+        // weight[0] = 0 * 0.467 + 0 = 0 (exact)
         assert!(
-            (out[0] - 0.0).abs() < 1e-6,
-            "weight[0] should be 0.0, got {}",
+            (out[0] - 0.0).abs() < 1e-3,
+            "weight[0] should be ~0.0, got {}",
             out[0]
         );
+        // weight[1] = 15 * scale + bias. With f16 scale rounding, ~7.0 ± 1 ULP.
         assert!(
-            (out[1] - 7.0).abs() < 1e-6,
-            "weight[1] should be 7.0, got {}",
+            (out[1] - 7.0).abs() < 0.05,
+            "weight[1] should be ~7.0, got {}",
             out[1]
         );
     }
@@ -959,14 +1014,14 @@ mod tests {
         let blocks_per_row = cols.div_ceil(32); // 2 blocks per row of 64 cols
         assert_eq!(
             data.len(),
-            rows * blocks_per_row * 18,
+            rows * blocks_per_row * 20,
             "tensor bytes mismatch"
         );
 
         // Dequant each row and check roundtrip error.
         for row_idx in 0..rows {
             let row_bytes =
-                &data[row_idx * blocks_per_row * 18..(row_idx + 1) * blocks_per_row * 18];
+                &data[row_idx * blocks_per_row * 20..(row_idx + 1) * blocks_per_row * 20];
             let out = dequantize_row_q4_0(row_bytes, cols);
             let row_src = &src[row_idx * cols..(row_idx + 1) * cols];
             let max_err = row_src
@@ -1029,7 +1084,8 @@ mod tests {
 
     #[test]
     fn test_nibble_packing_byte_value_bf16() {
-        // w[0]=0.0, w[1]=7.0 → scale=1.0 → byte[0] = 0xF8
+        // Asymmetric: w[0]=0.0, w[1]=7.0, rest 0.0
+        // min=0, max=7, scale=7/15, bias=0. q[0]=0 (low), q[1]=15 (high). byte[0]=0xF0.
         let mut f32_vals = [0.0f32; 32];
         f32_vals[0] = 0.0;
         f32_vals[1] = 7.0;
@@ -1037,8 +1093,8 @@ mod tests {
         let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]);
         assert_eq!(tensor.blocks.len(), 1);
         assert_eq!(
-            tensor.blocks[0].packed[0], 0xF8,
-            "byte[0] should be 0xF8 for w[0]=0.0, w[1]=7.0 with scale=1.0"
+            tensor.blocks[0].packed[0], 0xF0,
+            "byte[0] should be 0xF0 for w[0]=0.0 (nibble 0), w[1]=7.0 (nibble 15)"
         );
     }
 
@@ -1203,16 +1259,17 @@ mod tests {
 
     #[test]
     fn quantize_f64_to_q4_matches_f32_path_after_downcast() {
-        // The f64 wrapper must agree byte-for-byte with the f32 entry after the
-        // caller does the downcast explicitly. This locks down the contract
-        // that the f64 path is a thin convenience wrapper, not a different
-        // quantization recipe.
+        // The f64 wrapper must agree byte-for-byte with the f32 entry under
+        // the same symmetry mode. `quantize_f64_to_q4` defaults to symmetric
+        // (Hadamard-rotated weights are zero-mean); the unrotated `quantize_
+        // f32_to_q4` defaults to asymmetric. Both should produce identical
+        // output when called with the same mode flag.
         let src_f64: Vec<f64> = synthetic_f32_uniform(256, 23)
             .into_iter()
             .map(f64::from)
             .collect();
         let src_f32: Vec<f32> = src_f64.iter().map(|&v| v as f32).collect();
-        let q_f64 = quantize_f64_to_q4(&src_f64, &[256]);
+        let q_f64 = quantize_f64_to_q4_mode(&src_f64, &[256], false);
         let q_f32 = quantize_f32_to_q4(&src_f32, &[256]);
         assert_eq!(q_f64.shape, q_f32.shape);
         assert_eq!(q_f64.original_len, q_f32.original_len);
@@ -1223,6 +1280,7 @@ mod tests {
         );
         for (i, (a, b)) in q_f64.blocks.iter().zip(q_f32.blocks.iter()).enumerate() {
             assert_eq!(a.scale, b.scale, "block {i} scale mismatch");
+            assert_eq!(a.bias, b.bias, "block {i} bias mismatch");
             assert_eq!(a.packed, b.packed, "block {i} packed mismatch");
         }
     }
@@ -1346,11 +1404,11 @@ mod tests {
         let src = synthetic_f32_uniform(128, 37);
         let q = quantize_f32_to_q4(&src, &[128]);
         let row_bytes = quantize_row_q4_0(&src);
-        assert_eq!(row_bytes.len(), q.blocks.len() * 18);
-        // SAFETY: Q4Block is #[repr(C)] size 18, alignment 2 (from leading
-        // `scale: u16`); byte-cast is valid because target element type is u8.
+        assert_eq!(row_bytes.len(), q.blocks.len() * 20);
+        // SAFETY: Q4Block is #[repr(C)] size 20 (scale + bias + 16 nibbles),
+        // alignment 2; byte-cast is valid because target element type is u8.
         let q_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(q.blocks.as_ptr().cast::<u8>(), q.blocks.len() * 18)
+            std::slice::from_raw_parts(q.blocks.as_ptr().cast::<u8>(), q.blocks.len() * 20)
         };
         assert_eq!(q_bytes, row_bytes.as_slice());
     }

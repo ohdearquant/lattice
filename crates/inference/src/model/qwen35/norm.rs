@@ -1,5 +1,7 @@
-/// Qwen3.5 uses a shifted RMSNorm where gamma is offset by 1.0.
-/// This is different from standard RMSNorm (used by Qwen3/Llama) which uses plain gamma.
+/// Qwen3.5 uses a shifted RMSNorm: `x * rsqrt(mean(x²) + eps) * (1 + gamma)`.
+/// Empirically verified by PPL — plain `gamma` (the standard convention used
+/// by Qwen3/Llama and MLX `nn.RMSNorm`) produces nonsense logits on this
+/// model. MLX must absorb the +1 into weights at load time.
 pub(crate) fn qwen35_rms_norm(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
     let num_tokens = x.len() / hidden;
     debug_assert_eq!(x.len(), num_tokens * hidden);

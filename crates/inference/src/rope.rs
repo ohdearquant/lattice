@@ -45,6 +45,14 @@ impl RopeTable {
         }
     }
 
+    /// **Unstable**: row stride in the cos/sin tables — equals `head_dim / 2`.
+    /// Callers performing partial RoPE need this to compute the per-position
+    /// base offset correctly when the table is built for the full `head_dim`.
+    #[inline]
+    pub fn half_dim(&self) -> usize {
+        self.half_dim
+    }
+
     /// **Unstable**: raw cos accessor; exposed for testing only.
     #[inline]
     pub fn cos_at(&self, idx: usize) -> f32 {

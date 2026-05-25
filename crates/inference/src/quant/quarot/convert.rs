@@ -365,9 +365,9 @@ pub fn convert_quarot_qwen35(
                 ))
             })?;
             // Q4 file footprint: 4-byte magic + 4 version + 4 ndim +
-            // 8*ndim shape + 8 original_len + 18 bytes per block.
+            // 8*ndim shape + 8 original_len + 20 bytes per block (asymmetric).
             let header_bytes = (4 + 4 + 4 + 8 * entry.shape.len() + 8) as u64;
-            total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(18);
+            total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(20);
             planned_quantized += 1;
             index_entries.push(IndexEntry {
                 name: name.clone(),

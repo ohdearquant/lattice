@@ -49,6 +49,10 @@ impl Qwen35Model {
 
         let rope_dim = config.rope_dim();
         let rope_max = config.max_position_embeddings.min(8192);
+        // Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically
+        // verified by PPL regression when using head_dim. The partial-RoPE
+        // frequency spectrum is compressed into the first `rope_dim` dimensions
+        // rather than sliced from a head_dim-wide spectrum.
         let rope = RopeTable::new(rope_dim, rope_max, config.rope_theta);
 
         Ok(Self {
