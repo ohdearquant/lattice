@@ -7,7 +7,7 @@
 use crate::error::InferenceError;
 use crate::tokenizer::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, json_path, known_special_id, pad_ids,
-    parse_json, push_eos_preserving_limit,
+    parse_json, parse_post_processor_flags, push_eos_preserving_limit,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -140,6 +140,8 @@ struct ParsedSentencePieceModel {
     bos_id: Option<u32>,
     eos_id: Option<u32>,
     pad_id: Option<u32>,
+    add_bos: bool,
+    add_eos: bool,
     dummy_prefix: bool,
     remove_extra_whitespaces: bool,
     escape_whitespaces: bool,
@@ -153,6 +155,8 @@ impl Default for ParsedSentencePieceModel {
             bos_id: None,
             eos_id: None,
             pad_id: None,
+            add_bos: false,
+            add_eos: false,
             dummy_prefix: true,
             remove_extra_whitespaces: true,
             escape_whitespaces: true,
@@ -243,12 +247,15 @@ impl SentencePieceTokenizer {
         let eos_id = known_special_id(&vocab_map, &["<eos>", "</s>"]);
         let pad_id = known_special_id(&vocab_map, &["<pad>"]);
 
+        let pp = parse_post_processor_flags(&root);
         let model = ParsedSentencePieceModel {
             pieces,
             unk_id,
-            bos_id,
-            eos_id,
+            bos_id: bos_id.or(pp.bos_id),
+            eos_id: eos_id.or(pp.eos_id),
             pad_id,
+            add_bos: pp.add_bos,
+            add_eos: pp.add_eos,
             dummy_prefix: true,
             remove_extra_whitespaces: true,
             escape_whitespaces: true,
@@ -306,8 +313,8 @@ impl SentencePieceTokenizer {
             pad_id,
             bos_id: model.bos_id,
             eos_id: model.eos_id,
-            add_bos: false,
-            add_eos: false,
+            add_bos: model.add_bos,
+            add_eos: model.add_eos,
             max_seq_len,
             dummy_prefix: model.dummy_prefix,
             remove_extra_whitespaces: model.remove_extra_whitespaces,
@@ -334,6 +341,8 @@ impl SentencePieceTokenizer {
                 bos_id: None,
                 eos_id: None,
                 pad_id: Some(unk_id),
+                add_bos: false,
+                add_eos: false,
                 dummy_prefix: true,
                 remove_extra_whitespaces: true,
                 escape_whitespaces: true,

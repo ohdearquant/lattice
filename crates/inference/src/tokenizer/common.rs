@@ -753,6 +753,86 @@ pub(crate) fn known_special_id(vocab: &HashMap<String, u32>, names: &[&str]) -> 
     names.iter().find_map(|name| vocab.get(*name).copied())
 }
 
+pub(crate) struct PostProcessorFlags {
+    pub add_bos: bool,
+    pub add_eos: bool,
+    pub bos_id: Option<u32>,
+    pub eos_id: Option<u32>,
+}
+
+pub(crate) fn parse_post_processor_flags(root: &JsonValue) -> PostProcessorFlags {
+    let default = PostProcessorFlags {
+        add_bos: false,
+        add_eos: false,
+        bos_id: None,
+        eos_id: None,
+    };
+
+    let Some(pp) = root.get("post_processor") else {
+        return default;
+    };
+
+    let Some(template) = find_template_processing(pp) else {
+        return default;
+    };
+
+    let Some(single) = template.get("single").and_then(JsonValue::as_array) else {
+        return default;
+    };
+
+    let special_tokens = template.get("special_tokens");
+    let mut add_bos = false;
+    let mut add_eos = false;
+    let mut bos_id = None;
+    let mut eos_id = None;
+    let mut seen_sequence = false;
+
+    for item in single {
+        if let Some(st) = item.get("SpecialToken") {
+            let token_name = st.get("id").and_then(JsonValue::as_str);
+            if !seen_sequence {
+                add_bos = true;
+                if let Some(name) = token_name {
+                    bos_id = resolve_template_token_id(special_tokens, name);
+                }
+            } else {
+                add_eos = true;
+                if let Some(name) = token_name {
+                    eos_id = resolve_template_token_id(special_tokens, name);
+                }
+            }
+        } else if item.get("Sequence").is_some() {
+            seen_sequence = true;
+        }
+    }
+
+    PostProcessorFlags {
+        add_bos,
+        add_eos,
+        bos_id,
+        eos_id,
+    }
+}
+
+fn find_template_processing(pp: &JsonValue) -> Option<&JsonValue> {
+    let pp_type = pp.get("type")?.as_str()?;
+    match pp_type {
+        "TemplateProcessing" => Some(pp),
+        "Sequence" => {
+            let processors = pp.get("processors")?.as_array()?;
+            processors
+                .iter()
+                .find(|p| p.get("type").and_then(JsonValue::as_str) == Some("TemplateProcessing"))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_template_token_id(special_tokens: Option<&JsonValue>, name: &str) -> Option<u32> {
+    let ids = special_tokens?.get(name)?.get("ids")?.as_array()?;
+    ids.first()?.as_u64().map(|v| v as u32)
+}
+
 /// **Unstable**: internal LRU cache used by tokenizer implementations;
 /// not part of the public embedding API.
 ///
