@@ -68,6 +68,7 @@ pub use crate::error::InferenceError;
 pub use crate::model::{
     BertConfig, BertModel, CrossEncoderModel, LayerTimings, ProfileTimings, QwenConfig, QwenModel,
 };
+pub use crate::pool::BertPooling;
 pub use crate::tokenizer::{
     BpeTokenizer, SentencePieceTokenizer, TokenizedInput, Tokenizer, WordPieceTokenizer,
     load_tokenizer,
