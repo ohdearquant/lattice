@@ -1,6 +1,7 @@
 //! Tests for embedding services.
 
 use super::*;
+use crate::model::EmbeddingModel;
 
 #[test]
 fn test_max_batch_size_constant() {
@@ -198,4 +199,91 @@ mod native_tests {
             "error should mention the model mismatch, got: {err}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Role-aware prompt tests (P0-E2)
+// ---------------------------------------------------------------------------
+
+/// E5 query_instruction returns "query: ", document_instruction returns "passage: ".
+#[test]
+fn test_e5_query_instruction() {
+    assert_eq!(
+        EmbeddingModel::MultilingualE5Small.query_instruction(),
+        Some("query: "),
+        "E5 small must return 'query: ' prefix"
+    );
+    assert_eq!(
+        EmbeddingModel::MultilingualE5Base.query_instruction(),
+        Some("query: "),
+        "E5 base must return 'query: ' prefix"
+    );
+}
+
+/// E5 document_instruction returns "passage: " (P0-E2 fix — was None before).
+#[test]
+fn test_e5_document_instruction() {
+    assert_eq!(
+        EmbeddingModel::MultilingualE5Small.document_instruction(),
+        Some("passage: "),
+        "E5 small must return 'passage: ' document prefix"
+    );
+    assert_eq!(
+        EmbeddingModel::MultilingualE5Base.document_instruction(),
+        Some("passage: "),
+        "E5 base must return 'passage: ' document prefix"
+    );
+}
+
+/// BGE and MiniLM models must NOT have document_instruction (they use raw text).
+#[test]
+fn test_bge_minilm_no_document_instruction() {
+    assert_eq!(
+        EmbeddingModel::BgeSmallEnV15.document_instruction(),
+        None,
+        "BGE small must not have document prefix"
+    );
+    assert_eq!(EmbeddingModel::BgeBaseEnV15.document_instruction(), None);
+    assert_eq!(EmbeddingModel::BgeLargeEnV15.document_instruction(), None);
+    assert_eq!(EmbeddingModel::AllMiniLmL6V2.document_instruction(), None);
+    assert_eq!(
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2.document_instruction(),
+        None
+    );
+}
+
+/// Qwen document_instruction returns None (raw passage, instruction only for queries).
+#[test]
+fn test_qwen_no_document_instruction() {
+    assert_eq!(
+        EmbeddingModel::Qwen3Embedding0_6B.document_instruction(),
+        None,
+        "Qwen document side uses raw text"
+    );
+}
+
+/// apply_prefix prepends the prefix when Some, returns clone when None.
+#[test]
+fn test_apply_prefix_some() {
+    let texts = vec!["hello".to_string(), "world".to_string()];
+    let result = apply_prefix(&texts, Some("query: "));
+    assert_eq!(result, vec!["query: hello", "query: world"]);
+}
+
+#[test]
+fn test_apply_prefix_none() {
+    let texts = vec!["hello".to_string()];
+    let result = apply_prefix(&texts, None);
+    assert_eq!(result, texts);
+}
+
+/// EmbeddingRole cache tags are distinct strings.
+#[test]
+fn test_embedding_role_cache_tags_distinct() {
+    let q = EmbeddingRole::Query.cache_tag();
+    let p = EmbeddingRole::Passage.cache_tag();
+    let g = EmbeddingRole::Generic.cache_tag();
+    assert_ne!(q, p);
+    assert_ne!(q, g);
+    assert_ne!(p, g);
 }
