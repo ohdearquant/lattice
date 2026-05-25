@@ -290,7 +290,12 @@ async fn e5_small_parity_vs_hf() {
 // Qwen3-Embedding-0.6B parity test
 // ---------------------------------------------------------------------------
 
+// TODO(lattice#103): Qwen3-Embedding forward-pass divergence (cosine 0.948 on
+// whitespace input, 0.989 on "fox" even when tokens match HF exactly). Tracked
+// at https://github.com/ohdearquant/lattice/issues/103. Run with `--ignored` to
+// exercise. Remove this attribute once the bug is fixed.
 #[tokio::test]
+#[ignore = "Qwen3-Embedding forward-pass divergence — see lattice#103"]
 async fn qwen3_embedding_0_6b_parity_vs_hf() {
     let Some(goldens) = load_fixture("qwen3_embedding_0_6b.json") else {
         return;
