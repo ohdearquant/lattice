@@ -10,7 +10,7 @@ pub use crate::tokenizer::common::{TokenizedInput, Tokenizer};
 use crate::error::InferenceError;
 use crate::tokenizer::common::{
     ThreadSafeLruCache, invert_vocab, json_object_to_vocab, json_path, pad_ids,
-    pad_ids_with_token_types, parse_json,
+    pad_ids_with_token_types, parse_added_tokens, parse_json,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -35,6 +35,8 @@ struct WordPieceInner {
     id_to_token: Vec<String>,
     whole_word_trie: Arc<DoubleArrayTrie>,
     continuation_trie: Arc<DoubleArrayTrie>,
+    added_tokens: HashMap<String, u32>,
+    added_tokens_sorted: Vec<String>,
     cls_id: u32,
     sep_id: u32,
     pad_id: u32,
@@ -295,7 +297,13 @@ impl WordPieceTokenizer {
             json_object_to_vocab(json_path(&root, &["model", "vocab"]).ok_or_else(|| {
                 InferenceError::Tokenizer("tokenizer.json missing model.vocab".into())
             })?)?;
-        Self::from_vocab_map(vocab, DEFAULT_WORDPIECE_CACHE_CAPACITY, DEFAULT_MAX_SEQ_LEN)
+        let added = parse_added_tokens(&root);
+        Self::from_vocab_map_with_added(
+            vocab,
+            added,
+            DEFAULT_WORDPIECE_CACHE_CAPACITY,
+            DEFAULT_MAX_SEQ_LEN,
+        )
     }
 
     /// **Unstable**: load from file with explicit cache capacity.
@@ -331,6 +339,15 @@ impl WordPieceTokenizer {
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
+        Self::from_vocab_map_with_added(vocab, HashMap::new(), cache_capacity, max_seq_len)
+    }
+
+    fn from_vocab_map_with_added(
+        vocab: HashMap<String, u32>,
+        added_tokens: HashMap<String, u32>,
+        cache_capacity: usize,
+        max_seq_len: usize,
+    ) -> Result<Self, InferenceError> {
         let id_to_token = invert_vocab(&vocab)?;
 
         let cls_id = *vocab
@@ -359,10 +376,15 @@ impl WordPieceTokenizer {
             }
         }
 
+        let mut added_tokens_sorted: Vec<String> = added_tokens.keys().cloned().collect();
+        added_tokens_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
         let inner = WordPieceInner {
             id_to_token,
             whole_word_trie: Arc::new(whole_builder.build()),
             continuation_trie: Arc::new(continuation_builder.build()),
+            added_tokens,
+            added_tokens_sorted,
             cls_id,
             sep_id,
             pad_id,
@@ -385,6 +407,8 @@ impl WordPieceTokenizer {
             id_to_token: self.inner.id_to_token.clone(),
             whole_word_trie: self.inner.whole_word_trie.clone(),
             continuation_trie: self.inner.continuation_trie.clone(),
+            added_tokens: self.inner.added_tokens.clone(),
+            added_tokens_sorted: self.inner.added_tokens_sorted.clone(),
             cls_id: self.inner.cls_id,
             sep_id: self.inner.sep_id,
             pad_id: self.inner.pad_id,
@@ -443,20 +467,24 @@ impl WordPieceTokenizer {
     fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch, out: &mut Vec<u32>) {
         out.clear();
         out.push(self.inner.cls_id);
-        pre_tokenize_into(text, &mut scratch.normalized, &mut scratch.words);
 
-        for word in &scratch.words {
-            if let Some(cached) = self.inner.cache.get(word) {
-                out.extend(cached.iter().copied());
-                continue;
+        if self.inner.added_tokens_sorted.is_empty() {
+            self.tokenize_wordpiece_payload_into(text, scratch, out);
+        } else {
+            let mut pos = 0;
+            while pos < text.len() {
+                if let Some((end, id)) = self.match_added_token(text, pos) {
+                    out.push(id);
+                    pos = end;
+                } else {
+                    let segment_start = pos;
+                    while pos < text.len() && self.match_added_token(text, pos).is_none() {
+                        let ch = text[pos..].chars().next().unwrap();
+                        pos += ch.len_utf8();
+                    }
+                    self.tokenize_wordpiece_payload_into(&text[segment_start..pos], scratch, out);
+                }
             }
-
-            scratch.piece_ids.clear();
-            self.wordpiece_tokenize_word_into(word, &mut scratch.piece_ids);
-            self.inner
-                .cache
-                .insert(word.clone(), scratch.piece_ids.clone());
-            out.extend(scratch.piece_ids.iter().copied());
         }
 
         out.push(self.inner.sep_id);
@@ -494,6 +522,18 @@ impl WordPieceTokenizer {
                 .insert(word.clone(), scratch.piece_ids.clone());
             out.extend(scratch.piece_ids.iter().copied());
         }
+    }
+
+    fn match_added_token(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
+        let tail = &text[pos..];
+        for token in &self.inner.added_tokens_sorted {
+            if tail.starts_with(token.as_str()) {
+                if let Some(&id) = self.inner.added_tokens.get(token) {
+                    return Some((pos + token.len(), id));
+                }
+            }
+        }
+        None
     }
 
     fn wordpiece_tokenize_word_into(&self, word: &str, out: &mut Vec<u32>) {
