@@ -122,6 +122,21 @@ fn bge_small_en_v15_wordpiece_parity() {
                     3643, 102,
                 ],
             },
+            // CJK + Hiragana/Katakana: voiced chars (で→て, etc.) must be
+            // stripped of their combining dakuten (U+3099) to match HF
+            // BertNormalizer strip_accents behaviour on NFD input.
+            Case {
+                input: "短い日本語のテストです。",
+                expected: &[
+                    101, 100, 1647, 1864, 1876, 1950, 1671, 30239, 30233, 30240, 30191, 30184,
+                    1636, 102,
+                ],
+            },
+            // Voiced hiragana only — every character has a dakuten: が→か, ぎ→き, etc.
+            Case {
+                input: "がぎぐげご",
+                expected: &[101, 1651, 30178, 30179, 30180, 30181, 102],
+            },
         ],
     );
 }
@@ -181,6 +196,17 @@ fn multilingual_e5_small_sentencepiece_parity() {
                     0, 3975, 696, 3355, 11, 33209, 5, 277, 64, 128405, 32, 944, 1294, 1369, 27494,
                     13, 2,
                 ],
+            },
+            // Whitespace regression cases — HF ref collected with AutoTokenizer
+            // (transformers==4.x) on 2026-05-25.  These cover the trailing-space bug
+            // where lattice used to emit an extra ▁ (token 6) before EOS.
+            Case {
+                input: "   leading whitespace and    multiple    spaces   ",
+                expected: &[0, 105207, 35011, 65421, 136, 48716, 32628, 7, 2],
+            },
+            Case {
+                input: "trailing space ",
+                expected: &[0, 141037, 214, 32628, 2],
             },
         ],
     );

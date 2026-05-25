@@ -80,14 +80,14 @@ mod cache;
 mod error;
 pub mod migration;
 mod model;
-mod service;
+pub mod service;
 pub mod simd;
 pub mod types;
 
 pub use cache::{CacheStats, DEFAULT_CACHE_CAPACITY, EmbeddingCache, ShardStats};
 pub use error::{EmbedError, Result};
 pub use model::{EmbeddingModel, MIN_MRL_OUTPUT_DIM, ModelConfig, ModelProvenance};
-pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_CHARS};
+pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
 pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]

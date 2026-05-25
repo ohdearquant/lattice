@@ -9,7 +9,7 @@ use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{add_bias, gelu, layer_norm, matmul_bt};
 use crate::lora_hook::{LoraHook, NoopLoraHook};
-use crate::pool::{l2_normalize, mean_pool};
+use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{BertWeights, SafetensorsFile};
 use std::fs;
@@ -113,6 +113,9 @@ pub struct BertModel {
     // See the struct-level doc comment for the full safety argument.
     weights: BertWeights<'static>,
     _safetensors: Box<SafetensorsFile>,
+    /// Pooling strategy used to reduce hidden states to a single embedding vector.
+    /// Defaults to `BertPooling::Mean` for backwards compatibility.
+    pooling: BertPooling,
 }
 
 impl BertModel {
@@ -166,6 +169,7 @@ impl BertModel {
             tokenizer,
             weights,
             _safetensors: safetensors,
+            pooling: BertPooling::default(),
         })
     }
 
@@ -191,6 +195,19 @@ impl BertModel {
         self.config.hidden_size
     }
 
+    /// **Stable** (provisional): set the pooling strategy.
+    ///
+    /// Must be called before any encoding.  The `NativeEmbeddingService` uses this to
+    /// route BGE models through CLS pooling and E5/MiniLM through mean pooling.
+    pub fn set_pooling(&mut self, pooling: BertPooling) {
+        self.pooling = pooling;
+    }
+
+    /// **Unstable**: pooling strategy accessor for testing.
+    pub fn pooling(&self) -> BertPooling {
+        self.pooling
+    }
+
     /// **Stable**: single-text encoding entry point; consumed by `lattice-embed`.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
         let input = self.tokenizer.tokenize(text);
@@ -210,12 +227,7 @@ impl BertModel {
             &mut buffers,
         );
 
-        let mut pooled = mean_pool(
-            &hidden_states,
-            &input.attention_mask[..seq_len],
-            seq_len,
-            self.config.hidden_size,
-        );
+        let mut pooled = self.pool(&hidden_states, &input.attention_mask[..seq_len], seq_len);
         l2_normalize(&mut pooled);
         Ok(pooled)
     }
@@ -250,17 +262,28 @@ impl BertModel {
                 seq_len,
                 &mut buffers,
             );
-            let mut pooled = mean_pool(
-                &hidden_states,
-                &input.attention_mask[..seq_len],
-                seq_len,
-                self.config.hidden_size,
-            );
+            let mut pooled = self.pool(&hidden_states, &input.attention_mask[..seq_len], seq_len);
             l2_normalize(&mut pooled);
             outputs.push(pooled);
         }
 
         Ok(outputs)
+    }
+
+    /// Apply the configured pooling strategy to `hidden_states`.
+    ///
+    /// Both `encode` and `encode_batch` delegate here so the pooling branch
+    /// is in one place.  L2 normalization is applied by the caller.
+    fn pool(&self, hidden_states: &[f32], attention_mask: &[u32], seq_len: usize) -> Vec<f32> {
+        match self.pooling {
+            BertPooling::Mean => mean_pool(
+                hidden_states,
+                attention_mask,
+                seq_len,
+                self.config.hidden_size,
+            ),
+            BertPooling::CLS => cls_pool(hidden_states, seq_len, self.config.hidden_size),
+        }
     }
 
     /// Forward pass for a pre-tokenized input; used by `CrossEncoderModel`.
@@ -567,6 +590,7 @@ fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::{cls_pool, l2_normalize, mean_pool};
     use approx::assert_relative_eq;
 
     #[test]
@@ -582,6 +606,132 @@ mod tests {
         assert_eq!(embedding.len(), model.dimensions());
         let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
         assert_relative_eq!(norm, 1.0, epsilon = 1e-4);
+    }
+
+    // -------------------------------------------------------------------------
+    // Deterministic pooling tests (P1-E3)
+    //
+    // These tests use fixed hidden-state tensors — no model weights needed.
+    // They validate the pooling routing at the kernel level: CLS extracts
+    // position 0, mean computes an attention-mask-weighted average, and L2
+    // normalisation produces a unit vector in both cases.
+    // -------------------------------------------------------------------------
+
+    /// Fixed 2-token, 4-dim hidden-state tensor.
+    ///
+    /// Token 0 (CLS):  [1.0, 0.0, 0.0, 0.0]
+    /// Token 1 (word): [0.0, 1.0, 0.0, 0.0]
+    /// Both tokens are real (attention_mask = [1, 1]).
+    fn hidden_2x4() -> (Vec<f32>, Vec<u32>) {
+        let hidden = vec![
+            1.0_f32, 0.0, 0.0, 0.0, // token 0 (CLS)
+            0.0_f32, 1.0, 0.0, 0.0, // token 1 (word)
+        ];
+        let mask = vec![1_u32, 1];
+        (hidden, mask)
+    }
+
+    /// CLS pooling returns the first-token hidden state ([1,0,0,0]), then L2 normalises.
+    ///
+    /// The CLS token is already unit-length here, so after L2 it stays [1,0,0,0].
+    /// This matches the BGE model-card recipe: `model_output[0][:, 0]` + L2.
+    #[test]
+    fn test_cls_pool_extracts_first_token_and_l2_unit_norm() {
+        let (hidden, _mask) = hidden_2x4();
+        let seq_len = 2;
+        let hidden_size = 4;
+
+        let mut pooled = cls_pool(&hidden, seq_len, hidden_size);
+
+        // Before L2: should be the CLS row [1,0,0,0].
+        assert_eq!(
+            pooled,
+            vec![1.0, 0.0, 0.0, 0.0],
+            "CLS row mismatch before L2"
+        );
+
+        l2_normalize(&mut pooled);
+
+        // CLS row is already unit-length → unchanged.
+        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert_relative_eq!(norm, 1.0, epsilon = 1e-6);
+        assert_relative_eq!(pooled[0], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(pooled[1], 0.0, epsilon = 1e-6);
+    }
+
+    /// Mean pooling with uniform mask averages all tokens, then L2 normalises.
+    ///
+    /// With hidden = [[1,0,0,0],[0,1,0,0]] and mask [1,1],
+    /// mean = [0.5, 0.5, 0, 0].  After L2: [1/√2, 1/√2, 0, 0] ≈ [0.7071, 0.7071, 0, 0].
+    ///
+    /// This matches the E5/MiniLM model-card recipe: masked mean pooling + L2.
+    #[test]
+    fn test_mean_pool_averages_masked_tokens_and_l2_unit_norm() {
+        let (hidden, mask) = hidden_2x4();
+        let seq_len = 2;
+        let hidden_size = 4;
+
+        let mut pooled = mean_pool(&hidden, &mask, seq_len, hidden_size);
+
+        // Before L2: mean of [1,0,0,0] and [0,1,0,0] = [0.5, 0.5, 0, 0].
+        assert_relative_eq!(pooled[0], 0.5, epsilon = 1e-6);
+        assert_relative_eq!(pooled[1], 0.5, epsilon = 1e-6);
+        assert_relative_eq!(pooled[2], 0.0, epsilon = 1e-6);
+        assert_relative_eq!(pooled[3], 0.0, epsilon = 1e-6);
+
+        l2_normalize(&mut pooled);
+
+        let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert_relative_eq!(norm, 1.0, epsilon = 1e-6);
+
+        // L2 of [0.5, 0.5, 0, 0]: magnitude = √0.5, so normalised = [1/√2, 1/√2, 0, 0].
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        assert_relative_eq!(pooled[0], inv_sqrt2, epsilon = 1e-5);
+        assert_relative_eq!(pooled[1], inv_sqrt2, epsilon = 1e-5);
+    }
+
+    /// CLS and mean pooling of the same hidden states produce DIFFERENT vectors.
+    ///
+    /// This is the key correctness guarantee for P1-E3: using the wrong pooling
+    /// strategy for a model produces a meaningfully different embedding.
+    #[test]
+    fn test_cls_and_mean_produce_different_embeddings() {
+        let (hidden, mask) = hidden_2x4();
+        let seq_len = 2;
+        let hidden_size = 4;
+
+        let mut cls = cls_pool(&hidden, seq_len, hidden_size);
+        let mut mean = mean_pool(&hidden, &mask, seq_len, hidden_size);
+
+        l2_normalize(&mut cls);
+        l2_normalize(&mut mean);
+
+        // CLS = [1, 0, 0, 0],  mean = [1/√2, 1/√2, 0, 0] — these differ.
+        assert_ne!(
+            cls, mean,
+            "CLS and mean pooling must produce different unit vectors"
+        );
+    }
+
+    /// Mean pooling with a padding mask ignores masked positions.
+    ///
+    /// With hidden = [[1,0,0,0],[0,1,0,0]] and mask [1, 0],
+    /// only token 0 contributes: mean = [1, 0, 0, 0].
+    #[test]
+    fn test_mean_pool_respects_padding_mask() {
+        let hidden = vec![
+            1.0_f32, 0.0, 0.0, 0.0, // token 0 (real)
+            0.0_f32, 1.0, 0.0, 0.0, // token 1 (pad, mask=0)
+        ];
+        let mask = vec![1_u32, 0]; // second token is padding
+        let seq_len = 2;
+        let hidden_size = 4;
+
+        let pooled = mean_pool(&hidden, &mask, seq_len, hidden_size);
+
+        // Only token 0 is unmasked → mean = [1,0,0,0].
+        assert_relative_eq!(pooled[0], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(pooled[1], 0.0, epsilon = 1e-6);
     }
 }
 

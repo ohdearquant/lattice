@@ -1,6 +1,6 @@
 //! Caching wrapper for embedding services.
 
-use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_CHARS};
+use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
 use crate::error::Result;
 use crate::model::EmbeddingModel;
 use async_trait::async_trait;
@@ -80,6 +80,53 @@ impl<S: EmbeddingService> CachedEmbeddingService<S> {
 #[async_trait]
 impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<S> {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        // Generic role: cache key does NOT include a role tag, maintaining
+        // backwards compatibility with any on-disk cache entries written before
+        // role-aware keys were introduced.
+        self.embed_with_role(texts, model, EmbeddingRole::Generic)
+            .await
+    }
+
+    /// Override: apply query prompt then cache with `Query` role key.
+    async fn embed_query(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        let prefix = model.query_instruction();
+        let prompted = super::apply_prefix(texts, prefix);
+        self.embed_with_role(&prompted, model, EmbeddingRole::Query)
+            .await
+    }
+
+    /// Override: apply passage prompt then cache with `Passage` role key.
+    async fn embed_passage(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>> {
+        let prefix = model.document_instruction();
+        let prompted = super::apply_prefix(texts, prefix);
+        self.embed_with_role(&prompted, model, EmbeddingRole::Passage)
+            .await
+    }
+
+    fn supports_model(&self, model: EmbeddingModel) -> bool {
+        self.inner.supports_model(model)
+    }
+
+    fn name(&self) -> &'static str {
+        "cached-embedding"
+    }
+}
+
+impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
+    /// Core cache-and-embed implementation shared by `embed`, `embed_query`, and
+    /// `embed_passage`.  `texts` must already have the prompt prefix applied; `role`
+    /// is used only as part of the cache key so that different roles produce separate
+    /// cache entries for the same raw text.
+    async fn embed_with_role(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
         use crate::error::EmbedError;
 
         // Validate inputs before any cache interaction so callers always get
@@ -108,11 +155,11 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
             return self.inner.embed(texts, model).await;
         }
 
-        // Compute cache keys — include the active dimension (for MRL models).
+        // Compute cache keys — include the active dimension (for MRL models) and role.
         let model_config = self.inner.model_config(model);
         let keys: Vec<_> = texts
             .iter()
-            .map(|t| self.cache.compute_key(t, model_config))
+            .map(|t| self.cache.compute_key(t, model_config, role))
             .collect();
 
         // Check cache for all texts — returns Arc<[f32]> refs (O(1) per hit)
@@ -144,7 +191,7 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
             to_embed.len()
         );
 
-        // Embed missing texts
+        // Embed missing texts (after prompt is already applied in texts)
         let texts_to_embed: Vec<String> = to_embed.iter().map(|(_, t)| (*t).clone()).collect();
         let new_embeddings = self.inner.embed(&texts_to_embed, model).await?;
 
@@ -171,14 +218,6 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
         // - Cached items were assigned via results[i] = Some(arc.to_vec())
         // - Non-cached items were assigned via results[i] = Some(embedding) in the loop above
         Ok(results.into_iter().flatten().collect())
-    }
-
-    fn supports_model(&self, model: EmbeddingModel) -> bool {
-        self.inner.supports_model(model)
-    }
-
-    fn name(&self) -> &'static str {
-        "cached-embedding"
     }
 }
 

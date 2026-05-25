@@ -212,7 +212,12 @@ fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel
                 _ => unreachable!(),
             };
             info!(model = model_name, "loading native BERT embedding model");
-            let bert = BertModel::from_pretrained(model_name).map_err(|e| e.to_string())?;
+            let mut bert = BertModel::from_pretrained(model_name).map_err(|e| e.to_string())?;
+            // Route each model family through its correct pooling strategy.
+            // BGE uses CLS pooling; E5 and MiniLM use mean pooling.
+            if let Some(pooling) = model_config.model.bert_pooling() {
+                bert.set_pooling(pooling);
+            }
             Ok(LoadedModel::Bert(Arc::new(bert)))
         }
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {

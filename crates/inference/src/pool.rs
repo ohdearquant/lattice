@@ -1,5 +1,34 @@
 use crate::forward::cpu::simd_config;
 
+/// **Stable** (provisional): pooling strategy for BERT-family encoder models.
+///
+/// Selects how the per-token hidden states produced by the final transformer layer
+/// are reduced to a single fixed-size embedding vector.
+///
+/// | Family | Strategy | Reference |
+/// |--------|----------|-----------|
+/// | BGE small/base/large-en-v1.5 | `CLS` | HF card: `model_output[0][:, 0]` + L2 |
+/// | E5 multilingual small/base | `Mean` | HF card: masked average pooling + L2 |
+/// | all-MiniLM-L6-v2 | `Mean` | sentence-transformers: mean pooling |
+/// | paraphrase-multilingual-MiniLM-L12-v2 | `Mean` | sentence-transformers: mean pooling |
+///
+/// Qwen3-Embedding models use `last_token_pool` (decoder-style) and do not use
+/// this enum — they have a separate inference path in `QwenModel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BertPooling {
+    /// Masked mean pooling (attention-mask-weighted average over all real tokens).
+    ///
+    /// Correct for E5 and MiniLM families.  This is the legacy default; existing
+    /// BGE users who loaded models without explicit pooling selection used this path.
+    #[default]
+    Mean,
+    /// CLS token pooling (hidden state at position 0).
+    ///
+    /// Correct for BGE v1.5 families.  The BGE model cards document their inference
+    /// recipe as `model_output[0][:, 0]` (CLS hidden state) followed by L2 normalization.
+    CLS,
+}
+
 /// **Unstable**: internal pooling kernel; SIMD dispatch details may change.
 ///
 /// Dispatches to SIMD (NEON/AVX2) when available, falls back to scalar.
