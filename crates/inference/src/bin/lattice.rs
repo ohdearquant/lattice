@@ -165,6 +165,7 @@ mod serve {
         message: String,
         r#type: &'static str,
         code: String,
+        param: Option<String>,
     }
 
     impl IntoResponse for ApiError {
@@ -176,6 +177,7 @@ mod serve {
                             message,
                             r#type: "invalid_request_error",
                             code: code.to_string(),
+                            param: None,
                         },
                     });
                     (StatusCode::BAD_REQUEST, body).into_response()
@@ -186,6 +188,7 @@ mod serve {
                             message,
                             r#type: "server_error",
                             code: "internal_error".to_string(),
+                            param: None,
                         },
                     });
                     (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
@@ -252,25 +255,45 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Build a single prompt string from the full message list using a simple
-    /// role-prefixed format compatible with instruction-tuned models.
+    /// Build a single prompt string from the full message list using Qwen ChatML format.
     ///
     /// Format (one block per message, in order):
     /// ```text
-    /// <|system|>
-    /// {content}
-    /// <|user|>
-    /// {content}
-    /// <|assistant|>
-    /// {content}
+    /// <|im_start|>system
+    /// {content}<|im_end|>
+    /// <|im_start|>user
+    /// {content}<|im_end|>
+    /// <|im_start|>assistant
+    /// {content}<|im_end|>
     /// ```
-    /// The caller is expected to validate that the last message is a user turn.
-    fn render_prompt(messages: &[Message]) -> String {
+    /// The final line is the open generation prompt `<|im_start|>assistant\n` — no closing
+    /// `<|im_end|>` — so the model generates from there.
+    ///
+    /// Only the roles `system`, `user`, and `assistant` are supported. Any other role
+    /// returns `Err` so the handler can respond with HTTP 400.
+    fn render_prompt(messages: &[Message]) -> Result<String, ApiError> {
         let mut buf = String::new();
         for msg in messages {
-            buf.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
+            match msg.role.as_str() {
+                "system" | "user" | "assistant" => {
+                    buf.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        msg.role, msg.content
+                    ));
+                }
+                other => {
+                    return Err(ApiError::BadRequest {
+                        message: format!(
+                            "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
+                        ),
+                        code: "invalid_role",
+                    });
+                }
+            }
         }
-        buf
+        // Open generation turn — model generates from here.
+        buf.push_str("<|im_start|>assistant\n");
+        Ok(buf)
     }
 
     // -----------------------------------------------------------------------
@@ -283,8 +306,16 @@ mod serve {
 
     pub async fn chat_completions(
         State(state): State<AppState>,
-        Json(req): Json<ChatCompletionRequest>,
+        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
     ) -> Result<Json<ChatCompletionResponse>, ApiError> {
+        // Surface JSON extraction failures (malformed JSON, missing Content-Type,
+        // deserialization errors) as structured 400 responses instead of axum's
+        // default plain-text rejection.
+        let Json(req) = result.map_err(|rejection| ApiError::BadRequest {
+            message: rejection.body_text(),
+            code: "invalid_request_body",
+        })?;
+
         // Validate that the caller targets the served model.
         if req.model != state.model_id {
             return Err(ApiError::BadRequest {
@@ -312,8 +343,9 @@ mod serve {
             });
         }
 
-        // Concatenate all messages into a single prompt preserving full context.
-        let prompt = render_prompt(&req.messages);
+        // Render the full conversation into a ChatML prompt.  Returns 400 for
+        // any unsupported role encountered in the message list.
+        let prompt = render_prompt(&req.messages)?;
 
         let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens);
         let temperature = req.temperature.unwrap_or(0.7);
