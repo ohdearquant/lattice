@@ -6,6 +6,11 @@
 //!
 //! Layout per layer: `[max_seq_len, kv_dim]` where `kv_dim = num_kv_heads * head_dim`.
 //! Only `[0..seq_len, kv_dim]` contains valid data.
+//!
+//! Storage format: f16 (half-precision) to halve memory footprint vs f32.
+//! Writes convert f32→f16; reads dequantize f16→f32 via `read_k_into`/`read_v_into`.
+
+use half::f16;
 
 /// **Unstable**: flat KV cache configuration; fields may change as the
 /// generation infrastructure evolves.
@@ -28,15 +33,15 @@ impl FlatKVCacheConfig {
         self.num_kv_heads * self.head_dim
     }
 
-    /// Total f32 elements per layer buffer.
+    /// Total f16 elements per layer buffer.
     #[inline]
     fn layer_capacity(&self) -> usize {
         self.max_seq_len * self.kv_dim()
     }
 
-    /// **Unstable**: total memory footprint in bytes.
+    /// **Unstable**: total memory footprint in bytes (f16 = 2 bytes per element).
     pub fn total_bytes(&self) -> usize {
-        2 * self.num_layers * self.layer_capacity() * std::mem::size_of::<f32>()
+        2 * self.num_layers * self.layer_capacity() * std::mem::size_of::<f16>()
     }
 
     /// **Unstable**: convenience constructor for Qwen3 models.
@@ -60,12 +65,15 @@ impl FlatKVCacheConfig {
 ///
 /// Pre-allocates all memory upfront. Append is O(1) per token per layer.
 /// Best for single-sequence inference where the max context length is known.
+///
+/// Storage is f16 (half-precision) to halve memory relative to f32.
+/// Callers supply f32 on write; reads dequantize via `read_k_into`/`read_v_into`.
 #[derive(Debug)]
 pub struct FlatKVCache {
-    /// Per-layer K cache, each `[max_seq_len * kv_dim]`.
-    k: Vec<Vec<f32>>,
-    /// Per-layer V cache, each `[max_seq_len * kv_dim]`.
-    v: Vec<Vec<f32>>,
+    /// Per-layer K cache, each `[max_seq_len * kv_dim]` f16 elements.
+    k: Vec<Vec<f16>>,
+    /// Per-layer V cache, each `[max_seq_len * kv_dim]` f16 elements.
+    v: Vec<Vec<f16>>,
     /// Current number of tokens cached (same across all layers).
     seq_len: usize,
     /// Config.
@@ -76,8 +84,12 @@ impl FlatKVCache {
     /// **Unstable**: construct with zero-initialized buffers.
     pub fn new(config: FlatKVCacheConfig) -> Self {
         let cap = config.layer_capacity();
-        let k = (0..config.num_layers).map(|_| vec![0.0f32; cap]).collect();
-        let v = (0..config.num_layers).map(|_| vec![0.0f32; cap]).collect();
+        let k = (0..config.num_layers)
+            .map(|_| vec![f16::ZERO; cap])
+            .collect();
+        let v = (0..config.num_layers)
+            .map(|_| vec![f16::ZERO; cap])
+            .collect();
         Self {
             k,
             v,
@@ -120,6 +132,7 @@ impl FlatKVCache {
     ///
     /// `k_token` and `v_token` must each have length `kv_dim`.
     /// Returns the position index where the token was stored.
+    /// Converts f32→f16 on write.
     ///
     /// # Panics
     /// Panics if the cache is full or if slice lengths are wrong.
@@ -136,8 +149,12 @@ impl FlatKVCache {
         );
 
         let offset = self.seq_len * kv_dim;
-        self.k[layer][offset..offset + kv_dim].copy_from_slice(k_token);
-        self.v[layer][offset..offset + kv_dim].copy_from_slice(v_token);
+        for (i, &val) in k_token.iter().enumerate() {
+            self.k[layer][offset + i] = f16::from_f32(val);
+        }
+        for (i, &val) in v_token.iter().enumerate() {
+            self.v[layer][offset + i] = f16::from_f32(val);
+        }
 
         self.seq_len
     }
@@ -162,6 +179,7 @@ impl FlatKVCache {
     }
 
     /// **Unstable**: batch-append tokens for one layer during prefill.
+    /// Converts f32→f16 on write.
     pub fn prefill_layer(
         &mut self,
         layer: usize,
@@ -180,8 +198,12 @@ impl FlatKVCache {
 
         let offset = self.seq_len * kv_dim;
         let total = num_tokens * kv_dim;
-        self.k[layer][offset..offset + total].copy_from_slice(k_tokens);
-        self.v[layer][offset..offset + total].copy_from_slice(v_tokens);
+        for (i, &val) in k_tokens[..total].iter().enumerate() {
+            self.k[layer][offset + i] = f16::from_f32(val);
+        }
+        for (i, &val) in v_tokens[..total].iter().enumerate() {
+            self.v[layer][offset + i] = f16::from_f32(val);
+        }
     }
 
     /// **Unstable**: advance position counter by n after prefilling all layers.
@@ -206,62 +228,110 @@ impl FlatKVCache {
         self.seq_len = seq_len;
     }
 
-    /// **Unstable**: read K slice for a layer up to current seq_len.
+    /// **Unstable**: dequantize K slice for a layer into `buf` up to current seq_len.
+    ///
+    /// `buf` must have length >= `seq_len * kv_dim`. Converts f16→f32.
+    pub fn read_k_into(&self, layer: usize, buf: &mut [f32]) {
+        debug_assert!(layer < self.config.num_layers);
+        let end = self.seq_len * self.config.kv_dim();
+        debug_assert!(buf.len() >= end);
+        for (i, &h) in self.k[layer][..end].iter().enumerate() {
+            buf[i] = h.to_f32();
+        }
+    }
+
+    /// **Unstable**: dequantize V slice for a layer into `buf` up to current seq_len.
+    ///
+    /// `buf` must have length >= `seq_len * kv_dim`. Converts f16→f32.
+    pub fn read_v_into(&self, layer: usize, buf: &mut [f32]) {
+        debug_assert!(layer < self.config.num_layers);
+        let end = self.seq_len * self.config.kv_dim();
+        debug_assert!(buf.len() >= end);
+        for (i, &h) in self.v[layer][..end].iter().enumerate() {
+            buf[i] = h.to_f32();
+        }
+    }
+
+    /// **Unstable**: read K slice for a layer up to current seq_len (f16).
+    ///
+    /// Use `read_k_into` for f32 dequantized access.
     #[inline]
-    pub fn get_k(&self, layer: usize) -> &[f32] {
+    pub fn get_k_f16(&self, layer: usize) -> &[f16] {
         debug_assert!(layer < self.config.num_layers);
         let end = self.seq_len * self.config.kv_dim();
         &self.k[layer][..end]
     }
 
-    /// **Unstable**: read V slice for a layer up to current seq_len.
+    /// **Unstable**: read V slice for a layer up to current seq_len (f16).
+    ///
+    /// Use `read_v_into` for f32 dequantized access.
     #[inline]
-    pub fn get_v(&self, layer: usize) -> &[f32] {
+    pub fn get_v_f16(&self, layer: usize) -> &[f16] {
         debug_assert!(layer < self.config.num_layers);
         let end = self.seq_len * self.config.kv_dim();
         &self.v[layer][..end]
     }
 
-    /// **Unstable**: mutable K slice for in-place operations (e.g. RoPE).
+    /// **Unstable**: read K slice for a layer up to current seq_len, dequantizing to f32.
+    ///
+    /// Allocates a Vec; prefer `read_k_into` when a pre-allocated buffer is available.
     #[inline]
-    pub fn get_k_mut(&mut self, layer: usize) -> &mut [f32] {
+    pub fn get_k(&self, layer: usize) -> Vec<f32> {
+        debug_assert!(layer < self.config.num_layers);
+        let end = self.seq_len * self.config.kv_dim();
+        self.k[layer][..end].iter().map(|h| h.to_f32()).collect()
+    }
+
+    /// **Unstable**: read V slice for a layer up to current seq_len, dequantizing to f32.
+    ///
+    /// Allocates a Vec; prefer `read_v_into` when a pre-allocated buffer is available.
+    #[inline]
+    pub fn get_v(&self, layer: usize) -> Vec<f32> {
+        debug_assert!(layer < self.config.num_layers);
+        let end = self.seq_len * self.config.kv_dim();
+        self.v[layer][..end].iter().map(|h| h.to_f32()).collect()
+    }
+
+    /// **Unstable**: mutable K slice for in-place f16 operations (e.g. RoPE applied in f16).
+    #[inline]
+    pub fn get_k_mut(&mut self, layer: usize) -> &mut [f16] {
         debug_assert!(layer < self.config.num_layers);
         let end = self.seq_len * self.config.kv_dim();
         &mut self.k[layer][..end]
     }
 
-    /// **Unstable**: mutable V slice for in-place operations.
+    /// **Unstable**: mutable V slice for in-place f16 operations.
     #[inline]
-    pub fn get_v_mut(&mut self, layer: usize) -> &mut [f32] {
+    pub fn get_v_mut(&mut self, layer: usize) -> &mut [f16] {
         debug_assert!(layer < self.config.num_layers);
         let end = self.seq_len * self.config.kv_dim();
         &mut self.v[layer][..end]
     }
 
-    /// **Unstable**: full K buffer including unwritten positions; used by prefill.
+    /// **Unstable**: full K buffer including unwritten positions (f16); used by prefill.
     #[inline]
-    pub fn k_buffer_mut(&mut self, layer: usize) -> &mut [f32] {
+    pub fn k_buffer_mut(&mut self, layer: usize) -> &mut [f16] {
         debug_assert!(layer < self.config.num_layers);
         &mut self.k[layer]
     }
 
-    /// **Unstable**: immutable full K buffer.
+    /// **Unstable**: immutable full K buffer (f16).
     #[inline]
-    pub fn k_buffer(&self, layer: usize) -> &[f32] {
+    pub fn k_buffer(&self, layer: usize) -> &[f16] {
         debug_assert!(layer < self.config.num_layers);
         &self.k[layer]
     }
 
-    /// **Unstable**: full V buffer including unwritten positions.
+    /// **Unstable**: full V buffer including unwritten positions (f16).
     #[inline]
-    pub fn v_buffer_mut(&mut self, layer: usize) -> &mut [f32] {
+    pub fn v_buffer_mut(&mut self, layer: usize) -> &mut [f16] {
         debug_assert!(layer < self.config.num_layers);
         &mut self.v[layer]
     }
 
-    /// **Unstable**: immutable full V buffer.
+    /// **Unstable**: immutable full V buffer (f16).
     #[inline]
-    pub fn v_buffer(&self, layer: usize) -> &[f32] {
+    pub fn v_buffer(&self, layer: usize) -> &[f16] {
         debug_assert!(layer < self.config.num_layers);
         &self.v[layer]
     }
@@ -271,8 +341,8 @@ impl FlatKVCache {
         self.seq_len = 0;
         // Zero out for safety (prevent stale data leaking).
         for layer in 0..self.config.num_layers {
-            self.k[layer].fill(0.0);
-            self.v[layer].fill(0.0);
+            self.k[layer].fill(f16::ZERO);
+            self.v[layer].fill(f16::ZERO);
         }
     }
 
@@ -300,6 +370,16 @@ mod tests {
         }
     }
 
+    /// f16 tolerance: ~3.3 decimal digits relative precision (eps ≈ 9.77e-4).
+    /// We use max(absolute_tol, relative_tol * max(|a|, |b|)) to handle both
+    /// near-zero and large values correctly.
+    fn approx_eq(a: f32, b: f32) -> bool {
+        let abs_tol = 1e-3_f32;
+        let rel_tol = 2e-3_f32; // 2× f16 epsilon for rounding slack
+        let scale = a.abs().max(b.abs()).max(1.0);
+        (a - b).abs() <= abs_tol.max(rel_tol * scale)
+    }
+
     #[test]
     fn append_get_roundtrip() {
         let config = make_config(2, 64);
@@ -307,31 +387,44 @@ mod tests {
         let mut cache = FlatKVCache::new(config);
 
         // Append one token to layer 0.
-        let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.01).collect();
-        let v: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.02 + 1.0).collect();
+        // Use small values well within f16 range to avoid precision loss.
+        let k: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.01).collect();
+        let v: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.02 + 1.0).collect();
         cache.append_kv(0, &k, &v);
 
         // Also append to layer 1.
-        let k1: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.03).collect();
-        let v1: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.04 + 2.0).collect();
+        let k1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.03).collect();
+        let v1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.04 + 2.0).collect();
         cache.append_kv(1, &k1, &v1);
 
         cache.advance();
         assert_eq!(cache.seq_len(), 1);
 
-        // Verify roundtrip.
+        // Verify roundtrip with f16 tolerance.
         let got_k = cache.get_k(0);
         assert_eq!(got_k.len(), kv_dim);
-        assert_eq!(got_k, &k[..]);
+        for (i, (&orig, &got)) in k.iter().zip(got_k.iter()).enumerate() {
+            assert!(
+                approx_eq(orig, got),
+                "k[{i}]: expected {orig}, got {got}, diff {}",
+                (orig - got).abs()
+            );
+        }
 
         let got_v = cache.get_v(0);
-        assert_eq!(got_v, &v[..]);
+        for (i, (&orig, &got)) in v.iter().zip(got_v.iter()).enumerate() {
+            assert!(approx_eq(orig, got), "v[{i}]: expected {orig}, got {got}");
+        }
 
         let got_k1 = cache.get_k(1);
-        assert_eq!(got_k1, &k1[..]);
+        for (i, (&orig, &got)) in k1.iter().zip(got_k1.iter()).enumerate() {
+            assert!(approx_eq(orig, got), "k1[{i}]: expected {orig}, got {got}");
+        }
 
         let got_v1 = cache.get_v(1);
-        assert_eq!(got_v1, &v1[..]);
+        for (i, (&orig, &got)) in v1.iter().zip(got_v1.iter()).enumerate() {
+            assert!(approx_eq(orig, got), "v1[{i}]: expected {orig}, got {got}");
+        }
     }
 
     #[test]
@@ -349,17 +442,17 @@ mod tests {
         }
         cache.advance();
 
-        // Each layer should have its own data.
+        // Each layer should have its own data (with f16 tolerance).
         for layer in 0..4 {
             let marker = (layer + 1) as f32;
             let got_k = cache.get_k(layer);
             assert!(
-                got_k.iter().all(|&x| x == marker),
+                got_k.iter().all(|&x| approx_eq(x, marker)),
                 "layer {layer} K mismatch"
             );
             let got_v = cache.get_v(layer);
             assert!(
-                got_v.iter().all(|&x| x == marker + 0.5),
+                got_v.iter().all(|&x| approx_eq(x, marker + 0.5)),
                 "layer {layer} V mismatch"
             );
         }
@@ -371,8 +464,8 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        let k = vec![1.0; kv_dim];
-        let v = vec![2.0; kv_dim];
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
         cache.append_kv(0, &k, &v);
         cache.append_kv(1, &k, &v);
         cache.advance();
@@ -380,7 +473,7 @@ mod tests {
 
         cache.reset();
         assert_eq!(cache.seq_len(), 0);
-        // After reset, get_k returns empty slice.
+        // After reset, get_k/get_v return empty Vec.
         assert_eq!(cache.get_k(0).len(), 0);
         assert_eq!(cache.get_v(1).len(), 0);
     }
@@ -391,8 +484,8 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        let k = vec![1.0; kv_dim];
-        let v = vec![2.0; kv_dim];
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
 
         // Fill to capacity.
         for _ in 0..4 {
@@ -410,8 +503,8 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        let k = vec![1.0; kv_dim];
-        let v = vec![2.0; kv_dim];
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
         cache.append_kv(0, &k, &v);
         cache.advance();
         cache.append_kv(0, &k, &v);
@@ -458,27 +551,35 @@ mod tests {
         let k0 = cache.get_k(0);
         assert_eq!(k0.len(), 15 * kv_dim);
 
-        // Check the first decode token (at position 10).
+        // Check the first decode token (at position 10), f16 roundtrip of 100.0 is exact.
         let decode_start = 10 * kv_dim;
-        assert_eq!(k0[decode_start], 100.0);
+        assert!(
+            approx_eq(k0[decode_start], 100.0),
+            "expected ~100.0, got {}",
+            k0[decode_start]
+        );
 
         // Check last decode token (at position 14).
         let last_start = 14 * kv_dim;
-        assert_eq!(k0[last_start], 104.0);
+        assert!(
+            approx_eq(k0[last_start], 104.0),
+            "expected ~104.0, got {}",
+            k0[last_start]
+        );
     }
 
     #[test]
     fn memory_bytes_calculation() {
         // Qwen3-0.6B: 28 layers, 8 KV heads, head_dim=128, max 4096
         // kv_dim = 8 * 128 = 1024
-        // Per side: 28 * 4096 * 1024 * 4 bytes
-        // Total: 2 * that = 939,524,096 bytes ~ 0.875 GB
+        // Per side: 28 * 4096 * 1024 * 2 bytes (f16)
+        // Total: 2 * that = 469,762,048 bytes ~ 448 MB (was 896 MB with f32)
         let config = FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096);
         let kv_dim = 8 * 128; // 1024
-        let expected = 2 * 28 * 4096 * kv_dim * 4;
+        let expected = 2 * 28 * 4096 * kv_dim * 2; // 2 bytes per f16
         assert_eq!(config.total_bytes(), expected);
         let mb = config.total_bytes() as f64 / (1024.0 * 1024.0);
-        assert!((mb - 896.0).abs() < 1.0, "expected ~896 MB, got {mb:.1} MB");
+        assert!((mb - 448.0).abs() < 1.0, "expected ~448 MB, got {mb:.1} MB");
     }
 
     #[test]
@@ -501,8 +602,8 @@ mod tests {
         // Buffer lengths must be unchanged (no deallocation)
         assert_eq!(cache.k_buffer(0).len(), k_len_before);
         assert_eq!(cache.v_buffer(0).len(), v_len_before);
-        // Valid slice shrinks accordingly
-        assert_eq!(cache.get_k(0).len(), 3 * kv_dim);
+        // Valid slice (f16) shrinks accordingly
+        assert_eq!(cache.get_k_f16(0).len(), 3 * kv_dim);
     }
 
     #[test]
@@ -511,15 +612,15 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        let k = vec![42.0; kv_dim];
-        let v = vec![43.0; kv_dim];
+        let k = vec![42.0f32; kv_dim];
+        let v = vec![43.0f32; kv_dim];
         cache.append_kv(0, &k, &v);
         cache.advance();
 
         cache.reset_fast();
         assert_eq!(cache.seq_len(), 0);
-        // Stale data is still there in the raw buffer (this is expected).
-        assert_eq!(cache.k[0][0], 42.0);
+        // Stale data is still there in the raw f16 buffer (this is expected).
+        assert!(approx_eq(cache.k[0][0].to_f32(), 42.0));
     }
 
     #[test]
@@ -528,15 +629,56 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        let k = vec![1.0; kv_dim];
-        let v = vec![2.0; kv_dim];
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
         cache.append_kv(0, &k, &v);
         cache.advance();
 
-        // Modify K in-place (e.g., for RoPE).
+        // Modify K in-place via f16 mutation.
         let k_mut = cache.get_k_mut(0);
-        k_mut[0] = 99.0;
+        k_mut[0] = f16::from_f32(99.0);
 
-        assert_eq!(cache.get_k(0)[0], 99.0);
+        let got_k = cache.get_k(0);
+        assert!(approx_eq(got_k[0], 99.0));
+    }
+
+    #[test]
+    fn read_k_into_dequantizes_correctly() {
+        let config = make_config(1, 8);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+
+        let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.5).collect();
+        let v = vec![0.0f32; kv_dim];
+        cache.append_kv(0, &k, &v);
+        cache.advance();
+
+        let mut buf = vec![0.0f32; kv_dim];
+        cache.read_k_into(0, &mut buf);
+
+        for (i, (&orig, &got)) in k.iter().zip(buf.iter()).enumerate() {
+            assert!(
+                approx_eq(orig, got),
+                "read_k_into[{i}]: expected {orig}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_storage_halves_memory() {
+        // Verify the storage byte count matches f16 (not f32).
+        let config = FlatKVCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 2,
+            head_dim: 4,
+            max_seq_len: 16,
+        };
+        let kv_dim = 2 * 4; // 8
+        // f16: 2 * 1 * 16 * 8 * 2 = 512 bytes
+        let expected_f16 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f16>();
+        assert_eq!(config.total_bytes(), expected_f16);
+        // Would have been 1024 with f32
+        let would_be_f32 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f32>();
+        assert_eq!(config.total_bytes() * 2, would_be_f32);
     }
 }

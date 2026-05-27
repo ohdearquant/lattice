@@ -19,6 +19,7 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
 
 [dependencies]
+half = { version = "2", features = ["std"] }
 memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
@@ -197,6 +198,10 @@ harness = false
 
 [[bench]]
 name = "metrics_bench"
+harness = false
+
+[[bench]]
+name = "kv_cache_f16_bench"
 harness = false
 
 [lints]
