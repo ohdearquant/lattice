@@ -215,5 +215,9 @@ harness = false
 name = "attention_dispatch_bench"
 harness = false
 
+[[bench]]
+name = "pruning_bench"
+harness = false
+
 [lints]
 workspace = true
