@@ -1,8 +1,9 @@
 # ADR-010: Attention Mechanisms
 
-**Status**: Accepted\
+**Status**: Accepted (attention taxonomy superseded by ADR-059)\
 **Date**: 2026-05-13\
-**Crate**: `lattice-inference`
+**Crate**: `lattice-inference`\
+**Amendment (2026-05-27)**: ADR-059 expands the attention taxonomy from 4 variants (MHA, GQA, Flash, GDN) to 10 modules with a composable `AttentionKind` enum and `AttentionOp` trait. This ADR remains the authoritative reference for the primitive-level API contracts of MHA (`AttentionBuffers`), GQA (`GqaScratch`), Flash (tiled), and GDN (recurrent state). For dispatch/composition and the full taxonomy, see ADR-059.
 
 ---
 

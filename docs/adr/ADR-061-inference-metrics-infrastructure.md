@@ -4,7 +4,8 @@
 **Date**: 2026-05-27
 **Crate**: lattice-inference (metrics collection), lattice-tune or new `experiment` module (runner)
 **Research**: RQ-3 (`workspaces/20260527/03.md`)
-**Depends on**: ADR-059 (ModelSpec), ADR-060 (Structured Pruning)
+**Depends on**: ADR-059 (ModelSpec, ForwardCtx, LayerMetrics schema — **ADR-061 is the authoritative source for LayerMetrics**)
+**Consumed by**: ADR-060 (Structured Pruning uses CheapOnline metrics as scoring substrate)
 
 ## Context
 
@@ -47,36 +48,36 @@ Notation: layer `l`, head `h`, query position `t`, key position `s`, attention l
 
 Collected at layer boundaries with negligible overhead relative to GEMMs.
 
-| Metric | Mathematical definition | Cost | Architectural insight | Extraction |
-|--------|------------------------|------|----------------------|------------|
-| **Per-layer latency** | Wall-clock per `LayerOp::forward` | Negligible | Identifies hot layers; latency outliers suggest fusion opportunities | Timer wrap around layer call |
-| **Activation norms** | `n_l(t) = \|\|x_l(t)\|\|_2 / sqrt(d)` | `O(L * T * d)` adds | Norm spikes indicate instability or quantization sensitivity | Reduction kernel at layer boundary |
-| **Update ratio** | `u_l(t) = \|\|x_l(t) - x_{l-1}(t)\|\|_2 / \|\|x_{l-1}(t)\|\|_2` | Same as norms | Small ratio = near-identity block = pruning candidate. This IS the ShortGPT scoring signal for ADR-060 | Fuse with residual-write kernel |
-| **Block Influence** | `BI_l = 1 - cos(x_{l-1}, x_l)` | Same as norms | Complementary to update ratio; cosine similarity vs magnitude change. ShortGPT (Men et al. 2024, arXiv:2403.03853) uses BI for layer pruning ranking. Caveat: cosine similarity alone may poorly predict PPL degradation -- always validate with paired PPL delta | Same reduction kernel |
-| **Memory bandwidth model** | `BW_k = bytes_moved_k / time_k`; utilization `rho_k = BW_k / BW_peak` | Negligible | Separates memory-bound from compute-bound ops. FP16 GEMV at ~1 FLOP/B is deeply memory-bound on all M-series (ridge 26-42 FLOP/B) | Modeled byte counts + command-buffer timestamps |
-| **Speculative acceptance** | `E[accepted_prefix] / draft_length` | Negligible | Direct proxy for draft quality; informs draft length, model, adaptive speculation | Counter bookkeeping in decode loop |
-| **PPL / NLL** | `PPL = exp(-(1/N) sum_i log p(t_i \| t_{<i}))` | Part of evaluation | The ground truth quality metric | Token log-probs from forward pass |
-| **Tokens/sec** | Output tokens / wall-clock seconds | Negligible | Throughput target | Timer around generation loop |
+| Metric                     | Mathematical definition                                               | Cost                | Architectural insight                                                                                                                                                                                                                                             | Extraction                                      |
+| -------------------------- | --------------------------------------------------------------------- | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| **Per-layer latency**      | Wall-clock per `LayerOp::forward`                                     | Negligible          | Identifies hot layers; latency outliers suggest fusion opportunities                                                                                                                                                                                              | Timer wrap around layer call                    |
+| **Activation norms**       | `n_l(t) = \|\|x_l(t)\|\|_2 / sqrt(d)`                                 | `O(L * T * d)` adds | Norm spikes indicate instability or quantization sensitivity                                                                                                                                                                                                      | Reduction kernel at layer boundary              |
+| **Update ratio**           | `u_l(t) = \|\|x_l(t) - x_{l-1}(t)\|\|_2 / \|\|x_{l-1}(t)\|\|_2`       | Same as norms       | Small ratio = near-identity block = pruning candidate. This IS the ShortGPT scoring signal for ADR-060                                                                                                                                                            | Fuse with residual-write kernel                 |
+| **Block Influence**        | `BI_l = 1 - cos(x_{l-1}, x_l)`                                        | Same as norms       | Complementary to update ratio; cosine similarity vs magnitude change. ShortGPT (Men et al. 2024, arXiv:2403.03853) uses BI for layer pruning ranking. Caveat: cosine similarity alone may poorly predict PPL degradation -- always validate with paired PPL delta | Same reduction kernel                           |
+| **Memory bandwidth model** | `BW_k = bytes_moved_k / time_k`; utilization `rho_k = BW_k / BW_peak` | Negligible          | Separates memory-bound from compute-bound ops. FP16 GEMV at ~1 FLOP/B is deeply memory-bound on all M-series (ridge 26-42 FLOP/B)                                                                                                                                 | Modeled byte counts + command-buffer timestamps |
+| **Speculative acceptance** | `E[accepted_prefix] / draft_length`                                   | Negligible          | Direct proxy for draft quality; informs draft length, model, adaptive speculation                                                                                                                                                                                 | Counter bookkeeping in decode loop              |
+| **PPL / NLL**              | `PPL = exp(-(1/N) sum_i log p(t_i \| t_{<i}))`                        | Part of evaluation  | The ground truth quality metric                                                                                                                                                                                                                                   | Token log-probs from forward pass               |
+| **Tokens/sec**             | Output tokens / wall-clock seconds                                    | Negligible          | Throughput target                                                                                                                                                                                                                                                 | Timer around generation loop                    |
 
 #### AttentionProfile tier (opt-in calibration pass)
 
 Requires modified attention kernels or a slower profiling path. Run on a short calibration corpus (128-512 examples), not in production decode.
 
-| Metric | Mathematical definition | Cost | Architectural insight | Extraction |
-|--------|------------------------|------|----------------------|------------|
-| **Attention entropy** | `H_{l,h,t} = -sum_s p_{l,h,t,s} log(p_{l,h,t,s})`. Normalize as `H / log(T_t)` for cross-length comparability. Aggregate by mean, p10/p50/p90, and token class. | If probabilities materialized: `O(H * T^2)` extra reductions in prefill, `O(H * T)` per decode token. If fused: a few scalar accumulators per row. | Low entropy = sharply focused head (local/sparse attention candidate, pruning candidate). High entropy = diffuse/global mixing (must keep or replace with linear attention). Entropy collapse is also a training-stability signal. | **Fused via Online Softmax Entropy** (see D3). No matrix materialization required. |
-| **Attention sparsity** | `S_{l,h,t}(tau) = (1/T_t) sum_s 1[p_{l,h,t,s} < tau]`. Better: top-k mass `M_k = sum_{s in topk} p_s`, Gini coefficient, block sparsity by page/block. | `O(H * T^2)` prefill or `O(H * T)` decode for exact; approximate top-k/block mass cheaper if fused | Complements entropy: two heads can have similar entropy but different locality, sink-token dependence, or block patterns. Useful for sliding attention, page eviction, sparse kernel selection | Second row pass in attention kernel, or approximate top-k/block mass accumulation |
-| **KV cache utilization** | Per-token: `U_l(s) = sum_{h,t>s} p_{l,h,t,s}`. Per-page: `U_l(b) = sum_{s in block_b} U_l(s)`. Also track recency curves, sink-token mass, protected-token mass. | Per-page cheap if accumulated inside attention; exact per-token has attention-probability cost | Directly informs KV eviction, compression, page promotion/demotion, sink-token protection, layer-specific cache policies | Accumulate attention mass per physical KV page in PagedKVCache, not per token |
-| **Attention pattern classification** | Classify heads by entropy, sink mass, locality, top-k mass, recency decay, vertical/slash/sink patterns | Cheap if entropy/sparsity already instrumented | Decides KV eviction/compression strategy, local attention candidates, sink-token protection | Post-process entropy + sparsity vectors per head |
+| Metric                               | Mathematical definition                                                                                                                                          | Cost                                                                                                                                               | Architectural insight                                                                                                                                                                                                              | Extraction                                                                         |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Attention entropy**                | `H_{l,h,t} = -sum_s p_{l,h,t,s} log(p_{l,h,t,s})`. Normalize as `H / log(T_t)` for cross-length comparability. Aggregate by mean, p10/p50/p90, and token class.  | If probabilities materialized: `O(H * T^2)` extra reductions in prefill, `O(H * T)` per decode token. If fused: a few scalar accumulators per row. | Low entropy = sharply focused head (local/sparse attention candidate, pruning candidate). High entropy = diffuse/global mixing (must keep or replace with linear attention). Entropy collapse is also a training-stability signal. | **Fused via Online Softmax Entropy** (see D3). No matrix materialization required. |
+| **Attention sparsity**               | `S_{l,h,t}(tau) = (1/T_t) sum_s 1[p_{l,h,t,s} < tau]`. Better: top-k mass `M_k = sum_{s in topk} p_s`, Gini coefficient, block sparsity by page/block.           | `O(H * T^2)` prefill or `O(H * T)` decode for exact; approximate top-k/block mass cheaper if fused                                                 | Complements entropy: two heads can have similar entropy but different locality, sink-token dependence, or block patterns. Useful for sliding attention, page eviction, sparse kernel selection                                     | Second row pass in attention kernel, or approximate top-k/block mass accumulation  |
+| **KV cache utilization**             | Per-token: `U_l(s) = sum_{h,t>s} p_{l,h,t,s}`. Per-page: `U_l(b) = sum_{s in block_b} U_l(s)`. Also track recency curves, sink-token mass, protected-token mass. | Per-page cheap if accumulated inside attention; exact per-token has attention-probability cost                                                     | Directly informs KV eviction, compression, page promotion/demotion, sink-token protection, layer-specific cache policies                                                                                                           | Accumulate attention mass per physical KV page in PagedKVCache, not per token      |
+| **Attention pattern classification** | Classify heads by entropy, sink mass, locality, top-k mass, recency decay, vertical/slash/sink patterns                                                          | Cheap if entropy/sparsity already instrumented                                                                                                     | Decides KV eviction/compression strategy, local attention candidates, sink-token protection                                                                                                                                        | Post-process entropy + sparsity vectors per head                                   |
 
 #### HeavyDiagnostics tier (rare, small windows)
 
 Not compatible with FlashAttention (must materialize P). Run on short sequences (<512 tokens) only.
 
-| Metric | Mathematical definition | Cost | Architectural insight | Extraction |
-|--------|------------------------|------|----------------------|------------|
+| Metric                          | Mathematical definition                                                                                                                                                                                               | Cost                                                                                                  | Architectural insight                                                                                                                                                                                        | Extraction                                              |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
 | **Effective rank of attention** | Threshold rank: `r_tau = #{i : sigma_i / sigma_1 > tau}`. Energy rank: `r_eps = min{k : sum_{i<=k} sigma_i^2 / sum_i sigma_i^2 >= 1-eps}`. Entropic rank: `exp(-sum_i q_i log q_i)`, `q_i = sigma_i / sum_j sigma_j`. | Exact SVD: `O(T^3)` per head. Randomized SVD/sketching: `O(T^2 * k)` if P materialized or streamable. | Low effective rank suggests low-rank/linear attention (Linformer-style) may preserve behavior. High rank suggests sparse/local patterns safer. Low-rank and sparse approximations work in different regimes. | Materialize full attention matrix, apply randomized SVD |
-| **Activation outlier analysis** | Per-layer/channel: max/mean, p99.9, kurtosis, outlier fraction above `k * sigma`, channel concentration | Cheap reductions | Strong for quantization sensitivity prediction (LLM.int8, SmoothQuant). Choose quantization scheme, mixed precision, smoothing, per-channel scales | Reduction kernels at layer boundaries |
+| **Activation outlier analysis** | Per-layer/channel: max/mean, p99.9, kurtosis, outlier fraction above `k * sigma`, channel concentration                                                                                                               | Cheap reductions                                                                                      | Strong for quantization sensitivity prediction (LLM.int8, SmoothQuant). Choose quantization scheme, mixed precision, smoothing, per-channel scales                                                           | Reduction kernels at layer boundaries                   |
 
 ### D3: Online Softmax Entropy -- the fused implementation trick
 
@@ -95,6 +96,7 @@ H = log(l) + m - e / l
 ```
 
 **Derivation:** By definition, `p_s = exp(a_s - m) / l`, so:
+
 ```
 H = -sum_s p_s log(p_s)
   = -sum_s (exp(a_s - m) / l) * (a_s - m - log(l))
@@ -104,7 +106,21 @@ H = -sum_s p_s log(p_s)
   = log(l) + m - e/l
 ```
 
-Cost: three scalar accumulators (m, l, e) per row instead of two. Negligible overhead vs the baseline Flash kernel's memory traffic. Production kernels should NOT pay this cost by default -- gate behind `MetricsMode::AttentionProfile`.
+**Tiled recurrence rule.** In an online tiled kernel, when processing a new tile with max `m_new > m_old`, all three accumulators must be rescaled:
+
+```
+alpha = exp(m_old - m_new)       // or exp2((m_old - m_new) * log2_e) on Metal
+l_new = alpha * l_old + sum_tile exp(a_s - m_new)
+e_new = alpha * e_old + sum_tile exp(a_s - m_new) * a_s
+```
+
+The final formula `H = log(l) + m - e/l` uses the fully-rescaled `m`, `l`, and `e`. Implementers should verify the `e` update rule — it is the most likely source of numerical error.
+
+**Shifted-logit alternative** (numerically stabler): accumulate `r = sum exp(a_s - m) * (a_s - m)` instead of `e`. Then `H = log(l) - r/l`, avoiding subtraction of similarly-shifted terms (`m - e/l`). The update rule becomes `r_new = alpha * r_old + sum_tile exp(a_s - m_new) * (a_s - m_new)`.
+
+Cost: three scalar accumulators (m, l, e or r) per row instead of two. Negligible overhead vs the baseline Flash kernel's memory traffic. Production kernels should NOT pay this cost by default -- gate behind `MetricsMode::AttentionProfile`.
+
+**Unit convention**: if the kernel uses `exp2` (Metal fast path per ADR-062), entropy is in log2 units. Convert to nats via `H_nat = H_log2 * ln(2)` before reporting or comparing.
 
 This applies to both the Metal fused attention path (`crates/inference/src/attention/flash_causal.rs`) and the CPU attention path (`crates/inference/src/attention/standard.rs`).
 
@@ -145,19 +161,19 @@ The roofline separates memory-bound from compute-bound ops using operational int
 
 #### Chip table (treat as initial ceilings -- replace with measured local microbenchmarks)
 
-| Chip | Public/derived FP32 GPU peak | Apple-published memory BW | Ridge I* (FLOP/B) |
-|------|-----------------------------:|--------------------------:|-------------------:|
-| M1 Pro, 16-core GPU | ~5.3 TFLOP/s | 200 GB/s | ~26.5 |
-| M1 Max, 32-core GPU | ~10.4 TFLOP/s | 400 GB/s | ~26 |
-| M1 Ultra, 64-core GPU | ~21.2 TFLOP/s | 800 GB/s | ~26.5 |
-| M2 Pro, 19-core GPU | ~6.79 TFLOP/s | 200 GB/s | ~34 |
-| M2 Max, 38-core GPU | ~13.5 TFLOP/s | 400 GB/s | ~34 |
-| M2 Ultra, 76-core GPU | ~27.2 TFLOP/s | 800 GB/s | ~34 |
-| M3 Pro, 18-core GPU | ~6.35 TFLOP/s | 150 GB/s | ~42 |
-| M3 Max, 40-core GPU | ~14.1 TFLOP/s | 400 GB/s | ~35 |
-| M3 Ultra, 80-core GPU | ~28.2 TFLOP/s | 819 GB/s | ~34 |
-| M4 Pro, 20-core GPU | ~8.0-9.2 TFLOP/s | 273 GB/s | ~29-34 |
-| M4 Max, 40-core GPU | ~17.0 TFLOP/s | 546 GB/s | ~31 |
+| Chip                  | Public/derived FP32 GPU peak | Apple-published memory BW | Ridge I* (FLOP/B) |
+| --------------------- | ---------------------------: | ------------------------: | ----------------: |
+| M1 Pro, 16-core GPU   |                 ~5.3 TFLOP/s |                  200 GB/s |             ~26.5 |
+| M1 Max, 32-core GPU   |                ~10.4 TFLOP/s |                  400 GB/s |               ~26 |
+| M1 Ultra, 64-core GPU |                ~21.2 TFLOP/s |                  800 GB/s |             ~26.5 |
+| M2 Pro, 19-core GPU   |                ~6.79 TFLOP/s |                  200 GB/s |               ~34 |
+| M2 Max, 38-core GPU   |                ~13.5 TFLOP/s |                  400 GB/s |               ~34 |
+| M2 Ultra, 76-core GPU |                ~27.2 TFLOP/s |                  800 GB/s |               ~34 |
+| M3 Pro, 18-core GPU   |                ~6.35 TFLOP/s |                  150 GB/s |               ~42 |
+| M3 Max, 40-core GPU   |                ~14.1 TFLOP/s |                  400 GB/s |               ~35 |
+| M3 Ultra, 80-core GPU |                ~28.2 TFLOP/s |                  819 GB/s |               ~34 |
+| M4 Pro, 20-core GPU   |             ~8.0-9.2 TFLOP/s |                  273 GB/s |            ~29-34 |
+| M4 Max, 40-core GPU   |                ~17.0 TFLOP/s |                  546 GB/s |               ~31 |
 
 Sources: Apple support pages, Notebookcheck, Low End Mac, cpu-monkey for FP32 derived estimates. FP32 numbers are third-party derived, not from a single Apple "compute roofline" document. For production roofline work, run a local microbenchmark on the target machine, power mode, OS version, and thermal state.
 
@@ -165,19 +181,19 @@ Sources: Apple support pages, Notebookcheck, Low End Mac, cpu-monkey for FP32 de
 
 Architecture: hidden=1024, 24 layers, FFN intermediate=3584, 8 Q heads, 2 KV heads, head dim=256.
 
-| Operation | FLOPs/bytes model | Typical I (FLOP/B) | Bound | Optimization lever |
-|-----------|-------------------|--------------------:|-------|-------------------|
-| Embedding lookup | Read d elements, ~0 arithmetic | ~0 | Memory/random-access | Cache locality, token batching |
-| Q/K/V/O GEMV | 2mn FLOPs, mn * weight_bytes | ~1 (FP16) | **Strongly memory-bound** | Quantization, weight packing, fusion, prefetch |
-| Attention QK^T | 2 * H_q * T * d_h FLOPs, reads K cache | ~1-4 (GQA reuse) | Memory-bound (long ctx) | KV layout, GQA, KV quantization |
-| Softmax | O(H * T) reductions/exp | Low | Latency/reduction | Keep fused with QK/V |
-| Attention * V | 2 * H_q * T * d_h FLOPs, reads V cache | ~1-4 (reuse) | Memory-bound | Same as QK |
-| FFN gate/up GEMV | ~4 * d * d_ff FLOPs, two matrices | ~1 (FP16) | **Strongly memory-bound** | Quantize FFN weights first; fuse gate/up/SwiGLU |
-| FFN down GEMV | 2 * d_ff * d FLOPs, one matrix | ~1 (FP16) | **Strongly memory-bound** | Quantization and layout |
-| RMSNorm | Read + reduce + scale + write | <1 | Memory/reduction | Fuse with adjacent matmul |
-| Residual add | Read 2 vectors, write 1, 1 add/elem | ~0.17 (FP16) | Memory-bound | Fuse with following norm |
-| KV cache write | Write K,V per token per layer | 0 | Pure BW / cache pressure | Compact KV dtype/layout |
-| KV cache read | Grows O(T) per decode token | Low | Increasingly memory-bound | Page/block hotness metrics |
+| Operation        | FLOPs/bytes model                      | Typical I (FLOP/B) | Bound                     | Optimization lever                              |
+| ---------------- | -------------------------------------- | -----------------: | ------------------------- | ----------------------------------------------- |
+| Embedding lookup | Read d elements, ~0 arithmetic         |                 ~0 | Memory/random-access      | Cache locality, token batching                  |
+| Q/K/V/O GEMV     | 2mn FLOPs, mn * weight_bytes           |          ~1 (FP16) | **Strongly memory-bound** | Quantization, weight packing, fusion, prefetch  |
+| Attention QK^T   | 2 * H_q * T * d_h FLOPs, reads K cache |   ~1-4 (GQA reuse) | Memory-bound (long ctx)   | KV layout, GQA, KV quantization                 |
+| Softmax          | O(H * T) reductions/exp                |                Low | Latency/reduction         | Keep fused with QK/V                            |
+| Attention * V    | 2 * H_q * T * d_h FLOPs, reads V cache |       ~1-4 (reuse) | Memory-bound              | Same as QK                                      |
+| FFN gate/up GEMV | ~4 * d * d_ff FLOPs, two matrices      |          ~1 (FP16) | **Strongly memory-bound** | Quantize FFN weights first; fuse gate/up/SwiGLU |
+| FFN down GEMV    | 2 * d_ff * d FLOPs, one matrix         |          ~1 (FP16) | **Strongly memory-bound** | Quantization and layout                         |
+| RMSNorm          | Read + reduce + scale + write          |                 <1 | Memory/reduction          | Fuse with adjacent matmul                       |
+| Residual add     | Read 2 vectors, write 1, 1 add/elem    |       ~0.17 (FP16) | Memory-bound              | Fuse with following norm                        |
+| KV cache write   | Write K,V per token per layer          |                  0 | Pure BW / cache pressure  | Compact KV dtype/layout                         |
+| KV cache read    | Grows O(T) per decode token            |                Low | Increasingly memory-bound | Page/block hotness metrics                      |
 
 Key insight: for decode on Apple GPUs (ridge 26-42 FLOP/B), a FP16 GEMV at ~1 FLOP/B is nowhere near compute-bound. Local LLM decode scales with memory bandwidth. This is why quantization is effective: it reduces bytes moved for weight- and KV-dominated kernels. Prefill is different -- large GEMMs reuse weights across many tokens and can become compute-bound or mixed.
 
@@ -387,6 +403,7 @@ Per-trial event streams stored as `runs/<run_id>/events.jsonl.zst` (zstd-compres
 #### khive KG (distilled findings and provenance)
 
 Store interpreted results, not telemetry:
+
 - "For Qwen3.5-0.8B on M4 Max, FFN down GEMV is memory-bound at ~X GB/s"
 - "Layer 17 removal increased PPL by +0.04 after 20 LoRA-heal steps"
 
@@ -414,13 +431,13 @@ Comparison reports use paired evaluation: same examples, tokenization, prompt or
 
 **CheapOnline mode IS the pruning scoring signal.** No separate calibration pass needed.
 
-| Metric | Pruning signal | ADR-060 use |
-|--------|---------------|-------------|
-| Update ratio / Block Influence | Rank layers by BI ascending -> lowest BI = most removable | `ShortGPTScorer` layer ranking |
-| Activation norms | Detect norm spikes / quantization-sensitive layers | Mixed-precision decisions |
-| Activation outlier analysis | Identify channels with extreme kurtosis | Per-channel quantization scaling (QuaRot, AWQ) |
-| Attention entropy | Low entropy heads -> head pruning candidates (remove entire heads, not just layers) | Future head-pruning extension |
-| Attention pattern classification | Sink-heavy heads: must keep sink tokens. Local-only heads: candidates for sliding-window replacement | KV cache policy per head |
+| Metric                           | Pruning signal                                                                                       | ADR-060 use                                    |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| Update ratio / Block Influence   | Rank layers by BI ascending -> lowest BI = most removable                                            | `ShortGPTScorer` layer ranking                 |
+| Activation norms                 | Detect norm spikes / quantization-sensitive layers                                                   | Mixed-precision decisions                      |
+| Activation outlier analysis      | Identify channels with extreme kurtosis                                                              | Per-channel quantization scaling (QuaRot, AWQ) |
+| Attention entropy                | Low entropy heads -> head pruning candidates (remove entire heads, not just layers)                  | Future head-pruning extension                  |
+| Attention pattern classification | Sink-heavy heads: must keep sink tokens. Local-only heads: candidates for sliding-window replacement | KV cache policy per head                       |
 
 The experiment runner's paired-PPL evaluation provides the mandatory validation gate: no irreversible pruning decision is made on proxy metrics alone. Pipeline:
 
@@ -447,6 +464,7 @@ The gradient-free architecture search pipeline:
 6. Run larger validation corpus for top candidates
 
 Most predictive and cheapest in practice (ranked):
+
 1. **Small-corpus paired PPL delta**: strongest signal, costs a full eval
 2. **Update ratio / Block Influence**: cheapest pruning heuristic
 3. **Activation outliers**: best quantization predictor
@@ -458,6 +476,7 @@ Entropy + effective rank + update ratio across layer types enable automated laye
 ## Implementation roadmap
 
 ### Phase 1: Cheap metrics and schema
+
 - `MetricSink` trait
 - SQLite recorder with schema above
 - JSONL event writer
@@ -467,6 +486,7 @@ Entropy + effective rank + update ratio across layer types enable automated laye
 - **Immediately enables architecture sweeps**
 
 ### Phase 2: Attention profiling
+
 - Instrumented attention path behind `--metrics-mode attention-profile`
 - Online Softmax Entropy implementation in Flash causal and standard attention
 - Top-k mass / sparsity thresholds
@@ -475,17 +495,20 @@ Entropy + effective rank + update ratio across layer types enable automated laye
 - Pattern classification post-processor
 
 ### Phase 3: Roofline reports
+
 - Per-op/layer output: modeled_flops, modeled_bytes, gpu_time_ns, achieved_gflops, achieved_gbps, %peak_bw, %peak_compute, roofline_bound
 - Markdown table and CSV export
 - Runtime chip detection via `MTLDevice` properties
 
 ### Phase 4: Minimal LoRA-heal (ADR-060 dependency)
+
 - Start CPU-only: rank-r LoRA params, forward injection, manual backward for short sequence
 - SGD optimizer, finite-difference gradient tests
 - "modify -> 10 LoRA steps -> measure PPL" loop
 - Move hot backward kernels to Metal
 
 ### Phase 5: Agent loop (ADR-059 dependency)
+
 - Stable CLI contract:
   ```bash
   lattice-exp run --config model.toml --sweep sweep.toml \

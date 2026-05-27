@@ -20,7 +20,7 @@ crates/inference/src/attention/
   differential.rs    — DifferentialAttention
   flash.rs           — TiledAttentionConfig, cpu_tiled_attention()
   flash_causal.rs    — FlashCausalAttention
-  gated.rs           — GatedAttention
+  gated.rs           — Gated attention primitives (deinterleave_q_gate, apply_sigmoid_gate)
   gdn.rs             — gated_delta_net_step(), GatedDeltaNetState
   gdn_fused.rs       — GatedDeltaNetFusedAttention
   gqa.rs             — apply_gqa_attention(), GqaScratch
@@ -74,18 +74,18 @@ None of these support per-layer heterogeneous attention + FFN + quantization + K
 
 ### Attention variants and their state requirements
 
-| Variant | State | Scratch | Category |
-|---------|-------|---------|----------|
-| MHA `10998240` | KV cache | Softmax buffers | Softmax |
-| GQA `36e42eb8` | KV cache | Softmax + group batch | Softmax |
-| Flash CPU | KV cache | Tiled buffers | Softmax |
-| Flash Causal | KV cache | Tiled buffers | Softmax |
-| GDN `82877a02` | Recurrent `[B, heads, state_rank, head_dim]` | Gate/delta buffers | Linear |
-| GDN Fused | Recurrent | Gate/delta + fused | Linear |
-| Gated Attention | KV cache | Gate buffers | Softmax |
-| Differential `ba18a56e` | KV cache | Split Q/K + lambda | Softmax |
-| NSA (Sparse Attention `44932c9a`) | KV cache + sparse state | Sparse selection | Sparse |
-| Decode | KV cache | Minimal | Softmax |
+| Variant                           | State                                        | Scratch               | Category          |
+| --------------------------------- | -------------------------------------------- | --------------------- | ----------------- |
+| MHA `10998240`                    | None (scratch `AttentionBuffers`)            | Softmax buffers       | Softmax (encoder) |
+| GQA `36e42eb8`                    | KV cache                                     | Softmax + group batch | Softmax           |
+| Flash CPU                         | KV cache                                     | Tiled buffers         | Softmax           |
+| Flash Causal                      | KV cache                                     | Tiled buffers         | Softmax           |
+| GDN `82877a02`                    | Recurrent `[B, heads, state_rank, head_dim]` | Gate/delta buffers    | Linear            |
+| GDN Fused                         | Recurrent                                    | Gate/delta + fused    | Linear            |
+| Gated GQA                         | KV cache                                     | Gate + GQA scratch    | Softmax           |
+| Differential `ba18a56e`           | KV cache                                     | Split Q/K + lambda    | Softmax           |
+| NSA (Sparse Attention `44932c9a`) | KV cache + sparse state                      | Sparse selection      | Sparse            |
+| Decode                            | KV cache                                     | Minimal               | Softmax           |
 
 The three state categories (KV, Recurrent, Sparse hybrid) are the fundamental reason a single trait with one `State` associated type does not work for heterogeneous composition.
 
@@ -100,8 +100,9 @@ Adopt a **two-tier architecture** combining enum-dispatched inner kernels (Optio
 Three category-specific traits capture the natural API differences between softmax, linear, and sparse attention:
 
 ```rust
-/// Softmax-based attention (MHA, GQA, Flash, Differential, Decode).
-/// State is always a KV cache variant.
+/// Softmax-based attention with KV cache (GQA, Flash, Differential, Decode).
+/// MHA (BERT-style encoder attention) uses scratch buffers instead of KV cache
+/// and implements `SoftmaxAttention` with `KvCacheKind::None`.
 pub trait SoftmaxAttention: Send + Sync {
     fn forward_softmax(
         &self,
@@ -198,7 +199,10 @@ pub enum AttentionKind {
     FlashCausal(FlashCausalAttention),
     Gdn(GatedDeltaNetAttention),
     GdnFused(GatedDeltaNetFusedAttention),
-    GatedAttention(GatedAttention),
+    /// GQA with sigmoid gate (Qwen3.5-style). Uses gated.rs primitives
+    /// (deinterleave_q_gate, apply_sigmoid_gate) composed with GQA attention.
+    /// Not a standalone kernel — wraps GQA with pre/post gate application.
+    GatedGqa(GatedGqaAttention),
     Differential(DifferentialAttention),
     Nsa(NativeSparseAttention),
     Decode(DecodeAttention),
@@ -213,7 +217,7 @@ impl AttentionOp for AttentionKind {
             Self::FlashCausal(_) => AttentionTag::FlashCausal,
             Self::Gdn(_) => AttentionTag::Gdn,
             Self::GdnFused(_) => AttentionTag::GdnFused,
-            Self::GatedAttention(_) => AttentionTag::GatedAttention,
+            Self::GatedGqa(_) => AttentionTag::GatedGqa,
             Self::Differential(_) => AttentionTag::Differential,
             Self::Nsa(_) => AttentionTag::Nsa,
             Self::Decode(_) => AttentionTag::Decode,
@@ -226,14 +230,14 @@ impl AttentionOp for AttentionKind {
         cache: &KvCacheSpec,
     ) -> Result<AttentionStateKind> {
         match self {
-            // Softmax-family: all use KV cache
+            // Softmax-family with KV cache
             Self::Gqa(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
             Self::FlashCpu(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
             Self::FlashCausal(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
             Self::Differential(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
             Self::Decode(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
-            Self::Mha(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
-            Self::GatedAttention(a) => Ok(AttentionStateKind::Kv(a.alloc_kv(shape, cache)?)),
+            // MHA (BERT-style encoder): scratch buffers, no KV cache
+            Self::Mha(_) => Ok(AttentionStateKind::None),
             // Linear-family: recurrent state, NO KV cache
             Self::Gdn(a) => Ok(AttentionStateKind::Recurrent(a.alloc_recurrent(shape)?)),
             Self::GdnFused(a) => Ok(AttentionStateKind::Recurrent(a.alloc_recurrent(shape)?)),
@@ -411,13 +415,19 @@ pub struct AttnShape {
     pub head_dim: usize,
 }
 
-/// Per-layer metrics for architecture search diagnostics (ADR-061).
+/// Per-layer metrics for architecture search diagnostics.
+/// **The authoritative `LayerMetrics` schema is defined in ADR-061.**
+/// This struct is an illustrative subset; implementers should use ADR-061's
+/// full definition (including mode, block_influence, sparsity, kv_page_mass).
 pub struct LayerMetrics {
-    pub attention_entropy: f32,
-    pub activation_rms: f32,
-    pub outlier_ratio: f32,
-    pub residual_cosine_sim: f32,
-    pub latency_us: u64,
+    pub mode: MetricsMode,
+    pub latency_ns: u64,
+    pub input_norm: f32,
+    pub output_norm: f32,
+    pub update_ratio: f32,
+    pub block_influence: f32,
+    pub entropy: Option<f32>,
+    pub sparsity: Option<f32>,
 }
 
 pub struct ForwardCtx<'a> {
@@ -692,6 +702,7 @@ Key validation: GDN with a KV cache spec is rejected. Softmax attention without 
 **Example configs**:
 
 **Config 1: Standard Qwen3.5-0.8B** (reproduces current behavior):
+
 ```yaml
 schema_version: lattice.arch/v1
 name: qwen35_0_8b_standard
@@ -703,7 +714,7 @@ defaults:
 layers:
   - repeat: 6
     sequence:
-      - {}  # GDN (default)
+      - {} # GDN (default)
       - {}
       - {}
       - attention: { kind: gqa }
@@ -711,6 +722,7 @@ layers:
 ```
 
 **Config 2: Hybrid GDN+GQA+NSA experiment**:
+
 ```yaml
 schema_version: lattice.arch/v1
 name: qwen35_0_8b_nsa_experiment
@@ -729,12 +741,13 @@ layers:
         kv_cache: { kind: paged, dtype: f16, block_size: 16 }
 healing:
   method: lora
-  layers: [2, 6, 10, 14, 18, 22]  # NSA layers need adaptation
+  layers: [2, 6, 10, 14, 18, 22] # NSA layers need adaptation
   rank: 8
   alpha: 16
 ```
 
 **Config 3: Pruned model with QuaRot-Q4**:
+
 ```yaml
 schema_version: lattice.arch/v1
 name: qwen35_0_8b_pruned_quarot
@@ -744,12 +757,17 @@ defaults:
   quant: { weights: quarot_q4, group_size: 128, rotation: { seed: 0xC0FFEE } }
 overrides:
   - layers: [20, 22]
-    residual: skip  # ShortGPT-style removal
+    residual: skip # ShortGPT-style removal
   - layers: [0, 1, 2]
-    quant: { weights: f16 }  # Keep early layers full-precision
+    quant: { weights: f16 } # Keep early layers full-precision
 ```
 
-### D6: Architecture search environment
+### D6: Architecture search environment (Future Work)
+
+**Note:** D6 is deferred to a dedicated architecture-search ADR. ADR-059 defines the layer
+representation and DSL; search environments consume `NormalizedModelSpec` but belong in
+ADR-061's experiment runner or a separate ADR. The hooks below are preserved as design intent,
+not as v0.3 scope.
 
 ```rust
 pub trait ArchitectureEnv {
@@ -772,13 +790,13 @@ pub enum ArchAction {
 
 Search space for 24 layers with 10 attention x 4 quantization = 40 choices per layer is 40^24 ~ 2.8 x 10^38. The `search` section constrains this with allowed sets and hardware constraints. Search algorithms (staged plan):
 
-| Algorithm | Fit for lattice | When to use |
-|-----------|----------------|-------------|
-| Random search + constraints | Strong baseline | DSL validation, early exploration |
-| Evolutionary search | Very good | Discrete architecture strings, Pareto fronts |
-| Bayesian optimization / TPE | Very good | Expensive evaluations, structured features |
-| PPO `e59014dd` on discrete actions | Later | Needs many evaluations; better with cheap proxies |
-| LLM-agent search | Orchestration | Emit configs/actions, not source patches |
+| Algorithm                          | Fit for lattice | When to use                                       |
+| ---------------------------------- | --------------- | ------------------------------------------------- |
+| Random search + constraints        | Strong baseline | DSL validation, early exploration                 |
+| Evolutionary search                | Very good       | Discrete architecture strings, Pareto fronts      |
+| Bayesian optimization / TPE        | Very good       | Expensive evaluations, structured features        |
+| PPO `e59014dd` on discrete actions | Later           | Needs many evaluations; better with cheap proxies |
+| LLM-agent search                   | Orchestration   | Emit configs/actions, not source patches          |
 
 Prior work: NAS-RL (`7504a737`, Zoph & Le 2017, arxiv:1611.01578), HAT (`b8d7b2ff`, Wang et al. 2020, arxiv:2005.14187), DynaBERT (`aa3ffd4a`, Hou et al. 2020, arxiv:2004.04037), KVTuner (`6bf7f34d`, Liu et al. 2025, arxiv:2502.04420), Zero-Cost NAS Proxies (`7e5b0314`, Abdelfattah et al. 2021, arxiv:2101.08134).
 
@@ -797,12 +815,12 @@ pub trait AttentionKernel: Send + Sync + 'static {
 }
 ```
 
-| Property | Assessment |
-|----------|-----------|
-| Type safety | Excellent -- GDN cannot accidentally receive KV cache state |
-| Runtime composition | **Poor** -- heterogeneous storage requires `dyn Any` downcasting |
-| Hot-loop performance | Excellent with monomorphized generics |
-| Code size | Grows via attention x quant x FFN generics |
+| Property             | Assessment                                                       |
+| -------------------- | ---------------------------------------------------------------- |
+| Type safety          | Excellent -- GDN cannot accidentally receive KV cache state      |
+| Runtime composition  | **Poor** -- heterogeneous storage requires `dyn Any` downcasting |
+| Hot-loop performance | Excellent with monomorphized generics                            |
+| Code size            | Grows via attention x quant x FFN generics                       |
 
 **Rejected because**: `Vec<Box<dyn AttentionKernel>>` requires type erasure of the associated `State` and `Scratch` types. The only way to get them back is `downcast_ref::<GqaState>()`, which reintroduces unsafe code and loses the type safety that motivated associated types in the first place. For a closed set of 10 implementations, the cure is worse than the disease.
 
@@ -812,12 +830,12 @@ pub trait AttentionKernel: Send + Sync + 'static {
 
 See Decision section above. This is the selected approach.
 
-| Property | Assessment |
-|----------|-----------|
-| Type safety | Good -- mismatches caught at construction or with one checked match |
-| Runtime composition | Excellent for DSL-driven models |
-| Hot-loop performance | Very good -- one predictable branch per layer |
-| Extensibility | Good for lattice's closed set of 10 attention variants |
+| Property             | Assessment                                                          |
+| -------------------- | ------------------------------------------------------------------- |
+| Type safety          | Good -- mismatches caught at construction or with one checked match |
+| Runtime composition  | Excellent for DSL-driven models                                     |
+| Hot-loop performance | Very good -- one predictable branch per layer                       |
+| Extensibility        | Good for lattice's closed set of 10 attention variants              |
 
 **Why enum dispatch wins for lattice's specific set**: The `enum_dispatch` crate's benchmarks report large speedups over `dyn Trait` for tiny trait methods because enum dispatch avoids heap indirection, vtable lookups, and enables compiler inlining ([docs.rs/enum_dispatch](https://docs.rs/enum_dispatch/latest/enum_dispatch/)). For lattice, dispatch happens once per layer per token (24 calls/token). Even if an indirect call costs tens of nanoseconds, total dispatch is sub-microsecond -- dominated by projection matmuls. But vtable dispatch **prevents inlining across the call boundary**, which matters when the compiler could otherwise fuse the dispatch with the subsequent GEMM setup. Enum dispatch preserves this optimization path.
 
@@ -886,18 +904,26 @@ See Decision section. Used as the **public runtime interface** (combined with Op
 
 The `LayerType` enum (`qwen35_config.rs:37-42`) is superseded by `AttentionKind`. Migration preserves all existing behavior:
 
-| Phase | Scope | Files Changed | PRs |
-|-------|-------|---------------|-----|
-| P1 | `AttentionOp` trait + `AttentionKind` enum wrapping existing 10 modules | `attention/mod.rs`, new `attention/attention_op.rs`, new `attention/attention_kind.rs` | 1 |
-| P2 | `LayerOp` trait + `TransformerLayer` struct; refactor Qwen3.5 CPU forward to use `TransformerLayer` | `forward/cpu/`, new `layer/mod.rs`, new `layer/transformer_layer.rs` | 1 |
-| P3 | `FfnKind` + `LinearKind` + `NormKind` + `ResidualPolicy` enums | New `layer/ffn_kind.rs`, `layer/linear_kind.rs`, `layer/norm_kind.rs` | 1 |
-| P4 | `ModelSpec` YAML parser + validator + builder | New `arch/spec.rs`, `arch/normalize.rs`, `arch/validate.rs`, `arch/build.rs` | 1-2 |
-| P5 | `ResidualPolicy::Skip` for pruned layers (links to ADR-060) | `layer/transformer_layer.rs` | 1 |
-| P6 | `ArchitectureEnv` + search database (links to ADR-061) | New `search/env.rs`, `search/reward.rs`, `search/db.rs` | 2-3 |
+| Phase | Scope                                                                                               | Files Changed                                                                          | PRs |
+| ----- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | --- |
+| P1    | `AttentionOp` trait + `AttentionKind` enum wrapping existing 10 modules                             | `attention/mod.rs`, new `attention/attention_op.rs`, new `attention/attention_kind.rs` | 1   |
+| P2    | `LayerOp` trait + `TransformerLayer` struct; refactor Qwen3.5 CPU forward to use `TransformerLayer` | `forward/cpu/`, new `layer/mod.rs`, new `layer/transformer_layer.rs`                   | 1   |
+| P3    | `FfnKind` + `LinearKind` + `NormKind` + `ResidualPolicy` enums                                      | New `layer/ffn_kind.rs`, `layer/linear_kind.rs`, `layer/norm_kind.rs`                  | 1   |
+| P4    | `ModelSpec` YAML parser + validator + builder                                                       | New `arch/spec.rs`, `arch/normalize.rs`, `arch/validate.rs`, `arch/build.rs`           | 1-2 |
+| P5    | `ResidualPolicy::Skip` for pruned layers (links to ADR-060)                                         | `layer/transformer_layer.rs`                                                           | 1   |
+| P6    | `ArchitectureEnv` + search database (links to ADR-061) — **Future Work**                            | New `search/env.rs`, `search/reward.rs`, `search/db.rs`                                | 2-3 |
 
-**Dependency order**: P1 -> P2 -> P3 -> P4 -> P5, P6 (P5 and P6 are independent).
+**v0.3 scope**: P1 through P5. P6 is deferred to a dedicated architecture-search ADR.
+
+**Dependency order**: P1 -> P2 -> P3 -> P4 -> P5.
 
 **Key invariant**: After each phase, `make bench-compare` must show no throughput regression on Qwen3.5-0.8B decode. The refactor adds abstraction layers; it must not add overhead.
+
+**Quality gates per phase** (beyond bench-compare throughput):
+
+- P1-P2: PPL/NLL delta < 0.001 vs pre-refactor on WikiText-2 (refactor must be semantically identical)
+- P3-P4: Token agreement test: identical logits for 100 random prompts before/after
+- P5: Paired PPL comparison for pruned vs unpruned (links to ADR-060 quality gates)
 
 ---
 

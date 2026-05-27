@@ -89,3 +89,13 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | ADR                                      | Title                                     |
 | ---------------------------------------- | ----------------------------------------- |
 | [058](ADR-058-cpu-perf-regression-ci.md) | CPU Performance Regression Tracking in CI |
+
+## architecture / research (ADR-059 through ADR-063) — Proposed
+
+| ADR                                                | Title                                        | Status   | Depends on   |
+| -------------------------------------------------- | -------------------------------------------- | -------- | ------------ |
+| [059](ADR-059-composable-layer-architecture.md)    | Composable Layer Architecture                | Proposed | ADR-010      |
+| [060](ADR-060-pruning-toolbox.md)                  | Pruning Toolbox                              | Proposed | ADR-044, 059 |
+| [061](ADR-061-inference-metrics-infrastructure.md) | Inference Metrics & Experiment Runner        | Proposed | ADR-059      |
+| [062](ADR-062-metal-fa2-prefill.md)                | Metal FA2 Prefill + KV Cache Quantization    | Proposed | ADR-047      |
+| [063](ADR-063-serving-architecture.md)             | Serving Architecture — CLI, HTTP, API Compat | Proposed | ADR-048, 046 |

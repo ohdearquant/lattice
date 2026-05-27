@@ -4,7 +4,7 @@
 **Date**: 2026-05-27
 **Crate**: lattice-inference (calibration, scoring, transforms), lattice-tune (recovery, future)
 **Research**: RQ-2 (`workspaces/20260527/02.md`)
-**Depends on**: ADR-044 (QuaRot rotation infrastructure), ADR-059 (ResidualPolicy)
+**Depends on**: ADR-044 (QuaRot rotation infrastructure), ADR-059 (ResidualPolicy, AttentionTag), ADR-061 Phase 1 (CheapOnline metrics substrate — update_ratio and block_influence are the scoring signals ADR-060 consumes)
 
 ## Context
 
@@ -14,12 +14,12 @@ The RQ-2 survey examined 12 methods across two families. The critical finding fo
 
 A second finding: the claim "50% pruning with less than 1 PPL degradation" is **scale-dependent**. It holds for 13B+ models under SparseGPT/Wanda but not for Qwen3.5-0.8B-class models. STADE's Qwen3 table is the most directly relevant evidence:
 
-| Model | Dense PPL | 50% STADE PPL | Delta |
-|---|---|---|---|
-| Qwen3-32B | 7.60 | 8.65 | +1.05 |
-| Qwen3-14B | 8.64 | 9.60 | +0.96 |
-| Qwen3-8B | 9.72 | 11.19 | +1.47 |
-| Qwen3-1.7B | 16.67 | 18.67 | +2.00 |
+| Model      | Dense PPL | 50% STADE PPL | Delta |
+| ---------- | --------- | ------------- | ----- |
+| Qwen3-32B  | 7.60      | 8.65          | +1.05 |
+| Qwen3-14B  | 8.64      | 9.60          | +0.96 |
+| Qwen3-8B   | 9.72      | 11.19         | +1.47 |
+| Qwen3-1.7B | 16.67     | 18.67         | +2.00 |
 
 Source: STADE (arxiv:2503.22451), Table 4. The trend is clear: smaller models degrade more. For Qwen3.5-0.8B, 50% unstructured pruning will exceed +1 PPL. Conservative structured pruning (10-20%) is the realistic starting point.
 
@@ -27,21 +27,21 @@ Lattice has one critical advantage: **QuaRot's rotation machinery** (ADR-044) sh
 
 ### Method Comparison (12 methods surveyed)
 
-| Method | Pattern | Retraining? | Decision cost | Representative result | Lattice fit |
-|---|---|---|---|---|---|
-| **Lottery Ticket Hypothesis** (Frankle & Carlin 2019, arxiv:1803.03635) | Unstructured | Yes: iterative train-prune-reset | Very high | Sparse subnetworks at 10-20% of original | KG entity only; not implementable for inference-only |
-| **SparseGPT** (Frantar & Alistarh 2023, arxiv:2301.00774) | Unstructured, 2:4, 4:8 | No | Hessian inverse, cubic per layer | OPT-175B: 8.35->8.21 at 50% | Strong analysis baseline; no Metal speedup |
-| **Wanda** (Sun et al. 2024, arxiv:2306.11695) | Unstructured, 2:4, N:M | No | One forward pass | LLaMA-30B: 4.77->5.24 at 50% | Best first unstructured scorer |
-| **STADE** (2025, arxiv:2503.22451) | Unstructured, N:M | No | One forward pass | Qwen3-14B: 8.64->9.60 at 50% | Essential for Qwen/RMSNorm models |
-| **Wanda++** (2025, arxiv:2503.04992) | Unstructured, N:M | Regional gradients | Lightweight | 32% PPL improvement over Wanda | Future Wanda v2; needs gradient infra |
-| **D2Prune** (2026, arxiv:2601.09176) | Unstructured, semi-structured | Weight update | Dual Taylor + attention matching | Improves over SparseGPT/Wanda on Qwen3 | Later research target |
-| **ShortGPT** (Men et al. 2024, ACL Findings 2025) | Layer removal | No | One forward pass for BI | LLaMA-2-13B: remove 10/40 layers, MMLU 55->52 | **MVP structured pruner** |
-| **Gromov Layer Pruning** (2024, arxiv:2403.17887) | Contiguous layer blocks | QLoRA healing | Similarity search + PEFT | Large blocks removable with QLoRA | After lattice-tune #88 |
-| **Prune&Comp** (2025, arxiv:2507.18212) | Layer removal | Training-free compensation | Iterative pruning + compensation | Frames degradation as magnitude-gap | Extension after ShortGPT |
-| **SliceGPT** (Ashkboos et al., ICLR 2024) | Residual width | No (optional recovery) | PCA per block, 1024 cal seqs | OPT-66B: 25% slicing, PPL 9.33->9.68 | **Highest-priority research** (reuses QuaRot) |
-| **LLM-Pruner** (Ma et al. 2023, NeurIPS) | Coupled channels/heads/neurons | LoRA recovery | Gradient-based importance | Structural pruning + LoRA in ~3h | After training loop exists |
-| **FLAP** (An et al. 2024, AAAI) | Channels/structured | No | One forward pass, fluctuation | Outperforms LLM-Pruner without retraining | After activation-stat framework |
-| **CFSP** (2024, arxiv:2409.13199) | Structured block/channel | Optional IG-LoRA | One forward pass | Coarse-to-fine activation info | Design reference; avoids GQA head pruning |
+| Method                                                                  | Pattern                        | Retraining?                      | Decision cost                    | Representative result                         | Lattice fit                                          |
+| ----------------------------------------------------------------------- | ------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------------- | ---------------------------------------------------- |
+| **Lottery Ticket Hypothesis** (Frankle & Carlin 2019, arxiv:1803.03635) | Unstructured                   | Yes: iterative train-prune-reset | Very high                        | Sparse subnetworks at 10-20% of original      | KG entity only; not implementable for inference-only |
+| **SparseGPT** (Frantar & Alistarh 2023, arxiv:2301.00774)               | Unstructured, 2:4, 4:8         | No                               | Hessian inverse, cubic per layer | OPT-175B: 8.35->8.21 at 50%                   | Strong analysis baseline; no Metal speedup           |
+| **Wanda** (Sun et al. 2024, arxiv:2306.11695)                           | Unstructured, 2:4, N:M         | No                               | One forward pass                 | LLaMA-30B: 4.77->5.24 at 50%                  | Best first unstructured scorer                       |
+| **STADE** (2025, arxiv:2503.22451)                                      | Unstructured, N:M              | No                               | One forward pass                 | Qwen3-14B: 8.64->9.60 at 50%                  | Essential for Qwen/RMSNorm models                    |
+| **Wanda++** (2025, arxiv:2503.04992)                                    | Unstructured, N:M              | Regional gradients               | Lightweight                      | 32% PPL improvement over Wanda                | Future Wanda v2; needs gradient infra                |
+| **D2Prune** (2026, arxiv:2601.09176)                                    | Unstructured, semi-structured  | Weight update                    | Dual Taylor + attention matching | Improves over SparseGPT/Wanda on Qwen3        | Later research target                                |
+| **ShortGPT** (Men et al. 2024, ACL Findings 2025)                       | Layer removal                  | No                               | One forward pass for BI          | LLaMA-2-13B: remove 10/40 layers, MMLU 55->52 | **MVP structured pruner**                            |
+| **Gromov Layer Pruning** (2024, arxiv:2403.17887)                       | Contiguous layer blocks        | QLoRA healing                    | Similarity search + PEFT         | Large blocks removable with QLoRA             | After lattice-tune #88                               |
+| **Prune&Comp** (2025, arxiv:2507.18212)                                 | Layer removal                  | Training-free compensation       | Iterative pruning + compensation | Frames degradation as magnitude-gap           | Extension after ShortGPT                             |
+| **SliceGPT** (Ashkboos et al., ICLR 2024)                               | Residual width                 | No (optional recovery)           | PCA per block, 1024 cal seqs     | OPT-66B: 25% slicing, PPL 9.33->9.68          | **Highest-priority research** (reuses QuaRot)        |
+| **LLM-Pruner** (Ma et al. 2023, NeurIPS)                                | Coupled channels/heads/neurons | LoRA recovery                    | Gradient-based importance        | Structural pruning + LoRA in ~3h              | After training loop exists                           |
+| **FLAP** (An et al. 2024, AAAI)                                         | Channels/structured            | No                               | One forward pass, fluctuation    | Outperforms LLM-Pruner without retraining     | After activation-stat framework                      |
+| **CFSP** (2024, arxiv:2409.13199)                                       | Structured block/channel       | Optional IG-LoRA                 | One forward pass                 | Coarse-to-fine activation info                | Design reference; avoids GQA head pruning            |
 
 ## Decision
 
@@ -54,7 +54,7 @@ Every pruning method requires: calibration data -> forward pass -> activation ca
 /// calibration sequences. One `LayerStats` per transformer layer.
 pub struct LayerStats {
     pub layer_idx: usize,
-    pub layer_type: LayerType,  // GatedDeltaNet or FullAttention
+    pub attention_tag: AttentionTag,  // ADR-059 taxonomy (supersedes LayerType)
 
     // --- Block Influence scoring (ShortGPT) ---
     /// Running dot product: sum_tokens(dot(x_in, x_out))
@@ -112,7 +112,7 @@ pub trait CalibrationObserver {
     fn observe_block_input(
         &mut self,
         layer: usize,
-        layer_type: LayerType,
+        attention_tag: AttentionTag,
         x: TensorView<'_>,
     ) -> Result<()>;
 
@@ -222,7 +222,7 @@ impl ImportanceScorer for ShortGptScorer {
             })
             .map(|(i, s)| LayerCandidate {
                 layer_idx: i,
-                layer_type: s.layer_type,
+                attention_tag: s.attention_tag,
                 block_influence: s.bi_score(),
             })
             .collect();
@@ -279,8 +279,9 @@ For each block l = 0..num_layers:
             W ← Q_l · W      (output-side absorption)
 
   Step 6. Keep only the top d' residual dimensions.
-          Physically slice tensors:
-            Input-reading tensors: keep last d' columns (after rotation)
+          After descending eigenvalue sort, the first d' coordinates carry
+          the most signal energy. Physically slice tensors:
+            Input-reading tensors: keep first d' columns (after rotation)
             Output-writing tensors: keep first d' rows (after rotation)
 
   Step 7. For per-block rotations where Q_{l-1} ≠ Q_l:
@@ -292,16 +293,16 @@ For each block l = 0..num_layers:
 
 **Tensor-axis table** (which tensors get sliced on which axis):
 
-| Tensor class | Rotation/slice action |
-|---|---|
-| Token embedding output axis | Rotate and slice residual output axis |
-| `q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj` | Rotate/slice the **input residual axis** (columns) |
-| `o_proj`, `down_proj` | Rotate/slice the **output residual axis** (rows) |
-| `lm_head` | Rotate/slice the **input residual axis** (columns) |
+| Tensor class                                             | Rotation/slice action                              |
+| -------------------------------------------------------- | -------------------------------------------------- |
+| Token embedding output axis                              | Rotate and slice residual output axis              |
+| `q_proj`, `k_proj`, `v_proj`, `gate_proj`, `up_proj`     | Rotate/slice the **input residual axis** (columns) |
+| `o_proj`, `down_proj`                                    | Rotate/slice the **output residual axis** (rows)   |
+| `lm_head`                                                | Rotate/slice the **input residual axis** (columns) |
 | GDN `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b` | Rotate/slice the **input residual axis** (columns) |
-| GDN `out_proj` | Rotate/slice the **output residual axis** (rows) |
-| Residual bridge between differently rotated blocks | Insert/fuse/slice `Q_{prev}^T Q_next` |
-| Internal attention head dimension | Do **not** slice |
+| GDN `out_proj`                                           | Rotate/slice the **output residual axis** (rows)   |
+| Residual bridge between differently rotated blocks       | Insert/fuse/slice `Q_{prev}^T Q_next`              |
+| Internal attention head dimension                        | Do **not** slice                                   |
 
 **RoPE safety rules.** Baseline SliceGPT must NOT rotate or slice inside the Q/K head coordinate system. RoPE acts after `q_proj` / `k_proj` on per-head Q/K coordinates. If SliceGPT only changes the residual-stream basis and fuses that basis into the **input axes** of projections, RoPE remains unchanged.
 
@@ -322,19 +323,23 @@ UNSAFE: Break even/odd RoPE pairs.
 pub trait OrthogonalBasis {
     fn dim(&self) -> usize;
 
+    /// Whether this basis supports the given dimension (power-of-two check
+    /// for Hadamard, any dim for PCA/Dense).
+    fn supports_dim(&self, n: usize) -> bool;
+
     /// X ← X Q  (rotate activation vectors right-multiply)
-    fn apply_right(&self, x: &mut Tensor);
+    fn apply(&self, x: &mut [f32], rows: usize, cols: usize) -> Result<()>;
 
-    /// W ← Q^T W  (absorb rotation into weight matrix, left side)
-    fn apply_left_t(&self, w: &mut Tensor);
+    /// X ← X Q^T  (inverse rotation)
+    fn apply_inverse(&self, x: &mut [f32], rows: usize, cols: usize) -> Result<()>;
 
-    /// Fuse rotation into a linear layer's input side: W ← W Q^T
-    /// This is what input-reading tensors (q_proj etc.) get.
-    fn fuse_into_linear_input(&self, linear: &mut LinearWeight);
+    /// Absorb rotation into weight matrix input side: W ← W Q^T
+    /// Compatible with existing `absorb_input_rotation_f64` in quarot::rotation.
+    fn absorb_input_rotation(&self, w: &mut [f64], rows: usize, cols: usize) -> Result<()>;
 
-    /// Fuse rotation into a linear layer's output side: W ← Q W
-    /// This is what output-writing tensors (o_proj etc.) get.
-    fn fuse_into_linear_output(&self, linear: &mut LinearWeight);
+    /// Absorb rotation into weight matrix output side: W ← Q W
+    /// Compatible with existing `absorb_output_rotation_f64` in quarot::rotation.
+    fn absorb_output_rotation(&self, w: &mut [f64], rows: usize, cols: usize) -> Result<()>;
 }
 
 pub enum BasisKind {
@@ -368,7 +373,7 @@ dense fp16/bf16 model
 
 Do **NOT** apply QuaRot's Hadamard first and then expect PCA slicing to work. Hadamard deliberately spreads information across all coordinates, making dimensions look similarly important. After slicing, the reduced model can be rotated for quantization.
 
-**Implementation detail**: if lattice's Hadamard kernels require power-of-two dimensions, the SliceGPT planner should prefer `d'` values compatible with the rotation backend (multiples of 128 or block-Hadamard-friendly widths). For Qwen3.5-0.8B with d=1024: d'=896 (12.5% slice) and d'=768 (25%) are both power-of-two-friendly.
+**Implementation detail**: lattice's current `RandomizedHadamard` (ADR-044) requires **power-of-two** dimensions (`hadamard.rs:139`). `d'=896` and `d'=768` are NOT powers of two — they require a `BlockHadamard` basis (block-diagonal Hadamard with block_size being a power of two). The SliceGPT→QuaRot composition is therefore gated on P9's `BlockHadamard` implementation. Until then, the SliceGPT+QuaRot pipeline is restricted to power-of-two `d'` values (e.g., `d'=512` for Qwen3.5-0.8B with d=1024 — a 50% slice, which may be too aggressive). For Qwen3.5-0.8B: d'=896 (12.5% slice) and d'=768 (25%) are the target ratios, but both require `BlockHadamard`.
 
 **Why SliceGPT on Qwen3.5-0.8B is experimental.** The original SliceGPT ICLR paper reports OPT, LLaMA-2, and Phi-2 results; it does NOT provide Qwen-family tables. No published Qwen-family SliceGPT results exist. Treat as research path with strict PPL gates and conservative slice ratios (5-15% for 0.5-1B models).
 
@@ -397,11 +402,11 @@ Structured pruning:    real speedup (this is why D2/D3 are prioritized).
 
 **GQA constraints from FlashAttention.** The public FlashAttention interface requires `num_q_heads % num_kv_heads == 0`. This constrains three pruning modes:
 
-| Mode | What changes | Risk |
-|---|---|---|
-| Q-head-only pruning | Remove selected Q heads + corresponding `o_proj` input slices | Must preserve divisibility; creates uneven groups |
-| KV-group pruning | Remove one KV head and ALL Q heads assigned to it | Safer shape semantics; larger quality hit per step |
-| Mask-only pruning | Keep tensors, multiply head output by zero | No speedup; scoring only |
+| Mode                | What changes                                                  | Risk                                               |
+| ------------------- | ------------------------------------------------------------- | -------------------------------------------------- |
+| Q-head-only pruning | Remove selected Q heads + corresponding `o_proj` input slices | Must preserve divisibility; creates uneven groups  |
+| KV-group pruning    | Remove one KV head and ALL Q heads assigned to it             | Safer shape semantics; larger quality hit per step |
+| Mask-only pruning   | Keep tensors, multiply head output by zero                    | No speedup; scoring only                           |
 
 **Lattice default: prune entire GQA groups.** CFSP (arxiv:2409.13199) explicitly avoids pruning attention heads in GQA models because it can cause significant degradation. Lattice follows this constraint for the first deployable version: remove entire KV groups (a KV head plus all its assigned Q heads), not arbitrary Q heads.
 
@@ -544,12 +549,12 @@ The strict answer is scale-dependent.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why not |
-|---|---|---|---|
-| SparseGPT first | Best quality | Hessian inverse, cubic per layer, complex | Wanda gives 80% of analysis value at 5% cost |
-| Unstructured + sparse kernels | Real speedup | Metal has no sparse GEMM | Infrastructure doesn't exist |
-| LLM-Pruner (gradient-based) | Better importance scores | Requires backward pass | No training loop yet |
-| Skip calibration, use magnitude-only | Simpler | Magnitude alone misses activation importance | Wanda proved activation-weight product matters |
+| Alternative                          | Pros                     | Cons                                         | Why not                                        |
+| ------------------------------------ | ------------------------ | -------------------------------------------- | ---------------------------------------------- |
+| SparseGPT first                      | Best quality             | Hessian inverse, cubic per layer, complex    | Wanda gives 80% of analysis value at 5% cost   |
+| Unstructured + sparse kernels        | Real speedup             | Metal has no sparse GEMM                     | Infrastructure doesn't exist                   |
+| LLM-Pruner (gradient-based)          | Better importance scores | Requires backward pass                       | No training loop yet                           |
+| Skip calibration, use magnitude-only | Simpler                  | Magnitude alone misses activation importance | Wanda proved activation-weight product matters |
 
 ## Consequences
 
@@ -576,22 +581,22 @@ The strict answer is scale-dependent.
 
 ## Implementation Plan
 
-| Phase | Scope | Files | Depends on | Estimated PR |
-|---|---|---|---|---|
-| P0 | `CalibrationObserver` trait + `LayerStats` + forward hook points | `crates/inference/src/prune/calibration.rs`, `crates/inference/src/prune/mod.rs`, forward.rs hooks | -- | Single PR |
-| P1 | `CovarianceAccumulator` (streaming X^T X) | `crates/inference/src/prune/covariance.rs` | P0 | Same PR as P0 |
-| P2 | `BlockInfluenceScorer` + `ShortGptScorer` | `crates/inference/src/prune/scoring/block_influence.rs` | P0 |  |
-| P3 | `LayerRemovalTransform` (apply layer_mask, update config) | `crates/inference/src/prune/transforms/remove_layers.rs` | P2, ADR-059 `ResidualPolicy::Skip` |  |
-| P4 | `PplGate` (reuse `run_strided_perplexity`) | `crates/inference/src/prune/eval.rs` | P0, ADR-044 step 4 harness |  |
-| P5 | `PrunePlan` serialization + `lattice_pruning.json` metadata | `crates/inference/src/prune/plan.rs` | P0 |  |
-| P6 | `WandaScorer` + `StadeScorer` + mask export | `crates/inference/src/prune/scoring/wanda.rs`, `stade.rs` | P0 |  |
-| P7 | `FfnSwiGluScorer` + `FfnNeuronPruneTransform` | `crates/inference/src/prune/scoring/ffn_swiglu.rs`, `transforms/prune_ffn.rs` | P0 |  |
-| P8 | `GqaGroupScorer` + `GqaGroupPruneTransform` + Flash shape validation | `crates/inference/src/prune/scoring/attention_heads.rs`, `transforms/prune_heads.rs` | P0 |  |
-| P9 | `OrthogonalBasis` trait refactor from `quant::quarot` | `crates/inference/src/quant/orthogonal_basis.rs` | ADR-044 existing code |  |
-| P10 | `PcaCalibration` basis + `SliceGptScorer` | `crates/inference/src/prune/scoring/slice_pca.rs` | P1, P9 |  |
-| P11 | `SliceResidualTransform` (tensor rewriting) | `crates/inference/src/prune/transforms/slice_residual.rs` | P10 |  |
-| P12 | SliceGPT -> QuaRot composition pipeline | `crates/inference/src/prune/pipeline.rs` | P11, ADR-044 |  |
-| P13 | LoRA/QLoRA recovery after pruning | `crates/tune/src/prune_recovery.rs` | lattice-tune #88 |  |
+| Phase | Scope                                                                | Files                                                                                              | Depends on                         | Estimated PR  |
+| ----- | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------- | ------------- |
+| P0    | `CalibrationObserver` trait + `LayerStats` + forward hook points     | `crates/inference/src/prune/calibration.rs`, `crates/inference/src/prune/mod.rs`, forward.rs hooks | --                                 | Single PR     |
+| P1    | `CovarianceAccumulator` (streaming X^T X)                            | `crates/inference/src/prune/covariance.rs`                                                         | P0                                 | Same PR as P0 |
+| P2    | `BlockInfluenceScorer` + `ShortGptScorer`                            | `crates/inference/src/prune/scoring/block_influence.rs`                                            | P0                                 |               |
+| P3    | `LayerRemovalTransform` (apply layer_mask, update config)            | `crates/inference/src/prune/transforms/remove_layers.rs`                                           | P2, ADR-059 `ResidualPolicy::Skip` |               |
+| P4    | `PplGate` (reuse `run_strided_perplexity`)                           | `crates/inference/src/prune/eval.rs`                                                               | P0, ADR-044 step 4 harness         |               |
+| P5    | `PrunePlan` serialization + `lattice_pruning.json` metadata          | `crates/inference/src/prune/plan.rs`                                                               | P0                                 |               |
+| P6    | `WandaScorer` + `StadeScorer` + mask export                          | `crates/inference/src/prune/scoring/wanda.rs`, `stade.rs`                                          | P0                                 |               |
+| P7    | `FfnSwiGluScorer` + `FfnNeuronPruneTransform`                        | `crates/inference/src/prune/scoring/ffn_swiglu.rs`, `transforms/prune_ffn.rs`                      | P0                                 |               |
+| P8    | `GqaGroupScorer` + `GqaGroupPruneTransform` + Flash shape validation | `crates/inference/src/prune/scoring/attention_heads.rs`, `transforms/prune_heads.rs`               | P0                                 |               |
+| P9    | `OrthogonalBasis` trait refactor from `quant::quarot`                | `crates/inference/src/quant/orthogonal_basis.rs`                                                   | ADR-044 existing code              |               |
+| P10   | `PcaCalibration` basis + `SliceGptScorer`                            | `crates/inference/src/prune/scoring/slice_pca.rs`                                                  | P1, P9                             |               |
+| P11   | `SliceResidualTransform` (tensor rewriting)                          | `crates/inference/src/prune/transforms/slice_residual.rs`                                          | P10                                |               |
+| P12   | SliceGPT -> QuaRot composition pipeline                              | `crates/inference/src/prune/pipeline.rs`                                                           | P11, ADR-044                       |               |
+| P13   | LoRA/QLoRA recovery after pruning                                    | `crates/tune/src/prune_recovery.rs`                                                                | lattice-tune #88                   |               |
 
 **Dependency ordering for crate publishing**: all pruning code lives in `lattice-inference` (existing crate). No new crate needed. P13 touches `lattice-tune` (separate crate, ships later).
 
@@ -638,7 +643,7 @@ lattice_pruning.json        # method, sparsity stats
 - QuaRot infrastructure: `crates/inference/src/quant/quarot/` (ADR-044)
 - Rotation absorption: `quant::quarot::rotation` (input-side and output-side)
 - Rotation plan: `quant::quarot::plan` (per-tensor recipe for Qwen3.5 hybrid)
-- Qwen3.5 config: `crates/inference/src/model/qwen35_config.rs` (LayerType enum, layer_mask field)
+- Qwen3.5 config: `crates/inference/src/model/qwen35_config.rs` (AttentionTag via ADR-059, layer_mask field)
 - PPL evaluator: `qwen35::eval::run_strided_perplexity` (ADR-044 step 4)
 - ResidualPolicy: ADR-059
 

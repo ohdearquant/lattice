@@ -2,7 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-05-27
-**Crate**: lattice-inference (Metal shaders, KV cache)
+**Crate**: lattice-inference (Metal shaders, KV cache). Phase 0 proposes extracting shaders into a `crates/lattice-metal/` directory tree. **This introduces a new workspace member** — see Crate Layout below for dependency direction, feature gating, and publish-order consequences. If the team prefers keeping shaders inside `crates/inference/`, the same file structure applies under `crates/inference/src/metal/` without a new crate.
 **Research**: RQ-4 (`workspaces/20260527/04.md`)
 **Issues**: #126 (Metal FA2 prefill), #85 (MLX kernel study), #86 (shader extraction)
 **KG entities**: `Metal FA2 Prefill` (0dfbc841), `Metal Fused Attention` (48ee18b2), `FlashAttention-2` (63602a7f), `Chunked Prefill` (018193b3)
@@ -31,7 +31,7 @@ for t in 0..n {
 }
 ```
 
-This means prefill of `n` tokens dispatches `n` separate Metal compute commands, each processing an attention matrix of size `[1, t+1]`. Total work is O(n^2) dot products across all dispatches, with no Q-dimension parallelism, no tile reuse across query positions, and `n` GPU command buffer synchronization points. At 4K+ context, prefill latency is dominated by this attention loop.
+This means prefill of `n` tokens dispatches `n` separate per-token attention dispatches inside one prefill command buffer, each processing an attention matrix of size `[1, t+1]`. Total work is O(n^2) dot products across all dispatches, with no Q-dimension parallelism and no tile reuse across query positions. At 4K+ context, prefill latency is dominated by this attention loop. (Note: the overhead is per-token dispatch count, not per-token command buffer synchronization — the current code uses one encoder for the whole prefill at `metal_qwen35.rs:6311-6313`.)
 
 The `decode_attention` kernel itself (line 418-559) is an online-softmax GQA kernel with `Grid: [num_kv_heads, 1, 1], Threads: [256, 1, 1]` -- one threadgroup per KV head, 256 threads tiling over cache tokens in TILE_TOKENS=256 chunks. This design is optimal for M=1 decode but catastrophic for M>1 prefill.
 
@@ -97,19 +97,23 @@ Three build modes:
 **D1: Store K and V as `half`. Accumulate QK scores, softmax state, and output in `float`.**
 
 Changes to `flat.rs`:
+
 - `FlatKVCache` gets a parallel `k_f16: Vec<Vec<u16>>` / `v_f16: Vec<Vec<u16>>` storage path, gated by a `KvFormat` enum.
 - `append_kv` converts f32 input to f16 at write time.
 - `get_k` / `get_v` return f16 data; the attention kernel casts inside TGM load.
 - An f32 correctness path is preserved for regression testing.
 
 Changes to `paged.rs`:
+
 - `PagePool` data becomes `Vec<u16>` when `KvFormat::F16` is active.
 - `gather_k` / `gather_v` return f16 slices; no conversion buffer.
 
 Changes to `prefix.rs`:
+
 - `SharedPageRef` wraps `Arc<[u16]>` for f16 pages. The `copy_token_between_page_layouts` function operates on half-width elements.
 
 Metal kernel changes:
+
 - Tile load casts `half -> float` for QK accumulation and V accumulation.
 - Store path writes `float -> half` when populating KV cache from projections.
 
@@ -158,26 +162,42 @@ Use `exp2` (base-2 exponential) with pre-multiplied `scale * log2(e)` because Me
 
 All defaults must fit within the 32 KiB TGM ceiling. TGM holds: Q tile `[BQ, D]`, K tile `[BK, D]` (transposed), V tile `[BK, D]`, softmax accumulators, and padding for bank-conflict avoidance.
 
-Approximate threadgroup memory usage (f16 data tiles, f32 accumulators, 16-byte padding per buffer):
+Threadgroup memory formula (explicit per-buffer accounting):
 
-| `D` | `BQ` | `BK` | f16 TGM estimate | f32 TGM estimate | Status |
-|----:|-----:|-----:|-----------------:|-----------------:|--------|
-|  64 |   32 |   32 |          9.5 KiB |         17.5 KiB | Safe default |
-|  80 |   32 |   32 |         11.8 KiB |         21.8 KiB | Safe default |
-| 128 |   32 |   16 |         14.5 KiB |         26.5 KiB | Safe default |
-| 128 |   32 |   32 |         18.5 KiB |         34.5 KiB | **f16 only** (f32 exceeds 32 KiB) |
-|  64 |   32 |   64 |         13.5 KiB |         25.5 KiB | f16/f32 candidate |
-|  80 |   32 |   64 |         16.8 KiB |         31.8 KiB | f16 candidate; f32 tight |
-| 128 |   32 |   64 |         26.5 KiB |         50.5 KiB | f16 only, likely register-bound |
+```
+TGM_f16 = 2 * (BQ*D + BK*D + BK*D)   # Q[BQ,D] + K[BK,D] + V[BK,D] in f16
+        + 4 * (BQ*BK)                  # scores S[BQ,BK] in f32
+        + 4 * (BQ*3)                   # softmax row state: m, l, e (3 scalars per row)
+        + padding                       # 16-byte per buffer for bank-conflict avoidance
+TGM_f32 = 4 * (BQ*D + BK*D + BK*D) + 4*(BQ*BK) + 4*(BQ*3) + padding
+```
+
+|     `D` |   `BQ` |   `BK` | f16 TGM (formula) | f32 TGM (formula) | Status                                           |
+| ------: | -----: | -----: | ----------------: | ----------------: | ------------------------------------------------ |
+|      64 |     32 |     32 |          16.2 KiB |          28.2 KiB | Safe f16; f32 tight                              |
+|      80 |     32 |     32 |          19.2 KiB |          34.2 KiB | f16 only                                         |
+|     128 |     32 |     16 |          14.1 KiB |          26.1 KiB | Safe default                                     |
+|     128 |     32 |     32 |          28.2 KiB |          52.2 KiB | **Exceeds 32 KiB even f16** with scores resident |
+|      64 |     32 |     64 |          20.2 KiB |          36.2 KiB | f16 only                                         |
+|      80 |     32 |     64 |          24.2 KiB |          44.2 KiB | f16 only                                         |
+| **256** | **16** | **16** |      **25.6 KiB** |      **49.6 KiB** | **f16 only; Qwen3.5-0.8B target**                |
+| **256** |  **8** | **16** |      **13.1 KiB** |      **25.1 KiB** | **Safe default for D=256**                       |
+| **256** | **16** |  **8** |      **13.6 KiB** |      **25.6 KiB** | Alternative D=256 safe                           |
+
+**Note on D=128 BQ=32 BK=32**: Previous estimates undercounted by not including the `S[BQ,BK]` scores tile. With scores resident, this configuration exceeds 32 KiB for f16. Use BK=16 as the safe default for D=128. If scores are streamed (not staged in TGM), the original smaller tiles work — document which staging strategy the kernel uses.
+
+**D=256 (Qwen3.5-0.8B head_dim)**: The existing decode shader uses `HEAD_DIM=256` (`metal_qwen35.rs:440`). FA2 prefill must cover this. At D=256, even BQ=16/BK=16 uses 25.6 KiB f16 for Q/K/V+scores — within budget but tight. The recommended safe default is BQ=8/BK=16 (13.1 KiB) with BQ=16/BK=16 as an opt-in variant on devices with measured headroom.
 
 Starting tile table (mirrors MLX Steel instantiations):
 
-| GPU Family | Head dim | BQ | BK | WM | WN | Threads | Rationale |
-|------------|---------|---:|---:|---:|---:|--------:|-----------|
-| 7-10 (M1-M4) | 64, 80 | 32 | 32 | 4 | 1 | 128 | MLX Steel default; safe TGM/register footprint |
-| 7-10 (M1-M4) | 128 | 32 | 16 | 4 | 1 | 128 | Smaller BK avoids TGM/register pressure at D=128 |
-| 8-10 (M2-M4) | 64, 80 | 32 | 64 | 4 | 1 | 128 | Candidate: larger traversal tile if occupancy holds |
-| 9-10 (M3-M4) | 128 | 32 | 32 | 4 | 1 | 128 | f16 only; test against BK=16 default |
+| GPU Family       | Head dim |     BQ |     BK |    WM |    WN | Threads | Rationale                                              |
+| ---------------- | -------- | -----: | -----: | ----: | ----: | ------: | ------------------------------------------------------ |
+| 7-10 (M1-M4)     | 64, 80   |     32 |     32 |     4 |     1 |     128 | MLX Steel default; safe TGM/register footprint         |
+| 7-10 (M1-M4)     | 128      |     32 |     16 |     4 |     1 |     128 | Safe default for D=128 (BK=32 exceeds TGM with scores) |
+| **7-10 (M1-M4)** | **256**  |  **8** | **16** | **2** | **1** |  **64** | **Safe default for Qwen3.5-0.8B (13.1 KiB TGM)**       |
+| **8-10 (M2-M4)** | **256**  | **16** | **16** | **4** | **1** | **128** | **Opt-in for D=256 (25.6 KiB TGM; verify per device)** |
+| 8-10 (M2-M4)     | 64, 80   |     32 |     64 |     4 |     1 |     128 | Candidate: larger traversal tile if occupancy holds    |
+| 9-10 (M3-M4)     | 128      |     32 |     32 |     4 |     1 |     128 | f16 only; verify scores not in TGM or use streaming    |
 
 The 128-thread threadgroup layout (`WM=4, WN=1, 32 threads per simdgroup`) maps to Metal's simdgroup abstraction. MLX's `[[max_total_threads_per_threadgroup(WM * WN * 32)]]` attribute applies directly.
 
@@ -309,6 +329,7 @@ V scales:   [layer][page][kv_head][token][dim_group]       // per-token V
 The fused kernel loads packed int8 tiles, applies `scale * (q_int8 - zero_point)` in registers, and proceeds with the standard QK/softmax/PV flow. No global dequantization buffer in the production path (acceptable as a correctness oracle only).
 
 The attention processes KV in three segments to avoid divergent per-token formats:
+
 1. Compressed old prefix pages (int8)
 2. f16 residual tail (last 128-256 tokens)
 3. Current prefill suffix / current decode token
@@ -327,7 +348,7 @@ QuaRot's rotation infrastructure (`crates/inference/src/quant/quarot/` -- 11 sou
 
 Fused kernel: load packed nibbles, unpack via `(byte >> 4)` / `(byte & 0x0f)`, sign-extend, multiply by scale, optionally apply rotation/RoPE, then proceed with standard attention.
 
-**Pre-RoPE K quantization** (optional, int4 quality gate): quantize K before RoPE to preserve per-channel outlier structure (KVQuant insight). Cost: 3/(4G) of attention arithmetic when K RoPE is amortized per KV head group (~10-11% for Qwen's GQA group size 7). Implemented only in kernels that compute a KV-head group together, or that dequantize/RoPE K once and reuse across query heads.
+**Pre-RoPE K quantization** (optional, int4 quality gate): quantize K before RoPE to preserve per-channel outlier structure (KVQuant insight). Cost: 3/(4G) of attention arithmetic when K RoPE is amortized per KV head group. For Qwen3.5-0.8B with `gqa_factor=4` (8 Q heads / 2 KV heads), this is `3/(4*4) = 18.75%` overhead — significant but acceptable given the 8x memory reduction. Implemented only in kernels that compute a KV-head group together, or that dequantize/RoPE K once and reuse across query heads.
 
 ### Phase 6: SRFT and RateQuant (experimental)
 
@@ -340,26 +361,26 @@ Fused kernel: load packed nibbles, unpack via `(byte >> 4)` / `(byte & 0x0f)`, s
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Verdict |
-|---|---|---|---|
-| **MPS/MPSGraph integration** | Private Apple optimizations | AMX is a CPU-side matrix coprocessor; custom Metal compute shaders cannot invoke it. MLX attention is open Metal, not a black-box MPSGraph call. | Rejected -- no actionable private accelerator gap |
-| **Separate dequant-to-f16 global buffer** | Simple implementation | Writes and rereads f16 intermediates, throwing away bandwidth advantage. Open-TQ-Metal reports 48x attention speedup at 128K with fused vs dequant-then-attend. | Rejected as primary path; acceptable as correctness oracle |
-| **f32 TGM for all tile configurations** | Simplest kernel | `BQ=32 BK=32 D=128` at f32 needs 34.5 KiB, exceeding 32 KiB limit. Forces smaller tiles for the most common head dimension. | Rejected -- f16 TGM with f32 accumulators is the right split |
-| **CUDA-faithful FA2 port** | Matches paper exactly | CUDA warp/tensor-core mapping does not apply to Apple GPU simdgroups. | Rejected -- use MLX Steel tile shapes, not CUDA shapes |
-| **Full radix tree prefix cache** | Optimal token-boundary prefix matching | Complex in safe Rust; interior mutability, leaf LRU. | Deferred -- hash map covers single-user case per ADR-047 |
-| **Post-RoPE K quantization only** | Simpler kernel (no per-tile RoPE) | RoPE disrupts per-channel outlier structure; int4 quality degrades. | Acceptable for int8; re-evaluate at int4 quality gate |
+| Alternative                               | Pros                                   | Cons                                                                                                                                                            | Verdict                                                      |
+| ----------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| **MPS/MPSGraph integration**              | Private Apple optimizations            | AMX is a CPU-side matrix coprocessor; custom Metal compute shaders cannot invoke it. MLX attention is open Metal, not a black-box MPSGraph call.                | Rejected -- no actionable private accelerator gap            |
+| **Separate dequant-to-f16 global buffer** | Simple implementation                  | Writes and rereads f16 intermediates, throwing away bandwidth advantage. Open-TQ-Metal reports 48x attention speedup at 128K with fused vs dequant-then-attend. | Rejected as primary path; acceptable as correctness oracle   |
+| **f32 TGM for all tile configurations**   | Simplest kernel                        | `BQ=32 BK=32 D=128` at f32 needs 34.5 KiB, exceeding 32 KiB limit. Forces smaller tiles for the most common head dimension.                                     | Rejected -- f16 TGM with f32 accumulators is the right split |
+| **CUDA-faithful FA2 port**                | Matches paper exactly                  | CUDA warp/tensor-core mapping does not apply to Apple GPU simdgroups.                                                                                           | Rejected -- use MLX Steel tile shapes, not CUDA shapes       |
+| **Full radix tree prefix cache**          | Optimal token-boundary prefix matching | Complex in safe Rust; interior mutability, leaf LRU.                                                                                                            | Deferred -- hash map covers single-user case per ADR-047     |
+| **Post-RoPE K quantization only**         | Simpler kernel (no per-tile RoPE)      | RoPE disrupts per-channel outlier structure; int4 quality degrades.                                                                                             | Acceptable for int8; re-evaluate at int4 quality gate        |
 
 ---
 
 ## Expected Speedup Envelope
 
-| Change | Attention effect | End-to-end expectation |
-|---|---|---|
-| f32 KV -> f16 KV | Up to 2x lower KV bandwidth | +15-60% decode throughput, workload-dependent |
-| Sequential prefill -> FA2 prefill | Large TTFT improvement at long prompts | 1.3-2x TTFT improvement for long prefill-heavy requests |
-| f16 KV -> fused int8 KV | 2x lower KV payload than f16 | Long-context decode improvement; smaller at short context |
-| Fused int4 + rotation + f16 tail | ~4x lower payload than f16 plus scale overhead | Can beat f16 at long context if fused; validate on Qwen |
-| Prefix cache wiring | Skips matched prefill | Can dominate TTFT for repeated prompts |
+| Change                            | Attention effect                               | End-to-end expectation                                    |
+| --------------------------------- | ---------------------------------------------- | --------------------------------------------------------- |
+| f32 KV -> f16 KV                  | Up to 2x lower KV bandwidth                    | +15-60% decode throughput, workload-dependent             |
+| Sequential prefill -> FA2 prefill | Large TTFT improvement at long prompts         | 1.3-2x TTFT improvement for long prefill-heavy requests   |
+| f16 KV -> fused int8 KV           | 2x lower KV payload than f16                   | Long-context decode improvement; smaller at short context |
+| Fused int4 + rotation + f16 tail  | ~4x lower payload than f16 plus scale overhead | Can beat f16 at long context if fused; validate on Qwen   |
+| Prefix cache wiring               | Skips matched prefill                          | Can dominate TTFT for repeated prompts                    |
 
 Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** decode (current: ~118 tok/s). With fused int4 at longer contexts, **MLX-level or better** decode throughput is plausible (MLX: ~259 tok/s), but should be treated as a benchmark goal, not a guaranteed sum of independent speedups.
 
@@ -381,9 +402,9 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 
 ### Phase 2 -- MLX-style FA2 prefill
 
-**Deliverables**: `fa2_prefill_f16` kernel, tile variants for D=64/80/128, causal and non-causal modes, GQA mapping, page-table-ready addressing (even if initially contiguous).
+**Deliverables**: `fa2_prefill_f16` kernel, tile variants for D=64/80/128/**256**, causal and non-causal modes, GQA mapping, page-table-ready addressing (even if initially contiguous). D=256 is mandatory — Qwen3.5-0.8B has `head_dim=256` (`qwen35_config.rs:201`, `metal_qwen35.rs:440`).
 
-**Acceptance**: Beats current prefill at 2K+ sequence lengths. Preserves current decode path for M=1. PPL matches current prefill path.
+**Acceptance**: Beats current prefill at 2K+ sequence lengths. Preserves current decode path for M=1. PPL matches current prefill path. D=256 tile must pass on M1-M4 without exceeding 32 KiB TGM.
 
 ### Phase 3 -- Paged KV + prefix cache
 
@@ -401,7 +422,7 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 
 **Deliverables**: int4 nibble-packed page format, WHT/block-Hadamard rotation, Q/K rotation consistency, V inverse/folded compensation, fused decode attention, fused quant-write kernel.
 
-**Acceptance**: Qwen PPL and LongBench/RULER/NIAH within threshold. Faster than f16 KV at long context. Residual f16 tail enabled.
+**Acceptance**: Qwen3.5-0.8B PPL delta < 0.3 vs f16 KV (Q4 quantization budgets typically add 0.1-0.3 PPL; arxiv:2404.00456 Table 1). LongBench score within 2% of f16 baseline. RULER/NIAH at 4K/8K context: recall > 95%. Faster than f16 KV at context lengths > 2K. Residual f16 tail enabled.
 
 ### Phase 6 -- SRFT and RateQuant
 
@@ -429,14 +450,14 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 
 ### Risks
 
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| TGM pressure prevents larger tiles on some GPU families | Medium | Start with conservative BK=16/32; runtime autotune table |
-| f16 KV introduces token divergence vs f32 | Expected | Documented in literature; PPL delta < 0.05; f32 reference path preserved |
-| Shader extraction changes numerical behavior | Low | Bit-for-bit comparison tests against pre-extraction outputs |
-| int4 quality insufficient without pre-RoPE K | Medium | Gate on PPL/token-agreement; post-RoPE int8 as fallback |
-| SRFT complexity not justified by quality/speed gain | Medium | WHT is the production path; SRFT is explicitly experimental and droppable |
-| RateQuant calibration is model-specific | Low | Expose per-head bit budgets as metadata; calibration tool is offline |
+| Risk                                                    | Likelihood | Mitigation                                                                |
+| ------------------------------------------------------- | ---------- | ------------------------------------------------------------------------- |
+| TGM pressure prevents larger tiles on some GPU families | Medium     | Start with conservative BK=16/32; runtime autotune table                  |
+| f16 KV introduces token divergence vs f32               | Expected   | Documented in literature; PPL delta < 0.05; f32 reference path preserved  |
+| Shader extraction changes numerical behavior            | Low        | Bit-for-bit comparison tests against pre-extraction outputs               |
+| int4 quality insufficient without pre-RoPE K            | Medium     | Gate on PPL/token-agreement; post-RoPE int8 as fallback                   |
+| SRFT complexity not justified by quality/speed gain     | Medium     | WHT is the production path; SRFT is explicitly experimental and droppable |
+| RateQuant calibration is model-specific                 | Low        | Expose per-head bit budgets as metadata; calibration tool is offline      |
 
 ---
 

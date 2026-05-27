@@ -1,9 +1,10 @@
 # ADR-048: Continuous Batching with Disaggregated Prefill/Decode
 
-**Status**: Accepted
+**Status**: Accepted (Phase 2 GPU-worker ownership superseded by ADR-063)
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
 **Depends on**: ADR-004 (KV Cache), ADR-008 (LoRA Injection), ADR-047 (Paged KV Cache)
+**Amendment (2026-05-27)**: ADR-063 supersedes the "Tokio task owning a dedicated Metal command buffer encoder" Phase 2 wording. GPU work runs on a dedicated OS thread (`std::thread`), not on the tokio runtime, to avoid starving HTTP handlers during 10-100ms GPU steps. The Phase 1 `FifoScheduler`, chunked prefill, and single-resource GPU scheduling remain unchanged and are consumed by ADR-063.
 
 ---
 
@@ -79,6 +80,7 @@ This ADR covers interfaces and data structures only. It does not mandate any imp
 timeline for Phase 2, and does not touch the CPU inference path (`generate.rs`).
 
 **In scope**:
+
 - `InferenceRequest` and `InferenceResponse` types
 - `Scheduler` trait and `FifoScheduler` implementation
 - Iteration loop structure for the serving task
@@ -86,6 +88,7 @@ timeline for Phase 2, and does not touch the CPU inference path (`generate.rs`).
 - LoRA adapter grouping constraint
 
 **Out of scope**:
+
 - HTTP/gRPC serving layer
 - Speculative decoding integration (ADR-006)
 - Quantization during serving (ADR-044)
@@ -97,26 +100,26 @@ timeline for Phase 2, and does not touch the CPU inference path (`generate.rs`).
 ### Request lifecycle
 
 ```text
-  Client submit
-       │
-       ▼
-  RequestQueue (tokio::sync::mpsc)
-       │
-       ▼
-  Scheduler::select_batch()     ← called each iteration
-       │
-       ├─ prefill slots: chunk prompt → PagedKvBlock allocation → Metal prefill pass
-       │
-       └─ decode slots: single token → KV append → Metal decode pass
-            │
-            ▼
-       SamplerPool::sample()    ← per-sequence sampling config
-            │
-            ▼
-       token → stream to caller (tokio::sync::oneshot or watch channel)
-            │ (if EOS or max_len)
-            ▼
-       SequenceManager::release(seq_id)  // drops PageTable + GDN state for this sequence
+Client submit
+     │
+     ▼
+RequestQueue (tokio::sync::mpsc)
+     │
+     ▼
+Scheduler::select_batch()     ← called each iteration
+     │
+     ├─ prefill slots: chunk prompt → PagedKvBlock allocation → Metal prefill pass
+     │
+     └─ decode slots: single token → KV append → Metal decode pass
+          │
+          ▼
+     SamplerPool::sample()    ← per-sequence sampling config
+          │
+          ▼
+     token → stream to caller (tokio::sync::oneshot or watch channel)
+          │ (if EOS or max_len)
+          ▼
+     SequenceManager::release(seq_id)  // drops PageTable + GDN state for this sequence
 ```
 
 ### Core types
@@ -244,13 +247,13 @@ between them.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Decision |
-|---|---|---|---|
-| **Request-level batching** (static) | Simple scheduler; no mid-batch eviction | Decode waits for slowest sequence; GPU idle during mismatched lengths | Rejected — baseline of 2022, superseded by Orca |
-| **Full disaggregation (Phase 2 now)** | Maximum TTFT/TBT separation; cleanest utilization | Two `MTLCommandQueue` instances add synchronization complexity; `Arc<PagedKvBlock>` ownership protocol unproven | Deferred — chunked prefill recovers most of the gain on single-GPU Apple Silicon |
-| **Separate process per worker** | True isolation; OS-level memory protection | IPC overhead; no shared Metal heap; defeats unified-memory zero-copy advantage | Rejected — Rust `async` tasks in one process with ownership transfer achieves isolation without IPC |
-| **Priority-based scheduler (SLA-aware)** | Better p99 latency for high-priority requests | Priority inversion risk; more complex preemption policy; premature for Phase 1 | Deferred to Phase 2 |
-| **Preemption via cache eviction** | Handles memory pressure gracefully | Must serialize evicted sequence's KV pages to CPU or disk; page fault on resume | Accepted for Phase 2; Phase 1 rejects new requests when memory is low instead of evicting |
+| Alternative                              | Pros                                              | Cons                                                                                                            | Decision                                                                                            |
+| ---------------------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Request-level batching** (static)      | Simple scheduler; no mid-batch eviction           | Decode waits for slowest sequence; GPU idle during mismatched lengths                                           | Rejected — baseline of 2022, superseded by Orca                                                     |
+| **Full disaggregation (Phase 2 now)**    | Maximum TTFT/TBT separation; cleanest utilization | Two `MTLCommandQueue` instances add synchronization complexity; `Arc<PagedKvBlock>` ownership protocol unproven | Deferred — chunked prefill recovers most of the gain on single-GPU Apple Silicon                    |
+| **Separate process per worker**          | True isolation; OS-level memory protection        | IPC overhead; no shared Metal heap; defeats unified-memory zero-copy advantage                                  | Rejected — Rust `async` tasks in one process with ownership transfer achieves isolation without IPC |
+| **Priority-based scheduler (SLA-aware)** | Better p99 latency for high-priority requests     | Priority inversion risk; more complex preemption policy; premature for Phase 1                                  | Deferred to Phase 2                                                                                 |
+| **Preemption via cache eviction**        | Handles memory pressure gracefully                | Must serialize evicted sequence's KV pages to CPU or disk; page fault on resume                                 | Accepted for Phase 2; Phase 1 rejects new requests when memory is low instead of evicting           |
 
 ---
 

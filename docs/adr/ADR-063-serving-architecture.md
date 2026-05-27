@@ -15,17 +15,17 @@
 
 Lattice has zero product surface. There are 9 standalone binaries in `crates/inference/src/bin/`, each solving one narrow problem:
 
-| Binary | Purpose |
-|--------|---------|
-| `backfill_qwen3` | Re-embed atoms from BGE-Small-384d to Qwen3-1024d |
-| `bench_decode_ab` | A/B decode slope benchmark (Metal e2e path) |
-| `bench_logit_dump` | Logit dump for divergence analysis vs MLX |
-| `chat_metal` | Interactive chat with Qwen3.5-2B/27B (Q4) on Metal |
-| `eval_perplexity` | Perplexity evaluator for Qwen3.5 on text corpora |
-| `quantize_q4` | Stream quantizer: BF16 safetensors to Q4_0 `.q4` files |
-| `quantize_quarot` | QuaRot offline converter: Hadamard-rotated Q4_0 |
-| `qwen35_debug` | Debug diagnostic for Qwen3.5-2B forward pass |
-| `qwen35_generate` | Text generation demo |
+| Binary             | Purpose                                                |
+| ------------------ | ------------------------------------------------------ |
+| `backfill_qwen3`   | Re-embed atoms from BGE-Small-384d to Qwen3-1024d      |
+| `bench_decode_ab`  | A/B decode slope benchmark (Metal e2e path)            |
+| `bench_logit_dump` | Logit dump for divergence analysis vs MLX              |
+| `chat_metal`       | Interactive chat with Qwen3.5-2B/27B (Q4) on Metal     |
+| `eval_perplexity`  | Perplexity evaluator for Qwen3.5 on text corpora       |
+| `quantize_q4`      | Stream quantizer: BF16 safetensors to Q4_0 `.q4` files |
+| `quantize_quarot`  | QuaRot offline converter: Hadamard-rotated Q4_0        |
+| `qwen35_debug`     | Debug diagnostic for Qwen3.5-2B forward pass           |
+| `qwen35_generate`  | Text generation demo                                   |
 
 No unified CLI. No server. No HTTP handler. No API compatibility layer. A new user must `cargo run --release --bin chat_metal -- --model-dir /path/to/weights` to get a single chat response. There is no model acquisition, no model registry, no way to serve requests concurrently, and no way for external tools to talk to lattice over HTTP.
 
@@ -33,28 +33,30 @@ No unified CLI. No server. No HTTP handler. No API compatibility layer. A new us
 
 Every competitor has `serve` as a first-class command:
 
-| System | Core lang | Product surface | Hardware center | Key strength | Lattice wedge |
-|--------|-----------|-----------------|-----------------|--------------|---------------|
-| **llama.cpp** | C/C++ | Very strong: CLI, server, OpenAI/Anthropic, embeddings, grammars, continuous batching, parallel decoding | Broad hardware | Massive ecosystem, GGUF, mature local inference | C++ complexity; less composable/verifiable |
-| **Ollama** | Go + llama.cpp | Excellent UX: pull/run/serve/list/show/rm | Local dev machines | Best consumer/dev UX | Opaque scheduling/quantization internals |
-| **MLX-LM** | Python + MLX | Simple generate/server | Apple Silicon | Apple-native, MLX models | Python surface; docs warn server is not production-hardened |
-| **vLLM / Inferact** | Python + CUDA | Excellent OpenAI server + bench tooling | NVIDIA datacenter | PagedAttention, throughput, production serving | Not Apple/Metal-first; not Rust-native |
-| **SGLang / RadixArk** | Python/PyTorch | Strong serving + RadixAttention | Datacenter GPUs | Prefix caching, agent workflows, structured generation | Not Rust/Apple-first; heavier Python stack |
-| **Candle** | Rust | Framework/library | CPU/CUDA/WASM | Rust ML framework, safetensors, examples | More framework than polished LLM serving product |
-| **lattice** | Pure Rust | **Currently missing** | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path | Must add CLI/server/API immediately |
+| System                | Core lang      | Product surface                                                                                          | Hardware center     | Key strength                                                                                                                   | Lattice wedge                                                                                                                                                                                               |
+| --------------------- | -------------- | -------------------------------------------------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **llama.cpp**         | C/C++          | Very strong: CLI, server, OpenAI/Anthropic, embeddings, grammars, continuous batching, parallel decoding | Broad hardware      | Massive ecosystem, GGUF, mature local inference                                                                                | C++ complexity; less composable/verifiable                                                                                                                                                                  |
+| **Ollama**            | Go + llama.cpp | Excellent UX: pull/run/serve/list/show/rm                                                                | Local dev machines  | Best consumer/dev UX                                                                                                           | Opaque scheduling/quantization internals                                                                                                                                                                    |
+| **MLX-LM**            | Python + MLX   | Simple generate/server                                                                                   | Apple Silicon       | Apple-native, MLX models                                                                                                       | Python surface; docs warn server is not production-hardened                                                                                                                                                 |
+| **vLLM / Inferact**   | Python + CUDA  | Excellent OpenAI server + bench tooling                                                                  | NVIDIA datacenter   | PagedAttention, throughput, production serving                                                                                 | Not Apple/Metal-first; not Rust-native                                                                                                                                                                      |
+| **SGLang / RadixArk** | Python/PyTorch | Strong serving + RadixAttention                                                                          | Datacenter GPUs     | Prefix caching, agent workflows, structured generation                                                                         | Not Rust/Apple-first; heavier Python stack                                                                                                                                                                  |
+| **Candle**            | Rust           | Framework/library                                                                                        | CPU/CUDA/WASM       | Rust ML framework, safetensors, examples                                                                                       | More framework than polished LLM serving product                                                                                                                                                            |
+| **mistral.rs**        | Rust           | Strong: CLI run/serve, OpenAI API, quantization, Metal, multimodal, tool use, SDKs                       | Broad (CUDA+Metal)  | Nearest Rust competitor: zero-config HF loading, quantization breadth (GGUF/GPTQ/EXL2/HQQ), vision models, agent/tool features | Direct competitor; broader model+quant support. Lattice wedge: research-composable architecture (10 attn mechanisms, QuaRot, architecture search DSL), verified inference, Apple-Silicon-first optimization |
+| **Burn**              | Rust           | Framework (not LLM-serving product)                                                                      | CPU/CUDA/WASM/Metal | Type-safe Rust ML framework, auto-diff, training                                                                               | ML framework, not polished inference server; no LLM-specific serving features                                                                                                                               |
+| **lattice**           | Pure Rust      | **Currently missing**                                                                                    | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path                                 | Must add CLI/server/API immediately                                                                                                                                                                         |
 
 ### Market validation for inference infrastructure
 
 The inference stack is now an investor category:
 
-| Company | Round | Positioning |
-|---------|-------|-------------|
-| **Inferact** | $150M seed, Jan 2026, $800M valuation | Commercialization of vLLM |
-| **RadixArk** | $100M seed, May 2026, led by Accel | Commercialization of SGLang |
-| **Fireworks AI** | $250M Series C, Oct 2025, $4B valuation | Inference platform for open models, $280M ARR |
-| **RunPod** | $20M seed, May 2024 | GPU cloud and serverless inference endpoints |
-| **FriendliAI** | $20M seed extension, Aug 2025 | Enterprise inference speed + GPU cost reduction |
-| **Baseten** | $75M Series C, Feb 2025 | Mission-critical AI inference infrastructure |
+| Company          | Round                                   | Positioning                                     |
+| ---------------- | --------------------------------------- | ----------------------------------------------- |
+| **Inferact**     | $150M seed, Jan 2026, $800M valuation   | Commercialization of vLLM                       |
+| **RadixArk**     | $100M seed, May 2026, led by Accel      | Commercialization of SGLang                     |
+| **Fireworks AI** | $250M Series C, Oct 2025, $4B valuation | Inference platform for open models, $280M ARR   |
+| **RunPod**       | $20M seed, May 2024                     | GPU cloud and serverless inference endpoints    |
+| **FriendliAI**   | $20M seed extension, Aug 2025           | Enterprise inference speed + GPU cost reduction |
+| **Baseten**      | $75M Series C, Feb 2025                 | Mission-critical AI inference infrastructure    |
 
 The market understands "faster/cheaper inference." Lattice needs a sharper wedge than "we serve models." The gap inventory (`gap_inventory_20260527.md`) scored CLI+Daemon at 80/100 priority -- the single highest-impact gap.
 
@@ -92,17 +94,17 @@ lattice
 
 #### Priority for seed demo
 
-| Priority | Command | Rationale |
-|---------:|---------|-----------|
-| P0 | `lattice serve` | Converts library into product |
-| P0 | `lattice chat` | Fastest visible demo path |
-| P0 | `lattice pull` | Non-Rust users need model acquisition |
-| P0 | `lattice bench` | Investors need numbers |
-| P1 | `lattice embed` | RAG/product wedge |
-| P1 | `lattice info` | Helps demos and bug reports |
-| P2 | `lattice quantize` | Not required if pre-quantized demo model exists |
-| P2 | `lattice complete` | Covered by `chat --prompt` |
-| P2 | `lattice cache` | Useful after MVP |
+| Priority | Command            | Rationale                                       |
+| -------: | ------------------ | ----------------------------------------------- |
+|       P0 | `lattice serve`    | Converts library into product                   |
+|       P0 | `lattice chat`     | Fastest visible demo path                       |
+|       P0 | `lattice pull`     | Non-Rust users need model acquisition           |
+|       P0 | `lattice bench`    | Investors need numbers                          |
+|       P1 | `lattice embed`    | RAG/product wedge                               |
+|       P1 | `lattice info`     | Helps demos and bug reports                     |
+|       P2 | `lattice quantize` | Not required if pre-quantized demo model exists |
+|       P2 | `lattice complete` | Covered by `chat --prompt`                      |
+|       P2 | `lattice cache`    | Useful after MVP                                |
 
 #### `lattice pull` flags
 
@@ -353,8 +355,14 @@ pub async fn chat_completions(
     };
 
     // 4. Submit to scheduler. Bounded channel provides backpressure.
-    state.engine_tx.send(engine_req).await
-        .map_err(|_| ApiError::service_unavailable("engine_not_running"))?;
+    //    Use try_send for immediate admission control — do NOT await capacity.
+    state.engine_tx.try_send(engine_req)
+        .map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) =>
+                ApiError::service_unavailable("queue_full"),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) =>
+                ApiError::service_unavailable("engine_not_running"),
+        })?;
 
     // 5. Construct SSE stream.
     let stream = async_stream::stream! {
@@ -591,23 +599,23 @@ When `--spec ngram` or `--spec mtp` is set, the scheduler integrates with ADR-00
 
 #### Supported request fields (v1)
 
-| Field | v1 behavior |
-|-------|-------------|
-| `model` | Required unless server has one loaded default |
-| `messages` | Required. `role`: system/user/assistant. `content`: string or content-parts array |
-| `stream` | Support both `true` and `false`. Non-streaming accumulates tokens then returns |
-| `temperature` | Implement. Default 0.7 |
-| `top_p` | Implement. Default 0.95 |
-| `max_tokens` | Implement. Default 512 |
-| `stop` | Implement. String or array of strings |
-| `seed` | Implement. Deterministic sampling when set |
-| `response_format: {"type":"text"}` | Default. Normal decoding |
-| `response_format: {"type":"json_object"}` | JSON grammar-constrained decoding (ADR-046) |
-| `response_format: {"type":"json_schema"}` | Convert schema to grammar; `400` if unsupported features |
-| `tools`, `tool_choice` | Parse; v1 rejects with clear error unless model/template supports it |
-| `logprobs` | Do not fake. Return `400 unsupported_feature` |
-| `n > 1` | Return `400` for v1 |
-| Unknown fields | Ignore unless strict mode enabled |
+| Field                                     | v1 behavior                                                                       |
+| ----------------------------------------- | --------------------------------------------------------------------------------- |
+| `model`                                   | Required unless server has one loaded default                                     |
+| `messages`                                | Required. `role`: system/user/assistant. `content`: string or content-parts array |
+| `stream`                                  | Support both `true` and `false`. Non-streaming accumulates tokens then returns    |
+| `temperature`                             | Implement. Default 0.7                                                            |
+| `top_p`                                   | Implement. Default 0.95                                                           |
+| `max_tokens`                              | Implement. Default 512                                                            |
+| `stop`                                    | Implement. String or array of strings                                             |
+| `seed`                                    | Implement. Deterministic sampling when set                                        |
+| `response_format: {"type":"text"}`        | Default. Normal decoding                                                          |
+| `response_format: {"type":"json_object"}` | JSON grammar-constrained decoding (ADR-046)                                       |
+| `response_format: {"type":"json_schema"}` | Convert schema to grammar; `400` if unsupported features                          |
+| `tools`, `tool_choice`                    | Parse; v1 rejects with clear error unless model/template supports it              |
+| `logprobs`                                | Do not fake. Return `400 unsupported_feature`                                     |
+| `n > 1`                                   | Return `400` for v1                                                               |
+| Unknown fields                            | Ignore unless strict mode enabled                                                 |
 
 #### Streaming wire format
 
@@ -676,30 +684,30 @@ HTTP status codes: `400` for bad requests, `401` for auth failures, `404` for un
 
 #### Supported request fields (v1)
 
-| Field | v1 behavior |
-|-------|-------------|
-| `model` | Required |
-| `messages` | Required. `role`: user/assistant only (system is top-level) |
-| `system` | Top-level system prompt (Anthropic convention) |
-| `stream` | Support both `true` and `false` |
-| `max_tokens` | Required |
-| `temperature` | Implement. Default 1.0 (Anthropic default) |
-| `top_p` | Implement |
-| `top_k` | Implement (not in OpenAI) |
-| `stop_sequences` | Implement |
-| `tools` | Parse; v1 rejects |
-| `metadata` | Parse; store for logging |
+| Field            | v1 behavior                                                 |
+| ---------------- | ----------------------------------------------------------- |
+| `model`          | Required                                                    |
+| `messages`       | Required. `role`: user/assistant only (system is top-level) |
+| `system`         | Top-level system prompt (Anthropic convention)              |
+| `stream`         | Support both `true` and `false`                             |
+| `max_tokens`     | Required                                                    |
+| `temperature`    | Implement. Default 1.0 (Anthropic default)                  |
+| `top_p`          | Implement                                                   |
+| `top_k`          | Implement (not in OpenAI)                                   |
+| `stop_sequences` | Implement                                                   |
+| `tools`          | Parse; v1 rejects                                           |
+| `metadata`       | Parse; store for logging                                    |
 
 #### Streaming event types
 
-| Event | When | Payload |
-|-------|------|---------|
-| `message_start` | First event | Full message shell with `id`, `role`, `model`, `usage.input_tokens` |
-| `content_block_start` | Before first token | `index: 0`, `content_block: {"type": "text", "text": ""}` |
-| `content_block_delta` | Each token | `index: 0`, `delta: {"type": "text_delta", "text": "..."}` |
-| `content_block_stop` | After last token | `index: 0` |
-| `message_delta` | After content done | `delta: {"stop_reason": "end_turn"}`, `usage.output_tokens` |
-| `message_stop` | Final event | Empty |
+| Event                 | When               | Payload                                                             |
+| --------------------- | ------------------ | ------------------------------------------------------------------- |
+| `message_start`       | First event        | Full message shell with `id`, `role`, `model`, `usage.input_tokens` |
+| `content_block_start` | Before first token | `index: 0`, `content_block: {"type": "text", "text": ""}`           |
+| `content_block_delta` | Each token         | `index: 0`, `delta: {"type": "text_delta", "text": "..."}`          |
+| `content_block_stop`  | After last token   | `index: 0`                                                          |
+| `message_delta`       | After content done | `delta: {"stop_reason": "end_turn"}`, `usage.output_tokens`         |
+| `message_stop`        | Final event        | Empty                                                               |
 
 ### D7: Chat template rendering
 
@@ -726,10 +734,11 @@ pub struct TemplateContext<'a> {
 
 #### Load order
 
-1. `tokenizer_config.json["chat_template"]`
-2. `chat_template.jinja` file in model directory
-3. Built-in fallback by model family (Qwen, Llama, Mistral, Gemma, Phi)
-4. Explicit `--chat-template path.jinja`
+1. **`--chat-template <PATH>` CLI flag** (highest priority, always wins)
+2. `tokenizer_config.json["chat_template"]`
+3. `chat_template.jinja` file in model directory
+4. Built-in fallback by model family (Qwen, Llama, Mistral, Gemma, Phi)
+5. Explicit `--chat-template path.jinja`
 
 #### Required compatibility helpers for MiniJinja
 
@@ -765,11 +774,13 @@ Namespace must include adapter identity: same tokens but different LoRA adapter 
 #### Page-aligned matching (v1)
 
 ```text
-matched_len = floor(longest_token_prefix / 256) * 256
+matched_len = floor(longest_token_prefix / prefix_page_size) * prefix_page_size
+// prefix_page_size defaults to 64 (ADR-047, prefix.rs:111) — NOT 256.
+// Using 256 here would conflict with ADR-047's accepted page size.
 recompute_tail = longest_token_prefix - matched_len
 ```
 
-v1 uses page-aligned matching only. This loses up to 255 reusable tokens per request but has simple correctness and zero-copy page reuse. v2 adds token-aligned matching with partial-page tails for short system prompts.
+v1 uses page-aligned matching only. With `prefix_page_size=64` (ADR-047 default), this loses up to 63 reusable tokens per request but has simple correctness and zero-copy page reuse. v2 adds token-aligned matching with partial-page tails for short system prompts.
 
 #### Eviction policy
 
@@ -787,26 +798,26 @@ SGLang-style LRU with reference counting:
 
 **Track A -- closest numerical equivalence**: Use the least-transformed model format across frameworks. FP16/BF16 where possible for strict comparability. Then "best practical Q4" as a separate track.
 
-| Framework | Model format |
-|-----------|-------------|
-| lattice | safetensors / lattice native |
-| llama.cpp | GGUF |
-| Ollama | same GGUF where possible |
-| MLX | MLX-converted weights |
+| Framework | Model format                 |
+| --------- | ---------------------------- |
+| lattice   | safetensors / lattice native |
+| llama.cpp | GGUF                         |
+| Ollama    | same GGUF where possible     |
+| MLX       | MLX-converted weights        |
 
 **Track B -- product-realistic comparison**: Use each framework as users actually use it. This is the investor-relevant result.
 
 #### Workloads
 
-| Workload | Prompt len | Output len | Concurrency | Primary metric |
-|----------|-----------|-----------|------------|----------------|
-| Interactive chat | 256 | 128 | 1 | TTFT, tok/s |
-| Long prompt chat | 2048 | 128 | 1 | TTFT, prefill tok/s |
-| Decode stress | 128 | 512 | 1 | decode tok/s |
-| Concurrent chat | 512 | 128 | 1,2,4,8 | aggregate tok/s, p99 latency |
-| RAG answer | 4096 | 256 | 1,4 | TTFT, memory, p99 |
-| Embedding | 128,512 | n/a | batch 1,16,64 | embeddings/sec, tokens/sec |
-| Model lifecycle | n/a | n/a | n/a | cold load, warm load, peak memory |
+| Workload         | Prompt len | Output len | Concurrency   | Primary metric                    |
+| ---------------- | ---------- | ---------- | ------------- | --------------------------------- |
+| Interactive chat | 256        | 128        | 1             | TTFT, tok/s                       |
+| Long prompt chat | 2048       | 128        | 1             | TTFT, prefill tok/s               |
+| Decode stress    | 128        | 512        | 1             | decode tok/s                      |
+| Concurrent chat  | 512        | 128        | 1,2,4,8       | aggregate tok/s, p99 latency      |
+| RAG answer       | 4096       | 256        | 1,4           | TTFT, memory, p99                 |
+| Embedding        | 128,512    | n/a        | batch 1,16,64 | embeddings/sec, tokens/sec        |
+| Model lifecycle  | n/a        | n/a        | n/a           | cold load, warm load, peak memory |
 
 #### Statistical rigor
 
@@ -833,23 +844,24 @@ queue_delay = scheduler_admit_time - request_arrival_time
 
 #### Seed-demo targets (Qwen-class 0.6B-0.8B Q4 on M2 Max)
 
-| Metric | Good | Seed-impressive |
-|--------|------|-----------------|
-| Warm TTFT, 128-token prompt | <150 ms | <80 ms |
-| Warm TTFT, 2k-token prompt | <600 ms | <300 ms |
-| Cached TTFT, shared system prompt | <100 ms | <50 ms |
-| Single-stream decode | >180 tok/s | >250 tok/s |
-| Prompt processing, 512 tokens | >4k tok/s | >8k tok/s |
-| 4 concurrent streams aggregate | >350 tok/s | >600 tok/s |
-| p99 inter-token latency, 4 streams | <100 ms | <60 ms |
-| Model load, warm filesystem cache | <2 s | <1 s |
-| Peak memory, model + 4x4k ctx | <3 GB | <2 GB |
+| Metric                             | Good       | Seed-impressive |
+| ---------------------------------- | ---------- | --------------- |
+| Warm TTFT, 128-token prompt        | <150 ms    | <80 ms          |
+| Warm TTFT, 2k-token prompt         | <600 ms    | <300 ms         |
+| Cached TTFT, shared system prompt  | <100 ms    | <50 ms          |
+| Single-stream decode               | >180 tok/s | >250 tok/s      |
+| Prompt processing, 512 tokens      | >4k tok/s  | >8k tok/s       |
+| 4 concurrent streams aggregate     | >350 tok/s | >600 tok/s      |
+| p99 inter-token latency, 4 streams | <100 ms    | <60 ms          |
+| Model load, warm filesystem cache  | <2 s       | <1 s            |
+| Peak memory, model + 4x4k ctx      | <3 GB      | <2 GB           |
 
 These are benchmark targets, not achieved numbers. Do not present as achieved unless measured in this session.
 
 ### D10: Competitive positioning
 
 **Avoid:**
+
 - "We are a faster Ollama."
 - "We are llama.cpp in Rust."
 - "We are vLLM for Mac."
@@ -861,6 +873,7 @@ These are benchmark targets, not achieved numbers. Do not present as achieved un
 The "microkernel" framing separates a minimal trusted core from pluggable modules:
 
 **Trusted core** (the scheduler):
+
 - Scheduler + decode loop
 - KV cache manager
 - Sampling/grammar constraints
@@ -869,6 +882,7 @@ The "microkernel" framing separates a minimal trusted core from pluggable module
 - API compatibility layer
 
 **Pluggable modules** (the research platform):
+
 - Attention mechanism (10 implementations: GQA, GDN, Flash, NSA, ...)
 - Quantization policy (QuaRot Q4, Q8, FP16)
 - Draft model (N-gram, MTP speculative decoding)
@@ -884,15 +898,15 @@ This gives investors a coherent systems story: minimal core, high extensibility,
 
 ## Alternatives considered
 
-| Alternative | Pros | Cons | Decision |
-|-------------|------|------|----------|
-| **actix-web** instead of axum | Battle-tested, good performance | Worse tokio integration, no Tower middleware, less ergonomic SSE | Rejected |
-| **hyper directly** | Maximum control | Too low-level for JSON parsing, routing, middleware | Rejected |
-| **Unix socket** for local daemon | Lower latency than TCP | HTTP over localhost sufficient for v1; adds complexity | Deferred |
-| **gRPC** | Type-safe, bidirectional streaming | OpenAI/Anthropic compatibility requires HTTP+JSON; gRPC adds protobuf dep | Deferred |
-| **Python wrapper** (like MLX-LM) | Faster to prototype | Violates pure-Rust constraint; performance overhead | Rejected |
-| **Embed HTTP in each binary** | Incremental, no unified CLI needed | Duplicates server logic; no unified model registry; terrible UX | Rejected |
-| **Axum + GPU on tokio** | Simpler (no dedicated thread) | Metal blocks tokio workers, starving HTTP handling | Rejected |
+| Alternative                      | Pros                               | Cons                                                                      | Decision |
+| -------------------------------- | ---------------------------------- | ------------------------------------------------------------------------- | -------- |
+| **actix-web** instead of axum    | Battle-tested, good performance    | Worse tokio integration, no Tower middleware, less ergonomic SSE          | Rejected |
+| **hyper directly**               | Maximum control                    | Too low-level for JSON parsing, routing, middleware                       | Rejected |
+| **Unix socket** for local daemon | Lower latency than TCP             | HTTP over localhost sufficient for v1; adds complexity                    | Deferred |
+| **gRPC**                         | Type-safe, bidirectional streaming | OpenAI/Anthropic compatibility requires HTTP+JSON; gRPC adds protobuf dep | Deferred |
+| **Python wrapper** (like MLX-LM) | Faster to prototype                | Violates pure-Rust constraint; performance overhead                       | Rejected |
+| **Embed HTTP in each binary**    | Incremental, no unified CLI needed | Duplicates server logic; no unified model registry; terrible UX           | Rejected |
+| **Axum + GPU on tokio**          | Simpler (no dedicated thread)      | Metal blocks tokio workers, starving HTTP handling                        | Rejected |
 
 ---
 
@@ -900,22 +914,23 @@ This gives investors a coherent systems story: minimal core, high extensibility,
 
 ### New crate dependencies
 
-| Crate | Purpose | Risk |
-|-------|---------|------|
-| `axum` | HTTP server, routing, SSE | Well-maintained, tokio team. Low risk |
-| `tower`, `tower-http` | Middleware (CORS, trace, compression) | Part of tokio ecosystem. Low risk |
-| `minijinja` | Jinja2 chat template rendering | Active maintenance, used by Candle. Low risk |
-| `hf-hub` | Hugging Face model downloads | Active, used by Candle. API stability moderate |
-| `clap` | CLI argument parsing | De facto standard. Negligible risk |
-| `async-stream` | SSE stream construction | Thin macro crate. Low risk |
-| `tokio-util` | `CancellationToken` | Part of tokio ecosystem. Low risk |
-| `indicatif` | Progress bars for `lattice pull` | Optional, display only. Negligible risk |
+| Crate                 | Purpose                               | Risk                                           |
+| --------------------- | ------------------------------------- | ---------------------------------------------- |
+| `axum`                | HTTP server, routing, SSE             | Well-maintained, tokio team. Low risk          |
+| `tower`, `tower-http` | Middleware (CORS, trace, compression) | Part of tokio ecosystem. Low risk              |
+| `minijinja`           | Jinja2 chat template rendering        | Active maintenance, used by Candle. Low risk   |
+| `hf-hub`              | Hugging Face model downloads          | Active, used by Candle. API stability moderate |
+| `clap`                | CLI argument parsing                  | De facto standard. Negligible risk             |
+| `async-stream`        | SSE stream construction               | Thin macro crate. Low risk                     |
+| `tokio-util`          | `CancellationToken`                   | Part of tokio ecosystem. Low risk              |
+| `indicatif`           | Progress bars for `lattice pull`      | Optional, display only. Negligible risk        |
 
 Note: `tokio` and `serde_json` are already workspace dependencies. `axum` pulls in `hyper` but does not add a new async runtime.
 
 ### Scope boundaries for v1
 
 **In scope:**
+
 - `lattice pull`, `lattice chat`, `lattice serve`, `lattice bench`, `lattice info`
 - `/v1/chat/completions` (streaming + non-streaming)
 - `/v1/messages` (streaming)
@@ -928,6 +943,7 @@ Note: `tokio` and `serde_json` are already workspace dependencies. `axum` pulls 
 - JSON/JSON-schema response format (via ADR-046)
 
 **Deferred to v2:**
+
 - Function calling / tool use
 - Vision / multimodal input
 - `/v1/embeddings` via HTTP (use `lattice embed` CLI for now)
@@ -955,18 +971,28 @@ The seed demo is `lattice pull -> lattice serve -> curl` in under 60 seconds. Ev
 
 ## Implementation plan
 
-| Phase | Scope | Issues | Est. effort |
-|-------|-------|--------|-------------|
-| P1 | CLI skeleton (`clap` subcommands, model registry, `lattice pull`) | #91 | 3-4 days |
-| P2 | `lattice chat` (interactive terminal, wraps existing Metal path) | #91 | 2-3 days |
-| P3 | HTTP server skeleton (axum, health, `/v1/models`) | #92 | 2 days |
-| P4 | Inference scheduler (dedicated thread, MPSC channel, single-request) | #92 | 3-4 days |
-| P5 | OpenAI `/v1/chat/completions` (streaming + non-streaming) | #93 | 3-4 days |
-| P6 | Anthropic `/v1/messages` (streaming) | #94 | 2 days |
-| P7 | Continuous batching in scheduler (multi-request, chunked prefill) | #92 | 4-5 days |
-| P8 | `lattice bench --suite serving` (cross-framework comparison) | #84 | 3-4 days |
+### v0.3 Seed Boundary (hard scope cut)
 
-The first seed-round milestone: **a non-Rust developer can install lattice, pull a model, chat with it, serve it behind OpenAI/Anthropic APIs, run Aider/Continue/LangChain against it, and see credible latency/throughput numbers on an M2 Max.**
+**In scope for v0.3 (seed demo):** P1-P5 + P8. The demo is `lattice pull -> lattice serve -> curl`. Single-model, single-request HTTP serving with OpenAI streaming. Benchmark harness for competitive numbers.
+
+**Deferred to v0.4+:** Anthropic API (P6), continuous batching (P7), prefix cache, speculative serving, structured output, embeddings HTTP, multi-client benchmark polish.
+
+| Phase | Scope                                                                            | Issues | Est. effort    | v0.3?                         |
+| ----- | -------------------------------------------------------------------------------- | ------ | -------------- | ----------------------------- |
+| P1    | CLI skeleton (`clap` subcommands, model registry, `lattice pull`)                | #91    | 3-4 days       | **Yes**                       |
+| P2    | `lattice chat` (interactive terminal, wraps existing Metal path)                 | #91    | 2-3 days       | **Yes**                       |
+| P3    | HTTP server skeleton (axum, health, `/v1/models`)                                | #92    | 2-3 days       | **Yes**                       |
+| P4    | Inference scheduler (dedicated thread, MPSC, single-request decode)              | #92    | **2-3 weeks**  | **Yes** (single-request only) |
+| P5    | OpenAI `/v1/chat/completions` (streaming + non-streaming)                        | #93    | 3-4 days       | **Yes**                       |
+| P6    | Anthropic `/v1/messages` (streaming + non-streaming)                             | #94    | 3-4 days       | v0.4                          |
+| P7    | Continuous batching (multi-request, chunked prefill, KV lifecycle, cancellation) | #92    | **6-10 weeks** | v0.4                          |
+| P8    | `lattice bench --suite serving` (cross-framework comparison)                     | #84    | 3-4 days       | **Yes**                       |
+
+**Note on P4/P7 effort revision**: ADR-048 describes the Metal `forward_step` migration as a "non-trivial refactor." The single-request scheduler (P4) is simpler — no batch construction, KV lifecycle, or cancellation — but still requires the dedicated-thread + channel architecture, request/response marshaling, error handling, and Metal pipeline integration. Comparable serving loops (vLLM, SGLang, llama.cpp server) took months; P4's single-request scope is feasible in 2-3 weeks, P7's full batching in 6-10 weeks. Previous estimates of 3-4 days (P4) and 4-5 days (P7) were not credible.
+
+**Benchmark targets require measured baselines.** Before any investor-facing claim, measure llama.cpp, MLX-LM, and mistral.rs on the same hardware (M2 Max), same model (Qwen3-0.6B Q4), same prompt/decode lengths. The target table should include: hardware, OS, framework version/commit, command line, quantization, prompt/decode lengths, TTFT, prefill tok/s, decode tok/s, p95 latency, peak memory.
+
+The first seed-round milestone: **a non-Rust developer can install lattice, pull a model, chat with it, serve it behind the OpenAI API, run Aider/Continue/LangChain against it, and see credible latency/throughput numbers on an M2 Max.**
 
 ---
 
