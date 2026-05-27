@@ -37,12 +37,11 @@ fn bench_append_kv(c: &mut Criterion) {
         (kv_dim * 2 * std::mem::size_of::<f32>()) as u64,
     ));
 
-    // Pre-allocate the cache outside the measured loop; each iteration resets it
-    // so that only `append_kv` (the f32→f16 conversion) is measured, not allocation.
+    // Use iter_batched_ref so the cache Drop is excluded from the timed path.
     group.bench_function("f32_to_f16_one_token", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || FlatKVCache::new(config.clone()),
-            |mut cache| {
+            |cache| {
                 cache.append_kv(0, black_box(&k_token), black_box(&v_token));
             },
             BatchSize::SmallInput,

@@ -778,13 +778,32 @@ mod tests {
 
     #[test]
     fn boundary_f32_subnormal_flushes() {
-        // f32 subnormals with magnitude below f16 MIN_POSITIVE (~6e-8) flush to
-        // ±0 when converted to f16.  Contract: result is zero (positive or negative).
-        let tiny = f32::MIN_POSITIVE * 1e-10; // well below f16 representable range
+        // A real f32 subnormal (nonzero, below f32::MIN_POSITIVE) is too small
+        // for f16 and flushes to ±0. Use from_bits(1) = smallest positive f32 subnormal.
+        let tiny = f32::from_bits(1); // ~1.4e-45, a real subnormal
+        assert!(
+            tiny > 0.0 && tiny < f32::MIN_POSITIVE,
+            "should be a real f32 subnormal"
+        );
         let out = roundtrip_single(tiny);
         assert_eq!(
             out, 0.0f32,
             "f32 subnormal below f16 range should flush to 0, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_f16_min_positive_subnormal_survives() {
+        // The smallest nonzero f16 value should survive the roundtrip.
+        let smallest_f16 = half::f16::MIN_POSITIVE_SUBNORMAL.to_f32();
+        assert!(
+            smallest_f16 > 0.0,
+            "f16 MIN_POSITIVE_SUBNORMAL should be positive"
+        );
+        let out = roundtrip_single(smallest_f16);
+        assert_eq!(
+            out, smallest_f16,
+            "f16 MIN_POSITIVE_SUBNORMAL should survive roundtrip, got {out}"
         );
     }
 }
