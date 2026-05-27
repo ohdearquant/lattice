@@ -30,6 +30,9 @@ pub struct LayerMetrics {
     pub output_norm: f32,
     /// Mean attention entropy across heads (only in `AttentionProfile` mode).
     pub entropy: Option<f32>,
+    /// Per-head entropy values (only in `AttentionProfile` mode).
+    /// When populated, `entropy` above is `Some(mean(head_entropies))`.
+    pub head_entropies: Option<Vec<f32>>,
 }
 
 /// Collects [`LayerMetrics`] for an entire forward pass.
@@ -46,24 +49,22 @@ pub struct ForwardMetrics {
 /// Online softmax entropy accumulator.
 ///
 /// Computes H = -Σ pᵢ ln pᵢ without materializing the probability vector,
-/// using the numerically stable online algorithm described in ADR-061.
+/// using the shifted-logit variant of the online algorithm (ADR-061).
 ///
 /// The invariant maintained after each [`update`](OnlineSoftmaxEntropy::update) call:
 /// - `m` = max(a₁ … aₜ)
 /// - `l` = Σ exp(aₛ − m)
-/// - `e` = Σ exp(aₛ − m) · aₛ
+/// - `r` = Σ exp(aₛ − m) · (aₛ − m)   ← shifted accumulator
 ///
-/// From these, entropy in nats is: H = ln(l) + m − e/l ≥ 0.
+/// From these, entropy in nats is: H = ln(l) − r/l ≥ 0.
 ///
-/// # Numerical stability
-///
-/// Logits in \[-100, 100\] produce exp differences in \[exp(-200), exp(200)\].
-/// The running-max rescaling keeps intermediate values in a safe range for `f32`.
+/// The shifted form keeps `r` bounded by `l * (max_logit_range)` rather than
+/// `l * max_abs_logit`, preventing overflow on extreme finite logits like `f32::MAX`.
 #[derive(Debug, Clone)]
 pub struct OnlineSoftmaxEntropy {
     m: f32, // running max of logits seen so far
     l: f32, // running sum of exp(aₛ − m)
-    e: f32, // running weighted accumulator: Σ exp(aₛ − m) · aₛ
+    r: f32, // shifted accumulator: Σ exp(aₛ − m) · (aₛ − m)
     count: usize,
 }
 
@@ -79,7 +80,7 @@ impl OnlineSoftmaxEntropy {
         Self {
             m: 0.0,
             l: 0.0,
-            e: 0.0,
+            r: 0.0,
             count: 0,
         }
     }
@@ -91,21 +92,26 @@ impl OnlineSoftmaxEntropy {
         if self.count == 0 {
             self.m = logit;
             self.l = 1.0;
-            self.e = logit;
+            self.r = 0.0; // (logit - m) = 0 for first element
             self.count = 1;
             return;
         }
         if logit > self.m {
             // New max: rescale existing accumulators.
-            let alpha = (self.m - logit).exp();
+            let diff = self.m - logit; // negative
+            let alpha = diff.exp();
+            // Shift correction: old terms had (a_s - m_old), now need (a_s - m_new).
+            // (a_s - m_new) = (a_s - m_old) + (m_old - m_new) = (a_s - m_old) + diff
+            // So r_new = alpha * r_old + alpha * l_old * diff + (logit - logit) * 1
+            //          = alpha * (r_old + l_old * diff)
+            self.r = alpha * (self.r + self.l * diff);
             self.l = alpha * self.l + 1.0;
-            self.e = alpha * self.e + logit;
             self.m = logit;
         } else {
-            // No max change: incorporate this logit with a relative weight.
-            let w = (logit - self.m).exp();
+            let shifted = logit - self.m; // non-positive
+            let w = shifted.exp();
             self.l += w;
-            self.e += w * logit;
+            self.r += w * shifted;
         }
         self.count += 1;
     }
@@ -118,7 +124,9 @@ impl OnlineSoftmaxEntropy {
         if self.count < 2 {
             return 0.0;
         }
-        (self.l.ln() + self.m - self.e / self.l).max(0.0)
+        // H = ln(l) - r/l, where r = Σ exp(aₛ - m)(aₛ - m) ≤ 0 always,
+        // so -r/l ≥ 0, making H ≥ ln(l) ≥ 0 when l ≥ 1.
+        (self.l.ln() - self.r / self.l).max(0.0)
     }
 
     /// Entropy in bits (H / ln 2).
@@ -146,7 +154,7 @@ impl OnlineSoftmaxEntropy {
     pub fn reset(&mut self) {
         self.m = 0.0;
         self.l = 0.0;
-        self.e = 0.0;
+        self.r = 0.0;
         self.count = 0;
     }
 }
@@ -286,13 +294,60 @@ mod tests {
         let mut acc = OnlineSoftmaxEntropy::new();
         acc.update(100.0);
         acc.update(-100.0);
-        // Should not produce NaN or inf.
         let h = acc.entropy_nats();
         assert!(
             h.is_finite(),
             "extreme logits produced non-finite entropy: {h}"
         );
         assert!(h >= 0.0, "entropy should be non-negative, got {h}");
+    }
+
+    #[test]
+    fn test_entropy_f32_max_uniform() {
+        // Codex finding: uniform f32::MAX logits must produce ln(N), not 0.
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(f32::MAX);
+        acc.update(f32::MAX);
+        assert_close(
+            acc.entropy_nats(),
+            std::f32::consts::LN_2,
+            "f32::MAX uniform pair",
+        );
+
+        let mut acc3 = OnlineSoftmaxEntropy::new();
+        for _ in 0..3 {
+            acc3.update(f32::MAX / 2.0);
+        }
+        assert_close(
+            acc3.entropy_nats(),
+            (3.0_f32).ln(),
+            "f32::MAX/2 uniform triple",
+        );
+    }
+
+    #[test]
+    fn test_entropy_large_spread() {
+        // Large positive and large negative should still be finite.
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(1e30);
+        acc.update(-1e30);
+        let h = acc.entropy_nats();
+        assert!(h.is_finite(), "large spread non-finite: {h}");
+        // The distribution is effectively peaked on the larger logit.
+        assert!(h < 0.01, "large spread should be near-peaked, got {h}");
+    }
+
+    #[test]
+    fn test_head_entropies_storage() {
+        let mut lm = LayerMetrics::default();
+        assert!(lm.head_entropies.is_none());
+        lm.head_entropies = Some(vec![0.5, 0.8, 1.2, 0.3]);
+        lm.entropy = lm
+            .head_entropies
+            .as_ref()
+            .map(|h| h.iter().sum::<f32>() / h.len() as f32);
+        assert_eq!(lm.head_entropies.as_ref().map(|h| h.len()), Some(4));
+        assert!((lm.entropy.unwrap() - 0.7).abs() < 0.001);
     }
 
     #[test]
