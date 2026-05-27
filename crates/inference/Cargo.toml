@@ -27,8 +27,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-clap = { version = "4", features = ["derive"] }
-axum = "0.8"
+clap = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 sha2 = { workspace = true, optional = true }
