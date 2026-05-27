@@ -97,8 +97,8 @@ impl AttentionKind {
     /// Returns `true` if this variant reads from / writes to a KV cache.
     ///
     /// MHA uses pre-allocated scratch buffers recomputed each forward pass and
-    /// does not maintain a KV cache. All decoder variants maintain past-KV state
-    /// to avoid recomputing keys and values at each decode step.
+    /// does not maintain a KV cache. KV-backed decoder variants maintain
+    /// past-KV state; GDN variants use recurrent state matrices instead.
     pub fn supports_kv_cache(&self) -> bool {
         match self {
             // MHA uses scratch buffers, not KV cache.
