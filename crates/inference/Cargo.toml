@@ -19,7 +19,7 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
 
 [dependencies]
-half = { version = "2", features = ["std"] }
+half.workspace = true
 memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
