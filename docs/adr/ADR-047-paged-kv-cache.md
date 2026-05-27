@@ -1,8 +1,9 @@
 # ADR-047: Paged KV Cache with Prefix Reuse
 
-**Status**: Accepted
+**Status**: Accepted (KV element format superseded by ADR-062 for f16/int8/int4)
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
+**Amendment (2026-05-27)**: ADR-062 replaces `Arc<[f32]>` page storage with format-parameterized `KvFormat` (f16/int8/int4). The page adapter namespacing, LRU ownership, restore/promote semantics, and 256-token multi-sequence page design remain unchanged. `PrefixPageCache` `prefix_page_size` (default 64 tokens, `prefix.rs:111`) is the authoritative prefix matching granularity.
 
 ---
 
@@ -98,12 +99,14 @@ unaffected.
 ## Scope
 
 This ADR covers:
+
 - `PrefixPageCache` struct and lookup/insert/evict logic
 - Integration point in `PagedKVCache::new` and a new `PagedKVCache::restore_prefix` method
 - Interaction with LoRA hot-swap (adapter-keyed prefix namespacing)
 - Metal buffer alignment constraints for page size selection
 
 This ADR does not cover:
+
 - Full radix tree implementation (deferred — see Alternatives)
 - Multi-tenant server path (future ADR)
 - Persistent KV cache across process restarts
@@ -171,25 +174,25 @@ not available in the CUDA ecosystem.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Verdict |
-|---|---|---|---|
-| **Radix tree (RadixAttention / SGLang)** | Optimal prefix matching at any token boundary; 6.4x throughput on prefix-heavy server workloads | Complex to implement in safe Rust; interior mutability on tree nodes; LRU on leaf nodes requires careful ownership | Deferred — implement when multi-tenant server path is active. Hash map covers the single-user case. |
-| **No prefix cache; longer FlatKVCache** | Zero code complexity | Re-encodes the same prefix on every request; unacceptable for chat latency at 1K+ token system prompts | Rejected — measurable latency regression. |
-| **Persist KV cache to disk (mmap)** | Survives process restart; useful for fixed system prompts | mmap I/O latency (μs–ms) during restore; added complexity; macOS unified memory already fast | Deferred — low priority until session resumption is a product requirement. |
-| **Smaller page size (16 tokens) for finer sharing** | More sharing opportunities; works for shorter common prefixes | 16× more page table entries; LRU bookkeeping overhead; 16-token page is 3.5 MB (fine) but table grows proportionally | Not adopted; 64-token prefix page is a reasonable balance point. |
-| **fp16 KV storage in prefix pages** | Halves prefix cache memory; doubles effective capacity | Introduces conversion cost at restore time; breaks the invariant that cached and live pages have identical layout | Deferred to a quantized-KV ADR. |
+| Alternative                                         | Pros                                                                                            | Cons                                                                                                                 | Verdict                                                                                             |
+| --------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **Radix tree (RadixAttention / SGLang)**            | Optimal prefix matching at any token boundary; 6.4x throughput on prefix-heavy server workloads | Complex to implement in safe Rust; interior mutability on tree nodes; LRU on leaf nodes requires careful ownership   | Deferred — implement when multi-tenant server path is active. Hash map covers the single-user case. |
+| **No prefix cache; longer FlatKVCache**             | Zero code complexity                                                                            | Re-encodes the same prefix on every request; unacceptable for chat latency at 1K+ token system prompts               | Rejected — measurable latency regression.                                                           |
+| **Persist KV cache to disk (mmap)**                 | Survives process restart; useful for fixed system prompts                                       | mmap I/O latency (μs–ms) during restore; added complexity; macOS unified memory already fast                         | Deferred — low priority until session resumption is a product requirement.                          |
+| **Smaller page size (16 tokens) for finer sharing** | More sharing opportunities; works for shorter common prefixes                                   | 16× more page table entries; LRU bookkeeping overhead; 16-token page is 3.5 MB (fine) but table grows proportionally | Not adopted; 64-token prefix page is a reasonable balance point.                                    |
+| **fp16 KV storage in prefix pages**                 | Halves prefix cache memory; doubles effective capacity                                          | Introduces conversion cost at restore time; breaks the invariant that cached and live pages have identical layout    | Deferred to a quantized-KV ADR.                                                                     |
 
 ---
 
 ## Risks
 
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| Hash collision on token sequence | Very low (FxHash 64-bit on token ids, not strings) | `debug_assert` prefix length match after hit; log collision metrics |
-| LoRA adapter id not propagated to cache call site | Medium — call sites spread across `generate.rs` | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error |
-| Arc ref-count overhead on prefix restore | Low — one `clone()` per page per layer at restore | Profile shows atomic increment < 5 ns; restore of 8 pages = 40 ns, negligible vs prefill |
-| Cache invalidation on model reload | Low but silent | `PrefixPageCache::clear()` called on model swap; cache is owned by session, not global |
-| Prefix cache grows unbounded in long session | Medium — embedding loops can insert many entries | Bounded LRU capacity (default 128 entries); eviction is O(1) with `IndexMap` |
+| Risk                                              | Likelihood                                         | Mitigation                                                                               |
+| ------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Hash collision on token sequence                  | Very low (FxHash 64-bit on token ids, not strings) | `debug_assert` prefix length match after hit; log collision metrics                      |
+| LoRA adapter id not propagated to cache call site | Medium — call sites spread across `generate.rs`    | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error |
+| Arc ref-count overhead on prefix restore          | Low — one `clone()` per page per layer at restore  | Profile shows atomic increment < 5 ns; restore of 8 pages = 40 ns, negligible vs prefill |
+| Cache invalidation on model reload                | Low but silent                                     | `PrefixPageCache::clear()` called on model swap; cache is owned by session, not global   |
+| Prefix cache grows unbounded in long session      | Medium — embedding loops can insert many entries   | Bounded LRU capacity (default 128 entries); eviction is O(1) with `IndexMap`             |
 
 ---
 
