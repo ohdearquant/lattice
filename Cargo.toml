@@ -54,6 +54,9 @@ tracing = "0.1"
 safetensors = "0.5"
 bytemuck = { version = "1.14", features = ["derive"] }
 
+# Half-precision floats
+half = { version = "2", features = ["std"] }
+
 # Arc swap
 arc-swap = "1.7"
 
