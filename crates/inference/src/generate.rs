@@ -99,6 +99,9 @@ struct ForwardScratch {
     ffn_out: Vec<f32>,     // [≥ seq_len_cap * hidden_size]
     scores: Vec<f32>,      // [≥ num_heads * max_seq_len] — score_stride = max_seq_len
     logits: Vec<f32>,      // [≥ vocab_size]
+    // Dequantization buffers: f16 KV cache → f32 for compute_attention.
+    cached_k_f32: Vec<f32>, // [≥ max_seq_len * kv_dim]
+    cached_v_f32: Vec<f32>, // [≥ max_seq_len * kv_dim]
 }
 
 impl ForwardScratch {
@@ -117,6 +120,8 @@ impl ForwardScratch {
             ffn_out: Vec::new(),
             scores: Vec::new(),
             logits: Vec::new(),
+            cached_k_f32: Vec::new(),
+            cached_v_f32: Vec::new(),
         }
     }
 
@@ -143,6 +148,10 @@ impl ForwardScratch {
         grow(&mut self.ffn_out, seq_len_cap * h);
         grow(&mut self.scores, cfg.num_attention_heads * max_seq_len);
         grow(&mut self.logits, cfg.vocab_size);
+        // Dequant scratch: must hold up to max_seq_len * kv_dim f32 elements.
+        let kv_dim = cfg.kv_dim();
+        grow(&mut self.cached_k_f32, max_seq_len * kv_dim);
+        grow(&mut self.cached_v_f32, max_seq_len * kv_dim);
     }
 }
 
@@ -422,41 +431,63 @@ fn forward_with_cache<'a>(
             }
         }
 
-        // Append K, V to cache for this layer
+        // Append K, V to cache for this layer (convert f32→f16 on write).
         {
             let base_pos = cache.seq_len();
             let k_layer = cache.k_buffer_mut(layer_idx);
             for i in 0..seq_len {
                 let dst_off = (base_pos + i) * kv_dim;
-                k_layer[dst_off..dst_off + kv_dim]
-                    .copy_from_slice(&scratch.k_buf[i * kv_dim..(i + 1) * kv_dim]);
+                for (j, &val) in scratch.k_buf[i * kv_dim..(i + 1) * kv_dim]
+                    .iter()
+                    .enumerate()
+                {
+                    k_layer[dst_off + j] = half::f16::from_f32(val);
+                }
             }
             let v_layer = cache.v_buffer_mut(layer_idx);
             for i in 0..seq_len {
                 let dst_off = (base_pos + i) * kv_dim;
-                v_layer[dst_off..dst_off + kv_dim]
-                    .copy_from_slice(&scratch.v_buf[i * kv_dim..(i + 1) * kv_dim]);
+                for (j, &val) in scratch.v_buf[i * kv_dim..(i + 1) * kv_dim]
+                    .iter()
+                    .enumerate()
+                {
+                    v_layer[dst_off + j] = half::f16::from_f32(val);
+                }
             }
         }
 
         // Attention: Q(seq_len) @ K(cached)^T → softmax → @ V(cached)
+        // Dequantize f16 KV cache into f32 scratch buffers before compute_attention.
         let cached_seq_len = cache.seq_len() + seq_len; // not yet advanced
         let k_end = cached_seq_len * kv_dim;
-        let cached_k = &cache.k_buffer(layer_idx)[..k_end];
-        let cached_v = &cache.v_buffer(layer_idx)[..k_end];
+        for (i, &h) in cache.k_buffer(layer_idx)[..k_end].iter().enumerate() {
+            scratch.cached_k_f32[i] = h.to_f32();
+        }
+        for (i, &h) in cache.v_buffer(layer_idx)[..k_end].iter().enumerate() {
+            scratch.cached_v_f32[i] = h.to_f32();
+        }
 
-        // Split scratch borrows: attn_out + scores are mutable, q_buf is immutable.
-        // These are disjoint fields; Rust allows simultaneous partial borrows.
+        // Split scratch borrows: attn_out + scores are mutable; q_buf, cached_k_f32,
+        // cached_v_f32 are immutable. All are distinct Vec fields — no aliasing.
         {
-            // Capture immutable slice before mutable borrows.
-            let q_slice = &scratch.q_buf[..seq_len * q_dim];
-            // SAFETY: q_buf, attn_out, scores are distinct Vec fields — no aliasing.
+            // SAFETY: q_buf, cached_k_f32, cached_v_f32, attn_out, scores are distinct
+            // Vec fields — no aliasing. Raw pointers avoid simultaneous borrow conflicts.
+            let q_ptr = scratch.q_buf.as_ptr();
+            let ck_ptr = scratch.cached_k_f32.as_ptr();
+            let cv_ptr = scratch.cached_v_f32.as_ptr();
             let attn_ptr = scratch.attn_out.as_mut_ptr();
             let scores_ptr = scratch.scores.as_mut_ptr();
             let attn_len = seq_len * q_dim;
             let scores_len = scratch.scores.len();
-            let attn_slice = unsafe { std::slice::from_raw_parts_mut(attn_ptr, attn_len) };
-            let scores_slice = unsafe { std::slice::from_raw_parts_mut(scores_ptr, scores_len) };
+            let (q_slice, cached_k, cached_v, attn_slice, scores_slice) = unsafe {
+                (
+                    std::slice::from_raw_parts(q_ptr, seq_len * q_dim),
+                    std::slice::from_raw_parts(ck_ptr, k_end),
+                    std::slice::from_raw_parts(cv_ptr, k_end),
+                    std::slice::from_raw_parts_mut(attn_ptr, attn_len),
+                    std::slice::from_raw_parts_mut(scores_ptr, scores_len),
+                )
+            };
             compute_attention(
                 attn_slice,
                 q_slice,
