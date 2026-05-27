@@ -38,9 +38,12 @@ enum Command {
         /// Port to listen on
         #[arg(long, default_value = "8080")]
         port: u16,
-        /// Maximum tokens to generate per request
+        /// Maximum tokens to generate per request (default when request omits max_tokens)
         #[arg(long, default_value = "256")]
         max_tokens: usize,
+        /// Model identifier echoed in responses (defaults to the model path basename)
+        #[arg(long)]
+        model_id: Option<String>,
     },
 }
 
@@ -113,18 +116,92 @@ mod serve {
         Json, Router,
         extract::State,
         http::StatusCode,
+        response::{IntoResponse, Response},
         routing::{get, post},
     };
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    pub type SharedModel = Arc<lattice_inference::model::qwen35::Qwen35Model>;
+    // -----------------------------------------------------------------------
+    // Shared application state
+    // -----------------------------------------------------------------------
+
+    /// State shared across all request handlers via axum's `State` extractor.
+    #[derive(Clone)]
+    pub struct AppState {
+        /// The loaded model, wrapped in Arc so it can be cheaply cloned into
+        /// `spawn_blocking` closures without copying weights.
+        pub model: Arc<lattice_inference::model::qwen35::Qwen35Model>,
+        /// Default `max_tokens` value used when a request omits the field.
+        /// Set from the `--max-tokens` CLI flag passed to `lattice serve`.
+        pub default_max_tokens: usize,
+        /// Canonical model identifier echoed in every response.
+        /// Derived from the `--model-id` flag or the model path basename.
+        pub model_id: String,
+    }
+
+    // -----------------------------------------------------------------------
+    // Error type
+    // -----------------------------------------------------------------------
+
+    /// Structured HTTP error that serialises to the OpenAI error envelope so
+    /// that clients can parse failure responses uniformly.
+    #[derive(Debug)]
+    pub enum ApiError {
+        /// Caller mistake — HTTP 400.
+        BadRequest { message: String, code: &'static str },
+        /// Server-side failure — HTTP 500.
+        Internal { message: String },
+    }
+
+    #[derive(Serialize)]
+    struct ErrorBody {
+        error: ErrorDetail,
+    }
+
+    #[derive(Serialize)]
+    struct ErrorDetail {
+        message: String,
+        r#type: &'static str,
+        code: String,
+    }
+
+    impl IntoResponse for ApiError {
+        fn into_response(self) -> Response {
+            match self {
+                ApiError::BadRequest { message, code } => {
+                    let body = Json(ErrorBody {
+                        error: ErrorDetail {
+                            message,
+                            r#type: "invalid_request_error",
+                            code: code.to_string(),
+                        },
+                    });
+                    (StatusCode::BAD_REQUEST, body).into_response()
+                }
+                ApiError::Internal { message } => {
+                    let body = Json(ErrorBody {
+                        error: ErrorDetail {
+                            message,
+                            r#type: "server_error",
+                            code: "internal_error".to_string(),
+                        },
+                    });
+                    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Request / response types
+    // -----------------------------------------------------------------------
 
     #[derive(Deserialize)]
     pub struct ChatCompletionRequest {
-        #[allow(dead_code)]
-        pub model: Option<String>,
+        /// Required: must match the served model identifier.
+        pub model: String,
         pub messages: Vec<Message>,
         pub max_tokens: Option<usize>,
         pub temperature: Option<f32>,
@@ -132,7 +209,6 @@ mod serve {
 
     #[derive(Deserialize)]
     pub struct Message {
-        #[allow(dead_code)]
         pub role: String,
         pub content: String,
     }
@@ -172,31 +248,74 @@ mod serve {
         pub status: &'static str,
     }
 
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a single prompt string from the full message list using a simple
+    /// role-prefixed format compatible with instruction-tuned models.
+    ///
+    /// Format (one block per message, in order):
+    /// ```text
+    /// <|system|>
+    /// {content}
+    /// <|user|>
+    /// {content}
+    /// <|assistant|>
+    /// {content}
+    /// ```
+    /// The caller is expected to validate that the last message is a user turn.
+    fn render_prompt(messages: &[Message]) -> String {
+        let mut buf = String::new();
+        for msg in messages {
+            buf.push_str(&format!("<|{}|>\n{}\n", msg.role, msg.content));
+        }
+        buf
+    }
+
+    // -----------------------------------------------------------------------
+    // Handlers
+    // -----------------------------------------------------------------------
+
     pub async fn health() -> Json<HealthResponse> {
         Json(HealthResponse { status: "ok" })
     }
 
     pub async fn chat_completions(
-        State(model): State<SharedModel>,
+        State(state): State<AppState>,
         Json(req): Json<ChatCompletionRequest>,
-    ) -> Result<Json<ChatCompletionResponse>, (StatusCode, String)> {
-        // Extract the last user message content as the prompt.
-        let prompt = req
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
-
-        if prompt.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "no user message found in messages".to_string(),
-            ));
+    ) -> Result<Json<ChatCompletionResponse>, ApiError> {
+        // Validate that the caller targets the served model.
+        if req.model != state.model_id {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "model '{}' is not loaded; this server serves '{}'",
+                    req.model, state.model_id
+                ),
+                code: "model_not_found",
+            });
         }
 
-        let max_tokens = req.max_tokens.unwrap_or(256);
+        if req.messages.is_empty() {
+            return Err(ApiError::BadRequest {
+                message: "messages must not be empty".to_string(),
+                code: "invalid_messages",
+            });
+        }
+
+        // Require the conversation to end with a user turn.
+        let last_role = req.messages.last().map(|m| m.role.as_str()).unwrap_or("");
+        if last_role != "user" {
+            return Err(ApiError::BadRequest {
+                message: "the last message must have role 'user'".to_string(),
+                code: "invalid_messages",
+            });
+        }
+
+        // Concatenate all messages into a single prompt preserving full context.
+        let prompt = render_prompt(&req.messages);
+
+        let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens);
         let temperature = req.temperature.unwrap_or(0.7);
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
@@ -205,21 +324,27 @@ mod serve {
             ..Default::default()
         };
 
+        let model = Arc::clone(&state.model);
+
         // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
         let output = tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("task join error: {e}"),
-                )
+            .map_err(|e| ApiError::Internal {
+                message: format!("task join error: {e}"),
             })?
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("generation error: {e}"),
-                )
+            .map_err(|e| ApiError::Internal {
+                message: format!("generation error: {e}"),
             })?;
+
+        // Distinguish "hit token cap" from "natural stop" (EOS / stop token).
+        // `GenerateOutput` does not carry an explicit stop reason, so we infer
+        // it: if the model generated exactly `max_new_tokens` tokens the cap
+        // was reached.
+        let finish_reason = if output.generated_tokens >= max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
 
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -230,14 +355,14 @@ mod serve {
             id: format!("chatcmpl-{created}"),
             object: "chat.completion".to_string(),
             created,
-            model: "lattice".to_string(),
+            model: state.model_id.clone(),
             choices: vec![Choice {
                 index: 0,
                 message: ResponseMessage {
                     role: "assistant".to_string(),
                     content: output.text.clone(),
                 },
-                finish_reason: "stop".to_string(),
+                finish_reason: finish_reason.to_string(),
             }],
             usage: Usage {
                 prompt_tokens: output.prompt_tokens,
@@ -249,11 +374,15 @@ mod serve {
         Ok(Json(response))
     }
 
-    pub fn router(model: SharedModel) -> Router {
+    // -----------------------------------------------------------------------
+    // Router
+    // -----------------------------------------------------------------------
+
+    pub fn router(state: AppState) -> Router {
         Router::new()
             .route("/health", get(health))
             .route("/v1/chat/completions", post(chat_completions))
-            .with_state(model)
+            .with_state(state)
     }
 }
 
@@ -277,9 +406,20 @@ async fn main() {
             model,
             port,
             max_tokens,
+            model_id,
         } => {
             use std::path::Path;
             use std::sync::Arc;
+
+            // Derive a model identifier from the path basename when --model-id
+            // is not provided.
+            let served_model_id = model_id.unwrap_or_else(|| {
+                Path::new(&model)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("lattice")
+                    .to_string()
+            });
 
             eprintln!("Loading model from {model}...");
             let qwen_model = match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
@@ -291,15 +431,15 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            eprintln!("Model loaded.");
+            eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
-            // Wrap in Arc so the model can be cheaply cloned into each request's
-            // spawn_blocking closure without copying weights.
-            let shared = Arc::new(qwen_model);
+            let state = serve::AppState {
+                model: Arc::new(qwen_model),
+                default_max_tokens: max_tokens,
+                model_id: served_model_id.clone(),
+            };
 
-            // Build and start the axum server.  The default max_tokens from the
-            // CLI flag is baked into the router via a closure over `max_tokens`.
-            let app = serve::router(shared);
+            let app = serve::router(state);
 
             let addr = format!("0.0.0.0:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -309,7 +449,9 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            eprintln!("Listening on {addr}  (max_tokens default: {max_tokens})");
+            eprintln!(
+                "Listening on {addr}  (model: {served_model_id}, max_tokens default: {max_tokens})"
+            );
             eprintln!("  POST /v1/chat/completions");
             eprintln!("  GET  /health");
 
