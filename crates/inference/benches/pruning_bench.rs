@@ -1,12 +1,18 @@
 //! Criterion benchmarks for block influence scoring (ADR-060 Phase 1).
 //!
-//! Measures cosine_similarity and score_from_hidden_states throughput
-//! for typical model configurations (24-layer Qwen3-0.6B, 36-layer Qwen3-1.7B).
+//! Two benchmark groups:
+//!
+//! * `cosine_similarity` — per-observation throughput (one token pair at a time).
+//! * `block_influence_scoring` — full single-token sweep over all layers.
+//! * `accumulator_calibration` — realistic calibration workload: N tokens per
+//!   layer via [`BlockInfluenceAccumulator`], simulating offline calibration.
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::pruning::{cosine_similarity, score_from_hidden_states};
+use lattice_inference::pruning::{
+    BlockInfluenceAccumulator, cosine_similarity, score_from_hidden_states,
+};
 
 struct Lcg(u64);
 
@@ -29,6 +35,7 @@ fn random_vec(len: usize, seed: u64) -> Vec<f32> {
     (0..len).map(|_| rng.next_f32()).collect()
 }
 
+/// Per-observation throughput: one cosine_similarity call per iteration.
 fn bench_cosine_similarity(c: &mut Criterion) {
     let mut group = c.benchmark_group("cosine_similarity");
     group.warm_up_time(Duration::from_millis(500));
@@ -55,6 +62,7 @@ fn bench_cosine_similarity(c: &mut Criterion) {
     group.finish();
 }
 
+/// Per-layer sweep: score_from_hidden_states over a full model.
 fn bench_score_from_hidden_states(c: &mut Criterion) {
     let mut group = c.benchmark_group("block_influence_scoring");
     group.warm_up_time(Duration::from_millis(500));
@@ -74,9 +82,69 @@ fn bench_score_from_hidden_states(c: &mut Criterion) {
     group.finish();
 }
 
+/// Calibration workload: accumulate N tokens per layer via BlockInfluenceAccumulator.
+///
+/// This measures the realistic offline calibration cost — each token in the
+/// calibration dataset feeds through the accumulator before finalize() is called.
+fn bench_accumulator_calibration(c: &mut Criterion) {
+    let mut group = c.benchmark_group("accumulator_calibration");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(4));
+    group.sample_size(30);
+
+    // Simulate calibration for a 24-layer Qwen3-0.6B (hidden_dim=896).
+    let n_layers = 24usize;
+    let hidden_dim = 896usize;
+
+    for n_tokens in [128usize, 512] {
+        // Pre-generate token vectors for all layers.
+        // input[layer][token] and output[layer][token].
+        let inputs: Vec<Vec<Vec<f32>>> = (0..n_layers)
+            .map(|layer| {
+                (0..n_tokens)
+                    .map(|tok| random_vec(hidden_dim, (layer * n_tokens + tok) as u64))
+                    .collect()
+            })
+            .collect();
+        let outputs: Vec<Vec<Vec<f32>>> = (0..n_layers)
+            .map(|layer| {
+                (0..n_tokens)
+                    .map(|tok| random_vec(hidden_dim, 1_000_000 + (layer * n_tokens + tok) as u64))
+                    .collect()
+            })
+            .collect();
+
+        let label = format!("{n_layers}L_d{hidden_dim}_{n_tokens}tok");
+        group.throughput(Throughput::Elements((n_layers * n_tokens) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("tokens_per_layer", &label),
+            &n_tokens,
+            |bench, _| {
+                bench.iter(|| {
+                    let scores: Vec<_> = (0..n_layers)
+                        .map(|layer| {
+                            let mut acc = BlockInfluenceAccumulator::new(black_box(layer));
+                            for tok in 0..n_tokens {
+                                acc.update(
+                                    black_box(&inputs[layer][tok]),
+                                    black_box(&outputs[layer][tok]),
+                                );
+                            }
+                            acc.finalize()
+                        })
+                        .collect();
+                    black_box(scores)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_all(c: &mut Criterion) {
     bench_cosine_similarity(c);
     bench_score_from_hidden_states(c);
+    bench_accumulator_calibration(c);
 }
 
 criterion_group!(pruning, bench_all);
