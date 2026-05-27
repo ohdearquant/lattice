@@ -681,4 +681,110 @@ mod tests {
         let would_be_f32 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f32>();
         assert_eq!(config.total_bytes() * 2, would_be_f32);
     }
+
+    // -----------------------------------------------------------------------
+    // Boundary / special-value conversion tests (f32→f16→f32 contract).
+    //
+    // These tests assert the *chosen contract* for each boundary rather than
+    // relying on roundtrip tolerance alone.  `f16::from_f32` follows IEEE-754:
+    //
+    //  * NaN input  → f16 NaN  → f32 NaN  (is_nan() propagates)
+    //  * ±∞ input   → f16 ±∞  → f32 ±∞  (exact preservation)
+    //  * +0.0 / -0.0 → f16 ±0 → f32 ±0  (sign bit preserved)
+    //  * f16::MAX (65504.0) roundtrips exactly within f16 representable range
+    //  * f32 values above f16 range (e.g. 1e38) overflow → f16::INFINITY
+    //  * f32 subnormals flush to ±0 in f16 (magnitude below f16 MIN_POSITIVE)
+    // -----------------------------------------------------------------------
+
+    /// Helper: store a single f32 value in layer 0, advance, read back via get_k.
+    fn roundtrip_single(val: f32) -> f32 {
+        let config = FlatKVCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            max_seq_len: 4,
+        };
+        let mut cache = FlatKVCache::new(config);
+        cache.append_kv(0, &[val], &[0.0f32]);
+        cache.advance();
+        cache.get_k(0)[0]
+    }
+
+    #[test]
+    fn boundary_nan_propagates() {
+        // Contract: NaN input → NaN stored and read back.
+        let out = roundtrip_single(f32::NAN);
+        assert!(out.is_nan(), "expected NaN, got {out}");
+    }
+
+    #[test]
+    fn boundary_positive_infinity() {
+        // Contract: +∞ input → +∞ stored and read back.
+        let out = roundtrip_single(f32::INFINITY);
+        assert!(
+            out.is_infinite() && out.is_sign_positive(),
+            "expected +∞, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_negative_infinity() {
+        // Contract: -∞ input → -∞ stored and read back.
+        let out = roundtrip_single(f32::NEG_INFINITY);
+        assert!(
+            out.is_infinite() && out.is_sign_negative(),
+            "expected -∞, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_positive_zero() {
+        // Contract: +0.0 roundtrips as zero (sign not guaranteed by f16 spec but
+        // practically preserved; assert at minimum the value is zero).
+        let out = roundtrip_single(0.0f32);
+        assert_eq!(out, 0.0f32, "expected 0.0, got {out}");
+    }
+
+    #[test]
+    fn boundary_negative_zero() {
+        // Contract: -0.0 roundtrips as zero (sign preserved in IEEE-754 f16).
+        let out = roundtrip_single(-0.0f32);
+        assert_eq!(out, 0.0f32, "expected -0.0 (==0.0), got {out}");
+        assert!(
+            out.is_sign_negative(),
+            "expected sign bit to be negative for -0.0"
+        );
+    }
+
+    #[test]
+    fn boundary_f16_max_exact() {
+        // f16::MAX = 65504.0; this value is exactly representable in f16,
+        // so the roundtrip must be exact.
+        let f16_max = f16::MAX.to_f32(); // 65504.0
+        let out = roundtrip_single(f16_max);
+        assert_eq!(out, f16_max, "f16::MAX roundtrip must be exact, got {out}");
+    }
+
+    #[test]
+    fn boundary_overflow_to_infinity() {
+        // f32 values above f16 range (> 65504) overflow to ±∞ in f16.
+        // Contract: store overflows to +∞ and is read back as +∞.
+        let out = roundtrip_single(1e38_f32);
+        assert!(
+            out.is_infinite() && out.is_sign_positive(),
+            "expected +∞ (f32→f16 overflow), got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_f32_subnormal_flushes() {
+        // f32 subnormals with magnitude below f16 MIN_POSITIVE (~6e-8) flush to
+        // ±0 when converted to f16.  Contract: result is zero (positive or negative).
+        let tiny = f32::MIN_POSITIVE * 1e-10; // well below f16 representable range
+        let out = roundtrip_single(tiny);
+        assert_eq!(
+            out, 0.0f32,
+            "f32 subnormal below f16 range should flush to 0, got {out}"
+        );
+    }
 }
