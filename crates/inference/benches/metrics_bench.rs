@@ -147,50 +147,6 @@ fn bench_l2_norm(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Overhead ratio: print after benchmarking (informational, not Criterion).
-// ---------------------------------------------------------------------------
-//
-// Criterion does not expose raw ns values at bench-time, so we compute the
-// ratio ourselves via `std::time::Instant` with enough iterations for stability.
-
-fn print_overhead_ratio() {
-    use std::hint::black_box as bb;
-    use std::time::Instant;
-
-    let iters = 2_000_usize;
-    println!("\n=== online_entropy / naive_entropy overhead ratio ===");
-
-    for seq_len in [128usize, 512, 2048, 8192] {
-        let logits = logit_vec(seq_len, 42);
-
-        // Online — prevent the loop from being elided.
-        let mut acc = OnlineSoftmaxEntropy::new();
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            acc.reset();
-            for &l in bb(logits.as_slice()) {
-                acc.update(bb(l));
-            }
-            bb(acc.entropy_nats());
-        }
-        let online_ns = t0.elapsed().as_nanos() / iters as u128;
-
-        // Naive.
-        let t1 = Instant::now();
-        for _ in 0..iters {
-            bb(naive_entropy_nats(bb(logits.as_slice())));
-        }
-        let naive_ns = t1.elapsed().as_nanos() / iters as u128;
-
-        let ratio = online_ns as f64 / naive_ns.max(1) as f64;
-        println!(
-            "  seq_len={seq_len:5}: online={online_ns:6} ns, naive={naive_ns:6} ns, ratio={ratio:.3}"
-        );
-    }
-    println!();
-}
-
-// ---------------------------------------------------------------------------
 // Criterion entry points
 // ---------------------------------------------------------------------------
 
@@ -198,8 +154,6 @@ fn bench_all(c: &mut Criterion) {
     bench_online_entropy(c);
     bench_naive_entropy(c);
     bench_l2_norm(c);
-    // Print overhead ratio once at the end of the benchmark run.
-    print_overhead_ratio();
 }
 
 criterion_group!(metrics, bench_all);
