@@ -114,13 +114,14 @@ fn run_chat(model_path: &str, max_tokens: usize, temperature: f32) {
 mod serve {
     use axum::{
         Json, Router,
-        extract::State,
+        extract::{DefaultBodyLimit, State},
         http::StatusCode,
         response::{IntoResponse, Response},
         routing::{get, post},
     };
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // -----------------------------------------------------------------------
@@ -136,9 +137,15 @@ mod serve {
         /// Default `max_tokens` value used when a request omits the field.
         /// Set from the `--max-tokens` CLI flag passed to `lattice serve`.
         pub default_max_tokens: usize,
+        /// Hard upper bound on `max_tokens` accepted from any request.
+        /// Prevents callers from requesting unbounded generation.
+        pub max_tokens_cap: usize,
         /// Canonical model identifier echoed in every response.
         /// Derived from the `--model-id` flag or the model path basename.
         pub model_id: String,
+        /// Monotonically increasing counter used to make response IDs unique
+        /// across concurrent requests within the same second.
+        pub request_counter: Arc<AtomicU64>,
     }
 
     // -----------------------------------------------------------------------
@@ -347,7 +354,10 @@ mod serve {
         // any unsupported role encountered in the message list.
         let prompt = render_prompt(&req.messages)?;
 
-        let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens);
+        let max_tokens = req
+            .max_tokens
+            .unwrap_or(state.default_max_tokens)
+            .min(state.max_tokens_cap);
         let temperature = req.temperature.unwrap_or(0.7);
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
@@ -361,18 +371,30 @@ mod serve {
         // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
         let output = tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
             .await
-            .map_err(|e| ApiError::Internal {
-                message: format!("task join error: {e}"),
+            .map_err(|e| {
+                eprintln!("task join error: {e}");
+                ApiError::Internal {
+                    message: "inference failed".to_string(),
+                }
             })?
-            .map_err(|e| ApiError::Internal {
-                message: format!("generation error: {e}"),
+            .map_err(|e| {
+                eprintln!("generation error: {e}");
+                ApiError::Internal {
+                    message: "inference failed".to_string(),
+                }
             })?;
 
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token).
         // `GenerateOutput` does not carry an explicit stop reason, so we infer
         // it: if the model generated exactly `max_new_tokens` tokens the cap
         // was reached.
-        let finish_reason = if output.generated_tokens >= max_tokens {
+        debug_assert!(
+            output.generated_tokens <= max_tokens,
+            "generated_tokens ({}) exceeded max_tokens ({})",
+            output.generated_tokens,
+            max_tokens
+        );
+        let finish_reason = if output.generated_tokens == max_tokens {
             "length"
         } else {
             "stop"
@@ -382,9 +404,10 @@ mod serve {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
 
         let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{created}"),
+            id: format!("chatcmpl-{created}-{seq}"),
             object: "chat.completion".to_string(),
             created,
             model: state.model_id.clone(),
@@ -414,6 +437,7 @@ mod serve {
         Router::new()
             .route("/health", get(health))
             .route("/v1/chat/completions", post(chat_completions))
+            .layer(DefaultBodyLimit::max(1_048_576))
             .with_state(state)
     }
 }
@@ -442,6 +466,7 @@ async fn main() {
         } => {
             use std::path::Path;
             use std::sync::Arc;
+            use std::sync::atomic::AtomicU64;
 
             // Derive a model identifier from the path basename when --model-id
             // is not provided.
@@ -468,7 +493,9 @@ async fn main() {
             let state = serve::AppState {
                 model: Arc::new(qwen_model),
                 default_max_tokens: max_tokens,
+                max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
+                request_counter: Arc::new(AtomicU64::new(0)),
             };
 
             let app = serve::router(state);
