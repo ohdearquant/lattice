@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! lattice chat --model /path/to/model [--max-tokens 256] [--temperature 0.7]
-//! lattice serve --model /path/to/model [--port 8080] [--max-tokens 256]
+//! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
 //! ```
 
 use clap::{Parser, Subcommand};
@@ -35,6 +35,9 @@ enum Command {
         /// Path to model directory
         #[arg(long)]
         model: String,
+        /// Host address to bind (default: 127.0.0.1; use 0.0.0.0 for LAN)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// Port to listen on
         #[arg(long, default_value = "8080")]
         port: u16,
@@ -158,6 +161,8 @@ mod serve {
     pub enum ApiError {
         /// Caller mistake — HTTP 400.
         BadRequest { message: String, code: &'static str },
+        /// Request body exceeds size limit — HTTP 413.
+        PayloadTooLarge { message: String },
         /// Server-side failure — HTTP 500.
         Internal { message: String },
     }
@@ -188,6 +193,17 @@ mod serve {
                         },
                     });
                     (StatusCode::BAD_REQUEST, body).into_response()
+                }
+                ApiError::PayloadTooLarge { message } => {
+                    let body = Json(ErrorBody {
+                        error: ErrorDetail {
+                            message,
+                            r#type: "invalid_request_error",
+                            code: "request_body_too_large".to_string(),
+                            param: None,
+                        },
+                    });
+                    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
                 }
                 ApiError::Internal { message } => {
                     let body = Json(ErrorBody {
@@ -318,9 +334,17 @@ mod serve {
         // Surface JSON extraction failures (malformed JSON, missing Content-Type,
         // deserialization errors) as structured 400 responses instead of axum's
         // default plain-text rejection.
-        let Json(req) = result.map_err(|rejection| ApiError::BadRequest {
-            message: rejection.body_text(),
-            code: "invalid_request_body",
+        let Json(req) = result.map_err(|rejection| {
+            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".to_string(),
+                }
+            } else {
+                ApiError::BadRequest {
+                    message: rejection.body_text(),
+                    code: "invalid_request_body",
+                }
+            }
         })?;
 
         // Validate that the caller targets the served model.
@@ -358,6 +382,12 @@ mod serve {
             .max_tokens
             .unwrap_or(state.default_max_tokens)
             .min(state.max_tokens_cap);
+        if max_tokens == 0 {
+            return Err(ApiError::BadRequest {
+                message: "max_tokens must be at least 1".to_string(),
+                code: "invalid_request_error",
+            });
+        }
         let temperature = req.temperature.unwrap_or(0.7);
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
@@ -460,6 +490,7 @@ async fn main() {
         }
         Command::Serve {
             model,
+            host,
             port,
             max_tokens,
             model_id,
@@ -500,7 +531,7 @@ async fn main() {
 
             let app = serve::router(state);
 
-            let addr = format!("0.0.0.0:{port}");
+            let addr = format!("{host}:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
