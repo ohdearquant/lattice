@@ -104,7 +104,8 @@ impl AttentionKind {
             // MHA uses scratch buffers, not KV cache.
             AttentionKind::Mha => false,
             AttentionKind::Gqa(_) => true,
-            AttentionKind::Flash => false,
+            // Flash CPU uses a KV cache (ADR-059 state table: Flash CPU → Softmax, KV-backed).
+            AttentionKind::Flash => true,
             AttentionKind::FlashCausal => true,
             // GDN keeps a recurrent state (S matrix), not a growing KV cache.
             AttentionKind::Gdn => false,
@@ -260,8 +261,9 @@ mod attention_kind_tests {
     }
 
     #[test]
-    fn kv_cache_flash_false() {
-        assert!(!AttentionKind::Flash.supports_kv_cache());
+    fn kv_cache_flash_true() {
+        // ADR-059 state table classifies Flash CPU as KV-backed (Softmax category).
+        assert!(AttentionKind::Flash.supports_kv_cache());
     }
 
     #[test]
