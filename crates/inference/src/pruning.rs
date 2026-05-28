@@ -190,7 +190,7 @@ pub fn score_from_hidden_states(hidden_states: &[Vec<f32>]) -> Vec<BlockInfluenc
 pub fn pruning_rank(scores: &[BlockInfluence]) -> Vec<usize> {
     let mut indexed: Vec<(usize, f32)> =
         scores.iter().map(|s| (s.layer_idx, s.influence)).collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
     indexed.into_iter().map(|(idx, _)| idx).collect()
 }
 
