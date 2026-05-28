@@ -1,4 +1,4 @@
-//! Criterion benchmarks for FlatKVCache f16 storage (ADR-062 Phase 1).
+//! Criterion benchmarks for FlatKVCache f16 storage (ADR-062 seed).
 //!
 //! Measures:
 //! - `append_kv` throughput (f32→f16 conversion cost per token per layer)
