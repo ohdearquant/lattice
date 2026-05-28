@@ -73,7 +73,12 @@ fn bench_dispatch_vs_direct(c: &mut Criterion) {
         b.iter(|| {
             let kind = &kinds[i % kinds.len()];
             i = i.wrapping_add(1);
-            black_box(dispatch_kind(kind))
+            // Black-box the input so the compiler cannot specialize dispatch on
+            // a known-constant enum variant. Black-box the output to prevent
+            // dead-code elimination of the result.
+            let k = black_box(kind);
+            let result = dispatch_kind(k);
+            black_box(result);
         });
     });
 
