@@ -88,7 +88,14 @@ impl OnlineSoftmaxEntropy {
     /// Feed one logit value into the accumulator.
     ///
     /// This is the hot path — no allocation, branch-minimal.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Asserts `logit` is finite in debug builds. NaN or Inf inputs silently
+    /// corrupt the accumulator in release mode; callers must guarantee finite
+    /// inputs or filter them before calling this method.
     pub fn update(&mut self, logit: f32) {
+        debug_assert!(logit.is_finite(), "logit must be finite, got {logit}");
         if self.count == 0 {
             self.m = logit;
             self.l = 1.0;
@@ -104,14 +111,25 @@ impl OnlineSoftmaxEntropy {
             // (a_s - m_new) = (a_s - m_old) + (m_old - m_new) = (a_s - m_old) + diff
             // So r_new = alpha * r_old + alpha * l_old * diff + (logit - logit) * 1
             //          = alpha * (r_old + l_old * diff)
-            self.r = alpha * (self.r + self.l * diff);
+            //
+            // Guard: when the new logit dwarfs the old max (|diff| very large),
+            // alpha underflows to 0.0. In that case the old terms vanish exactly,
+            // so r_new = 0.0 rather than 0.0 * (finite + possibly-large) = NaN.
+            self.r = if alpha == 0.0 {
+                0.0
+            } else {
+                alpha * (self.r + self.l * diff)
+            };
             self.l = alpha * self.l + 1.0;
             self.m = logit;
         } else {
             let shifted = logit - self.m; // non-positive
             let w = shifted.exp();
             self.l += w;
-            self.r += w * shifted;
+            // Guard: when shifted is very negative, w underflows to 0.0.
+            // Computing 0.0 * shifted would give 0.0 * -inf = NaN in release
+            // mode when logit << m. Use 0.0 directly to keep r clean.
+            self.r += if w == 0.0 { 0.0 } else { w * shifted };
         }
         self.count += 1;
     }
