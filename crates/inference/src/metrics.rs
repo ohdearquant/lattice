@@ -1,4 +1,4 @@
-//! Inference metrics infrastructure (ADR-061 Phase 1).
+//! Inference metrics core seed (ADR-061).
 //!
 //! Provides zero-cost-when-disabled metrics collection for forward passes.
 //! The [`OnlineSoftmaxEntropy`] accumulator computes attention entropy in O(1)
