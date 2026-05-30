@@ -16,12 +16,20 @@ pub use self::standard::*;
 ///
 /// Each variant names one attention mechanism supported by Lattice.
 /// Variants that carry configuration embed a `Copy` config struct so callers
-/// can cheaply clone the enum and inspect parameters without heap allocation.
+/// can cheaply copy the enum and inspect parameters without heap allocation.
 ///
 /// This enum does **not** own mutable state (scratch buffers, KV caches); those
 /// remain in the per-variant structs in the individual modules. `AttentionKind`
 /// is the *routing* layer, not the *execution* layer.
-#[derive(Debug, Clone)]
+///
+/// # ADR-059 Phase 1 landing
+///
+/// This type is deliberately wired ahead of the dispatch sites. Production
+/// callers (`TransformerLayer`, Metal dispatch) will reference `AttentionKind`
+/// in subsequent phases (P2+). The enum is intentionally dead from a call-site
+/// perspective in P1; see ADR-059 §Implementation Phases and tracking issue
+/// `ADR-059-P2-wiring`.
+#[derive(Debug, Clone, Copy)]
 pub enum AttentionKind {
     /// Standard multi-head attention (BERT-style bidirectional encoder).
     ///
@@ -51,6 +59,7 @@ pub enum AttentionKind {
 
 impl AttentionKind {
     /// Human-readable name for logging and diagnostics.
+    #[inline]
     pub fn name(&self) -> &'static str {
         match self {
             AttentionKind::Mha => "mha",
@@ -70,6 +79,7 @@ impl AttentionKind {
     ///
     /// Causal attention ensures position `i` cannot attend to position `j > i`.
     /// Bidirectional variants (MHA encoder, plain Flash) return `false`.
+    #[inline]
     pub fn is_causal(&self) -> bool {
         match self {
             // Bidirectional encoder — no causal mask.
@@ -99,6 +109,7 @@ impl AttentionKind {
     /// MHA uses pre-allocated scratch buffers recomputed each forward pass and
     /// does not maintain a KV cache. KV-backed decoder variants maintain
     /// past-KV state; GDN variants use recurrent state matrices instead.
+    #[inline]
     pub fn supports_kv_cache(&self) -> bool {
         match self {
             // MHA uses scratch buffers, not KV cache.
