@@ -683,10 +683,14 @@ impl QwenModel {
         let mut ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
 
         let eos = self.inference_config.eos_token_id;
-        if ids.len() < max_len {
-            ids.push(eos);
-        } else {
-            if let Some(last) = ids.last_mut() {
+        // Only append EOS if the tokenizer has not already done so. Qwen3's
+        // tokenizer.json post_processor (TemplateProcessing) appends <|endoftext|>
+        // automatically; a second append would pool from a spurious extra EOS
+        // token instead of the real last-content token, causing embedding divergence.
+        if ids.last() != Some(&eos) {
+            if ids.len() < max_len {
+                ids.push(eos);
+            } else if let Some(last) = ids.last_mut() {
                 *last = eos;
             }
         }

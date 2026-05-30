@@ -1071,7 +1071,12 @@ fn try_newline_run(chars: &[char], pos: usize) -> Option<usize> {
     if i > nl_start { Some(i) } else { None }
 }
 
-/// `\s+(?!\S)` — whitespace not followed by non-whitespace (i.e. trailing)
+/// `\s+(?!\S)` — whitespace not followed by non-whitespace.
+///
+/// Implements greedy-with-backtracking semantics: match as many whitespace chars
+/// as possible such that the char immediately after is NOT `\S` (non-whitespace).
+/// When a whitespace run precedes a non-whitespace char, the longest valid match
+/// is the run minus the last char (whose lookahead sees the following whitespace).
 fn try_trailing_ws(chars: &[char], pos: usize) -> Option<usize> {
     if !chars.get(pos).is_some_and(|c| c.is_whitespace()) {
         return None;
@@ -1080,7 +1085,16 @@ fn try_trailing_ws(chars: &[char], pos: usize) -> Option<usize> {
     while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
     }
-    if i == chars.len() { Some(i) } else { None }
+    if i == chars.len() {
+        Some(i)
+    } else if i > pos + 1 {
+        // Whitespace run of ≥2 before a non-whitespace: backtrack one position.
+        // The resulting match ends at i-1, whose lookahead char (at i-1) is whitespace.
+        Some(i - 1)
+    } else {
+        // Single space before non-whitespace: (?!\S) fails even after backtracking.
+        None
+    }
 }
 
 #[cfg(test)]
