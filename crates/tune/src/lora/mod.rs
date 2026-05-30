@@ -181,6 +181,61 @@ impl LoraAdapter {
     }
 }
 
+#[cfg(feature = "inference-hook")]
+impl LoraAdapter {
+    /// Validate adapter dimensions against a Qwen3.5 model configuration.
+    ///
+    /// Checks every `(layer_idx, module)` pair in the adapter:
+    /// - `layer_idx` is within `config.num_hidden_layers`
+    /// - `d_in` / `d_out` match the projection dimensions the model expects
+    ///
+    /// Returns `Err(TuneError::Validation(...))` on the first mismatch found.
+    /// Call this after loading and before
+    /// [`set_lora`](lattice_inference::model::qwen35::Qwen35Model::set_lora)
+    /// to surface dim errors before generation starts.
+    pub fn validate_against(
+        &self,
+        config: &lattice_inference::model::qwen35_config::Qwen35Config,
+    ) -> crate::error::Result<()> {
+        for ((layer_idx, module), layer) in &self.layers {
+            if *layer_idx >= config.num_hidden_layers {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer index {layer_idx} >= model num_hidden_layers {} (module: {module})",
+                    config.num_hidden_layers
+                )));
+            }
+
+            let is_full = config.is_full_attention(*layer_idx);
+            let (expected_d_in, expected_d_out) = match (module.as_str(), is_full) {
+                ("q_proj", true) => (config.hidden_size, 2 * config.full_q_dim()),
+                ("k_proj", true) => (config.hidden_size, config.full_kv_dim()),
+                ("v_proj", true) => (config.hidden_size, config.full_kv_dim()),
+                ("o_proj", true) => (config.full_q_dim(), config.hidden_size),
+                ("in_proj_qkv", false) => (config.hidden_size, config.linear_qkv_dim()),
+                ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
+                ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
+                ("gate_proj", _) => (config.hidden_size, config.intermediate_size),
+                ("up_proj", _) => (config.hidden_size, config.intermediate_size),
+                ("down_proj", _) => (config.intermediate_size, config.hidden_size),
+                (m, _) => {
+                    return Err(crate::error::TuneError::Validation(format!(
+                        "LoRA module '{m}' (layer {layer_idx}) is not a recognised Qwen3.5 projection"
+                    )));
+                }
+            };
+
+            if layer.d_in != expected_d_in || layer.d_out != expected_d_out {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA adapter dims mismatch for layer {layer_idx} module '{module}': \
+                     adapter has (d_in={}, d_out={}) but model expects (d_in={expected_d_in}, d_out={expected_d_out})",
+                    layer.d_in, layer.d_out
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 // Implement LoraHook from lattice-inference so LoraAdapter can be injected
 // into the inference forward pass.
 #[cfg(feature = "inference-hook")]
@@ -351,5 +406,81 @@ mod tests {
         let adapter = LoraAdapter::new(config, HashMap::new());
         let unknown = adapter.validate_modules(&["q_proj"]);
         assert!(unknown.is_empty());
+    }
+
+    #[cfg(feature = "inference-hook")]
+    mod validate_against_tests {
+        use super::*;
+        use lattice_inference::model::qwen35_config::Qwen35Config;
+
+        fn make_adapter_for_layer(
+            layer_idx: usize,
+            module: &str,
+            d_in: usize,
+            d_out: usize,
+        ) -> LoraAdapter {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (layer_idx, module.to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * d_in],
+                    b: vec![0.0; d_out * rank],
+                    d_in,
+                    d_out,
+                    rank,
+                },
+            );
+            LoraAdapter::new(
+                LoraConfig {
+                    rank,
+                    alpha: rank as f32,
+                    target_modules: vec![module.to_string()],
+                },
+                layers,
+            )
+        }
+
+        #[test]
+        fn test_validate_against_layer_out_of_bounds() {
+            let cfg = Qwen35Config::qwen35_0_8b();
+            // layer 999 does not exist
+            let adapter = make_adapter_for_layer(999, "q_proj", 1024, 4096);
+            assert!(adapter.validate_against(&cfg).is_err());
+        }
+
+        #[test]
+        fn test_validate_against_dim_mismatch() {
+            let cfg = Qwen35Config::qwen35_0_8b();
+            // 0.8b: hidden=1024, full_q_dim=8*256=2048 → q_proj expects (1024, 4096)
+            // Supply 2b dims (hidden=2048, full_q_dim=4096 → d_out=8192) — wrong for 0.8b.
+            // Layer 3 is full-attention in the 24-layer 0.8b config.
+            let adapter = make_adapter_for_layer(3, "q_proj", 2048, 8192);
+            assert!(adapter.validate_against(&cfg).is_err());
+        }
+
+        #[test]
+        fn test_validate_against_correct_dims_passes() {
+            let cfg = Qwen35Config::qwen35_0_8b();
+            // Layer 3 is full-attention; q_proj: d_in=hidden=1024, d_out=2*full_q_dim=4096.
+            let adapter = make_adapter_for_layer(3, "q_proj", 1024, 4096);
+            assert!(adapter.validate_against(&cfg).is_ok());
+        }
+
+        #[test]
+        fn test_validate_against_mlp_correct() {
+            let cfg = Qwen35Config::qwen35_0_8b();
+            // gate_proj on any layer: d_in=hidden=1024, d_out=intermediate=3584.
+            let adapter = make_adapter_for_layer(0, "gate_proj", 1024, 3584);
+            assert!(adapter.validate_against(&cfg).is_ok());
+        }
+
+        #[test]
+        fn test_validate_against_unknown_module_errors() {
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let adapter = make_adapter_for_layer(3, "xq_proj_typo", 1024, 4096);
+            let err = adapter.validate_against(&cfg).unwrap_err();
+            assert!(err.to_string().contains("not a recognised"));
+        }
     }
 }
