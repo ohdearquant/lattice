@@ -505,7 +505,7 @@ mod tests {
         // Paper: mean(cos) = (1.0 + 0.0) / 2 = 0.5
         // Pseudocode drift: sum(dot) / sum(norms) = 0.0 / 10001.0 ≈ 0.0 ← WRONG
         let unit_x = vec![1.0_f32, 0.0];
-        let unit_y = vec![0.0_f32, 1.0];
+        let _unit_y = vec![0.0_f32, 1.0];
         let big_x = vec![100.0_f32, 0.0];
         let big_y = vec![0.0_f32, 100.0];
 
