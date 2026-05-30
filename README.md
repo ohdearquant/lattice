@@ -71,20 +71,20 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 
 ## Features
 
-| Feature                       | Description                                                                                  |
-| ----------------------------- | -------------------------------------------------------------------------------------------- |
-| Pure Rust compute             | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                             |
-| Two transformer architectures | BERT/BGE encoder-only (mean pooling) and Qwen3 decoder-only (causal GQA, last-token pooling) |
-| 9 supported models            | BGE, mE5, MiniLM, Qwen3-Embedding families — see table below                                 |
-| Metal GPU backend             | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.   |
-| Three pure Rust tokenizers    | WordPiece, SentencePiece, BPE — no Hugging Face tokenizers C extension                       |
-| Safetensors native            | Memory-mapped weight loading from HuggingFace `.safetensors` format                          |
-| MRL support                   | Matryoshka truncation for Qwen3 models (configurable output dimension >= 32)                 |
-| LRU embedding cache           | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats                     |
-| LoRA adapter injection        | Inject trained LoRA adapters into inference models at runtime                                |
-| Knowledge distillation        | Train small models from Claude/GPT/Gemini teacher soft labels                                |
-| Optimal transport             | Sinkhorn-Knopp solver (log-domain, epsilon-scaling) for embedding drift detection            |
-| Tiny fast networks            | `lattice-fann`: sub-5ms classifiers with pre-allocated buffers, zero-alloc forward pass      |
+| Feature                    | Description                                                                                                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pure Rust compute          | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                                                                                                |
+| Multiple model families    | BERT/BGE encoder (CLS pooling), E5/MiniLM encoder (mean pooling), Qwen3 decoder embedding, Qwen3.5/3.6 generation, CrossEncoder reranker — see [docs/models.md](docs/models.md) |
+| 9 local embedding models   | BGE, mE5, MiniLM, Qwen3-Embedding families — full support matrix: [docs/models.md](docs/models.md)                                                                              |
+| Metal GPU backend          | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.                                                                                      |
+| Three pure Rust tokenizers | WordPiece, SentencePiece, BPE — no Hugging Face tokenizers C extension                                                                                                          |
+| Safetensors native         | Memory-mapped weight loading from HuggingFace `.safetensors` format                                                                                                             |
+| MRL support                | Matryoshka truncation for Qwen3 models (configurable output dimension >= 32)                                                                                                    |
+| LRU embedding cache        | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats                                                                                                        |
+| LoRA adapter injection     | Inference hook, `Qwen35Model::set_lora`, `lattice-tune` PEFT safetensors, Metal single-adapter path — see [docs/models.md §3](docs/models.md#3-inference-features)              |
+| Knowledge distillation     | Train small models from Claude/GPT/Gemini teacher soft labels                                                                                                                   |
+| Optimal transport          | Sinkhorn-Knopp solver (log-domain, epsilon-scaling) for embedding drift detection                                                                                               |
+| Tiny fast networks         | `lattice-fann`: sub-5ms classifiers with pre-allocated buffers, zero-alloc forward pass                                                                                         |
 
 ---
 
@@ -127,25 +127,26 @@ and can be used standalone.
 
 ## Supported Models
 
-All local models load from HuggingFace safetensors format.
+For the full support matrix — all embedding and generation models, attention variants, inference
+features, and tokenizer details — see **[docs/models.md](docs/models.md)**.
 
-| Model                               | Variant                                                     | Architecture       | Dimensions | Max Tokens | Tokenizer     |
-| ----------------------------------- | ----------------------------------------------------------- | ------------------ | ---------- | ---------- | ------------- |
-| `BgeSmallEnV15`                     | BAAI/bge-small-en-v1.5                                      | BERT encoder       | 384        | 512        | WordPiece     |
-| `BgeBaseEnV15`                      | BAAI/bge-base-en-v1.5                                       | BERT encoder       | 768        | 512        | WordPiece     |
-| `BgeLargeEnV15`                     | BAAI/bge-large-en-v1.5                                      | BERT encoder       | 1024       | 512        | WordPiece     |
-| `MultilingualE5Small`               | intfloat/multilingual-e5-small                              | BERT encoder       | 384        | 512        | SentencePiece |
-| `MultilingualE5Base`                | intfloat/multilingual-e5-base                               | BERT encoder       | 768        | 512        | SentencePiece |
-| `AllMiniLmL6V2`                     | sentence-transformers/all-MiniLM-L6-v2                      | BERT encoder       | 384        | 256        | WordPiece     |
-| `ParaphraseMultilingualMiniLmL12V2` | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 | BERT encoder       | 384        | 128        | WordPiece     |
-| `Qwen3Embedding0_6B`                | Qwen/Qwen3-Embedding-0.6B                                   | Decoder (GQA+RoPE) | 1024       | 8192       | BPE           |
-| `Qwen3Embedding4B`                  | Qwen/Qwen3-Embedding-4B                                     | Decoder (GQA+RoPE) | 2560*      | 8192       | BPE           |
+Quick reference for the local embedding models available through `EmbeddingModel`:
 
-*Qwen3-Embedding-4B supports MRL truncation to any dimension >= 32.
+| Variant                             | HuggingFace ID                                                | Dims  | Max tokens | Auto-download  |
+| ----------------------------------- | ------------------------------------------------------------- | :---: | :--------: | :------------: |
+| `BgeSmallEnV15`                     | `BAAI/bge-small-en-v1.5`                                      |  384  |    512     |       ✓        |
+| `BgeBaseEnV15`                      | `BAAI/bge-base-en-v1.5`                                       |  768  |    512     |       ✓        |
+| `BgeLargeEnV15`                     | `BAAI/bge-large-en-v1.5`                                      | 1024  |    512     |       ✓        |
+| `MultilingualE5Small`               | `intfloat/multilingual-e5-small`                              |  384  |    512     |       ✓        |
+| `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               |  768  |    512     |       ✓        |
+| `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      |  384  |    256     |       ✓        |
+| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |  384  |    128     |       ✓        |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  |    8192    | local dir only |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560† |    8192    | local dir only |
 
-E5 models expect asymmetric `"query: "` / `"passage: "` prefixes for retrieval. Qwen3 models
-expect an instruction prefix. The `EmbeddingModel` enum exposes `query_instruction()` and
-`document_instruction()` so callers can apply these correctly.
+†Both Qwen3 embedding variants support MRL truncation to any dimension ≥ 32.
+BGE v1.5 uses CLS pooling; E5 and MiniLM use mean pooling.
+E5 `document_instruction()` returns `"passage: "` — `embed_passage()` applies it automatically.
 
 ---
 
@@ -283,30 +284,30 @@ vectors enough to warrant re-indexing.
 
 Fair end-to-end measurement — **slope method**: `tok/s = (N₂−N₁) / (T(N₂)−T(N₁))` for a fixed
 prompt, so prompt prefill, model load, and per-call overhead cancel and every engine is measured
-the *same* way (greedy, median of 5 runs, N₁=32, N₂=256).
+the _same_ way (greedy, median of 5 runs, N₁=32, N₂=256).
 
-| Engine | Quant | decode tok/s | Notes |
-|--------|-------|--------------|-------|
-| MLX | Q8 (g64) | **247** | Apple's Metal-native framework — fastest |
-| **Lattice** | f16 | **157** | Pure Rust + Metal; ~1.9× Ollama |
-| Ollama | Q8_0 | **84** | llama.cpp Metal backend |
+| Engine      | Quant    | decode tok/s | Notes                                    |
+| ----------- | -------- | ------------ | ---------------------------------------- |
+| MLX         | Q8 (g64) | **247**      | Apple's Metal-native framework — fastest |
+| **Lattice** | f16      | **157**      | Pure Rust + Metal; ~1.9× Ollama          |
+| Ollama      | Q8_0     | **84**       | llama.cpp Metal backend                  |
 
 Cross-check: Ollama's slope (84) matches its own `eval_duration` rate (87), confirming the
 methodology is sound.
 
 **Honest caveats.** Lattice's Qwen3.5 decode path is **f16** (`MetalQwen35State::new`); MLX is Q8
 and Ollama is Q8_0, so this is not quant-matched. There is **no end-to-end Q8 path** for Qwen3.5
-in Lattice — the earlier "Q8 139" number was an f16 `forward_step` *micro-benchmark* mislabeled
+in Lattice — the earlier "Q8 139" number was an f16 `forward_step` _micro-benchmark_ mislabeled
 "Q8" (the bench's `load_q8_state` builds the same f16 state as the f16 path). 157 tok/s (f16,
 true e2e) is Lattice's actual decode rate for this model; the only other real e2e path is **Q4**
 (`from_q4_dir`). **MLX decodes faster than Lattice.** Lattice's value is portability plus
 capabilities no other engine has on this model:
 
-| Lattice-only capability | MLX | Ollama |
-|---|---|---|
-| QuaRot 4-bit (rotated quant) | ✗ | ✗ |
-| Q4 + LoRA r8 hot-swap (no reload) | ✗ | ✗ |
-| Pure Rust, zero Python / framework | ✗ | ✗ |
+| Lattice-only capability            | MLX | Ollama |
+| ---------------------------------- | --- | ------ |
+| QuaRot 4-bit (rotated quant)       | ✗   | ✗      |
+| Q4 + LoRA r8 hot-swap (no reload)  | ✗   | ✗      |
+| Pure Rust, zero Python / framework | ✗   | ✗      |
 
 A previous version of this table claimed "+8% vs MLX"; that was a measurement artifact (a
 criterion `forward_step` micro-bench compared against MLX end-to-end with prefill counted in the
