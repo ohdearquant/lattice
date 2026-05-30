@@ -71,18 +71,23 @@ fn fixture_dir() -> PathBuf {
         .join("embed_parity_v1")
 }
 
-fn load_fixture(filename: &str) -> Option<Vec<Golden>> {
+fn load_fixture(filename: &str) -> Vec<Golden> {
     let path = fixture_dir().join(filename);
-    if !path.exists() {
-        eprintln!(
-            "SKIP: fixture not found at {path}. Run scripts/gen_embed_parity_goldens.py first.",
-            path = path.display()
-        );
-        return None;
-    }
+    assert!(
+        path.exists(),
+        "committed fixture not found at {path} — run scripts/gen_embed_parity_goldens.py and commit the output",
+        path = path.display()
+    );
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-    Some(serde_json::from_str(&data).unwrap_or_else(|e| panic!("bad JSON in {filename}: {e}")))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("bad JSON in {filename}: {e}"))
+}
+
+fn record_vector_weight_skip(test_name: &str, model_dir: &std::path::Path) {
+    eprintln!(
+        "LATTICE_VECTOR_PARITY_SKIPPED test={test_name} reason=missing_weights path={}",
+        model_dir.display()
+    );
 }
 
 /// Cosine similarity between two f32 vectors, returned as f64 for comparison.
@@ -144,17 +149,12 @@ async fn embed_passage_text(
 
 #[tokio::test]
 async fn bge_small_parity_vs_hf() {
-    let Some(goldens) = load_fixture("bge_small_en_v15.json") else {
-        return; // fixture absent → skip
-    };
+    let goldens = load_fixture("bge_small_en_v15.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/bge-small-en-v1.5");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP bge_small_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("bge_small_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -216,17 +216,12 @@ async fn bge_small_parity_vs_hf() {
 
 #[tokio::test]
 async fn e5_small_parity_vs_hf() {
-    let Some(goldens) = load_fixture("multilingual_e5_small.json") else {
-        return;
-    };
+    let goldens = load_fixture("multilingual_e5_small.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/multilingual-e5-small");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP e5_small_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("e5_small_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -292,17 +287,12 @@ async fn e5_small_parity_vs_hf() {
 
 #[tokio::test]
 async fn all_minilm_l6_v2_parity_vs_hf() {
-    let Some(goldens) = load_fixture("all_minilm_l6_v2.json") else {
-        return;
-    };
+    let goldens = load_fixture("all_minilm_l6_v2.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/all-minilm-l6-v2");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP all_minilm_l6_v2_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("all_minilm_l6_v2_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -368,16 +358,14 @@ async fn all_minilm_l6_v2_parity_vs_hf() {
 
 #[tokio::test]
 async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
-    let Some(goldens) = load_fixture("paraphrase_multilingual_minilm_l12_v2.json") else {
-        return;
-    };
+    let goldens = load_fixture("paraphrase_multilingual_minilm_l12_v2.json");
 
     let model_dir = PathBuf::from(std::env::var("HOME").unwrap())
         .join(".lattice/models/paraphrase-multilingual-minilm-l12-v2");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP paraphrase_multilingual_minilm_l12_v2_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
+        record_vector_weight_skip(
+            "paraphrase_multilingual_minilm_l12_v2_parity_vs_hf",
+            &model_dir,
         );
         return;
     }
@@ -449,17 +437,12 @@ async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
 #[tokio::test]
 #[ignore = "Qwen3-Embedding forward-pass divergence — see lattice#103"]
 async fn qwen3_embedding_0_6b_parity_vs_hf() {
-    let Some(goldens) = load_fixture("qwen3_embedding_0_6b.json") else {
-        return;
-    };
+    let goldens = load_fixture("qwen3_embedding_0_6b.json");
 
     let qwen_model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/qwen3-embedding-0.6b");
     if !qwen_model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP qwen3_embedding_0_6b_parity_vs_hf: model weights not found at {}",
-            qwen_model_dir.display()
-        );
+        record_vector_weight_skip("qwen3_embedding_0_6b_parity_vs_hf", &qwen_model_dir);
         return;
     }
 
