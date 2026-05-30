@@ -213,6 +213,7 @@ mod tests {
             max_seq_len: 4096,
             chunk_size: chunk,
             prefill_reserve_pages: reserve,
+            ..Default::default()
         })
     }
 

@@ -552,6 +552,7 @@ mod tests {
             max_seq_len: 64,
             chunk_size: 8,
             prefill_reserve_pages: 2,
+            ..Default::default()
         };
         BatchWorker::new(
             config,
@@ -726,6 +727,7 @@ mod tests {
                 max_seq_len: 128,
                 chunk_size: 3, // small chunk to force multiple prefill steps
                 prefill_reserve_pages: 0,
+                ..Default::default()
             },
             test_kv_config(),
             16,
