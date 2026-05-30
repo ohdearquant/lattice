@@ -1170,17 +1170,18 @@ impl ShardedSafetensors {
         });
 
         // --- Build QwenWeights borrowing from the backing ---
-        // SAFETY: The backing is heap-allocated in a Box and will be stored alongside
-        // the QwenWeights<'static> in SafetensorsStorage::Sharded inside QwenModel.
-        // Field drop order (RFC 1857) guarantees backing outlives weights: `weights`
-        // is declared before `_safetensors` in QwenModel, so `_safetensors` (which
-        // owns the backing) is dropped last.
+        // SAFETY: The backing is heap-allocated in a Box; its address is stable.
+        // `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
+        // implements `Drop` to drop `weights` before `_storage`, ensuring the
+        // slice references in `weights` are released before `backing` is freed.
+        // This invariant is independent of field declaration order in `QwenModel`.
         let weights: QwenWeights<'static> = {
             #[allow(clippy::explicit_auto_deref)]
             let b: &ShardedQwenBacking = &*backing;
-            // SAFETY: We extend the lifetime of references into `b` to 'static.
-            // This is safe because `backing` lives in a Box that is co-located
-            // with the QwenWeights inside QwenModel and is dropped after it.
+            // SAFETY: We extend the borrow of `b` to 'static. This is sound because
+            // `backing` outlives any use of these references: `QwenModel` drops
+            // `weights` before `_storage` via an explicit `Drop` impl that uses
+            // `ManuallyDrop`, independent of field declaration order.
             let b: &'static ShardedQwenBacking = unsafe { &*(b as *const ShardedQwenBacking) };
 
             let embed_tokens = Tensor2D {

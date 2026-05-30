@@ -13,6 +13,7 @@ use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -20,9 +21,9 @@ use std::time::Instant;
 /// Backing storage for Qwen model weights — either a single mmap'd file or
 /// an owned heap allocation for sharded checkpoints.
 ///
-/// Drop order within `QwenModel` guarantees that `weights` is dropped before
-/// this enum (RFC 1857 struct field ordering), keeping all tensor slice
-/// references valid for the model's lifetime.
+/// `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
+/// implements `Drop` to drop `weights` before `_storage`, keeping tensor
+/// slice references valid regardless of field declaration order.
 ///
 /// The inner fields are kept solely for their `Drop` effect (RAII backing store).
 #[allow(dead_code)]
@@ -392,11 +393,24 @@ pub struct QwenModel {
     /// Optional Metal GPU forward pass. When available, transformer layers run on GPU
     /// while embedding lookup and pooling stay on CPU.
     metal: Option<Mutex<MetalForwardPass>>,
-    // INVARIANT: `weights` MUST be declared before `_storage`.
-    // RFC 1857 guarantees struct fields are dropped in declaration order, so
-    // `weights` (which holds slices into `_storage`) is dropped first.
-    weights: QwenWeights<'static>,
-    _storage: SafetensorsStorage,
+    // Both fields are `ManuallyDrop` so that `Drop for QwenModel` can enforce
+    // explicit drop order: `weights` before `_storage`. This is independent of
+    // field declaration order — a reorder cannot cause use-after-free.
+    weights: ManuallyDrop<QwenWeights<'static>>,
+    _storage: ManuallyDrop<SafetensorsStorage>,
+}
+
+impl Drop for QwenModel {
+    fn drop(&mut self) {
+        // SAFETY: `weights` holds slice references into the data owned by `_storage`.
+        // We drop `weights` first to release those references, then drop `_storage`.
+        // Using `ManuallyDrop` here makes this ordering explicit and independent of
+        // field declaration order — a future field reorder cannot cause use-after-free.
+        unsafe {
+            ManuallyDrop::drop(&mut self.weights);
+            ManuallyDrop::drop(&mut self._storage);
+        }
+    }
 }
 
 impl QwenModel {
@@ -474,8 +488,8 @@ impl QwenModel {
                 buffers: Mutex::new(ForwardBuffers::new()),
                 cache: Mutex::new(HashMap::with_capacity(1024)),
                 metal,
-                weights,
-                _storage: SafetensorsStorage::Single(safetensors),
+                weights: ManuallyDrop::new(weights),
+                _storage: ManuallyDrop::new(SafetensorsStorage::Single(safetensors)),
             })
         } else if index_path.exists() {
             // --- Sharded path ---
@@ -535,8 +549,8 @@ impl QwenModel {
                 buffers: Mutex::new(ForwardBuffers::new()),
                 cache: Mutex::new(HashMap::with_capacity(1024)),
                 metal,
-                weights,
-                _storage: SafetensorsStorage::Sharded(backing),
+                weights: ManuallyDrop::new(weights),
+                _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(backing)),
             })
         } else {
             Err(InferenceError::ModelNotFound(format!(
