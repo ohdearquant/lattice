@@ -806,4 +806,76 @@ mod tests {
             "f16 MIN_POSITIVE_SUBNORMAL should survive roundtrip, got {out}"
         );
     }
+
+    /// Quality measurement: f32→f16→f32 roundtrip error over representative KV value ranges.
+    ///
+    /// Reports max absolute error, max relative error, and confirms they are within
+    /// the bounds implied by IEEE-754 binary16 (f16 epsilon = 2^-10 ≈ 9.77e-4).
+    #[test]
+    fn quality_measurement_f16_roundtrip_error() {
+        let n = 200_000usize;
+
+        // Ranges representing typical KV values in transformer models
+        let ranges: &[(&str, f32, f32)] = &[
+            ("tiny [-0.1, 0.1]", -0.1, 0.1),
+            ("small [-1.0, 1.0]", -1.0, 1.0),
+            ("typical [-5.0, 5.0]", -5.0, 5.0),
+            ("large [-10.0, 10.0]", -10.0, 10.0),
+        ];
+
+        // f16::MIN_POSITIVE is the smallest *normal* f16 value (~6.1e-5).
+        // Values below this may flush to a subnormal or zero — relative error near zero
+        // is by-design large (subnormal flush is expected behavior). We check only
+        // normal f16 values for the relative-error invariant.
+        let f16_min_normal = f16::MIN_POSITIVE.to_f32();
+
+        for (label, lo, hi) in ranges {
+            let mut max_abs = 0.0f32;
+            let mut max_rel_normal = 0.0f32;
+            for i in 0..n {
+                let t = i as f32 / (n - 1) as f32;
+                let v = lo + t * (hi - lo);
+                let v_h = f16::from_f32(v).to_f32();
+                let abs_err = (v - v_h).abs();
+                if abs_err > max_abs {
+                    max_abs = abs_err;
+                }
+                // Relative error only meaningful for normal f16 inputs
+                if v.abs() >= f16_min_normal {
+                    let rel_err = abs_err / v.abs();
+                    if rel_err > max_rel_normal {
+                        max_rel_normal = rel_err;
+                    }
+                }
+            }
+            // Max relative error for normal inputs must be <= 0.5 * f16::EPSILON
+            let half_eps = f16::EPSILON.to_f32() / 2.0;
+            assert!(
+                max_rel_normal <= half_eps + 1e-7,
+                "{label}: max relative error (normal inputs) {max_rel_normal:.2e} exceeds 0.5*ε ({half_eps:.2e})"
+            );
+        }
+
+        // Confirm the specific "< 0.1% relative error" claim for [-10, 10]
+        let mut max_rel_kv = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let v = -10.0 + t * 20.0_f32;
+            let v_h = f16::from_f32(v).to_f32();
+            let rel_err = if v.abs() > 1e-10 {
+                (v - v_h).abs() / v.abs()
+            } else {
+                (v - v_h).abs()
+            };
+            if rel_err > max_rel_kv {
+                max_rel_kv = rel_err;
+            }
+        }
+        // Measured relative error must be < 0.1% (0.001)
+        assert!(
+            max_rel_kv < 0.001,
+            "max relative error for KV in [-10,10] is {:.4e}, expected < 0.001",
+            max_rel_kv
+        );
+    }
 }
