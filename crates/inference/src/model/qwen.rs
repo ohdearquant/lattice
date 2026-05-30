@@ -470,8 +470,8 @@ impl QwenModel {
                 }
             };
 
-            // SAFETY: The backing store (_storage / safetensors) outlives weights
-            // because it is dropped after weights (RFC 1857 struct field drop order).
+            // SAFETY: The safetensors backing is stored in `_storage`; `QwenModel::drop`
+            // explicitly drops `weights` before `_storage`, independent of field order.
             let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
 
             let rope_max = config
@@ -529,10 +529,9 @@ impl QwenModel {
                 }
             };
 
-            // SAFETY: `weights_tmp` already has 'static lifetime from
-            // `load_qwen_weights_owned` — the slices point into `backing` which
-            // is a heap-allocated Box.  We store `backing` in `_storage` and
-            // declare `weights` before `_storage` so drop order is correct.
+            // SAFETY: `weights_tmp` contains slices into `backing`. `backing` is moved
+            // into `_storage`, and `QwenModel::drop` explicitly drops `weights` before
+            // `_storage`, independent of field declaration order.
             let weights: QwenWeights<'static> = weights_tmp;
 
             let rope_max = config

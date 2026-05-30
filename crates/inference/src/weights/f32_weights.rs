@@ -987,9 +987,9 @@ impl ShardedSafetensors {
     /// Load all Qwen3 weights from a sharded checkpoint into an owned backing store.
     ///
     /// Returns `(backing, weights)` where `weights` borrows from `backing`.
-    /// The caller MUST store `backing` in a `Box` and ensure `weights` does not
-    /// outlive it.  In `QwenModel` the `SafetensorsStorage::Sharded` variant
-    /// owns the `Box<ShardedQwenBacking>` and is dropped after `weights`.
+    /// The caller MUST keep `backing` alive until after `weights` is dropped.
+    /// `QwenModel` enforces this with `ManuallyDrop` fields and an explicit
+    /// `Drop` impl that drops `weights` before `_storage`.
     pub fn load_qwen_weights_owned(
         &mut self,
         num_layers: usize,
