@@ -121,6 +121,16 @@ fn bench_dispatch_vs_direct(c: &mut Criterion) {
         });
     });
 
+    // --- tag() overhead ---
+    group.bench_function("tag_all_variants", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let kind = &kinds[i % kinds.len()];
+            i = i.wrapping_add(1);
+            black_box(kind.tag())
+        });
+    });
+
     group.finish();
 }
 
