@@ -32,6 +32,7 @@ use crate::metrics::l2_norm;
 /// Panics if `a.len() != b.len()`. This check is always-on (not
 /// debug-only) because mismatched inputs silently truncate via zip,
 /// producing wrong scores during offline calibration.
+#[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     assert_eq!(a.len(), b.len(), "vectors must have equal length");
     let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
@@ -131,6 +132,7 @@ impl BlockInfluenceAccumulator {
     /// # Panics
     ///
     /// Panics if `input.len() != output.len()`.
+    #[inline]
     pub fn update(&mut self, input: &[f32], output: &[f32]) {
         if let Some(cos) = cosine_similarity(input, output) {
             self.cosine_sum += cos as f64;
