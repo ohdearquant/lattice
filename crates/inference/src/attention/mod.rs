@@ -12,23 +12,44 @@ pub mod standard;
 // Re-export from standard for backward compat
 pub use self::standard::*;
 
-/// Unified attention dispatch enum (ADR-059).
+/// Stable tag enum for ADR-059 attention variants (consumed by ADR-060 pruning).
+///
+/// `AttentionTag` is the typed taxonomy that higher layers (`LayerStats`,
+/// `CalibrationObserver`) use instead of the lossy string `name()`. Tag values
+/// are stable; variant names here match ADR-059's `AttentionTag` identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionTag {
+    Mha,
+    Gqa,
+    /// Tiled Flash Attention v2 (CPU, O(1) memory, no mask).
+    FlashCpu,
+    /// Tiled Flash Attention v2 with causal mask (decoder prefill).
+    FlashCausal,
+    Gdn,
+    GdnFused,
+    GatedGqa,
+    Differential,
+    /// Native Sparse Attention (ADR-059: sparse-hybrid state).
+    Nsa,
+    Decode,
+}
+
+/// Phase-1 metadata enum for ADR-059 attention dispatch.
 ///
 /// Each variant names one attention mechanism supported by Lattice.
 /// Variants that carry configuration embed a `Copy` config struct so callers
 /// can cheaply copy the enum and inspect parameters without heap allocation.
 ///
-/// This enum does **not** own mutable state (scratch buffers, KV caches); those
-/// remain in the per-variant structs in the individual modules. `AttentionKind`
-/// is the *routing* layer, not the *execution* layer.
+/// This enum does **not** implement `AttentionOp`, allocate state/scratch, or
+/// call kernels. Those belong to ADR-059 P2+. `AttentionKind` is the
+/// *routing* and *metadata* layer — not the *execution* layer.
 ///
 /// # ADR-059 Phase 1 landing
 ///
 /// This type is deliberately wired ahead of the dispatch sites. Production
 /// callers (`TransformerLayer`, Metal dispatch) will reference `AttentionKind`
 /// in subsequent phases (P2+). The enum is intentionally dead from a call-site
-/// perspective in P1; see ADR-059 §Implementation Phases and tracking issue
-/// `ADR-059-P2-wiring`.
+/// perspective in P1; see ADR-059 §Implementation Phases.
 #[derive(Debug, Clone, Copy)]
 pub enum AttentionKind {
     /// Standard multi-head attention (BERT-style bidirectional encoder).
@@ -47,13 +68,15 @@ pub enum AttentionKind {
     Gdn,
     /// SIMD-fused GDN: AVX2/NEON-accelerated alternative to `Gdn`.
     GdnFused,
-    /// Gated GQA: per-element sigmoid gate applied after GQA context aggregation.
+    /// Gated GQA tag for Qwen3.5 full-attention layers; concrete GQA dimensions
+    /// are supplied by the future `LayerSpec`/runtime wrapper.
     GatedGqa,
     /// Differential Attention: dual-softmax subtraction (Ye et al., ICLR 2025).
     Differential,
     /// Native Sparse Attention: compression + selection + sliding window (Yuan et al., ACL 2025).
     NativeSparse,
-    /// Decode-optimized single-token fast path using `GqaConfig`.
+    /// Decode-optimized single-token fast-path tag; concrete GQA dimensions are
+    /// supplied by the decode runtime.
     Decode,
 }
 
@@ -72,6 +95,27 @@ impl AttentionKind {
             AttentionKind::Differential => "differential",
             AttentionKind::NativeSparse => "native_sparse",
             AttentionKind::Decode => "decode",
+        }
+    }
+
+    /// Returns the stable typed tag for this variant (ADR-059 taxonomy).
+    ///
+    /// Use this instead of `name()` when interfacing with ADR-060 pruning
+    /// (`LayerStats`, `CalibrationObserver`), Metal kernel selection, or any
+    /// code that needs a stable, matchable identifier.
+    #[inline]
+    pub fn tag(&self) -> AttentionTag {
+        match self {
+            AttentionKind::Mha => AttentionTag::Mha,
+            AttentionKind::Gqa(_) => AttentionTag::Gqa,
+            AttentionKind::Flash => AttentionTag::FlashCpu,
+            AttentionKind::FlashCausal => AttentionTag::FlashCausal,
+            AttentionKind::Gdn => AttentionTag::Gdn,
+            AttentionKind::GdnFused => AttentionTag::GdnFused,
+            AttentionKind::GatedGqa => AttentionTag::GatedGqa,
+            AttentionKind::Differential => AttentionTag::Differential,
+            AttentionKind::NativeSparse => AttentionTag::Nsa,
+            AttentionKind::Decode => AttentionTag::Decode,
         }
     }
 
@@ -104,26 +148,40 @@ impl AttentionKind {
         }
     }
 
-    /// Returns `true` if this variant reads from / writes to a KV cache.
+    /// Returns `true` if the **current** implementation reads from / writes to
+    /// a KV cache.
     ///
-    /// MHA uses pre-allocated scratch buffers recomputed each forward pass and
-    /// does not maintain a KV cache. KV-backed decoder variants maintain
-    /// past-KV state; GDN variants use recurrent state matrices instead.
+    /// This reflects what the existing Rust kernels in this crate actually do
+    /// today, not ADR-059 target-state intent. When P2 wires cache-backed
+    /// wrappers for Flash/Differential/NSA, these values will be re-evaluated.
+    ///
+    /// - `Mha`: scratch buffers recomputed each pass — no KV cache.
+    /// - `Gqa`/`GatedGqa`/`Decode`: append to and read from `FlatKVCache`.
+    /// - `Gdn`/`GdnFused`: recurrent state matrix (`S`), not a KV cache.
+    /// - `Flash`/`FlashCausal`: current tiled CPU kernels recompute K/V from
+    ///   hidden states; no production cache path exists yet.
+    /// - `Differential`/`NativeSparse`: standalone kernels consume
+    ///   caller-supplied buffers; no production cache owner exists yet.
     #[inline]
     pub fn supports_kv_cache(&self) -> bool {
         match self {
             // MHA uses scratch buffers, not KV cache.
             AttentionKind::Mha => false,
+            // Production Qwen generation appends K/V to FlatKVCache.
             AttentionKind::Gqa(_) => true,
-            // Flash CPU uses a KV cache (ADR-059 state table: Flash CPU → Softmax, KV-backed).
-            AttentionKind::Flash => true,
-            AttentionKind::FlashCausal => true,
+            // Current tiled Flash path recomputes K/V from hidden states; P2 adds cache wrapper.
+            AttentionKind::Flash => false,
+            // Current causal Flash kernel is prefill over caller-supplied full K/V buffers.
+            AttentionKind::FlashCausal => false,
             // GDN keeps a recurrent state (S matrix), not a growing KV cache.
             AttentionKind::Gdn => false,
             AttentionKind::GdnFused => false,
+            // Qwen3.5 full-attention path uses KV cache (gated.rs wraps GQA + sigmoid gate).
             AttentionKind::GatedGqa => true,
-            AttentionKind::Differential => true,
-            AttentionKind::NativeSparse => true,
+            // Standalone differential kernel; no production cache path yet.
+            AttentionKind::Differential => false,
+            // NSA kernels consume projected branch buffers; no persistent cache state yet.
+            AttentionKind::NativeSparse => false,
             // Decode path reads from an existing KV cache.
             AttentionKind::Decode => true,
         }
@@ -194,6 +252,68 @@ mod attention_kind_tests {
     }
 
     // -----------------------------------------------------------------------
+    // tag()
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tag_mha() {
+        assert_eq!(AttentionKind::Mha.tag(), AttentionTag::Mha);
+    }
+
+    #[test]
+    fn tag_gqa() {
+        let cfg = gqa::GqaConfig {
+            num_heads: 16,
+            num_kv_heads: 8,
+            head_dim: 64,
+        };
+        assert_eq!(AttentionKind::Gqa(cfg).tag(), AttentionTag::Gqa);
+    }
+
+    #[test]
+    fn tag_flash_maps_to_flash_cpu() {
+        assert_eq!(AttentionKind::Flash.tag(), AttentionTag::FlashCpu);
+    }
+
+    #[test]
+    fn tag_flash_causal() {
+        assert_eq!(AttentionKind::FlashCausal.tag(), AttentionTag::FlashCausal);
+    }
+
+    #[test]
+    fn tag_gdn() {
+        assert_eq!(AttentionKind::Gdn.tag(), AttentionTag::Gdn);
+    }
+
+    #[test]
+    fn tag_gdn_fused() {
+        assert_eq!(AttentionKind::GdnFused.tag(), AttentionTag::GdnFused);
+    }
+
+    #[test]
+    fn tag_gated_gqa() {
+        assert_eq!(AttentionKind::GatedGqa.tag(), AttentionTag::GatedGqa);
+    }
+
+    #[test]
+    fn tag_differential() {
+        assert_eq!(
+            AttentionKind::Differential.tag(),
+            AttentionTag::Differential
+        );
+    }
+
+    #[test]
+    fn tag_native_sparse_maps_to_nsa() {
+        assert_eq!(AttentionKind::NativeSparse.tag(), AttentionTag::Nsa);
+    }
+
+    #[test]
+    fn tag_decode() {
+        assert_eq!(AttentionKind::Decode.tag(), AttentionTag::Decode);
+    }
+
+    // -----------------------------------------------------------------------
     // is_causal()
     // -----------------------------------------------------------------------
 
@@ -253,7 +373,7 @@ mod attention_kind_tests {
     }
 
     // -----------------------------------------------------------------------
-    // supports_kv_cache()
+    // supports_kv_cache() — reflects current implementation, not ADR target state
     // -----------------------------------------------------------------------
 
     #[test]
@@ -272,14 +392,15 @@ mod attention_kind_tests {
     }
 
     #[test]
-    fn kv_cache_flash_true() {
-        // ADR-059 state table classifies Flash CPU as KV-backed (Softmax category).
-        assert!(AttentionKind::Flash.supports_kv_cache());
+    fn kv_cache_flash_false() {
+        // Current tiled Flash CPU kernel recomputes K/V from hidden states; no cache path.
+        assert!(!AttentionKind::Flash.supports_kv_cache());
     }
 
     #[test]
-    fn kv_cache_flash_causal_true() {
-        assert!(AttentionKind::FlashCausal.supports_kv_cache());
+    fn kv_cache_flash_causal_false() {
+        // Prefill over caller-supplied full K/V buffers; no production cache owner.
+        assert!(!AttentionKind::FlashCausal.supports_kv_cache());
     }
 
     #[test]
@@ -299,13 +420,15 @@ mod attention_kind_tests {
     }
 
     #[test]
-    fn kv_cache_differential_true() {
-        assert!(AttentionKind::Differential.supports_kv_cache());
+    fn kv_cache_differential_false() {
+        // Standalone kernel; no production cache state.
+        assert!(!AttentionKind::Differential.supports_kv_cache());
     }
 
     #[test]
-    fn kv_cache_native_sparse_true() {
-        assert!(AttentionKind::NativeSparse.supports_kv_cache());
+    fn kv_cache_native_sparse_false() {
+        // NSA kernels consume projected branch buffers; no persistent cache yet.
+        assert!(!AttentionKind::NativeSparse.supports_kv_cache());
     }
 
     #[test]
@@ -314,7 +437,7 @@ mod attention_kind_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Clone round-trip (Gqa carries a Copy config — verify no drop issues)
+    // Clone/Copy round-trip (Gqa carries a Copy config — verify no drop issues)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -337,7 +460,7 @@ mod attention_kind_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Exhaustiveness: all 10 variants covered by name(), is_causal(),
+    // Exhaustiveness: all 10 variants covered by name(), tag(), is_causal(),
     // supports_kv_cache(). Compile-time check via a match with no wildcard.
     // -----------------------------------------------------------------------
 
@@ -363,6 +486,9 @@ mod attention_kind_tests {
         assert_eq!(variants.len(), 10, "update test when adding a new variant");
         for v in variants {
             assert!(!v.name().is_empty());
+            // tag() must compile (exhaustive match — adding a variant without
+            // updating tag() is a compile error, not a runtime error).
+            let _ = v.tag();
         }
     }
 }
