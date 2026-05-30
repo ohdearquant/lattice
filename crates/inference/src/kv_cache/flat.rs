@@ -878,4 +878,309 @@ mod tests {
             max_rel_kv
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Tensor oracle: f32-KV reference vs f16-KV-via-FlatKVCache logit diff.
+    //
+    // Implements the mandatory fallback harness from quality_measurement_design.md:
+    //   - Builds deterministic Q/K/V tensors (xorshift32 PRNG, no model weights).
+    //   - Runs scaled dot-product attention with f32 KV directly.
+    //   - Stores same K/V in FlatKVCache (quantizes to f16), dequantizes via
+    //     the scratch-loop used by generate.rs, runs same attention.
+    //   - Projects both outputs through a deterministic W_out to produce logits.
+    //   - Asserts: logit_max_abs_diff < 0.02, top1_match_rate >= 0.95,
+    //              nan_count == 0, synthetic_nll_delta_abs < 0.01.
+    //
+    // This is NOT a PPL measurement. It is the CI tensor oracle only.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic xorshift32 PRNG (Marsaglia 2003).
+    fn xorshift32(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    /// Sample a f32 uniformly in [lo, hi] using xorshift32.
+    fn rand_f32(state: &mut u32, lo: f32, hi: f32) -> f32 {
+        let bits = xorshift32(state);
+        let t = (bits as f32) / (u32::MAX as f32);
+        lo + t * (hi - lo)
+    }
+
+    /// Scaled dot-product attention (q_seq_len=1 decode, GQA).
+    ///
+    /// Q:      [num_heads * head_dim]            (single query token)
+    /// K, V:   [kv_seq_len * num_kv_heads * head_dim]
+    /// output: [num_heads * head_dim]
+    ///
+    /// Groups = num_heads / num_kv_heads; each KV head is shared across `groups` Q heads.
+    fn sdpa_decode(
+        output: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        let groups = num_heads / num_kv_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let q_dim = num_heads * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        output[..q_dim].fill(0.0);
+        let mut scores = vec![0.0f32; kv_seq_len];
+
+        for h in 0..num_heads {
+            let kv_h = h / groups;
+            let q_off = h * head_dim;
+
+            // Phase 1: QK^T
+            for ki in 0..kv_seq_len {
+                let k_off = ki * kv_dim + kv_h * head_dim;
+                let dot: f32 = (0..head_dim).map(|d| q[q_off + d] * k[k_off + d]).sum();
+                scores[ki] = dot * scale;
+            }
+
+            // Phase 2: stable softmax
+            let max_s = scores[..kv_seq_len]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores[..kv_seq_len]
+                .iter_mut()
+                .map(|s| {
+                    *s = (*s - max_s).exp();
+                    *s
+                })
+                .sum();
+            if sum > 0.0 {
+                scores[..kv_seq_len].iter_mut().for_each(|s| *s /= sum);
+            }
+
+            // Phase 3: weighted V sum
+            let out_off = h * head_dim;
+            for ki in 0..kv_seq_len {
+                let v_off = ki * kv_dim + kv_h * head_dim;
+                let w = scores[ki];
+                for d in 0..head_dim {
+                    output[out_off + d] += w * v[v_off + d];
+                }
+            }
+        }
+    }
+
+    /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.
+    ///
+    /// Produces actual measured logit_max_abs_diff and top1_match_rate.
+    #[test]
+    fn f16_kv_tensor_oracle_logit_diff() {
+        // Oracle parameters (matching design doc).
+        const NUM_HEADS: usize = 4;
+        const NUM_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 16;
+        const VOCAB: usize = 257;
+        const Q_DIM: usize = NUM_HEADS * HEAD_DIM; // 64
+        const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 32
+
+        // KV context lengths and value ranges per design doc.
+        let seq_lens: &[usize] = &[1, 8, 64, 256];
+        let kv_ranges: &[(&str, f32, f32)] = &[
+            ("tiny", -0.1, 0.1),
+            ("typical", -5.0, 5.0),
+            ("outlier", -10.0, 10.0),
+        ];
+
+        // Deterministic W_out: [VOCAB, Q_DIM], scaled to [-0.05, 0.05].
+        let mut w_seed: u32 = 0xDEAD_BEEF;
+        let w_out: Vec<f32> = (0..VOCAB * Q_DIM)
+            .map(|_| rand_f32(&mut w_seed, -0.05, 0.05))
+            .collect();
+
+        let mut global_max_logit_diff = 0.0f32;
+        let mut top1_match_count = 0usize;
+        let mut total_cases = 0usize;
+        let mut nan_count = 0usize;
+        let mut max_synth_nll_delta = 0.0f32;
+
+        for &seq_len in seq_lens {
+            for &(range_name, lo, hi) in kv_ranges {
+                let mut seed: u32 = 0x1234_5678u32
+                    .wrapping_add(seq_len as u32)
+                    .wrapping_mul(0x9E37_79B9)
+                    .wrapping_add(range_name.len() as u32);
+
+                // Build deterministic Q (seq_len=1 decode query).
+                let q: Vec<f32> = (0..Q_DIM).map(|_| rand_f32(&mut seed, -1.0, 1.0)).collect();
+
+                // Build deterministic K_f32, V_f32.
+                let k_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                    .map(|_| rand_f32(&mut seed, lo, hi))
+                    .collect();
+                let v_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                    .map(|_| rand_f32(&mut seed, lo, hi))
+                    .collect();
+
+                // ---- Reference path: f32 KV directly ----
+                let mut out_f32 = vec![0.0f32; Q_DIM];
+                sdpa_decode(
+                    &mut out_f32,
+                    &q,
+                    &k_f32,
+                    &v_f32,
+                    seq_len,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                );
+
+                // ---- f16 path: store in FlatKVCache, dequantize via k_buffer/v_buffer ----
+                let cfg = FlatKVCacheConfig {
+                    num_layers: 1,
+                    num_kv_heads: NUM_KV_HEADS,
+                    head_dim: HEAD_DIM,
+                    max_seq_len: seq_len,
+                };
+                let mut cache = FlatKVCache::new(cfg);
+
+                // Write K/V row by row (matching generate.rs prefill pattern).
+                {
+                    let k_layer = cache.k_buffer_mut(0);
+                    for (i, &val) in k_f32.iter().enumerate() {
+                        k_layer[i] = f16::from_f32(val);
+                    }
+                    let v_layer = cache.v_buffer_mut(0);
+                    for (i, &val) in v_f32.iter().enumerate() {
+                        v_layer[i] = f16::from_f32(val);
+                    }
+                }
+                cache.advance_by(seq_len);
+
+                // Dequantize via the same scratch-loop pattern as generate.rs:463-466.
+                let k_end = seq_len * KV_DIM;
+                let mut k_dequant = vec![0.0f32; k_end];
+                let mut v_dequant = vec![0.0f32; k_end];
+                for (i, &h) in cache.k_buffer(0)[..k_end].iter().enumerate() {
+                    k_dequant[i] = h.to_f32();
+                }
+                for (i, &h) in cache.v_buffer(0)[..k_end].iter().enumerate() {
+                    v_dequant[i] = h.to_f32();
+                }
+
+                let mut out_f16 = vec![0.0f32; Q_DIM];
+                sdpa_decode(
+                    &mut out_f16,
+                    &q,
+                    &k_dequant,
+                    &v_dequant,
+                    seq_len,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                );
+
+                // ---- Project both outputs to logits via W_out ----
+                let mut logits_f32 = vec![0.0f32; VOCAB];
+                let mut logits_f16 = vec![0.0f32; VOCAB];
+                for v_idx in 0..VOCAB {
+                    let row_off = v_idx * Q_DIM;
+                    logits_f32[v_idx] = (0..Q_DIM)
+                        .map(|d| out_f32[d] * w_out[row_off + d])
+                        .sum::<f32>();
+                    logits_f16[v_idx] = (0..Q_DIM)
+                        .map(|d| out_f16[d] * w_out[row_off + d])
+                        .sum::<f32>();
+                }
+
+                // ---- Measure diff ----
+                let case_max_diff = logits_f32
+                    .iter()
+                    .zip(logits_f16.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+
+                let nans = logits_f16.iter().filter(|&&x| x.is_nan()).count();
+                nan_count += nans;
+
+                let top1_f32 = logits_f32
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let top1_f16 = logits_f16
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+
+                // Synthetic NLL delta on deterministic target token.
+                let target = (seq_len * 37 + 11) % VOCAB;
+                let nll_f32 = -softmax_log_prob(&logits_f32, target);
+                let nll_f16 = -softmax_log_prob(&logits_f16, target);
+                let nll_delta = (nll_f16 - nll_f32).abs();
+
+                if case_max_diff > global_max_logit_diff {
+                    global_max_logit_diff = case_max_diff;
+                }
+                if top1_f32 == top1_f16 {
+                    top1_match_count += 1;
+                }
+                if nll_delta > max_synth_nll_delta {
+                    max_synth_nll_delta = nll_delta;
+                }
+                total_cases += 1;
+
+                eprintln!(
+                    "  oracle seq={:3} range={:<8} logit_max_diff={:.2e}  top1={}  nll_delta={:.2e}",
+                    seq_len,
+                    range_name,
+                    case_max_diff,
+                    if top1_f32 == top1_f16 {
+                        "MATCH"
+                    } else {
+                        "DIFF"
+                    },
+                    nll_delta
+                );
+            }
+        }
+
+        let top1_rate = top1_match_count as f32 / total_cases as f32;
+        eprintln!(
+            "\n=== Tensor Oracle Summary ===\n  logit_max_abs_diff = {:.4e}  (gate: < 0.02)\n  top1_match_rate    = {:.4}    (gate: >= 0.95)\n  nan_count          = {}\n  max_synth_nll_delta= {:.4e}  (gate: < 0.01)",
+            global_max_logit_diff, top1_rate, nan_count, max_synth_nll_delta
+        );
+
+        assert_eq!(nan_count, 0, "f16 KV dequant introduced NaN in logits");
+        assert!(
+            global_max_logit_diff < 0.02,
+            "logit_max_abs_diff {:.4e} >= 0.02 gate",
+            global_max_logit_diff
+        );
+        assert!(
+            top1_rate >= 0.95,
+            "top1_match_rate {:.4} < 0.95 gate",
+            top1_rate
+        );
+        assert!(
+            max_synth_nll_delta < 0.01,
+            "max synthetic NLL delta {:.4e} >= 0.01",
+            max_synth_nll_delta
+        );
+    }
+
+    /// Compute log softmax probability for target token (for synthetic NLL).
+    fn softmax_log_prob(logits: &[f32], target: usize) -> f32 {
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+        let log_sum = sum.ln();
+        (logits[target] - max_l) - log_sum
+    }
 }
