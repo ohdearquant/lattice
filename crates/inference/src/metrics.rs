@@ -15,24 +15,42 @@ pub enum MetricsMode {
     /// Adds attention entropy and sparsity via online accumulators.
     /// Requires modified attention kernels.
     AttentionProfile,
+    /// Full diagnostics: entropy histograms, sparsity maps, KV-page mass,
+    /// pattern labels. Higher overhead; not for production hot paths.
+    HeavyDiagnostics,
 }
 
-/// Per-layer measurement collected during a forward pass.
+/// Per-layer measurement collected during a forward pass (ADR-061 D4 schema).
+///
+/// `update_ratio` and `block_influence` are the scoring signals consumed by
+/// ADR-060 pruning. `entropy` holds per-head entropy in nats (one element per
+/// attention head) when `mode >= AttentionProfile`. All `Option<Vec<_>>` fields
+/// default to `None` so `Default` is allocation-free.
 #[derive(Debug, Clone, Default)]
 pub struct LayerMetrics {
+    /// Mode active when this record was populated.
+    pub mode: MetricsMode,
     /// Layer index.
     pub layer_idx: usize,
-    /// Forward pass wall time in nanoseconds.
-    pub forward_ns: u64,
+    /// Forward pass wall time in nanoseconds (ADR-061 `latency_ns`).
+    pub latency_ns: u64,
     /// L2 norm of input hidden states (pre-layernorm).
     pub input_norm: f32,
     /// L2 norm of output hidden states (post-residual).
     pub output_norm: f32,
-    /// Mean attention entropy across heads (only in `AttentionProfile` mode).
-    pub entropy: Option<f32>,
-    /// Per-head entropy values (only in `AttentionProfile` mode).
-    /// When populated, `entropy` above is `Some(mean(head_entropies))`.
-    pub head_entropies: Option<Vec<f32>>,
+    /// Parameter update ratio: ‖Δθ‖ / ‖θ‖ for this layer. Consumed by ADR-060.
+    pub update_ratio: f32,
+    /// Block influence score used by ADR-060 pruning (higher = more important).
+    pub block_influence: f32,
+    /// Per-head attention entropy in nats (one entry per head).
+    /// Populated in `AttentionProfile` or `HeavyDiagnostics` mode.
+    pub entropy: Option<Vec<f32>>,
+    /// Per-head sparsity fractions in [0, 1]. Populated in `HeavyDiagnostics`.
+    pub sparsity: Option<Vec<f32>>,
+    /// Per-page KV-cache mass. Populated in `HeavyDiagnostics`.
+    pub kv_page_mass: Option<Vec<f32>>,
+    /// Attention-pattern labels (e.g. "diagonal", "sink"). `HeavyDiagnostics`.
+    pub pattern_label: Option<Vec<String>>,
 }
 
 /// Collects [`LayerMetrics`] for an entire forward pass.
@@ -60,6 +78,14 @@ pub struct ForwardMetrics {
 ///
 /// The shifted form keeps `r` bounded by `l * (max_logit_range)` rather than
 /// `l * max_abs_logit`, preventing overflow on extreme finite logits like `f32::MAX`.
+///
+/// # Non-finite inputs
+///
+/// All update methods require finite logits. Use [`try_update`] for recoverable
+/// error handling; [`update`] panics on non-finite input in both debug and
+/// release builds (fail-fast finite precondition).
+///
+/// [`try_update`]: OnlineSoftmaxEntropy::try_update
 #[derive(Debug, Clone)]
 pub struct OnlineSoftmaxEntropy {
     m: f32, // running max of logits seen so far
@@ -89,13 +115,37 @@ impl OnlineSoftmaxEntropy {
     ///
     /// This is the hot path — no allocation, branch-minimal.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
-    /// Asserts `logit` is finite in debug builds. NaN or Inf inputs silently
-    /// corrupt the accumulator in release mode; callers must guarantee finite
-    /// inputs or filter them before calling this method.
+    /// Panics in both debug and release builds if `logit` is not finite.
+    /// Use [`try_update`](OnlineSoftmaxEntropy::try_update) for a recoverable path.
+    #[inline]
     pub fn update(&mut self, logit: f32) {
-        debug_assert!(logit.is_finite(), "logit must be finite, got {logit}");
+        assert!(logit.is_finite(), "logit must be finite, got {logit}");
+        self.update_finite(logit);
+    }
+
+    /// Feed one logit value, returning an error if it is not finite.
+    ///
+    /// Leaves the accumulator unchanged on error so it remains valid for
+    /// further use.
+    #[inline]
+    pub fn try_update(&mut self, logit: f32) -> Result<(), crate::error::InferenceError> {
+        if !logit.is_finite() {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "attention entropy logit must be finite, got {logit}"
+            )));
+        }
+        self.update_finite(logit);
+        Ok(())
+    }
+
+    /// Inner finite-preconditioned update (recurrence body).
+    ///
+    /// Called only after the caller has verified `logit.is_finite()`.
+    #[inline]
+    fn update_finite(&mut self, logit: f32) {
+        debug_assert!(logit.is_finite());
         if self.count == 0 {
             self.m = logit;
             self.l = 1.0;
@@ -179,8 +229,9 @@ impl OnlineSoftmaxEntropy {
 
 /// Compute the L2 norm of a slice.
 ///
-/// Uses a simple sum-of-squares approach. The inner loop is written to be
-/// auto-vectorizable (no horizontal reduction inside the loop).
+/// Uses f64 accumulation to avoid overflow on finite vectors whose element-wise
+/// squares would exceed `f32::MAX` (e.g. elements near `1e20`). The inner loop
+/// is written to be auto-vectorizable.
 ///
 /// # Examples
 /// ```
@@ -188,9 +239,16 @@ impl OnlineSoftmaxEntropy {
 /// let v = [3.0_f32, 4.0];
 /// assert!((l2_norm(&v) - 5.0).abs() < 1e-5);
 /// ```
+#[inline]
 pub fn l2_norm(data: &[f32]) -> f32 {
-    let sum_sq: f32 = data.iter().map(|&x| x * x).sum();
-    sum_sq.sqrt()
+    let sum_sq: f64 = data
+        .iter()
+        .map(|&x| {
+            let x = f64::from(x);
+            x * x
+        })
+        .sum();
+    sum_sq.sqrt() as f32
 }
 
 #[cfg(test)]
@@ -212,6 +270,12 @@ mod tests {
     #[test]
     fn test_metrics_mode_default() {
         assert_eq!(MetricsMode::default(), MetricsMode::Off);
+    }
+
+    #[test]
+    fn test_metrics_mode_heavy_diagnostics() {
+        // HeavyDiagnostics must be a distinct variant from AttentionProfile.
+        assert_ne!(MetricsMode::HeavyDiagnostics, MetricsMode::AttentionProfile);
     }
 
     #[test]
@@ -356,16 +420,31 @@ mod tests {
     }
 
     #[test]
-    fn test_head_entropies_storage() {
-        let mut lm = LayerMetrics::default();
-        assert!(lm.head_entropies.is_none());
-        lm.head_entropies = Some(vec![0.5, 0.8, 1.2, 0.3]);
-        lm.entropy = lm
-            .head_entropies
-            .as_ref()
-            .map(|h| h.iter().sum::<f32>() / h.len() as f32);
-        assert_eq!(lm.head_entropies.as_ref().map(|h| h.len()), Some(4));
-        assert!((lm.entropy.unwrap() - 0.7).abs() < 0.001);
+    fn test_entropy_try_update_rejects_non_finite_logits() {
+        for logit in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut acc = OnlineSoftmaxEntropy::new();
+            let err = acc
+                .try_update(logit)
+                .expect_err("non-finite logit must fail");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(acc.count(), 0);
+            assert_eq!(acc.entropy_nats(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_entropy_f32_extreme_tied_after_underflow() {
+        // [-f32::MAX, f32::MAX, f32::MAX]: the first term underflows to zero
+        // weight, leaving two equal-max terms → entropy = ln(2).
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(-f32::MAX);
+        acc.update(f32::MAX);
+        acc.update(f32::MAX);
+        assert_close(
+            acc.entropy_nats(),
+            std::f32::consts::LN_2,
+            "tied max after underflowed rescale",
+        );
     }
 
     #[test]
@@ -419,12 +498,40 @@ mod tests {
     }
 
     #[test]
-    fn test_layer_metrics_default() {
+    fn test_l2_norm_large_finite_inputs() {
+        // f32 sum-of-squares overflows for elements near 1e20, but the true
+        // norm is representable. f64 accumulation must keep it finite.
+        let h = l2_norm(&[1.0e20_f32, 1.0e20_f32]);
+        assert!(
+            h.is_finite(),
+            "representable norm should stay finite, got {h}"
+        );
+        assert!((h - 2.0_f32.sqrt() * 1.0e20_f32).abs() / h < 1e-6);
+    }
+
+    #[test]
+    fn test_layer_metrics_default_matches_adr061_schema() {
         let lm = LayerMetrics::default();
+        assert_eq!(lm.mode, MetricsMode::Off);
         assert_eq!(lm.layer_idx, 0);
-        assert_eq!(lm.forward_ns, 0);
+        assert_eq!(lm.latency_ns, 0);
         assert_eq!(lm.input_norm, 0.0);
         assert_eq!(lm.output_norm, 0.0);
+        assert_eq!(lm.update_ratio, 0.0);
+        assert_eq!(lm.block_influence, 0.0);
         assert!(lm.entropy.is_none());
+        assert!(lm.sparsity.is_none());
+        assert!(lm.kv_page_mass.is_none());
+        assert!(lm.pattern_label.is_none());
+    }
+
+    #[test]
+    fn test_layer_metrics_entropy_is_per_head_vector() {
+        let lm = LayerMetrics {
+            mode: MetricsMode::AttentionProfile,
+            entropy: Some(vec![0.5, 0.8, 1.2, 0.3]),
+            ..LayerMetrics::default()
+        };
+        assert_eq!(lm.entropy.as_ref().map(Vec::len), Some(4));
     }
 }
