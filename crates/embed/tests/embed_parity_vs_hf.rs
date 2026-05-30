@@ -10,8 +10,12 @@
 //! represent the HF reference at the time of generation.
 //!
 //! **Tolerances** (constants at top of file — adjust here if needed):
-//! - BGE, E5 (full f32 inference): cosine ≥ 0.9990, max-abs-diff ≤ 1e-3
+//! - BGE, E5, MiniLM (full f32 inference): cosine ≥ 0.9990, max-abs-diff ≤ 5e-3
 //! - Qwen3 (may have bf16 in path): cosine ≥ 0.9950, max-abs-diff ≤ 5e-3
+//!
+//! Note: max-abs-diff is observed at 1.8–3.5e-3 on current hardware (f32 → f64
+//! cast noise). The threshold is set at 5e-3 to provide headroom without masking
+//! regressions; the cosine guard (≥ 0.9990) is the primary quality signal.
 //!
 //! **How to regenerate fixtures** (run once, then commit the output):
 //!   ```bash
@@ -35,9 +39,11 @@ const COS_SIM_MIN_F32: f64 = 0.9990;
 /// Minimum cosine similarity for Qwen3 (bf16 in forward pass).
 const COS_SIM_MIN_QWEN: f64 = 0.9950;
 
-/// Secondary guard: maximum element-wise absolute difference (informational, not blocking).
-#[allow(dead_code)]
-const MAX_ABS_DIFF_F32: f64 = 1e-3;
+/// Maximum element-wise absolute difference for BGE, E5, and MiniLM (full f32 inference).
+const MAX_ABS_DIFF_F32: f64 = 5e-3;
+
+/// Maximum element-wise absolute difference for Qwen3 (bf16 in forward pass).
+const MAX_ABS_DIFF_QWEN: f64 = 5e-3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -183,10 +189,10 @@ async fn bge_small_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [bge-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [bge-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -254,10 +260,10 @@ async fn e5_small_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -325,10 +331,10 @@ async fn all_minilm_l6_v2_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [all-minilm-l6] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [all-minilm-l6] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -399,10 +405,10 @@ async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [paraphrase-multilingual-minilm-l12] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [paraphrase-multilingual-minilm-l12] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -482,10 +488,10 @@ async fn qwen3_embedding_0_6b_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_QWEN {
+        if cos < COS_SIM_MIN_QWEN || diff > MAX_ABS_DIFF_QWEN {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [qwen3-0.6b] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_QWEN})\n  max_abs_diff={diff:.2e}\n  pooling={}",
+                "PARITY FAIL [qwen3-0.6b] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_QWEN})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_QWEN})\n  pooling={}",
                 golden.input, cos, golden.pooling,
             );
         } else {
