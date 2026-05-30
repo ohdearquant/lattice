@@ -748,9 +748,11 @@ mod tests {
     }
 
     #[test]
-    fn test_int4_packed_scalar_fallback_matches_neon_reference() {
-        // Verify that the non-aarch64 fallback produces the same result as the
-        // per-item prepared path (which on aarch64 uses NEON, on others uses packed scalar).
+    fn test_int4_batch_prepared_api_dispatch_parity() {
+        // Verify that approximate_int4_batch_prepared produces the same cosine distance
+        // as approximate_cosine_distance_prepared for each candidate. On aarch64 both
+        // sides dispatch to NEON; on other targets both use the packed scalar fallback.
+        // For direct scalar-vs-NEON integer parity, see int4::tests::test_packed_scalar_matches_neon_exact.
         for dim in [1usize, 3, 31, 127, 383, 384] {
             let query = generate_vector(dim, 700 + dim as u64);
             let candidate = generate_vector(dim, 800 + dim as u64);
@@ -763,7 +765,7 @@ mod tests {
 
             assert!(
                 (batch_result[0] - per_item_result).abs() < 1e-5,
-                "int4 fallback mismatch at dim={dim}: batch={}, per_item={}",
+                "int4 batch prepared dispatch mismatch at dim={dim}: batch={}, per_item={}",
                 batch_result[0],
                 per_item_result
             );

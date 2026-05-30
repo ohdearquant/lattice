@@ -474,6 +474,31 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn test_packed_scalar_matches_neon_exact() {
+        // Directly compare dot_product_int4_packed_scalar against
+        // dot_product_int4_neon_unrolled on integer tuples. Both return
+        // (raw_dot, sum_a, sum_b) as i32 — integer domain, exact equality expected.
+        // This is the executing parity proof for the non-aarch64 fallback kernel.
+        for dim in [1usize, 3, 31, 127, 383, 384] {
+            let a_f32 = generate_vector(dim, 500 + dim as u64);
+            let b_f32 = generate_vector(dim, 600 + dim as u64);
+            let qa = Int4Vector::from_f32(&a_f32);
+            let qb = Int4Vector::from_f32(&b_f32);
+
+            let scalar_result = dot_product_int4_packed_scalar(&qa.data, &qb.data, dim);
+            // SAFETY: aarch64 always has NEON; data slices are correctly sized by
+            // Int4Vector::from_f32 (len = dims.div_ceil(2)).
+            let neon_result = unsafe { dot_product_int4_neon_unrolled(&qa.data, &qb.data, dim) };
+
+            assert_eq!(
+                scalar_result, neon_result,
+                "packed_scalar vs NEON integer mismatch at dim={dim}: scalar={scalar_result:?}, neon={neon_result:?}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn test_int4_neon_matches_dequantized_scalar() {
         for dim in [1, 2, 31, 64, 127, 384, 768] {
             let a = generate_vector(dim, 501);
