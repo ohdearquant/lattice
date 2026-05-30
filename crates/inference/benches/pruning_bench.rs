@@ -82,10 +82,10 @@ fn bench_score_from_hidden_states(c: &mut Criterion) {
     group.finish();
 }
 
-/// Calibration workload: accumulate N tokens per layer via BlockInfluenceAccumulator.
+/// Synthetic scorer workload: accumulate N tokens per layer via BlockInfluenceAccumulator.
 ///
-/// This measures the realistic offline calibration cost — each token in the
-/// calibration dataset feeds through the accumulator before finalize() is called.
+/// This measures scorer throughput with generated random vectors — not actual
+/// calibration cost, which would require a real forward pass and activation capture.
 fn bench_accumulator_calibration(c: &mut Criterion) {
     let mut group = c.benchmark_group("accumulator_calibration");
     group.warm_up_time(Duration::from_millis(500));

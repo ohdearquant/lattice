@@ -1,12 +1,18 @@
-//! Block influence scoring for layer pruning (ADR-060 Phase 1).
+//! Standalone ShortGPT block influence scorer (ADR-060 D2 seed).
 //!
-//! Implements the ShortGPT angular distance metric: for each transformer
-//! layer, measure cos(θ) between the input and output hidden states.
-//! Layers where θ ≈ 0 (input ≈ output) contribute little and are pruning
-//! candidates.
+//! Implements the ShortGPT block-influence (BI) metric: for each transformer
+//! layer, compute `BI_i = 1 − E_t[cos(X_{i,t}, X_{i+1,t})]` where X_{i,t}
+//! is the residual hidden state at the input of layer i for token t and
+//! X_{i+1,t} is the output of the full block. Layers where BI ≈ 0 (input ≈
+//! output) contribute little and are removal candidates.
+//!
+//! **This is a standalone scorer utility, not the full ADR-060 calibration
+//! pipeline.** The `CalibrationObserver` trait and `ForwardCtx` hooks that
+//! feed real activation captures are ADR-060 D1/P0 work (future PR). This
+//! module exposes the math primitives; callers provide the hidden-state slices.
 //!
 //! Reference: Men et al., "ShortGPT: Layers in Large Language Models are
-//! More Redundant Than You Expect" (arXiv:2403.03853).
+//! More Redundant Than You Expect" (arXiv:2403.03853, ACL Findings 2025).
 //!
 //! # Calibration workflow
 //!
@@ -17,13 +23,15 @@
 //! [`update`]: BlockInfluenceAccumulator::update
 //! [`finalize`]: BlockInfluenceAccumulator::finalize
 
-use crate::metrics::l2_norm;
-
-/// Angular distance between two vectors, returned as cosine similarity.
+/// Cosine similarity between two vectors.
 ///
 /// cos(θ) = (a · b) / (‖a‖ · ‖b‖)
 ///
-/// Returns `None` when either vector has zero norm, so that erased
+/// Dot product and norms are accumulated in `f64` to avoid overflow for
+/// large-magnitude inputs: f32 squares overflow at ~1e19, while f64 is
+/// safe to ~1e154.
+///
+/// Returns `None` when either vector is exactly zero-norm, so that erased
 /// residual streams do not spuriously appear as "identical to input."
 /// Callers should skip `None` observations during calibration.
 ///
@@ -35,14 +43,18 @@ use crate::metrics::l2_norm;
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
     assert_eq!(a.len(), b.len(), "vectors must have equal length");
-    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
-    let norm_a = l2_norm(a);
-    let norm_b = l2_norm(b);
-    let denom = norm_a * norm_b;
-    if denom < f32::EPSILON {
+    let dot: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| x as f64 * y as f64)
+        .sum();
+    let aa: f64 = a.iter().map(|&x| x as f64 * x as f64).sum();
+    let bb: f64 = b.iter().map(|&x| x as f64 * x as f64).sum();
+    if aa == 0.0 || bb == 0.0 {
         return None;
     }
-    Some((dot / denom).clamp(-1.0, 1.0))
+    let cos = dot / (aa.sqrt() * bb.sqrt());
+    Some(cos.clamp(-1.0, 1.0) as f32)
 }
 
 /// Per-layer block influence score.
@@ -55,10 +67,10 @@ pub struct BlockInfluence {
     /// Values near 1.0 mean the layer barely transforms its input.
     pub cosine_sim: f32,
     /// Angular distance in radians: θ = arccos(cosine_sim).
-    /// Values near 0.0 mean low influence (pruning candidate).
+    /// Diagnostic only — pruning decisions use `influence`, not this field.
     pub angular_distance: f32,
-    /// Block influence score: 1.0 - cos(θ).
-    /// Higher = more influential (less prunable).
+    /// Block influence score: 1.0 − cosine_sim (ShortGPT BI formula).
+    /// Higher = more influential (less prunable); lower = more removable.
     pub influence: f32,
 }
 
@@ -165,13 +177,14 @@ impl BlockInfluenceAccumulator {
     }
 }
 
-/// Compute exact block influence scores from full hidden state vectors.
+/// Compute block influence scores from a single representative hidden-state
+/// vector per layer.
 ///
 /// `hidden_states` should contain `n_layers + 1` entries: the input to
 /// layer 0, then the output of each layer. Each entry is a single vector
-/// of shape `[hidden_dim]` — one representative token per layer.
+/// of shape `[hidden_dim]` representing one token.
 ///
-/// For real calibration over multiple tokens per layer, use
+/// For multi-token calibration (more accurate BI estimates), use
 /// [`BlockInfluenceAccumulator`] instead.
 ///
 /// Layers where `cosine_similarity` returns `None` (zero-norm input or
@@ -281,6 +294,37 @@ mod tests {
         assert!(
             c > 0.999,
             "near-identical vectors should have cos > 0.999, got {c}"
+        );
+    }
+
+    #[test]
+    fn test_cosine_large_magnitude_finite() {
+        // f32 squares of 1e20 overflow to inf; f64 accumulation must stay finite.
+        let a = vec![1e20_f32, 0.0];
+        let b = vec![1e20_f32, 0.0];
+        let c = cosine_similarity(&a, &b);
+        assert!(
+            c.is_some(),
+            "large identical vectors must return Some, not None"
+        );
+        assert!(
+            c.unwrap().is_finite(),
+            "large identical cosine must be finite, got {:?}",
+            c
+        );
+        assert_close(
+            c.unwrap(),
+            1.0,
+            "large identical vectors must give cos = 1.0",
+        );
+
+        let neg_b = vec![-1e20_f32, 0.0];
+        let c2 = cosine_similarity(&a, &neg_b);
+        assert!(c2.is_some(), "large opposite vectors must return Some");
+        assert_close(
+            c2.unwrap(),
+            -1.0,
+            "large opposite vectors must give cos = -1.0",
         );
     }
 
@@ -448,6 +492,35 @@ mod tests {
         assert_eq!(acc.count(), 1, "only non-zero-norm token counted");
         let bi = acc.finalize().unwrap();
         assert_close(bi.cosine_sim, 1.0, "only valid token was identical");
+    }
+
+    #[test]
+    fn test_accumulator_unequal_norm_tokens() {
+        // Regression: accumulator must average per-token cosine values (paper formula),
+        // NOT use sum(dot)/sum(norm_product) (ADR-060 pseudocode drift).
+        //
+        // Token 1: identical [1,0] pair → cos = 1.0, norm_product = 1.0
+        // Token 2: orthogonal [100,0] vs [0,100] → cos = 0.0, norm_product = 10000.0
+        //
+        // Paper: mean(cos) = (1.0 + 0.0) / 2 = 0.5
+        // Pseudocode drift: sum(dot) / sum(norms) = 0.0 / 10001.0 ≈ 0.0 ← WRONG
+        let unit_x = vec![1.0_f32, 0.0];
+        let unit_y = vec![0.0_f32, 1.0];
+        let big_x = vec![100.0_f32, 0.0];
+        let big_y = vec![0.0_f32, 100.0];
+
+        let mut acc = BlockInfluenceAccumulator::new(0);
+        acc.update(&unit_x, &unit_x); // cos = 1.0
+        acc.update(&big_x, &big_y); // cos = 0.0 (orthogonal, large norms)
+        let bi = acc.finalize().unwrap();
+
+        assert_eq!(acc.count(), 2);
+        assert_close(
+            bi.cosine_sim,
+            0.5,
+            "unequal-norm mean must be 0.5, not norm-weighted 0.0",
+        );
+        assert_close(bi.influence, 0.5, "influence = 1 - 0.5");
     }
 
     #[test]
