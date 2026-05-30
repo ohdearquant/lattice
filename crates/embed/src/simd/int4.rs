@@ -212,12 +212,10 @@ pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
         }
     }
 
-    let a_deq = a.to_f32();
-    let b_deq = b.to_f32();
-    a_deq.iter().zip(b_deq.iter()).map(|(&x, &y)| x * y).sum()
+    let (raw_dot, sum_a, sum_b) = dot_product_int4_packed_scalar(&a.data, &b.data, a.dims);
+    finish_int4_dot(raw_dot, sum_a, sum_b, a, b)
 }
 
-#[cfg(target_arch = "aarch64")]
 #[inline]
 fn finish_int4_dot(raw_dot: i32, sum_a: i32, sum_b: i32, a: &Int4Vector, b: &Int4Vector) -> f32 {
     let raw_dot = raw_dot as f32;
@@ -230,6 +228,38 @@ fn finish_int4_dot(raw_dot: i32, sum_a: i32, sum_b: i32, a: &Int4Vector, b: &Int
         - (b.params.max_abs * sum_a / scale_a)
         - (a.params.max_abs * sum_b / scale_b)
         + (a.dims as f32 * a.params.max_abs * b.params.max_abs)
+}
+
+#[inline]
+fn dot_product_int4_packed_scalar(a: &[u8], b: &[u8], dims: usize) -> (i32, i32, i32) {
+    let full_bytes = dims / 2;
+    let mut raw_dot = 0i32;
+    let mut sum_a = 0i32;
+    let mut sum_b = 0i32;
+
+    for i in 0..full_bytes {
+        let av = a[i];
+        let bv = b[i];
+        let ah = ((av >> 4) & 0x0f) as i32;
+        let al = (av & 0x0f) as i32;
+        let bh = ((bv >> 4) & 0x0f) as i32;
+        let bl = (bv & 0x0f) as i32;
+        raw_dot += ah * bh + al * bl;
+        sum_a += ah + al;
+        sum_b += bh + bl;
+    }
+
+    if dims % 2 == 1 {
+        let av = a[full_bytes];
+        let bv = b[full_bytes];
+        let ah = ((av >> 4) & 0x0f) as i32;
+        let bh = ((bv >> 4) & 0x0f) as i32;
+        raw_dot += ah * bh;
+        sum_a += ah;
+        sum_b += bh;
+    }
+
+    (raw_dot, sum_a, sum_b)
 }
 
 #[cfg(target_arch = "aarch64")]

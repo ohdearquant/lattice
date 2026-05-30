@@ -158,8 +158,8 @@ fn bench_int8_comparison(c: &mut Criterion) {
         let b_q = QuantizedVector::from_f32(&b_f32);
 
         // Convert to i8 slices for SimSIMD
-        let a_i8: Vec<i8> = a_q.data.clone();
-        let b_i8: Vec<i8> = b_q.data.clone();
+        let a_i8: Vec<i8> = a_q.data().to_vec();
+        let b_i8: Vec<i8> = b_q.data().to_vec();
 
         group.throughput(Throughput::Elements(dim as u64));
 
@@ -175,8 +175,8 @@ fn bench_int8_comparison(c: &mut Criterion) {
             |bench, _| {
                 bench.iter(|| {
                     black_box(dot_product_i8_raw(
-                        black_box(&a_q.data),
-                        black_box(&b_q.data),
+                        black_box(a_q.data()),
+                        black_box(b_q.data()),
                     ))
                 });
             },
