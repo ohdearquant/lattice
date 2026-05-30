@@ -24,7 +24,7 @@ use crate::batch::scheduler::{FifoScheduler, Scheduler};
 use crate::batch::sequence::{
     AdapterKey, FinishReason, SeqId, Sequence, SequenceManager, SequenceState,
 };
-use crate::kv_cache::{PagePool, PagedKVCacheConfig};
+use crate::kv_cache::{PagePool, PageTable, PagedKVCacheConfig};
 use crate::sampling::{Sampler, SamplingConfig};
 
 // ---------------------------------------------------------------------------
@@ -199,6 +199,8 @@ pub struct BatchWorker {
     seq_manager: SequenceManager,
     gdn_pool: GdnStatePool,
     kv_pool: PagePool,
+    /// Page size used by the KV pool (tokens per page).
+    kv_page_size: usize,
     scheduler: FifoScheduler,
     /// Per-sequence samplers (one Sampler per sequence, indexed by SeqId).
     samplers: HashMap<SeqId, Sampler>,
@@ -228,6 +230,7 @@ impl BatchWorker {
     ) -> Self {
         let floats_per_page = kv_pool_config.floats_per_page_pub();
         let kv_pool = PagePool::new(kv_pool_config.max_pages, floats_per_page);
+        let kv_page_size = kv_pool_config.page_size;
         let gdn_pool = GdnStatePool::new(
             config.max_batch_size,
             s_floats_per_slot,
@@ -239,6 +242,7 @@ impl BatchWorker {
             seq_manager: SequenceManager::new(),
             gdn_pool,
             kv_pool,
+            kv_page_size,
             scheduler,
             samplers: HashMap::new(),
             eos_token_id,
@@ -351,6 +355,10 @@ impl BatchWorker {
                 continue;
             }
 
+            if !self.ensure_kv_pages(seq_id, real_start + real_len) {
+                continue;
+            }
+
             // Run forward for the chunk.
             let Some(gdn_slot) = self.gdn_pool.slot_of(seq_id) else {
                 continue;
@@ -419,14 +427,26 @@ impl BatchWorker {
                 continue;
             };
 
-            let logits = {
+            // Compute start_pos before entering the forward borrow block so we
+            // can call ensure_kv_pages (which needs &mut self) in between.
+            let (start_pos, last_token) = {
                 let Some(seq) = self.seq_manager.get(seq_id) else {
                     continue;
                 };
                 let Some(&last_token) = seq.generated_ids.last() else {
                     continue; // should not happen in Decoding state
                 };
-                let start_pos = seq.position().saturating_sub(1);
+                (seq.position().saturating_sub(1), last_token)
+            };
+
+            if !self.ensure_kv_pages(seq_id, start_pos + 1) {
+                continue;
+            }
+
+            let logits = {
+                let Some(seq) = self.seq_manager.get(seq_id) else {
+                    continue;
+                };
                 let token_buf = std::slice::from_ref(&last_token);
                 let adapter = seq.adapter_id.as_ref();
                 let input = BatchStepInput {
@@ -503,10 +523,49 @@ impl BatchWorker {
 
     /// Page size used by the KV pool (needed when creating PageTables).
     fn kv_pool_page_size(&self) -> usize {
-        // The PagePool doesn't directly expose page_size; we track it via config.
-        // In Phase 1 the KV pool page size defaults to 256 tokens.
-        // If needed, store it explicitly in the worker.
-        256
+        self.kv_page_size
+    }
+
+    /// Ensure the page table for `seq_id` has enough physical pages to cover
+    /// `new_seq_len` tokens.  Allocates pages from the pool as needed.
+    ///
+    /// Returns `false` (and rolls back any partial allocation) if the pool
+    /// cannot satisfy the request.
+    fn ensure_kv_pages(&mut self, seq_id: SeqId, new_seq_len: usize) -> bool {
+        if new_seq_len == 0 {
+            return true;
+        }
+        let page_size = self.kv_page_size;
+        let pages_needed = new_seq_len.div_ceil(page_size);
+        let pages_have = self
+            .seq_manager
+            .page_table(seq_id)
+            .map(PageTable::num_pages)
+            .unwrap_or(0);
+        let need = pages_needed.saturating_sub(pages_have);
+        let mut new_phys: Vec<usize> = Vec::with_capacity(need);
+        for _ in 0..need {
+            match self.kv_pool.alloc() {
+                Some(phys) => new_phys.push(phys),
+                None => {
+                    for p in new_phys {
+                        self.kv_pool.free(p);
+                    }
+                    return false;
+                }
+            }
+        }
+        let Some(table) = self.seq_manager.page_table_mut(seq_id) else {
+            for p in new_phys {
+                self.kv_pool.free(p);
+            }
+            return false;
+        };
+        for phys in new_phys {
+            table.push_page(phys);
+        }
+        table.set_seq_len(new_seq_len);
+        true
     }
 }
 

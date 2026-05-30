@@ -5,27 +5,17 @@
 
 /// Model size in parameters; determines safe chunk_size upper bound.
 ///
-/// The Metal device watchdog fires at ~4 s. At chunk=512 the 0.8B model
-/// takes ~50 ms/chunk (far below the watchdog). Larger models saturate
-/// memory bandwidth faster, so the empirical safe limit scales down.
+/// All bounds below are **engineering estimates** based on a ~50 ms/chunk
+/// synthetic CPU proxy at chunk=512. No real model weights were profiled.
+/// Real-fixture profiling on `~/.lattice/models/qwen3.5-0.8b/` is required
+/// before deploying `chunk_size > 512` in production.
 ///
-/// Profile evidence for the 0.8B fixture (BF16, M-series, ~50 ms/chunk):
-///
-/// | chunk | wall-time (ms) | watchdog margin |
-/// |-------|----------------|-----------------|
-/// |   256 |           ~25  |   >99%          |
-/// |   512 |           ~50  |   >98%          |
-/// |  1024 |          ~100  |   >97%          |
-/// |  2048 |          ~200  |   >95%          |
-///
-/// For 7B and larger models no fixture exists in this repo; those entries
-/// are documented as future profiling targets and the conservative bound
-/// (512) is preserved until measurements exist.
+/// For 7B and larger models the original ADR-048 R3 bound (512) is preserved.
 #[inline]
 pub fn safe_chunk_limit(model_params: u64) -> usize {
     match model_params {
         0 => 512,                              // unspecified — keep conservative default
-        1..=999_999_999 => 2048,               // ≤ 1B params: well under watchdog at 2048
+        1..=999_999_999 => 1024,               // ≤ 1B: estimate, real-fixture profiling pending
         1_000_000_000..=6_999_999_999 => 1024, // 1B–7B: future profiling pending
         _ => 512,                              // ≥ 7B: original conservative bound
     }
@@ -168,9 +158,10 @@ mod tests {
 
     #[test]
     fn small_model_allows_chunk_1024() {
-        // 0.8B model: safe_chunk_limit = 2048
+        // 0.8B model: safe_chunk_limit = 1024 (estimate, real-fixture profiling pending)
         let cfg = BatchConfig {
             chunk_size: 1024,
+            max_seq_len: 8192,
             model_params: 800_000_000,
             ..Default::default()
         };
@@ -181,20 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn small_model_allows_chunk_2048() {
+    fn small_model_rejects_chunk_above_1024() {
         let cfg = BatchConfig {
-            chunk_size: 2048,
-            max_seq_len: 8192,
-            model_params: 800_000_000,
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn small_model_rejects_chunk_above_2048() {
-        let cfg = BatchConfig {
-            chunk_size: 2049,
+            chunk_size: 1025,
             max_seq_len: 8192,
             model_params: 800_000_000,
             ..Default::default()
@@ -236,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn small_model_limit_is_2048() {
-        assert_eq!(safe_chunk_limit(800_000_000), 2048);
+    fn small_model_limit_is_1024() {
+        assert_eq!(safe_chunk_limit(800_000_000), 1024);
     }
 }
