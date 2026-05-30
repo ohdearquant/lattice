@@ -807,6 +807,79 @@ mod tests {
         );
     }
 
+    // -- Exact bit-pattern overflow and RNE tests (Defect 3 fix) ---------
+
+    #[test]
+    fn boundary_requested_overflow_inputs_map_to_infinity() {
+        // 65536.0 = 2^16 is above f16::MAX (65504.0) and must overflow to ±inf.
+        // These are the *exact* boundary values requested in the hardening pass.
+        assert_eq!(
+            f16::from_f32(65536.0_f32).to_bits(),
+            f16::INFINITY.to_bits(),
+            "65536.0 must overflow to +inf in f16"
+        );
+        assert_eq!(
+            f16::from_f32(-65536.0_f32).to_bits(),
+            f16::NEG_INFINITY.to_bits(),
+            "-65536.0 must overflow to -inf in f16"
+        );
+    }
+
+    #[test]
+    fn boundary_round_to_nearest_even_ties() {
+        // Verify IEEE-754 round-to-nearest-even at the exact halfway points.
+        //
+        // Case 1: 2^-25 is below the smallest f16 subnormal (2^-24); rounds to 0.
+        assert_eq!(
+            f16::from_f32(2.0_f32.powi(-25)).to_bits(),
+            0x0000,
+            "2^-25 must round to 0 (below subnormal range)"
+        );
+        // Case 2: 1.5 * 2^-24 is the midpoint between subnormal bit=1 and bit=2.
+        // RNE selects even mantissa → bit=2 → 0x0002.
+        assert_eq!(
+            f16::from_f32(1.5 * 2.0_f32.powi(-24)).to_bits(),
+            0x0002,
+            "1.5*2^-24 must round to subnormal bit=2 (RNE)"
+        );
+        // Case 3: 1.0 + 2^-11 is the midpoint between 0x3C00 (1.0) and 0x3C01.
+        // 0x3C00 has even mantissa LSB; RNE rounds to 0x3C00.
+        assert_eq!(
+            f16::from_f32(1.0_f32 + 2.0_f32.powi(-11)).to_bits(),
+            0x3c00,
+            "1.0 + 2^-11 must round to 1.0 = 0x3C00 (RNE, even mantissa wins)"
+        );
+        // Case 4: 1.0 + 3*2^-11 is the midpoint between 0x3C01 and 0x3C02.
+        // 0x3C02 has even mantissa LSB; RNE rounds to 0x3C02.
+        assert_eq!(
+            f16::from_f32(1.0_f32 + 3.0 * 2.0_f32.powi(-11)).to_bits(),
+            0x3c02,
+            "1.0 + 3*2^-11 must round to 0x3C02 (RNE, even mantissa wins)"
+        );
+    }
+
+    // -- Allocation-contract test (Defect 2 fix, Option B) ---------------
+
+    #[test]
+    fn constructed_cache_eagerly_initializes_configured_len() {
+        // Verifies that FlatKVCache::new immediately materializes all buffers
+        // at max_seq_len capacity (current eager-allocation contract, issue #12 deferred).
+        let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
+        let cache = FlatKVCache::new(config);
+        let kv_dim = cache.kv_dim(); // 2 * 4 = 8
+        let max_seq = cache.max_seq_len(); // 16
+        // num_layers * (K-side + V-side) * max_seq * kv_dim
+        // = 2 * 2 * 16 * 8 = 512
+        let expected_elems = cache.num_layers() * 2 * max_seq * kv_dim;
+        let actual_elems: usize = (0..cache.num_layers())
+            .map(|layer| cache.k_buffer(layer).len() + cache.v_buffer(layer).len())
+            .sum();
+        assert_eq!(
+            actual_elems, expected_elems,
+            "FlatKVCache eagerly allocates max_seq_len * kv_dim per layer per side"
+        );
+    }
+
     /// Quality measurement: f32→f16→f32 roundtrip error over representative KV value ranges.
     ///
     /// Reports max absolute error, max relative error, and confirms they are within
