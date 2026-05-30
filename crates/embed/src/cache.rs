@@ -446,7 +446,7 @@ mod tests {
         // will evict the first.
         let mut keys = Vec::new();
         for i in 0..32u32 {
-            let text = format!("text_{}", i);
+            let text = format!("text_{i}");
             let key = cache.compute_key(
                 &text,
                 ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
@@ -469,7 +469,6 @@ mod tests {
         // Find 3 keys that land in the same shard.
         let mut same_shard_keys = Vec::new();
         let mut i = 0u32;
-        let target_shard;
 
         // Find the first key's shard and collect 3 keys for it.
         let first_key = cache.compute_key(
@@ -477,11 +476,11 @@ mod tests {
             ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
             EmbeddingRole::Generic,
         );
-        target_shard = shard_index(&first_key);
+        let target_shard = shard_index(&first_key);
 
         loop {
             let key = cache.compute_key(
-                &format!("lru_test_{}", i),
+                &format!("lru_test_{i}"),
                 ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
                 EmbeddingRole::Generic,
             );
@@ -666,7 +665,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..100 {
                     // Each thread uses unique keys to avoid contention on same entry.
-                    let text = format!("thread_{}_item_{}", t, i);
+                    let text = format!("thread_{t}_item_{i}");
                     let key = cache.compute_key(
                         &text,
                         ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
@@ -701,7 +700,7 @@ mod tests {
         let n = 800;
         for i in 0..n {
             let key = cache.compute_key(
-                &format!("item_{}", i),
+                &format!("item_{i}"),
                 ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
                 EmbeddingRole::Generic,
             );

@@ -416,7 +416,7 @@ mod tests {
         // 3. Output is deterministic (running twice gives same result)
         assert_eq!(result.len(), seq_len * hidden_size);
         for (i, &val) in result.iter().enumerate() {
-            assert!(val.is_finite(), "result[{}] = {} is not finite", i, val);
+            assert!(val.is_finite(), "result[{i}] = {val} is not finite");
         }
 
         // Run again to verify determinism

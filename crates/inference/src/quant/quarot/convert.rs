@@ -988,7 +988,9 @@ mod tests {
             .expect("quantize_index.json must have a `tensors` array");
         assert_eq!(tensors.len(), report.planned_quantized + report.kept_f16);
         assert!(
-            idx.get("quarot_seed").and_then(|v| v.as_u64()).is_some(),
+            idx.get("quarot_seed")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
             "quantize_index.json must carry quarot_seed (ADR-051 contract)"
         );
     }
@@ -1791,7 +1793,9 @@ mod tests {
         let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
         let idx_val: serde_json::Value = serde_json::from_str(&idx_str).unwrap();
         assert_eq!(
-            idx_val.get("quarot_seed").and_then(|v| v.as_u64()),
+            idx_val
+                .get("quarot_seed")
+                .and_then(serde_json::Value::as_u64),
             Some(rotation_seed),
             "quantize_index.json must carry quarot_seed (ADR-051 contract)"
         );
@@ -1804,12 +1808,14 @@ mod tests {
             out_val
                 .get("text_config")
                 .and_then(|tc| tc.get("mtp_num_hidden_layers"))
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(1),
             "output config text_config.mtp_num_hidden_layers must be 1"
         );
         assert_eq!(
-            out_val.get("quarot_rotation_seed").and_then(|v| v.as_u64()),
+            out_val
+                .get("quarot_rotation_seed")
+                .and_then(serde_json::Value::as_u64),
             Some(rotation_seed),
             "output config must carry quarot_rotation_seed at top level"
         );
@@ -1817,7 +1823,7 @@ mod tests {
             out_val
                 .get("text_config")
                 .and_then(|tc| tc.get("quarot_rotation_seed"))
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(rotation_seed),
             "output config text_config must carry quarot_rotation_seed"
         );
@@ -1859,14 +1865,15 @@ mod tests {
         let output = inject_quarot_seed(json, seed).unwrap();
         let val: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(
-            val.get("quarot_rotation_seed").and_then(|v| v.as_u64()),
+            val.get("quarot_rotation_seed")
+                .and_then(serde_json::Value::as_u64),
             Some(seed),
             "quarot_rotation_seed must be at top level"
         );
         assert_eq!(
             val.get("text_config")
                 .and_then(|tc| tc.get("quarot_rotation_seed"))
-                .and_then(|v| v.as_u64()),
+                .and_then(serde_json::Value::as_u64),
             Some(seed),
             "quarot_rotation_seed must be inside text_config"
         );
@@ -1903,7 +1910,7 @@ mod tests {
         // No mtp.* files should exist in the output directory.
         let entries: Vec<_> = fs::read_dir(&output)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         for name in &entries {
@@ -1952,7 +1959,7 @@ mod tests {
 
         let entries: Vec<_> = fs::read_dir(&output)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         for name in &entries {

@@ -431,7 +431,7 @@ mod tests {
                         row[ki] *= scale;
                     }
                 }
-                let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
                 for v in row.iter_mut() {
                     *v = (*v - max_val).exp();
@@ -521,7 +521,7 @@ mod tests {
                     row[ki] *= scale;
                 }
             }
-            let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
             for v in row.iter_mut() {
                 *v = (*v - max_val).exp();

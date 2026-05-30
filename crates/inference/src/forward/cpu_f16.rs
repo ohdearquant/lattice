@@ -947,6 +947,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn test_f16_forward_compiles() {
         // Verify the function signatures are correct by constructing the types
         // and calling the functions with a trivial (1-layer, tiny) config.

@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_decode_ternary_masks_correctly() {
         // Only the lowest 2 bits should matter.
-        assert_eq!(decode_ternary(0b11_10_01_00 >> 0), 0);
+        assert_eq!(decode_ternary(0b11_10_01_00), 0);
         assert_eq!(decode_ternary(0b11_10_01_00 >> 2), 1);
         assert_eq!(decode_ternary(0b11_10_01_00 >> 4), -1);
         // 0b11 maps to 0 (unused encoding).
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(packed.len(), packed_row_bytes(k)); // ceil(7/4) = 2 bytes
 
         for j in 0..k {
-            assert_eq!(unpack_weight(&packed, k, 0, j), 1, "col={}", j);
+            assert_eq!(unpack_weight(&packed, k, 0, j), 1, "col={j}");
         }
     }
 
@@ -592,11 +592,7 @@ mod tests {
                 let rel_error = (reconstructed - original).abs() / original.abs();
                 assert!(
                     rel_error < 0.02,
-                    "index {}: original={} reconstructed={} rel_error={}",
-                    i,
-                    original,
-                    reconstructed,
-                    rel_error
+                    "index {i}: original={original} reconstructed={reconstructed} rel_error={rel_error}"
                 );
             }
         }

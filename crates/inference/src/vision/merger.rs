@@ -237,7 +237,7 @@ mod tests {
         let vit_out = vec![1.0f32; 4 * d_vit];
         let out = merger.merge_and_project(&vit_out, 4).expect("merge");
         // 4 / 4 = 1 merged patch
-        assert_eq!(out.len(), 1 * d_model);
+        assert_eq!(out.len(), d_model);
     }
 
     #[test]

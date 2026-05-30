@@ -138,10 +138,7 @@ fn main() {
     // All solves of the same problem should produce the same result
     let max_spread = transport_costs.iter().copied().fold(0.0_f32, f32::max)
         - transport_costs.iter().copied().fold(f32::MAX, f32::min);
-    println!(
-        "5 identical solves, transport cost spread: {:.2e}  (should be ~0)",
-        max_spread
-    );
+    println!("5 identical solves, transport cost spread: {max_spread:.2e}  (should be ~0)");
     assert!(max_spread < 1e-5);
     println!();
 

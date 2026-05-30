@@ -309,8 +309,8 @@ fn epsilon_scaling_converges() {
 /// Test 9: Cost matrix from point sets.
 #[test]
 fn cost_matrix_from_points() {
-    let points_a = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
-    let points_b = vec![vec![0.0, 1.0], vec![1.0, 1.0]];
+    let points_a = [vec![0.0, 0.0], vec![1.0, 0.0]];
+    let points_b = [vec![0.0, 1.0], vec![1.0, 1.0]];
 
     let cost =
         DenseCostMatrix::from_point_sets(&points_a[..], &points_b[..], SquaredEuclidean).unwrap();

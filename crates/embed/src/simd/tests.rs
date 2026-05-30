@@ -789,7 +789,7 @@ fn test_batch_cosine_one_vs_many_matches_per_pair() {
     let candidates: Vec<Vec<f32>> = (0..8)
         .map(|i| generate_random_vector_seeded(384, 0x3333_0000 + i as u64))
         .collect();
-    let candidate_refs: Vec<&[f32]> = candidates.iter().map(|c| c.as_slice()).collect();
+    let candidate_refs: Vec<&[f32]> = candidates.iter().map(Vec::as_slice).collect();
 
     let batch = batch_cosine_one_vs_many(&query, &candidate_refs);
     assert_eq!(batch.len(), 8);

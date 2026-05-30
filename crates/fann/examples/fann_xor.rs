@@ -105,9 +105,9 @@ fn main() {
     println!("Intermediate activations for input [0, 1]:");
     network.forward(&[0.0, 1.0]).expect("forward");
     let hidden = network.activations(0).expect("layer 0 activations");
-    println!("  Hidden layer (4 neurons): {:?}", hidden);
+    println!("  Hidden layer (4 neurons): {hidden:?}");
     let output_layer = network.activations(1).expect("layer 1 activations");
-    println!("  Output layer (1 neuron):  {:?}", output_layer);
+    println!("  Output layer (1 neuron):  {output_layer:?}");
     println!();
 
     // -------------------------------------------------------------------------
@@ -153,7 +153,7 @@ fn main() {
         .zip(&out_b)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0_f32, f32::max);
-    println!("  Max output difference: {:.2e}  (should be ~0)", max_diff);
+    println!("  Max output difference: {max_diff:.2e}  (should be ~0)");
     assert!(
         max_diff < 1e-5,
         "training must be deterministic under same seed"

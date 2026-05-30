@@ -779,7 +779,7 @@ fn print_table(metrics: &[Metric], baseline: &[(String, f64)]) {
                 } else {
                     let is_higher_better =
                         m.name.contains("tok_per_sec") || m.name.contains("speedup");
-                    if (pct < 0.0) == !is_higher_better {
+                    if (pct < 0.0) != is_higher_better {
                         format!(" {pct:>5.1}% ")
                     } else {
                         format!(" {pct:>+5.1}% ")
@@ -825,7 +825,7 @@ fn main() {
         .iter()
         .position(|a| a == "--baseline")
         .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str());
+        .map(std::string::String::as_str);
 
     // Select which benchmarks to run
     let run_all = !args
@@ -880,7 +880,7 @@ fn main() {
     );
 
     // Load baseline for comparison
-    let baseline = baseline_path.map(|p| load_baseline(p)).unwrap_or_default();
+    let baseline = baseline_path.map(load_baseline).unwrap_or_default();
 
     if json_mode {
         print_json(&metrics);

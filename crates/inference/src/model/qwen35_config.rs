@@ -797,7 +797,7 @@ mod tests {
     fn test_qwen36_27b_from_config_json() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
         let path =
-            std::path::PathBuf::from(format!("{}/.lattice/models/qwen3.6-27b/config.json", home));
+            std::path::PathBuf::from(format!("{home}/.lattice/models/qwen3.6-27b/config.json"));
         if !path.exists() {
             return; // model not downloaded; skip
         }

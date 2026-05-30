@@ -20,17 +20,17 @@ fn main() {
 
     let identical = vec![1.0_f32, 2.0, 3.0];
     let sim_same = cosine_similarity(&identical, &identical);
-    println!("identical vectors: {:.4}", sim_same); // 1.0
+    println!("identical vectors: {sim_same:.4}"); // 1.0
 
     let a = vec![1.0_f32, 0.0, 0.0];
     let b = vec![0.0_f32, 1.0, 0.0];
     let sim_ortho = cosine_similarity(&a, &b);
-    println!("orthogonal vectors: {:.4}", sim_ortho); // 0.0
+    println!("orthogonal vectors: {sim_ortho:.4}"); // 0.0
 
     let c = vec![1.0_f32, 0.0];
     let d = vec![-1.0_f32, 0.0];
     let sim_opposite = cosine_similarity(&c, &d);
-    println!("opposite vectors: {:.4}", sim_opposite); // -1.0
+    println!("opposite vectors: {sim_opposite:.4}"); // -1.0
     println!();
 
     // -------------------------------------------------------------------------
@@ -40,11 +40,11 @@ fn main() {
 
     let mut v1 = vec![3.0_f32, 4.0]; // magnitude = 5
     let original_mag: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
-    println!("before normalize: magnitude = {:.4}", original_mag);
+    println!("before normalize: magnitude = {original_mag:.4}");
 
     normalize(&mut v1);
     let normalized_mag: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
-    println!("after normalize:  magnitude = {:.4}", normalized_mag); // 1.0
+    println!("after normalize:  magnitude = {normalized_mag:.4}"); // 1.0
 
     // For unit-norm vectors, dot == cosine (and is faster — skips norm computation)
     let mut v2 = vec![0.0_f32, 1.0];
@@ -52,8 +52,8 @@ fn main() {
 
     let dot = dot_product(&v1, &v2);
     let cosine = cosine_similarity(&v1, &v2);
-    println!("dot product  = {:.6}", dot);
-    println!("cosine sim   = {:.6}", cosine);
+    println!("dot product  = {dot:.6}");
+    println!("cosine sim   = {cosine:.6}");
     println!("difference   = {:.2e}", (dot - cosine).abs()); // essentially 0
     println!();
 
@@ -65,7 +65,7 @@ fn main() {
     let origin = vec![0.0_f32, 0.0, 0.0];
     let point = vec![1.0_f32, 2.0, 2.0]; // distance = sqrt(1+4+4) = 3
     let dist = euclidean_distance(&origin, &point);
-    println!("distance from origin to [1,2,2]: {:.4}", dist); // 3.0
+    println!("distance from origin to [1,2,2]: {dist:.4}"); // 3.0
     println!();
 
     // -------------------------------------------------------------------------

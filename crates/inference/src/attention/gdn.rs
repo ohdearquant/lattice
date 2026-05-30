@@ -772,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)]
     fn test_k_head_mapping_ratio_3() {
         let num_key_heads: usize = 16;
         let num_value_heads: usize = 48;

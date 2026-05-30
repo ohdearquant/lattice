@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = NativeEmbeddingService::default();
     let model = EmbeddingModel::default(); // BgeSmallEnV15
 
-    println!("Model:      {}", model);
+    println!("Model:      {model}");
     println!("Dimensions: {}", model.dimensions());
     println!("Max tokens: {}", model.max_input_tokens());
     println!("Local:      {}", model.is_local());

@@ -596,9 +596,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_encode_output_shape_and_l2_norm() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(value) => value,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
 
         let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
