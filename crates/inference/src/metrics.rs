@@ -534,4 +534,186 @@ mod tests {
         };
         assert_eq!(lm.entropy.as_ref().map(Vec::len), Some(4));
     }
+
+    // ── l2_norm edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_l2_norm_empty() {
+        // An empty slice has no elements; the sum-of-squares is 0 → norm = 0.
+        assert_eq!(l2_norm(&[]), 0.0_f32);
+    }
+
+    #[test]
+    fn test_l2_norm_single_element() {
+        assert_close(l2_norm(&[3.0_f32]), 3.0, "positive single");
+        assert_close(l2_norm(&[-4.0_f32]), 4.0, "negative single");
+        assert_eq!(l2_norm(&[0.0_f32]), 0.0, "zero single");
+    }
+
+    // ── split distribution: online == naive ────────────────────────────────
+
+    #[test]
+    fn test_entropy_split_distribution_vs_naive() {
+        // 32 tokens at +3.0, 32 tokens at -3.0 → two-cluster split.
+        // Both clusters uniform within themselves; compare online to naive.
+        let mut logits = vec![3.0_f32; 32];
+        logits.extend(std::iter::repeat(-3.0_f32).take(32));
+
+        let mut acc = OnlineSoftmaxEntropy::new();
+        for &l in &logits {
+            acc.update(l);
+        }
+        let online_h = acc.entropy_nats();
+
+        let max_l = 3.0_f32;
+        let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let naive_h: f32 = exps
+            .iter()
+            .map(|&e| {
+                let p = e / sum_exp;
+                if p > 1e-30 { -p * p.ln() } else { 0.0 }
+            })
+            .sum();
+
+        let diff = (online_h - naive_h).abs();
+        assert!(
+            diff < 1e-4,
+            "split distribution: online={online_h} naive={naive_h} diff={diff} exceeds 1e-4"
+        );
+        assert!(online_h.is_finite(), "split entropy must be finite");
+        assert!(online_h >= 0.0, "split entropy must be non-negative");
+    }
+
+    // ── subnormal inputs ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_entropy_subnormal_inputs() {
+        // Subnormal f32 values are valid finite numbers; the accumulator must
+        // not produce NaN/Inf and must remain consistent with the naive result.
+        let sub = f32::from_bits(1); // smallest positive subnormal ≈ 1.4e-45
+        let logits = [sub, sub, 0.0_f32, -sub];
+
+        let mut acc = OnlineSoftmaxEntropy::new();
+        for &l in &logits {
+            acc.update(l);
+        }
+        let h = acc.entropy_nats();
+        assert!(
+            h.is_finite(),
+            "subnormal inputs produced non-finite entropy: {h}"
+        );
+        assert!(h >= 0.0, "subnormal entropy must be non-negative, got {h}");
+
+        // Verify within tolerance of naive reference.
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let naive_h: f32 = exps
+            .iter()
+            .map(|&e| {
+                let p = e / sum_exp;
+                if p > 1e-30 { -p * p.ln() } else { 0.0 }
+            })
+            .sum();
+        let diff = (h - naive_h).abs();
+        assert!(
+            diff < 1e-4,
+            "subnormal: online={h} naive={naive_h} diff={diff} exceeds 1e-4"
+        );
+    }
+
+    // ── NaN/Inf escape: update must panic, accumulator must stay clean ─────
+
+    #[test]
+    #[should_panic(expected = "logit must be finite")]
+    fn test_entropy_update_panics_on_nan() {
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "logit must be finite")]
+    fn test_entropy_update_panics_on_pos_inf() {
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(f32::INFINITY);
+    }
+
+    #[test]
+    #[should_panic(expected = "logit must be finite")]
+    fn test_entropy_update_panics_on_neg_inf() {
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn test_entropy_try_update_valid_state_after_rejection() {
+        // After try_update rejects a NaN, the accumulator must be usable and
+        // give the same result as if no non-finite input was ever offered.
+        let mut acc = OnlineSoftmaxEntropy::new();
+        acc.update(1.0);
+        let _ = acc.try_update(f32::NAN); // must be rejected
+        acc.update(1.0);
+        // Two equal logits → ln(2), same as a fresh accumulator with [1.0, 1.0].
+        let mut fresh = OnlineSoftmaxEntropy::new();
+        fresh.update(1.0);
+        fresh.update(1.0);
+        assert_close(
+            acc.entropy_nats(),
+            fresh.entropy_nats(),
+            "state after NaN rejection must match fresh two-equal run",
+        );
+        assert_eq!(acc.count(), 2, "count must not increment on rejection");
+    }
+
+    // ── per-head vs per-row semantics ──────────────────────────────────────
+
+    #[test]
+    fn test_entropy_per_head_per_row_semantics() {
+        // Each OnlineSoftmaxEntropy models one attention row (one query, one head).
+        // LayerMetrics.entropy collects one scalar per head (mean over rows, or
+        // single-row entropy). Verify the expected layering:
+        //   H heads × T keys → H independent accumulators → Vec<f32> of length H.
+        const H: usize = 4; // heads
+        const T: usize = 16; // keys per row
+        // Head 0: uniform → ln(T); Head 1: peaked → ≈0; others: intermediate.
+        let logit_patterns: [fn(usize) -> f32; H] = [
+            |_| 0.0,                                 // uniform over T
+            |i| if i == 0 { 100.0 } else { -100.0 }, // peaked
+            |i| i as f32,                            // ascending ramp
+            |i| (i as f32) * -0.1,                   // shallow descending
+        ];
+        let mut head_entropies = Vec::with_capacity(H);
+        for pattern in &logit_patterns {
+            let mut acc = OnlineSoftmaxEntropy::new();
+            for i in 0..T {
+                acc.update(pattern(i));
+            }
+            head_entropies.push(acc.entropy_nats());
+        }
+        // Head 0: uniform → entropy ≈ ln(T).
+        assert_close(
+            head_entropies[0],
+            (T as f32).ln(),
+            "head 0 (uniform) entropy",
+        );
+        // Head 1: peaked → entropy ≈ 0.
+        assert!(
+            head_entropies[1] < 0.01,
+            "head 1 (peaked) entropy should be near 0, got {}",
+            head_entropies[1]
+        );
+        // All head entropies must be finite and non-negative.
+        for (i, &h) in head_entropies.iter().enumerate() {
+            assert!(h.is_finite(), "head {i} entropy non-finite: {h}");
+            assert!(h >= 0.0, "head {i} entropy negative: {h}");
+        }
+        // The LayerMetrics struct should hold exactly H values.
+        let lm = LayerMetrics {
+            mode: MetricsMode::AttentionProfile,
+            entropy: Some(head_entropies.clone()),
+            ..LayerMetrics::default()
+        };
+        assert_eq!(lm.entropy.as_ref().map(Vec::len), Some(H));
+    }
 }
