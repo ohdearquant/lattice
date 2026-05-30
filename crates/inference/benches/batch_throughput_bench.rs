@@ -23,7 +23,6 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::batch::worker::PagedKVCacheConfigExt;
 use lattice_inference::batch::{BatchConfig, BatchWorker, InferenceRequest};
 use lattice_inference::kv_cache::{EvictionPolicy, PagedKVCacheConfig};
 use lattice_inference::sampling::SamplingConfig;
@@ -40,42 +39,38 @@ const MODEL_PARAMS: u64 = 800_000_000;
 // Synthetic forward function (real matmul: hidden → logits)
 // ---------------------------------------------------------------------------
 
-/// Computes logits as `hidden_state · W_out` where `hidden_state` is the last
-/// token's hidden vector. Sized for HIDDEN_DIM=1024, VOCAB_SIZE=32000.
-///
-/// Leaks the projection matrix once per bench group so we pay allocation cost
-/// outside the hot path. The matmul is `1 × HIDDEN_DIM × VOCAB_SIZE = 32M`
-/// FLOPs — representative of the logit projection for a 0.8B model.
+/// Lightweight compute proxy — NOT a full model forward pass.
+/// Performs one 64-element dot product per token so cost scales linearly with
+/// `token_ids.len()`. Used to make prefill-chunk sizing observable in the bench
+/// without being dominated by model-weight compute.
 fn logit_projection(
-    hidden: &'static [f32],
+    proj: &'static [f32], // HIDDEN_DIM * HIDDEN_DIM elements
 ) -> impl FnMut(
     lattice_inference::batch::BatchStepInput<'_>,
     &mut lattice_inference::batch::GdnStatePool,
 ) -> Vec<f32> {
     move |input, _pool| {
-        let n = input.token_ids.len();
-        // Use the last token's position as a seed for a deterministic logit
-        // vector to avoid winner-takes-all collapse. The real cost is in the
-        // projection below.
-        let seed_row = (input.start_pos + n) % HIDDEN_DIM;
-        let proj_row = &hidden[seed_row * VOCAB_SIZE..(seed_row + 1) * VOCAB_SIZE];
-
-        // Compute dot products for a subset of vocab positions to keep bench
-        // runtime reasonable (full 32K projection would dominate wall time
-        // and swamp scheduler overhead; representative sample: 4096 classes).
-        let sample = 4_096usize.min(VOCAB_SIZE);
-        let mut logits = vec![0.0f32; VOCAB_SIZE];
-        for (i, l) in logits[..sample].iter_mut().enumerate() {
-            *l = proj_row[i];
+        const PROJ_DIM: usize = 64;
+        let mut acc = 0.0f32;
+        for (i, _) in input.token_ids.iter().enumerate() {
+            let row_base = ((input.start_pos + i) % HIDDEN_DIM) * HIDDEN_DIM;
+            let row = &proj[row_base..row_base + PROJ_DIM];
+            let mirror_base = ((input.start_pos + i + HIDDEN_DIM / 2) % HIDDEN_DIM) * HIDDEN_DIM;
+            let mirror = &proj[mirror_base..mirror_base + PROJ_DIM];
+            for j in 0..PROJ_DIM {
+                acc += row[j] * mirror[j];
+            }
         }
+        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        logits[0] = acc;
         black_box(logits)
     }
 }
 
 fn make_projection_matrix() -> &'static [f32] {
     let mut rng_state: u32 = 0xDEAD_BEEF;
-    let mut data = Vec::with_capacity(HIDDEN_DIM * VOCAB_SIZE);
-    for _ in 0..HIDDEN_DIM * VOCAB_SIZE {
+    let mut data = Vec::with_capacity(HIDDEN_DIM * HIDDEN_DIM);
+    for _ in 0..HIDDEN_DIM * HIDDEN_DIM {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 17;
         rng_state ^= rng_state << 5;
@@ -231,49 +226,53 @@ fn bench_page_utilisation(c: &mut Criterion) {
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
 
-    // Total pages in pool. "Warm" sequences pre-consume pages to hit the
-    // target utilisation before the measured request is submitted.
-    let total_pages = 128usize;
+    // 100-page pool, page_size=4. Each sequence (prompt=4, +1 decode token) uses
+    // ceil(5/4)=2 pages. At 99%, 49 hold_seqs × 2 pages = 98 of 100 pages used →
+    // scheduler memory guard fires (free=2, prefill_reserve=2: admitted only when empty).
+    const POOL_PAGES: usize = 100;
+    const PAGE_SIZE: usize = 4;
+    const SEQ_PROMPT: usize = 4;
+    const PAGES_PER_SEQ: usize = 2; // ceil((SEQ_PROMPT+1)/PAGE_SIZE)
 
     for (label, target_pct) in [("70pct", 70usize), ("90pct", 90), ("99pct", 99)] {
-        let pages_consumed = total_pages * target_pct / 100;
-        // Each sequence of prompt_len=32 with page_size=16 consumes 2 pages.
-        let warm_seqs = pages_consumed / 2;
-        // Leave room for the measured sequence plus reserve.
-        let max_batch = warm_seqs + 8;
+        let pages_to_consume = POOL_PAGES * target_pct / 100;
+        let hold_seqs = pages_to_consume / PAGES_PER_SEQ;
+        let max_batch = hold_seqs + 4;
 
-        group.throughput(Throughput::Elements((32 + 4) as u64));
+        group.throughput(Throughput::Elements((SEQ_PROMPT + 4) as u64));
 
         group.bench_function(BenchmarkId::new("tok_per_sec", label), |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let mut worker = make_worker(512, max_batch, total_pages + 8);
+                    let kv_cfg = PagedKVCacheConfig {
+                        page_size: PAGE_SIZE,
+                        max_pages: POOL_PAGES,
+                        num_layers: 4,
+                        num_kv_heads: 4,
+                        head_dim: 64,
+                        eviction: EvictionPolicy::None,
+                    };
+                    let cfg = BatchConfig {
+                        max_batch_size: max_batch,
+                        max_seq_len: 256,
+                        chunk_size: 512,
+                        prefill_reserve_pages: 2,
+                        model_params: MODEL_PARAMS,
+                    };
+                    let mut worker = BatchWorker::new(cfg, kv_cfg, HIDDEN_DIM, HIDDEN_DIM, None);
 
-                    // Pre-warm: submit warm_seqs sequences of length 32 with
-                    // max_new_tokens=1 so they complete quickly but hold pages.
-                    let warm_count = warm_seqs.min(max_batch.saturating_sub(1));
-                    for _ in 0..warm_count {
-                        worker.submit(make_request(32, 1));
+                    // Submit hold_seqs sequences sized to consume exactly PAGES_PER_SEQ each.
+                    // max_new_tokens=4: total len = SEQ_PROMPT+4 = 8 tokens = 2 pages (page_size=4).
+                    for _ in 0..hold_seqs {
+                        worker.submit(make_request(SEQ_PROMPT, 4));
                     }
-                    // Run warm sequences to completion.
-                    while !worker.is_idle() {
-                        worker.step(logit_projection(proj));
-                    }
-
-                    // Now submit the measured sequence under page pressure.
-                    // (The warm sequences freed their pages; re-submit them to
-                    // re-apply pressure, then submit the measured request.)
-                    let pressure_count = warm_count;
-                    for _ in 0..pressure_count {
-                        worker.submit(make_request(32, 100)); // long-running
-                    }
-                    // Run one prefill round to lock pages, then submit measure req.
+                    // One step to trigger real KV page allocation.
                     worker.step(logit_projection(proj));
-                    worker.submit(make_request(32, 4));
 
+                    // Submit and time the measured short request.
+                    worker.submit(make_request(SEQ_PROMPT, 4));
                     let t0 = Instant::now();
-                    // Run until the entire batch finishes.
                     while !worker.is_idle() {
                         worker.step(logit_projection(proj));
                     }

@@ -42,7 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Bench list (same as ADR-058 Phase 1) ---
-BENCHES_INFERENCE="elementwise_cpu_bench"
+BENCHES_INFERENCE=("elementwise_cpu_bench" "batch_throughput_bench")
 BENCHES_EMBED="simd"
 
 # --- Build + bench base ---
@@ -51,11 +51,13 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
 (
   cd "$WT"
   # Only bench what exists — some benches may not exist on older refs
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
-  else
-    echo "  (elementwise_cpu_bench not present on $BASE_SHA — skipping)"
-  fi
+  for bench in "${BENCHES_INFERENCE[@]}"; do
+    if cargo bench -p lattice-inference --bench "$bench" --no-run 2>/dev/null; then
+      cargo bench -p lattice-inference --bench "$bench" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+    else
+      echo "  ($bench not present on $BASE_SHA — skipping)"
+    fi
+  done
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
 )
 
@@ -88,11 +90,13 @@ fi
 
 (
   cd "$HEAD_DIR"
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
-  else
-    echo "  (elementwise_cpu_bench not present on $HEAD_SHA — skipping)"
-  fi
+  for bench in "${BENCHES_INFERENCE[@]}"; do
+    if cargo bench -p lattice-inference --bench "$bench" --no-run 2>/dev/null; then
+      cargo bench -p lattice-inference --bench "$bench" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+    else
+      echo "  ($bench not present on $HEAD_SHA — skipping)"
+    fi
+  done
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
