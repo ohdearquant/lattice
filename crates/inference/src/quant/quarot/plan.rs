@@ -160,6 +160,7 @@
 //! - Batch LoRA kernel for prefill (currently falls back to sequential)
 
 use crate::error::InferenceError;
+use crate::model::qwen::QwenConfig;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::rotation::{
     absorb_input_rotation, absorb_input_rotation_f64, absorb_output_rotation,
@@ -302,6 +303,58 @@ impl RotationPlan {
                 // in the output config so the runtime loads it. See module
                 // §Tied embeddings for why the tied-fallback path is NOT
                 // correctness-preserving.
+                opt("lm_head.weight", r_in),
+            ],
+        }
+    }
+
+    /// Plan rules for **the linear-layer subset** of plain Qwen3 residual-stream
+    /// rotation. Covers GQA attention + dense MLP + embed/lm_head.
+    ///
+    /// Plain Qwen3 has no GDN (GatedDeltaNet) linear-attention layers — use
+    /// [`Self::qwen35_residual_stream_linear_layers`] for Qwen3.5 hybrid.
+    ///
+    /// Key shape difference vs Qwen3.5: `self_attn.q_proj.weight` is
+    /// `[q_dim, hidden]` (plain Qwen3) not the fused `[2*q_dim, hidden]`
+    /// (Qwen3.5). The absorption rule is identical (input-side) — the plan
+    /// only needs the suffix to match correctly.
+    ///
+    /// Use [`qwen3_required_tensor_names`] to cross-check that every required
+    /// tensor is present before quantization begins (step 3c of ADR-044).
+    pub fn qwen3_residual_stream_linear_layers() -> Self {
+        let r_in = TensorRotation {
+            side: AbsorptionSide::InputSide,
+            rotation_id: RotationId::ResidualStream,
+        };
+        let r_out = TensorRotation {
+            side: AbsorptionSide::OutputSide,
+            rotation_id: RotationId::ResidualStream,
+        };
+        let req = |pat: &str, rot: TensorRotation| Rule {
+            pattern: pat.into(),
+            rotation: rot,
+            requirement: RuleRequirement::Required,
+        };
+        let opt = |pat: &str, rot: TensorRotation| Rule {
+            pattern: pat.into(),
+            rotation: rot,
+            requirement: RuleRequirement::Optional,
+        };
+        Self {
+            rules: vec![
+                // GQA attention layers — no GDN in plain Qwen3
+                req("self_attn.q_proj.weight", r_in),
+                req("self_attn.k_proj.weight", r_in),
+                req("self_attn.v_proj.weight", r_in),
+                req("self_attn.o_proj.weight", r_out),
+                // Dense MLP layers
+                req("mlp.gate_proj.weight", r_in),
+                req("mlp.up_proj.weight", r_in),
+                req("mlp.down_proj.weight", r_out),
+                // Embedding — always required
+                req("embed_tokens.weight", r_in),
+                // lm_head — optional in INPUT SafeTensors; materialised by
+                // step 3c when tie_word_embeddings=true
                 opt("lm_head.weight", r_in),
             ],
         }
@@ -502,6 +555,35 @@ pub fn apply_tensor_rotation_f64(
         AbsorptionSide::OutputSide => absorb_output_rotation_f64(weight, rows, cols, rotation)?,
     }
     Ok(true)
+}
+
+/// Required tensor names for a plain Qwen3 model with the given `cfg`.
+///
+/// Analogous to [`crate::model::qwen35::qwen_required_tensor_names`] for
+/// Qwen3.5. Plain Qwen3 uses `layers.{i}.*` names directly — no
+/// `model.language_model.*` prefix — and has no GDN `linear_attn.*` tensors.
+///
+/// Step 3c of ADR-044 calls this to cross-check that every required tensor
+/// is reachable in the SafeTensors file before quantization begins.
+pub fn qwen3_required_tensor_names(cfg: &QwenConfig) -> Vec<String> {
+    let mut names: Vec<String> = vec!["embed_tokens.weight".to_string(), "norm.weight".to_string()];
+    for i in 0..cfg.num_hidden_layers {
+        let p = format!("layers.{i}");
+        names.extend([
+            format!("{p}.self_attn.q_proj.weight"),
+            format!("{p}.self_attn.k_proj.weight"),
+            format!("{p}.self_attn.v_proj.weight"),
+            format!("{p}.self_attn.o_proj.weight"),
+            format!("{p}.self_attn.q_norm.weight"),
+            format!("{p}.self_attn.k_norm.weight"),
+            format!("{p}.input_layernorm.weight"),
+            format!("{p}.mlp.gate_proj.weight"),
+            format!("{p}.mlp.up_proj.weight"),
+            format!("{p}.mlp.down_proj.weight"),
+            format!("{p}.post_attention_layernorm.weight"),
+        ]);
+    }
+    names
 }
 
 #[cfg(test)]
@@ -871,6 +953,101 @@ mod tests {
         let plan = RotationPlan::qwen35_residual_stream_linear_layers();
         assert_eq!(plan.absorption_for_module("conv1d"), None);
         assert_eq!(plan.absorption_for_module("norm"), None);
+    }
+
+    #[test]
+    fn qwen3_plan_covers_residual_stream_tensors() {
+        let plan = RotationPlan::qwen3_residual_stream_linear_layers();
+        // 8 required + 1 optional = 9 rules (no GDN)
+        assert_eq!(plan.rule_count(), 9);
+        let cases = [
+            (
+                "layers.0.self_attn.q_proj.weight",
+                AbsorptionSide::InputSide,
+            ),
+            (
+                "layers.5.self_attn.k_proj.weight",
+                AbsorptionSide::InputSide,
+            ),
+            (
+                "layers.5.self_attn.v_proj.weight",
+                AbsorptionSide::InputSide,
+            ),
+            (
+                "layers.5.self_attn.o_proj.weight",
+                AbsorptionSide::OutputSide,
+            ),
+            ("layers.27.mlp.gate_proj.weight", AbsorptionSide::InputSide),
+            ("layers.27.mlp.up_proj.weight", AbsorptionSide::InputSide),
+            ("layers.27.mlp.down_proj.weight", AbsorptionSide::OutputSide),
+            ("embed_tokens.weight", AbsorptionSide::InputSide),
+            ("lm_head.weight", AbsorptionSide::InputSide),
+        ];
+        for (name, expected_side) in cases {
+            let tr = plan
+                .for_tensor(name)
+                .unwrap_or_else(|| panic!("qwen3 plan missed tensor {name}"));
+            assert_eq!(tr.side, expected_side, "wrong side for {name}");
+            assert_eq!(tr.rotation_id, RotationId::ResidualStream);
+        }
+    }
+
+    #[test]
+    fn qwen3_plan_does_not_cover_gdn_tensors() {
+        let plan = RotationPlan::qwen3_residual_stream_linear_layers();
+        let gdn_names = [
+            "layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_z.weight",
+            "layers.0.linear_attn.in_proj_b.weight",
+            "layers.0.linear_attn.in_proj_a.weight",
+            "layers.0.linear_attn.out_proj.weight",
+        ];
+        for name in gdn_names {
+            assert!(
+                plan.for_tensor(name).is_none(),
+                "GDN tensor {name} should not match qwen3 plan"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3_0_6b_required_tensor_names_count_and_spot_check() {
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        let names = qwen3_required_tensor_names(&cfg);
+        // 2 global + 28 layers × 11 per-layer = 310
+        assert_eq!(
+            names.len(),
+            310,
+            "expected 310 names for Qwen3-0.6B (28 layers × 11 + 2 global)"
+        );
+        assert!(names.contains(&"embed_tokens.weight".to_string()));
+        assert!(names.contains(&"norm.weight".to_string()));
+        assert!(names.contains(&"layers.0.self_attn.q_proj.weight".to_string()));
+        assert!(names.contains(&"layers.27.mlp.down_proj.weight".to_string()));
+        assert!(names.contains(&"layers.0.self_attn.q_norm.weight".to_string()));
+        assert!(names.contains(&"layers.0.self_attn.k_norm.weight".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("linear_attn")),
+            "Qwen3 required names must not include GDN linear_attn tensors"
+        );
+    }
+
+    #[test]
+    fn qwen3_0_6b_validate_coverage_complete_without_lm_head() {
+        let plan = RotationPlan::qwen3_residual_stream_linear_layers();
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        let names = qwen3_required_tensor_names(&cfg);
+        let report = plan.validate_coverage(names.iter().map(String::as_str));
+        assert!(
+            report.is_complete(),
+            "Qwen3-0.6B required names yield complete coverage: {report:?}"
+        );
+        assert_eq!(report.unmatched_required_rules.len(), 0);
+        assert_eq!(
+            report.unmatched_optional_rules,
+            vec!["lm_head.weight".to_string()],
+            "lm_head.weight should be the only unmatched-optional rule (tied embeddings)"
+        );
     }
 
     #[test]
