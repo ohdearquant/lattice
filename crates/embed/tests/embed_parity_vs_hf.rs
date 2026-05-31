@@ -10,8 +10,12 @@
 //! represent the HF reference at the time of generation.
 //!
 //! **Tolerances** (constants at top of file — adjust here if needed):
-//! - BGE, E5 (full f32 inference): cosine ≥ 0.9990, max-abs-diff ≤ 1e-3
+//! - BGE, E5, MiniLM (full f32 inference): cosine ≥ 0.9990, max-abs-diff ≤ 5e-3
 //! - Qwen3 (may have bf16 in path): cosine ≥ 0.9950, max-abs-diff ≤ 5e-3
+//!
+//! Note: max-abs-diff is observed at 1.8–3.5e-3 on current hardware (f32 → f64
+//! cast noise). The threshold is set at 5e-3 to provide headroom without masking
+//! regressions; the cosine guard (≥ 0.9990) is the primary quality signal.
 //!
 //! **How to regenerate fixtures** (run once, then commit the output):
 //!   ```bash
@@ -35,9 +39,11 @@ const COS_SIM_MIN_F32: f64 = 0.9990;
 /// Minimum cosine similarity for Qwen3 (bf16 in forward pass).
 const COS_SIM_MIN_QWEN: f64 = 0.9950;
 
-/// Secondary guard: maximum element-wise absolute difference (informational, not blocking).
-#[allow(dead_code)]
-const MAX_ABS_DIFF_F32: f64 = 1e-3;
+/// Maximum element-wise absolute difference for BGE, E5, and MiniLM (full f32 inference).
+const MAX_ABS_DIFF_F32: f64 = 5e-3;
+
+/// Maximum element-wise absolute difference for Qwen3 (bf16 in forward pass).
+const MAX_ABS_DIFF_QWEN: f64 = 5e-3;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,18 +77,23 @@ fn fixture_dir() -> PathBuf {
         .join("embed_parity_v1")
 }
 
-fn load_fixture(filename: &str) -> Option<Vec<Golden>> {
+fn load_fixture(filename: &str) -> Vec<Golden> {
     let path = fixture_dir().join(filename);
-    if !path.exists() {
-        eprintln!(
-            "SKIP: fixture not found at {path}. Run scripts/gen_embed_parity_goldens.py first.",
-            path = path.display()
-        );
-        return None;
-    }
+    assert!(
+        path.exists(),
+        "committed fixture not found at {path} — run scripts/gen_embed_parity_goldens.py and commit the output",
+        path = path.display()
+    );
     let data = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-    Some(serde_json::from_str(&data).unwrap_or_else(|e| panic!("bad JSON in {filename}: {e}")))
+    serde_json::from_str(&data).unwrap_or_else(|e| panic!("bad JSON in {filename}: {e}"))
+}
+
+fn record_vector_weight_skip(test_name: &str, model_dir: &std::path::Path) {
+    eprintln!(
+        "LATTICE_VECTOR_PARITY_SKIPPED test={test_name} reason=missing_weights path={}",
+        model_dir.display()
+    );
 }
 
 /// Cosine similarity between two f32 vectors, returned as f64 for comparison.
@@ -144,17 +155,12 @@ async fn embed_passage_text(
 
 #[tokio::test]
 async fn bge_small_parity_vs_hf() {
-    let Some(goldens) = load_fixture("bge_small_en_v15.json") else {
-        return; // fixture absent → skip
-    };
+    let goldens = load_fixture("bge_small_en_v15.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/bge-small-en-v1.5");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP bge_small_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("bge_small_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -183,10 +189,10 @@ async fn bge_small_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [bge-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [bge-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -216,17 +222,12 @@ async fn bge_small_parity_vs_hf() {
 
 #[tokio::test]
 async fn e5_small_parity_vs_hf() {
-    let Some(goldens) = load_fixture("multilingual_e5_small.json") else {
-        return;
-    };
+    let goldens = load_fixture("multilingual_e5_small.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/multilingual-e5-small");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP e5_small_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("e5_small_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -259,10 +260,10 @@ async fn e5_small_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -292,17 +293,12 @@ async fn e5_small_parity_vs_hf() {
 
 #[tokio::test]
 async fn all_minilm_l6_v2_parity_vs_hf() {
-    let Some(goldens) = load_fixture("all_minilm_l6_v2.json") else {
-        return;
-    };
+    let goldens = load_fixture("all_minilm_l6_v2.json");
 
     let model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/all-minilm-l6-v2");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP all_minilm_l6_v2_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
-        );
+        record_vector_weight_skip("all_minilm_l6_v2_parity_vs_hf", &model_dir);
         return;
     }
 
@@ -335,10 +331,10 @@ async fn all_minilm_l6_v2_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [all-minilm-l6] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [all-minilm-l6] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -368,16 +364,14 @@ async fn all_minilm_l6_v2_parity_vs_hf() {
 
 #[tokio::test]
 async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
-    let Some(goldens) = load_fixture("paraphrase_multilingual_minilm_l12_v2.json") else {
-        return;
-    };
+    let goldens = load_fixture("paraphrase_multilingual_minilm_l12_v2.json");
 
     let model_dir = PathBuf::from(std::env::var("HOME").unwrap())
         .join(".lattice/models/paraphrase-multilingual-minilm-l12-v2");
     if !model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP paraphrase_multilingual_minilm_l12_v2_parity_vs_hf: model weights not found at {}",
-            model_dir.display()
+        record_vector_weight_skip(
+            "paraphrase_multilingual_minilm_l12_v2_parity_vs_hf",
+            &model_dir,
         );
         return;
     }
@@ -411,10 +405,10 @@ async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_F32 {
+        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [paraphrase-multilingual-minilm-l12] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [paraphrase-multilingual-minilm-l12] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
@@ -449,17 +443,12 @@ async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
 #[tokio::test]
 #[ignore = "Qwen3-Embedding forward-pass divergence — see lattice#103"]
 async fn qwen3_embedding_0_6b_parity_vs_hf() {
-    let Some(goldens) = load_fixture("qwen3_embedding_0_6b.json") else {
-        return;
-    };
+    let goldens = load_fixture("qwen3_embedding_0_6b.json");
 
     let qwen_model_dir =
         PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/qwen3-embedding-0.6b");
     if !qwen_model_dir.join("model.safetensors").exists() {
-        eprintln!(
-            "SKIP qwen3_embedding_0_6b_parity_vs_hf: model weights not found at {}",
-            qwen_model_dir.display()
-        );
+        record_vector_weight_skip("qwen3_embedding_0_6b_parity_vs_hf", &qwen_model_dir);
         return;
     }
 
@@ -499,10 +488,10 @@ async fn qwen3_embedding_0_6b_parity_vs_hf() {
         min_cos = min_cos.min(cos);
         max_diff = max_diff.max(diff);
 
-        if cos < COS_SIM_MIN_QWEN {
+        if cos < COS_SIM_MIN_QWEN || diff > MAX_ABS_DIFF_QWEN {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [qwen3-0.6b] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_QWEN})\n  max_abs_diff={diff:.2e}\n  pooling={}",
+                "PARITY FAIL [qwen3-0.6b] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_QWEN})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_QWEN})\n  pooling={}",
                 golden.input, cos, golden.pooling,
             );
         } else {
