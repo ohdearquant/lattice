@@ -448,7 +448,7 @@ mod attention_kind_tests {
             head_dim: 128,
         };
         let kind = AttentionKind::Gqa(cfg);
-        let cloned = kind.clone();
+        let cloned = kind;
         assert_eq!(cloned.name(), "gqa");
         if let AttentionKind::Gqa(c) = cloned {
             assert_eq!(c.num_heads, 32);
