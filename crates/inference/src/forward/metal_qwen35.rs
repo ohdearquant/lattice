@@ -3544,13 +3544,20 @@ kernel void moe_shared_gate_add(
             // ADR-064: runtime KV layout assertion (debug builds only).
             // Current layout is f32; update this when #154 migrates to f16.
             #[cfg(debug_assertions)]
-            {
+            if num_full_layers > 0 {
                 let expected_bytes = max_cache_len * kv_dim * std::mem::size_of::<f32>();
-                debug_assert_eq!(
-                    cache.k_bufs[0].length() as usize,
-                    expected_bytes,
-                    "KV cache buffer size mismatch: expected f32 layout ({expected_bytes} bytes)"
-                );
+                for (i, (k, v)) in cache.k_bufs.iter().zip(cache.v_bufs.iter()).enumerate() {
+                    debug_assert_eq!(
+                        k.length() as usize,
+                        expected_bytes,
+                        "KV cache K[{i}] size mismatch: expected f32 layout ({expected_bytes} bytes)"
+                    );
+                    debug_assert_eq!(
+                        v.length() as usize,
+                        expected_bytes,
+                        "KV cache V[{i}] size mismatch: expected f32 layout ({expected_bytes} bytes)"
+                    );
+                }
             }
             cache
         }

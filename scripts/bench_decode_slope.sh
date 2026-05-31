@@ -10,7 +10,7 @@
 #   ./scripts/bench_decode_slope.sh              # default 5 runs, contexts 64-1024
 #   RUNS=3 ./scripts/bench_decode_slope.sh       # fewer runs (faster)
 #   CONTEXTS="64 256 512" ./scripts/bench_decode_slope.sh
-set -uo pipefail
+set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LAT_BIN="$REPO/target/release/bench_decode_ab"
@@ -18,10 +18,36 @@ Q8_DIR="$HOME/.lattice/models/qwen3.5-0.8b"
 RUNS="${RUNS:-5}"
 N1=8
 
+# Validate RUNS
+if ! [[ "$RUNS" =~ ^[0-9]+$ ]] || (( RUNS < 1 )); then
+    echo '{"error":"RUNS must be a positive integer"}'; exit 1
+fi
+
 if [[ -z "${CONTEXTS:-}" ]]; then
     CONTEXTS_ARR=(64 128 256 512 1024)
 else
     read -ra CONTEXTS_ARR <<< "$CONTEXTS"
+fi
+
+# Validate contexts: must be positive integers > N1, no duplicates
+declare -A SEEN_CTX=()
+VALID_CTX=()
+for CTX in "${CONTEXTS_ARR[@]}"; do
+    if ! [[ "$CTX" =~ ^[0-9]+$ ]] || (( CTX <= N1 )); then
+        >&2 echo "WARNING: skipping invalid context $CTX (must be integer > $N1)"
+        continue
+    fi
+    if [[ -n "${SEEN_CTX[$CTX]:-}" ]]; then
+        >&2 echo "WARNING: skipping duplicate context $CTX"
+        continue
+    fi
+    SEEN_CTX[$CTX]=1
+    VALID_CTX+=("$CTX")
+done
+CONTEXTS_ARR=("${VALID_CTX[@]}")
+if (( ${#CONTEXTS_ARR[@]} < 2 )); then
+    echo '{"error":"need at least 2 valid contexts (integers > '$N1')"}'
+    exit 1
 fi
 
 # Build if needed
@@ -60,7 +86,11 @@ for CTX in "${CONTEXTS_ARR[@]}"; do
         # Use ACTUAL completion tokens, not requested — model may hit EOS early
         ACTUAL_DELTA=$(( C2 - C1 ))
         if (( ACTUAL_DELTA > 0 )); then
-            PTM=$(echo "scale=6; ($T2 - $T1) / $ACTUAL_DELTA" | bc)
+            PTM=$(echo "scale=6; ($T2 - $T1) / $ACTUAL_DELTA" | bc) || true
+            if [[ -z "$PTM" || ! "$PTM" =~ ^-?[0-9] ]]; then
+                >&2 echo "  ctx=$CTX: bc failed (T2=$T2, T1=$T1, delta=$ACTUAL_DELTA), skipping"
+                continue
+            fi
             CTX_VALS+=("$C2")
             PTM_VALS+=("$PTM")
             >&2 echo "  ctx=$C2 (req=$CTX): T2=${T2}ms per_tok=${PTM}ms"
@@ -91,6 +121,7 @@ BEGIN {
         sx += x; sy += y; sxx += x*x; sxy += x*y
     }
     denom = n * sxx - sx * sx
+    if (denom == 0) { printf "{\"error\":\"degenerate input (all x identical)\"}\n"; exit }
     slope = (n * sxy - sx * sy) / denom
     intercept = (sy - slope * sx) / n
     # R-squared
@@ -119,16 +150,25 @@ BEGIN {
     printf "]}\n"
 }' /dev/null)
 
+# Validate output
+if [[ -z "$RESULT" ]]; then
+    echo '{"error":"regression calculation produced no output"}'
+    exit 1
+fi
+
 # Pretty print to stderr, raw JSON to stdout
 >&2 echo ""
 >&2 echo "=== Decode Slope Fit ==="
 >&2 echo "$RESULT" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
+if 'error' in d:
+    print(f\"  ERROR: {d['error']}\")
+    sys.exit(0)
 print(f\"  slope:     {d['slope_ms']:.6f} ms/ctx-token\")
 print(f\"  intercept: {d['intercept_ms']:.4f} ms\")
 print(f\"  R²:        {d['r_squared']:.6f}\")
 print(f\"  tok/s@64:  {d['tok_per_sec_64']:.1f}\")
-" 2>/dev/null
+" 2>/dev/null || true
 
 echo "$RESULT"
