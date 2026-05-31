@@ -98,7 +98,7 @@ fn test_pipeline_label_batch() {
 
     let results = pipeline.label_batch(&raws);
     assert_eq!(results.len(), 5);
-    assert!(results.iter().all(|r| r.is_success()));
+    assert!(results.iter().all(super::types::LabelingResult::is_success));
 }
 
 #[test]

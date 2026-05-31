@@ -1038,7 +1038,7 @@ mod tests {
     fn synthetic_spec_vocab() -> String {
         let max_id = 16_515usize;
         let mut tokens = (0..=max_id)
-            .map(|i| format!("[unused{}]", i))
+            .map(|i| format!("[unused{i}]"))
             .collect::<Vec<_>>();
 
         let entries = [

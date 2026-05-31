@@ -1710,9 +1710,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_long_text_bench() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
         // Warmup
@@ -1733,9 +1732,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_multilingual() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
 
@@ -1778,9 +1776,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_encode_real_model() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
 
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();

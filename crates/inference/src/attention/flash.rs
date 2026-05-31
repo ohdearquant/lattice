@@ -1407,8 +1407,7 @@ mod tests {
 
                 let speedup = mat_ns / tiled_ns;
                 eprintln!(
-                    "{:30} {:>6} {:>10.0} ns {:>10.0} ns {:>7.2}x",
-                    label, seq_len, mat_ns, tiled_ns, speedup
+                    "{label:30} {seq_len:>6} {mat_ns:>10.0} ns {tiled_ns:>10.0} ns {speedup:>7.2}x"
                 );
             }
         }

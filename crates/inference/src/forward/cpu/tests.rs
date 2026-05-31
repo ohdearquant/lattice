@@ -169,11 +169,7 @@ fn test_fast_tanh_precision() {
         let abs_err = (actual - expected).abs();
         assert!(
             abs_err < 4e-5,
-            "fast_tanh({}) = {}, expected {}, abs_err = {} (exceeds 4e-5 in core)",
-            x,
-            actual,
-            expected,
-            abs_err,
+            "fast_tanh({x}) = {actual}, expected {expected}, abs_err = {abs_err} (exceeds 4e-5 in core)",
         );
     }
 
@@ -183,11 +179,7 @@ fn test_fast_tanh_precision() {
         let abs_err = (actual - expected).abs();
         assert!(
             abs_err < 2e-4,
-            "fast_tanh({}) = {}, expected {}, abs_err = {} (exceeds 2e-4 in tail)",
-            x,
-            actual,
-            expected,
-            abs_err,
+            "fast_tanh({x}) = {actual}, expected {expected}, abs_err = {abs_err} (exceeds 2e-4 in tail)",
         );
     }
 }
@@ -266,11 +258,7 @@ fn test_fast_exp_accuracy() {
         let rel_err = ((actual - expected) / expected).abs();
         assert!(
             rel_err < 0.08,
-            "fast_exp({}) = {}, expected {}, rel_err = {}",
-            x,
-            actual,
-            expected,
-            rel_err
+            "fast_exp({x}) = {actual}, expected {expected}, rel_err = {rel_err}"
         );
     }
 }

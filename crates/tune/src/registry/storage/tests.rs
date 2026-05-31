@@ -517,7 +517,7 @@ mod sqlite_tests {
                     Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
                 })
                 .unwrap()
-                .filter_map(|r| r.ok())
+                .filter_map(std::result::Result::ok)
                 .filter(|(name, _)| name == "registered_at" || name == "updated_at")
                 .collect();
 

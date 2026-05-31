@@ -772,7 +772,7 @@ pub fn compile(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::pda::{GrammarState, SimResult, StepResult, advance_byte, simulate_token};
+    use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
 
     fn compile_ok(schema_json: &str) -> CompiledGrammar {
         let v: Value = serde_json::from_str(schema_json).unwrap();

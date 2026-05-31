@@ -1801,7 +1801,7 @@ mod tests {
     }
 
     fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
-        let byte_len = values.len() * std::mem::size_of::<f32>();
+        let byte_len = std::mem::size_of_val(values);
         let header = format!(
             r#"{{"{name}":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{byte_len}]}}}}"#,
             values.len()
@@ -1970,8 +1970,7 @@ mod tests {
     ) {
         let bias_end = weight_end + 4; // one f32
         let header = format!(
-            r#"{{"classifier.weight":{{{},"data_offsets":[0,{weight_end}]}},"classifier.bias":{{"dtype":"F32","shape":[1],"data_offsets":[{weight_end},{bias_end}]}}}}"#,
-            weight_shape_header
+            r#"{{"classifier.weight":{{{weight_shape_header},"data_offsets":[0,{weight_end}]}},"classifier.bias":{{"dtype":"F32","shape":[1],"data_offsets":[{weight_end},{bias_end}]}}}}"#
         );
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());

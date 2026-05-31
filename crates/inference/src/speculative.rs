@@ -2752,7 +2752,7 @@ mod tests {
             &[2u32],
             &[draft_logit],
             &target_logit,
-            &[target_logit.clone()],
+            std::slice::from_ref(&target_logit),
             false,
             Some(99),
         )

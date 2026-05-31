@@ -55,12 +55,14 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 }
 
+#[allow(dead_code)]
 struct AllocationSnapshot {
     alloc_calls: u64,
     realloc_calls: u64,
     bytes_allocated: u64,
 }
 
+#[allow(dead_code)]
 impl AllocationSnapshot {
     fn capture() -> Self {
         Self {
@@ -80,6 +82,7 @@ impl AllocationSnapshot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 struct AllocationDelta {
     alloc_calls: u64,
     realloc_calls: u64,
@@ -95,9 +98,7 @@ use lattice_inference::forward::cpu::{elementwise_mul, rms_norm, silu_inplace};
 use lattice_inference::forward::neon::{
     matmul_q8_neon, matvec_q8_scalar, pack_weights_q8, quantize_vec_q8,
 };
-use lattice_inference::kv_cache::{
-    EvictionPolicy, FlatKVCache, FlatKVCacheConfig, PagedKVCache, PagedKVCacheConfig,
-};
+use lattice_inference::kv_cache::{EvictionPolicy, PagedKVCache, PagedKVCacheConfig};
 #[cfg(feature = "bench-internals")]
 use lattice_inference::rope::RopeTable;
 use lattice_inference::sampling::{Sampler, SamplingConfig};
@@ -769,6 +770,7 @@ fn bench_q8_neon_forward(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 // Print allocation counts without asserting zero — use for "before" snapshots.
+#[allow(dead_code)]
 fn allocation_count_print(
     label: &str,
     phase: &str,
@@ -810,6 +812,7 @@ fn allocation_count_print(
     );
 }
 
+#[allow(dead_code)]
 fn allocation_count_report(
     label: &str,
     phase: &str,
@@ -986,16 +989,13 @@ fn bench_logits_projection(c: &mut Criterion) {
     let hidden = rand_f32_vec(LOGITS_HIDDEN, 0xC0DE_2048);
 
     // ~1.94 GiB weight matrix; skip gracefully if OOM
-    let weight = match try_rand_f32_vec(LOGITS_VOCAB * LOGITS_HIDDEN, 0xC0DE_0001) {
-        Some(w) => w,
-        None => {
-            eprintln!(
-                "[bench_logits_projection] Cannot allocate {:.1} GiB weight matrix — skip",
-                (LOGITS_VOCAB * LOGITS_HIDDEN * 4) as f64 / (1u64 << 30) as f64
-            );
-            group.finish();
-            return;
-        }
+    let Some(weight) = try_rand_f32_vec(LOGITS_VOCAB * LOGITS_HIDDEN, 0xC0DE_0001) else {
+        eprintln!(
+            "[bench_logits_projection] Cannot allocate {:.1} GiB weight matrix — skip",
+            (LOGITS_VOCAB * LOGITS_HIDDEN * 4) as f64 / (1u64 << 30) as f64
+        );
+        group.finish();
+        return;
     };
 
     let mut out = vec![0.0f32; LOGITS_VOCAB];
@@ -1055,18 +1055,31 @@ fn bench_logits_projection(c: &mut Criterion) {
 //     --bench inference_perf -- generate_forward_with_cache
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 const FWD_VOCAB: usize = 248_320;
+#[allow(dead_code)]
 const FWD_HIDDEN: usize = 2_048;
+#[allow(dead_code)]
 const FWD_LAYERS: usize = 24;
+#[allow(dead_code)]
 const FWD_N_HEADS: usize = 8;
+#[allow(dead_code)]
 const FWD_N_KV_HEADS: usize = 2;
+#[allow(dead_code)]
 const FWD_HEAD_DIM: usize = 256;
+#[allow(dead_code)]
 const FWD_INTER: usize = 6_144;
+#[allow(dead_code)]
 const FWD_WARM_KV: usize = 128;
+#[allow(dead_code)]
 const FWD_Q_DIM: usize = FWD_N_HEADS * FWD_HEAD_DIM; // 2048
+#[allow(dead_code)]
 const FWD_KV_DIM: usize = FWD_N_KV_HEADS * FWD_HEAD_DIM; // 512
+#[allow(dead_code)]
 const FWD_QKV_DIM: usize = FWD_Q_DIM + 2 * FWD_KV_DIM; // 3072
+#[allow(dead_code)]
 const FWD_RMS_EPS: f32 = 1e-6;
+#[allow(dead_code)]
 const FWD_ROPE_THETA: f64 = 10_000_000.0;
 
 // Synthetic single-layer weights; one set shared across all FWD_LAYERS.
@@ -1829,8 +1842,11 @@ fn bench_forward_with_cache(c: &mut Criterion) {
 //   replace BenchMtpTarget and mock_mtp_decode_loop with the real types.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 const MOCK_MTP_VOCAB: usize = 8_192; // smaller than real (248 320) for <30 s
+#[allow(dead_code)]
 const MOCK_MTP_PROMPT_LEN: usize = 16;
+#[allow(dead_code)]
 const MOCK_MTP_GEN_TOKENS: usize = 64;
 
 // Deterministic forward: generates MOCK_MTP_VOCAB f32 logits.
