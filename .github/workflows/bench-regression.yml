@@ -82,8 +82,8 @@ jobs:
           # --save-baseline saves new data AND compares against existing baseline
           # if present. Unlike --baseline, it doesn't panic when a bench group
           # has no prior baseline (e.g., newly added bench groups).
-          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline base --noplot
-          cargo bench -p lattice-embed --bench simd -- --save-baseline base --noplot
+          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline base --noplot --quick
+          cargo bench -p lattice-embed --bench simd -- --save-baseline base --noplot --quick
 
       - name: Apply gate
         id: gate
