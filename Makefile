@@ -57,6 +57,12 @@ bench-gate:
 		cargo bench -p lattice-embed --bench simd -- --baseline base --noplot; \
 		python3 scripts/perf-bench-gate.py target/criterion "$$arch-local"
 
+# ADR-064: measure decode slope/intercept and output JSON.
+# Usage: make bench-decode                   (default 5 runs, ctx 64-1024)
+#        RUNS=3 make bench-decode            (faster)
+bench-decode:
+	./scripts/bench_decode_slope.sh
+
 # A/B benchmark across git refs. Uses worktree for base, leaves working tree untouched.
 # Usage: make bench-compare                     (origin/main vs HEAD)
 #        make bench-compare BASE=main HEAD=pr/x (explicit refs)
