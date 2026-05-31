@@ -205,6 +205,9 @@ harness = false
 
 [[bench]]
 name = "batch_throughput_bench"
+harness = false
+
+[[bench]]
 name = "metrics_bench"
 harness = false
 
