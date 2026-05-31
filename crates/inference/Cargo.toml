@@ -208,14 +208,6 @@ name = "metrics_bench"
 harness = false
 
 [[bench]]
-name = "kv_cache_f16_bench"
-harness = false
-
-[[bench]]
-name = "attention_dispatch_bench"
-harness = false
-
-[[bench]]
 name = "pruning_bench"
 harness = false
 

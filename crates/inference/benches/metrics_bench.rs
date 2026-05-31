@@ -1,12 +1,12 @@
-//! Criterion benchmarks for inference metrics infrastructure (ADR-061 Phase 1).
+//! Criterion benchmarks for inference metrics core (ADR-061 seed).
 //!
 //! Measures:
 //!   - [`OnlineSoftmaxEntropy`] throughput across seq-len sizes used in practice
 //!   - [`l2_norm`] throughput for hidden sizes used by Qwen3 (896) and LLaMA (4096)
-//!   - Naive entropy baseline (materialize softmax, then -Σ p log p) for overhead ratio
+//!   - Naive entropy baseline (materialize softmax + allocate, then -Σ p log p)
 //!
-//! The overhead ratio online_entropy_ns / naive_entropy_ns is reported via
-//! [`print_overhead_ratio`] after each paired bench group.
+//! The naive baseline includes Vec allocation cost. Compare Criterion group
+//! means directly for online vs materialized-softmax throughput.
 
 use std::time::Duration;
 
