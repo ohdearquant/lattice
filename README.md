@@ -7,269 +7,269 @@ Lower numbers are faster. Trend sparkline reads left → right (oldest → newes
 
 ## `aarch64-linux`
 
-Last update: **2026-05-31T03:06:12+00:00**, commit [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14)
+Last update: **2026-05-31T03:08:37+00:00**, commit [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9)
 
 | Bench | Trend (last 20) | Best | Latest | Δ from best |
 |---|---|---:|---:|---:|
-| `add_bias_gelu/4096` | ▄▂▁▆▂▁▁▂█▄▃▃ | 4.62µs | 4.62µs | +0.0% |
-| `add_bias_gelu/896` | ▂▁▁▁▆▁▁▅▁▁▁█ | 1.01µs | 1.02µs | +0.3% |
-| `binary_cosine_distance/binary/1024` | ▁▁▁▁▂▁▁▃▄█▂▁ | 10.8ns | 10.8ns | +0.0% |
-| `binary_cosine_distance/binary/1536` | ▁▅▅▃▃▃▃▇▂█▅▁ | 15.3ns | 15.3ns | +0.0% |
-| `binary_cosine_distance/binary/384` | ▄▂▂▄▄▃▄▅▆█▂▁ | 5.5ns | 5.5ns | +0.0% |
-| `binary_cosine_distance/binary/768` | ▄▄▃▄▃▁▂▇▅█▃▂ | 9.1ns | 9.1ns | +0.3% |
-| `binary_cosine_distance/float32_simd/1024` | ▁▃▂▁▁▆▆▇▃▆▂█ | 128.7ns | 129.6ns | +0.7% |
-| `binary_cosine_distance/float32_simd/1536` | ▆▅▆▄▆▁▁█▇▅▆▅ | 186.6ns | 186.8ns | +0.1% |
-| `binary_cosine_distance/float32_simd/384` | ▆█▅▄█▁▅█▆▇▆▆ | 59.4ns | 59.7ns | +0.4% |
-| `binary_cosine_distance/float32_simd/768` | ▃▃▃▆█▂▇▄▃▁▃▆ | 101.0ns | 101.2ns | +0.2% |
-| `elementwise_mul/4096` | ▇█▇▇█▇▇▄▄▄▂▁ | 369.6ns | 369.6ns | +0.0% |
-| `gelu/4096` | █▂▆▁▂▆▅▄▇▁▇▇ | 4.33µs | 4.33µs | +0.0% |
-| `gelu/896` | ▄▁▄▂▄▃▇▃█▁▃▄ | 948.0ns | 948.2ns | +0.0% |
-| `int4_cosine_distance/float32_simd/1024` | ▂▁▂▂▄▆▇▇▄▆▃█ | 128.6ns | 129.5ns | +0.7% |
-| `int4_cosine_distance/float32_simd/1536` | ▅▃▄▇▃▂▁█▅▃▃▄ | 186.6ns | 186.8ns | +0.1% |
-| `int4_cosine_distance/float32_simd/384` | ▆▆█▅▇▁▄▃▃▄▄▃ | 59.6ns | 59.7ns | +0.1% |
-| `int4_cosine_distance/float32_simd/768` | ▄▇▅█▃▁▆▂▇▃▅▆ | 101.0ns | 101.2ns | +0.2% |
-| `int4_cosine_distance/int4/1024` | ▆▇█▇█▇▇▆▅▆▆▁ | 123.7ns | 123.7ns | +0.0% |
-| `int4_cosine_distance/int4/1536` | ▄▆▇▆▄▇▇▆▆▅█▁ | 181.3ns | 181.3ns | +0.0% |
-| `int4_cosine_distance/int4/384` | ▄▅▅▄▅▁▅▆▅▇█▃ | 53.7ns | 53.9ns | +0.4% |
-| `int4_cosine_distance/int4/768` | ▆▅▆▅▇▇▇▄▇▄█▁ | 95.8ns | 95.8ns | +0.0% |
-| `int8_batch_cosine/float32_simd/10` | ▄▃▂▃▁▃▅▅█▇▄▂ | 571.2ns | 571.4ns | +0.0% |
-| `int8_batch_cosine/float32_simd/100` | ▃▁▃▄█▁▁▃▃▃▃▂ | 6.85µs | 6.86µs | +0.2% |
-| `int8_batch_cosine/float32_simd/1000` | █▅▁▂▁▆▇▄▅▅▁▃ | 86.53µs | 90.13µs | +4.2% |
-| `int8_batch_cosine/int8_loop/10` | ▅▅▅▇▇█▄▁▂▂▂▄ | 162.4ns | 164.1ns | +1.1% |
-| `int8_batch_cosine/int8_loop/100` | ▁▂▃██▂▃▂▂▃▄▂ | 1.71µs | 1.71µs | +0.2% |
-| `int8_batch_cosine/int8_loop/1000` | █▁▃▇▅▅▂▄▆▇▅▆ | 18.15µs | 20.79µs | +14.6% |
-| `int8_prepared_dot_product/per_call/1024` | ▄▅▃▃▄▄▅▃█▁▂▅ | 3.63µs | 3.64µs | +0.0% |
-| `int8_prepared_dot_product/per_call/127` | ▄▅▃▁▅██▂▄▁▃▄ | 467.3ns | 467.5ns | +0.0% |
-| `int8_prepared_dot_product/per_call/128` | ▂▂▁▂█▂▁▅▃▄▃▂ | 459.3ns | 459.4ns | +0.0% |
-| `int8_prepared_dot_product/per_call/129` | ▅▄▄▄▃▅▅▇▁▆▅█ | 466.3ns | 467.1ns | +0.2% |
-| `int8_prepared_dot_product/per_call/384` | ▆█▃▃▆▁▃▁▅▂▇▅ | 1.37µs | 1.37µs | +0.0% |
-| `int8_prepared_dot_product/per_call/768` | ▃▃▁▃▅▄▃▂█▁▇▃ | 2.73µs | 2.73µs | +0.0% |
-| `int8_prepared_dot_product/prepared/1024` | ▇█▅▄▆▆█▁▂▄▅▆ | 30.6ns | 31.1ns | +1.8% |
-| `int8_prepared_dot_product/prepared/127` | ▅▅▁▂▂▇▇▁▁▁▁█ | 12.0ns | 12.3ns | +2.1% |
-| `int8_prepared_dot_product/prepared/128` | ▃▃▁▁█▂▄▃▂▂▂▅ | 8.5ns | 8.7ns | +2.5% |
-| `int8_prepared_dot_product/prepared/129` | ▄▅▁▂▃▆▅▃▂▂▄█ | 9.0ns | 9.1ns | +1.7% |
-| `int8_prepared_dot_product/prepared/384` | █▇▅▄▆█▅▁▁▁▁▆ | 14.3ns | 14.8ns | +3.6% |
-| `int8_prepared_dot_product/prepared/768` | ▅▄▃▄▆▅█▄▆▃▁▆ | 24.2ns | 24.9ns | +2.9% |
-| `int8_quantization/quantize/1024` | ▄▃▃▂▁▆▅▁▂▁▁█ | 3.61µs | 3.61µs | +0.0% |
-| `int8_quantization/quantize/1536` | ▁▁▄▄▅▁▄▃█▃▄▄ | 5.43µs | 5.44µs | +0.1% |
-| `int8_quantization/quantize/384` | ▂▂▃▂▁▇█▆▄▃▅▄ | 1.35µs | 1.35µs | +0.0% |
-| `int8_quantization/quantize/768` | ▃▅▄▁▃▇█▄▄▂▃█ | 2.71µs | 2.71µs | +0.0% |
-| `int8_raw_dot_product/dot_product_i8/1024` | █▆▅▄▇▆▄▄▃▇▁▅ | 30.1ns | 30.5ns | +1.4% |
-| `int8_raw_dot_product/dot_product_i8/127` | ▁▂▂▄▂▆█▂▁▁▁█ | 11.7ns | 11.9ns | +1.5% |
-| `int8_raw_dot_product/dot_product_i8/128` | ▂▂▄▁▃▆█▁▆▁▂▇ | 8.1ns | 8.2ns | +1.6% |
-| `int8_raw_dot_product/dot_product_i8/129` | ▃▃▄█▃▆▅▂▅▂▁▇ | 8.5ns | 8.6ns | +1.3% |
-| `int8_raw_dot_product/dot_product_i8/384` | ▄▇▅▄▆█▄▁▁▁▁▅ | 13.8ns | 14.1ns | +2.1% |
-| `int8_raw_dot_product/dot_product_i8/768` | ▅▆▅▆▅██▁▆▁▃▅ | 23.6ns | 24.3ns | +2.9% |
-| `int8_raw_dot_product/dot_product_i8_raw/1024` | ▂▃▃▁▃▂▄▂█▆▃▃ | 28.0ns | 28.1ns | +0.2% |
-| `int8_raw_dot_product/dot_product_i8_raw/127` | ▆▇▂▁▇▇█▆█▇▆█ | 9.9ns | 10.1ns | +1.5% |
-| `int8_raw_dot_product/dot_product_i8_raw/128` | ▄▅▅▆▅▇▇▂▃▂▁█ | 6.4ns | 6.6ns | +2.5% |
-| `int8_raw_dot_product/dot_product_i8_raw/129` | ▂▂▃▃▂▅█▁▁▁▁▅ | 7.1ns | 7.2ns | +1.0% |
-| `int8_raw_dot_product/dot_product_i8_raw/384` | ▃▄▁▁█▁▁▃▅▃▃▂ | 12.4ns | 12.4ns | +0.1% |
-| `int8_raw_dot_product/dot_product_i8_raw/768` | ▂▄▁▂▄▄▂▂█▂▃▅ | 21.8ns | 22.0ns | +0.6% |
-| `int8_vs_float32_cosine/float32_simd/1024` | ▇▆█▅▁▄▅▆▇▆▄▇ | 128.5ns | 129.2ns | +0.6% |
-| `int8_vs_float32_cosine/float32_simd/1536` | ▁▂▂▁█▃▂▃▂▃▄▂ | 184.9ns | 185.0ns | +0.1% |
-| `int8_vs_float32_cosine/float32_simd/384` | ▁▃▃▃█▄▃▆▇▆▃▃ | 57.7ns | 58.0ns | +0.5% |
-| `int8_vs_float32_cosine/float32_simd/768` | ▃▂▁▂█▂▃▅▄▂▂▂ | 99.3ns | 99.6ns | +0.3% |
-| `int8_vs_float32_cosine/int8/1024` | ▄▅▂▇▂▇█▄▃▃▁▇ | 32.9ns | 33.6ns | +2.1% |
-| `int8_vs_float32_cosine/int8/1536` | ▆█▆▆█▆▇▁▃▅▂█ | 45.5ns | 46.1ns | +1.4% |
-| `int8_vs_float32_cosine/int8/384` | ▅▅▇▅█▇▇▄▁▁▃▆ | 15.7ns | 16.4ns | +4.9% |
-| `int8_vs_float32_cosine/int8/768` | ▆█▆▃▆▅▅▆▂▁▁▃ | 26.5ns | 26.8ns | +1.0% |
-| `layer_norm/4096` | ▂▃█▃▅▁▁▅▃▆▅█ | 1.27µs | 1.28µs | +0.8% |
-| `layer_norm/896` | ▇▅▅▆▆▂▁▇▇▆██ | 288.0ns | 289.7ns | +0.6% |
-| `memory_size/search_1000_float32` | ▃▁▁▂▁▁▂█▃▃▁▃ | 56.90µs | 57.29µs | +0.7% |
-| `memory_size/search_1000_int8` | ▆▃▅▃▄▄▄▃▁█▄▅ | 14.63µs | 15.27µs | +4.4% |
-| `rms_norm/4096` | ▂▂▂▁▁▂▂▇██▇▇ | 572.9ns | 580.9ns | +1.4% |
-| `rms_norm/896` | ▂▇▄▃▇▁▃▅▄▄█▃ | 136.2ns | 136.6ns | +0.3% |
-| `silu_inplace/4096` | ▄▅▄▃▅▅█▂▅▁▆▄ | 4.91µs | 4.91µs | +0.0% |
-| `silu_inplace/896` | ▄▄▄▃▆█▄▁▃▂▂▄ | 1.07µs | 1.08µs | +0.0% |
-| `simd_batch_cosine/scalar_loop/10` | ▅▇▃▂▅█▇▆▇▆▆▁ | 6.38µs | 6.38µs | +0.0% |
-| `simd_batch_cosine/scalar_loop/100` | ▂▂▇▄█▃▆▅▇▆█▁ | 63.90µs | 63.90µs | +0.0% |
-| `simd_batch_cosine/scalar_loop/1000` | ▆▁▂▃▆▄▆▅█▆▄▃ | 643.56µs | 644.86µs | +0.2% |
-| `simd_batch_cosine/simd_batch/10` | ▂▁▂▂▁▅▅▆█▇▂▆ | 575.0ns | 576.4ns | +0.2% |
-| `simd_batch_cosine/simd_batch/100` | ▃▂▂▂█▂▂▂▁▃▃▂ | 6.89µs | 6.90µs | +0.2% |
-| `simd_batch_cosine/simd_batch/1000` | █▂▁▄▃▇█▂▆▅▂▂ | 85.93µs | 86.54µs | +0.7% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c` | ▅▁▆▆▂▆▇█▇▅▁█ | 143.76µs | 146.00µs | +1.6% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c` | ▆▃▅▁█▅█▃▅▄▃▅ | 2.08µs | 2.10µs | +1.0% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c` | ▄▃▃▃▅▂▃▁█▅▁▁ | 35.51µs | 35.51µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c` | ▅▃▅▃▅██▂▆▂▁▃ | 520.7ns | 521.1ns | +0.1% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c` | ▄▁▄▁█▂▄▂▃▁▃▃ | 8.27µs | 8.29µs | +0.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c` | ▅▃▂▁▄▅▁▂▃▃▃█ | 58.11µs | 58.75µs | +1.1% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c` | ▁▂▂▂▁█▄▁▂▂▂▃ | 921.9ns | 925.3ns | +0.4% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c` | ▁▁▄▁█▁▁▂▅▁▄▃ | 14.77µs | 14.99µs | +1.5% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c` | ▅▂▄▂▃▃█▁▂▁▂▃ | 237.1ns | 237.9ns | +0.4% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c` | ▆▄▅▂▇██▂▃▁▅▆ | 3.71µs | 3.75µs | +0.9% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c` | ▅▅▆▁▁▆█▇█▅▁▆ | 105.24µs | 106.73µs | +1.4% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c` | ▄▆▅▃▆█▃▁▁▂██ | 1.62µs | 1.63µs | +1.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c` | ▄▆▄▁▅█▃▅▇█▆▆ | 27.16µs | 29.27µs | +7.8% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c` | ▃▂▅▄▄▄█▁▃▃▃▄ | 406.6ns | 407.5ns | +0.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c` | ▃▁▂▂█▄█▃▃▃█▅ | 6.45µs | 6.47µs | +0.2% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c` | ▄▂▅▅▂█▇▇▆▄▁▅ | 143.83µs | 145.39µs | +1.1% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c` | ▅▃▅▁▆▄█▄▄▄▆▅ | 2.07µs | 2.10µs | +1.1% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c` | █▃▄▄▅▃▄▁█▆▄▁ | 35.44µs | 35.44µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c` | ▄▄▃▁▅▇▁▃█▅▄▅ | 517.9ns | 518.7ns | +0.1% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c` | ▅▁▃▃█▁▄▃▄▃▄▄ | 8.24µs | 8.26µs | +0.3% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c` | ▃▆▂▁▂▆▂▁▅▄▆█ | 57.54µs | 58.36µs | +1.4% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c` | ▂▁▃▁▁█▃▂▃▃▃▅ | 914.7ns | 921.8ns | +0.8% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c` | ▄▁▄▁█▂▂▁▅▂▃▃ | 14.60µs | 14.87µs | +1.9% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c` | ▂▂▁▂▃▃▆▂▅▅▅█ | 234.9ns | 236.1ns | +0.5% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c` | ▆▃▅▁█▇█▃▄▂▆█ | 3.69µs | 3.72µs | +0.9% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c` | ▅▆▆▁▁▇█▇█▆▁▆ | 105.75µs | 106.98µs | +1.2% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c` | ▅▅█▄▇█▄▁▃██▆ | 1.60µs | 1.62µs | +1.1% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c` | ▄▇▅▁▅▇▃▄▇█▆▇ | 26.87µs | 29.22µs | +8.7% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c` | ▂▁▁▃▂█▂▁▂▂▃▃ | 404.7ns | 405.5ns | +0.2% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c` | ▃▁▃▂█▄▆▃▃▂█▄ | 6.43µs | 6.44µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | ▅▅▆▇▅▆▅█▄▄▁▁ | 143.55µs | 143.58µs | +0.0% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c` | ▅▅▇▄▅█▅▁▃▃▃▅ | 2.07µs | 2.09µs | +1.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c` | ▅▂▂▆▄▃▁▃█▂▂▃ | 35.14µs | 36.62µs | +4.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c` | ▄▃▃▃▄█▄▂▄▁▁▃ | 518.8ns | 519.7ns | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c` | ▄▄▇▁█▂▆▅▅▁█▆ | 8.23µs | 8.26µs | +0.4% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c` | ▃▁▁▄▂▆▅▃▅▅▆█ | 57.77µs | 58.30µs | +0.9% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c` | ▂▁▂▁▁▂▂▅▂▁█▃ | 920.1ns | 923.0ns | +0.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c` | ▁▁▁▁▇▁▁▂█▁▂▁ | 14.71µs | 14.74µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c` | ▆▄▅█▂▁▇▂▆▁▁▆ | 236.9ns | 237.6ns | +0.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c` | ▅▁▄▂▇█▅▅▅▁▆▂ | 3.70µs | 3.70µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c` | ▃▁▆▆█▂▄▆▇▁█▅ | 104.91µs | 106.47µs | +1.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c` | ▃▃▁▂▅▃▁█▁▁▂▄ | 1.60µs | 1.61µs | +0.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c` | ▃▂▂▁█▂▅▁▇▇▆█ | 28.20µs | 30.07µs | +6.6% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c` | ▆▅▅█▇▅▇▄▆▁█▆ | 403.5ns | 404.4ns | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c` | ▄▃▃▃▆▆▅█▇▁▆▁ | 6.40µs | 6.40µs | +0.0% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c` | ▃▂▁▁▅▃▁▂▃▁▂█ | 95.67µs | 97.65µs | +2.1% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c` | ▅█▇▄▇▇▅▁▆▃▅▅ | 1.33µs | 1.43µs | +7.6% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c` | ▇▃▂██▃▁▄█▅▄▁ | 26.53µs | 26.57µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c` | ▃▃▂▂▂▇█▂▃▃▁▂ | 296.2ns | 297.2ns | +0.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c` | ▂▂▃▂▅▅▆▂▂▁█▂ | 6.05µs | 6.06µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c` | ▃▃▁▅▃▄▅▃▇▅▆█ | 37.67µs | 38.70µs | +2.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c` | ▃▃▃▃▁▁▂▄▂▃█▅ | 486.8ns | 510.2ns | +4.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c` | ▁▁▁▁▇▁▁▂█▁▂▂ | 9.56µs | 9.63µs | +0.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c` | ▄▃▃▂▃▂▃█▁▄▂▄ | 131.5ns | 135.0ns | +2.6% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c` | ▃▂▂▁▆▅▃▃▃▂█▁ | 2.43µs | 2.43µs | +0.1% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c` | ▂▂▁▂█▁▂▄▂▃▂▄ | 72.36µs | 73.83µs | +2.0% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c` | ▅▃▁▃▄▆▂█▁▃▄▃ | 952.2ns | 978.1ns | +2.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c` | ▂▂▃▁██▅▂▆▆▅▇ | 21.01µs | 22.83µs | +8.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c` | ▆▂▃▂▅▂▃█▁▂▄▃ | 230.0ns | 233.7ns | +1.6% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c` | ▂▄▁▁▃▂▂█▂▁▃▂ | 4.59µs | 4.61µs | +0.3% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c` | ▅▆▆▇▆▆▅█▄▅▁▁ | 143.48µs | 143.56µs | +0.1% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c` | ▆▅▆▂▅█▄▃▁▅▄▄ | 2.07µs | 2.08µs | +0.8% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c` | ▆▂▁▄▃▁▁▁█▃▂▃ | 35.44µs | 36.68µs | +3.5% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c` | ▂▁▁▁▂█▂▃▃▃▃▄ | 515.8ns | 517.2ns | +0.3% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c` | ▃▃▅▃█▆▇▅▅▁▇▇ | 8.20µs | 8.22µs | +0.4% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c` | ▄▂▁▄▂▅▅▄▆▄▆█ | 57.13µs | 57.82µs | +1.2% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_16c` | ▁▂▁▂▁▂▂▃▂▂█▃ | 913.0ns | 919.7ns | +0.7% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_256c` | ▁▁▁▁▆▁▁▂█▁▃▂ | 14.56µs | 14.62µs | +0.5% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_4c` | ▂▂▁▃▂▂▃▄▅▄▄█ | 234.6ns | 236.1ns | +0.6% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_64c` | ▃▂▂▁▆▆▄▄▄▂█▃ | 3.67µs | 3.68µs | +0.2% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c` | ▄▁▆▇█▂▄▆▇▂▇▅ | 105.30µs | 106.66µs | +1.3% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_16c` | ▃▂▁▂▅▇▂█▃▂▄▄ | 1.60µs | 1.61µs | +1.1% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_256c` | ▃▂▂▁▆▂▄▂▆█▆▇ | 28.18µs | 29.81µs | +5.8% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_4c` | ▃▂▂▂█▂▁▄▃▃▄▅ | 401.4ns | 403.2ns | +0.4% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_64c` | ▂▁▁▂▆▃▄▇▇▃█▃ | 6.37µs | 6.38µs | +0.1% |
-| `simd_batch_dot_product/scalar_loop/10` | ▁▂█▂▂▁▆▁▁▂▁▁ | 2.14µs | 2.14µs | +0.0% |
-| `simd_batch_dot_product/scalar_loop/100` | ▄▅▂▆▃▅▁▄█▃▂▅ | 21.35µs | 21.47µs | +0.5% |
-| `simd_batch_dot_product/scalar_loop/1000` | █▅▃▅▂▇▁▇▆▂▃█ | 218.51µs | 221.18µs | +1.2% |
-| `simd_batch_dot_product/simd_batch/10` | ▇▆▆▅█▆▁▃▆▅▇▆ | 316.0ns | 337.7ns | +6.9% |
-| `simd_batch_dot_product/simd_batch/100` | ▂▂▂▂▂▁▁▂█▁▁▂ | 5.62µs | 5.72µs | +1.8% |
-| `simd_batch_dot_product/simd_batch/1000` | ▆▃▄▄▁▇▁█▇▂▂▆ | 83.52µs | 90.89µs | +8.8% |
-| `simd_cosine_similarity/scalar/1024` | ▅▃▃▁█▂▂▁▄▃▂▂ | 1.77µs | 1.77µs | +0.0% |
-| `simd_cosine_similarity/scalar/1536` | ▂▂▃▃█▂▃▂▂▁▂▂ | 2.68µs | 2.68µs | +0.1% |
-| `simd_cosine_similarity/scalar/384` | ▄▄▃▁█▁▃▅▆▅▄▃ | 639.3ns | 641.6ns | +0.4% |
-| `simd_cosine_similarity/scalar/768` | ▂▂▁▁█▃▂▂▃▃▂▁ | 1.32µs | 1.32µs | +0.0% |
-| `simd_cosine_similarity/simd/1024` | ▇█▆▆▃▆▅▃▂▁▁▄ | 129.7ns | 130.1ns | +0.3% |
-| `simd_cosine_similarity/simd/1536` | ▂▁▁▂█▃▃▂▃▂▃█ | 185.1ns | 185.9ns | +0.4% |
-| `simd_cosine_similarity/simd/384` | ▄▁▄▄█▃▄▄▄▆▄▅ | 57.6ns | 58.2ns | +1.0% |
-| `simd_cosine_similarity/simd/768` | ▄▂▁▃▇▃▃▅▅█▆▅ | 100.1ns | 100.7ns | +0.6% |
-| `simd_dot_product/scalar/1024` | ▃▆▆▄▇▇▅▁▄▃▄█ | 593.0ns | 593.4ns | +0.1% |
-| `simd_dot_product/scalar/1536` | ▄▂▅▂█▇▂▁▂▁▂▂ | 892.3ns | 892.3ns | +0.0% |
-| `simd_dot_product/scalar/384` | ▃▂▇█▅▄▂▁▇▃▄▄ | 213.0ns | 213.1ns | +0.0% |
-| `simd_dot_product/scalar/768` | █▂▅▅▆▅▃▄▆▄▁▅ | 439.4ns | 439.6ns | +0.0% |
-| `simd_dot_product/simd/1024` | ▁▃▂▂▂▄▂▂▁▂▃█ | 73.4ns | 74.2ns | +1.1% |
-| `simd_dot_product/simd/1536` | ▁█▁▃▁█▇█▇█▇▇ | 101.6ns | 105.8ns | +4.1% |
-| `simd_dot_product/simd/384` | ▄▄▆▅▃▅▁▂▂▄▁█ | 31.5ns | 31.7ns | +0.7% |
-| `simd_dot_product/simd/768` | ▂▂▂▂▅▃▄▅▄▁▄█ | 54.3ns | 59.4ns | +9.3% |
-| `simd_euclidean_distance/scalar/1024` | ▁▁▁▆▂█▁▁▁▁▁▁ | 595.3ns | 595.7ns | +0.1% |
-| `simd_euclidean_distance/scalar/1536` | ▂▂▂█▂█▁▂▂▂▃▃ | 895.6ns | 896.0ns | +0.1% |
-| `simd_euclidean_distance/scalar/384` | ▂▃▁▅▃█▃▂▃▂▂▂ | 216.7ns | 217.0ns | +0.2% |
-| `simd_euclidean_distance/scalar/768` | ▂▂▁▇▁█▂▂▁▃▂▁ | 443.1ns | 443.2ns | +0.0% |
-| `simd_euclidean_distance/simd/1024` | ▇▆▄▄▅█▆▄▅▁▅▅ | 116.7ns | 117.1ns | +0.3% |
-| `simd_euclidean_distance/simd/1536` | ▄▂▅▄█▁▆▅▇▇▇▆ | 170.6ns | 171.1ns | +0.3% |
-| `simd_euclidean_distance/simd/384` | ▁▂▆▂█▃██████ | 48.4ns | 49.1ns | +1.4% |
-| `simd_euclidean_distance/simd/768` | ▅▁▇▄▇▂▇▆▇▇▅█ | 89.0ns | 89.8ns | +0.9% |
-| `simd_normalize/scalar/1024` | ▅▆▁▂▂▃▆▅█▆▅▇ | 681.2ns | 686.1ns | +0.7% |
-| `simd_normalize/scalar/1536` | ▄▄▁▁▁▂▅▅█▄▄▆ | 1.02µs | 1.02µs | +0.8% |
-| `simd_normalize/scalar/384` | ▂▃▂▁▂▂▃▁█▁▂▂ | 264.5ns | 265.3ns | +0.3% |
-| `simd_normalize/scalar/768` | ▅▆▂▁▂▅▆▅█▄▅▆ | 513.5ns | 517.1ns | +0.7% |
-| `simd_normalize/simd/1024` | ▁▁▁▁▂▁▆▂█▁▂▁ | 150.0ns | 150.6ns | +0.4% |
-| `simd_normalize/simd/1536` | ▂▁▁▁▃█▂▂█▂▂▂ | 218.1ns | 221.8ns | +1.7% |
-| `simd_normalize/simd/384` | ▂▂▁▁▂▂▃▂█▁▁▁ | 67.2ns | 67.5ns | +0.3% |
-| `simd_normalize/simd/768` | ▂▂▁▁▂▁▂▂█▂▂▂ | 116.1ns | 117.3ns | +1.1% |
-| `simd_normalized_cosine_fast_path/cosine_full/1024` | █▁▃▄▁▃▃▅▅▆▂▄ | 128.8ns | 129.0ns | +0.2% |
-| `simd_normalized_cosine_fast_path/cosine_full/384` | ▁▁▁▁▄▁█▆▅▁▅▅ | 58.0ns | 58.8ns | +1.4% |
-| `simd_normalized_cosine_fast_path/cosine_full/768` | ▁▃▂▃█▃▂▅▃▃▁▆ | 99.2ns | 100.2ns | +1.0% |
-| `simd_normalized_cosine_fast_path/dot_product/1024` | █▄▅▅▁▅▅▂▅▅▁▅ | 70.0ns | 73.7ns | +5.3% |
-| `simd_normalized_cosine_fast_path/dot_product/384` | ▅▅▅▅▇▅▆▂▅▁█▄ | 30.6ns | 31.5ns | +2.7% |
-| `simd_normalized_cosine_fast_path/dot_product/768` | ▄▅█▅▁▆▅▇▆▂▁▃ | 54.0ns | 55.4ns | +2.5% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/1024` | ▃▁▇▆▄▄█▃█▃██ | 95.55µs | 96.40µs | +0.9% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/384` | ▃▂▁▃▂▃▂▁▃█▃▂ | 38.12µs | 38.46µs | +0.9% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/768` | ▃▂▅▃▃▆█▁▄▁▇▂ | 72.40µs | 72.47µs | +0.1% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | ▄▄▁▄▇▆█▆▁▄▃▅ | 144.57µs | 145.87µs | +0.9% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384` | ▃▂▁▄▄▂▃▄▅▃▄█ | 57.84µs | 58.39µs | +1.0% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768` | ▆▂▇▁▁▁▇██▁▇▄ | 105.98µs | 107.05µs | +1.0% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024` | ▂▁█▂▃▁▅▁▃▁▃▃ | 95.97µs | 96.68µs | +0.7% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384` | ▂▄▂▂▄▁▂▁▄▅█▃ | 39.05µs | 39.28µs | +0.6% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768` | ▂▁▅▃▃▇█▃█▄▅▁ | 73.13µs | 73.13µs | +0.0% |
-| `simd_query_batch_dot_product/pair_loop/128d_16c` | █▇█▅▇▃▆▆▃▆▁▅ | 215.9ns | 219.1ns | +1.5% |
-| `simd_query_batch_dot_product/pair_loop/128d_256c` | ▆▂▄▃▄▁▄█▂▃▁▂ | 3.77µs | 3.80µs | +1.0% |
-| `simd_query_batch_dot_product/pair_loop/128d_4c` | █▄▅▃▅▂▃▄▁▅▁▂ | 66.2ns | 66.4ns | +0.2% |
-| `simd_query_batch_dot_product/pair_loop/128d_64c` | █▃▄▄▅▄▁▃▄▃▁▃ | 814.7ns | 825.6ns | +1.3% |
-| `simd_query_batch_dot_product/pair_loop/384d_16c` | ▇▇▆█▂▄▆▃▁▅▁▃ | 483.1ns | 489.5ns | +1.3% |
-| `simd_query_batch_dot_product/pair_loop/384d_256c` | ▄▁▂▁▇▁▂▂█▁▅▆ | 9.52µs | 9.97µs | +4.8% |
-| `simd_query_batch_dot_product/pair_loop/384d_4c` | ▄▂▄▆▃▂▄█▂▂▁▆ | 132.8ns | 135.0ns | +1.7% |
-| `simd_query_batch_dot_product/pair_loop/384d_64c` | █▁▃▃▆▄▃▆▆▄▄▅ | 2.41µs | 2.45µs | +1.4% |
-| `simd_query_batch_dot_product/pair_loop/768d_16c` | ▃▃▃▃▅▂█▅▃▃▃▁ | 949.4ns | 949.4ns | +0.0% |
-| `simd_query_batch_dot_product/pair_loop/768d_256c` | ▆▂▅▄▆▇▁▄▇▇▆█ | 19.47µs | 22.66µs | +16.4% |
-| `simd_query_batch_dot_product/pair_loop/768d_4c` | █▂▆▂▅▃▃▆▂▃▁▃ | 230.1ns | 233.2ns | +1.3% |
-| `simd_query_batch_dot_product/pair_loop/768d_64c` | ▃█▂▁▄▃▂▄▄▁▃▄ | 4.58µs | 4.62µs | +0.9% |
-| `simd_query_batch_dot_product/simd_batch/128d_16c` | ▃▃▆▂▃▆█▇▆▆▄▁ | 137.3ns | 137.3ns | +0.0% |
-| `simd_query_batch_dot_product/simd_batch/128d_256c` | ▆▇▇▆▆▇▆█▆▇▁▆ | 2.98µs | 3.05µs | +2.3% |
-| `simd_query_batch_dot_product/simd_batch/128d_4c` | ▃▁▂▃▇▃▆█▅▇▅▂ | 46.0ns | 46.1ns | +0.2% |
-| `simd_query_batch_dot_product/simd_batch/128d_64c` | ▇▅▂▆▄▇▁█▇▅▃▇ | 504.6ns | 522.8ns | +3.6% |
-| `simd_query_batch_dot_product/simd_batch/384d_16c` | ▅▂▂▅▃▆█▅▆▅▃▁ | 325.0ns | 325.0ns | +0.0% |
-| `simd_query_batch_dot_product/simd_batch/384d_256c` | ▃▁▁▁█▂▃▁█▁▇▇ | 8.33µs | 8.81µs | +5.7% |
-| `simd_query_batch_dot_product/simd_batch/384d_4c` | ▄▁▂▃█▃▄▄▄▄▄▁ | 92.9ns | 92.9ns | +0.0% |
-| `simd_query_batch_dot_product/simd_batch/384d_64c` | █▅▅▄▇▁▅▅▅▆▄▅ | 2.06µs | 2.12µs | +2.7% |
-| `simd_query_batch_dot_product/simd_batch/768d_16c` | ▂▁▅▃▄▂█▄▂▄▄▃ | 624.5ns | 667.3ns | +6.9% |
-| `simd_query_batch_dot_product/simd_batch/768d_256c` | ▅▃▅▅▆▆▁▄▇█▇▇ | 16.48µs | 18.08µs | +9.7% |
-| `simd_query_batch_dot_product/simd_batch/768d_4c` | ▄▁▁▃▇▅▆▆▆▅█▁ | 163.8ns | 163.9ns | +0.1% |
-| `simd_query_batch_dot_product/simd_batch/768d_64c` | ▄▁▄▇█▃▆▇▇▄▇▃ | 3.75µs | 3.79µs | +1.1% |
-| `simd_squared_euclidean_fast_path/euclidean_full/1024` | █▄▆▁▄▆▅▁▄▄▁▅ | 116.8ns | 117.0ns | +0.1% |
-| `simd_squared_euclidean_fast_path/euclidean_full/384` | ▂▃▅▄█▁▆▅▄▆▄▅ | 48.2ns | 48.9ns | +1.5% |
-| `simd_squared_euclidean_fast_path/euclidean_full/768` | ▁▅▇▄▄▄█▆▇▅▅▆ | 89.0ns | 89.6ns | +0.6% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/1024` | ▄▂█▂▆▅▅▁▅▅▂▅ | 113.6ns | 113.8ns | +0.2% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/384` | ▂▃▂▃█▁▃▃▁▃▂▂ | 45.5ns | 45.7ns | +0.6% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/768` | ▁▇▇▆▁▆██▆▇▃▃ | 86.3ns | 86.4ns | +0.1% |
-| `simd_throughput_384/cosine_similarity` | ▁▃▂▄█▄▃▃▅▅▅▄ | 57.5ns | 58.1ns | +1.1% |
-| `simd_throughput_384/dot_product` | ▇█▁▃▃▆▃▃▃█▃▃ | 31.0ns | 31.7ns | +2.3% |
-| `simd_throughput_384/euclidean_distance` | ▁▁▅▂█▂███▆▇▇ | 48.4ns | 49.1ns | +1.3% |
-| `simd_throughput_384/normalize` | █▃▃▂▂▃▁▂█▁▄▂ | 112.1ns | 113.4ns | +1.1% |
-| `softmax_attention/128` | █▆▄▆▅▂▁▇▆▇▇▁ | 8.32µs | 8.32µs | +0.0% |
-| `softmax_attention/512` | █▅▁▄▄▅▄▃▅▁▃▆ | 126.40µs | 129.42µs | +2.4% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/10` | ▁ | 522.3ns | 522.3ns | +0.0% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/100` | ▁ | 5.03µs | 5.03µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/1000` | ▁ | 50.19µs | 50.19µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/10` | ▁ | 20.50µs | 20.50µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/100` | ▁ | 204.64µs | 204.64µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/1000` | ▁ | 2.05ms | 2.05ms | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/10` | ▁ | 171.8ns | 171.8ns | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/100` | ▁ | 1.55µs | 1.55µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/1000` | ▁ | 16.19µs | 16.19µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/10` | ▁ | 13.72µs | 13.72µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/100` | ▁ | 137.01µs | 137.01µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/1000` | ▁ | 1.37ms | 1.37ms | +0.0% |
-| `tier_prepared_query/binary_query_once_1000` | ▆▄▅▇▄▄▇▂▄▂▁█ | 7.37µs | 7.55µs | +2.4% |
-| `tier_prepared_query/binary_query_per_call_1000` | ▂▂▂▂▂▁▁▂▂▂▂█ | 962.48µs | 968.00µs | +0.6% |
-| `tier_prepared_query/int4_query_once_1000` | ▂▁▁▇▂▁█▂▂▁▁▆ | 51.09µs | 51.57µs | +0.9% |
-| `tier_prepared_query/int4_query_per_call_1000` | ▂▂▁▃▃██▂▆▁▂▄ | 2.06ms | 2.06ms | +0.0% |
-| `tier_prepared_query/int8_query_once_1000` | ▄▄▄█▅▇▅▄▅▅▅▁ | 17.35µs | 17.35µs | +0.0% |
-| `tier_prepared_query/int8_query_per_call_1000` | ▃▄▆█▇▇▅▁▅▃▄▆ | 1.37ms | 1.37ms | +0.1% |
+| `add_bias_gelu/4096` | ▄▂▁▆▂▁▁▂█▄▃▃▄ | 4.62µs | 4.62µs | +0.0% |
+| `add_bias_gelu/896` | ▂▁▁▁▆▁▁▅▁▁▁█▁ | 1.01µs | 1.01µs | +0.0% |
+| `binary_cosine_distance/binary/1024` | ▁▁▁▁▂▁▁▃▄█▂▁▇ | 10.8ns | 10.9ns | +1.1% |
+| `binary_cosine_distance/binary/1536` | ▁▅▅▃▃▃▃▇▂█▅▁▅ | 15.3ns | 15.3ns | +0.3% |
+| `binary_cosine_distance/binary/384` | ▄▂▂▄▄▃▄▅▆█▂▁▆ | 5.5ns | 5.5ns | +0.6% |
+| `binary_cosine_distance/binary/768` | ▄▄▃▄▃▁▂▇▅█▃▂▂ | 9.1ns | 9.1ns | +0.3% |
+| `binary_cosine_distance/float32_simd/1024` | ▁▃▂▁▁▆▆▇▃▆▂█▂ | 128.7ns | 128.9ns | +0.1% |
+| `binary_cosine_distance/float32_simd/1536` | ▆▅▆▄▆▁▁█▇▅▆▅▃ | 186.6ns | 186.7ns | +0.0% |
+| `binary_cosine_distance/float32_simd/384` | ▆█▅▄█▁▅█▆▇▆▆▆ | 59.4ns | 59.7ns | +0.5% |
+| `binary_cosine_distance/float32_simd/768` | ▃▃▃▆█▂▇▄▃▁▃▆▃ | 101.0ns | 101.1ns | +0.1% |
+| `elementwise_mul/4096` | ▇█▇▇█▇▇▄▄▄▂▁▂ | 369.6ns | 370.9ns | +0.4% |
+| `gelu/4096` | █▂▆▁▂▆▅▄▇▁▇▇▄ | 4.33µs | 4.33µs | +0.0% |
+| `gelu/896` | ▄▁▄▂▄▃▇▃█▁▃▄▃ | 948.0ns | 948.1ns | +0.0% |
+| `int4_cosine_distance/float32_simd/1024` | ▂▁▂▂▄▆▇▇▄▆▃█▂ | 128.6ns | 128.8ns | +0.1% |
+| `int4_cosine_distance/float32_simd/1536` | ▅▃▄▇▃▂▁█▅▃▃▄▄ | 186.6ns | 186.8ns | +0.1% |
+| `int4_cosine_distance/float32_simd/384` | ▆▆█▅▇▁▄▃▃▄▄▃▃ | 59.6ns | 59.7ns | +0.2% |
+| `int4_cosine_distance/float32_simd/768` | ▄▇▅█▃▁▆▂▇▃▅▆▃ | 101.0ns | 101.1ns | +0.1% |
+| `int4_cosine_distance/int4/1024` | ▆▇█▇██▇▆▅▆▆▂▁ | 123.4ns | 123.4ns | +0.0% |
+| `int4_cosine_distance/int4/1536` | ▅▆▇▇▅▇▇▇▆▆█▂▁ | 181.1ns | 181.1ns | +0.0% |
+| `int4_cosine_distance/int4/384` | ▄▅▅▄▅▁▅▆▅▇█▃▁ | 53.7ns | 53.8ns | +0.1% |
+| `int4_cosine_distance/int4/768` | ▆▆▆▆▇▇▇▅▇▅█▃▁ | 95.4ns | 95.4ns | +0.0% |
+| `int8_batch_cosine/float32_simd/10` | ▄▃▂▃▁▃▅▅█▇▄▂▃ | 571.2ns | 571.7ns | +0.1% |
+| `int8_batch_cosine/float32_simd/100` | ▃▁▃▄█▁▁▃▃▃▃▂▃ | 6.85µs | 6.90µs | +0.7% |
+| `int8_batch_cosine/float32_simd/1000` | █▅▁▂▁▆▇▄▅▅▁▃▄ | 86.53µs | 91.43µs | +5.7% |
+| `int8_batch_cosine/int8_loop/10` | ▅▅▅▇▇█▄▁▂▂▂▄▅ | 162.4ns | 164.6ns | +1.3% |
+| `int8_batch_cosine/int8_loop/100` | ▁▃▃██▂▃▃▂▃▄▂▁ | 1.71µs | 1.71µs | +0.0% |
+| `int8_batch_cosine/int8_loop/1000` | █▁▃▇▅▅▂▄▆▇▅▆▇ | 18.15µs | 21.07µs | +16.1% |
+| `int8_prepared_dot_product/per_call/1024` | ▄▅▃▃▄▄▅▃█▁▂▅▄ | 3.63µs | 3.64µs | +0.0% |
+| `int8_prepared_dot_product/per_call/127` | ▄▅▃▁▅██▂▄▁▃▄▆ | 467.3ns | 467.6ns | +0.1% |
+| `int8_prepared_dot_product/per_call/128` | ▂▂▁▂█▂▁▅▃▄▃▂▃ | 459.3ns | 459.5ns | +0.1% |
+| `int8_prepared_dot_product/per_call/129` | ▅▄▄▄▃▅▅▇▁▆▅██ | 466.3ns | 467.1ns | +0.2% |
+| `int8_prepared_dot_product/per_call/384` | ▆█▃▃▆▁▃▁▅▂▇▅▄ | 1.37µs | 1.37µs | +0.0% |
+| `int8_prepared_dot_product/per_call/768` | ▃▃▁▃▅▄▃▂█▁▇▃▅ | 2.73µs | 2.73µs | +0.0% |
+| `int8_prepared_dot_product/prepared/1024` | ▇█▅▄▆▆█▁▂▄▅▆▆ | 30.6ns | 31.1ns | +1.7% |
+| `int8_prepared_dot_product/prepared/127` | ▅▅▁▂▂▇▇▁▁▁▁██ | 12.0ns | 12.3ns | +2.1% |
+| `int8_prepared_dot_product/prepared/128` | ▃▃▁▁█▂▄▃▂▂▂▅▄ | 8.5ns | 8.6ns | +1.8% |
+| `int8_prepared_dot_product/prepared/129` | ▄▅▁▂▃▆▅▃▂▂▄█▅ | 9.0ns | 9.1ns | +1.1% |
+| `int8_prepared_dot_product/prepared/384` | █▇▅▄▆█▅▁▁▁▁▆▅ | 14.3ns | 14.7ns | +2.7% |
+| `int8_prepared_dot_product/prepared/768` | ▅▄▃▄▆▅█▄▆▃▁▆▅ | 24.2ns | 24.7ns | +2.4% |
+| `int8_quantization/quantize/1024` | ▄▃▃▂▁▆▅▁▂▁▁█▅ | 3.61µs | 3.61µs | +0.0% |
+| `int8_quantization/quantize/1536` | ▁▁▄▄▅▁▄▃█▃▃▄█ | 5.43µs | 5.45µs | +0.4% |
+| `int8_quantization/quantize/384` | ▂▂▃▂▁▇█▆▄▃▅▄▃ | 1.35µs | 1.35µs | +0.0% |
+| `int8_quantization/quantize/768` | ▃▅▃▁▃▆▇▄▄▂▃▇█ | 2.71µs | 2.71µs | +0.0% |
+| `int8_raw_dot_product/dot_product_i8/1024` | █▆▅▄▇▆▄▄▃▇▁▅▆ | 30.1ns | 30.6ns | +1.9% |
+| `int8_raw_dot_product/dot_product_i8/127` | ▁▂▂▄▂▆█▂▁▁▁█▇ | 11.7ns | 11.9ns | +1.4% |
+| `int8_raw_dot_product/dot_product_i8/128` | ▂▂▄▁▃▆█▁▆▁▂▇▁ | 8.1ns | 8.1ns | +0.0% |
+| `int8_raw_dot_product/dot_product_i8/129` | ▃▃▄█▃▆▅▂▅▂▁▇▄ | 8.5ns | 8.5ns | +0.8% |
+| `int8_raw_dot_product/dot_product_i8/384` | ▄▇▅▄▆█▄▁▁▁▁▅▄ | 13.8ns | 14.1ns | +1.7% |
+| `int8_raw_dot_product/dot_product_i8/768` | ▅▆▅▆▅██▁▆▁▃▅▅ | 23.6ns | 24.2ns | +2.6% |
+| `int8_raw_dot_product/dot_product_i8_raw/1024` | ▂▃▃▁▃▂▄▂█▆▃▃▄ | 28.0ns | 28.1ns | +0.3% |
+| `int8_raw_dot_product/dot_product_i8_raw/127` | ▆▇▂▁▇▇█▆█▇▆█▇ | 9.9ns | 10.1ns | +1.4% |
+| `int8_raw_dot_product/dot_product_i8_raw/128` | ▄▅▅▆▅▇▇▂▃▂▁██ | 6.4ns | 6.6ns | +2.5% |
+| `int8_raw_dot_product/dot_product_i8_raw/129` | ▂▂▃▃▂▅█▁▁▁▁▅▄ | 7.1ns | 7.2ns | +0.9% |
+| `int8_raw_dot_product/dot_product_i8_raw/384` | ▃▄▁▁█▁▁▃▅▃▃▂▁ | 12.4ns | 12.4ns | +0.0% |
+| `int8_raw_dot_product/dot_product_i8_raw/768` | ▂▄▁▂▄▄▂▂█▂▃▅▅ | 21.8ns | 21.9ns | +0.6% |
+| `int8_vs_float32_cosine/float32_simd/1024` | ▇▆█▅▁▄▅▆▇▆▄▇▇ | 128.5ns | 129.2ns | +0.6% |
+| `int8_vs_float32_cosine/float32_simd/1536` | ▁▂▂▁█▃▂▃▂▃▄▂▃ | 184.9ns | 185.1ns | +0.1% |
+| `int8_vs_float32_cosine/float32_simd/384` | ▁▃▃▃█▄▃▆▇▆▃▃▇ | 57.7ns | 58.6ns | +1.5% |
+| `int8_vs_float32_cosine/float32_simd/768` | ▃▂▁▂█▂▃▅▄▂▂▂▂ | 99.3ns | 99.5ns | +0.2% |
+| `int8_vs_float32_cosine/int8/1024` | ▄▅▂▇▂▇█▄▃▃▁▇▅ | 32.9ns | 33.3ns | +1.2% |
+| `int8_vs_float32_cosine/int8/1536` | ▆█▆▆█▆▇▁▃▅▂█▄ | 45.5ns | 45.8ns | +0.7% |
+| `int8_vs_float32_cosine/int8/384` | ▅▅▇▅█▇▇▄▁▁▃▆▅ | 15.7ns | 16.3ns | +4.2% |
+| `int8_vs_float32_cosine/int8/768` | ▅▇▅▃▅▅▄▅▂▁▁▃█ | 26.5ns | 27.3ns | +3.1% |
+| `layer_norm/4096` | ▂▃█▃▅▁▁▅▃▆▅█▆ | 1.27µs | 1.27µs | +0.6% |
+| `layer_norm/896` | ▇▅▅▆▆▂▁▇▇▆██▇ | 288.0ns | 289.5ns | +0.5% |
+| `memory_size/search_1000_float32` | ▃▁▁▂▁▁▂█▃▃▁▃▃ | 56.90µs | 57.43µs | +0.9% |
+| `memory_size/search_1000_int8` | ▆▃▅▃▄▄▄▃▁█▄▅▄ | 14.63µs | 15.05µs | +2.9% |
+| `rms_norm/4096` | ▂▂▂▁▁▂▂▇██▇▇▇ | 572.9ns | 580.6ns | +1.4% |
+| `rms_norm/896` | ▂▇▄▃▇▁▃▅▄▄█▃▅ | 136.2ns | 136.7ns | +0.4% |
+| `silu_inplace/4096` | ▄▅▄▃▅▅█▂▅▁▆▄▂ | 4.91µs | 4.91µs | +0.0% |
+| `silu_inplace/896` | ▄▄▄▃▆█▄▁▃▂▂▄▁ | 1.07µs | 1.07µs | +0.0% |
+| `simd_batch_cosine/scalar_loop/10` | ▅▇▃▂▅█▇▆▇▆▆▁▄ | 6.38µs | 6.39µs | +0.1% |
+| `simd_batch_cosine/scalar_loop/100` | ▂▂▇▄█▃▆▅▇▆█▁▂ | 63.90µs | 63.93µs | +0.0% |
+| `simd_batch_cosine/scalar_loop/1000` | ▆▁▂▃▆▄▆▅█▆▄▃▅ | 643.56µs | 646.20µs | +0.4% |
+| `simd_batch_cosine/simd_batch/10` | ▂▁▂▂▁▅▅▆█▇▂▆▅ | 575.0ns | 576.1ns | +0.2% |
+| `simd_batch_cosine/simd_batch/100` | ▄▃▃▃█▃▃▃▂▄▄▃▁ | 6.87µs | 6.87µs | +0.0% |
+| `simd_batch_cosine/simd_batch/1000` | █▂▁▄▃▇█▂▆▅▂▂▇ | 85.93µs | 92.80µs | +8.0% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c` | ▅▁▆▆▂▆▇█▇▅▁█▆ | 143.76µs | 145.55µs | +1.2% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c` | ▆▃▅▁█▅█▃▅▄▃▅▆ | 2.08µs | 2.10µs | +1.1% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c` | ▄▃▃▃▅▂▃▁█▅▁▁▆ | 35.51µs | 37.85µs | +6.6% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c` | ▅▃▅▃▅██▂▆▂▁▃▃ | 520.7ns | 521.2ns | +0.1% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c` | ▄▁▄▁█▂▄▂▃▁▃▃▃ | 8.27µs | 8.29µs | +0.2% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c` | ▅▃▂▁▄▅▁▂▃▃▃█▆ | 58.11µs | 58.56µs | +0.8% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c` | ▁▂▂▂▁█▄▁▂▂▂▃▂ | 921.9ns | 924.6ns | +0.3% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c` | ▁▁▄▁█▁▁▂▅▁▄▃▁ | 14.77µs | 14.79µs | +0.1% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c` | ▅▂▄▂▃▃█▁▂▁▂▃▃ | 237.1ns | 237.9ns | +0.3% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c` | ▆▄▅▂▇██▂▃▁▅▆▄ | 3.71µs | 3.73µs | +0.5% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c` | ▅▅▆▁▁▆█▇█▅▁▆▅ | 105.24µs | 106.48µs | +1.2% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c` | ▄▆▅▃▆█▃▁▁▂██▃ | 1.62µs | 1.62µs | +0.3% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c` | ▄▆▄▁▅▇▃▅▇█▆▆█ | 27.16µs | 29.99µs | +10.4% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c` | ▃▂▅▄▄▄█▁▃▃▃▄▄ | 406.6ns | 407.8ns | +0.3% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c` | ▃▁▂▂█▄█▃▃▃█▅▅ | 6.45µs | 6.47µs | +0.3% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c` | ▄▂▅▅▂█▇▇▆▄▁▅▅ | 143.83µs | 145.42µs | +1.1% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c` | ▅▃▅▁▆▄█▄▄▄▆▅▅ | 2.07µs | 2.10µs | +1.1% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c` | █▃▄▄▅▃▄▁█▆▄▁▅ | 35.44µs | 37.68µs | +6.3% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c` | ▄▄▃▁▅▇▁▃█▅▄▅▆ | 517.9ns | 519.0ns | +0.2% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c` | ▅▁▃▃█▁▄▃▄▃▄▄▄ | 8.24µs | 8.26µs | +0.3% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c` | ▃▆▂▁▂▆▂▁▅▄▆█▅ | 57.54µs | 57.95µs | +0.7% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c` | ▂▁▃▁▁█▃▂▃▃▃▅▃ | 914.7ns | 918.9ns | +0.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c` | ▄▁▄▁█▂▂▁▅▂▃▃▂ | 14.60µs | 14.68µs | +0.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c` | ▂▂▁▂▃▃▆▂▅▅▅█▆ | 234.9ns | 235.8ns | +0.4% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c` | ▆▃▅▁█▇█▃▄▂▆█▅ | 3.69µs | 3.71µs | +0.6% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c` | ▅▆▆▁▁▇█▇█▆▁▆▃ | 105.75µs | 106.28µs | +0.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c` | ▅▅█▄▇█▄▁▃██▆▆ | 1.60µs | 1.62µs | +1.1% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c` | ▄▇▅▁▅▇▃▄▇█▆▇█ | 26.87µs | 29.72µs | +10.6% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c` | ▂▁▁▃▂█▂▁▂▂▃▃▃ | 404.7ns | 405.8ns | +0.3% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c` | ▃▁▃▂█▄▆▃▃▂█▄▅ | 6.43µs | 6.45µs | +0.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | ▅▅▆▇▅▆▅█▄▄▁▁▆ | 143.55µs | 145.12µs | +1.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c` | ▅▅▇▄▅█▅▁▃▃▃▅▂ | 2.07µs | 2.07µs | +0.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c` | ▅▂▂▆▄▃▁▃█▂▂▃▄ | 35.14µs | 37.28µs | +6.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c` | ▄▃▃▃▄█▄▂▄▁▁▃▃ | 518.8ns | 519.7ns | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c` | ▄▄▇▁█▂▆▅▅▁█▆▄ | 8.23µs | 8.25µs | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c` | ▃▁▁▄▂▆▅▃▅▅▆██ | 57.77µs | 58.27µs | +0.9% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c` | ▂▁▂▁▁▂▂▅▂▁█▃▂ | 920.1ns | 921.5ns | +0.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c` | ▁▁▁▁▇▁▁▂█▁▂▁▁ | 14.71µs | 14.73µs | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c` | ▆▄▅█▂▁▇▂▆▁▁▆▄ | 236.9ns | 237.3ns | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c` | ▅▁▄▂▇█▅▅▅▁▆▂▆ | 3.70µs | 3.72µs | +0.7% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c` | ▃▁▆▆█▂▄▆▇▁█▅▇ | 104.91µs | 107.08µs | +2.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c` | ▃▃▁▂▅▃▁█▁▁▂▄▃ | 1.60µs | 1.61µs | +0.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c` | ▃▂▂▁█▂▅▁▇▇▆█▆ | 28.20µs | 29.52µs | +4.7% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c` | ▆▅▅█▇▅▇▄▆▁█▆▅ | 403.5ns | 404.2ns | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c` | ▄▃▂▃▅▅▅▇▇▁▆▁█ | 6.40µs | 6.44µs | +0.5% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c` | ▃▂▁▁▅▃▁▂▃▁▂█▄ | 95.67µs | 96.45µs | +0.8% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c` | ▅█▇▄▇▇▅▁▆▃▅▅▄ | 1.33µs | 1.42µs | +6.5% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c` | ▇▃▂▇▇▃▁▄▇▅▄▁█ | 26.53µs | 28.33µs | +6.8% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c` | ▃▃▂▂▂▇█▂▃▃▁▂▂ | 296.2ns | 297.4ns | +0.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c` | ▂▂▃▂▅▅▆▂▂▁█▂▂ | 6.05µs | 6.05µs | +0.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c` | ▃▃▁▅▃▄▅▃▇▅▆█▇ | 37.67µs | 38.53µs | +2.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c` | ▃▃▃▃▁▁▂▄▂▃█▅▃ | 486.8ns | 498.9ns | +2.5% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c` | ▁▁▁▁▇▁▁▂█▁▂▂▁ | 9.56µs | 9.59µs | +0.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c` | ▄▃▃▂▃▂▃█▁▄▂▄▄ | 131.5ns | 134.5ns | +2.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c` | ▃▂▂▁▆▅▃▃▃▂█▁▂ | 2.43µs | 2.44µs | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c` | ▂▂▁▂█▁▂▄▂▃▂▄▄ | 72.36µs | 73.54µs | +1.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c` | ▅▃▁▃▄▆▂█▁▃▄▃▅ | 952.2ns | 1.01µs | +6.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c` | ▂▂▃▁██▅▂▆▆▅▇▆ | 21.01µs | 22.48µs | +7.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c` | ▆▂▃▂▅▂▃█▁▂▄▃▃ | 230.0ns | 233.7ns | +1.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c` | ▂▄▁▁▃▂▂█▂▁▃▂▃ | 4.59µs | 4.64µs | +1.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c` | ▅▆▆▇▆▆▅█▄▅▁▁▆ | 143.48µs | 145.12µs | +1.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c` | ▆▅▇▃▅█▄▄▂▅▄▅▁ | 2.06µs | 2.06µs | +0.0% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c` | ▆▂▁▄▃▁▁▁█▃▂▃▄ | 35.44µs | 37.77µs | +6.6% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c` | ▂▁▁▁▂█▂▃▃▃▃▄▄ | 515.8ns | 517.0ns | +0.2% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c` | ▃▃▅▃█▆▇▅▅▁▇▇▃ | 8.20µs | 8.21µs | +0.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c` | ▄▂▁▄▂▅▅▄▆▄▆█▇ | 57.13µs | 57.71µs | +1.0% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_16c` | ▁▂▁▂▁▂▂▃▂▂█▃▂ | 913.0ns | 917.5ns | +0.5% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_256c` | ▁▁▁▁▆▁▁▂█▁▃▂▂ | 14.56µs | 14.62µs | +0.4% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_4c` | ▂▂▁▃▂▂▃▄▅▄▄█▅ | 234.6ns | 235.3ns | +0.3% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_64c` | ▃▂▂▁▆▆▄▄▄▂█▃█ | 3.67µs | 3.70µs | +0.8% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c` | ▄▁▆▇█▂▄▆▇▂▇▅▇ | 105.30µs | 107.28µs | +1.9% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_16c` | ▃▂▁▂▅▇▂█▃▂▄▄▃ | 1.60µs | 1.61µs | +0.7% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_256c` | ▃▂▂▁▆▂▄▂▆█▆▇▆ | 28.18µs | 29.54µs | +4.8% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_4c` | ▃▂▂▂█▂▁▄▃▃▄▅▃ | 401.4ns | 402.4ns | +0.2% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_64c` | ▂▁▁▂▆▃▄▇▆▃▇▃█ | 6.37µs | 6.40µs | +0.5% |
+| `simd_batch_dot_product/scalar_loop/10` | ▁▂█▂▂▁▆▁▁▂▁▁▂ | 2.14µs | 2.14µs | +0.0% |
+| `simd_batch_dot_product/scalar_loop/100` | ▄▅▂▆▃▅▁▄█▃▂▅▄ | 21.35µs | 21.45µs | +0.4% |
+| `simd_batch_dot_product/scalar_loop/1000` | ▇▄▃▄▂▆▁▆▆▂▃▇█ | 218.51µs | 221.61µs | +1.4% |
+| `simd_batch_dot_product/simd_batch/10` | ▇▆▆▅█▆▁▃▆▅▇▆▆ | 316.0ns | 336.3ns | +6.4% |
+| `simd_batch_dot_product/simd_batch/100` | ▂▂▂▂▂▁▁▂█▁▁▂▂ | 5.62µs | 5.68µs | +1.0% |
+| `simd_batch_dot_product/simd_batch/1000` | ▆▃▄▄▁▇▁█▇▂▂▆▇ | 83.52µs | 92.02µs | +10.2% |
+| `simd_cosine_similarity/scalar/1024` | ▅▃▃▁█▂▂▁▄▃▂▂▂ | 1.77µs | 1.77µs | +0.0% |
+| `simd_cosine_similarity/scalar/1536` | ▂▂▃▃█▂▃▂▂▁▂▂▃ | 2.68µs | 2.68µs | +0.1% |
+| `simd_cosine_similarity/scalar/384` | ▄▄▃▁█▁▃▅▆▅▄▃▃ | 639.3ns | 640.9ns | +0.3% |
+| `simd_cosine_similarity/scalar/768` | ▂▂▁▁█▃▂▂▃▃▂▁▂ | 1.32µs | 1.32µs | +0.1% |
+| `simd_cosine_similarity/simd/1024` | ▇█▇▇▅▇▆▅▅▄▄▆▁ | 129.0ns | 129.0ns | +0.0% |
+| `simd_cosine_similarity/simd/1536` | ▂▁▁▂█▃▃▂▃▂▃█▂ | 185.1ns | 185.2ns | +0.1% |
+| `simd_cosine_similarity/simd/384` | ▄▁▄▄█▃▄▄▄▆▄▅▄ | 57.6ns | 58.0ns | +0.8% |
+| `simd_cosine_similarity/simd/768` | ▄▂▁▃▇▃▃▅▅█▆▅█ | 100.1ns | 101.3ns | +1.2% |
+| `simd_dot_product/scalar/1024` | ▃▆▆▄▇▇▅▁▄▃▄█▇ | 593.0ns | 593.3ns | +0.1% |
+| `simd_dot_product/scalar/1536` | ▄▂▅▂█▇▂▁▂▁▂▂▃ | 892.3ns | 892.4ns | +0.0% |
+| `simd_dot_product/scalar/384` | ▃▂▇█▅▄▂▁▇▃▄▄▃ | 213.0ns | 213.1ns | +0.0% |
+| `simd_dot_product/scalar/768` | ▂▁▁▁▂▁▁▁▂▁▁▁█ | 439.4ns | 442.9ns | +0.8% |
+| `simd_dot_product/simd/1024` | ▁▃▂▂▂▄▂▂▁▂▃█▁ | 73.4ns | 73.4ns | +0.1% |
+| `simd_dot_product/simd/1536` | ▁█▁▃▁█▇█▇█▇▇▇ | 101.6ns | 106.1ns | +4.4% |
+| `simd_dot_product/simd/384` | ▄▄▆▅▃▅▁▂▂▄▁█▄ | 31.5ns | 31.6ns | +0.3% |
+| `simd_dot_product/simd/768` | ▂▂▂▂▅▃▄▅▄▁▄█▄ | 54.3ns | 56.7ns | +4.4% |
+| `simd_euclidean_distance/scalar/1024` | ▁▁▁▆▂█▁▁▁▁▁▁▁ | 595.3ns | 595.5ns | +0.0% |
+| `simd_euclidean_distance/scalar/1536` | ▂▂▂█▂█▁▂▂▂▃▃▂ | 895.6ns | 896.0ns | +0.0% |
+| `simd_euclidean_distance/scalar/384` | ▂▃▁▅▃█▃▂▃▂▂▂▂ | 216.7ns | 216.9ns | +0.1% |
+| `simd_euclidean_distance/scalar/768` | ▂▂▁▇▁█▂▂▁▃▂▁▁ | 443.1ns | 443.2ns | +0.0% |
+| `simd_euclidean_distance/simd/1024` | ▇▆▄▄▅█▆▄▅▁▅▅▅ | 116.7ns | 117.1ns | +0.3% |
+| `simd_euclidean_distance/simd/1536` | ▄▂▅▄█▁▆▅▇▇▇▆█ | 170.6ns | 171.2ns | +0.4% |
+| `simd_euclidean_distance/simd/384` | ▁▂▆▂█▃██████▅ | 48.4ns | 48.8ns | +0.9% |
+| `simd_euclidean_distance/simd/768` | ▅▁▇▄▇▂▇▆▇▇▅██ | 89.0ns | 89.8ns | +0.9% |
+| `simd_normalize/scalar/1024` | ▅▆▁▂▂▃▆▅█▆▅▇▇ | 681.2ns | 686.4ns | +0.8% |
+| `simd_normalize/scalar/1536` | ▄▄▁▁▁▂▅▅█▄▄▆▆ | 1.02µs | 1.02µs | +0.8% |
+| `simd_normalize/scalar/384` | ▂▃▂▁▂▂▃▁█▁▂▂▃ | 264.5ns | 266.5ns | +0.8% |
+| `simd_normalize/scalar/768` | ▅▆▂▁▂▅▆▅█▄▅▆▆ | 513.5ns | 516.9ns | +0.7% |
+| `simd_normalize/simd/1024` | ▁▁▁▁▂▁▆▂█▁▂▁▄ | 150.0ns | 156.4ns | +4.3% |
+| `simd_normalize/simd/1536` | ▂▁▁▁▃█▂▂█▂▂▂▃ | 218.1ns | 227.0ns | +4.1% |
+| `simd_normalize/simd/384` | ▂▂▁▁▂▂▃▂█▁▁▁▄ | 67.2ns | 69.1ns | +2.8% |
+| `simd_normalize/simd/768` | ▂▂▁▁▂▁▂▂█▂▂▂▃ | 116.1ns | 118.6ns | +2.1% |
+| `simd_normalized_cosine_fast_path/cosine_full/1024` | █▁▃▄▁▃▃▅▅▆▂▄▆ | 128.8ns | 129.2ns | +0.4% |
+| `simd_normalized_cosine_fast_path/cosine_full/384` | ▁▁▁▁▄▁█▆▅▁▅▅▁ | 58.0ns | 58.1ns | +0.2% |
+| `simd_normalized_cosine_fast_path/cosine_full/768` | ▁▃▂▃█▃▂▅▃▃▁▆▂ | 99.2ns | 99.4ns | +0.2% |
+| `simd_normalized_cosine_fast_path/dot_product/1024` | █▄▅▅▁▅▅▂▅▅▁▅▄ | 70.0ns | 72.4ns | +3.6% |
+| `simd_normalized_cosine_fast_path/dot_product/384` | ▅▅▅▅▇▅▆▂▅▁█▄▄ | 30.6ns | 31.4ns | +2.6% |
+| `simd_normalized_cosine_fast_path/dot_product/768` | ▄▅█▅▁▆▅▇▆▂▁▃▃ | 54.0ns | 55.1ns | +1.9% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/1024` | ▂▁▄▄▃▃▅▂▅▂▅▄█ | 95.55µs | 97.26µs | +1.8% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/384` | ▃▂▁▃▂▃▂▁▃█▃▂▃ | 38.12µs | 38.69µs | +1.5% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/768` | ▃▂▄▂▂▅▆▁▃▁▅▁█ | 72.40µs | 73.78µs | +1.9% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | ▄▄▁▄▇▆█▆▁▄▃▅▃ | 144.57µs | 145.26µs | +0.5% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384` | ▂▂▁▃▃▂▃▃▅▃▄▇█ | 57.84µs | 58.45µs | +1.1% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768` | ▆▂▇▁▁▁▇██▁▇▄▂ | 105.98µs | 106.42µs | +0.4% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024` | ▂▁█▂▃▁▅▁▃▁▃▃▇ | 95.97µs | 98.00µs | +2.1% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384` | ▂▄▂▂▄▁▂▁▄▅█▃▄ | 39.05µs | 39.44µs | +1.0% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768` | ▂▁▅▃▃▇█▃█▄▅▁█ | 73.13µs | 74.00µs | +1.2% |
+| `simd_query_batch_dot_product/pair_loop/128d_16c` | █▇█▅▇▃▆▆▃▆▁▅▅ | 215.9ns | 219.0ns | +1.5% |
+| `simd_query_batch_dot_product/pair_loop/128d_256c` | ▆▂▄▃▄▁▄█▂▃▁▂▂ | 3.77µs | 3.81µs | +1.3% |
+| `simd_query_batch_dot_product/pair_loop/128d_4c` | █▄▅▃▅▂▃▄▁▅▁▂▃ | 66.2ns | 66.8ns | +0.8% |
+| `simd_query_batch_dot_product/pair_loop/128d_64c` | ▇▃▄▄▅▄▁▃▃▃▁▃█ | 814.7ns | 852.6ns | +4.6% |
+| `simd_query_batch_dot_product/pair_loop/384d_16c` | ▇▇▆█▂▄▆▃▁▅▁▃▅ | 483.1ns | 497.6ns | +3.0% |
+| `simd_query_batch_dot_product/pair_loop/384d_256c` | ▄▁▂▁▇▁▂▂█▁▅▆▂ | 9.52µs | 9.59µs | +0.8% |
+| `simd_query_batch_dot_product/pair_loop/384d_4c` | ▄▂▄▆▃▂▄█▂▂▁▆▃ | 132.8ns | 133.9ns | +0.9% |
+| `simd_query_batch_dot_product/pair_loop/384d_64c` | █▁▃▃▆▄▃▆▆▄▄▅▇ | 2.41µs | 2.47µs | +2.4% |
+| `simd_query_batch_dot_product/pair_loop/768d_16c` | ▃▃▃▃▅▂█▅▃▃▃▁▆ | 949.4ns | 1.03µs | +8.0% |
+| `simd_query_batch_dot_product/pair_loop/768d_256c` | ▆▂▅▄▆▇▁▄▇▇▆██ | 19.47µs | 22.63µs | +16.2% |
+| `simd_query_batch_dot_product/pair_loop/768d_4c` | █▂▆▂▅▃▃▆▂▃▁▃▄ | 230.1ns | 234.0ns | +1.7% |
+| `simd_query_batch_dot_product/pair_loop/768d_64c` | ▃█▂▁▄▃▂▄▄▁▃▄▇ | 4.58µs | 4.67µs | +1.9% |
+| `simd_query_batch_dot_product/simd_batch/128d_16c` | ▃▃▆▂▃▆█▇▆▆▄▁▃ | 137.3ns | 138.0ns | +0.5% |
+| `simd_query_batch_dot_product/simd_batch/128d_256c` | ▆▇▇▆▆▇▆█▆▇▁▆▆ | 2.98µs | 3.05µs | +2.4% |
+| `simd_query_batch_dot_product/simd_batch/128d_4c` | ▃▁▂▃▇▄▆█▅▇▆▂▁ | 46.0ns | 46.0ns | +0.0% |
+| `simd_query_batch_dot_product/simd_batch/128d_64c` | ▄▃▁▃▃▄▁▄▄▃▂▄█ | 504.6ns | 552.6ns | +9.5% |
+| `simd_query_batch_dot_product/simd_batch/384d_16c` | ▅▂▂▅▃▆█▅▆▅▃▁▂ | 325.0ns | 325.7ns | +0.2% |
+| `simd_query_batch_dot_product/simd_batch/384d_256c` | ▃▁▁▁█▂▃▁█▁▇▇▂ | 8.33µs | 8.42µs | +1.1% |
+| `simd_query_batch_dot_product/simd_batch/384d_4c` | ▄▁▂▃█▃▄▄▄▄▄▁▂ | 92.9ns | 93.2ns | +0.3% |
+| `simd_query_batch_dot_product/simd_batch/384d_64c` | █▅▅▄▇▁▅▅▅▆▄▅█ | 2.06µs | 2.15µs | +4.5% |
+| `simd_query_batch_dot_product/simd_batch/768d_16c` | ▂▁▅▃▄▂█▄▂▄▄▃▄ | 624.5ns | 696.7ns | +11.6% |
+| `simd_query_batch_dot_product/simd_batch/768d_256c` | ▅▃▅▅▆▆▁▄▇█▇▇▇ | 16.48µs | 18.19µs | +10.4% |
+| `simd_query_batch_dot_product/simd_batch/768d_4c` | ▄▁▁▃▇▅▆▆▆▅█▁▂ | 163.8ns | 164.0ns | +0.1% |
+| `simd_query_batch_dot_product/simd_batch/768d_64c` | ▃▁▃▅▆▂▅▆▅▃▅▃█ | 3.75µs | 3.93µs | +4.8% |
+| `simd_squared_euclidean_fast_path/euclidean_full/1024` | █▄▆▁▄▆▅▁▄▄▁▅▅ | 116.8ns | 117.0ns | +0.1% |
+| `simd_squared_euclidean_fast_path/euclidean_full/384` | ▂▃▅▄█▁▆▅▄▆▄▅▆ | 48.2ns | 49.1ns | +1.8% |
+| `simd_squared_euclidean_fast_path/euclidean_full/768` | ▁▅▇▄▄▄█▆▇▅▅▆▅ | 89.0ns | 89.5ns | +0.5% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/1024` | ▄▂█▂▆▅▅▁▅▅▂▅▇ | 113.6ns | 113.9ns | +0.3% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/384` | ▂▃▂▃█▁▃▃▁▃▂▂▃ | 45.5ns | 45.9ns | +1.0% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/768` | ▁▇▇▆▁▆██▆▇▃▃▃ | 86.3ns | 86.5ns | +0.2% |
+| `simd_throughput_384/cosine_similarity` | ▁▃▂▄█▄▃▃▅▅▅▄▅ | 57.5ns | 58.3ns | +1.5% |
+| `simd_throughput_384/dot_product` | ▇█▁▃▃▆▃▃▃█▃▃▃ | 31.0ns | 31.7ns | +2.3% |
+| `simd_throughput_384/euclidean_distance` | ▁▁▅▂█▂███▆▇▇▇ | 48.4ns | 49.0ns | +1.3% |
+| `simd_throughput_384/normalize` | █▃▃▂▂▃▁▂█▁▄▂█ | 112.1ns | 123.3ns | +9.9% |
+| `softmax_attention/128` | █▆▅▆▅▂▂▇▆▇▇▁▁ | 8.32µs | 8.32µs | +0.0% |
+| `softmax_attention/512` | █▅▁▄▄▅▄▃▅▁▃▆▇ | 126.40µs | 130.48µs | +3.2% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/10` | █▁ | 521.4ns | 521.4ns | +0.0% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/100` | █▁ | 5.02µs | 5.02µs | +0.0% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/1000` | █▁ | 50.10µs | 50.10µs | +0.0% |
+| `tier_prepared_batch_sizes/int4_query_per_call/10` | ▁█ | 20.50µs | 20.51µs | +0.1% |
+| `tier_prepared_batch_sizes/int4_query_per_call/100` | ▁█ | 204.64µs | 204.88µs | +0.1% |
+| `tier_prepared_batch_sizes/int4_query_per_call/1000` | ▁█ | 2.05ms | 2.05ms | +0.1% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/10` | ▁█ | 171.8ns | 172.5ns | +0.4% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/100` | ▁█ | 1.55µs | 1.56µs | +0.7% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/1000` | █▁ | 15.50µs | 15.50µs | +0.0% |
+| `tier_prepared_batch_sizes/int8_query_per_call/10` | █▁ | 13.72µs | 13.72µs | +0.0% |
+| `tier_prepared_batch_sizes/int8_query_per_call/100` | █▁ | 136.97µs | 136.97µs | +0.0% |
+| `tier_prepared_batch_sizes/int8_query_per_call/1000` | █▁ | 1.37ms | 1.37ms | +0.0% |
+| `tier_prepared_query/binary_query_once_1000` | ▆▄▅▇▄▄▇▂▄▂▁█▇ | 7.37µs | 7.53µs | +2.1% |
+| `tier_prepared_query/binary_query_per_call_1000` | ▂▂▂▂▂▁▁▂▂▂▂█▃ | 962.48µs | 964.29µs | +0.2% |
+| `tier_prepared_query/int4_query_once_1000` | ▂▁▁▇▂▁█▂▂▁▁▆▅ | 51.09µs | 51.46µs | +0.7% |
+| `tier_prepared_query/int4_query_per_call_1000` | ▄▄▃▄▄██▄▆▃▄▅▁ | 2.06ms | 2.06ms | +0.0% |
+| `tier_prepared_query/int8_query_once_1000` | ▄▄▄█▅▇▅▄▅▅▅▁▂ | 17.35µs | 17.56µs | +1.2% |
+| `tier_prepared_query/int8_query_per_call_1000` | ▃▄▆█▇▇▅▁▅▃▄▆▇ | 1.37ms | 1.37ms | +0.1% |
 
 **Headlines:**
 - Worst step-regression: **+20.3%** on `simd_query_batch_dot_product/simd_batch/768d_16c` at commit [`fdf1b75`](https://github.com/ohdearquant/lattice/commit/fdf1b7553ab165ca444d14b40588dc5ed7f110aa) (2026-05-31T02:22:20+00:00)
@@ -277,269 +277,269 @@ Last update: **2026-05-31T03:06:12+00:00**, commit [`8981928`](https://github.co
 
 ## `x86_64-linux`
 
-Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14)
+Last update: **2026-05-31T03:10:47+00:00**, commit [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9)
 
 | Bench | Trend (last 20) | Best | Latest | Δ from best |
 |---|---|---:|---:|---:|
-| `add_bias_gelu/4096` | ▄▂▃▃▃██▁▁█▁▁ | 1.72µs | 1.73µs | +0.4% |
-| `add_bias_gelu/896` | ▂▅▂▂▁██▁▁█▁▁ | 375.5ns | 375.5ns | +0.0% |
-| `binary_cosine_distance/binary/1024` | ▇▁▇████▇▇█▇▇ | 103.1ns | 112.2ns | +8.8% |
-| `binary_cosine_distance/binary/1536` | ▇▁▇▇▇█▇▇▇▇▇▇ | 151.9ns | 162.2ns | +6.8% |
-| `binary_cosine_distance/binary/384` | █▁██████████ | 41.9ns | 49.3ns | +17.7% |
-| `binary_cosine_distance/binary/768` | █▁▇█████▇███ | 78.7ns | 87.2ns | +10.9% |
-| `binary_cosine_distance/float32_simd/1024` | ▂█▂▂▂▆▆▂▂▆▂▁ | 81.1ns | 81.1ns | +0.0% |
-| `binary_cosine_distance/float32_simd/1536` | ▁█▂▁▁▅▅▁▁▅▁▁ | 112.3ns | 112.3ns | +0.0% |
-| `binary_cosine_distance/float32_simd/384` | █▁██████▇█▇█ | 36.9ns | 44.7ns | +21.2% |
-| `binary_cosine_distance/float32_simd/768` | ▁▆▂▅▆▅▄▃▁█▁▁ | 65.9ns | 65.9ns | +0.0% |
-| `elementwise_mul/4096` | ██████▂▁▁▁▁▁ | 204.8ns | 205.3ns | +0.2% |
-| `gelu/4096` | ▁█▁▁▁▆▆▁▁▆▁▁ | 1.63µs | 1.65µs | +1.1% |
-| `gelu/896` | ▁▂▁▁▁██▂▂█▁▁ | 357.5ns | 357.5ns | +0.0% |
-| `int4_cosine_distance/float32_simd/1024` | ▅▁▅▅▅▆▆▅▅█▅▅ | 68.6ns | 82.4ns | +20.0% |
-| `int4_cosine_distance/float32_simd/1536` | ▆▁▆▆▆██▆▆█▆▅ | 96.0ns | 111.2ns | +15.9% |
-| `int4_cosine_distance/float32_simd/384` | ▇▁▆█▆▆███▇▆▆ | 38.4ns | 44.4ns | +15.7% |
-| `int4_cosine_distance/float32_simd/768` | ▃▃▂▂▃▇▆▂▁▇▂█ | 66.4ns | 71.0ns | +6.8% |
-| `int4_cosine_distance/int4/1024` | ███████████▁ | 302.1ns | 302.1ns | +0.0% |
-| `int4_cosine_distance/int4/1536` | ███████████▁ | 442.8ns | 442.8ns | +0.0% |
-| `int4_cosine_distance/int4/384` | ███████████▁ | 126.2ns | 126.2ns | +0.0% |
-| `int4_cosine_distance/int4/768` | █████████▇█▁ | 232.0ns | 232.0ns | +0.0% |
-| `int8_batch_cosine/float32_simd/10` | ▇▁▇▇▇▆▅▇▇▆█▇ | 353.9ns | 423.7ns | +19.7% |
-| `int8_batch_cosine/float32_simd/100` | ▆█▁▃▄▁▁▄▂▁▂▃ | 4.30µs | 4.42µs | +2.8% |
-| `int8_batch_cosine/float32_simd/1000` | ▁█▁▁▁▁▁▁▁▁▁▁ | 54.14µs | 54.14µs | +0.0% |
-| `int8_batch_cosine/int8_loop/10` | ▇▁██▇▆▅▇█▆▇▇ | 153.2ns | 174.4ns | +13.8% |
-| `int8_batch_cosine/int8_loop/100` | ▇▁█▇▇▄▅▆▇▅▆▆ | 1.59µs | 1.75µs | +10.2% |
-| `int8_batch_cosine/int8_loop/1000` | ▆▁▆▆▇▄▃▇█▃▆▆ | 16.55µs | 18.79µs | +13.6% |
-| `int8_prepared_dot_product/per_call/1024` | ▃█▃▃▃▅▅▃▁▄▁▃ | 5.25µs | 5.79µs | +10.4% |
-| `int8_prepared_dot_product/per_call/127` | ▁█▁▁▁▃▃▁▁▃▁▁ | 732.6ns | 743.7ns | +1.5% |
-| `int8_prepared_dot_product/per_call/128` | ▂█▂▃▂▄▄▂▁▄▂▃ | 699.7ns | 745.7ns | +6.6% |
-| `int8_prepared_dot_product/per_call/129` | ▁█▁▂▂▃▃▂▁▃▂▂ | 734.4ns | 752.0ns | +2.4% |
-| `int8_prepared_dot_product/per_call/384` | ▂█▃▃▂▄▄▃▁▄▂▂ | 1.98µs | 2.05µs | +3.3% |
-| `int8_prepared_dot_product/per_call/768` | ▃█▃▃▃▄▅▂▁▄▃▂ | 3.93µs | 4.16µs | +6.0% |
-| `int8_prepared_dot_product/prepared/1024` | ▇▁█▇▇██▇▇█▇▇ | 28.5ns | 34.8ns | +22.3% |
-| `int8_prepared_dot_product/prepared/127` | ▃█▂▃▃▁▁▃▃▁▃▃ | 16.2ns | 17.1ns | +5.6% |
-| `int8_prepared_dot_product/prepared/128` | ▇▅█▆▆▁▁▆▇▁▆▇ | 8.9ns | 10.0ns | +12.8% |
-| `int8_prepared_dot_product/prepared/129` | █▆█▇█▁▁▆█▁▆█ | 9.4ns | 10.7ns | +13.5% |
-| `int8_prepared_dot_product/prepared/384` | █▁▆▆▆▆▆▇▆▆▆▆ | 14.1ns | 15.6ns | +11.1% |
-| `int8_prepared_dot_product/prepared/768` | ▇▁██▇▅▆█▇▅█▇ | 21.6ns | 29.2ns | +35.4% |
-| `int8_quantization/quantize/1024` | ▁█▃▁▃▅▄▂▁▄▁▃ | 5.23µs | 5.77µs | +10.4% |
-| `int8_quantization/quantize/1536` | ▂█▂▃▁▅▄▁▁▄▁▃ | 7.80µs | 8.67µs | +11.2% |
-| `int8_quantization/quantize/384` | ▁█▁▁▂▄▄▂▁▄▁▂ | 1.98µs | 2.09µs | +5.9% |
-| `int8_quantization/quantize/768` | ▁█▃▂▃▄▄▂▁▄▁▂ | 3.95µs | 4.08µs | +3.3% |
-| `int8_raw_dot_product/dot_product_i8/1024` | ▇▁█▇▇▇██▆▇▇▆ | 31.3ns | 34.5ns | +10.2% |
-| `int8_raw_dot_product/dot_product_i8/127` | ▃█▂▃▃▁▁▃▄▂▂▃ | 16.4ns | 17.1ns | +4.0% |
-| `int8_raw_dot_product/dot_product_i8/128` | █▄▇▇█▁▂▆▇▁▇▆ | 8.8ns | 9.8ns | +10.5% |
-| `int8_raw_dot_product/dot_product_i8/129` | ▇▄█▅▆▁▂▅▇▂▅▆ | 9.3ns | 10.3ns | +10.7% |
-| `int8_raw_dot_product/dot_product_i8/384` | ▇▁▇▇▇██▇██▇▇ | 13.6ns | 15.5ns | +14.2% |
-| `int8_raw_dot_product/dot_product_i8/768` | █▁▇█▇▅▅▇▇▅█▇ | 21.0ns | 29.3ns | +39.3% |
-| `int8_raw_dot_product/dot_product_i8_raw/1024` | ▇▁▇▆▇█▇▇▆▆▇▆ | 24.9ns | 30.3ns | +21.8% |
-| `int8_raw_dot_product/dot_product_i8_raw/127` | ▁█▁▁▁▂▂▁▁▂▁▁ | 13.6ns | 13.7ns | +0.7% |
-| `int8_raw_dot_product/dot_product_i8_raw/128` | ▇▁█▅▇▃▄▆▇▃▆▇ | 6.6ns | 7.3ns | +10.2% |
-| `int8_raw_dot_product/dot_product_i8_raw/129` | ▇▂█▆▇▁▃▆▇▁▅▇ | 7.2ns | 7.6ns | +5.0% |
-| `int8_raw_dot_product/dot_product_i8_raw/384` | ▇▁▆▆▇██▇▇█▆▇ | 11.3ns | 13.1ns | +15.8% |
-| `int8_raw_dot_product/dot_product_i8_raw/768` | █▁▇█▇▆▆▇▇▆█▇ | 18.8ns | 24.8ns | +32.2% |
-| `int8_vs_float32_cosine/float32_simd/1024` | ▂█▃▃▂▆▆▂▂▅▁▂ | 80.4ns | 81.4ns | +1.2% |
-| `int8_vs_float32_cosine/float32_simd/1536` | ▄▁▄▆▅▆▆▅▄█▅▄ | 96.5ns | 111.5ns | +15.6% |
-| `int8_vs_float32_cosine/float32_simd/384` | █▁▇▇▇▆▇▇▇▇▆▇ | 39.1ns | 44.0ns | +12.5% |
-| `int8_vs_float32_cosine/float32_simd/768` | ▃█▄▁▃▇▇█▂▇▃▃ | 65.0ns | 66.3ns | +2.0% |
-| `int8_vs_float32_cosine/int8/1024` | ▇▁█▇███▇▇█▇▇ | 31.4ns | 38.2ns | +21.5% |
-| `int8_vs_float32_cosine/int8/1536` | ▇▁▇▆▆██▆▇█▆▆ | 41.5ns | 48.7ns | +17.5% |
-| `int8_vs_float32_cosine/int8/384` | █▁█▇▇▇▇▇█▇██ | 14.8ns | 18.3ns | +23.8% |
-| `int8_vs_float32_cosine/int8/768` | ▇▁█▇▇▅▅▇█▅█▇ | 24.0ns | 32.6ns | +35.6% |
-| `layer_norm/4096` | ▂▁▂▂▂▄█▄▄▆▆▅ | 689.5ns | 867.9ns | +25.9% |
-| `layer_norm/896` | ▂▃█▃▃▃▆▁▁▂▁▁ | 154.9ns | 155.6ns | +0.5% |
-| `memory_size/search_1000_float32` | ▃█▃▃▃▂▁▃▃▁▃▃ | 40.40µs | 42.69µs | +5.7% |
-| `memory_size/search_1000_int8` | █▁▇█▇▅▅▆▆▅▆▇ | 14.42µs | 16.41µs | +13.9% |
-| `rms_norm/4096` | ▁█▁▁▁▁▁▁▁▁▁▁ | 705.1ns | 725.9ns | +2.9% |
-| `rms_norm/896` | ▁█▁▁▁▁▁▁▁▁▁▁ | 206.6ns | 207.1ns | +0.2% |
-| `silu_inplace/4096` | ▂▄▁▁▁█▇▁▁▇▁▁ | 12.42µs | 12.42µs | +0.0% |
-| `silu_inplace/896` | ▂▃▁▁▁█▇▁▁▇▁▁ | 2.70µs | 2.70µs | +0.0% |
-| `simd_batch_cosine/scalar_loop/10` | ▁█▁▁▁▅▅▁▁▅▁▁ | 9.86µs | 9.88µs | +0.2% |
-| `simd_batch_cosine/scalar_loop/100` | ▁█▁▁▁▅▄▁▁▄▁▁ | 98.44µs | 98.53µs | +0.1% |
-| `simd_batch_cosine/scalar_loop/1000` | ▁█▁▁▁▄▄▁▁▄▁▁ | 987.39µs | 990.52µs | +0.3% |
-| `simd_batch_cosine/simd_batch/10` | █▁█▇█▆▆██▇▇█ | 340.7ns | 425.4ns | +24.8% |
-| `simd_batch_cosine/simd_batch/100` | ▄█▂▃▃▂▁▄▂▁▂▃ | 4.25µs | 4.46µs | +4.9% |
-| `simd_batch_cosine/simd_batch/1000` | ▂█▁▁▁▂▁▁▁▂▁▁ | 53.55µs | 56.69µs | +5.9% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c` | ▂█▁▂▂▁▂▁▁▂▂▁ | 84.06µs | 84.99µs | +1.1% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c` | ▂█▁▂▂▂▂▁▁▂▂▁ | 1.30µs | 1.30µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c` | ▃█▁▃▃▂▃▁▂▃▃▂ | 21.62µs | 22.32µs | +3.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c` | ▃█▁▃▃▂▅▁▂▆▄▁ | 327.9ns | 327.9ns | +0.0% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c` | ▃█▁▂▂▂▂▁▁▂▂▁ | 5.18µs | 5.20µs | +0.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c` | ▃█▂▃▂▂▁▃▂▁▂▂ | 41.09µs | 42.67µs | +3.8% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c` | █▁▇█▇▅▆█▇▅▇▇ | 591.4ns | 670.8ns | +13.4% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c` | █▇▇▆▆▂▁▆▇▁▄▆ | 10.16µs | 10.89µs | +7.1% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c` | █▁▇▇▇▂▃█▇▃▆▇ | 166.6ns | 178.6ns | +7.2% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c` | ▆█▅▆▆▁▁▆▆▁▄▅ | 2.56µs | 2.68µs | +4.7% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c` | ▁█▁▁▁▁▁▁▁▁▁▁ | 67.94µs | 68.48µs | +0.8% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c` | ▁█▁▂▂▁▂▂▁▂▁▁ | 1.05µs | 1.06µs | +1.8% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c` | ▂█▂▃▃▁▁▃▂▂▁▂ | 17.34µs | 17.93µs | +3.4% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c` | ▂█▂▃▃▂▅▂▁▅▁▁ | 266.4ns | 267.3ns | +0.3% |
-| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c` | ▁█▁▂▂▁▂▂▁▂▁▁ | 4.15µs | 4.23µs | +1.7% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c` | ▂█▁▂▁▁▂▁▁▂▂▁ | 82.63µs | 83.77µs | +1.4% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c` | ▂█▁▂▂▂▃▁▁▃▂▁ | 1.27µs | 1.27µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c` | ▂█▂▃▂▂▃▁▂▃▃▂ | 21.24µs | 21.84µs | +2.8% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c` | ▃█▂▄▂▃▅▁▂▆▄▁ | 319.7ns | 319.7ns | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c` | ▃█▁▂▂▂▃▁▁▂▂▁ | 5.08µs | 5.08µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c` | ▃█▃▃▂▁▁▃▃▁▂▂ | 39.93µs | 41.76µs | +4.6% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c` | █▁▇█▇▆▆█▇▆▇▇ | 558.7ns | 648.6ns | +16.1% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c` | ▇█▅▆▅▂▁▆▅▁▄▅ | 10.00µs | 10.53µs | +5.3% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c` | █▁▇█▇▇▇█▇▇▇▇ | 151.3ns | 170.8ns | +12.9% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c` | ▅█▄▆▅▁▁▆▅▁▃▄ | 2.51µs | 2.59µs | +3.3% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c` | ▁█▁▁▁▁▁▁▁▁▁▁ | 66.71µs | 66.71µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c` | ▁█▁▂▂▁▃▂▁▂▁▁ | 1.03µs | 1.03µs | +0.0% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c` | ▂█▂▃▃▁▁▃▂▂▁▂ | 17.13µs | 17.40µs | +1.5% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c` | ▁█▂▄▄▂▆▃▂█▁▁ | 259.2ns | 260.3ns | +0.4% |
-| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c` | ▁█▁▂▂▁▂▂▁▂▁▁ | 4.09µs | 4.11µs | +0.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | ▁█▁▂▁▁▁▁▁▁▁▁ | 84.32µs | 84.74µs | +0.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c` | ▁█▁▂▁▂▁▁▁▂▂▁ | 1.30µs | 1.30µs | +0.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c` | ▂█▁▂▁▂▂▁▁▂▃▂ | 21.56µs | 22.29µs | +3.4% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c` | ▂█▂▃▂▂▂▁▁▄▃▁ | 326.8ns | 327.8ns | +0.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c` | ▁█▁▂▁▂▁▁▁▂▂▁ | 5.18µs | 5.20µs | +0.4% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c` | ▃█▃▃▃▁▂▃▃▁▃▂ | 40.49µs | 42.62µs | +5.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c` | █▁▇▇▇▄▄▇█▅▇▇ | 595.5ns | 681.7ns | +14.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c` | █▇▆▇▇▁▁▆▆▁▇▆ | 10.16µs | 10.84µs | +6.7% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c` | ▇▁▇▇█▃▃██▄▇▇ | 163.4ns | 178.8ns | +9.4% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c` | ▆█▆▆▆▁▂▆▆▂▅▅ | 2.52µs | 2.67µs | +6.0% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c` | ▁█▂▁▂▁▁▂▁▁▂▁ | 68.27µs | 70.84µs | +3.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c` | ▁█▃▁▂▁▂▂▂▂▂▂ | 1.05µs | 1.10µs | +4.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c` | ▂█▃▂▂▁▂▃▂▁▃▃ | 17.33µs | 18.30µs | +5.6% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c` | ▂█▅▁▄▁▅▅▅▅▄▄ | 267.2ns | 274.8ns | +2.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c` | ▁█▂▁▂▁▂▂▂▂▂▂ | 4.18µs | 4.35µs | +4.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c` | ▂█▁▂▂▁▁▁▁▂▂▂ | 68.07µs | 74.32µs | +9.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c` | ▁█▁▃▁▃▂▁▁▅▃▁ | 955.0ns | 963.1ns | +0.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c` | ▃█▂▃▁▂▁▂▃▄▄▃ | 17.50µs | 19.58µs | +11.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c` | ▃▇▂▆▃▃▃▂▁█▆▂ | 226.1ns | 237.9ns | +5.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c` | ▁█▁▃▁▃▂▁▁▄▃▁ | 3.77µs | 3.79µs | +0.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c` | ▁█▁▂▂▂▃▂▂▃▂▁ | 29.53µs | 30.38µs | +2.9% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c` | ▁▆▁▅▄▅▇▅▅█▅▂ | 410.9ns | 427.7ns | +4.1% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c` | ▁█▂▄▄▃▅▃▃▅▃▁ | 7.03µs | 7.03µs | +0.0% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c` | ▁▄▁▄▄▅█▅▅█▅▁ | 113.9ns | 115.2ns | +1.1% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c` | ▁█▁▃▃▃▅▃▃▅▃▁ | 1.71µs | 1.71µs | +0.3% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c` | ▁█▂▁▂▁▂▁▂▂▁▂ | 55.75µs | 60.08µs | +7.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c` | ▁█▄▁▄▃▅▄▄▅▃▄ | 749.2ns | 880.0ns | +17.5% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c` | ▂█▄▁▃▁▃▃▃▃▃▄ | 13.59µs | 15.60µs | +14.8% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c` | ▁▅▅▁▅▄█▅▅█▅▅ | 186.8ns | 224.5ns | +20.2% |
-| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c` | ▁█▃▁▃▂▄▃▃▄▃▃ | 2.96µs | 3.45µs | +16.8% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c` | ▁█▁▂▁▁▁▁▁▁▂▁ | 82.74µs | 83.35µs | +0.7% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c` | ▁█▁▂▁▂▂▁▁▃▂▁ | 1.27µs | 1.27µs | +0.0% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c` | ▂█▂▃▂▂▂▁▂▂▃▂ | 21.11µs | 21.86µs | +3.6% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c` | ▂█▁▃▁▃▃▁▂▆▃▁ | 320.1ns | 320.1ns | +0.0% |
-| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c` | ▂█▁▂▁▂▂▁▁▂▂▁ | 5.06µs | 5.06µs | +0.0% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c` | ▃█▂▃▃▁▁▂▃▁▃▂ | 39.44µs | 41.54µs | +5.3% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_16c` | ▇▁▇▇█▅▅▇▇▆▇▇ | 552.0ns | 656.0ns | +18.8% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_256c` | ▆█▄▅▅▁▁▅▅▁▅▄ | 9.98µs | 10.47µs | +4.9% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_4c` | ▇▁▆▇█▅▅██▆▇▇ | 155.9ns | 171.2ns | +9.8% |
-| `simd_batch_cosine_normalized_query/simd_batch/384d_64c` | ▅█▅▅▆▁▂▅▅▂▄▄ | 2.47µs | 2.59µs | +5.0% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c` | ▁█▂▁▂▁▁▂▂▁▂▁ | 67.36µs | 68.93µs | +2.3% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_16c` | ▂█▃▁▃▂▃▃▃▃▂▂ | 1.03µs | 1.07µs | +4.1% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_256c` | ▂█▃▁▃▁▂▂▂▁▃▂ | 17.17µs | 17.96µs | +4.6% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_4c` | ▁▁▅▄▄▄█▅▆▇▄▄ | 260.4ns | 267.0ns | +2.6% |
-| `simd_batch_cosine_normalized_query/simd_batch/768d_64c` | ▁█▂▁▂▁▃▂▂▂▂▂ | 4.10µs | 4.27µs | +4.3% |
-| `simd_batch_dot_product/scalar_loop/10` | ▁█▁▁▁▅▅▁▁▅▁▁ | 3.28µs | 3.29µs | +0.2% |
-| `simd_batch_dot_product/scalar_loop/100` | ▁█▁▁▁▅▅▁▁▅▁▁ | 32.92µs | 32.92µs | +0.0% |
-| `simd_batch_dot_product/scalar_loop/1000` | ▁█▁▁▁▅▅▁▁▅▁▁ | 336.20µs | 336.77µs | +0.2% |
-| `simd_batch_dot_product/simd_batch/10` | ▁▄▃▃▄▇▆▁▁█▆▂ | 276.3ns | 279.7ns | +1.2% |
-| `simd_batch_dot_product/simd_batch/100` | ▃█▄▆▅▃▃▂▁▃▁▃ | 3.33µs | 3.69µs | +10.6% |
-| `simd_batch_dot_product/simd_batch/1000` | ▂█▂▂▁▂▁▃▂▂▂▁ | 45.62µs | 45.62µs | +0.0% |
-| `simd_cosine_similarity/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁ | 2.79µs | 2.80µs | +0.1% |
-| `simd_cosine_similarity/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁ | 4.23µs | 4.23µs | +0.0% |
-| `simd_cosine_similarity/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁ | 995.2ns | 996.0ns | +0.1% |
-| `simd_cosine_similarity/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁ | 2.08µs | 2.08µs | +0.1% |
-| `simd_cosine_similarity/simd/1024` | ▁▄▄▄▁█▄▄▅█▄▁ | 81.2ns | 81.2ns | +0.0% |
-| `simd_cosine_similarity/simd/1536` | ▆▁▆▆▆██▆▆█▆▆ | 94.8ns | 111.7ns | +17.8% |
-| `simd_cosine_similarity/simd/384` | █▁█▇█▇▇▇▇▇▆▆ | 41.8ns | 43.9ns | +5.0% |
-| `simd_cosine_similarity/simd/768` | ▂▆▂▁▂██▁▂█▁▂ | 66.1ns | 66.4ns | +0.4% |
-| `simd_dot_product/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁ | 934.5ns | 935.2ns | +0.1% |
-| `simd_dot_product/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁ | 1.41µs | 1.41µs | +0.1% |
-| `simd_dot_product/scalar/384` | ▁█▁▁▁▆▆▁▁▆▁▁ | 337.5ns | 337.7ns | +0.0% |
-| `simd_dot_product/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁ | 695.8ns | 696.0ns | +0.0% |
-| `simd_dot_product/simd/1024` | ▆▁▆▅▆▇▇▅█▇▆▅ | 56.0ns | 62.8ns | +12.1% |
-| `simd_dot_product/simd/1536` | ▇▄▇▁▇▃█▆▁█▁▇ | 69.8ns | 94.5ns | +35.4% |
-| `simd_dot_product/simd/384` | ▃█▃▃▃▁▁▃▃▁▃▃ | 27.3ns | 28.6ns | +4.9% |
-| `simd_dot_product/simd/768` | ▇▆▄▇▇██▁▇▁▇▁ | 40.1ns | 40.1ns | +0.2% |
-| `simd_euclidean_distance/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁ | 941.6ns | 942.0ns | +0.0% |
-| `simd_euclidean_distance/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁ | 1.42µs | 1.42µs | +0.0% |
-| `simd_euclidean_distance/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁ | 343.9ns | 344.4ns | +0.2% |
-| `simd_euclidean_distance/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁ | 702.6ns | 702.6ns | +0.0% |
-| `simd_euclidean_distance/simd/1024` | ▄▃▇▁▇▅▅▄▄█▄▄ | 56.4ns | 67.2ns | +19.0% |
-| `simd_euclidean_distance/simd/1536` | ▄█▄▄▄▆▆█▄▆▁▄ | 76.3ns | 94.0ns | +23.1% |
-| `simd_euclidean_distance/simd/384` | ▄▁▃▄▄▃▂▃▃▃▃█ | 32.6ns | 39.5ns | +21.4% |
-| `simd_euclidean_distance/simd/768` | ▄▁▄▄▄▁█▇▄▅▄▄ | 46.9ns | 54.3ns | +15.8% |
-| `simd_normalize/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁ | 1.05µs | 1.06µs | +0.5% |
-| `simd_normalize/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁ | 1.57µs | 1.59µs | +0.9% |
-| `simd_normalize/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁ | 396.1ns | 400.9ns | +1.2% |
-| `simd_normalize/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁ | 787.5ns | 792.8ns | +0.7% |
-| `simd_normalize/simd/1024` | ▅█▄▂▃▁▁▃▂▁▂▃ | 139.7ns | 161.3ns | +15.5% |
-| `simd_normalize/simd/1536` | ▃█▃▂▂▁▁▂▂▁▂▂ | 195.0ns | 217.3ns | +11.4% |
-| `simd_normalize/simd/384` | ▅▅▆▂▅▂▁█▂▁▂▅ | 68.5ns | 75.3ns | +9.9% |
-| `simd_normalize/simd/768` | ▄█▃▃▂▁▁▃▃▁▄▃ | 110.4ns | 124.1ns | +12.5% |
-| `simd_normalized_cosine_fast_path/cosine_full/1024` | ▆▁▆██▇█▆▆█▆▆ | 67.6ns | 81.2ns | +20.0% |
-| `simd_normalized_cosine_fast_path/cosine_full/384` | ▇▁██▇▇▇███▇▆ | 34.9ns | 43.2ns | +23.8% |
-| `simd_normalized_cosine_fast_path/cosine_full/768` | ▁▂▂▇█▄▄▂▁▆▁▂ | 66.1ns | 66.5ns | +0.7% |
-| `simd_normalized_cosine_fast_path/dot_product/1024` | ▁▃▅██▂▆▅▅▆▄▄ | 50.0ns | 62.3ns | +24.6% |
-| `simd_normalized_cosine_fast_path/dot_product/384` | ▅▃██▃▁▁██▇▅▃ | 22.4ns | 24.9ns | +11.3% |
-| `simd_normalized_cosine_fast_path/dot_product/768` | ▄▇▄██▁▁▄▄▅▄▄ | 40.6ns | 49.6ns | +22.1% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/1024` | ▂█▂▂▂▃▂▂▂▁▂▁ | 67.45µs | 67.45µs | +0.0% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/384` | ▂█▃▂▂▂▂▃▃▃▂▁ | 29.34µs | 29.34µs | +0.0% |
-| `simd_prepared_query_normalized_cosine/dot_product_loop/768` | ▂█▂▂▂▂▂▂▂▂▂▁ | 51.81µs | 51.81µs | +0.0% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | ▂█▁▁▁▁▁▁▂▁▁▁ | 86.47µs | 88.68µs | +2.6% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384` | ▃█▃▃▃▁▁▃▃▁▃▃ | 41.43µs | 43.78µs | +5.7% |
-| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768` | ▁█▂▂▁▁▁▁▁▁▁▁ | 68.83µs | 70.51µs | +2.5% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024` | ▂█▁▂▂▁▁▂▂▂▂▂ | 66.37µs | 72.70µs | +9.5% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384` | ▂█▁▁▂▁▂▁▂▁▁▂ | 28.27µs | 29.73µs | +5.2% |
-| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768` | ▁█▁▂▁▂▂▁▁▁▂▂ | 52.69µs | 56.82µs | +7.8% |
-| `simd_query_batch_dot_product/pair_loop/128d_16c` | ▂▅▁█▁▆▆█▂▆▃▇ | 207.3ns | 241.6ns | +16.5% |
-| `simd_query_batch_dot_product/pair_loop/128d_256c` | ▁█▁▄▁▃▃▄▁▃▂▄ | 3.08µs | 3.63µs | +17.8% |
-| `simd_query_batch_dot_product/pair_loop/128d_4c` | ▁▅▁█▂▇▅▇▃▇▄▆ | 64.2ns | 72.7ns | +13.3% |
-| `simd_query_batch_dot_product/pair_loop/128d_64c` | ▂▇▂█▁▇▆█▂▇▃█ | 790.6ns | 931.6ns | +17.8% |
-| `simd_query_batch_dot_product/pair_loop/384d_16c` | ▄▁▄▃▆██▆▄▆▄▄ | 355.4ns | 424.9ns | +19.6% |
-| `simd_query_batch_dot_product/pair_loop/384d_256c` | ▁▅▃▃▆██▄▁▄▂▂ | 6.87µs | 7.06µs | +2.7% |
-| `simd_query_batch_dot_product/pair_loop/384d_4c` | ▄▁▄▄▅██▆▄▆▃▄ | 95.6ns | 113.4ns | +18.6% |
-| `simd_query_batch_dot_product/pair_loop/384d_64c` | ▁▅▂▁▄██▅▁▄▁▁ | 1.69µs | 1.71µs | +1.2% |
-| `simd_query_batch_dot_product/pair_loop/768d_16c` | ▁█▄▃▄▂▂▄▄▅▄▁ | 757.2ns | 767.2ns | +1.3% |
-| `simd_query_batch_dot_product/pair_loop/768d_256c` | ▁█▄▃▄▁▁▃▃▃▄▂ | 13.67µs | 14.41µs | +5.4% |
-| `simd_query_batch_dot_product/pair_loop/768d_4c` | ▁▅▆▅▆▃▃▅▅█▅▂ | 187.1ns | 195.9ns | +4.7% |
-| `simd_query_batch_dot_product/pair_loop/768d_64c` | ▁█▃▃▃▂▂▃▃▄▃▁ | 2.94µs | 2.96µs | +0.5% |
-| `simd_query_batch_dot_product/simd_batch/128d_16c` | ▂▁▄█▅▄█▇▃▅▃▅ | 125.0ns | 131.8ns | +5.5% |
-| `simd_query_batch_dot_product/simd_batch/128d_256c` | ▁█▂▂▁▄▄▃▁▃▂▂ | 1.95µs | 2.01µs | +3.4% |
-| `simd_query_batch_dot_product/simd_batch/128d_4c` | ▄▁▄▇▄█▇▆▅█▅▆ | 39.6ns | 45.2ns | +14.0% |
-| `simd_query_batch_dot_product/simd_batch/128d_64c` | ▂▁▄▆▃▆█▅▃█▆▆ | 464.0ns | 511.6ns | +10.3% |
-| `simd_query_batch_dot_product/simd_batch/384d_16c` | ▃▁▄▃▅██▅▃▆▃▄ | 217.0ns | 249.7ns | +15.0% |
-| `simd_query_batch_dot_product/simd_batch/384d_256c` | ▁█▆▄▆▄▃▄▂▁▃▅ | 4.91µs | 5.33µs | +8.6% |
-| `simd_query_batch_dot_product/simd_batch/384d_4c` | ▄▁▆▅▅▇█▆▅▇▂▄ | 63.3ns | 72.9ns | +15.2% |
-| `simd_query_batch_dot_product/simd_batch/384d_64c` | ▁█▂▂▁▅▆▁▁▄▁▂ | 1.11µs | 1.13µs | +2.0% |
-| `simd_query_batch_dot_product/simd_batch/768d_16c` | ▁▇▄▁▃▆▇▂▂█▁▂ | 529.8ns | 536.5ns | +1.3% |
-| `simd_query_batch_dot_product/simd_batch/768d_256c` | ▇▄▄▆▄▁▂██▁█▇ | 9.58µs | 13.44µs | +40.3% |
-| `simd_query_batch_dot_product/simd_batch/768d_4c` | ▁▁▅▂▆▄▆▄▄█▄▄ | 119.6ns | 132.5ns | +10.8% |
-| `simd_query_batch_dot_product/simd_batch/768d_64c` | ▁█▂▁▂▃▃▁▁▄▂▁ | 2.13µs | 2.15µs | +0.7% |
-| `simd_squared_euclidean_fast_path/euclidean_full/1024` | ▁▃▄██▂▆▄▄▆█▄ | 56.4ns | 67.3ns | +19.3% |
-| `simd_squared_euclidean_fast_path/euclidean_full/384` | █▁███▇▇▇█▇▇▃ | 28.3ns | 30.3ns | +7.1% |
-| `simd_squared_euclidean_fast_path/euclidean_full/768` | ▄▂▄██▁▁▄▄▅▄▄ | 47.4ns | 54.4ns | +14.7% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/1024` | ▁▅▄██▂▆▄▄▆█▄ | 51.4ns | 62.7ns | +22.1% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/384` | █▅▇██▇▇██▆█▁ | 25.3ns | 25.3ns | +0.0% |
-| `simd_squared_euclidean_fast_path/squared_euclidean/768` | ▄▄▄██▁▁▄▄▅▄▄ | 42.3ns | 49.8ns | +17.7% |
-| `simd_throughput_384/cosine_similarity` | █▁▇▇▇▇█▇██▇█ | 31.1ns | 45.5ns | +46.3% |
-| `simd_throughput_384/dot_product` | ▅▁▅▅▅▅▇▅▅▇▅█ | 21.6ns | 33.6ns | +55.7% |
-| `simd_throughput_384/euclidean_distance` | ▅▁▅▅▅█▇▅▅▇▅▇ | 25.4ns | 39.6ns | +55.8% |
-| `simd_throughput_384/normalize` | ▅█▄█▄▆▅▄▅▆▃▁ | 96.1ns | 96.1ns | +0.0% |
-| `softmax_attention/128` | ▂█▂▂▂▄▄▁▁▄▁▁ | 4.09µs | 4.09µs | +0.0% |
-| `softmax_attention/512` | ▂█▂▂▂▄▄▁▁▄▁▁ | 60.58µs | 60.58µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/10` | ▁ | 1.23µs | 1.23µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/100` | ▁ | 12.22µs | 12.22µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_batch_prepared/1000` | ▁ | 122.28µs | 122.28µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/10` | ▁ | 23.83µs | 23.83µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/100` | ▁ | 227.72µs | 227.72µs | +0.0% |
-| `tier_prepared_batch_sizes/int4_query_per_call/1000` | ▁ | 2.27ms | 2.27ms | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/10` | ▁ | 180.9ns | 180.9ns | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/100` | ▁ | 1.71µs | 1.71µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_batch_prepared/1000` | ▁ | 16.92µs | 16.92µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/10` | ▁ | 20.07µs | 20.07µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/100` | ▁ | 219.76µs | 219.76µs | +0.0% |
-| `tier_prepared_batch_sizes/int8_query_per_call/1000` | ▁ | 2.20ms | 2.20ms | +0.0% |
-| `tier_prepared_query/binary_query_once_1000` | ▇▁▇█▇▇▆▇▆▇▆▇ | 43.80µs | 48.76µs | +11.3% |
-| `tier_prepared_query/binary_query_per_call_1000` | ▁▇▄▁▂██▁▁▅▁▁ | 827.35µs | 832.72µs | +0.6% |
-| `tier_prepared_query/int4_query_once_1000` | ███████████▁ | 123.09µs | 123.09µs | +0.0% |
-| `tier_prepared_query/int4_query_per_call_1000` | ▄▇▅▅▅▅▅██▅█▁ | 2.28ms | 2.28ms | +0.0% |
-| `tier_prepared_query/int8_query_once_1000` | ▇▁▇▇▇▄▅█▇▄██ | 16.67µs | 18.56µs | +11.3% |
-| `tier_prepared_query/int8_query_per_call_1000` | ▁█▃▁▁▅▄▃▁▅▁▃ | 1.99ms | 2.19ms | +10.5% |
+| `add_bias_gelu/4096` | ▄▂▃▃▃██▁▁█▁▁▇ | 1.72µs | 1.91µs | +10.9% |
+| `add_bias_gelu/896` | ▂▅▂▂▁██▁▁█▁▁█ | 375.5ns | 418.6ns | +11.5% |
+| `binary_cosine_distance/binary/1024` | ▇▁▇████▇▇█▇▇█ | 103.1ns | 112.7ns | +9.3% |
+| `binary_cosine_distance/binary/1536` | ▇▁▇▇▇█▇▇▇▇▇▇▇ | 151.9ns | 163.3ns | +7.5% |
+| `binary_cosine_distance/binary/384` | █▁███████████ | 41.9ns | 49.7ns | +18.6% |
+| `binary_cosine_distance/binary/768` | █▁▇▇███▇▇█▇▇█ | 78.7ns | 88.0ns | +11.8% |
+| `binary_cosine_distance/float32_simd/1024` | ▂█▂▂▂▆▆▂▂▆▂▁▆ | 81.1ns | 86.8ns | +7.0% |
+| `binary_cosine_distance/float32_simd/1536` | ▁█▂▁▁▅▅▁▁▅▁▁▅ | 112.3ns | 120.7ns | +7.4% |
+| `binary_cosine_distance/float32_simd/384` | █▁██████▇█▇██ | 36.9ns | 44.9ns | +21.7% |
+| `binary_cosine_distance/float32_simd/768` | ▁▆▂▅▆▅▄▃▁█▁▁▄ | 65.9ns | 68.8ns | +4.4% |
+| `elementwise_mul/4096` | ██████▂▁▁▁▁▁▁ | 204.4ns | 204.4ns | +0.0% |
+| `gelu/4096` | ▁█▁▁▁▆▆▁▁▆▁▁▆ | 1.63µs | 1.84µs | +12.5% |
+| `gelu/896` | ▁▂▁▁▁██▂▂█▁▁█ | 357.5ns | 398.4ns | +11.4% |
+| `int4_cosine_distance/float32_simd/1024` | ▅▁▅▅▅▆▆▅▅█▅▅▆ | 68.6ns | 86.6ns | +26.2% |
+| `int4_cosine_distance/float32_simd/1536` | ▆▁▆▆▆██▆▆█▆▅█ | 96.0ns | 119.6ns | +24.6% |
+| `int4_cosine_distance/float32_simd/384` | ▇▁▆█▆▆███▇▆▆▇ | 38.4ns | 45.9ns | +19.6% |
+| `int4_cosine_distance/float32_simd/768` | ▃▃▂▂▃▇▆▂▁▇▂█▆ | 66.4ns | 69.8ns | +5.0% |
+| `int4_cosine_distance/int4/1024` | ███████████▁▁ | 302.1ns | 330.8ns | +9.5% |
+| `int4_cosine_distance/int4/1536` | ███████████▁▁ | 442.8ns | 484.9ns | +9.5% |
+| `int4_cosine_distance/int4/384` | ███████████▁▁ | 126.2ns | 136.3ns | +8.0% |
+| `int4_cosine_distance/int4/768` | █████████▇█▁▁ | 232.0ns | 252.5ns | +8.8% |
+| `int8_batch_cosine/float32_simd/10` | ▇▁▇▇▇▆▅▇▇▆█▇▅ | 353.9ns | 399.8ns | +13.0% |
+| `int8_batch_cosine/float32_simd/100` | ▆█▁▃▄▁▁▄▂▁▂▃▁ | 4.30µs | 4.31µs | +0.1% |
+| `int8_batch_cosine/float32_simd/1000` | ▁█▁▁▁▁▁▁▁▁▁▁▁ | 54.14µs | 57.53µs | +6.2% |
+| `int8_batch_cosine/int8_loop/10` | ▇▁██▇▆▅▇█▆▇▇▅ | 153.2ns | 169.1ns | +10.4% |
+| `int8_batch_cosine/int8_loop/100` | ▇▁█▇▇▄▅▆▇▅▆▆▄ | 1.59µs | 1.69µs | +5.9% |
+| `int8_batch_cosine/int8_loop/1000` | ▆▁▆▆▇▄▃▇█▃▆▆▄ | 16.55µs | 18.19µs | +9.9% |
+| `int8_prepared_dot_product/per_call/1024` | ▃█▃▃▃▅▅▃▁▄▁▃▄ | 5.25µs | 6.22µs | +18.6% |
+| `int8_prepared_dot_product/per_call/127` | ▁█▁▁▁▃▃▁▁▃▁▁▃ | 732.6ns | 778.7ns | +6.3% |
+| `int8_prepared_dot_product/per_call/128` | ▂█▂▃▂▄▄▂▁▄▂▃▄ | 699.7ns | 787.7ns | +12.6% |
+| `int8_prepared_dot_product/per_call/129` | ▁█▁▂▂▃▃▂▁▃▂▂▃ | 734.4ns | 790.7ns | +7.7% |
+| `int8_prepared_dot_product/per_call/384` | ▂█▃▃▂▄▄▃▁▄▂▂▄ | 1.98µs | 2.33µs | +17.9% |
+| `int8_prepared_dot_product/per_call/768` | ▃█▃▃▃▄▅▂▁▄▃▂▄ | 3.93µs | 4.67µs | +19.0% |
+| `int8_prepared_dot_product/prepared/1024` | ▇▁█▇▇██▇▇█▇▇█ | 28.5ns | 35.0ns | +23.1% |
+| `int8_prepared_dot_product/prepared/127` | ▃█▂▃▃▁▁▃▃▁▃▃▁ | 16.2ns | 16.3ns | +0.3% |
+| `int8_prepared_dot_product/prepared/128` | ▇▅█▆▆▁▁▆▇▁▆▇▂ | 8.9ns | 9.0ns | +1.5% |
+| `int8_prepared_dot_product/prepared/129` | █▆█▇█▁▁▆█▁▆█▁ | 9.4ns | 9.5ns | +0.9% |
+| `int8_prepared_dot_product/prepared/384` | █▁▆▆▆▆▆▇▆▆▆▆▇ | 14.1ns | 15.8ns | +12.3% |
+| `int8_prepared_dot_product/prepared/768` | ▇▁██▇▅▆█▇▅█▇▆ | 21.6ns | 27.0ns | +25.2% |
+| `int8_quantization/quantize/1024` | ▁█▃▁▃▅▄▂▁▄▁▃▄ | 5.23µs | 6.21µs | +18.9% |
+| `int8_quantization/quantize/1536` | ▂█▂▃▁▅▄▁▁▄▁▃▅ | 7.80µs | 9.35µs | +19.8% |
+| `int8_quantization/quantize/384` | ▁█▁▁▂▄▄▂▁▄▁▂▄ | 1.98µs | 2.33µs | +17.6% |
+| `int8_quantization/quantize/768` | ▁█▃▂▃▄▄▂▁▄▁▂▄ | 3.95µs | 4.65µs | +17.7% |
+| `int8_raw_dot_product/dot_product_i8/1024` | ▇▁█▇▇▇██▆▇▇▆▇ | 31.3ns | 34.7ns | +10.7% |
+| `int8_raw_dot_product/dot_product_i8/127` | ▃█▂▃▃▁▁▃▄▂▃▃▁ | 16.3ns | 16.3ns | +0.0% |
+| `int8_raw_dot_product/dot_product_i8/128` | █▄▇▇█▁▂▆▇▁▇▆▂ | 8.8ns | 9.1ns | +2.7% |
+| `int8_raw_dot_product/dot_product_i8/129` | ▇▄█▅▆▁▂▅▇▂▅▆▂ | 9.3ns | 9.5ns | +2.5% |
+| `int8_raw_dot_product/dot_product_i8/384` | ▇▁▇▇▇██▇██▇▇█ | 13.6ns | 15.6ns | +14.8% |
+| `int8_raw_dot_product/dot_product_i8/768` | █▁▇█▇▅▅▇▇▅█▇▅ | 21.0ns | 26.6ns | +26.8% |
+| `int8_raw_dot_product/dot_product_i8_raw/1024` | ▇▁▇▆▇█▇▇▆▆▇▆▆ | 24.9ns | 30.6ns | +23.0% |
+| `int8_raw_dot_product/dot_product_i8_raw/127` | ▁█▁▁▁▂▂▁▁▂▁▁▂ | 13.6ns | 14.2ns | +4.8% |
+| `int8_raw_dot_product/dot_product_i8_raw/128` | ▇▁█▅▇▃▄▆▇▃▆▇▂ | 6.6ns | 6.7ns | +2.3% |
+| `int8_raw_dot_product/dot_product_i8_raw/129` | ▇▂█▆▇▁▃▆▇▁▅▇▂ | 7.2ns | 7.2ns | +0.5% |
+| `int8_raw_dot_product/dot_product_i8_raw/384` | ▇▁▆▆▇██▇▇█▆▇█ | 11.3ns | 13.5ns | +19.3% |
+| `int8_raw_dot_product/dot_product_i8_raw/768` | █▁▇█▇▆▆▇▇▆█▇▆ | 18.8ns | 24.0ns | +27.7% |
+| `int8_vs_float32_cosine/float32_simd/1024` | ▂█▃▃▂▆▆▂▂▅▁▂▆ | 80.4ns | 85.8ns | +6.7% |
+| `int8_vs_float32_cosine/float32_simd/1536` | ▄▁▄▆▅▆▆▅▄█▅▄▆ | 96.5ns | 119.4ns | +23.8% |
+| `int8_vs_float32_cosine/float32_simd/384` | █▁▇▇▇▆▇▇▇▇▆▇▇ | 39.1ns | 44.2ns | +12.9% |
+| `int8_vs_float32_cosine/float32_simd/768` | ▃█▄▁▃▇▇█▂▇▃▃▇ | 65.0ns | 69.0ns | +6.2% |
+| `int8_vs_float32_cosine/int8/1024` | ▇▁█▇▇█▇▇▇▇▇▇█ | 31.4ns | 39.5ns | +25.5% |
+| `int8_vs_float32_cosine/int8/1536` | ▇▁▇▆▆██▆▇█▆▆█ | 41.5ns | 51.2ns | +23.6% |
+| `int8_vs_float32_cosine/int8/384` | █▁█▇▇▇▇▇█▇██▇ | 14.8ns | 18.1ns | +22.4% |
+| `int8_vs_float32_cosine/int8/768` | ▇▁█▇▇▅▅▇█▅█▇▅ | 24.0ns | 29.3ns | +21.8% |
+| `layer_norm/4096` | ▂▁▂▂▂▄█▄▄▆▆▅▆ | 689.5ns | 919.3ns | +33.3% |
+| `layer_norm/896` | ▂▃█▃▃▃▆▁▁▂▁▁▂ | 154.9ns | 169.9ns | +9.7% |
+| `memory_size/search_1000_float32` | ▃█▃▃▃▂▁▃▃▂▃▃▁ | 40.05µs | 40.05µs | +0.0% |
+| `memory_size/search_1000_int8` | █▁▇█▇▅▅▆▆▅▆▇▅ | 14.42µs | 15.66µs | +8.6% |
+| `rms_norm/4096` | ▁█▁▁▁▁▁▁▁▁▁▁▁ | 705.1ns | 801.3ns | +13.6% |
+| `rms_norm/896` | ▁█▁▁▁▁▁▁▁▁▁▁▁ | 206.6ns | 225.6ns | +9.2% |
+| `silu_inplace/4096` | ▂▄▁▁▁█▇▁▁▇▁▁▇ | 12.42µs | 13.91µs | +12.0% |
+| `silu_inplace/896` | ▂▃▁▁▁█▇▁▁▇▁▁▇ | 2.70µs | 3.01µs | +11.3% |
+| `simd_batch_cosine/scalar_loop/10` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 9.86µs | 10.75µs | +9.0% |
+| `simd_batch_cosine/scalar_loop/100` | ▁█▁▁▁▅▄▁▁▄▁▁▄ | 98.44µs | 107.32µs | +9.0% |
+| `simd_batch_cosine/scalar_loop/1000` | ▁█▁▁▁▄▄▁▁▄▁▁▄ | 987.39µs | 1.08ms | +9.3% |
+| `simd_batch_cosine/simd_batch/10` | █▁█▇█▆▆██▇▇█▆ | 340.7ns | 408.7ns | +19.9% |
+| `simd_batch_cosine/simd_batch/100` | ▄█▂▃▃▂▁▄▂▁▂▃▂ | 4.25µs | 4.32µs | +1.6% |
+| `simd_batch_cosine/simd_batch/1000` | ▂█▁▁▁▂▁▁▁▂▁▁▂ | 53.55µs | 57.64µs | +7.6% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c` | ▂█▁▂▂▁▂▁▁▂▂▁▂ | 84.06µs | 89.33µs | +6.3% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c` | ▂█▁▂▂▂▂▁▁▂▂▁▂ | 1.30µs | 1.37µs | +5.7% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c` | ▃█▁▃▃▂▃▁▂▃▃▂▃ | 21.62µs | 23.13µs | +7.0% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c` | ▃█▁▃▃▂▅▁▂▆▄▁▄ | 327.9ns | 349.7ns | +6.7% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c` | ▃█▁▂▂▂▂▁▁▂▂▁▂ | 5.18µs | 5.49µs | +6.0% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c` | ▃█▂▃▂▂▁▃▂▁▂▂▁ | 41.09µs | 41.30µs | +0.5% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_16c` | █▁▇█▇▅▆█▇▅▇▇▅ | 591.4ns | 649.6ns | +9.8% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_256c` | █▇▇▆▆▂▁▆▇▁▄▆▂ | 10.16µs | 10.23µs | +0.7% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_4c` | █▁▇▇▇▂▃█▇▃▆▇▅ | 166.6ns | 174.6ns | +4.8% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/384d_64c` | ▆█▅▆▆▁▁▆▆▁▄▅▁ | 2.55µs | 2.55µs | +0.0% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c` | ▁█▁▁▁▁▁▁▁▁▁▁▁ | 67.94µs | 70.78µs | +4.2% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_16c` | ▁█▁▂▂▁▂▂▁▂▁▁▂ | 1.05µs | 1.09µs | +3.9% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_256c` | ▂█▂▃▃▁▁▃▂▂▁▂▂ | 17.34µs | 17.77µs | +2.5% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_4c` | ▂█▂▃▃▂▅▂▁▅▁▁▄ | 266.4ns | 278.4ns | +4.5% |
+| `simd_batch_cosine_non_normalized_query/pair_loop/768d_64c` | ▁█▁▂▂▁▂▂▁▂▁▁▂ | 4.15µs | 4.34µs | +4.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c` | ▂█▁▂▁▁▂▁▁▂▂▁▂ | 82.63µs | 88.74µs | +7.4% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c` | ▂█▁▂▂▂▃▁▁▃▂▁▂ | 1.27µs | 1.36µs | +7.0% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c` | ▂█▂▃▂▂▃▁▂▃▃▂▂ | 21.24µs | 22.35µs | +5.2% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c` | ▃█▂▄▂▃▅▁▂▆▄▁▆ | 319.7ns | 348.1ns | +8.9% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c` | ▃█▁▂▂▂▃▁▁▂▂▁▃ | 5.08µs | 5.46µs | +7.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c` | ▃█▃▃▂▁▁▃▃▁▂▂▂ | 39.93µs | 40.73µs | +2.0% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_16c` | █▁▇█▇▆▆█▇▆▇▇▆ | 558.7ns | 639.6ns | +14.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_256c` | ▇█▅▆▅▂▁▆▅▁▄▅▂ | 10.00µs | 10.15µs | +1.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_4c` | █▁▇█▇▇▇█▇▇▇▇█ | 151.3ns | 171.6ns | +13.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/384d_64c` | ▅█▄▆▅▁▁▆▅▁▃▄▂ | 2.51µs | 2.53µs | +0.8% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c` | ▁█▁▁▁▁▁▁▁▁▁▁▁ | 66.71µs | 69.29µs | +3.9% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_16c` | ▁█▁▂▂▁▃▂▁▂▁▁▂ | 1.03µs | 1.07µs | +4.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_256c` | ▂█▂▃▃▁▁▃▂▂▁▂▂ | 17.13µs | 17.46µs | +1.9% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_4c` | ▁█▂▄▄▂▆▃▂█▁▁▆ | 259.2ns | 276.1ns | +6.5% |
+| `simd_batch_cosine_non_normalized_query/simd_batch/768d_64c` | ▁█▁▂▂▁▂▂▁▂▁▁▃ | 4.09µs | 4.33µs | +5.9% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c` | ▁█▁▂▁▁▁▁▁▁▁▁▁ | 84.32µs | 86.55µs | +2.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c` | ▁█▁▂▁▂▁▁▁▂▂▁▁ | 1.30µs | 1.32µs | +2.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c` | ▂█▁▂▁▂▂▁▁▂▃▂▁ | 21.56µs | 22.07µs | +2.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c` | ▂█▂▃▂▂▂▁▁▄▃▁▂ | 326.8ns | 334.7ns | +2.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c` | ▁█▁▂▁▂▁▁▁▂▂▁▁ | 5.18µs | 5.26µs | +1.7% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c` | ▃█▃▃▃▁▂▃▃▁▃▂▁ | 40.49µs | 40.55µs | +0.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c` | █▁▇▇▇▄▄▇█▅▇▇▅ | 595.5ns | 646.8ns | +8.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c` | █▇▆▇▇▂▂▆▆▂▇▆▁ | 10.09µs | 10.09µs | +0.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c` | ▇▁▇▇█▃▃██▄▇▇▃ | 163.4ns | 168.2ns | +2.9% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c` | ▆█▆▆▆▁▂▆▆▂▅▅▁ | 2.52µs | 2.53µs | +0.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c` | ▁█▂▁▂▁▁▂▁▁▂▁▁ | 68.27µs | 69.87µs | +2.3% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c` | ▁█▃▁▂▁▂▂▂▂▂▂▂ | 1.05µs | 1.08µs | +2.7% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c` | ▂█▃▂▂▁▂▃▂▁▃▃▂ | 17.33µs | 17.68µs | +2.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c` | ▂█▅▁▄▁▅▅▅▅▄▄▄ | 267.2ns | 273.8ns | +2.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c` | ▁█▂▁▂▁▂▂▂▂▂▂▂ | 4.18µs | 4.36µs | +4.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c` | ▂█▁▂▂▁▁▁▁▂▂▂▁ | 68.07µs | 73.16µs | +7.5% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c` | ▁█▁▃▁▃▂▁▁▅▃▁▂ | 955.0ns | 1.06µs | +11.5% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c` | ▃█▂▃▁▂▁▂▃▄▄▃▂ | 17.50µs | 18.28µs | +4.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c` | ▃▇▂▆▃▃▃▂▁█▆▂▄ | 226.1ns | 271.9ns | +20.2% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c` | ▁█▁▃▁▃▂▁▁▄▃▁▂ | 3.77µs | 4.15µs | +10.1% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c` | ▁█▁▂▂▂▃▂▂▃▂▁▂ | 29.53µs | 31.72µs | +7.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c` | ▁▆▁▅▄▅▇▅▅█▅▂▄ | 410.9ns | 470.0ns | +14.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c` | ▁█▂▄▄▃▅▃▃▅▃▁▃ | 7.03µs | 7.64µs | +8.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c` | ▁▄▁▄▄▅█▅▅█▅▁▄ | 113.9ns | 127.4ns | +11.8% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c` | ▁█▁▃▃▃▅▃▃▅▃▁▃ | 1.71µs | 1.89µs | +10.6% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c` | ▁█▂▁▂▁▂▁▂▂▁▂▂ | 55.75µs | 61.88µs | +11.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c` | ▁█▄▁▄▃▅▄▄▅▃▄▅ | 749.2ns | 951.8ns | +27.0% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c` | ▂█▄▁▃▁▃▃▃▃▃▄▄ | 13.59µs | 15.41µs | +13.4% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c` | ▁▅▅▁▅▄█▅▅█▅▅▇ | 186.8ns | 238.7ns | +27.8% |
+| `simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c` | ▁█▃▁▃▂▄▃▃▄▃▃▅ | 2.96µs | 3.79µs | +28.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_1000c` | ▁█▁▂▁▁▁▁▁▁▂▁▁ | 82.74µs | 85.61µs | +3.5% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_16c` | ▁█▁▂▁▂▂▁▁▃▂▁▂ | 1.27µs | 1.31µs | +3.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_256c` | ▂█▂▃▂▂▂▁▂▂▃▂▂ | 21.11µs | 21.87µs | +3.6% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_4c` | ▂█▁▃▁▃▃▁▂▆▃▁▃ | 320.1ns | 331.9ns | +3.7% |
+| `simd_batch_cosine_normalized_query/simd_batch/1024d_64c` | ▂█▁▂▁▂▂▁▁▂▂▁▂ | 5.06µs | 5.21µs | +3.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_1000c` | ▃█▂▃▃▁▁▂▃▁▃▂▁ | 39.44µs | 39.88µs | +1.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_16c` | ▇▁▇▇█▅▅▇▇▆▇▇▆ | 552.0ns | 635.3ns | +15.1% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_256c` | ▆█▄▅▆▁▁▅▅▁▅▄▁ | 9.95µs | 9.95µs | +0.0% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_4c` | ▇▁▆▇█▅▅██▆▇▇▅ | 155.9ns | 165.3ns | +6.0% |
+| `simd_batch_cosine_normalized_query/simd_batch/384d_64c` | ▅█▅▅▆▁▂▅▅▂▄▄▁ | 2.47µs | 2.47µs | +0.0% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_1000c` | ▁█▂▁▂▁▁▂▂▁▂▁▁ | 67.36µs | 69.16µs | +2.7% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_16c` | ▂█▃▁▃▂▃▃▃▃▂▂▃ | 1.03µs | 1.07µs | +4.8% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_256c` | ▂█▃▁▃▁▂▂▂▁▃▂▁ | 17.17µs | 17.41µs | +1.4% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_4c` | ▁▁▅▄▄▄█▅▆▇▄▄▆ | 260.4ns | 270.6ns | +3.9% |
+| `simd_batch_cosine_normalized_query/simd_batch/768d_64c` | ▁█▂▁▂▁▃▂▂▂▂▂▂ | 4.10µs | 4.29µs | +4.7% |
+| `simd_batch_dot_product/scalar_loop/10` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 3.28µs | 3.61µs | +10.3% |
+| `simd_batch_dot_product/scalar_loop/100` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 32.92µs | 36.22µs | +10.0% |
+| `simd_batch_dot_product/scalar_loop/1000` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 336.20µs | 371.18µs | +10.4% |
+| `simd_batch_dot_product/simd_batch/10` | ▁▄▃▃▄▇▆▁▁█▆▂▇ | 276.3ns | 302.6ns | +9.5% |
+| `simd_batch_dot_product/simd_batch/100` | ▃█▄▆▅▃▃▂▁▃▁▃▃ | 3.33µs | 3.65µs | +9.5% |
+| `simd_batch_dot_product/simd_batch/1000` | ▂█▂▂▁▂▁▃▂▂▂▁▂ | 45.62µs | 49.72µs | +9.0% |
+| `simd_cosine_similarity/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 2.79µs | 3.12µs | +11.6% |
+| `simd_cosine_similarity/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 4.23µs | 4.74µs | +12.2% |
+| `simd_cosine_similarity/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 995.2ns | 1.09µs | +9.3% |
+| `simd_cosine_similarity/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 2.08µs | 2.30µs | +11.0% |
+| `simd_cosine_similarity/simd/1024` | ▁▄▄▄▁█▄▄▅█▄▁█ | 81.2ns | 90.9ns | +11.9% |
+| `simd_cosine_similarity/simd/1536` | ▆▁▆▆▆██▆▆█▆▆█ | 94.8ns | 119.4ns | +25.9% |
+| `simd_cosine_similarity/simd/384` | █▁█▇█▇▇▇▇▇▆▆▇ | 41.8ns | 44.0ns | +5.3% |
+| `simd_cosine_similarity/simd/768` | ▂▆▂▁▂██▁▂█▁▂█ | 66.1ns | 69.1ns | +4.5% |
+| `simd_dot_product/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 934.5ns | 1.04µs | +11.8% |
+| `simd_dot_product/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 1.41µs | 1.59µs | +12.2% |
+| `simd_dot_product/scalar/384` | ▁█▁▁▁▆▆▁▁▆▁▁▆ | 337.5ns | 370.1ns | +9.7% |
+| `simd_dot_product/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 695.8ns | 775.8ns | +11.5% |
+| `simd_dot_product/simd/1024` | ▆▁▆▅▆▇▇▅█▇▆▅▇ | 56.0ns | 65.8ns | +17.5% |
+| `simd_dot_product/simd/1536` | ▇▄▇▁▇▃█▆▁█▁▇▇ | 69.8ns | 97.0ns | +38.9% |
+| `simd_dot_product/simd/384` | ▃█▃▃▃▁▁▃▃▁▃▃▁ | 27.3ns | 27.6ns | +0.9% |
+| `simd_dot_product/simd/768` | ▇▆▄▇▇██▁▇▁▇▁▁ | 40.1ns | 40.6ns | +1.4% |
+| `simd_euclidean_distance/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 941.6ns | 1.06µs | +12.6% |
+| `simd_euclidean_distance/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 1.42µs | 1.59µs | +12.3% |
+| `simd_euclidean_distance/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 343.9ns | 380.5ns | +10.7% |
+| `simd_euclidean_distance/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 702.6ns | 786.3ns | +11.9% |
+| `simd_euclidean_distance/simd/1024` | ▄▃▇▁▇▅▅▄▄█▄▄█ | 56.4ns | 84.1ns | +49.1% |
+| `simd_euclidean_distance/simd/1536` | ▄█▄▄▄▆▆█▄▆▁▄▂ | 76.3ns | 82.9ns | +8.7% |
+| `simd_euclidean_distance/simd/384` | ▄▁▃▄▄▃▂▃▃▃▃█▂ | 32.6ns | 34.0ns | +4.3% |
+| `simd_euclidean_distance/simd/768` | ▄▁▄▄▄▁█▇▄▅▄▄▅ | 46.9ns | 56.5ns | +20.5% |
+| `simd_normalize/scalar/1024` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 1.05µs | 1.18µs | +12.1% |
+| `simd_normalize/scalar/1536` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 1.57µs | 1.77µs | +12.5% |
+| `simd_normalize/scalar/384` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 396.1ns | 445.0ns | +12.3% |
+| `simd_normalize/scalar/768` | ▁█▁▁▁▅▅▁▁▅▁▁▅ | 787.5ns | 887.7ns | +12.7% |
+| `simd_normalize/simd/1024` | ▅█▄▂▃▁▁▃▂▁▂▃▁ | 139.7ns | 140.7ns | +0.7% |
+| `simd_normalize/simd/1536` | ▃█▃▂▂▁▁▂▂▁▂▂▁ | 195.0ns | 195.8ns | +0.4% |
+| `simd_normalize/simd/384` | ▅▅▆▂▅▂▁█▂▁▂▅▁ | 68.5ns | 69.1ns | +0.8% |
+| `simd_normalize/simd/768` | ▄█▃▃▂▁▁▃▃▁▄▃▁ | 110.4ns | 110.5ns | +0.1% |
+| `simd_normalized_cosine_fast_path/cosine_full/1024` | ▆▁▆██▇█▆▆█▆▆█ | 67.6ns | 86.1ns | +27.2% |
+| `simd_normalized_cosine_fast_path/cosine_full/384` | ▇▁██▇▇▇███▇▆▇ | 34.9ns | 44.3ns | +26.9% |
+| `simd_normalized_cosine_fast_path/cosine_full/768` | ▁▂▂▇█▄▄▂▁▆▁▂▇ | 66.1ns | 69.6ns | +5.3% |
+| `simd_normalized_cosine_fast_path/dot_product/1024` | ▁▃▅██▂▆▅▅▆▄▄▆ | 50.0ns | 67.1ns | +34.2% |
+| `simd_normalized_cosine_fast_path/dot_product/384` | ▅▃██▃▁▁██▇▅▃▄ | 22.4ns | 27.3ns | +21.9% |
+| `simd_normalized_cosine_fast_path/dot_product/768` | ▄▇▄██▁▁▄▄▅▄▄▅ | 40.6ns | 51.2ns | +26.1% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/1024` | ▂█▂▂▂▃▂▂▂▁▂▁▂ | 67.45µs | 73.98µs | +9.7% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/384` | ▂█▃▂▂▂▂▃▃▃▂▁▂ | 29.34µs | 30.95µs | +5.5% |
+| `simd_prepared_query_normalized_cosine/dot_product_loop/768` | ▂█▂▂▂▂▂▂▂▂▂▁▃ | 51.81µs | 63.26µs | +22.1% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/1024` | ▂█▁▁▁▁▁▁▂▁▁▁▁ | 86.47µs | 90.21µs | +4.3% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/384` | ▃█▃▃▃▁▁▃▃▁▃▃▁ | 41.43µs | 41.44µs | +0.0% |
+| `simd_prepared_query_normalized_cosine/prepared_full_cosine/768` | ▁█▂▂▁▁▁▁▁▁▁▁▁ | 68.83µs | 69.06µs | +0.3% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/1024` | ▂█▁▂▂▁▁▂▂▂▂▂▂ | 66.37µs | 77.27µs | +16.4% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/384` | ▂█▁▁▂▁▂▁▂▁▁▂▂ | 28.27µs | 30.82µs | +9.0% |
+| `simd_prepared_query_normalized_cosine/prepared_meta_unit/768` | ▁█▁▂▁▂▂▁▁▁▂▂▁ | 52.69µs | 53.47µs | +1.5% |
+| `simd_query_batch_dot_product/pair_loop/128d_16c` | ▂▅▁█▁▆▆█▂▆▃▇▄ | 207.3ns | 222.9ns | +7.5% |
+| `simd_query_batch_dot_product/pair_loop/128d_256c` | ▁█▁▄▁▃▃▄▁▃▂▄▂ | 3.08µs | 3.30µs | +7.3% |
+| `simd_query_batch_dot_product/pair_loop/128d_4c` | ▁▅▁█▂▇▅▇▃▇▄▆▅ | 64.2ns | 71.3ns | +11.1% |
+| `simd_query_batch_dot_product/pair_loop/128d_64c` | ▂▇▂█▁▇▆█▂▇▃█▃ | 790.6ns | 837.3ns | +5.9% |
+| `simd_query_batch_dot_product/pair_loop/384d_16c` | ▄▁▄▃▆██▆▄▆▄▄█ | 355.4ns | 524.5ns | +47.6% |
+| `simd_query_batch_dot_product/pair_loop/384d_256c` | ▁▅▃▃▆██▄▁▄▂▂█ | 6.87µs | 8.46µs | +23.0% |
+| `simd_query_batch_dot_product/pair_loop/384d_4c` | ▄▁▄▄▅██▆▄▆▃▄█ | 95.6ns | 142.7ns | +49.2% |
+| `simd_query_batch_dot_product/pair_loop/384d_64c` | ▁▅▂▁▄██▅▁▄▁▁█ | 1.69µs | 2.11µs | +24.6% |
+| `simd_query_batch_dot_product/pair_loop/768d_16c` | ▁█▄▃▄▂▂▄▄▅▄▁▅ | 757.2ns | 951.3ns | +25.6% |
+| `simd_query_batch_dot_product/pair_loop/768d_256c` | ▁█▄▃▄▁▁▃▃▃▄▂▃ | 13.67µs | 15.34µs | +12.2% |
+| `simd_query_batch_dot_product/pair_loop/768d_4c` | ▁▅▆▅▆▃▃▅▅█▅▂▇ | 187.1ns | 239.0ns | +27.7% |
+| `simd_query_batch_dot_product/pair_loop/768d_64c` | ▁█▃▃▃▂▂▃▃▄▃▁▅ | 2.94µs | 3.83µs | +30.0% |
+| `simd_query_batch_dot_product/simd_batch/128d_16c` | ▃▂▅█▆▅█▇▄▅▄▆▁ | 122.5ns | 122.5ns | +0.0% |
+| `simd_query_batch_dot_product/simd_batch/128d_256c` | ▁█▂▂▁▄▄▃▁▃▂▂▃ | 1.95µs | 2.08µs | +6.8% |
+| `simd_query_batch_dot_product/simd_batch/128d_4c` | ▄▁▄▇▄█▇▆▅█▅▆▇ | 39.6ns | 47.0ns | +18.6% |
+| `simd_query_batch_dot_product/simd_batch/128d_64c` | ▂▁▄▆▃▆█▅▃█▆▆▃ | 464.0ns | 483.1ns | +4.1% |
+| `simd_query_batch_dot_product/simd_batch/384d_16c` | ▃▁▄▃▅██▅▃▆▃▄▇ | 217.0ns | 274.5ns | +26.5% |
+| `simd_query_batch_dot_product/simd_batch/384d_256c` | ▁█▆▄▆▄▃▄▂▁▃▅▂ | 4.91µs | 5.05µs | +2.7% |
+| `simd_query_batch_dot_product/simd_batch/384d_4c` | ▄▁▆▅▅▇█▆▅▇▂▄█ | 63.3ns | 82.2ns | +29.9% |
+| `simd_query_batch_dot_product/simd_batch/384d_64c` | ▁█▂▂▁▅▆▁▁▄▁▂▄ | 1.11µs | 1.24µs | +12.2% |
+| `simd_query_batch_dot_product/simd_batch/768d_16c` | ▁▇▄▁▃▆▇▂▂█▁▂▇ | 529.8ns | 598.8ns | +13.0% |
+| `simd_query_batch_dot_product/simd_batch/768d_256c` | ▇▄▄▆▄▁▂██▁█▇▁ | 9.58µs | 9.85µs | +2.8% |
+| `simd_query_batch_dot_product/simd_batch/768d_4c` | ▁▁▅▂▆▄▆▄▄█▄▄▆ | 119.6ns | 140.3ns | +17.3% |
+| `simd_query_batch_dot_product/simd_batch/768d_64c` | ▁█▂▁▂▃▃▁▁▄▂▁▄ | 2.13µs | 2.45µs | +14.9% |
+| `simd_squared_euclidean_fast_path/euclidean_full/1024` | ▁▃▄██▂▆▄▄▆█▄▆ | 56.4ns | 71.8ns | +27.3% |
+| `simd_squared_euclidean_fast_path/euclidean_full/384` | ▅▁▅▅▆▅▅▅▅▅▅▂█ | 28.3ns | 38.9ns | +37.5% |
+| `simd_squared_euclidean_fast_path/euclidean_full/768` | ▄▂▄██▁▁▄▄▅▄▄▅ | 47.4ns | 56.5ns | +19.1% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/1024` | ▁▅▄██▂▆▄▄▆█▄▆ | 51.4ns | 67.2ns | +30.7% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/384` | ▅▃▅▅▅▄▄▅▅▄▅▁█ | 25.3ns | 34.5ns | +36.7% |
+| `simd_squared_euclidean_fast_path/squared_euclidean/768` | ▄▄▄██▁▁▄▄▅▄▄▅ | 42.3ns | 52.0ns | +23.0% |
+| `simd_throughput_384/cosine_similarity` | █▁▇▇▇▇█▇██▇█▇ | 31.1ns | 44.3ns | +42.2% |
+| `simd_throughput_384/dot_product` | ▅▁▅▅▅▅▇▅▅▇▅█▄ | 21.6ns | 27.3ns | +26.6% |
+| `simd_throughput_384/euclidean_distance` | ▅▁▅▅▅█▇▅▅▇▅▇▅ | 25.4ns | 34.1ns | +34.0% |
+| `simd_throughput_384/normalize` | ▅█▄█▄▆▅▄▅▆▃▁▅ | 96.1ns | 107.7ns | +12.1% |
+| `softmax_attention/128` | ▂█▂▂▂▄▄▁▁▄▁▁▄ | 4.09µs | 4.80µs | +17.2% |
+| `softmax_attention/512` | ▂█▂▂▂▄▄▁▁▄▁▁▄ | 60.58µs | 75.59µs | +24.8% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/10` | ▁█ | 1.23µs | 1.33µs | +7.4% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/100` | ▁█ | 12.22µs | 13.16µs | +7.7% |
+| `tier_prepared_batch_sizes/int4_batch_prepared/1000` | ▁█ | 122.28µs | 131.98µs | +7.9% |
+| `tier_prepared_batch_sizes/int4_query_per_call/10` | ▁█ | 23.83µs | 24.23µs | +1.7% |
+| `tier_prepared_batch_sizes/int4_query_per_call/100` | ▁█ | 227.72µs | 242.20µs | +6.4% |
+| `tier_prepared_batch_sizes/int4_query_per_call/1000` | ▁█ | 2.27ms | 2.42ms | +6.7% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/10` | █▁ | 174.5ns | 174.5ns | +0.0% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/100` | █▁ | 1.66µs | 1.66µs | +0.0% |
+| `tier_prepared_batch_sizes/int8_batch_prepared/1000` | █▁ | 16.24µs | 16.24µs | +0.0% |
+| `tier_prepared_batch_sizes/int8_query_per_call/10` | ▁█ | 20.07µs | 23.63µs | +17.7% |
+| `tier_prepared_batch_sizes/int8_query_per_call/100` | ▁█ | 219.76µs | 233.88µs | +6.4% |
+| `tier_prepared_batch_sizes/int8_query_per_call/1000` | ▁█ | 2.20ms | 2.35ms | +6.9% |
+| `tier_prepared_query/binary_query_once_1000` | ▇▁▇█▇▇▆▇▆▇▆▇▇ | 43.80µs | 48.50µs | +10.7% |
+| `tier_prepared_query/binary_query_per_call_1000` | ▁▇▄▁▂██▁▁▅▁▁▅ | 827.35µs | 896.46µs | +8.4% |
+| `tier_prepared_query/int4_query_once_1000` | ███████████▁▁ | 123.09µs | 132.88µs | +8.0% |
+| `tier_prepared_query/int4_query_per_call_1000` | ▄▇▅▅▅▅▅██▅█▁▁ | 2.28ms | 2.43ms | +6.7% |
+| `tier_prepared_query/int8_query_once_1000` | ▇▁▇▇▇▄▅█▇▄██▃ | 16.67µs | 17.31µs | +3.8% |
+| `tier_prepared_query/int8_query_per_call_1000` | ▁█▃▁▁▅▄▃▁▅▁▃▄ | 1.99ms | 2.35ms | +18.2% |
 
 **Headlines:**
 - Worst step-regression: **+4190.3%** on `rms_norm/4096` at commit [`fff66b2`](https://github.com/ohdearquant/lattice/commit/fff66b2ec897870afd0b3f21348be6befc15d7ef) (2026-05-25T01:00:55+00:00)
@@ -564,6 +564,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 4.62µs | -0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 4.62µs | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 4.62µs | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 4.62µs | +0.01% |
 
 </details>
 
@@ -583,6 +584,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.01µs | -0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.01µs | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.02µs | +0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.01µs | -0.31% |
 
 </details>
 
@@ -602,6 +604,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 11.0ns | +0.83% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 10.8ns | -1.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 10.8ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 10.9ns | +1.07% |
 
 </details>
 
@@ -621,6 +624,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 15.3ns | +0.51% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 15.3ns | -0.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 15.3ns | -0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 15.3ns | +0.27% |
 
 </details>
 
@@ -640,6 +644,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 5.5ns | +0.29% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 5.5ns | -0.67% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 5.5ns | -0.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 5.5ns | +0.60% |
 
 </details>
 
@@ -659,6 +664,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 9.2ns | +0.72% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 9.1ns | -1.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 9.1ns | -0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 9.1ns | -0.00% |
 
 </details>
 
@@ -678,6 +684,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 129.4ns | +0.32% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 128.8ns | -0.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 129.6ns | +0.64% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 128.9ns | -0.56% |
 
 </details>
 
@@ -697,6 +704,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 186.8ns | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 186.8ns | +0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 186.8ns | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 186.7ns | -0.04% |
 
 </details>
 
@@ -716,6 +724,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 59.7ns | +0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 59.7ns | -0.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 59.7ns | -0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 59.7ns | +0.05% |
 
 </details>
 
@@ -735,6 +744,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 101.0ns | -0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 101.1ns | +0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 101.2ns | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 101.1ns | -0.16% |
 
 </details>
 
@@ -754,6 +764,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 374.0ns | +0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 370.7ns | -0.87% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 369.6ns | -0.29% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 370.9ns | +0.35% |
 
 </details>
 
@@ -773,6 +784,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 4.33µs | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 4.33µs | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 4.33µs | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 4.33µs | -0.01% |
 
 </details>
 
@@ -792,6 +804,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 948.0ns | -0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 948.1ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 948.2ns | +0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 948.1ns | -0.01% |
 
 </details>
 
@@ -811,6 +824,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 129.2ns | +0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 128.8ns | -0.32% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 129.5ns | +0.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 128.8ns | -0.58% |
 
 </details>
 
@@ -830,6 +844,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 186.8ns | -0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 186.8ns | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 186.8ns | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 186.8ns | -0.01% |
 
 </details>
 
@@ -849,6 +864,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 59.7ns | +0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 59.7ns | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 59.7ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 59.7ns | +0.03% |
 
 </details>
 
@@ -868,6 +884,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 101.1ns | -0.16% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 101.2ns | +0.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 101.2ns | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 101.1ns | -0.11% |
 
 </details>
 
@@ -887,6 +904,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 125.3ns | +0.33% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 125.2ns | -0.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 123.7ns | -1.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 123.4ns | -0.19% |
 
 </details>
 
@@ -906,6 +924,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 181.9ns | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 182.2ns | +0.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 181.3ns | -0.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 181.1ns | -0.09% |
 
 </details>
 
@@ -925,6 +944,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 54.6ns | +0.50% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 54.7ns | +0.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 53.9ns | -1.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 53.8ns | -0.29% |
 
 </details>
 
@@ -944,6 +964,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 96.4ns | -0.42% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 97.1ns | +0.69% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 95.8ns | -1.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 95.4ns | -0.39% |
 
 </details>
 
@@ -963,6 +984,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 573.1ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 572.1ns | -0.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 571.4ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 571.7ns | +0.05% |
 
 </details>
 
@@ -982,6 +1004,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.90µs | +0.25% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.89µs | -0.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.86µs | -0.46% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.90µs | +0.49% |
 
 </details>
 
@@ -1001,6 +1024,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 91.93µs | -0.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 86.61µs | -5.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 90.13µs | +4.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 91.43µs | +1.44% |
 
 </details>
 
@@ -1020,6 +1044,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 163.1ns | +0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 162.9ns | -0.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 164.1ns | +0.73% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 164.6ns | +0.27% |
 
 </details>
 
@@ -1039,6 +1064,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.72µs | +0.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.73µs | +0.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.71µs | -0.81% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.71µs | -0.32% |
 
 </details>
 
@@ -1058,6 +1084,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 21.07µs | +1.72% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 19.95µs | -5.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 20.79µs | +4.24% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 21.07µs | +1.31% |
 
 </details>
 
@@ -1077,6 +1104,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.63µs | -0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.63µs | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.64µs | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.64µs | -0.02% |
 
 </details>
 
@@ -1096,6 +1124,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 467.3ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 467.5ns | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 467.5ns | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 467.6ns | +0.03% |
 
 </details>
 
@@ -1115,6 +1144,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 459.6ns | +0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 459.6ns | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 459.4ns | -0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 459.5ns | +0.03% |
 
 </details>
 
@@ -1134,6 +1164,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 466.9ns | +0.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 466.7ns | -0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 467.1ns | +0.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 467.1ns | +0.00% |
 
 </details>
 
@@ -1153,6 +1184,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.37µs | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.37µs | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.37µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.37µs | -0.01% |
 
 </details>
 
@@ -1172,6 +1204,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.73µs | -0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.73µs | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.73µs | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.73µs | +0.01% |
 
 </details>
 
@@ -1191,6 +1224,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 30.9ns | +0.74% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 31.0ns | +0.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 31.1ns | +0.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 31.1ns | -0.10% |
 
 </details>
 
@@ -1210,6 +1244,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 12.0ns | +0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 12.1ns | +0.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 12.3ns | +1.94% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 12.3ns | +0.03% |
 
 </details>
 
@@ -1229,6 +1264,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.5ns | +0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.5ns | -0.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.7ns | +2.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.6ns | -0.66% |
 
 </details>
 
@@ -1248,6 +1284,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 9.0ns | +0.14% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 9.0ns | +0.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 9.1ns | +1.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 9.1ns | -0.60% |
 
 </details>
 
@@ -1267,6 +1304,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 14.4ns | +0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 14.4ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.8ns | +3.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.7ns | -0.88% |
 
 </details>
 
@@ -1286,6 +1324,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 24.4ns | -1.88% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 24.2ns | -0.95% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 24.9ns | +2.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 24.7ns | -0.46% |
 
 </details>
 
@@ -1305,6 +1344,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.61µs | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.61µs | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.61µs | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.61µs | -0.02% |
 
 </details>
 
@@ -1324,6 +1364,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 5.44µs | -0.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 5.44µs | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 5.44µs | +0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 5.45µs | +0.21% |
 
 </details>
 
@@ -1343,6 +1384,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.35µs | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.36µs | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.35µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.35µs | -0.01% |
 
 </details>
 
@@ -1362,6 +1404,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.71µs | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.71µs | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.71µs | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.71µs | +0.00% |
 
 </details>
 
@@ -1381,6 +1424,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 30.7ns | +1.36% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 30.1ns | -2.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 30.5ns | +1.40% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 30.6ns | +0.51% |
 
 </details>
 
@@ -1400,6 +1444,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 11.7ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 11.8ns | +0.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 11.9ns | +1.40% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 11.9ns | -0.06% |
 
 </details>
 
@@ -1419,6 +1464,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.1ns | -1.38% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.1ns | +0.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.2ns | +1.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.1ns | -1.60% |
 
 </details>
 
@@ -1438,6 +1484,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.5ns | -0.54% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.5ns | -0.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.6ns | +1.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.5ns | -0.52% |
 
 </details>
 
@@ -1457,6 +1504,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 13.8ns | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 13.8ns | +0.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.1ns | +1.96% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.1ns | -0.42% |
 
 </details>
 
@@ -1476,6 +1524,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 23.7ns | -2.70% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 23.9ns | +0.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 24.3ns | +1.76% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 24.2ns | -0.31% |
 
 </details>
 
@@ -1495,6 +1544,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 28.2ns | -0.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 28.1ns | -0.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 28.1ns | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 28.1ns | +0.11% |
 
 </details>
 
@@ -1514,6 +1564,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 10.1ns | -0.25% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 10.0ns | -0.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 10.1ns | +0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 10.1ns | -0.10% |
 
 </details>
 
@@ -1533,6 +1584,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.4ns | -0.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.4ns | -0.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.6ns | +2.45% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.6ns | +0.01% |
 
 </details>
 
@@ -1552,6 +1604,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 7.1ns | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 7.1ns | +0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 7.2ns | +0.95% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 7.2ns | -0.12% |
 
 </details>
 
@@ -1571,6 +1624,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 12.4ns | -0.39% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 12.4ns | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 12.4ns | -0.20% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 12.4ns | -0.09% |
 
 </details>
 
@@ -1590,6 +1644,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 21.9ns | -0.86% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 21.9ns | +0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 22.0ns | +0.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 21.9ns | -0.04% |
 
 </details>
 
@@ -1609,6 +1664,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 129.1ns | -0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 128.9ns | -0.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 129.2ns | +0.29% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 129.2ns | +0.01% |
 
 </details>
 
@@ -1628,6 +1684,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 185.1ns | +0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 185.3ns | +0.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 185.0ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 185.1ns | +0.04% |
 
 </details>
 
@@ -1647,6 +1704,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.5ns | -0.25% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.0ns | -0.81% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.0ns | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.6ns | +0.98% |
 
 </details>
 
@@ -1666,6 +1724,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 99.4ns | -0.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 99.6ns | +0.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 99.6ns | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 99.5ns | -0.06% |
 
 </details>
 
@@ -1685,6 +1744,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 33.1ns | +0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 32.9ns | -0.56% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 33.6ns | +2.10% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 33.3ns | -0.88% |
 
 </details>
 
@@ -1704,6 +1764,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 45.9ns | +0.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 45.6ns | -0.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 46.1ns | +1.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 45.8ns | -0.66% |
 
 </details>
 
@@ -1723,6 +1784,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 15.7ns | +0.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 15.9ns | +1.53% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 16.4ns | +3.10% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 16.3ns | -0.68% |
 
 </details>
 
@@ -1742,6 +1804,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 26.5ns | -0.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 26.5ns | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 26.8ns | +0.96% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 27.3ns | +2.07% |
 
 </details>
 
@@ -1761,6 +1824,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.27µs | +0.35% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.27µs | -0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.28µs | +0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.27µs | -0.23% |
 
 </details>
 
@@ -1780,6 +1844,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 289.4ns | -0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 289.8ns | +0.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 289.7ns | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 289.5ns | -0.07% |
 
 </details>
 
@@ -1799,6 +1864,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 57.29µs | -0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 56.90µs | -0.68% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 57.29µs | +0.68% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 57.43µs | +0.24% |
 
 </details>
 
@@ -1818,6 +1884,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 15.71µs | +7.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 15.09µs | -3.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 15.27µs | +1.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 15.05µs | -1.42% |
 
 </details>
 
@@ -1837,6 +1904,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 582.4ns | +0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 581.5ns | -0.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 580.9ns | -0.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 580.6ns | -0.05% |
 
 </details>
 
@@ -1856,6 +1924,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 136.6ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 137.3ns | +0.48% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 136.6ns | -0.50% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 136.7ns | +0.12% |
 
 </details>
 
@@ -1875,6 +1944,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 4.91µs | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 4.91µs | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 4.91µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 4.91µs | -0.02% |
 
 </details>
 
@@ -1894,6 +1964,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.07µs | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.08µs | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.08µs | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.07µs | -0.04% |
 
 </details>
 
@@ -1913,6 +1984,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.39µs | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.39µs | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.38µs | -0.10% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.39µs | +0.05% |
 
 </details>
 
@@ -1932,6 +2004,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 64.01µs | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 64.03µs | +0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 63.90µs | -0.20% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 63.93µs | +0.04% |
 
 </details>
 
@@ -1951,6 +2024,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 646.72µs | -0.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 645.34µs | -0.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 644.86µs | -0.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 646.20µs | +0.21% |
 
 </details>
 
@@ -1970,6 +2044,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 576.6ns | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 575.3ns | -0.24% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 576.4ns | +0.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 576.1ns | -0.04% |
 
 </details>
 
@@ -1989,6 +2064,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.92µs | +0.43% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.92µs | -0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.90µs | -0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.87µs | -0.52% |
 
 </details>
 
@@ -2008,6 +2084,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 90.58µs | -0.59% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 87.30µs | -3.62% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 86.54µs | -0.88% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 92.80µs | +7.24% |
 
 </details>
 
@@ -2027,6 +2104,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 145.00µs | -0.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 143.76µs | -0.86% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 146.00µs | +1.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 145.55µs | -0.31% |
 
 </details>
 
@@ -2046,6 +2124,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.09µs | -0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.09µs | -0.32% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.10µs | +0.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.10µs | +0.15% |
 
 </details>
 
@@ -2065,6 +2144,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 37.63µs | -3.33% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 35.55µs | -5.52% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 35.51µs | -0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 37.85µs | +6.61% |
 
 </details>
 
@@ -2084,6 +2164,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 521.0ns | -0.14% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 520.7ns | -0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 521.1ns | +0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 521.2ns | +0.02% |
 
 </details>
 
@@ -2103,6 +2184,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.27µs | -0.19% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.29µs | +0.16% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.29µs | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.29µs | -0.03% |
 
 </details>
 
@@ -2122,6 +2204,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.32µs | +0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.33µs | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.75µs | +0.71% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.56µs | -0.32% |
 
 </details>
 
@@ -2141,6 +2224,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 923.9ns | +0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 924.7ns | +0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 925.3ns | +0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 924.6ns | -0.07% |
 
 </details>
 
@@ -2160,6 +2244,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 14.80µs | -3.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 15.19µs | +2.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.99µs | -1.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.79µs | -1.37% |
 
 </details>
 
@@ -2179,6 +2264,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 237.3ns | -0.15% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 237.4ns | +0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 237.9ns | +0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 237.9ns | -0.02% |
 
 </details>
 
@@ -2198,6 +2284,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.71µs | -0.39% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.74µs | +0.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.75µs | +0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.73µs | -0.39% |
 
 </details>
 
@@ -2217,6 +2304,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 106.52µs | -0.73% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 105.27µs | -1.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 106.73µs | +1.39% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 106.48µs | -0.23% |
 
 </details>
 
@@ -2236,6 +2324,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.62µs | +0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.64µs | +1.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.63µs | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.62µs | -0.90% |
 
 </details>
 
@@ -2255,6 +2344,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 29.86µs | +0.82% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 29.05µs | -2.72% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 29.27µs | +0.77% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 29.99µs | +2.45% |
 
 </details>
 
@@ -2274,6 +2364,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 407.3ns | +0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 407.3ns | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 407.5ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 407.8ns | +0.07% |
 
 </details>
 
@@ -2293,6 +2384,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.46µs | +0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.48µs | +0.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.47µs | -0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.47µs | +0.02% |
 
 </details>
 
@@ -2312,6 +2404,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 144.91µs | -0.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 143.83µs | -0.74% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 145.39µs | +1.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 145.42µs | +0.02% |
 
 </details>
 
@@ -2331,6 +2424,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.09µs | +0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.10µs | +0.46% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.10µs | -0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.10µs | -0.00% |
 
 </details>
 
@@ -2350,6 +2444,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 38.28µs | -2.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 36.87µs | -3.67% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 35.44µs | -3.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 37.68µs | +6.32% |
 
 </details>
 
@@ -2369,6 +2464,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 518.7ns | -0.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 518.5ns | -0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 518.7ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 519.0ns | +0.07% |
 
 </details>
 
@@ -2388,6 +2484,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.25µs | -0.11% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.26µs | +0.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.26µs | +0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.26µs | -0.00% |
 
 </details>
 
@@ -2407,6 +2504,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 57.86µs | -0.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.09µs | +0.40% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.36µs | +0.47% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 57.95µs | -0.70% |
 
 </details>
 
@@ -2426,6 +2524,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 918.1ns | -0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 918.3ns | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 921.8ns | +0.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 918.9ns | -0.31% |
 
 </details>
 
@@ -2445,6 +2544,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 14.69µs | -3.15% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 14.81µs | +0.80% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.87µs | +0.45% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.68µs | -1.31% |
 
 </details>
 
@@ -2464,6 +2564,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 235.5ns | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 235.6ns | +0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 236.1ns | +0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 235.8ns | -0.14% |
 
 </details>
 
@@ -2483,6 +2584,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.69µs | -0.35% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.71µs | +0.63% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.72µs | +0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.71µs | -0.37% |
 
 </details>
 
@@ -2502,6 +2604,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 107.03µs | -0.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 105.75µs | -1.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 106.98µs | +1.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 106.28µs | -0.66% |
 
 </details>
 
@@ -2521,6 +2624,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.63µs | +1.19% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.63µs | -0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.62µs | -0.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.62µs | +0.01% |
 
 </details>
 
@@ -2540,6 +2644,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 29.83µs | +1.29% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 29.02µs | -2.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 29.22µs | +0.68% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 29.72µs | +1.72% |
 
 </details>
 
@@ -2559,6 +2664,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 405.3ns | +0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 405.5ns | +0.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 405.5ns | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 405.8ns | +0.07% |
 
 </details>
 
@@ -2578,6 +2684,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.43µs | -0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.46µs | +0.46% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.44µs | -0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.45µs | +0.08% |
 
 </details>
 
@@ -2597,6 +2704,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 144.70µs | +0.11% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 143.55µs | -0.80% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 143.58µs | +0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 145.12µs | +1.08% |
 
 </details>
 
@@ -2616,6 +2724,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.08µs | +0.28% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.08µs | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.09µs | +0.45% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.07µs | -0.81% |
 
 </details>
 
@@ -2635,6 +2744,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 36.09µs | -9.32% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 35.71µs | -1.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 36.62µs | +2.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 37.28µs | +1.82% |
 
 </details>
 
@@ -2654,6 +2764,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 518.9ns | -0.21% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 518.8ns | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 519.7ns | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 519.7ns | +0.00% |
 
 </details>
 
@@ -2673,6 +2784,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.23µs | -0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.27µs | +0.46% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.26µs | -0.10% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.25µs | -0.15% |
 
 </details>
 
@@ -2692,6 +2804,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.05µs | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.13µs | +0.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.30µs | +0.29% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.27µs | -0.06% |
 
 </details>
 
@@ -2711,6 +2824,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 920.1ns | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 928.2ns | +0.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 923.0ns | -0.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 921.5ns | -0.16% |
 
 </details>
 
@@ -2730,6 +2844,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 14.73µs | -3.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 14.76µs | +0.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.74µs | -0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.73µs | -0.03% |
 
 </details>
 
@@ -2749,6 +2864,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 236.9ns | -0.28% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 236.9ns | -0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 237.6ns | +0.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 237.3ns | -0.10% |
 
 </details>
 
@@ -2768,6 +2884,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.70µs | -0.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.72µs | +0.65% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.70µs | -0.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.72µs | +0.53% |
 
 </details>
 
@@ -2787,6 +2904,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 105.04µs | -2.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 107.46µs | +2.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 106.47µs | -0.92% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 107.08µs | +0.57% |
 
 </details>
 
@@ -2806,6 +2924,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.60µs | -0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.61µs | +0.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.61µs | +0.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.61µs | -0.08% |
 
 </details>
 
@@ -2825,6 +2944,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 29.92µs | +0.51% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 29.67µs | -0.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 30.07µs | +1.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 29.52µs | -1.84% |
 
 </details>
 
@@ -2844,6 +2964,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 403.5ns | -0.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 404.8ns | +0.32% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 404.4ns | -0.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 404.2ns | -0.07% |
 
 </details>
 
@@ -2863,6 +2984,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.40µs | -0.44% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.42µs | +0.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.40µs | -0.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.44µs | +0.54% |
 
 </details>
 
@@ -2882,6 +3004,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 95.73µs | -0.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 96.07µs | +0.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 97.65µs | +1.64% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 96.45µs | -1.23% |
 
 </details>
 
@@ -2901,6 +3024,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.39µs | -4.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.44µs | +3.52% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.43µs | -0.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.42µs | -1.09% |
 
 </details>
 
@@ -2920,6 +3044,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 27.54µs | -2.31% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 27.31µs | -0.83% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 26.57µs | -2.70% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 28.33µs | +6.61% |
 
 </details>
 
@@ -2939,6 +3064,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 298.9ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 296.2ns | -0.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 297.2ns | +0.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 297.4ns | +0.09% |
 
 </details>
 
@@ -2958,6 +3084,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.05µs | -0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.12µs | +1.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.06µs | -1.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.05µs | -0.07% |
 
 </details>
 
@@ -2977,6 +3104,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 38.32µs | -0.45% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 38.39µs | +0.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 38.70µs | +0.82% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 38.53µs | -0.45% |
 
 </details>
 
@@ -2996,6 +3124,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 496.8ns | +0.69% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 530.6ns | +6.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 510.2ns | -3.86% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 498.9ns | -2.20% |
 
 </details>
 
@@ -3015,6 +3144,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 9.58µs | -6.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 9.62µs | +0.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 9.63µs | +0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 9.59µs | -0.44% |
 
 </details>
 
@@ -3034,6 +3164,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 134.6ns | +2.31% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 132.8ns | -1.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 135.0ns | +1.60% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 134.5ns | -0.35% |
 
 </details>
 
@@ -3053,6 +3184,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.44µs | -0.34% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.49µs | +2.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.43µs | -2.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.44µs | +0.13% |
 
 </details>
 
@@ -3072,6 +3204,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 73.34µs | +0.63% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 72.82µs | -0.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 73.83µs | +1.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 73.54µs | -0.39% |
 
 </details>
 
@@ -3091,6 +3224,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 981.3ns | +2.47% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.00µs | +1.93% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 978.1ns | -2.21% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.01µs | +3.53% |
 
 </details>
 
@@ -3110,6 +3244,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 22.48µs | +0.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 22.26µs | -0.96% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 22.83µs | +2.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 22.48µs | -1.53% |
 
 </details>
 
@@ -3129,6 +3264,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 231.6ns | +0.70% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 234.0ns | +1.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 233.7ns | -0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 233.7ns | +0.01% |
 
 </details>
 
@@ -3148,6 +3284,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 4.59µs | -0.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 4.65µs | +1.28% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 4.61µs | -0.93% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 4.64µs | +0.72% |
 
 </details>
 
@@ -3167,6 +3304,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 144.75µs | +0.21% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 143.48µs | -0.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 143.56µs | +0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 145.12µs | +1.09% |
 
 </details>
 
@@ -3186,6 +3324,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.09µs | +0.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.08µs | -0.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.08µs | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.06µs | -1.05% |
 
 </details>
 
@@ -3205,6 +3344,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 36.70µs | -8.53% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 36.06µs | -1.75% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 36.68µs | +1.71% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 37.77µs | +2.99% |
 
 </details>
 
@@ -3224,6 +3364,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 516.6ns | -0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 516.6ns | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 517.2ns | +0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 517.0ns | -0.02% |
 
 </details>
 
@@ -3243,6 +3384,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.20µs | -0.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.23µs | +0.39% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.22µs | -0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.21µs | -0.22% |
 
 </details>
 
@@ -3262,6 +3404,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 57.46µs | -0.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 57.66µs | +0.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 57.82µs | +0.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 57.71µs | -0.21% |
 
 </details>
 
@@ -3281,6 +3424,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 915.5ns | -0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 936.1ns | +2.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 919.7ns | -1.76% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 917.5ns | -0.23% |
 
 </details>
 
@@ -3300,6 +3444,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 14.60µs | -3.72% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 14.71µs | +0.75% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 14.62µs | -0.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 14.62µs | -0.04% |
 
 </details>
 
@@ -3319,6 +3464,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 235.2ns | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 235.2ns | -0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 236.1ns | +0.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 235.3ns | -0.30% |
 
 </details>
 
@@ -3338,6 +3484,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.68µs | -0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.70µs | +0.69% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.68µs | -0.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.70µs | +0.56% |
 
 </details>
 
@@ -3357,6 +3504,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 105.52µs | -1.72% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 107.44µs | +1.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 106.66µs | -0.73% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 107.28µs | +0.59% |
 
 </details>
 
@@ -3376,6 +3524,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.60µs | -0.34% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.61µs | +0.51% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.61µs | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.61µs | -0.39% |
 
 </details>
 
@@ -3395,6 +3544,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 30.21µs | +1.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 29.76µs | -1.47% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 29.81µs | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 29.54µs | -0.90% |
 
 </details>
 
@@ -3414,6 +3564,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 402.1ns | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 402.8ns | +0.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 403.2ns | +0.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 402.4ns | -0.20% |
 
 </details>
 
@@ -3433,6 +3584,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 6.38µs | -0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 6.40µs | +0.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 6.38µs | -0.35% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 6.40µs | +0.39% |
 
 </details>
 
@@ -3452,6 +3604,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.14µs | +0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.14µs | -0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.14µs | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.14µs | +0.04% |
 
 </details>
 
@@ -3471,6 +3624,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 21.42µs | -0.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 21.38µs | -0.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 21.47µs | +0.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 21.45µs | -0.09% |
 
 </details>
 
@@ -3490,6 +3644,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 218.92µs | -0.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 219.31µs | +0.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 221.18µs | +0.85% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 221.61µs | +0.19% |
 
 </details>
 
@@ -3509,6 +3664,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 333.5ns | -1.42% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 341.4ns | +2.37% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 337.7ns | -1.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 336.3ns | -0.43% |
 
 </details>
 
@@ -3528,6 +3684,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 5.64µs | -8.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 5.62µs | -0.37% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 5.72µs | +1.80% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 5.68µs | -0.76% |
 
 </details>
 
@@ -3547,6 +3704,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 84.98µs | -7.38% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 85.55µs | +0.67% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 90.89µs | +6.24% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 92.02µs | +1.25% |
 
 </details>
 
@@ -3566,6 +3724,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.77µs | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.77µs | -0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.77µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.77µs | -0.00% |
 
 </details>
 
@@ -3585,6 +3744,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.68µs | -0.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.68µs | +0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.68µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.68µs | +0.01% |
 
 </details>
 
@@ -3604,6 +3764,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 643.2ns | -0.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 642.7ns | -0.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 641.6ns | -0.17% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 640.9ns | -0.10% |
 
 </details>
 
@@ -3623,6 +3784,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.32µs | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.32µs | -0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.32µs | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.32µs | +0.12% |
 
 </details>
 
@@ -3642,6 +3804,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 129.7ns | -0.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 129.7ns | +0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 130.1ns | +0.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 129.0ns | -0.88% |
 
 </details>
 
@@ -3661,6 +3824,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 185.3ns | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 185.3ns | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 185.9ns | +0.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 185.2ns | -0.37% |
 
 </details>
 
@@ -3680,6 +3844,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.3ns | +0.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.1ns | -0.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.2ns | +0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.0ns | -0.24% |
 
 </details>
 
@@ -3699,6 +3864,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 101.2ns | +0.54% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 100.9ns | -0.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 100.7ns | -0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 101.3ns | +0.58% |
 
 </details>
 
@@ -3718,6 +3884,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 593.1ns | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 593.1ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 593.4ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 593.3ns | -0.01% |
 
 </details>
 
@@ -3737,6 +3904,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 892.3ns | -0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 892.3ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 892.3ns | -0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 892.4ns | +0.00% |
 
 </details>
 
@@ -3756,6 +3924,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 213.1ns | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 213.1ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 213.1ns | -0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 213.1ns | -0.00% |
 
 </details>
 
@@ -3775,6 +3944,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 439.6ns | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 439.4ns | -0.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 439.6ns | +0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 442.9ns | +0.74% |
 
 </details>
 
@@ -3794,6 +3964,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 73.5ns | +0.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 73.6ns | +0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 74.2ns | +0.81% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 73.4ns | -1.01% |
 
 </details>
 
@@ -3813,6 +3984,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 106.6ns | +0.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 106.4ns | -0.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 105.8ns | -0.59% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 106.1ns | +0.27% |
 
 </details>
 
@@ -3832,6 +4004,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 31.6ns | +0.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 31.5ns | -0.26% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 31.7ns | +0.72% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 31.6ns | -0.41% |
 
 </details>
 
@@ -3851,6 +4024,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 54.3ns | -4.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 56.7ns | +4.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 59.4ns | +4.76% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 56.7ns | -4.51% |
 
 </details>
 
@@ -3870,6 +4044,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 595.8ns | -0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 595.3ns | -0.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 595.7ns | +0.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 595.5ns | -0.04% |
 
 </details>
 
@@ -3889,6 +4064,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 895.9ns | +0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 896.1ns | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 896.0ns | -0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 896.0ns | -0.01% |
 
 </details>
 
@@ -3908,6 +4084,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 216.8ns | -0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 217.1ns | +0.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 217.0ns | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 216.9ns | -0.08% |
 
 </details>
 
@@ -3927,6 +4104,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 443.7ns | +0.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 443.5ns | -0.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 443.2ns | -0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 443.2ns | +0.01% |
 
 </details>
 
@@ -3946,6 +4124,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 116.7ns | -0.30% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 117.0ns | +0.24% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 117.1ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 117.1ns | -0.01% |
 
 </details>
 
@@ -3965,6 +4144,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 171.2ns | +0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 171.2ns | -0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 171.1ns | -0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 171.2ns | +0.09% |
 
 </details>
 
@@ -3984,6 +4164,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 49.1ns | -0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 49.1ns | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 49.1ns | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 48.8ns | -0.49% |
 
 </details>
 
@@ -4003,6 +4184,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 89.8ns | +0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 89.4ns | -0.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 89.8ns | +0.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 89.8ns | -0.02% |
 
 </details>
 
@@ -4022,6 +4204,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 685.4ns | -0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 684.6ns | -0.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 686.1ns | +0.21% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 686.4ns | +0.04% |
 
 </details>
 
@@ -4041,6 +4224,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.02µs | -0.58% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.02µs | -0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.02µs | +0.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.02µs | -0.03% |
 
 </details>
 
@@ -4060,6 +4244,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 264.5ns | -2.34% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 265.6ns | +0.42% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 265.3ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 266.5ns | +0.46% |
 
 </details>
 
@@ -4079,6 +4264,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 515.4ns | -0.52% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 516.3ns | +0.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 517.1ns | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 516.9ns | -0.03% |
 
 </details>
 
@@ -4098,6 +4284,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 150.8ns | -8.47% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 151.2ns | +0.28% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 150.6ns | -0.41% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 156.4ns | +3.84% |
 
 </details>
 
@@ -4117,6 +4304,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 222.0ns | -12.60% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 221.4ns | -0.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 221.8ns | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 227.0ns | +2.35% |
 
 </details>
 
@@ -4136,6 +4324,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 67.2ns | -7.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 67.4ns | +0.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 67.5ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 69.1ns | +2.45% |
 
 </details>
 
@@ -4155,6 +4344,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 117.5ns | -6.50% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 117.4ns | -0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 117.3ns | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 118.6ns | +1.05% |
 
 </details>
 
@@ -4174,6 +4364,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 129.2ns | +0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 128.8ns | -0.27% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 129.0ns | +0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 129.2ns | +0.14% |
 
 </details>
 
@@ -4193,6 +4384,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.0ns | -1.15% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.7ns | +1.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.8ns | +0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.1ns | -1.24% |
 
 </details>
 
@@ -4212,6 +4404,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 99.6ns | +0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 99.2ns | -0.41% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 100.2ns | +1.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 99.4ns | -0.86% |
 
 </details>
 
@@ -4231,6 +4424,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 73.9ns | +0.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 70.0ns | -5.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 73.7ns | +5.31% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 72.4ns | -1.66% |
 
 </details>
 
@@ -4250,6 +4444,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 30.6ns | -2.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 32.3ns | +5.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 31.5ns | -2.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 31.4ns | -0.04% |
 
 </details>
 
@@ -4269,6 +4464,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 54.6ns | -4.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 54.0ns | -0.94% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 55.4ns | +2.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 55.1ns | -0.57% |
 
 </details>
 
@@ -4288,6 +4484,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 95.83µs | -0.66% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 96.46µs | +0.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 96.40µs | -0.06% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 97.26µs | +0.89% |
 
 </details>
 
@@ -4307,6 +4504,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 39.71µs | +3.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 38.48µs | -3.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 38.46µs | -0.06% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 38.69µs | +0.59% |
 
 </details>
 
@@ -4326,6 +4524,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 72.45µs | -0.45% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 73.26µs | +1.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 72.47µs | -1.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 73.78µs | +1.80% |
 
 </details>
 
@@ -4345,6 +4544,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 145.74µs | +0.81% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 145.37µs | -0.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 145.87µs | +0.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 145.26µs | -0.41% |
 
 </details>
 
@@ -4364,6 +4564,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.00µs | -0.33% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.09µs | +0.16% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.39µs | +0.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.45µs | +0.11% |
 
 </details>
 
@@ -4383,6 +4584,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 106.06µs | -1.96% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 107.76µs | +1.60% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 107.05µs | -0.66% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 106.42µs | -0.58% |
 
 </details>
 
@@ -4402,6 +4604,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 96.06µs | -0.77% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 96.72µs | +0.69% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 96.68µs | -0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 98.00µs | +1.37% |
 
 </details>
 
@@ -4421,6 +4624,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 39.58µs | +0.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 39.99µs | +1.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 39.28µs | -1.77% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 39.44µs | +0.41% |
 
 </details>
 
@@ -4440,6 +4644,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 73.47µs | -0.73% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 73.69µs | +0.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 73.13µs | -0.76% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 74.00µs | +1.19% |
 
 </details>
 
@@ -4459,6 +4664,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 219.8ns | +1.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 215.9ns | -1.78% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 219.1ns | +1.50% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 219.0ns | -0.04% |
 
 </details>
 
@@ -4478,6 +4684,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.85µs | +1.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.77µs | -2.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.80µs | +0.96% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.81µs | +0.29% |
 
 </details>
 
@@ -4497,6 +4704,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 67.0ns | +1.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 66.2ns | -1.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 66.4ns | +0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 66.8ns | +0.62% |
 
 </details>
 
@@ -4516,6 +4724,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 825.1ns | -0.34% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 815.3ns | -1.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 825.6ns | +1.26% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 852.6ns | +3.26% |
 
 </details>
 
@@ -4535,6 +4744,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 497.2ns | +2.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 484.5ns | -2.55% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 489.5ns | +1.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 497.6ns | +1.65% |
 
 </details>
 
@@ -4554,6 +4764,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 9.55µs | -5.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 9.88µs | +3.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 9.97µs | +0.98% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 9.59µs | -3.82% |
 
 </details>
 
@@ -4573,6 +4784,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 133.2ns | -0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 132.8ns | -0.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 135.0ns | +1.69% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 133.9ns | -0.83% |
 
 </details>
 
@@ -4592,6 +4804,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.44µs | -0.81% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.44µs | +0.22% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.45µs | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.47µs | +1.03% |
 
 </details>
 
@@ -4611,6 +4824,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 982.2ns | -0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 974.7ns | -0.76% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 949.4ns | -2.59% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.03µs | +8.00% |
 
 </details>
 
@@ -4630,6 +4844,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 22.34µs | +0.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 21.90µs | -1.96% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 22.66µs | +3.47% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 22.63µs | -0.16% |
 
 </details>
 
@@ -4649,6 +4864,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 232.7ns | +0.67% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 230.1ns | -1.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 233.2ns | +1.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 234.0ns | +0.36% |
 
 </details>
 
@@ -4668,6 +4884,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 4.58µs | -1.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 4.62µs | +0.72% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 4.62µs | +0.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 4.67µs | +1.00% |
 
 </details>
 
@@ -4687,6 +4904,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 138.8ns | -0.15% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 138.3ns | -0.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 137.3ns | -0.77% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 138.0ns | +0.52% |
 
 </details>
 
@@ -4706,6 +4924,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.06µs | +0.49% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.98µs | -2.77% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.05µs | +2.31% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.05µs | +0.11% |
 
 </details>
 
@@ -4725,6 +4944,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 47.1ns | +0.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 46.9ns | -0.50% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 46.1ns | -1.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 46.0ns | -0.29% |
 
 </details>
 
@@ -4744,6 +4964,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 516.4ns | -1.45% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 510.4ns | -1.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 522.8ns | +2.43% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 552.6ns | +5.68% |
 
 </details>
 
@@ -4763,6 +4984,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 327.6ns | -0.14% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 326.4ns | -0.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 325.0ns | -0.44% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 325.7ns | +0.22% |
 
 </details>
 
@@ -4782,6 +5004,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.36µs | -6.19% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.81µs | +5.39% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.81µs | -0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.42µs | -4.43% |
 
 </details>
 
@@ -4801,6 +5024,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 94.1ns | +0.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 94.1ns | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 92.9ns | -1.26% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 93.2ns | +0.30% |
 
 </details>
 
@@ -4820,6 +5044,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.12µs | +0.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.11µs | -0.84% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.12µs | +0.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.15µs | +1.77% |
 
 </details>
 
@@ -4839,6 +5064,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 686.5ns | +5.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 691.7ns | +0.75% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 667.3ns | -3.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 696.7ns | +4.42% |
 
 </details>
 
@@ -4858,6 +5084,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 18.50µs | +1.82% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 18.33µs | -0.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 18.08µs | -1.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 18.19µs | +0.63% |
 
 </details>
 
@@ -4877,6 +5104,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 164.9ns | -0.11% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 165.7ns | +0.48% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 163.9ns | -1.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 164.0ns | +0.02% |
 
 </details>
 
@@ -4896,6 +5124,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 3.81µs | -1.19% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 3.86µs | +1.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 3.79µs | -1.89% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 3.93µs | +3.67% |
 
 </details>
 
@@ -4915,6 +5144,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 117.0ns | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 116.8ns | -0.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 117.0ns | +0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 117.0ns | +0.01% |
 
 </details>
 
@@ -4934,6 +5164,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 49.0ns | +0.60% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 48.7ns | -0.57% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 48.9ns | +0.32% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 49.1ns | +0.35% |
 
 </details>
 
@@ -4953,6 +5184,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 89.5ns | -0.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 89.5ns | +0.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 89.6ns | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 89.5ns | -0.12% |
 
 </details>
 
@@ -4972,6 +5204,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 113.8ns | +0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 113.6ns | -0.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 113.8ns | +0.17% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 113.9ns | +0.08% |
 
 </details>
 
@@ -4991,6 +5224,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 46.1ns | +1.36% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 45.6ns | -1.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 45.7ns | +0.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 45.9ns | +0.46% |
 
 </details>
 
@@ -5010,6 +5244,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 86.7ns | +0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 86.4ns | -0.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 86.4ns | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 86.5ns | +0.04% |
 
 </details>
 
@@ -5029,6 +5264,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 58.2ns | -0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 58.3ns | +0.23% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 58.1ns | -0.39% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 58.3ns | +0.34% |
 
 </details>
 
@@ -5048,6 +5284,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 33.2ns | +4.82% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 31.5ns | -4.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 31.7ns | +0.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 31.7ns | -0.03% |
 
 </details>
 
@@ -5067,6 +5304,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 48.9ns | -0.35% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 49.0ns | +0.26% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 49.1ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 49.0ns | -0.03% |
 
 </details>
 
@@ -5086,6 +5324,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 112.7ns | -8.65% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 116.4ns | +3.27% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 113.4ns | -2.55% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 123.3ns | +8.71% |
 
 </details>
 
@@ -5105,6 +5344,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 8.38µs | +0.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 8.38µs | -0.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 8.32µs | -0.63% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 8.32µs | -0.04% |
 
 </details>
 
@@ -5124,6 +5364,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 126.45µs | -1.76% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 127.89µs | +1.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 129.42µs | +1.20% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 130.48µs | +0.81% |
 
 </details>
 
@@ -5132,6 +5373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 522.3ns | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 521.4ns | -0.17% |
 
 </details>
 
@@ -5140,6 +5382,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 5.03µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 5.02µs | -0.16% |
 
 </details>
 
@@ -5148,6 +5391,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 50.19µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 50.10µs | -0.18% |
 
 </details>
 
@@ -5156,6 +5400,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 20.50µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 20.51µs | +0.09% |
 
 </details>
 
@@ -5164,6 +5409,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 204.64µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 204.88µs | +0.12% |
 
 </details>
 
@@ -5172,6 +5418,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.05ms | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.05ms | +0.10% |
 
 </details>
 
@@ -5180,6 +5427,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 171.8ns | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 172.5ns | +0.41% |
 
 </details>
 
@@ -5188,6 +5436,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.55µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.56µs | +0.73% |
 
 </details>
 
@@ -5196,6 +5445,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 16.19µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 15.50µs | -4.27% |
 
 </details>
 
@@ -5204,6 +5454,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 13.72µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 13.72µs | -0.03% |
 
 </details>
 
@@ -5212,6 +5463,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 137.01µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 136.97µs | -0.03% |
 
 </details>
 
@@ -5220,6 +5472,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.37ms | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.37ms | -0.01% |
 
 </details>
 
@@ -5239,6 +5492,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 7.39µs | -0.66% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 7.37µs | -0.23% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 7.55µs | +2.40% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 7.53µs | -0.30% |
 
 </details>
 
@@ -5258,6 +5512,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 963.37µs | -0.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 963.23µs | -0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 968.00µs | +0.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 964.29µs | -0.38% |
 
 </details>
 
@@ -5277,6 +5532,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 51.10µs | -0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 51.11µs | +0.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 51.57µs | +0.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 51.46µs | -0.21% |
 
 </details>
 
@@ -5296,6 +5552,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 2.06ms | -0.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 2.06ms | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 2.06ms | +0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 2.06ms | -0.09% |
 
 </details>
 
@@ -5315,6 +5572,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 18.00µs | +0.02% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 17.98µs | -0.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 17.35µs | -3.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 17.56µs | +1.24% |
 
 </details>
 
@@ -5334,6 +5592,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:37:48+00:00 | 1.37ms | -0.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:01:06+00:00 | 1.37ms | +0.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:06:12+00:00 | 1.37ms | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:08:37+00:00 | 1.37ms | +0.02% |
 
 </details>
 
@@ -5354,6 +5613,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.91µs | +10.87% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.72µs | -9.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.73µs | +0.35% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.91µs | +10.47% |
 
 </details>
 
@@ -5373,6 +5633,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 416.4ns | +10.31% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 377.1ns | -9.45% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 375.5ns | -0.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 418.6ns | +11.47% |
 
 </details>
 
@@ -5392,6 +5653,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 112.7ns | +0.46% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 112.2ns | -0.48% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 112.2ns | +0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 112.7ns | +0.46% |
 
 </details>
 
@@ -5411,6 +5673,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 163.5ns | +0.67% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 161.9ns | -0.97% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 162.2ns | +0.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 163.3ns | +0.67% |
 
 </details>
 
@@ -5430,6 +5693,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 49.3ns | -0.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 49.3ns | +0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 49.3ns | +0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 49.7ns | +0.82% |
 
 </details>
 
@@ -5449,6 +5713,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 87.4ns | +0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 87.3ns | -0.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 87.2ns | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 88.0ns | +0.86% |
 
 </details>
 
@@ -5468,6 +5733,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 86.8ns | +5.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 82.0ns | -5.52% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 81.1ns | -1.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 86.8ns | +7.02% |
 
 </details>
 
@@ -5487,6 +5753,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 120.7ns | +6.43% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 113.2ns | -6.22% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 112.3ns | -0.77% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 120.7ns | +7.44% |
 
 </details>
 
@@ -5506,6 +5773,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 45.1ns | +2.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 44.6ns | -1.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 44.7ns | +0.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 44.9ns | +0.39% |
 
 </details>
 
@@ -5525,6 +5793,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 73.3ns | +10.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 66.4ns | -9.41% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 65.9ns | -0.64% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 68.8ns | +4.39% |
 
 </details>
 
@@ -5544,6 +5813,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 204.8ns | -0.56% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 206.7ns | +0.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 205.3ns | -0.65% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 204.4ns | -0.45% |
 
 </details>
 
@@ -5563,6 +5833,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.84µs | +11.84% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.64µs | -10.48% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.65µs | +0.47% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.84µs | +11.20% |
 
 </details>
 
@@ -5582,6 +5853,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 398.5ns | +10.52% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 357.9ns | -10.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 357.5ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 398.4ns | +11.44% |
 
 </details>
 
@@ -5601,6 +5873,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 91.8ns | +11.28% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 82.1ns | -10.56% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 82.4ns | +0.29% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 86.6ns | +5.16% |
 
 </details>
 
@@ -5620,6 +5893,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 120.9ns | +6.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 113.3ns | -6.26% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 111.2ns | -1.82% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 119.6ns | +7.48% |
 
 </details>
 
@@ -5639,6 +5913,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 45.1ns | -2.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 44.6ns | -1.23% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 44.4ns | -0.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 45.9ns | +3.41% |
 
 </details>
 
@@ -5658,6 +5933,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 70.0ns | +5.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 67.1ns | -4.24% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 71.0ns | +5.85% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.8ns | -1.68% |
 
 </details>
 
@@ -5677,6 +5953,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.60µs | -0.74% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.63µs | +0.81% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 302.1ns | -91.67% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 330.8ns | +9.49% |
 
 </details>
 
@@ -5696,6 +5973,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 5.35µs | -0.54% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.69µs | +6.28% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 442.8ns | -92.22% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 484.9ns | +9.51% |
 
 </details>
 
@@ -5715,6 +5993,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.42µs | +0.26% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.43µs | +1.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 126.2ns | -91.20% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 136.3ns | +7.98% |
 
 </details>
 
@@ -5734,6 +6013,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.72µs | -0.73% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.75µs | +1.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 232.0ns | -91.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 252.5ns | +8.84% |
 
 </details>
 
@@ -5753,6 +6033,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 407.0ns | -4.98% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 436.3ns | +7.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 423.7ns | -2.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 399.8ns | -5.63% |
 
 </details>
 
@@ -5772,6 +6053,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.30µs | -2.16% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.37µs | +1.49% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.42µs | +1.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.31µs | -2.56% |
 
 </details>
 
@@ -5791,6 +6073,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 57.32µs | +1.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 56.27µs | -1.84% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 54.14µs | -3.78% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 57.53µs | +6.25% |
 
 </details>
 
@@ -5810,6 +6093,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 169.8ns | -3.65% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 174.0ns | +2.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 174.4ns | +0.25% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 169.1ns | -3.04% |
 
 </details>
 
@@ -5829,6 +6113,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.72µs | -3.67% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.76µs | +2.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.75µs | -0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.69µs | -3.91% |
 
 </details>
 
@@ -5848,6 +6133,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.41µs | -12.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 18.74µs | +7.65% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 18.79µs | +0.29% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 18.19µs | -3.23% |
 
 </details>
 
@@ -5867,6 +6153,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 6.24µs | +18.79% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.28µs | -15.32% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.79µs | +9.71% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 6.22µs | +7.43% |
 
 </details>
 
@@ -5886,6 +6173,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 779.2ns | +6.36% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 743.9ns | -4.53% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 743.7ns | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 778.7ns | +4.70% |
 
 </details>
 
@@ -5905,6 +6193,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 788.1ns | +12.63% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 732.9ns | -7.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 745.7ns | +1.75% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 787.7ns | +5.63% |
 
 </details>
 
@@ -5924,6 +6213,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 790.3ns | +7.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 749.2ns | -5.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 752.0ns | +0.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 790.7ns | +5.15% |
 
 </details>
 
@@ -5943,6 +6233,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.34µs | +18.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.07µs | -11.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.05µs | -1.22% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.33µs | +14.15% |
 
 </details>
 
@@ -5962,6 +6253,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.67µs | +19.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.35µs | -6.87% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.16µs | -4.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.67µs | +12.19% |
 
 </details>
 
@@ -5981,6 +6273,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 35.0ns | +0.83% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 34.4ns | -1.61% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 34.8ns | +1.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 35.0ns | +0.68% |
 
 </details>
 
@@ -6000,6 +6293,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 16.2ns | -6.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 17.2ns | +5.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 17.1ns | -0.25% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 16.3ns | -5.06% |
 
 </details>
 
@@ -6019,6 +6313,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.0ns | -10.16% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 9.8ns | +9.25% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.0ns | +2.25% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.0ns | -10.05% |
 
 </details>
 
@@ -6038,6 +6333,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.5ns | -11.14% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 10.5ns | +10.22% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.7ns | +2.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.5ns | -11.09% |
 
 </details>
 
@@ -6057,6 +6353,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 15.6ns | -0.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 15.7ns | +0.16% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 15.6ns | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 15.8ns | +1.03% |
 
 </details>
 
@@ -6076,6 +6373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 26.9ns | -6.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 29.4ns | +9.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 29.2ns | -0.44% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 27.0ns | -7.53% |
 
 </details>
 
@@ -6095,6 +6393,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 6.20µs | +17.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.23µs | -15.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.77µs | +10.44% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 6.21µs | +7.63% |
 
 </details>
 
@@ -6114,6 +6413,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.32µs | +17.41% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 7.94µs | -14.74% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 8.67µs | +9.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.35µs | +7.74% |
 
 </details>
 
@@ -6133,6 +6433,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.32µs | +16.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.98µs | -14.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.09µs | +5.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.33µs | +11.10% |
 
 </details>
 
@@ -6152,6 +6453,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.65µs | +17.56% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.00µs | -14.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.08µs | +2.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.65µs | +13.95% |
 
 </details>
 
@@ -6171,6 +6473,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 34.6ns | +0.57% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 35.1ns | +1.42% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 34.5ns | -1.67% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 34.7ns | +0.48% |
 
 </details>
 
@@ -6190,6 +6493,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 16.8ns | -3.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 17.0ns | +1.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 17.1ns | +0.35% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 16.3ns | -4.29% |
 
 </details>
 
@@ -6209,6 +6513,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 8.9ns | -10.74% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 9.9ns | +10.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 9.8ns | -1.11% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.1ns | -7.11% |
 
 </details>
 
@@ -6228,6 +6533,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.4ns | -8.56% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 10.0ns | +6.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.3ns | +2.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.5ns | -7.36% |
 
 </details>
 
@@ -6247,6 +6553,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 15.6ns | +0.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 15.5ns | -0.57% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 15.5ns | -0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 15.6ns | +0.48% |
 
 </details>
 
@@ -6266,6 +6573,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 26.7ns | -9.36% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 30.0ns | +12.26% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 29.3ns | -2.41% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 26.6ns | -8.96% |
 
 </details>
 
@@ -6285,6 +6593,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 30.4ns | +0.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 31.1ns | +2.28% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 30.3ns | -2.78% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 30.6ns | +0.99% |
 
 </details>
 
@@ -6304,6 +6613,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 14.3ns | +4.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 13.7ns | -3.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 13.7ns | -0.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 14.2ns | +4.09% |
 
 </details>
 
@@ -6323,6 +6633,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 6.8ns | -6.27% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 7.1ns | +5.01% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 7.3ns | +2.32% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 6.7ns | -7.14% |
 
 </details>
 
@@ -6342,6 +6653,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 7.2ns | -4.98% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 7.5ns | +3.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 7.6ns | +1.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 7.2ns | -4.29% |
 
 </details>
 
@@ -6361,6 +6673,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 13.5ns | +2.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 13.1ns | -3.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 13.1ns | +0.41% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 13.5ns | +3.04% |
 
 </details>
 
@@ -6380,6 +6693,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 24.2ns | -5.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 25.9ns | +7.24% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 24.8ns | -4.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 24.0ns | -3.39% |
 
 </details>
 
@@ -6399,6 +6713,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 84.8ns | +4.51% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 80.4ns | -5.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 81.4ns | +1.24% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 85.8ns | +5.42% |
 
 </details>
 
@@ -6418,6 +6733,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 127.5ns | +14.96% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 112.1ns | -12.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 111.5ns | -0.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 119.4ns | +7.12% |
 
 </details>
 
@@ -6437,6 +6753,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 44.1ns | -0.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 43.7ns | -0.86% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 44.0ns | +0.82% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 44.2ns | +0.34% |
 
 </details>
 
@@ -6456,6 +6773,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 68.9ns | +5.20% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 66.1ns | -4.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 66.3ns | +0.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.0ns | +4.14% |
 
 </details>
 
@@ -6475,6 +6793,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 38.7ns | +2.50% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 38.3ns | -1.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 38.2ns | -0.35% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 39.5ns | +3.34% |
 
 </details>
 
@@ -6494,6 +6813,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 50.7ns | +2.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 48.7ns | -3.99% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 48.7ns | -0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 51.2ns | +5.18% |
 
 </details>
 
@@ -6513,6 +6833,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.8ns | -2.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 18.3ns | +2.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 18.3ns | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 18.1ns | -1.18% |
 
 </details>
 
@@ -6532,6 +6853,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 29.3ns | -12.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 33.2ns | +13.47% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 32.6ns | -1.79% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 29.3ns | -10.22% |
 
 </details>
 
@@ -6551,6 +6873,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 920.6ns | +9.59% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 911.9ns | -0.94% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 867.9ns | -4.83% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 919.3ns | +5.92% |
 
 </details>
 
@@ -6570,6 +6893,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 170.1ns | +9.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 154.9ns | -8.93% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 155.6ns | +0.46% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 169.9ns | +9.21% |
 
 </details>
 
@@ -6589,6 +6913,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 40.84µs | -5.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 42.93µs | +5.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 42.69µs | -0.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 40.05µs | -6.19% |
 
 </details>
 
@@ -6608,6 +6933,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 15.55µs | -2.80% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 16.03µs | +3.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 16.41µs | +2.43% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 15.66µs | -4.59% |
 
 </details>
 
@@ -6627,6 +6953,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 837.5ns | +17.63% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 712.7ns | -14.91% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 725.9ns | +1.85% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 801.3ns | +10.39% |
 
 </details>
 
@@ -6646,6 +6973,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 237.5ns | +14.39% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 209.4ns | -11.87% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 207.1ns | -1.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 225.6ns | +8.93% |
 
 </details>
 
@@ -6665,6 +6993,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 14.04µs | +13.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 12.44µs | -11.40% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 12.42µs | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 13.91µs | +12.01% |
 
 </details>
 
@@ -6684,6 +7013,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.04µs | +12.46% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.71µs | -11.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.70µs | -0.07% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.01µs | +11.31% |
 
 </details>
 
@@ -6703,6 +7033,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 10.76µs | +8.90% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 9.86µs | -8.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 9.88µs | +0.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 10.75µs | +8.86% |
 
 </details>
 
@@ -6722,6 +7053,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 107.39µs | +9.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 98.47µs | -8.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 98.53µs | +0.06% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 107.32µs | +8.92% |
 
 </details>
 
@@ -6741,6 +7073,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.08ms | +9.07% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 989.36µs | -8.13% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 990.52µs | +0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.08ms | +8.92% |
 
 </details>
 
@@ -6760,6 +7093,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 411.1ns | -4.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 415.7ns | +1.13% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 425.4ns | +2.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 408.7ns | -3.93% |
 
 </details>
 
@@ -6779,6 +7113,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.28µs | -2.84% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.36µs | +2.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.46µs | +2.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.32µs | -3.16% |
 
 </details>
 
@@ -6798,6 +7133,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 57.22µs | +2.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 55.86µs | -2.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 56.69µs | +1.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 57.64µs | +1.67% |
 
 </details>
 
@@ -6817,6 +7153,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 89.08µs | +3.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 90.32µs | +1.39% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 84.99µs | -5.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 89.33µs | +5.11% |
 
 </details>
 
@@ -6836,6 +7173,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.38µs | +5.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.36µs | -1.58% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.30µs | -4.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.37µs | +5.74% |
 
 </details>
 
@@ -6855,6 +7193,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 23.10µs | +2.87% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 23.54µs | +1.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 22.32µs | -5.17% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 23.13µs | +3.62% |
 
 </details>
 
@@ -6874,6 +7213,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 357.2ns | +6.78% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 346.6ns | -2.94% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 327.9ns | -5.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 349.7ns | +6.67% |
 
 </details>
 
@@ -6893,6 +7233,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 5.46µs | +4.52% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.46µs | -0.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.20µs | -4.81% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 5.49µs | +5.73% |
 
 </details>
 
@@ -6912,6 +7253,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 41.09µs | -5.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 42.89µs | +4.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 42.67µs | -0.52% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 41.30µs | -3.21% |
 
 </details>
 
@@ -6931,6 +7273,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 649.9ns | -3.76% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 677.9ns | +4.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 670.8ns | -1.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 649.6ns | -3.17% |
 
 </details>
 
@@ -6950,6 +7293,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 10.16µs | -7.62% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 10.65µs | +4.83% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.89µs | +2.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 10.23µs | -5.99% |
 
 </details>
 
@@ -6969,6 +7313,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 169.9ns | -4.68% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 175.9ns | +3.54% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 178.6ns | +1.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 174.6ns | -2.25% |
 
 </details>
 
@@ -6988,6 +7333,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.56µs | -5.38% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.65µs | +3.78% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.68µs | +0.88% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.55µs | -4.62% |
 
 </details>
 
@@ -7007,6 +7353,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 70.33µs | +2.11% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 69.27µs | -1.51% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 68.48µs | -1.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 70.78µs | +3.35% |
 
 </details>
 
@@ -7026,6 +7373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.09µs | +2.81% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.05µs | -3.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.06µs | +0.95% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.09µs | +2.01% |
 
 </details>
 
@@ -7045,6 +7393,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.69µs | -1.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 17.57µs | -0.68% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 17.93µs | +2.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 17.77µs | -0.84% |
 
 </details>
 
@@ -7064,6 +7413,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 284.7ns | +6.32% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 266.4ns | -6.40% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 267.3ns | +0.31% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 278.4ns | +4.16% |
 
 </details>
 
@@ -7083,6 +7433,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.30µs | +3.32% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.15µs | -3.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.23µs | +1.72% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.34µs | +2.78% |
 
 </details>
 
@@ -7102,6 +7453,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 88.01µs | +3.53% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 88.59µs | +0.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 83.77µs | -5.44% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 88.74µs | +5.93% |
 
 </details>
 
@@ -7121,6 +7473,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.37µs | +6.50% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.33µs | -2.37% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.27µs | -4.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.36µs | +6.99% |
 
 </details>
 
@@ -7140,6 +7493,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 22.75µs | +2.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 23.16µs | +1.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 21.84µs | -5.69% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 22.35µs | +2.34% |
 
 </details>
 
@@ -7159,6 +7513,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 350.5ns | +8.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 339.8ns | -3.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 319.7ns | -5.91% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 348.1ns | +8.88% |
 
 </details>
 
@@ -7178,6 +7533,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 5.42µs | +6.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.35µs | -1.27% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.08µs | -5.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 5.46µs | +7.51% |
 
 </details>
 
@@ -7197,6 +7553,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 39.93µs | -4.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 41.67µs | +4.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 41.76µs | +0.21% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 40.73µs | -2.47% |
 
 </details>
 
@@ -7216,6 +7573,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 636.8ns | -2.94% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 658.3ns | +3.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 648.6ns | -1.48% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 639.6ns | -1.40% |
 
 </details>
 
@@ -7235,6 +7593,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 10.01µs | -4.89% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 10.36µs | +3.50% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.53µs | +1.70% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 10.15µs | -3.66% |
 
 </details>
 
@@ -7254,6 +7613,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 168.1ns | -1.37% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 168.5ns | +0.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 170.8ns | +1.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 171.6ns | +0.52% |
 
 </details>
 
@@ -7273,6 +7633,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.51µs | -4.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.57µs | +2.49% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.59µs | +0.57% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.53µs | -2.43% |
 
 </details>
 
@@ -7292,6 +7653,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 69.28µs | +2.58% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 67.95µs | -1.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 66.71µs | -1.82% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.29µs | +3.86% |
 
 </details>
 
@@ -7311,6 +7673,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.08µs | +3.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.03µs | -4.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.03µs | -0.39% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.07µs | +4.49% |
 
 </details>
 
@@ -7330,6 +7693,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.49µs | -0.46% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 17.33µs | -0.94% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 17.40µs | +0.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 17.46µs | +0.37% |
 
 </details>
 
@@ -7349,6 +7713,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 280.9ns | +7.55% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 259.9ns | -7.46% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 260.3ns | +0.15% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 276.1ns | +6.04% |
 
 </details>
 
@@ -7368,6 +7733,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.26µs | +4.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.09µs | -4.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.11µs | +0.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.33µs | +5.29% |
 
 </details>
 
@@ -7387,6 +7753,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 89.11µs | +3.89% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 89.39µs | +0.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 84.74µs | -5.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 86.55µs | +2.13% |
 
 </details>
 
@@ -7406,6 +7773,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.38µs | +5.44% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.35µs | -2.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.30µs | -3.76% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.32µs | +1.83% |
 
 </details>
 
@@ -7425,6 +7793,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 22.82µs | +3.43% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 23.23µs | +1.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 22.29µs | -4.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 22.07µs | -1.00% |
 
 </details>
 
@@ -7444,6 +7813,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 356.0ns | +8.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 341.4ns | -4.10% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 327.8ns | -3.98% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 334.7ns | +2.13% |
 
 </details>
 
@@ -7463,6 +7833,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 5.47µs | +5.44% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.43µs | -0.89% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.20µs | -4.21% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 5.26µs | +1.25% |
 
 </details>
 
@@ -7482,6 +7853,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 40.89µs | -7.80% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 44.30µs | +8.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 42.62µs | -3.80% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 40.55µs | -4.85% |
 
 </details>
 
@@ -7501,6 +7873,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 647.0ns | -5.87% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 674.0ns | +4.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 681.7ns | +1.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 646.8ns | -5.12% |
 
 </details>
 
@@ -7520,6 +7893,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 10.18µs | -6.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 11.01µs | +8.06% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.84µs | -1.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 10.09µs | -6.95% |
 
 </details>
 
@@ -7539,6 +7913,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 169.9ns | -5.68% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 178.7ns | +5.17% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 178.8ns | +0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 168.2ns | -5.95% |
 
 </details>
 
@@ -7558,6 +7933,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.55µs | -5.74% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.67µs | +4.59% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.67µs | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.53µs | -5.40% |
 
 </details>
 
@@ -7577,6 +7953,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 69.85µs | -1.06% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 71.83µs | +2.84% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 70.84µs | -1.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.87µs | -1.38% |
 
 </details>
 
@@ -7596,6 +7973,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.09µs | -0.90% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.09µs | +0.23% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.10µs | +0.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.08µs | -1.53% |
 
 </details>
 
@@ -7615,6 +7993,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.39µs | -3.78% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 18.75µs | +7.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 18.30µs | -2.40% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 17.68µs | -3.41% |
 
 </details>
 
@@ -7634,6 +8013,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 276.1ns | -0.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 275.2ns | -0.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 274.8ns | -0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 273.8ns | -0.38% |
 
 </details>
 
@@ -7653,6 +8033,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.30µs | -0.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.36µs | +1.40% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.35µs | -0.17% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.36µs | +0.17% |
 
 </details>
 
@@ -7672,6 +8053,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 80.14µs | +11.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 77.32µs | -3.52% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 74.32µs | -3.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 73.16µs | -1.57% |
 
 </details>
 
@@ -7691,6 +8073,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.24µs | +29.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.14µs | -7.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 963.1ns | -15.85% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.06µs | +10.53% |
 
 </details>
 
@@ -7710,6 +8093,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 20.30µs | +5.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 20.44µs | +0.68% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 19.58µs | -4.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 18.28µs | -6.61% |
 
 </details>
 
@@ -7729,6 +8113,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 333.9ns | +47.65% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 295.7ns | -11.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 237.9ns | -19.55% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 271.9ns | +14.30% |
 
 </details>
 
@@ -7748,6 +8133,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.86µs | +28.82% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.57µs | -6.04% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 3.79µs | -16.98% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.15µs | +9.60% |
 
 </details>
 
@@ -7767,6 +8153,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 34.03µs | +1.77% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 33.23µs | -2.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 30.38µs | -8.59% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 31.72µs | +4.42% |
 
 </details>
 
@@ -7786,6 +8173,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 532.5ns | +12.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 472.2ns | -11.32% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 427.7ns | -9.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 470.0ns | +9.87% |
 
 </details>
 
@@ -7805,6 +8193,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 8.41µs | +9.53% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 7.75µs | -7.91% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 7.03µs | -9.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 7.64µs | +8.63% |
 
 </details>
 
@@ -7824,6 +8213,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 142.6ns | +10.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 130.2ns | -8.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 115.2ns | -11.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 127.4ns | +10.60% |
 
 </details>
 
@@ -7843,6 +8233,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.09µs | +9.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.90µs | -9.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.71µs | -9.89% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.89µs | +10.31% |
 
 </details>
 
@@ -7862,6 +8253,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 61.84µs | +3.59% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 58.98µs | -4.63% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 60.08µs | +1.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 61.88µs | +2.99% |
 
 </details>
 
@@ -7881,6 +8273,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 955.0ns | +8.90% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 859.8ns | -9.97% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 880.0ns | +2.35% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 951.8ns | +8.15% |
 
 </details>
 
@@ -7900,6 +8293,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 15.15µs | +2.18% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 15.27µs | +0.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 15.60µs | +2.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 15.41µs | -1.19% |
 
 </details>
 
@@ -7919,6 +8313,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 246.6ns | +9.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 221.1ns | -10.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 224.5ns | +1.51% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 238.7ns | +6.34% |
 
 </details>
 
@@ -7938,6 +8333,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.76µs | +7.97% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.49µs | -6.96% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 3.45µs | -1.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.79µs | +9.73% |
 
 </details>
 
@@ -7957,6 +8353,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 87.89µs | +3.17% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 88.49µs | +0.68% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 83.35µs | -5.81% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 85.61µs | +2.72% |
 
 </details>
 
@@ -7976,6 +8373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.37µs | +6.27% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.34µs | -2.13% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.27µs | -5.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.31µs | +3.07% |
 
 </details>
 
@@ -7995,6 +8393,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 22.43µs | +2.28% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 23.07µs | +2.82% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 21.86µs | -5.22% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 21.87µs | +0.02% |
 
 </details>
 
@@ -8014,6 +8413,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 355.4ns | +9.58% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 334.3ns | -5.95% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 320.1ns | -4.24% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 331.9ns | +3.69% |
 
 </details>
 
@@ -8033,6 +8433,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 5.44µs | +6.53% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.36µs | -1.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.06µs | -5.71% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 5.21µs | +3.06% |
 
 </details>
 
@@ -8052,6 +8453,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 39.88µs | -8.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 42.82µs | +7.38% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 41.54µs | -3.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 39.88µs | -3.99% |
 
 </details>
 
@@ -8071,6 +8473,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 635.2ns | -5.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 657.5ns | +3.51% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 656.0ns | -0.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 635.3ns | -3.15% |
 
 </details>
 
@@ -8090,6 +8493,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.99µs | -6.32% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 10.63µs | +6.45% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 10.47µs | -1.48% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.95µs | -4.97% |
 
 </details>
 
@@ -8109,6 +8513,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 168.2ns | -3.53% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 171.7ns | +2.05% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 171.2ns | -0.26% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 165.3ns | -3.49% |
 
 </details>
 
@@ -8128,6 +8533,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.51µs | -5.46% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.61µs | +3.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.59µs | -0.69% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.47µs | -4.71% |
 
 </details>
 
@@ -8147,6 +8553,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 68.91µs | -2.82% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 70.69µs | +2.58% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 68.93µs | -2.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.16µs | +0.33% |
 
 </details>
 
@@ -8166,6 +8573,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.07µs | -0.42% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.07µs | -0.71% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.07µs | +0.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.07µs | +0.64% |
 
 </details>
 
@@ -8185,6 +8593,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.18µs | -4.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 18.31µs | +6.62% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 17.96µs | -1.92% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 17.41µs | -3.09% |
 
 </details>
 
@@ -8204,6 +8613,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 273.8ns | +1.30% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 267.8ns | -2.18% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 267.0ns | -0.30% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 270.6ns | +1.32% |
 
 </details>
 
@@ -8223,6 +8633,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.26µs | -0.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.27µs | +0.24% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.27µs | -0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.29µs | +0.43% |
 
 </details>
 
@@ -8242,6 +8653,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.60µs | +9.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.29µs | -8.71% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 3.29µs | -0.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.61µs | +10.01% |
 
 </details>
 
@@ -8261,6 +8673,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 36.25µs | +10.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 32.93µs | -9.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 32.92µs | -0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 36.22µs | +10.01% |
 
 </details>
 
@@ -8280,6 +8693,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 371.97µs | +10.42% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 336.80µs | -9.45% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 336.77µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 371.18µs | +10.22% |
 
 </details>
 
@@ -8299,6 +8713,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 306.0ns | +10.74% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 298.6ns | -2.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 279.7ns | -6.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 302.6ns | +8.20% |
 
 </details>
 
@@ -8318,6 +8733,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.62µs | +7.45% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.33µs | -7.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 3.69µs | +10.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.65µs | -0.97% |
 
 </details>
 
@@ -8337,6 +8753,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 50.40µs | -9.51% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 56.52µs | +12.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 45.62µs | -19.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 49.72µs | +8.99% |
 
 </details>
 
@@ -8356,6 +8773,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.11µs | +11.30% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.80µs | -10.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.80µs | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.12µs | +11.45% |
 
 </details>
 
@@ -8375,6 +8793,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.73µs | +11.88% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.23µs | -10.59% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.23µs | -0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.74µs | +12.19% |
 
 </details>
 
@@ -8394,6 +8813,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.09µs | +9.44% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 995.2ns | -8.67% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 996.0ns | +0.09% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.09µs | +9.21% |
 
 </details>
 
@@ -8413,6 +8833,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.30µs | +10.83% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.08µs | -9.76% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.08µs | +0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.30µs | +10.92% |
 
 </details>
 
@@ -8432,6 +8853,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 91.0ns | +5.39% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 85.7ns | -5.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 81.2ns | -5.24% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 90.9ns | +11.85% |
 
 </details>
 
@@ -8451,6 +8873,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 119.7ns | +6.63% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 112.2ns | -6.27% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 111.7ns | -0.45% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 119.4ns | +6.90% |
 
 </details>
 
@@ -8470,6 +8893,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 44.0ns | -0.19% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 43.9ns | -0.19% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 43.9ns | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 44.0ns | +0.24% |
 
 </details>
 
@@ -8489,6 +8913,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 69.0ns | +3.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 66.3ns | -3.86% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 66.4ns | +0.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.1ns | +4.05% |
 
 </details>
 
@@ -8508,6 +8933,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.04µs | +11.48% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 935.4ns | -10.47% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 935.2ns | -0.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.04µs | +11.70% |
 
 </details>
 
@@ -8527,6 +8953,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.59µs | +12.22% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.41µs | -10.86% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.41µs | +0.04% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.59µs | +12.09% |
 
 </details>
 
@@ -8546,6 +8973,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 370.2ns | +9.67% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 337.7ns | -8.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 337.7ns | +0.00% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 370.1ns | +9.62% |
 
 </details>
 
@@ -8565,6 +8993,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 775.7ns | +11.33% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 696.0ns | -10.27% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 696.0ns | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 775.8ns | +11.46% |
 
 </details>
 
@@ -8584,6 +9013,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 66.7ns | -2.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 63.9ns | -4.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 62.8ns | -1.72% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 65.8ns | +4.81% |
 
 </details>
 
@@ -8603,6 +9033,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 99.4ns | +40.10% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 71.1ns | -28.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 94.5ns | +32.85% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 97.0ns | +2.60% |
 
 </details>
 
@@ -8622,6 +9053,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 27.6ns | -3.51% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 28.6ns | +3.73% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 28.6ns | +0.16% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 27.6ns | -3.77% |
 
 </details>
 
@@ -8641,6 +9073,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 40.5ns | -31.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 58.8ns | +45.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 40.1ns | -31.71% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 40.6ns | +1.17% |
 
 </details>
 
@@ -8660,6 +9093,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.06µs | +12.25% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 941.8ns | -10.93% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 942.0ns | +0.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.06µs | +12.57% |
 
 </details>
 
@@ -8679,6 +9113,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.59µs | +12.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.42µs | -10.93% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.42µs | -0.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.59µs | +12.26% |
 
 </details>
 
@@ -8698,6 +9133,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 380.6ns | +10.60% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 344.1ns | -9.57% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 344.4ns | +0.08% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 380.5ns | +10.49% |
 
 </details>
 
@@ -8717,6 +9153,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 785.5ns | +11.66% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 702.9ns | -10.51% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 702.6ns | -0.05% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 786.3ns | +11.91% |
 
 </details>
 
@@ -8736,6 +9173,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 84.0ns | +24.08% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 68.1ns | -18.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 67.2ns | -1.42% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 84.1ns | +25.25% |
 
 </details>
 
@@ -8755,6 +9193,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 102.4ns | +8.94% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 76.3ns | -25.44% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 94.0ns | +23.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 82.9ns | -11.73% |
 
 </details>
 
@@ -8774,6 +9213,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 34.2ns | -1.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 34.6ns | +1.00% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 39.5ns | +14.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 34.0ns | -14.11% |
 
 </details>
 
@@ -8793,6 +9233,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 56.7ns | +4.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 54.2ns | -4.35% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 54.3ns | +0.22% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 56.5ns | +4.05% |
 
 </details>
 
@@ -8812,6 +9253,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.18µs | +11.88% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.05µs | -10.64% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.06µs | +0.53% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.18µs | +11.53% |
 
 </details>
 
@@ -8831,6 +9273,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.77µs | +12.37% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.57µs | -11.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.59µs | +0.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.77µs | +11.49% |
 
 </details>
 
@@ -8850,6 +9293,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 444.5ns | +11.79% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 396.1ns | -10.90% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 400.9ns | +1.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 445.0ns | +10.97% |
 
 </details>
 
@@ -8869,6 +9313,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 886.6ns | +12.59% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 788.5ns | -11.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 792.8ns | +0.54% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 887.7ns | +11.97% |
 
 </details>
 
@@ -8888,6 +9333,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 139.7ns | -9.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 155.3ns | +11.20% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 161.3ns | +3.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 140.7ns | -12.78% |
 
 </details>
 
@@ -8907,6 +9353,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 195.0ns | -8.80% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 212.2ns | +8.86% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 217.3ns | +2.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 195.8ns | -9.90% |
 
 </details>
 
@@ -8926,6 +9373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 68.5ns | -1.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 70.8ns | +3.30% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 75.3ns | +6.40% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.1ns | -8.31% |
 
 </details>
 
@@ -8945,6 +9393,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 110.4ns | -11.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 136.8ns | +23.95% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 124.1ns | -9.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 110.5ns | -10.96% |
 
 </details>
 
@@ -8964,6 +9413,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 85.7ns | +4.67% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 81.7ns | -4.61% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 81.2ns | -0.67% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 86.1ns | +6.01% |
 
 </details>
 
@@ -8983,6 +9433,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 45.0ns | -1.04% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 44.2ns | -1.80% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 43.2ns | -2.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 44.3ns | +2.50% |
 
 </details>
 
@@ -9002,6 +9453,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 68.9ns | +4.27% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 66.4ns | -3.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 66.5ns | +0.25% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.6ns | +4.64% |
 
 </details>
 
@@ -9021,6 +9473,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 66.6ns | +4.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 62.2ns | -6.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 62.3ns | +0.18% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 67.1ns | +7.72% |
 
 </details>
 
@@ -9040,6 +9493,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 32.3ns | -3.95% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 28.5ns | -11.60% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 24.9ns | -12.63% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 27.3ns | +9.47% |
 
 </details>
 
@@ -9059,6 +9513,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 51.0ns | +3.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 49.4ns | -3.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 49.6ns | +0.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 51.2ns | +3.25% |
 
 </details>
 
@@ -9078,6 +9533,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 71.96µs | -2.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 78.41µs | +8.97% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 67.45µs | -13.98% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 73.98µs | +9.68% |
 
 </details>
 
@@ -9097,6 +9553,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 35.21µs | +2.13% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 32.65µs | -7.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 29.34µs | -10.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 30.95µs | +5.48% |
 
 </details>
 
@@ -9116,6 +9573,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 62.17µs | +4.76% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 60.54µs | -2.62% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 51.81µs | -14.41% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 63.26µs | +22.09% |
 
 </details>
 
@@ -9135,6 +9593,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 89.79µs | -1.89% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 87.98µs | -2.02% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 88.68µs | +0.80% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 90.21µs | +1.72% |
 
 </details>
 
@@ -9154,6 +9613,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 41.99µs | -6.66% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 43.98µs | +4.74% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 43.78µs | -0.46% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 41.44µs | -5.34% |
 
 </details>
 
@@ -9173,6 +9633,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 68.83µs | -0.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 70.66µs | +2.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 70.51µs | -0.20% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 69.06µs | -2.07% |
 
 </details>
 
@@ -9192,6 +9653,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 76.98µs | -0.71% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 75.12µs | -2.41% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 72.70µs | -3.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 77.27µs | +6.30% |
 
 </details>
 
@@ -9211,6 +9673,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 28.27µs | -8.01% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 29.14µs | +3.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 29.73µs | +2.03% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 30.82µs | +3.67% |
 
 </details>
 
@@ -9230,6 +9693,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 52.69µs | -5.44% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 57.29µs | +8.73% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 56.82µs | -0.83% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 53.47µs | -5.89% |
 
 </details>
 
@@ -9249,6 +9713,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 233.2ns | +8.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 219.0ns | -6.11% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 241.6ns | +10.34% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 222.9ns | -7.73% |
 
 </details>
 
@@ -9268,6 +9733,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.50µs | +12.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.22µs | -7.88% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 3.63µs | +12.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.30µs | -8.95% |
 
 </details>
 
@@ -9287,6 +9753,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 74.7ns | +11.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 69.1ns | -7.53% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 72.7ns | +5.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 71.3ns | -1.93% |
 
 </details>
 
@@ -9306,6 +9773,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 908.4ns | +13.43% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 829.7ns | -8.66% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 931.6ns | +12.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 837.3ns | -10.12% |
 
 </details>
 
@@ -9325,6 +9793,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 472.9ns | +13.40% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 424.0ns | -10.33% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 424.9ns | +0.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 524.5ns | +23.46% |
 
 </details>
 
@@ -9344,6 +9813,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 7.61µs | +9.09% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 7.00µs | -8.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 7.06µs | +0.87% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 8.46µs | +19.81% |
 
 </details>
 
@@ -9363,6 +9833,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 129.0ns | +13.98% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 110.9ns | -14.07% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 113.4ns | +2.23% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 142.7ns | +25.87% |
 
 </details>
 
@@ -9382,6 +9853,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.89µs | +11.76% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.71µs | -9.91% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.71µs | +0.28% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.11µs | +23.11% |
 
 </details>
 
@@ -9401,6 +9873,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 956.3ns | +8.70% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 878.6ns | -8.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 767.2ns | -12.68% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 951.3ns | +24.01% |
 
 </details>
 
@@ -9420,6 +9893,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 15.16µs | +1.24% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 15.52µs | +2.34% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 14.41µs | -7.14% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 15.34µs | +6.45% |
 
 </details>
 
@@ -9439,6 +9913,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 246.5ns | +9.84% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 222.4ns | -9.79% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 195.9ns | -11.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 239.0ns | +21.98% |
 
 </details>
 
@@ -9458,6 +9933,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.74µs | +7.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 3.52µs | -5.87% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.96µs | -16.02% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 3.83µs | +29.36% |
 
 </details>
 
@@ -9477,6 +9953,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 131.3ns | +2.87% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 127.8ns | -2.67% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 131.8ns | +3.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 122.5ns | -7.09% |
 
 </details>
 
@@ -9496,6 +9973,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.08µs | +6.05% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.00µs | -4.21% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.01µs | +0.98% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.08µs | +3.27% |
 
 </details>
 
@@ -9515,6 +9993,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 48.2ns | +8.75% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 44.3ns | -8.09% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 45.2ns | +2.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 47.0ns | +4.09% |
 
 </details>
 
@@ -9534,6 +10013,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 525.5ns | +8.95% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 507.8ns | -3.36% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 511.6ns | +0.74% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 483.1ns | -5.58% |
 
 </details>
 
@@ -9553,6 +10033,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 261.6ns | +9.58% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 239.3ns | -8.51% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 249.7ns | +4.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 274.5ns | +9.95% |
 
 </details>
 
@@ -9572,6 +10053,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.91µs | -1.72% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 5.07µs | +3.14% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 5.33µs | +5.26% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 5.05µs | -5.37% |
 
 </details>
 
@@ -9591,6 +10073,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 80.3ns | +9.96% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 67.1ns | -16.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 72.9ns | +8.56% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 82.2ns | +12.79% |
 
 </details>
 
@@ -9610,6 +10093,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.23µs | +10.28% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.12µs | -8.99% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.13µs | +1.13% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.24µs | +10.07% |
 
 </details>
 
@@ -9629,6 +10113,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 609.7ns | +13.81% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 534.1ns | -12.39% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 536.5ns | +0.44% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 598.8ns | +11.63% |
 
 </details>
 
@@ -9648,6 +10133,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 9.58µs | -31.93% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 13.82µs | +44.31% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 13.44µs | -2.75% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 9.85µs | -26.73% |
 
 </details>
 
@@ -9667,6 +10153,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 149.3ns | +13.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 132.7ns | -11.12% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 132.5ns | -0.12% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 140.3ns | +5.87% |
 
 </details>
 
@@ -9686,6 +10173,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.39µs | +10.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 2.26µs | -5.62% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.15µs | -4.88% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.45µs | +14.09% |
 
 </details>
 
@@ -9705,6 +10193,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 71.6ns | +5.92% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 79.6ns | +11.15% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 67.3ns | -15.43% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 71.8ns | +6.71% |
 
 </details>
 
@@ -9724,6 +10213,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 34.0ns | -2.55% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 34.6ns | +1.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 30.3ns | -12.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 38.9ns | +28.38% |
 
 </details>
 
@@ -9743,6 +10233,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 56.6ns | +4.00% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 54.3ns | -3.93% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 54.4ns | +0.19% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 56.5ns | +3.84% |
 
 </details>
 
@@ -9762,6 +10253,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 67.1ns | +6.97% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 74.9ns | +11.70% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 62.7ns | -16.27% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 67.2ns | +7.08% |
 
 </details>
 
@@ -9781,6 +10273,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 29.2ns | -2.78% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 30.1ns | +2.92% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 25.3ns | -16.01% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 34.5ns | +36.67% |
 
 </details>
 
@@ -9800,6 +10293,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 51.9ns | +4.81% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 49.6ns | -4.59% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 49.8ns | +0.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 52.0ns | +4.56% |
 
 </details>
 
@@ -9819,6 +10313,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 45.0ns | +1.03% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 43.6ns | -3.08% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 45.5ns | +4.33% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 44.3ns | -2.79% |
 
 </details>
 
@@ -9838,6 +10333,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 32.5ns | +13.85% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 28.6ns | -12.16% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 33.6ns | +17.73% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 27.3ns | -18.71% |
 
 </details>
 
@@ -9857,6 +10353,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 38.6ns | +10.54% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 34.5ns | -10.74% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 39.6ns | +14.93% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 34.1ns | -14.02% |
 
 </details>
 
@@ -9876,6 +10373,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 110.9ns | +2.23% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 103.1ns | -7.03% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 96.1ns | -6.83% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 107.7ns | +12.11% |
 
 </details>
 
@@ -9895,6 +10393,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 4.80µs | +16.89% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.11µs | -14.43% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 4.09µs | -0.36% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 4.80µs | +17.16% |
 
 </details>
 
@@ -9914,6 +10413,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 76.04µs | +22.64% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 61.13µs | -19.61% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 60.58µs | -0.90% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 75.59µs | +24.77% |
 
 </details>
 
@@ -9922,6 +10422,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.23µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.33µs | +7.44% |
 
 </details>
 
@@ -9930,6 +10431,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 12.22µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 13.16µs | +7.74% |
 
 </details>
 
@@ -9938,6 +10440,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 122.28µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 131.98µs | +7.94% |
 
 </details>
 
@@ -9946,6 +10449,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 23.83µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 24.23µs | +1.70% |
 
 </details>
 
@@ -9954,6 +10458,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 227.72µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 242.20µs | +6.36% |
 
 </details>
 
@@ -9962,6 +10467,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.27ms | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.42ms | +6.72% |
 
 </details>
 
@@ -9970,6 +10476,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 180.9ns | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 174.5ns | -3.51% |
 
 </details>
 
@@ -9978,6 +10485,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 1.71µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 1.66µs | -3.36% |
 
 </details>
 
@@ -9986,6 +10494,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 16.92µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 16.24µs | -4.07% |
 
 </details>
 
@@ -9994,6 +10503,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 20.07µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 23.63µs | +17.74% |
 
 </details>
 
@@ -10002,6 +10512,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 219.76µs | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 233.88µs | +6.43% |
 
 </details>
 
@@ -10010,6 +10521,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | Commit | Date | ns | Δ vs prev |
 |---|---|---:|---:|
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.20ms | — |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.35ms | +6.89% |
 
 </details>
 
@@ -10029,6 +10541,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 48.38µs | +0.58% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 48.09µs | -0.60% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 48.76µs | +1.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 48.50µs | -0.54% |
 
 </details>
 
@@ -10048,6 +10561,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 898.55µs | +8.61% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 829.52µs | -7.68% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 832.72µs | +0.38% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 896.46µs | +7.66% |
 
 </details>
 
@@ -10067,6 +10581,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 1.38ms | -0.90% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.40ms | +1.41% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 123.09µs | -91.22% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 132.88µs | +7.95% |
 
 </details>
 
@@ -10086,6 +10601,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 3.69ms | -22.21% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 4.78ms | +29.62% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.28ms | -52.37% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.43ms | +6.75% |
 
 </details>
 
@@ -10105,6 +10621,7 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 17.39µs | -4.68% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 18.48µs | +6.29% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 18.56µs | +0.41% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 17.31µs | -6.72% |
 
 </details>
 
@@ -10124,5 +10641,6 @@ Last update: **2026-05-31T03:09:35+00:00**, commit [`8981928`](https://github.co
 | [`caac129`](https://github.com/ohdearquant/lattice/commit/caac1295fb9fc6f11a476d1f17bbfbfa91d37a60) | 2026-05-31T02:39:24+00:00 | 2.35ms | +17.12% |
 | [`37dc9df`](https://github.com/ohdearquant/lattice/commit/37dc9df1aeb461b11383c396e4c53dff4743009f) | 2026-05-31T03:03:41+00:00 | 1.99ms | -15.46% |
 | [`8981928`](https://github.com/ohdearquant/lattice/commit/89819284ff898a78c5ab7287160ec7c9ea261e14) | 2026-05-31T03:09:35+00:00 | 2.19ms | +10.49% |
+| [`026f0cb`](https://github.com/ohdearquant/lattice/commit/026f0cb21383a596ad3985971a4fc300ae1889d9) | 2026-05-31T03:10:47+00:00 | 2.35ms | +7.02% |
 
 </details>
