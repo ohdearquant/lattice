@@ -588,9 +588,10 @@ fn forward_with_cache<'a>(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 /// # Safety
-/// `q` must point to at least 128 contiguous initialized f32 values.
-/// `k` must point to at least 128 contiguous initialized f16 values (as `half::f16`, same repr as u16).
-unsafe fn dot_f32xf16_neon_128(q: *const f32, k: *const half::f16) -> f32 {
+/// `q` must point to at least `dim` contiguous initialized f32 values.
+/// `k` must point to at least `dim` contiguous initialized f16 values.
+/// `dim` must be a multiple of 16.
+unsafe fn dot_f32xf16_neon(q: *const f32, k: *const half::f16, dim: usize) -> f32 {
     use std::arch::aarch64::*;
     let mut acc0 = vdupq_n_f32(0.0);
     let mut acc1 = vdupq_n_f32(0.0);
@@ -598,7 +599,7 @@ unsafe fn dot_f32xf16_neon_128(q: *const f32, k: *const half::f16) -> f32 {
     let mut acc3 = vdupq_n_f32(0.0);
     let k_raw = k as *const u16;
     let mut d = 0usize;
-    while d < 128 {
+    while d < dim {
         let q0 = vld1q_f32(q.add(d));
         let q1 = vld1q_f32(q.add(d + 4));
         let q2 = vld1q_f32(q.add(d + 8));
@@ -620,21 +621,23 @@ unsafe fn dot_f32xf16_neon_128(q: *const f32, k: *const half::f16) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 /// # Safety
-/// - `out` must point to at least 128 contiguous writable f32 values (pre-zeroed).
+/// - `out` must point to at least `dim` contiguous writable f32 values (pre-zeroed).
 /// - `scores` must point to at least `kv_len` initialized f32 values.
 /// - `v_base` must point to f16 values where `v_base[ki * kv_row_stride + d]` is valid
-///   for all `ki < kv_len`, `d < 128`.
-unsafe fn accum_v_f16_neon_128(
+///   for all `ki < kv_len`, `d < dim`.
+/// - `dim` must be a multiple of 16.
+unsafe fn accum_v_f16_neon(
     out: *mut f32,
     scores: *const f32,
     v_base: *const half::f16,
     kv_len: usize,
     kv_row_stride: usize,
+    dim: usize,
 ) {
     use std::arch::aarch64::*;
     let v_raw = v_base as *const u16;
     let mut d = 0usize;
-    while d < 128 {
+    while d < dim {
         let mut acc0 = vdupq_n_f32(0.0);
         let mut acc1 = vdupq_n_f32(0.0);
         let mut acc2 = vdupq_n_f32(0.0);
@@ -668,7 +671,7 @@ unsafe fn accum_v_f16_neon_128(
 }
 
 /// Compute the dot product of f32 Q · f16 K for `head_dim` elements.
-/// Uses NEON on aarch64 for head_dim=128; scalar fallback otherwise.
+/// Uses NEON on aarch64 for head_dim divisible by 16; scalar fallback otherwise.
 #[inline(always)]
 fn dot_f32_f16_dispatch(
     q: &[f32],
@@ -678,9 +681,8 @@ fn dot_f32_f16_dispatch(
     head_dim: usize,
 ) -> f32 {
     #[cfg(target_arch = "aarch64")]
-    if head_dim == 128 {
-        // SAFETY: head_dim == 128 guarantees q[q_off..q_off+128] and k[k_off..k_off+128] are valid.
-        return unsafe { dot_f32xf16_neon_128(q.as_ptr().add(q_off), k.as_ptr().add(k_off)) };
+    if head_dim % 16 == 0 {
+        return unsafe { dot_f32xf16_neon(q.as_ptr().add(q_off), k.as_ptr().add(k_off), head_dim) };
     }
     let mut dot = 0.0f32;
     for d in 0..head_dim {
@@ -690,7 +692,7 @@ fn dot_f32_f16_dispatch(
 }
 
 /// Accumulate weighted f16 V for one output head (pre-zeroed on entry).
-/// Uses NEON on aarch64 for head_dim=128; scalar fallback otherwise.
+/// Uses NEON on aarch64 for head_dim divisible by 16; scalar fallback otherwise.
 #[inline(always)]
 fn accum_v_f16_dispatch(
     out: &mut [f32],
@@ -704,17 +706,15 @@ fn accum_v_f16_dispatch(
     head_dim: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
-    if head_dim == 128 {
-        // SAFETY: head_dim == 128; out[out_off..out_off+128] is valid and pre-zeroed;
-        // scores[score_off..score_off+kv_len] is valid;
-        // v[v_base_off + ki*kv_row_stride .. +128] is valid for all ki < kv_len.
+    if head_dim % 16 == 0 {
         unsafe {
-            accum_v_f16_neon_128(
+            accum_v_f16_neon(
                 out.as_mut_ptr().add(out_off),
                 scores.as_ptr().add(score_off),
                 v.as_ptr().add(v_base_off),
                 kv_len,
                 kv_row_stride,
+                head_dim,
             );
         }
         return;
