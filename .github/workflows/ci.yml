@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  LATTICE_REQUIRE_FIXTURES: "1"
 
 jobs:
   ci:
