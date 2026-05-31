@@ -2142,6 +2142,84 @@ kernel void copy_and_rms_norm(
     }
 }
 
+// ===== Batch copy-then-RMS-norm: multi-row version for prefill =====
+// Each threadgroup processes one row. gid = row index.
+kernel void copy_and_rms_norm_batch(
+    device float* src            [[buffer(0)]],
+    device float* residual_out   [[buffer(1)]],
+    device const float* gamma    [[buffer(2)]],
+    constant uint& row_len       [[buffer(3)]],
+    constant uint& num_rows      [[buffer(4)]],
+    constant float& eps          [[buffer(5)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+    uint base = gid * row_len;
+
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float v = src[base + i];
+        residual_out[base + i] = v;
+        local_sum += v * v;
+    }
+
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(shared[0] / float(row_len) + eps);
+
+    for (uint i = lid; i < row_len; i += tgs) {
+        src[base + i] = src[base + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Batch fused residual-add-then-norm: multi-row version for prefill =====
+// residual_out[row] = base[row] + delta[row]; normed_out[row] = rms_norm(residual_out[row])
+kernel void fused_residual_add_norm_batch(
+    device const float* base     [[buffer(0)]],
+    device const float* delta    [[buffer(1)]],
+    device float* residual_out   [[buffer(2)]],
+    device float* normed_out     [[buffer(3)]],
+    device const float* gamma    [[buffer(4)]],
+    constant uint& row_len       [[buffer(5)]],
+    constant uint& num_rows      [[buffer(6)]],
+    constant float& eps          [[buffer(7)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+    uint base_off = gid * row_len;
+
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float val = base[base_off + i] + delta[base_off + i];
+        residual_out[base_off + i] = val;
+        local_sum += val * val;
+    }
+
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms = rsqrt(shared[0] / float(row_len) + eps);
+
+    for (uint i = lid; i < row_len; i += tgs) {
+        normed_out[base_off + i] = residual_out[base_off + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
 // ===== Fused add-into-residual + copy-to-hidden =====
 // residual[i] += src[i]; dst[i] = residual[i]
 // Replaces 2 dispatches (add_buf + copy_buf) with 1.
@@ -2893,6 +2971,8 @@ kernel void moe_shared_gate_add(
         fused_residual_add_norm: ComputePipelineState,
         copy_and_rms_norm: ComputePipelineState,
         add_and_copy: ComputePipelineState,
+        copy_and_rms_norm_batch: ComputePipelineState,
+        fused_residual_add_norm_batch: ComputePipelineState,
         gemm_q8: ComputePipelineState,
         topk_first_pass: ComputePipelineState,
         topk_merge_pass: ComputePipelineState,
@@ -3749,6 +3829,8 @@ kernel void moe_shared_gate_add(
                 fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
                 copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
                 add_and_copy: make_pipeline("add_and_copy")?,
+                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
@@ -4938,18 +5020,12 @@ kernel void moe_shared_gate_add(
                     let val_d = cfg.linear_value_head_dim;
                     let ks = cfg.linear_conv_kernel_dim as u32;
 
-                    // Batch: copy hidden → residual, norm hidden.
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.hidden,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    // SAFETY: w_in_norm is a live layer-owned buffer pointer.
+                    // Batch: fused copy hidden → residual + norm hidden in-place.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_copy_and_rms_norm_batch(
                             enc,
                             &self.session.activations.hidden,
+                            &self.session.activations.residual,
                             &*w_in_norm,
                             hidden as u32,
                             m,
@@ -5073,21 +5149,14 @@ kernel void moe_shared_gate_add(
                             out_d as u32,
                         );
                     }
-                    self.dispatch_add(
-                        enc,
-                        &self.session.activations.attn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
+                    // Batch: fused residual-add + norm for MLP.
+                    // SAFETY: w_post_norm is a live layer-owned buffer pointer.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_fused_residual_add_norm_batch(
                             enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.attn_out,
+                            &self.session.activations.residual,
                             &self.session.activations.hidden,
                             &*w_post_norm,
                             hidden as u32,
@@ -5133,14 +5202,10 @@ kernel void moe_shared_gate_add(
                             inter as u32,
                         );
                     }
-                    self.dispatch_add(
+                    // Batch: fused end-of-layer residual add + copy.
+                    self.dispatch_add_and_copy(
                         enc,
                         &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
                         &self.session.activations.residual,
                         &self.session.activations.hidden,
                         m * hidden as u32,
@@ -5164,18 +5229,13 @@ kernel void moe_shared_gate_add(
                     };
                     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-                    // Batch: copy + in-norm.
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.hidden,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
+                    // Batch: fused copy hidden → residual + norm hidden in-place.
                     // SAFETY: w_in_norm is a live layer-owned buffer pointer.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_copy_and_rms_norm_batch(
                             enc,
                             &self.session.activations.hidden,
+                            &self.session.activations.residual,
                             &*w_in_norm,
                             hidden as u32,
                             m,
@@ -5368,21 +5428,14 @@ kernel void moe_shared_gate_add(
                             q_dim as u32,
                         );
                     }
-                    self.dispatch_add(
-                        enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
+                    // Batch: fused residual-add + norm for MLP.
+                    // SAFETY: w_post_norm is a live layer-owned buffer pointer.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_fused_residual_add_norm_batch(
                             enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.ffn_out,
+                            &self.session.activations.residual,
                             &self.session.activations.hidden,
                             &*w_post_norm,
                             hidden as u32,
@@ -5428,14 +5481,10 @@ kernel void moe_shared_gate_add(
                             inter as u32,
                         );
                     }
-                    self.dispatch_add(
+                    // Batch: fused end-of-layer residual add + copy.
+                    self.dispatch_add_and_copy(
                         enc,
                         &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
                         &self.session.activations.residual,
                         &self.session.activations.hidden,
                         m * hidden as u32,
@@ -6460,19 +6509,12 @@ kernel void moe_shared_gate_add(
                     let val_d = cfg.linear_value_head_dim;
                     let ks = cfg.linear_conv_kernel_dim as u32;
 
-                    // Batch: copy hidden → residual, norm hidden
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.hidden,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    // SAFETY: The input norm buffer pointer is live for this command
-                    // buffer and row_len/num_rows match the batch activation layout.
+                    // Batch: fused copy hidden → residual + norm hidden in-place.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_copy_and_rms_norm_batch(
                             enc,
                             &self.session.activations.hidden,
+                            &self.session.activations.residual,
                             &*w_in_norm,
                             hidden as u32,
                             m,
@@ -6606,24 +6648,15 @@ kernel void moe_shared_gate_add(
                         );
                     }
 
-                    // Batch: residual + norm for MLP
-                    self.dispatch_add(
-                        enc,
-                        &self.session.activations.attn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
+                    // Batch: fused residual-add + norm for MLP.
                     // SAFETY: The post-attention norm pointer is live and hidden/m
                     // match the activation rows in the preallocated buffers.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_fused_residual_add_norm_batch(
                             enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.attn_out,
+                            &self.session.activations.residual,
                             &self.session.activations.hidden,
                             &*w_post_norm,
                             hidden as u32,
@@ -6678,15 +6711,10 @@ kernel void moe_shared_gate_add(
                         );
                     }
 
-                    // Batch: end-of-layer residual
-                    self.dispatch_add(
+                    // Batch: fused end-of-layer residual add + copy.
+                    self.dispatch_add_and_copy(
                         enc,
                         &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
                         &self.session.activations.residual,
                         &self.session.activations.hidden,
                         m * hidden as u32,
@@ -6711,19 +6739,12 @@ kernel void moe_shared_gate_add(
                     };
                     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-                    // Batch: copy + norm
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.hidden,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    // SAFETY: The input norm buffer pointer is live for this command
-                    // buffer and row_len/num_rows match the batch activation layout.
+                    // Batch: fused copy hidden → residual + norm hidden in-place.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_copy_and_rms_norm_batch(
                             enc,
                             &self.session.activations.hidden,
+                            &self.session.activations.residual,
                             &*w_in_norm,
                             hidden as u32,
                             m,
@@ -6938,24 +6959,15 @@ kernel void moe_shared_gate_add(
                         );
                     }
 
-                    // Batch: residual + norm for MLP
-                    self.dispatch_add(
-                        enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
+                    // Batch: fused residual-add + norm for MLP.
                     // SAFETY: The post-attention norm pointer is live and hidden/m
                     // match the activation rows in the preallocated buffers.
                     unsafe {
-                        self.dispatch_rms_norm(
+                        self.dispatch_fused_residual_add_norm_batch(
                             enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.ffn_out,
+                            &self.session.activations.residual,
                             &self.session.activations.hidden,
                             &*w_post_norm,
                             hidden as u32,
@@ -7010,15 +7022,10 @@ kernel void moe_shared_gate_add(
                         );
                     }
 
-                    // Batch: end-of-layer residual
-                    self.dispatch_add(
+                    // Batch: fused end-of-layer residual add + copy.
+                    self.dispatch_add_and_copy(
                         enc,
                         &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        m * hidden as u32,
-                    );
-                    self.dispatch_copy(
-                        enc,
                         &self.session.activations.residual,
                         &self.session.activations.hidden,
                         m * hidden as u32,
@@ -10457,6 +10464,56 @@ kernel void moe_shared_gate_add(
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(wg, 1, 1));
         }
 
+        /// Batch copy-then-RMS-norm for prefill: copies `src` rows to `residual_out`
+        /// and normalizes `src` in-place.  Multi-row version.
+        fn dispatch_copy_and_rms_norm_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            src: &Buffer,
+            residual_out: &Buffer,
+            gamma: &Buffer,
+            row_len: u32,
+            num_rows: u32,
+            eps: f32,
+        ) {
+            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_and_rms_norm_batch);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(residual_out), 0);
+            enc.set_buffer(2, Some(gamma), 0);
+            enc.set_bytes(3, 4, &row_len as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_rows as *const u32 as *const _);
+            enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), MTLSize::new(wg, 1, 1));
+        }
+
+        /// Batch fused residual-add + RMS-norm for prefill: `residual_out = base + delta`,
+        /// `normed_out = rms_norm(residual_out)`.  Multi-row version.
+        fn dispatch_fused_residual_add_norm_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            base: &Buffer,
+            delta: &Buffer,
+            residual_out: &Buffer,
+            normed_out: &Buffer,
+            gamma: &Buffer,
+            row_len: u32,
+            num_rows: u32,
+            eps: f32,
+        ) {
+            enc.set_compute_pipeline_state(&self.engine.pipelines.fused_residual_add_norm_batch);
+            enc.set_buffer(0, Some(base), 0);
+            enc.set_buffer(1, Some(delta), 0);
+            enc.set_buffer(2, Some(residual_out), 0);
+            enc.set_buffer(3, Some(normed_out), 0);
+            enc.set_buffer(4, Some(gamma), 0);
+            enc.set_bytes(5, 4, &row_len as *const u32 as *const _);
+            enc.set_bytes(6, 4, &num_rows as *const u32 as *const _);
+            enc.set_bytes(7, 4, &eps as *const f32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), MTLSize::new(wg, 1, 1));
+        }
+
         /// Fused add-into-residual + copy-to-hidden for decode end-of-layer.
         /// `residual[i] += src[i]; dst[i] = residual[i]`.
         /// Replaces `dispatch_add` + `dispatch_copy`.
@@ -11547,6 +11604,8 @@ kernel void moe_shared_gate_add(
                 fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
                 copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
                 add_and_copy: make_pipeline("add_and_copy")?,
+                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,

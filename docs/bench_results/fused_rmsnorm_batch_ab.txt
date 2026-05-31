@@ -1,0 +1,28 @@
+=== Fused RMSNorm+Residual Batch Dispatch A/B ===
+Date: 2026-05-31
+Branch: show/perf-discover/fused-rmsnorm
+Hardware: Apple M3 Max (Metal GPU)
+Model: Qwen3.5-0.8B (Q8)
+
+--- Decode Throughput (confirms no regression) ---
+slope_ms: 0.003555
+intercept_ms: 6.0312
+r_squared: 0.990771
+tok_per_sec_64: 159.8
+(Baseline main: ~160 tok/s @ ctx=64, intercept ~6.0ms)
+Result: No decode regression (expected — decode already uses fused kernels)
+
+--- Prefill Path Analysis (theoretical) ---
+Dispatch reduction per forward_prefill call:
+  Pattern 1 (copy+norm → copy_and_rms_norm_batch): 24 layers × 1 saved = 24
+  Pattern 2 (add+copy+norm → fused_residual_add_norm_batch): 24 layers × 2 saved = 48
+  Pattern 3 (add+copy → add_and_copy): 24 layers × 1 saved = 24
+  Total: 96 fewer Metal dispatches per prefill
+
+Memory bandwidth reduction:
+  Each fused kernel eliminates 1-2 extra buffer read/write passes per row.
+  For hidden=1536, 24 layers: ~72KB fewer memory passes per token in batch.
+
+Impact: Prefill latency improvement proportional to dispatch overhead fraction.
+At ~3µs/dispatch average: ~288µs saved per prefill (0.1-0.5% depending on seq_len).
+Larger impact on short prefills where dispatch overhead dominates.
