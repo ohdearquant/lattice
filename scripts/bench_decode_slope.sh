@@ -71,7 +71,7 @@ fi
 
 # Linear regression: per_tok_ms = slope * ctx + intercept
 # Using least-squares via awk
-RESULT=$(awk -v n="$N" '
+RESULT=$(CTX_STR="${CTX_VALS[*]}" PTM_STR="${PTM_VALS[*]}" awk -v n="$N" '
 BEGIN {
     split(ENVIRON["CTX_STR"], xs, " ")
     split(ENVIRON["PTM_STR"], ys, " ")
@@ -108,7 +108,7 @@ BEGIN {
         printf "%.4f", ys[i]
     }
     printf "]}\n"
-}' <<< "" CTX_STR="${CTX_VALS[*]}" PTM_STR="${PTM_VALS[*]}")
+}' /dev/null)
 
 # Pretty print to stderr, raw JSON to stdout
 >&2 echo ""
