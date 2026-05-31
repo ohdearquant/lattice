@@ -769,6 +769,16 @@ impl<'a> MtpVerifier<'a> {
 
         // GQA attention: dequantize f16 KV cache to f32 scratch buffers.
         let kv_end = cur_seq_len * kv_dim;
+        debug_assert!(
+            kv_end <= self.scratch.cached_k_f32.len(),
+            "kv_end={kv_end} > cached_k_f32.len()={} (rollback target exceeded scratch)",
+            self.scratch.cached_k_f32.len()
+        );
+        debug_assert!(
+            kv_end <= self.scratch.cached_v_f32.len(),
+            "kv_end={kv_end} > cached_v_f32.len()={} (rollback target exceeded scratch)",
+            self.scratch.cached_v_f32.len()
+        );
         for (i, &h) in self.cache.k_buffer(0)[..kv_end].iter().enumerate() {
             self.scratch.cached_k_f32[i] = h.to_f32();
         }
@@ -3020,5 +3030,161 @@ mod tests {
             Some(9),
             "bonus is argmax of target_logits[0]"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MtpVerifier f16 KV cache rollback regression (Defect 4 fix, Option A).
+    //
+    // Exercises the real f16 FlatKVCache + dequant scratch path under rollback:
+    //   replay:  forward(1,0) → forward(2,1) → forward(3,2) → rollback(1)
+    //              → forward(7,1)
+    //   fresh:   forward(1,0) → forward(7,1)
+    //
+    // After both sequences the KV cache at positions 0 and 1 must be identical
+    // and the final logits must match, proving stale f16 data at positions 2/3
+    // does not contaminate the output after rollback.
+    // -----------------------------------------------------------------------
+
+    /// Build the smallest valid MtpConfig for rollback testing.
+    fn tiny_mtp_config() -> MtpConfig {
+        MtpConfig {
+            draft_length: 1,
+            num_hidden_layers: 1,
+            hidden_size: 4,
+            vocab_size: 8,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5, // rope_dim = 4*0.5 = 2
+            num_experts: 1,
+            num_experts_per_tok: 1,
+            moe_intermediate_size: 2,
+            shared_expert_intermediate_size: 2,
+            use_dedicated_embeddings: false,
+        }
+    }
+
+    /// Build tiny MtpWeights for the given config with deterministic non-zero values.
+    fn tiny_mtp_weights(cfg: &MtpConfig) -> MtpWeights {
+        let h = cfg.hidden_size;
+        let q_proj_rows = 2 * cfg.num_attention_heads * cfg.head_dim;
+        let kv_proj_rows = cfg.num_key_value_heads * cfg.head_dim;
+        let moe_inter = cfg.moe_intermediate_size;
+        let shared_inter = cfg.shared_expert_intermediate_size;
+        let num_experts = cfg.num_experts;
+
+        // Small but non-zero values: use position-based pattern to avoid symmetry.
+        let fill = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| scale * ((i as f32 + 1.0) * 0.01).sin())
+                .collect()
+        };
+        let ones = |n: usize| vec![1.0f32; n];
+
+        let layer = MtpLayerWeights {
+            input_layernorm: ones(h),
+            post_attention_layernorm: ones(h),
+            self_attn: MtpAttentionWeights {
+                q_proj: fill(q_proj_rows * h, 0.1),
+                k_proj: fill(kv_proj_rows * h, 0.1),
+                v_proj: fill(kv_proj_rows * h, 0.1),
+                o_proj: fill(h * (cfg.num_attention_heads * cfg.head_dim), 0.1),
+                q_norm: ones(cfg.head_dim),
+                k_norm: ones(cfg.head_dim),
+            },
+            mlp: MtpMoeWeights {
+                router_gate: fill(num_experts * h, 0.1),
+                experts_gate_up_proj: fill(num_experts * 2 * moe_inter * h, 0.05),
+                experts_down_proj: fill(num_experts * h * moe_inter, 0.05),
+                shared_gate_proj: fill(shared_inter * h, 0.05),
+                shared_up_proj: fill(shared_inter * h, 0.05),
+                shared_down_proj: fill(h * shared_inter, 0.05),
+                shared_expert_gate: fill(h, 0.1),
+            },
+        };
+
+        MtpWeights {
+            fc_weight: fill(h * (2 * h), 0.1),
+            layers: vec![layer],
+            norm_weight: ones(h),
+            pre_fc_norm_embedding_weight: ones(h),
+            pre_fc_norm_hidden_weight: ones(h),
+        }
+    }
+
+    #[test]
+    fn mtp_verifier_f16_cache_replay_after_rollback_matches_fresh_suffix() {
+        let cfg = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&cfg);
+
+        // Embed and lm_head: [vocab * hidden] — small non-zero values.
+        let embed: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+
+        let h = cfg.hidden_size;
+        let max_seq = 8usize;
+
+        // Previous-hidden stub: same for all steps (non-zero, unit-like).
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        // --- Replay path ---
+        let mut replay =
+            MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, max_seq).unwrap();
+        replay.forward_one(1, 0, &prev_hidden).unwrap();
+        replay.forward_one(2, 1, &prev_hidden).unwrap();
+        replay.forward_one(3, 2, &prev_hidden).unwrap();
+        // Roll back to after position 0 (seq_len=1).
+        replay.rollback_cache_to(1).unwrap();
+        let replay_out = replay.forward_one(7, 1, &prev_hidden).unwrap();
+
+        // --- Fresh path ---
+        let mut fresh = MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, max_seq).unwrap();
+        fresh.forward_one(1, 0, &prev_hidden).unwrap();
+        let fresh_out = fresh.forward_one(7, 1, &prev_hidden).unwrap();
+
+        // Both caches should now hold exactly 2 tokens.
+        assert_eq!(
+            replay.cache.seq_len(),
+            2,
+            "replay cache must hold 2 tokens after rollback+replay"
+        );
+        assert_eq!(fresh.cache.seq_len(), 2, "fresh cache must hold 2 tokens");
+
+        // f16 KV slices at positions 0 and 1 must be identical.
+        assert_eq!(
+            replay.cache.get_k_f16(0),
+            fresh.cache.get_k_f16(0),
+            "K cache mismatch after rollback: stale f16 data contaminating position 0 or 1"
+        );
+        assert_eq!(
+            replay.cache.get_v_f16(0),
+            fresh.cache.get_v_f16(0),
+            "V cache mismatch after rollback: stale f16 data contaminating position 0 or 1"
+        );
+
+        // Logits from the final forward_one must be identical.
+        assert_eq!(
+            replay_out.logits.len(),
+            fresh_out.logits.len(),
+            "logit vector length must match"
+        );
+        for (i, (r, f)) in replay_out
+            .logits
+            .iter()
+            .zip(fresh_out.logits.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                r, f,
+                "logits[{i}] differ after rollback (replay={r}, fresh={f}): \
+                 stale f16 dequant scratch is contaminating attention output"
+            );
+        }
     }
 }

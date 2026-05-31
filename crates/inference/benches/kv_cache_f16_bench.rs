@@ -1,11 +1,11 @@
-//! Criterion benchmarks for FlatKVCache f16 storage (ADR-062 Phase 1).
+//! Criterion benchmarks for FlatKVCache f16 storage (ADR-062 seed).
 //!
 //! Measures:
 //! - `append_kv` throughput (f32→f16 conversion cost per token per layer)
 //! - `read_k_into` throughput (f16→f32 dequantization cost)
 //! - Memory footprint for Qwen3-0.6B config (target: ~448 MB vs 896 MB f32)
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 
 /// Qwen3-0.6B: 28 layers, 8 KV heads, head_dim=128, max_seq=4096.
@@ -37,11 +37,15 @@ fn bench_append_kv(c: &mut Criterion) {
         (kv_dim * 2 * std::mem::size_of::<f32>()) as u64,
     ));
 
+    // Use iter_batched_ref so the cache Drop is excluded from the timed path.
     group.bench_function("f32_to_f16_one_token", |b| {
-        b.iter(|| {
-            let mut cache = FlatKVCache::new(config.clone());
-            cache.append_kv(0, black_box(&k_token), black_box(&v_token));
-        });
+        b.iter_batched_ref(
+            || FlatKVCache::new(config.clone()),
+            |cache| {
+                cache.append_kv(0, black_box(&k_token), black_box(&v_token));
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
@@ -80,12 +84,15 @@ fn bench_read_k_into(c: &mut Criterion) {
 }
 
 fn bench_memory_footprint(c: &mut Criterion) {
-    // Not a time benchmark — reports the byte count and verifies the 2× reduction.
+    // This group is a comparison metric, not a time benchmark.
+    // `total_bytes()` is a pure arithmetic formula with no allocation; the
+    // Criterion measurement shows the cost of the formula itself (sub-nanosecond),
+    // while the assertions below verify the ADR-062 memory reduction requirement.
     let config_f16 = qwen3_06b_config(4096);
     let bytes_f16 = config_f16.total_bytes();
     let mb_f16 = bytes_f16 as f64 / (1024.0 * 1024.0);
 
-    // The old f32 footprint would be 2× larger.
+    // The equivalent f32 footprint would be 2× larger (f32 = 4 bytes, f16 = 2 bytes).
     let bytes_f32 = bytes_f16 * 2;
     let mb_f32 = bytes_f32 as f64 / (1024.0 * 1024.0);
 
@@ -99,7 +106,6 @@ fn bench_memory_footprint(c: &mut Criterion) {
         "f32 baseline should be ~896 MB for Qwen3-0.6B, got {mb_f32:.1} MB"
     );
 
-    // Use a trivial bench to emit the numbers into Criterion output.
     let mut group = c.benchmark_group("kv_cache_f16/memory");
     group.bench_function("qwen3_06b_total_bytes", |b| {
         b.iter(|| {
