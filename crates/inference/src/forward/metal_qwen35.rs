@@ -3534,13 +3534,25 @@ kernel void moe_shared_gate_add(
                     &format!("kv_v_{i}"),
                 ));
             }
-            Self {
+            let cache = Self {
                 k_bufs,
                 v_bufs,
                 seq_len: 0,
                 kv_dim,
                 max_cache_len,
+            };
+            // ADR-064: runtime KV layout assertion (debug builds only).
+            // Current layout is f32; update this when #154 migrates to f16.
+            #[cfg(debug_assertions)]
+            {
+                let expected_bytes = max_cache_len * kv_dim * std::mem::size_of::<f32>();
+                debug_assert_eq!(
+                    cache.k_bufs[0].length() as usize,
+                    expected_bytes,
+                    "KV cache buffer size mismatch: expected f32 layout ({expected_bytes} bytes)"
+                );
             }
+            cache
         }
 
         /// Append a K/V pair into the cache for a given full-attention layer.
