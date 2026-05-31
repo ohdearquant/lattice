@@ -1,0 +1,1242 @@
+{
+  "arch": "aarch64-linux",
+  "benches": {
+    "add_bias_gelu/4096": {
+      "ns": 4618.999618560553,
+      "ns_ci_high": 4619.558653377804,
+      "ns_ci_low": 4618.58501905163
+    },
+    "add_bias_gelu/896": {
+      "ns": 1013.2897931280479,
+      "ns_ci_high": 1013.6221758150978,
+      "ns_ci_low": 1013.0640736512421
+    },
+    "binary_cosine_distance/binary/1024": {
+      "ns": 10.831340036672236,
+      "ns_ci_high": 10.832389174581628,
+      "ns_ci_low": 10.830512936205876
+    },
+    "binary_cosine_distance/binary/1536": {
+      "ns": 15.281480780029725,
+      "ns_ci_high": 15.28343998969451,
+      "ns_ci_low": 15.279730804409388
+    },
+    "binary_cosine_distance/binary/384": {
+      "ns": 5.488096274640896,
+      "ns_ci_high": 5.488778199757621,
+      "ns_ci_low": 5.48743854607935
+    },
+    "binary_cosine_distance/binary/768": {
+      "ns": 9.118600566179355,
+      "ns_ci_high": 9.120024285251699,
+      "ns_ci_low": 9.117416519101953
+    },
+    "binary_cosine_distance/float32_simd/1024": {
+      "ns": 129.33200002879695,
+      "ns_ci_high": 129.3465648349985,
+      "ns_ci_low": 129.31758240079435
+    },
+    "binary_cosine_distance/float32_simd/1536": {
+      "ns": 186.6401010405577,
+      "ns_ci_high": 186.66664740673232,
+      "ns_ci_low": 186.6123070414746
+    },
+    "binary_cosine_distance/float32_simd/384": {
+      "ns": 59.659791976605376,
+      "ns_ci_high": 59.690451213561495,
+      "ns_ci_low": 59.6281690018911
+    },
+    "binary_cosine_distance/float32_simd/768": {
+      "ns": 101.29312998660977,
+      "ns_ci_high": 101.30656706026595,
+      "ns_ci_low": 101.28034404995921
+    },
+    "elementwise_mul/4096": {
+      "ns": 377.32672250514776,
+      "ns_ci_high": 377.42106688817876,
+      "ns_ci_low": 377.2061613530214
+    },
+    "gelu/4096": {
+      "ns": 4328.172722971306,
+      "ns_ci_high": 4328.474205707153,
+      "ns_ci_low": 4327.912391921212
+    },
+    "gelu/896": {
+      "ns": 948.3549049605666,
+      "ns_ci_high": 948.5689883343503,
+      "ns_ci_low": 948.1978930269729
+    },
+    "int4_cosine_distance/float32_simd/1024": {
+      "ns": 129.33649724770902,
+      "ns_ci_high": 129.3503156126589,
+      "ns_ci_low": 129.32315595700481
+    },
+    "int4_cosine_distance/float32_simd/1536": {
+      "ns": 186.6160202511423,
+      "ns_ci_high": 186.86736220362175,
+      "ns_ci_low": 186.47421838526137
+    },
+    "int4_cosine_distance/float32_simd/384": {
+      "ns": 59.76240059407419,
+      "ns_ci_high": 59.78931174136867,
+      "ns_ci_low": 59.73565027270281
+    },
+    "int4_cosine_distance/float32_simd/768": {
+      "ns": 101.17770055365858,
+      "ns_ci_high": 101.20378106339278,
+      "ns_ci_low": 101.15266135049218
+    },
+    "int4_cosine_distance/int4/1024": {
+      "ns": 125.68805791625982,
+      "ns_ci_high": 125.73183834016542,
+      "ns_ci_low": 125.6397140440535
+    },
+    "int4_cosine_distance/int4/1536": {
+      "ns": 182.03454069553524,
+      "ns_ci_high": 182.05424852353337,
+      "ns_ci_low": 182.0161299534705
+    },
+    "int4_cosine_distance/int4/384": {
+      "ns": 54.27992265935836,
+      "ns_ci_high": 54.292965608022016,
+      "ns_ci_low": 54.26750652655993
+    },
+    "int4_cosine_distance/int4/768": {
+      "ns": 96.87249647841153,
+      "ns_ci_high": 96.90171041890072,
+      "ns_ci_low": 96.84659717601431
+    },
+    "int8_batch_cosine/float32_simd/10": {
+      "ns": 572.2688892709168,
+      "ns_ci_high": 572.3233426836488,
+      "ns_ci_low": 572.225952526348
+    },
+    "int8_batch_cosine/float32_simd/100": {
+      "ns": 6850.163293323288,
+      "ns_ci_high": 6851.0831856835275,
+      "ns_ci_low": 6849.389597311671
+    },
+    "int8_batch_cosine/float32_simd/1000": {
+      "ns": 95558.2809725203,
+      "ns_ci_high": 95600.73923440474,
+      "ns_ci_low": 95517.61060725205
+    },
+    "int8_batch_cosine/int8_loop/10": {
+      "ns": 164.13589505812956,
+      "ns_ci_high": 164.15767037568253,
+      "ns_ci_low": 164.1129167913181
+    },
+    "int8_batch_cosine/int8_loop/100": {
+      "ns": 1720.2451642082247,
+      "ns_ci_high": 1720.4623045201972,
+      "ns_ci_low": 1720.0238030712349
+    },
+    "int8_batch_cosine/int8_loop/1000": {
+      "ns": 18796.025181274847,
+      "ns_ci_high": 18807.87888410932,
+      "ns_ci_low": 18784.237233086427
+    },
+    "int8_prepared_dot_product/per_call/1024": {
+      "ns": 3636.256938263532,
+      "ns_ci_high": 3636.762059620589,
+      "ns_ci_low": 3635.8418200288916
+    },
+    "int8_prepared_dot_product/per_call/127": {
+      "ns": 467.723536220983,
+      "ns_ci_high": 467.79169812475595,
+      "ns_ci_low": 467.67147286712037
+    },
+    "int8_prepared_dot_product/per_call/128": {
+      "ns": 459.25598533712866,
+      "ns_ci_high": 459.28915287960444,
+      "ns_ci_low": 459.2264845208443
+    },
+    "int8_prepared_dot_product/per_call/129": {
+      "ns": 466.7481399576371,
+      "ns_ci_high": 466.7865401039761,
+      "ns_ci_low": 466.71665505470156
+    },
+    "int8_prepared_dot_product/per_call/384": {
+      "ns": 1366.6466170576514,
+      "ns_ci_high": 1366.7438418733361,
+      "ns_ci_low": 1366.5634426027586
+    },
+    "int8_prepared_dot_product/per_call/768": {
+      "ns": 2728.746252612623,
+      "ns_ci_high": 2728.9164751327116,
+      "ns_ci_low": 2728.5919048607516
+    },
+    "int8_prepared_dot_product/prepared/1024": {
+      "ns": 31.3768419974149,
+      "ns_ci_high": 31.391923426273884,
+      "ns_ci_low": 31.3613426161565
+    },
+    "int8_prepared_dot_product/prepared/127": {
+      "ns": 12.259709565244604,
+      "ns_ci_high": 12.26206770434536,
+      "ns_ci_low": 12.25742311302629
+    },
+    "int8_prepared_dot_product/prepared/128": {
+      "ns": 8.577096086119777,
+      "ns_ci_high": 8.579589251191994,
+      "ns_ci_low": 8.574519659557005
+    },
+    "int8_prepared_dot_product/prepared/129": {
+      "ns": 9.06623519215611,
+      "ns_ci_high": 9.067514270576886,
+      "ns_ci_low": 9.065107149577551
+    },
+    "int8_prepared_dot_product/prepared/384": {
+      "ns": 14.73007806067973,
+      "ns_ci_high": 14.734529625083152,
+      "ns_ci_low": 14.725700159050733
+    },
+    "int8_prepared_dot_product/prepared/768": {
+      "ns": 25.20122423778118,
+      "ns_ci_high": 25.213911103825183,
+      "ns_ci_low": 25.185446419056913
+    },
+    "int8_quantization/quantize/1024": {
+      "ns": 3608.2204523498017,
+      "ns_ci_high": 3608.380211874257,
+      "ns_ci_low": 3608.074812160308
+    },
+    "int8_quantization/quantize/1536": {
+      "ns": 5438.663982435926,
+      "ns_ci_high": 5439.098596810238,
+      "ns_ci_low": 5438.288019475231
+    },
+    "int8_quantization/quantize/384": {
+      "ns": 1355.5233169123471,
+      "ns_ci_high": 1355.637461251299,
+      "ns_ci_low": 1355.4281012954852
+    },
+    "int8_quantization/quantize/768": {
+      "ns": 2708.072427615852,
+      "ns_ci_high": 2708.362609371772,
+      "ns_ci_low": 2707.834215421859
+    },
+    "int8_raw_dot_product/dot_product_i8/1024": {
+      "ns": 30.32411196643075,
+      "ns_ci_high": 30.331265405354813,
+      "ns_ci_low": 30.317257575390133
+    },
+    "int8_raw_dot_product/dot_product_i8/127": {
+      "ns": 11.923428325269118,
+      "ns_ci_high": 11.926031255760408,
+      "ns_ci_low": 11.92081324343044
+    },
+    "int8_raw_dot_product/dot_product_i8/128": {
+      "ns": 8.200240443420398,
+      "ns_ci_high": 8.20593489427599,
+      "ns_ci_low": 8.194728008458966
+    },
+    "int8_raw_dot_product/dot_product_i8/129": {
+      "ns": 8.558412387842752,
+      "ns_ci_high": 8.559814199162116,
+      "ns_ci_low": 8.557009529589555
+    },
+    "int8_raw_dot_product/dot_product_i8/384": {
+      "ns": 14.061975273650113,
+      "ns_ci_high": 14.063433500341269,
+      "ns_ci_low": 14.060523571066746
+    },
+    "int8_raw_dot_product/dot_product_i8/768": {
+      "ns": 24.708451556550408,
+      "ns_ci_high": 24.71531181399466,
+      "ns_ci_low": 24.699672944046526
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/1024": {
+      "ns": 28.115037777791596,
+      "ns_ci_high": 28.119780661550262,
+      "ns_ci_low": 28.110396397776377
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/127": {
+      "ns": 10.085174544604273,
+      "ns_ci_high": 10.086075916826974,
+      "ns_ci_low": 10.08431799409527
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/128": {
+      "ns": 6.558840941767115,
+      "ns_ci_high": 6.559468491606787,
+      "ns_ci_low": 6.558259656838107
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/129": {
+      "ns": 7.237426621017903,
+      "ns_ci_high": 7.2383753398968285,
+      "ns_ci_low": 7.236609197474639
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/384": {
+      "ns": 12.399825916353956,
+      "ns_ci_high": 12.401090447027107,
+      "ns_ci_low": 12.3987567019674
+    },
+    "int8_raw_dot_product/dot_product_i8_raw/768": {
+      "ns": 21.86283717195866,
+      "ns_ci_high": 21.867020060643387,
+      "ns_ci_low": 21.859239622214833
+    },
+    "int8_vs_float32_cosine/float32_simd/1024": {
+      "ns": 129.01802273757863,
+      "ns_ci_high": 129.0485585577909,
+      "ns_ci_low": 128.9879009195767
+    },
+    "int8_vs_float32_cosine/float32_simd/1536": {
+      "ns": 185.0131508302019,
+      "ns_ci_high": 185.04123570740202,
+      "ns_ci_low": 184.98674110813144
+    },
+    "int8_vs_float32_cosine/float32_simd/384": {
+      "ns": 57.969340703431406,
+      "ns_ci_high": 57.98152693343097,
+      "ns_ci_low": 57.95674905669589
+    },
+    "int8_vs_float32_cosine/float32_simd/768": {
+      "ns": 99.8362712703202,
+      "ns_ci_high": 99.86341960713608,
+      "ns_ci_low": 99.80894009360632
+    },
+    "int8_vs_float32_cosine/int8/1024": {
+      "ns": 33.71231477591487,
+      "ns_ci_high": 33.72538354824151,
+      "ns_ci_low": 33.699571148455185
+    },
+    "int8_vs_float32_cosine/int8/1536": {
+      "ns": 46.09883439734813,
+      "ns_ci_high": 46.108454538839574,
+      "ns_ci_low": 46.08940177377107
+    },
+    "int8_vs_float32_cosine/int8/384": {
+      "ns": 16.586280557122308,
+      "ns_ci_high": 16.61707930622836,
+      "ns_ci_low": 16.5583706360098
+    },
+    "int8_vs_float32_cosine/int8/768": {
+      "ns": 26.923476268522485,
+      "ns_ci_high": 26.936882609499733,
+      "ns_ci_low": 26.90944381363323
+    },
+    "layer_norm/4096": {
+      "ns": 1265.6043190604319,
+      "ns_ci_high": 1265.7447447561974,
+      "ns_ci_low": 1265.4861750327796
+    },
+    "layer_norm/896": {
+      "ns": 288.04445938360635,
+      "ns_ci_high": 288.0777945717738,
+      "ns_ci_low": 288.0143972794601
+    },
+    "memory_size/search_1000_float32": {
+      "ns": 57172.17940337754,
+      "ns_ci_high": 57183.666892395886,
+      "ns_ci_low": 57161.63544897972
+    },
+    "memory_size/search_1000_int8": {
+      "ns": 15088.747366652742,
+      "ns_ci_high": 15092.769409979337,
+      "ns_ci_low": 15084.694610654133
+    },
+    "rms_norm/4096": {
+      "ns": 573.7401661679563,
+      "ns_ci_high": 573.8148573803268,
+      "ns_ci_low": 573.6714094327815
+    },
+    "rms_norm/896": {
+      "ns": 136.54262630983152,
+      "ns_ci_high": 136.56521234036964,
+      "ns_ci_low": 136.51932016154257
+    },
+    "silu_inplace/4096": {
+      "ns": 4908.811950020083,
+      "ns_ci_high": 4910.124568216526,
+      "ns_ci_low": 4907.756449988546
+    },
+    "silu_inplace/896": {
+      "ns": 1075.3265234798857,
+      "ns_ci_high": 1075.685614862689,
+      "ns_ci_low": 1075.0619024123882
+    },
+    "simd_batch_cosine/scalar_loop/10": {
+      "ns": 6389.249450518113,
+      "ns_ci_high": 6389.807475459581,
+      "ns_ci_low": 6388.776650799645
+    },
+    "simd_batch_cosine/scalar_loop/100": {
+      "ns": 64004.58708366316,
+      "ns_ci_high": 64009.77771396344,
+      "ns_ci_low": 64000.17365996757
+    },
+    "simd_batch_cosine/scalar_loop/1000": {
+      "ns": 646798.332914392,
+      "ns_ci_high": 646958.7027056845,
+      "ns_ci_low": 646656.6168753927
+    },
+    "simd_batch_cosine/simd_batch/10": {
+      "ns": 576.0664588853418,
+      "ns_ci_high": 576.0920477405564,
+      "ns_ci_low": 576.0418785611254
+    },
+    "simd_batch_cosine/simd_batch/100": {
+      "ns": 6897.0568729950255,
+      "ns_ci_high": 6897.852269026172,
+      "ns_ci_low": 6896.36344628712
+    },
+    "simd_batch_cosine/simd_batch/1000": {
+      "ns": 93829.10597605577,
+      "ns_ci_high": 93899.16688536746,
+      "ns_ci_low": 93769.0228836752
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/1024d_1000c": {
+      "ns": 145844.41301899406,
+      "ns_ci_high": 145881.53960215134,
+      "ns_ci_low": 145808.28464675247
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/1024d_16c": {
+      "ns": 2112.7073898948374,
+      "ns_ci_high": 2112.812863755001,
+      "ns_ci_low": 2112.6100786457723
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/1024d_256c": {
+      "ns": 36360.355928012585,
+      "ns_ci_high": 36421.22610002541,
+      "ns_ci_low": 36298.22587897402
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/1024d_4c": {
+      "ns": 522.2748113219352,
+      "ns_ci_high": 522.3079171478511,
+      "ns_ci_low": 522.2481611631389
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c": {
+      "ns": 8291.538700229605,
+      "ns_ci_high": 8292.381635769516,
+      "ns_ci_low": 8290.864242181671
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/384d_1000c": {
+      "ns": 58149.29958345338,
+      "ns_ci_high": 58160.36226183233,
+      "ns_ci_low": 58139.06174031192
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/384d_16c": {
+      "ns": 927.5263954962693,
+      "ns_ci_high": 927.6439600792731,
+      "ns_ci_low": 927.4258749745829
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/384d_256c": {
+      "ns": 14814.854748846068,
+      "ns_ci_high": 14818.601495933664,
+      "ns_ci_low": 14811.93087960096
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/384d_4c": {
+      "ns": 239.4943671602632,
+      "ns_ci_high": 239.5230280716259,
+      "ns_ci_low": 239.47005310761514
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/384d_64c": {
+      "ns": 3756.6544080163517,
+      "ns_ci_high": 3757.0164163950312,
+      "ns_ci_low": 3756.3866176981323
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/768d_1000c": {
+      "ns": 107200.27050346114,
+      "ns_ci_high": 107228.70870214223,
+      "ns_ci_low": 107172.9300679503
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/768d_16c": {
+      "ns": 1621.506958209165,
+      "ns_ci_high": 1621.6635457184918,
+      "ns_ci_low": 1621.3545301169058
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/768d_256c": {
+      "ns": 28021.594170769207,
+      "ns_ci_high": 28040.30659382267,
+      "ns_ci_low": 28004.070691014014
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/768d_4c": {
+      "ns": 408.8787819486831,
+      "ns_ci_high": 408.920731099021,
+      "ns_ci_low": 408.8450765574872
+    },
+    "simd_batch_cosine_non_normalized_query/pair_loop/768d_64c": {
+      "ns": 6483.672407064195,
+      "ns_ci_high": 6484.158528941032,
+      "ns_ci_low": 6483.275899437156
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/1024d_1000c": {
+      "ns": 145992.5271304575,
+      "ns_ci_high": 146030.73693763226,
+      "ns_ci_low": 145955.62528390228
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/1024d_16c": {
+      "ns": 2115.4619652446618,
+      "ns_ci_high": 2115.6152753859865,
+      "ns_ci_low": 2115.327567980798
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/1024d_256c": {
+      "ns": 36935.262674913814,
+      "ns_ci_high": 37037.24695857105,
+      "ns_ci_low": 36832.98695039594
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/1024d_4c": {
+      "ns": 517.9068991939617,
+      "ns_ci_high": 517.9470429260809,
+      "ns_ci_low": 517.8739261942641
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/1024d_64c": {
+      "ns": 8258.844811039255,
+      "ns_ci_high": 8259.57168997041,
+      "ns_ci_low": 8258.211018436145
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/384d_1000c": {
+      "ns": 57617.93094262269,
+      "ns_ci_high": 57629.96946137425,
+      "ns_ci_low": 57606.81252451171
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/384d_16c": {
+      "ns": 917.8417078013616,
+      "ns_ci_high": 917.9211763125777,
+      "ns_ci_low": 917.7654999839776
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/384d_256c": {
+      "ns": 14713.028638022954,
+      "ns_ci_high": 14716.028649356664,
+      "ns_ci_low": 14710.404046204032
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/384d_4c": {
+      "ns": 235.7355453416781,
+      "ns_ci_high": 235.7568498555519,
+      "ns_ci_low": 235.7159879961812
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/384d_64c": {
+      "ns": 3721.0149699290196,
+      "ns_ci_high": 3721.3011652733308,
+      "ns_ci_low": 3720.7564252230504
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/768d_1000c": {
+      "ns": 107380.23712918331,
+      "ns_ci_high": 107409.26821653567,
+      "ns_ci_low": 107352.63795043115
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/768d_16c": {
+      "ns": 1616.5251741365864,
+      "ns_ci_high": 1616.702166448131,
+      "ns_ci_low": 1616.3662543912287
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/768d_256c": {
+      "ns": 27874.652806168837,
+      "ns_ci_high": 27895.513346449643,
+      "ns_ci_low": 27855.177970004326
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/768d_4c": {
+      "ns": 405.022422073974,
+      "ns_ci_high": 405.0498283500315,
+      "ns_ci_low": 404.9984097129297
+    },
+    "simd_batch_cosine_non_normalized_query/simd_batch/768d_64c": {
+      "ns": 6449.067322418883,
+      "ns_ci_high": 6450.099346608088,
+      "ns_ci_low": 6448.310861322924
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_1000c": {
+      "ns": 144969.20585942664,
+      "ns_ci_high": 145018.1967666216,
+      "ns_ci_low": 144926.16621699667
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_16c": {
+      "ns": 2087.083038401362,
+      "ns_ci_high": 2087.387848263751,
+      "ns_ci_low": 2086.8630084286547
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_256c": {
+      "ns": 35135.07589603785,
+      "ns_ci_high": 35184.788673559546,
+      "ns_ci_low": 35084.52672163496
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_4c": {
+      "ns": 520.0042779982402,
+      "ns_ci_high": 520.0386691077985,
+      "ns_ci_low": 519.9715076992943
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/1024d_64c": {
+      "ns": 8254.239469685943,
+      "ns_ci_high": 8255.513954101654,
+      "ns_ci_low": 8253.014980437889
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/384d_1000c": {
+      "ns": 58076.85933274539,
+      "ns_ci_high": 58085.43396478271,
+      "ns_ci_low": 58068.62709072172
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/384d_16c": {
+      "ns": 921.2489781328247,
+      "ns_ci_high": 921.4239165781465,
+      "ns_ci_low": 921.0638270069825
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/384d_256c": {
+      "ns": 14732.007797715622,
+      "ns_ci_high": 14734.836497281049,
+      "ns_ci_low": 14729.9419145104
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/384d_4c": {
+      "ns": 237.7362922312669,
+      "ns_ci_high": 237.75785324507612,
+      "ns_ci_low": 237.7184001368048
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/384d_64c": {
+      "ns": 3718.8726603748905,
+      "ns_ci_high": 3719.200888592539,
+      "ns_ci_low": 3718.584032580197
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/768d_1000c": {
+      "ns": 106058.11415877599,
+      "ns_ci_high": 106095.74036945065,
+      "ns_ci_low": 106023.80666895324
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/768d_16c": {
+      "ns": 1603.0650260530238,
+      "ns_ci_high": 1603.2860774094293,
+      "ns_ci_low": 1602.847494793849
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/768d_256c": {
+      "ns": 29407.167432742055,
+      "ns_ci_high": 29431.67005898047,
+      "ns_ci_low": 29383.129512255695
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/768d_4c": {
+      "ns": 404.6979353976721,
+      "ns_ci_high": 404.7331712868063,
+      "ns_ci_low": 404.66666115228855
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_cosine/768d_64c": {
+      "ns": 6420.574605519496,
+      "ns_ci_high": 6421.131375248786,
+      "ns_ci_low": 6420.138423764105
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_1000c": {
+      "ns": 95668.5256834497,
+      "ns_ci_high": 95717.76658660699,
+      "ns_ci_low": 95627.51382412831
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_16c": {
+      "ns": 1438.7856316043506,
+      "ns_ci_high": 1438.962092057323,
+      "ns_ci_low": 1438.6157570192338
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_256c": {
+      "ns": 26529.32010744436,
+      "ns_ci_high": 26582.830277476252,
+      "ns_ci_low": 26474.47047915252
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_4c": {
+      "ns": 304.3139971551628,
+      "ns_ci_high": 304.4516498893357,
+      "ns_ci_low": 304.1777813121134
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c": {
+      "ns": 6093.456161793892,
+      "ns_ci_high": 6094.917508470403,
+      "ns_ci_low": 6092.292769330795
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/384d_1000c": {
+      "ns": 38286.52387391182,
+      "ns_ci_high": 38299.95663950722,
+      "ns_ci_low": 38273.814649057735
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/384d_16c": {
+      "ns": 490.287343363662,
+      "ns_ci_high": 490.4344385673114,
+      "ns_ci_low": 490.1336439463882
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/384d_256c": {
+      "ns": 9572.95507258705,
+      "ns_ci_high": 9574.832013479812,
+      "ns_ci_low": 9571.530121969576
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/384d_4c": {
+      "ns": 133.81039466229583,
+      "ns_ci_high": 133.86759897872122,
+      "ns_ci_low": 133.76271971291624
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/384d_64c": {
+      "ns": 2451.17321693801,
+      "ns_ci_high": 2451.329363338239,
+      "ns_ci_low": 2451.032834781277
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/768d_1000c": {
+      "ns": 72874.17756855585,
+      "ns_ci_high": 72902.40804019663,
+      "ns_ci_low": 72845.6758045511
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/768d_16c": {
+      "ns": 969.2383559084586,
+      "ns_ci_high": 969.5093902828947,
+      "ns_ci_low": 968.9629277464408
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/768d_256c": {
+      "ns": 22272.64967353682,
+      "ns_ci_high": 22298.382313206843,
+      "ns_ci_low": 22246.950961645125
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/768d_4c": {
+      "ns": 233.1877506118251,
+      "ns_ci_high": 233.24344500631852,
+      "ns_ci_low": 233.13541290666183
+    },
+    "simd_batch_cosine_normalized_query/pair_loop_dot/768d_64c": {
+      "ns": 4614.784772347361,
+      "ns_ci_high": 4615.577655131506,
+      "ns_ci_low": 4614.15665795211
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/1024d_1000c": {
+      "ns": 144779.6578285935,
+      "ns_ci_high": 144824.56590702914,
+      "ns_ci_low": 144742.34782063044
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/1024d_16c": {
+      "ns": 2080.5412635893194,
+      "ns_ci_high": 2080.7553029922783,
+      "ns_ci_low": 2080.3427624949722
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/1024d_256c": {
+      "ns": 35539.809521985066,
+      "ns_ci_high": 35601.639167707646,
+      "ns_ci_low": 35477.3488929625
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/1024d_4c": {
+      "ns": 516.1004949122984,
+      "ns_ci_high": 516.2044793873258,
+      "ns_ci_low": 516.022245603004
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/1024d_64c": {
+      "ns": 8225.555478659522,
+      "ns_ci_high": 8229.740692084084,
+      "ns_ci_low": 8222.14998622834
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/384d_1000c": {
+      "ns": 57559.75266336547,
+      "ns_ci_high": 57572.9526362186,
+      "ns_ci_low": 57547.71580412516
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/384d_16c": {
+      "ns": 915.1571479759931,
+      "ns_ci_high": 915.2075676086055,
+      "ns_ci_low": 915.1107732101503
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/384d_256c": {
+      "ns": 14586.350898547773,
+      "ns_ci_high": 14589.113349328782,
+      "ns_ci_low": 14584.216193547036
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/384d_4c": {
+      "ns": 235.0267790126522,
+      "ns_ci_high": 235.04733282410197,
+      "ns_ci_low": 235.0080129432742
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/384d_64c": {
+      "ns": 3687.4169809280515,
+      "ns_ci_high": 3687.7858347197243,
+      "ns_ci_low": 3687.117074930526
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/768d_1000c": {
+      "ns": 106451.99421722107,
+      "ns_ci_high": 106491.96820607032,
+      "ns_ci_low": 106412.45654121054
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/768d_16c": {
+      "ns": 1602.9393063028253,
+      "ns_ci_high": 1603.0726335939794,
+      "ns_ci_low": 1602.8150565291423
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/768d_256c": {
+      "ns": 29143.343312493307,
+      "ns_ci_high": 29177.72881492839,
+      "ns_ci_low": 29109.520199183004
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/768d_4c": {
+      "ns": 401.4003310994402,
+      "ns_ci_high": 401.4301881459741,
+      "ns_ci_low": 401.37389459553594
+    },
+    "simd_batch_cosine_normalized_query/simd_batch/768d_64c": {
+      "ns": 6385.597591041408,
+      "ns_ci_high": 6386.318956874064,
+      "ns_ci_low": 6384.978866055857
+    },
+    "simd_batch_dot_product/scalar_loop/10": {
+      "ns": 2148.541804641886,
+      "ns_ci_high": 2148.761845728241,
+      "ns_ci_low": 2148.3587419209
+    },
+    "simd_batch_dot_product/scalar_loop/100": {
+      "ns": 21354.813987538873,
+      "ns_ci_high": 21356.911018591807,
+      "ns_ci_low": 21353.118497118117
+    },
+    "simd_batch_dot_product/scalar_loop/1000": {
+      "ns": 218506.04202961724,
+      "ns_ci_high": 218567.04603123013,
+      "ns_ci_low": 218446.80347314666
+    },
+    "simd_batch_dot_product/simd_batch/10": {
+      "ns": 316.03245413808486,
+      "ns_ci_high": 316.05772708481896,
+      "ns_ci_low": 316.0076743571738
+    },
+    "simd_batch_dot_product/simd_batch/100": {
+      "ns": 5620.39005226603,
+      "ns_ci_high": 5621.086800040759,
+      "ns_ci_low": 5619.823382623101
+    },
+    "simd_batch_dot_product/simd_batch/1000": {
+      "ns": 83520.57298625394,
+      "ns_ci_high": 83572.76387850249,
+      "ns_ci_low": 83473.92990744048
+    },
+    "simd_cosine_similarity/scalar/1024": {
+      "ns": 1772.3861875628986,
+      "ns_ci_high": 1772.553854744254,
+      "ns_ci_low": 1772.232931148153
+    },
+    "simd_cosine_similarity/scalar/1536": {
+      "ns": 2679.928423398923,
+      "ns_ci_high": 2680.092206120336,
+      "ns_ci_low": 2679.768204707723
+    },
+    "simd_cosine_similarity/scalar/384": {
+      "ns": 641.211027556781,
+      "ns_ci_high": 641.3946291063423,
+      "ns_ci_low": 641.0253047728726
+    },
+    "simd_cosine_similarity/scalar/768": {
+      "ns": 1321.6719248830882,
+      "ns_ci_high": 1321.8925176159773,
+      "ns_ci_low": 1321.470609980526
+    },
+    "simd_cosine_similarity/simd/1024": {
+      "ns": 130.15662280311378,
+      "ns_ci_high": 130.1717937111532,
+      "ns_ci_low": 130.14238723791658
+    },
+    "simd_cosine_similarity/simd/1536": {
+      "ns": 185.31380310305138,
+      "ns_ci_high": 185.33485614829206,
+      "ns_ci_low": 185.2951226440405
+    },
+    "simd_cosine_similarity/simd/384": {
+      "ns": 58.053828721412984,
+      "ns_ci_high": 58.06952555651217,
+      "ns_ci_low": 58.03750295799453
+    },
+    "simd_cosine_similarity/simd/768": {
+      "ns": 100.35098201938101,
+      "ns_ci_high": 100.36096806472075,
+      "ns_ci_low": 100.34180039261997
+    },
+    "simd_dot_product/scalar/1024": {
+      "ns": 593.2057326549939,
+      "ns_ci_high": 593.265039548718,
+      "ns_ci_low": 593.1513687424305
+    },
+    "simd_dot_product/scalar/1536": {
+      "ns": 892.3306209150466,
+      "ns_ci_high": 892.3691847621676,
+      "ns_ci_low": 892.2948044892886
+    },
+    "simd_dot_product/scalar/384": {
+      "ns": 213.04044276734473,
+      "ns_ci_high": 213.0639076565903,
+      "ns_ci_low": 213.01838484780265
+    },
+    "simd_dot_product/scalar/768": {
+      "ns": 439.5270734184818,
+      "ns_ci_high": 439.5696780826215,
+      "ns_ci_low": 439.4913090109652
+    },
+    "simd_dot_product/simd/1024": {
+      "ns": 73.48268165441382,
+      "ns_ci_high": 73.50950970086657,
+      "ns_ci_low": 73.45646854749978
+    },
+    "simd_dot_product/simd/1536": {
+      "ns": 106.46620875477817,
+      "ns_ci_high": 106.51345770202904,
+      "ns_ci_low": 106.41936769869329
+    },
+    "simd_dot_product/simd/384": {
+      "ns": 31.484787418865174,
+      "ns_ci_high": 31.4933011915716,
+      "ns_ci_low": 31.47623891118245
+    },
+    "simd_dot_product/simd/768": {
+      "ns": 56.174333340771966,
+      "ns_ci_high": 56.221554440526404,
+      "ns_ci_low": 56.12810761115534
+    },
+    "simd_euclidean_distance/scalar/1024": {
+      "ns": 595.7517354143009,
+      "ns_ci_high": 596.1120511175146,
+      "ns_ci_low": 595.5095612908898
+    },
+    "simd_euclidean_distance/scalar/1536": {
+      "ns": 895.5656088207186,
+      "ns_ci_high": 895.6222873714805,
+      "ns_ci_low": 895.509938863979
+    },
+    "simd_euclidean_distance/scalar/384": {
+      "ns": 217.1689526207925,
+      "ns_ci_high": 217.2225165027398,
+      "ns_ci_low": 217.11980319114457
+    },
+    "simd_euclidean_distance/scalar/768": {
+      "ns": 443.47680747558616,
+      "ns_ci_high": 443.5902825697015,
+      "ns_ci_low": 443.3845550941849
+    },
+    "simd_euclidean_distance/simd/1024": {
+      "ns": 117.10828302364031,
+      "ns_ci_high": 117.13143742064538,
+      "ns_ci_low": 117.08539296374623
+    },
+    "simd_euclidean_distance/simd/1536": {
+      "ns": 171.10973171572002,
+      "ns_ci_high": 171.1320232671709,
+      "ns_ci_low": 171.0918957669587
+    },
+    "simd_euclidean_distance/simd/384": {
+      "ns": 49.083654754023726,
+      "ns_ci_high": 49.15119775232663,
+      "ns_ci_low": 49.043075045266015
+    },
+    "simd_euclidean_distance/simd/768": {
+      "ns": 89.67625549016272,
+      "ns_ci_high": 89.7256342862954,
+      "ns_ci_low": 89.64156282683774
+    },
+    "simd_normalize/scalar/1024": {
+      "ns": 685.6506025814915,
+      "ns_ci_high": 686.5573757119358,
+      "ns_ci_low": 684.8415036343448
+    },
+    "simd_normalize/scalar/1536": {
+      "ns": 1023.6237315623513,
+      "ns_ci_high": 1024.9617875902647,
+      "ns_ci_low": 1022.4093043637356
+    },
+    "simd_normalize/scalar/384": {
+      "ns": 266.2285463639804,
+      "ns_ci_high": 267.0699105652882,
+      "ns_ci_low": 265.3849815147889
+    },
+    "simd_normalize/scalar/768": {
+      "ns": 516.5389375789624,
+      "ns_ci_high": 517.1373924280188,
+      "ns_ci_low": 516.0020513953846
+    },
+    "simd_normalize/simd/1024": {
+      "ns": 161.09177891388904,
+      "ns_ci_high": 168.9464872171288,
+      "ns_ci_low": 154.52952311152285
+    },
+    "simd_normalize/simd/1536": {
+      "ns": 224.75649254626103,
+      "ns_ci_high": 226.49863959473586,
+      "ns_ci_low": 223.08692154043612
+    },
+    "simd_normalize/simd/384": {
+      "ns": 68.4879577695373,
+      "ns_ci_high": 69.47477063040233,
+      "ns_ci_low": 67.56719817639694
+    },
+    "simd_normalize/simd/768": {
+      "ns": 117.9778398508445,
+      "ns_ci_high": 119.01045447826166,
+      "ns_ci_low": 116.99130544651156
+    },
+    "simd_normalized_cosine_fast_path/cosine_full/1024": {
+      "ns": 128.96645925773555,
+      "ns_ci_high": 128.99429540816337,
+      "ns_ci_low": 128.93836202186532
+    },
+    "simd_normalized_cosine_fast_path/cosine_full/384": {
+      "ns": 59.444969442014454,
+      "ns_ci_high": 59.45644621060845,
+      "ns_ci_low": 59.4353316177627
+    },
+    "simd_normalized_cosine_fast_path/cosine_full/768": {
+      "ns": 99.4143354666863,
+      "ns_ci_high": 99.42492060595643,
+      "ns_ci_low": 99.40446293736417
+    },
+    "simd_normalized_cosine_fast_path/dot_product/1024": {
+      "ns": 73.61032750489076,
+      "ns_ci_high": 73.6313027720217,
+      "ns_ci_low": 73.59072148279081
+    },
+    "simd_normalized_cosine_fast_path/dot_product/384": {
+      "ns": 31.736599683666647,
+      "ns_ci_high": 31.764787406986002,
+      "ns_ci_low": 31.707509171520154
+    },
+    "simd_normalized_cosine_fast_path/dot_product/768": {
+      "ns": 56.66523509402137,
+      "ns_ci_high": 56.69135342974582,
+      "ns_ci_low": 56.64106135271954
+    },
+    "simd_prepared_query_normalized_cosine/dot_product_loop/1024": {
+      "ns": 96444.67852343082,
+      "ns_ci_high": 96559.14907322168,
+      "ns_ci_low": 96349.22688049657
+    },
+    "simd_prepared_query_normalized_cosine/dot_product_loop/384": {
+      "ns": 38455.241529305,
+      "ns_ci_high": 38492.86175694268,
+      "ns_ci_low": 38422.119091936795
+    },
+    "simd_prepared_query_normalized_cosine/dot_product_loop/768": {
+      "ns": 73358.59280933278,
+      "ns_ci_high": 73391.29883578086,
+      "ns_ci_low": 73326.02930567297
+    },
+    "simd_prepared_query_normalized_cosine/prepared_full_cosine/1024": {
+      "ns": 147038.82894293882,
+      "ns_ci_high": 147106.98931982936,
+      "ns_ci_low": 146977.911172383
+    },
+    "simd_prepared_query_normalized_cosine/prepared_full_cosine/384": {
+      "ns": 58008.46863458186,
+      "ns_ci_high": 58025.085464899086,
+      "ns_ci_low": 57992.835750292856
+    },
+    "simd_prepared_query_normalized_cosine/prepared_full_cosine/768": {
+      "ns": 107803.43264996805,
+      "ns_ci_high": 107868.85179719204,
+      "ns_ci_low": 107746.98450014787
+    },
+    "simd_prepared_query_normalized_cosine/prepared_meta_unit/1024": {
+      "ns": 97598.9690896038,
+      "ns_ci_high": 97675.67833026686,
+      "ns_ci_low": 97526.68182003542
+    },
+    "simd_prepared_query_normalized_cosine/prepared_meta_unit/384": {
+      "ns": 39252.74591437724,
+      "ns_ci_high": 39292.75816163853,
+      "ns_ci_low": 39216.49965488629
+    },
+    "simd_prepared_query_normalized_cosine/prepared_meta_unit/768": {
+      "ns": 73965.143898132,
+      "ns_ci_high": 74033.98336478785,
+      "ns_ci_low": 73907.9283402618
+    },
+    "simd_query_batch_dot_product/pair_loop/128d_16c": {
+      "ns": 220.39850001571085,
+      "ns_ci_high": 220.50911934296374,
+      "ns_ci_low": 220.27990007962296
+    },
+    "simd_query_batch_dot_product/pair_loop/128d_256c": {
+      "ns": 3873.8606625924353,
+      "ns_ci_high": 3875.023872516481,
+      "ns_ci_low": 3873.1709111191817
+    },
+    "simd_query_batch_dot_product/pair_loop/128d_4c": {
+      "ns": 66.72326662722104,
+      "ns_ci_high": 66.773068145853,
+      "ns_ci_low": 66.67246594780495
+    },
+    "simd_query_batch_dot_product/pair_loop/128d_64c": {
+      "ns": 814.7192742492033,
+      "ns_ci_high": 815.2204706464878,
+      "ns_ci_low": 814.2641099009505
+    },
+    "simd_query_batch_dot_product/pair_loop/384d_16c": {
+      "ns": 499.1226968787482,
+      "ns_ci_high": 499.1599059571395,
+      "ns_ci_low": 499.07960604567006
+    },
+    "simd_query_batch_dot_product/pair_loop/384d_256c": {
+      "ns": 9626.388930330095,
+      "ns_ci_high": 9628.821847238067,
+      "ns_ci_low": 9624.404096819468
+    },
+    "simd_query_batch_dot_product/pair_loop/384d_4c": {
+      "ns": 134.2295285822446,
+      "ns_ci_high": 134.32441212856395,
+      "ns_ci_low": 134.13340118883931
+    },
+    "simd_query_batch_dot_product/pair_loop/384d_64c": {
+      "ns": 2433.36579183798,
+      "ns_ci_high": 2433.5904066529847,
+      "ns_ci_low": 2433.169940353936
+    },
+    "simd_query_batch_dot_product/pair_loop/768d_16c": {
+      "ns": 1049.9887126096548,
+      "ns_ci_high": 1050.238805175881,
+      "ns_ci_low": 1049.732996208959
+    },
+    "simd_query_batch_dot_product/pair_loop/768d_256c": {
+      "ns": 19468.39976818933,
+      "ns_ci_high": 19483.378832206854,
+      "ns_ci_low": 19455.31188641163
+    },
+    "simd_query_batch_dot_product/pair_loop/768d_4c": {
+      "ns": 232.2132764464546,
+      "ns_ci_high": 232.24696177052127,
+      "ns_ci_low": 232.18171087484166
+    },
+    "simd_query_batch_dot_product/pair_loop/768d_64c": {
+      "ns": 4598.353343726405,
+      "ns_ci_high": 4598.678669305331,
+      "ns_ci_low": 4598.048749349041
+    },
+    "simd_query_batch_dot_product/simd_batch/128d_16c": {
+      "ns": 139.6480281187948,
+      "ns_ci_high": 139.6766052050663,
+      "ns_ci_low": 139.62081266429593
+    },
+    "simd_query_batch_dot_product/simd_batch/128d_256c": {
+      "ns": 3042.2506118174006,
+      "ns_ci_high": 3043.5146445376963,
+      "ns_ci_low": 3041.4818574600336
+    },
+    "simd_query_batch_dot_product/simd_batch/128d_4c": {
+      "ns": 46.929268871604755,
+      "ns_ci_high": 46.956404462839195,
+      "ns_ci_low": 46.90231037961536
+    },
+    "simd_query_batch_dot_product/simd_batch/128d_64c": {
+      "ns": 504.62837155654177,
+      "ns_ci_high": 504.8335602177927,
+      "ns_ci_low": 504.44141465375145
+    },
+    "simd_query_batch_dot_product/simd_batch/384d_16c": {
+      "ns": 329.46019900121723,
+      "ns_ci_high": 329.51005616119704,
+      "ns_ci_low": 329.42200621046635
+    },
+    "simd_query_batch_dot_product/simd_batch/384d_256c": {
+      "ns": 8511.346177545101,
+      "ns_ci_high": 8513.347288461237,
+      "ns_ci_low": 8509.53937950606
+    },
+    "simd_query_batch_dot_product/simd_batch/384d_4c": {
+      "ns": 93.94767060432572,
+      "ns_ci_high": 93.96961159161168,
+      "ns_ci_low": 93.92672970358433
+    },
+    "simd_query_batch_dot_product/simd_batch/384d_64c": {
+      "ns": 2118.426982118098,
+      "ns_ci_high": 2120.2903605501447,
+      "ns_ci_low": 2117.1972488270417
+    },
+    "simd_query_batch_dot_product/simd_batch/768d_16c": {
+      "ns": 793.5492232440671,
+      "ns_ci_high": 794.1905169326168,
+      "ns_ci_low": 793.0400378640181
+    },
+    "simd_query_batch_dot_product/simd_batch/768d_256c": {
+      "ns": 16479.65262474485,
+      "ns_ci_high": 16490.061584976065,
+      "ns_ci_low": 16469.620492976366
+    },
+    "simd_query_batch_dot_product/simd_batch/768d_4c": {
+      "ns": 165.02073233124213,
+      "ns_ci_high": 165.05017094529782,
+      "ns_ci_low": 164.99089688524793
+    },
+    "simd_query_batch_dot_product/simd_batch/768d_64c": {
+      "ns": 3847.7598269889368,
+      "ns_ci_high": 3848.083030622227,
+      "ns_ci_low": 3847.433628664518
+    },
+    "simd_squared_euclidean_fast_path/euclidean_full/1024": {
+      "ns": 117.02457708570014,
+      "ns_ci_high": 117.04521073771292,
+      "ns_ci_low": 117.0038955094527
+    },
+    "simd_squared_euclidean_fast_path/euclidean_full/384": {
+      "ns": 49.11248161806536,
+      "ns_ci_high": 49.12510567578345,
+      "ns_ci_low": 49.09948519302344
+    },
+    "simd_squared_euclidean_fast_path/euclidean_full/768": {
+      "ns": 89.84959427951388,
+      "ns_ci_high": 89.8594298679608,
+      "ns_ci_low": 89.8398088224829
+    },
+    "simd_squared_euclidean_fast_path/squared_euclidean/1024": {
+      "ns": 113.81370714548049,
+      "ns_ci_high": 113.83211972559896,
+      "ns_ci_low": 113.79475012223757
+    },
+    "simd_squared_euclidean_fast_path/squared_euclidean/384": {
+      "ns": 46.03982390112317,
+      "ns_ci_high": 46.06177041903006,
+      "ns_ci_low": 46.01832573503548
+    },
+    "simd_squared_euclidean_fast_path/squared_euclidean/768": {
+      "ns": 86.76280075290582,
+      "ns_ci_high": 86.7878756581437,
+      "ns_ci_low": 86.73889143264923
+    },
+    "simd_throughput_384/cosine_similarity": {
+      "ns": 57.945758999301816,
+      "ns_ci_high": 57.96068417720892,
+      "ns_ci_low": 57.93143272409826
+    },
+    "simd_throughput_384/dot_product": {
+      "ns": 31.56171048563434,
+      "ns_ci_high": 31.579141975640685,
+      "ns_ci_low": 31.545496134138133
+    },
+    "simd_throughput_384/euclidean_distance": {
+      "ns": 49.131868559139946,
+      "ns_ci_high": 49.144615447743064,
+      "ns_ci_low": 49.11834543422236
+    },
+    "simd_throughput_384/normalize": {
+      "ns": 112.14970897978218,
+      "ns_ci_high": 112.17118235821412,
+      "ns_ci_low": 112.1314279872727
+    },
+    "softmax_attention/128": {
+      "ns": 8325.193732994161,
+      "ns_ci_high": 8325.808428828126,
+      "ns_ci_low": 8324.652231313035
+    },
+    "softmax_attention/512": {
+      "ns": 128080.72435809838,
+      "ns_ci_high": 128169.4586639356,
+      "ns_ci_low": 127961.32265389185
+    },
+    "tier_prepared_query/binary_query_once_1000": {
+      "ns": 7538.329519702596,
+      "ns_ci_high": 7539.193812556021,
+      "ns_ci_low": 7537.468934338413
+    },
+    "tier_prepared_query/binary_query_per_call_1000": {
+      "ns": 962482.576840698,
+      "ns_ci_high": 962549.2995898869,
+      "ns_ci_low": 962426.3998878077
+    },
+    "tier_prepared_query/int4_query_once_1000": {
+      "ns": 51726.18633838583,
+      "ns_ci_high": 51750.009948551575,
+      "ns_ci_low": 51700.313652697005
+    },
+    "tier_prepared_query/int4_query_per_call_1000": {
+      "ns": 2062280.5827999997,
+      "ns_ci_high": 2062391.2011200006,
+      "ns_ci_low": 2062189.2989599998
+    },
+    "tier_prepared_query/int8_query_once_1000": {
+      "ns": 17981.69899197586,
+      "ns_ci_high": 17984.389958379797,
+      "ns_ci_low": 17979.270191469244
+    },
+    "tier_prepared_query/int8_query_per_call_1000": {
+      "ns": 1370166.603336245,
+      "ns_ci_high": 1370344.9897049502,
+      "ns_ci_low": 1370014.1930598505
+    }
+  },
+  "commit": "fdf1b7553ab165ca444d14b40588dc5ed7f110aa",
+  "date": "2026-05-31T02:22:20+00:00"
+}
