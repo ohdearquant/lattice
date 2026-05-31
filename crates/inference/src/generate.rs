@@ -99,9 +99,6 @@ struct ForwardScratch {
     ffn_out: Vec<f32>,     // [≥ seq_len_cap * hidden_size]
     scores: Vec<f32>,      // [≥ num_heads * max_seq_len] — score_stride = max_seq_len
     logits: Vec<f32>,      // [≥ vocab_size]
-    // Dequantization buffers: f16 KV cache → f32 for compute_attention.
-    cached_k_f32: Vec<f32>, // [≥ max_seq_len * kv_dim]
-    cached_v_f32: Vec<f32>, // [≥ max_seq_len * kv_dim]
 }
 
 impl ForwardScratch {
@@ -120,8 +117,6 @@ impl ForwardScratch {
             ffn_out: Vec::new(),
             scores: Vec::new(),
             logits: Vec::new(),
-            cached_k_f32: Vec::new(),
-            cached_v_f32: Vec::new(),
         }
     }
 
@@ -148,10 +143,6 @@ impl ForwardScratch {
         grow(&mut self.ffn_out, seq_len_cap * h);
         grow(&mut self.scores, cfg.num_attention_heads * max_seq_len);
         grow(&mut self.logits, cfg.vocab_size);
-        // Dequant scratch: must hold up to max_seq_len * kv_dim f32 elements.
-        let kv_dim = cfg.kv_dim();
-        grow(&mut self.cached_k_f32, max_seq_len * kv_dim);
-        grow(&mut self.cached_v_f32, max_seq_len * kv_dim);
     }
 }
 
@@ -457,37 +448,29 @@ fn forward_with_cache<'a>(
         }
 
         // Attention: Q(seq_len) @ K(cached)^T → softmax → @ V(cached)
-        // Dequantize f16 KV cache into f32 scratch buffers before compute_attention.
+        // Pass f16 KV cache slices directly — no dequant scratch buffers needed.
         let cached_seq_len = cache.seq_len() + seq_len; // not yet advanced
         let k_end = cached_seq_len * kv_dim;
-        for (i, &h) in cache.k_buffer(layer_idx)[..k_end].iter().enumerate() {
-            scratch.cached_k_f32[i] = h.to_f32();
-        }
-        for (i, &h) in cache.v_buffer(layer_idx)[..k_end].iter().enumerate() {
-            scratch.cached_v_f32[i] = h.to_f32();
-        }
 
-        // Split scratch borrows: attn_out + scores are mutable; q_buf, cached_k_f32,
-        // cached_v_f32 are immutable. All are distinct Vec fields — no aliasing.
+        // Split scratch borrows: attn_out + scores are mutable; q_buf is immutable.
+        // KV cache slices are borrowed from `cache` (a separate variable — no aliasing).
         {
-            // SAFETY: q_buf, cached_k_f32, cached_v_f32, attn_out, scores are distinct
-            // Vec fields — no aliasing. Raw pointers avoid simultaneous borrow conflicts.
+            // SAFETY: q_buf, attn_out, scores are distinct Vec fields — no aliasing.
+            // Raw pointers avoid simultaneous borrow conflicts on scratch.
             let q_ptr = scratch.q_buf.as_ptr();
-            let ck_ptr = scratch.cached_k_f32.as_ptr();
-            let cv_ptr = scratch.cached_v_f32.as_ptr();
             let attn_ptr = scratch.attn_out.as_mut_ptr();
             let scores_ptr = scratch.scores.as_mut_ptr();
             let attn_len = seq_len * q_dim;
             let scores_len = scratch.scores.len();
-            let (q_slice, cached_k, cached_v, attn_slice, scores_slice) = unsafe {
+            let (q_slice, attn_slice, scores_slice) = unsafe {
                 (
                     std::slice::from_raw_parts(q_ptr, seq_len * q_dim),
-                    std::slice::from_raw_parts(ck_ptr, k_end),
-                    std::slice::from_raw_parts(cv_ptr, k_end),
                     std::slice::from_raw_parts_mut(attn_ptr, attn_len),
                     std::slice::from_raw_parts_mut(scores_ptr, scores_len),
                 )
             };
+            let cached_k = &cache.k_buffer(layer_idx)[..k_end];
+            let cached_v = &cache.v_buffer(layer_idx)[..k_end];
             compute_attention(
                 attn_slice,
                 q_slice,
@@ -605,29 +588,29 @@ fn forward_with_cache<'a>(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 /// # Safety
-/// `q` and `k` must each point to at least 128 contiguous, initialized f32 values.
-unsafe fn dot_f32_neon_128(q: *const f32, k: *const f32) -> f32 {
+/// `q` must point to at least 128 contiguous initialized f32 values.
+/// `k` must point to at least 128 contiguous initialized f16 values (as `half::f16`, same repr as u16).
+unsafe fn dot_f32xf16_neon_128(q: *const f32, k: *const half::f16) -> f32 {
     use std::arch::aarch64::*;
     let mut acc0 = vdupq_n_f32(0.0);
     let mut acc1 = vdupq_n_f32(0.0);
     let mut acc2 = vdupq_n_f32(0.0);
     let mut acc3 = vdupq_n_f32(0.0);
+    let k_raw = k as *const u16;
     let mut d = 0usize;
-    // head_dim=128: 8 outer iterations × 16 lanes = 128 f32, 4 accumulators break the dependency chain.
     while d < 128 {
-        // SAFETY: caller guarantees q and k each have ≥128 f32 values starting at the pointer.
         let q0 = vld1q_f32(q.add(d));
-        let k0 = vld1q_f32(k.add(d));
         let q1 = vld1q_f32(q.add(d + 4));
-        let k1 = vld1q_f32(k.add(d + 4));
         let q2 = vld1q_f32(q.add(d + 8));
-        let k2 = vld1q_f32(k.add(d + 8));
         let q3 = vld1q_f32(q.add(d + 12));
-        let k3 = vld1q_f32(k.add(d + 12));
-        acc0 = vfmaq_f32(acc0, q0, k0);
-        acc1 = vfmaq_f32(acc1, q1, k1);
-        acc2 = vfmaq_f32(acc2, q2, k2);
-        acc3 = vfmaq_f32(acc3, q3, k3);
+        let kf0 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_raw.add(d))));
+        let kf1 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_raw.add(d + 4))));
+        let kf2 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_raw.add(d + 8))));
+        let kf3 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(k_raw.add(d + 12))));
+        acc0 = vfmaq_f32(acc0, q0, kf0);
+        acc1 = vfmaq_f32(acc1, q1, kf1);
+        acc2 = vfmaq_f32(acc2, q2, kf2);
+        acc3 = vfmaq_f32(acc3, q3, kf3);
         d += 16;
     }
     let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
@@ -636,41 +619,46 @@ unsafe fn dot_f32_neon_128(q: *const f32, k: *const f32) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-/// Accumulate one output head's weighted V sum from a pre-zeroed `out` buffer.
-///
-/// Computes `out[d] = Σ_{ki<kv_len} scores[ki] * v_base[ki*kv_row_stride + d]` for d in 0..128.
-/// Accumulates across ki in NEON registers per 16-element output chunk, then stores once —
-/// eliminating the read-modify-write traffic of the scalar loop.
-///
 /// # Safety
-/// - `out` must point to at least 128 contiguous writable f32 values.
+/// - `out` must point to at least 128 contiguous writable f32 values (pre-zeroed).
 /// - `scores` must point to at least `kv_len` initialized f32 values.
-/// - `v_base[ki * kv_row_stride + d]` must be valid for all `ki < kv_len`, `d < 128`.
-unsafe fn accum_v_neon_128(
+/// - `v_base` must point to f16 values where `v_base[ki * kv_row_stride + d]` is valid
+///   for all `ki < kv_len`, `d < 128`.
+unsafe fn accum_v_f16_neon_128(
     out: *mut f32,
     scores: *const f32,
-    v_base: *const f32,
+    v_base: *const half::f16,
     kv_len: usize,
     kv_row_stride: usize,
 ) {
     use std::arch::aarch64::*;
+    let v_raw = v_base as *const u16;
     let mut d = 0usize;
-    // 128 / 16 = 8 outer iterations, each accumulating 16 output dimensions via 4 f32x4 registers.
     while d < 128 {
         let mut acc0 = vdupq_n_f32(0.0);
         let mut acc1 = vdupq_n_f32(0.0);
         let mut acc2 = vdupq_n_f32(0.0);
         let mut acc3 = vdupq_n_f32(0.0);
         for ki in 0..kv_len {
-            // SAFETY: scores has kv_len entries; v_base row ki has at least kv_row_stride ≥ 128 f32.
             let w = vdupq_n_f32(*scores.add(ki));
-            let v_row = v_base.add(ki * kv_row_stride + d);
-            acc0 = vfmaq_f32(acc0, w, vld1q_f32(v_row));
-            acc1 = vfmaq_f32(acc1, w, vld1q_f32(v_row.add(4)));
-            acc2 = vfmaq_f32(acc2, w, vld1q_f32(v_row.add(8)));
-            acc3 = vfmaq_f32(acc3, w, vld1q_f32(v_row.add(12)));
+            let v_row = v_raw.add(ki * kv_row_stride + d);
+            acc0 = vfmaq_f32(acc0, w, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v_row))));
+            acc1 = vfmaq_f32(
+                acc1,
+                w,
+                vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v_row.add(4)))),
+            );
+            acc2 = vfmaq_f32(
+                acc2,
+                w,
+                vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v_row.add(8)))),
+            );
+            acc3 = vfmaq_f32(
+                acc3,
+                w,
+                vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(v_row.add(12)))),
+            );
         }
-        // SAFETY: out has ≥128 writable f32 values; d+12 < 128 for all loop iterations.
         vst1q_f32(out.add(d), acc0);
         vst1q_f32(out.add(d + 4), acc1);
         vst1q_f32(out.add(d + 8), acc2);
@@ -679,31 +667,37 @@ unsafe fn accum_v_neon_128(
     }
 }
 
-/// Compute the dot product of `q[q_off..q_off+head_dim]` · `k[k_off..k_off+head_dim]`.
-/// Uses NEON on aarch64 for head_dim=128; scalar otherwise.
+/// Compute the dot product of f32 Q · f16 K for `head_dim` elements.
+/// Uses NEON on aarch64 for head_dim=128; scalar fallback otherwise.
 #[inline(always)]
-fn dot_f32_dispatch(q: &[f32], q_off: usize, k: &[f32], k_off: usize, head_dim: usize) -> f32 {
+fn dot_f32_f16_dispatch(
+    q: &[f32],
+    q_off: usize,
+    k: &[half::f16],
+    k_off: usize,
+    head_dim: usize,
+) -> f32 {
     #[cfg(target_arch = "aarch64")]
     if head_dim == 128 {
         // SAFETY: head_dim == 128 guarantees q[q_off..q_off+128] and k[k_off..k_off+128] are valid.
-        return unsafe { dot_f32_neon_128(q.as_ptr().add(q_off), k.as_ptr().add(k_off)) };
+        return unsafe { dot_f32xf16_neon_128(q.as_ptr().add(q_off), k.as_ptr().add(k_off)) };
     }
     let mut dot = 0.0f32;
     for d in 0..head_dim {
-        dot += q[q_off + d] * k[k_off + d];
+        dot += q[q_off + d] * k[k_off + d].to_f32();
     }
     dot
 }
 
-/// Accumulate weighted V for one output head (zeroed on entry).
-/// Uses NEON on aarch64 for head_dim=128; scalar otherwise.
+/// Accumulate weighted f16 V for one output head (pre-zeroed on entry).
+/// Uses NEON on aarch64 for head_dim=128; scalar fallback otherwise.
 #[inline(always)]
-fn accum_v_dispatch(
+fn accum_v_f16_dispatch(
     out: &mut [f32],
     out_off: usize,
     scores: &[f32],
     score_off: usize,
-    v: &[f32],
+    v: &[half::f16],
     v_base_off: usize,
     kv_len: usize,
     kv_row_stride: usize,
@@ -713,10 +707,9 @@ fn accum_v_dispatch(
     if head_dim == 128 {
         // SAFETY: head_dim == 128; out[out_off..out_off+128] is valid and pre-zeroed;
         // scores[score_off..score_off+kv_len] is valid;
-        // v[v_base_off + ki*kv_row_stride .. +128] is valid for all ki < kv_len
-        // because kv_h*head_dim + (kv_len-1)*kv_row_stride + 127 = v.len()-1.
+        // v[v_base_off + ki*kv_row_stride .. +128] is valid for all ki < kv_len.
         unsafe {
-            accum_v_neon_128(
+            accum_v_f16_neon_128(
                 out.as_mut_ptr().add(out_off),
                 scores.as_ptr().add(score_off),
                 v.as_ptr().add(v_base_off),
@@ -730,7 +723,7 @@ fn accum_v_dispatch(
         let w = scores[score_off + ki];
         let v_off = v_base_off + ki * kv_row_stride;
         for d in 0..head_dim {
-            out[out_off + d] += w * v[v_off + d];
+            out[out_off + d] += w * v[v_off + d].to_f32();
         }
     }
 }
@@ -738,16 +731,16 @@ fn accum_v_dispatch(
 /// Compute multi-head attention with GQA, supporting cached K/V and score scratch.
 ///
 /// Q shape: [q_seq_len, num_heads * head_dim]
-/// K shape: [kv_seq_len, num_kv_heads * head_dim]  (from cache)
-/// V shape: [kv_seq_len, num_kv_heads * head_dim]  (from cache)
+/// K shape: [kv_seq_len, num_kv_heads * head_dim]  (from cache, f16)
+/// V shape: [kv_seq_len, num_kv_heads * head_dim]  (from cache, f16)
 ///
 /// `scores_scratch` must have length >= `num_heads * score_stride`.
 /// `score_stride` is the allocated width per head (>= kv_seq_len).
 fn compute_attention(
     output: &mut [f32],
     q: &[f32],
-    k: &[f32],
-    v: &[f32],
+    k: &[half::f16],
+    v: &[half::f16],
     q_seq_len: usize,
     kv_seq_len: usize,
     start_pos: usize,
@@ -773,7 +766,7 @@ fn compute_attention(
         output[..num_heads * head_dim].fill(0.0);
 
         // Phase 1: Q·K^T — each K row loaded once, dotted with all G query heads.
-        // NEON dot product on aarch64 for head_dim=128; scalar fallback otherwise.
+        // NEON f32×f16 dot product on aarch64 for head_dim=128; scalar fallback otherwise.
         for kv_h in 0..num_kv_heads {
             let group_start = kv_h * groups;
             for ki in 0..kv_seq_len {
@@ -782,7 +775,7 @@ fn compute_attention(
                     let h = group_start + gi;
                     let q_off = h * head_dim; // qi=0
                     scores_scratch[h * score_stride + ki] =
-                        dot_f32_dispatch(q, q_off, k, k_off, head_dim) * scale;
+                        dot_f32_f16_dispatch(q, q_off, k, k_off, head_dim) * scale;
                 }
             }
         }
@@ -813,12 +806,12 @@ fn compute_attention(
             }
         }
 
-        // Phase 3: V accumulation — per-head, NEON-accelerated on aarch64 for head_dim=128.
+        // Phase 3: V accumulation — per-head, NEON f16 accumulation on aarch64 for head_dim=128.
         // Accumulates in registers and stores once per 16-element chunk (no read-modify-write).
         let kv_row_stride = num_kv_heads * head_dim;
         for h in 0..num_heads {
             let kv_h = h / groups;
-            accum_v_dispatch(
+            accum_v_f16_dispatch(
                 output,
                 h * head_dim,
                 scores_scratch,
@@ -851,11 +844,7 @@ fn compute_attention(
                 if ki > max_attend {
                     scores[ki] = f32::NEG_INFINITY;
                 } else {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[q_off + d] * k[k_off + d];
-                    }
-                    scores[ki] = dot * scale;
+                    scores[ki] = dot_f32_f16_dispatch(q, q_off, k, k_off, head_dim) * scale;
                 }
             }
 
@@ -879,7 +868,7 @@ fn compute_attention(
                 let mut val = 0.0f32;
                 for ki in 0..kv_seq_len {
                     let v_off = ki * (num_kv_heads * head_dim) + kv_h * head_dim;
-                    val += scores[ki] * v[v_off + d];
+                    val += scores[ki] * v[v_off + d].to_f32();
                 }
                 output[out_off + d] = val;
             }
@@ -896,8 +885,8 @@ pub mod bench_support {
     pub fn compute_attention_for_bench(
         output: &mut [f32],
         q: &[f32],
-        k: &[f32],
-        v: &[f32],
+        k: &[half::f16],
+        v: &[half::f16],
         q_seq_len: usize,
         kv_seq_len: usize,
         start_pos: usize,
@@ -944,6 +933,10 @@ mod tests {
         assert!(!output.stopped_by_eos);
     }
 
+    fn f32_to_f16_vec(v: &[f32]) -> Vec<half::f16> {
+        v.iter().map(|&x| half::f16::from_f32(x)).collect()
+    }
+
     #[test]
     fn test_compute_attention_single_token() {
         // 1 query token, 1 KV token, 1 head, dim=4
@@ -953,8 +946,8 @@ mod tests {
             head_dim: 4,
         };
         let q = vec![1.0f32, 0.0, 0.0, 0.0];
-        let k = vec![1.0f32, 0.0, 0.0, 0.0];
-        let v = vec![0.5f32, 0.5, 0.5, 0.5];
+        let k = f32_to_f16_vec(&[1.0f32, 0.0, 0.0, 0.0]);
+        let v = f32_to_f16_vec(&[0.5f32, 0.5, 0.5, 0.5]);
         let mut output = vec![0.0f32; 4];
         let mut scores = vec![0.0f32; 4]; // num_heads * score_stride
 
@@ -963,7 +956,7 @@ mod tests {
         // Single token: softmax of single score = 1.0, so output = v
         for i in 0..4 {
             assert!(
-                (output[i] - 0.5).abs() < 1e-5,
+                (output[i] - 0.5).abs() < 1e-3,
                 "output[{i}] = {}",
                 output[i]
             );
@@ -979,8 +972,8 @@ mod tests {
             head_dim: 2,
         };
         let q = vec![1.0f32, 0.0, 0.0, 1.0]; // 2 queries
-        let k = vec![1.0f32, 0.0, 0.0, 1.0]; // 2 keys
-        let v = vec![1.0f32, 0.0, 0.0, 1.0]; // 2 values
+        let k = f32_to_f16_vec(&[1.0f32, 0.0, 0.0, 1.0]); // 2 keys
+        let v = f32_to_f16_vec(&[1.0f32, 0.0, 0.0, 1.0]); // 2 values
         let mut output = vec![0.0f32; 4];
         let mut scores = vec![0.0f32; 4]; // 1 head * stride 2
 
@@ -994,6 +987,7 @@ mod tests {
 
     /// Reference implementation of compute_attention that never takes the fast path.
     /// Used to verify parity of the q_seq_len==1 GQA fast path.
+    /// Operates in f32 throughout; caller converts f16 KV to f32 before calling.
     fn compute_attention_ref(
         output: &mut [f32],
         q: &[f32],
@@ -1058,6 +1052,7 @@ mod tests {
     fn test_compute_attention_gqa_decode_parity() {
         // Verify q_seq_len=1 GQA fast path gives same result as the reference generic path.
         // Config: 4 Q heads, 2 KV heads (groups=2), head_dim=4.
+        // Tolerance is relaxed to f16 precision (max abs diff < 0.01).
         let cfg = GqaConfig {
             num_heads: 4,
             num_kv_heads: 2,
@@ -1070,25 +1065,39 @@ mod tests {
         let q: Vec<f32> = (0..num_heads * head_dim)
             .map(|i| (i as f32 + 1.0) * 0.15 - 0.5)
             .collect();
-        let k: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
+        let k_f32: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
             .map(|i| (i as f32) * 0.1 - 0.3)
             .collect();
-        let v: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
+        let v_f32: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
             .map(|i| (i as f32) * 0.07 + 0.05)
             .collect();
+        // Round-trip through f16 so reference and fast path use identical values.
+        let k_f16 = f32_to_f16_vec(&k_f32);
+        let v_f16 = f32_to_f16_vec(&v_f32);
+        let k_ref: Vec<f32> = k_f16.iter().map(|h| h.to_f32()).collect();
+        let v_ref: Vec<f32> = v_f16.iter().map(|h| h.to_f32()).collect();
 
         let start_pos = kv_seq_len - 1; // all KV positions are within causal window
 
         let mut ref_output = vec![0.0f32; num_heads * head_dim];
-        compute_attention_ref(&mut ref_output, &q, &k, &v, 1, kv_seq_len, start_pos, &cfg);
+        compute_attention_ref(
+            &mut ref_output,
+            &q,
+            &k_ref,
+            &v_ref,
+            1,
+            kv_seq_len,
+            start_pos,
+            &cfg,
+        );
 
         let mut fast_output = vec![0.0f32; num_heads * head_dim];
         let mut scores = vec![0.0f32; num_heads * kv_seq_len];
         compute_attention(
             &mut fast_output,
             &q,
-            &k,
-            &v,
+            &k_f16,
+            &v_f16,
             1,
             kv_seq_len,
             start_pos,
@@ -1102,6 +1111,70 @@ mod tests {
                 (fast_output[i] - ref_output[i]).abs() < 1e-5,
                 "output[{i}]: fast={} ref={}",
                 fast_output[i],
+                ref_output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_attention_f16_precision() {
+        // Verify that f32×f16 mixed-precision attention output is within f16 precision
+        // bounds (max abs diff < 0.01) compared to a pure f32 reference.
+        let cfg = GqaConfig {
+            num_heads: 2,
+            num_kv_heads: 2,
+            head_dim: 4,
+        };
+        let kv_seq_len = 8usize;
+        let num_heads = cfg.num_heads;
+        let head_dim = cfg.head_dim;
+
+        let q: Vec<f32> = (0..num_heads * head_dim)
+            .map(|i| (i as f32) * 0.1 - 0.3)
+            .collect();
+        let k_f32: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
+            .map(|i| (i as f32) * 0.05 - 0.2)
+            .collect();
+        let v_f32: Vec<f32> = (0..kv_seq_len * cfg.num_kv_heads * head_dim)
+            .map(|i| (i as f32) * 0.03 + 0.1)
+            .collect();
+        let k_f16 = f32_to_f16_vec(&k_f32);
+        let v_f16 = f32_to_f16_vec(&v_f32);
+
+        // Pure f32 reference (no round-trip).
+        let mut ref_output = vec![0.0f32; num_heads * head_dim];
+        compute_attention_ref(
+            &mut ref_output,
+            &q,
+            &k_f32,
+            &v_f32,
+            1,
+            kv_seq_len,
+            kv_seq_len - 1,
+            &cfg,
+        );
+
+        // f32×f16 mixed-precision.
+        let mut mixed_output = vec![0.0f32; num_heads * head_dim];
+        let mut scores = vec![0.0f32; num_heads * kv_seq_len];
+        compute_attention(
+            &mut mixed_output,
+            &q,
+            &k_f16,
+            &v_f16,
+            1,
+            kv_seq_len,
+            kv_seq_len - 1,
+            &cfg,
+            &mut scores,
+            kv_seq_len,
+        );
+
+        for i in 0..mixed_output.len() {
+            assert!(
+                (mixed_output[i] - ref_output[i]).abs() < 0.01,
+                "output[{i}]: mixed={} ref={}",
+                mixed_output[i],
                 ref_output[i]
             );
         }

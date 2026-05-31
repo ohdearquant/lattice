@@ -34,8 +34,8 @@ const CASES: [AttentionCase; 2] = [
 struct DecodeFixture {
     cfg: GqaConfig,
     q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
+    k: Vec<half::f16>,
+    v: Vec<half::f16>,
     output: Vec<f32>,
     scores: Vec<f32>,
     kv_seq_len: usize,
@@ -51,8 +51,10 @@ impl DecodeFixture {
         assert_eq!(cfg.groups(), case.groups);
 
         let q = build_q(NUM_HEADS, HEAD_DIM);
-        let k = build_kv(2, case.num_kv_heads, kv_seq_len, HEAD_DIM);
-        let v = build_kv(3, case.num_kv_heads, kv_seq_len, HEAD_DIM);
+        let k_f32 = build_kv(2, case.num_kv_heads, kv_seq_len, HEAD_DIM);
+        let v_f32 = build_kv(3, case.num_kv_heads, kv_seq_len, HEAD_DIM);
+        let k: Vec<half::f16> = k_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
+        let v: Vec<half::f16> = v_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
         let output = vec![0.0f32; Q_SEQ_LEN * NUM_HEADS * HEAD_DIM];
         let scores = vec![0.0f32; NUM_HEADS * kv_seq_len];
 
@@ -68,7 +70,7 @@ impl DecodeFixture {
     }
 
     fn kv_bytes_per_decode_step(&self) -> u64 {
-        ((self.k.len() + self.v.len()) * std::mem::size_of::<f32>()) as u64
+        ((self.k.len() + self.v.len()) * std::mem::size_of::<half::f16>()) as u64
     }
 }
 

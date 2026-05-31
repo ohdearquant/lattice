@@ -434,9 +434,6 @@ struct MtpScratch {
     shared_up: Vec<f32>,
     shared_silu_up: Vec<f32>,
     logits: Vec<f32>,
-    // Dequantization buffers: f16 KV cache → f32 for attention computation.
-    cached_k_f32: Vec<f32>,
-    cached_v_f32: Vec<f32>,
 }
 
 impl MtpScratch {
@@ -472,8 +469,6 @@ impl MtpScratch {
             shared_up: vec![0.0; shared_inter],
             shared_silu_up: vec![0.0; shared_inter],
             logits: vec![0.0; cfg.vocab_size],
-            cached_k_f32: vec![0.0; kv_dim * max_seq_len],
-            cached_v_f32: vec![0.0; kv_dim * max_seq_len],
         }
     }
 }
@@ -767,27 +762,11 @@ impl<'a> MtpVerifier<'a> {
         }
         let cur_seq_len = write_pos + 1;
 
-        // GQA attention: dequantize f16 KV cache to f32 scratch buffers.
+        // GQA attention: pass f16 KV cache slices directly — no dequant scratch needed.
         let kv_end = cur_seq_len * kv_dim;
-        debug_assert!(
-            kv_end <= self.scratch.cached_k_f32.len(),
-            "kv_end={kv_end} > cached_k_f32.len()={} (rollback target exceeded scratch)",
-            self.scratch.cached_k_f32.len()
-        );
-        debug_assert!(
-            kv_end <= self.scratch.cached_v_f32.len(),
-            "kv_end={kv_end} > cached_v_f32.len()={} (rollback target exceeded scratch)",
-            self.scratch.cached_v_f32.len()
-        );
-        for (i, &h) in self.cache.k_buffer(0)[..kv_end].iter().enumerate() {
-            self.scratch.cached_k_f32[i] = h.to_f32();
-        }
-        for (i, &h) in self.cache.v_buffer(0)[..kv_end].iter().enumerate() {
-            self.scratch.cached_v_f32[i] = h.to_f32();
-        }
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let k_all = &self.scratch.cached_k_f32[..kv_end];
-        let v_all = &self.scratch.cached_v_f32[..kv_end];
+        let k_all = &self.cache.k_buffer(0)[..kv_end];
+        let v_all = &self.cache.v_buffer(0)[..kv_end];
 
         for qh in 0..num_q_heads {
             let kvh = qh / groups;
@@ -800,7 +779,7 @@ impl<'a> MtpVerifier<'a> {
                 let k_off = t * kv_dim + kvh * head_dim;
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
-                    dot += self.scratch.q[q_off + d] * k_all[k_off + d];
+                    dot += self.scratch.q[q_off + d] * k_all[k_off + d].to_f32();
                 }
                 let s = dot * scale;
                 self.scratch.scores[scores_start + t] = s;
@@ -827,7 +806,7 @@ impl<'a> MtpVerifier<'a> {
                 let mut val = 0.0f32;
                 for t in 0..cur_seq_len {
                     let v_off = t * kv_dim + kvh * head_dim;
-                    val += self.scratch.scores[scores_start + t] * v_all[v_off + d];
+                    val += self.scratch.scores[scores_start + t] * v_all[v_off + d].to_f32();
                 }
                 self.scratch.context[ctx_off + d] = val;
             }
