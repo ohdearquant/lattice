@@ -19,7 +19,7 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
 
 [dependencies]
-half = { workspace = true }
+half.workspace = true
 memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
@@ -201,6 +201,14 @@ harness = false
 
 [[bench]]
 name = "attn_opt_bench"
+harness = false
+
+[[bench]]
+name = "metrics_bench"
+harness = false
+
+[[bench]]
+name = "pruning_bench"
 harness = false
 
 [lints]

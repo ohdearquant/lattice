@@ -434,6 +434,9 @@ struct MtpScratch {
     shared_up: Vec<f32>,
     shared_silu_up: Vec<f32>,
     logits: Vec<f32>,
+    // Dequantization buffers: f16 KV cache → f32 for attention computation.
+    cached_k_f32: Vec<f32>,
+    cached_v_f32: Vec<f32>,
 }
 
 impl MtpScratch {
@@ -469,6 +472,8 @@ impl MtpScratch {
             shared_up: vec![0.0; shared_inter],
             shared_silu_up: vec![0.0; shared_inter],
             logits: vec![0.0; cfg.vocab_size],
+            cached_k_f32: vec![0.0; kv_dim * max_seq_len],
+            cached_v_f32: vec![0.0; kv_dim * max_seq_len],
         }
     }
 }
@@ -744,24 +749,35 @@ impl<'a> MtpVerifier<'a> {
             );
         }
 
-        // Append K, V to MTP KV cache at current seq_len position
+        // Append K, V to MTP KV cache at current seq_len position (convert f32→f16 on write).
         let write_pos = self.cache.seq_len();
         {
             let k_buf = self.cache.k_buffer_mut(0);
-            k_buf[write_pos * kv_dim..(write_pos + 1) * kv_dim]
-                .copy_from_slice(&self.scratch.k[..kv_dim]);
+            let base = write_pos * kv_dim;
+            for (j, &val) in self.scratch.k[..kv_dim].iter().enumerate() {
+                k_buf[base + j] = half::f16::from_f32(val);
+            }
         }
         {
             let v_buf = self.cache.v_buffer_mut(0);
-            v_buf[write_pos * kv_dim..(write_pos + 1) * kv_dim]
-                .copy_from_slice(&self.scratch.v[..kv_dim]);
+            let base = write_pos * kv_dim;
+            for (j, &val) in self.scratch.v[..kv_dim].iter().enumerate() {
+                v_buf[base + j] = half::f16::from_f32(val);
+            }
         }
         let cur_seq_len = write_pos + 1;
 
-        // GQA attention
+        // GQA attention: dequantize f16 KV cache to f32 scratch buffers.
+        let kv_end = cur_seq_len * kv_dim;
+        for (i, &h) in self.cache.k_buffer(0)[..kv_end].iter().enumerate() {
+            self.scratch.cached_k_f32[i] = h.to_f32();
+        }
+        for (i, &h) in self.cache.v_buffer(0)[..kv_end].iter().enumerate() {
+            self.scratch.cached_v_f32[i] = h.to_f32();
+        }
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let k_all = &self.cache.k_buffer(0)[..cur_seq_len * kv_dim];
-        let v_all = &self.cache.v_buffer(0)[..cur_seq_len * kv_dim];
+        let k_all = &self.scratch.cached_k_f32[..kv_end];
+        let v_all = &self.scratch.cached_v_f32[..kv_end];
 
         for qh in 0..num_q_heads {
             let kvh = qh / groups;
