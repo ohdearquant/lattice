@@ -675,10 +675,10 @@ mod tests {
         };
         let kv_dim = 2 * 4; // 8
         // f16: 2 * 1 * 16 * 8 * 2 = 512 bytes
-        let expected_f16 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f16>();
+        let expected_f16 = 2 * 16 * kv_dim * std::mem::size_of::<f16>();
         assert_eq!(config.total_bytes(), expected_f16);
         // Would have been 1024 with f32
-        let would_be_f32 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f32>();
+        let would_be_f32 = 2 * 16 * kv_dim * std::mem::size_of::<f32>();
         assert_eq!(config.total_bytes() * 2, would_be_f32);
     }
 
@@ -947,8 +947,7 @@ mod tests {
         // Measured relative error must be < 0.1% (0.001)
         assert!(
             max_rel_kv < 0.001,
-            "max relative error for KV in [-10,10] is {:.4e}, expected < 0.001",
-            max_rel_kv
+            "max relative error for KV in [-10,10] is {max_rel_kv:.4e}, expected < 0.001"
         );
     }
 
@@ -1023,7 +1022,7 @@ mod tests {
             // Phase 2: stable softmax
             let max_s = scores[..kv_seq_len]
                 .iter()
-                .cloned()
+                .copied()
                 .fold(f32::NEG_INFINITY, f32::max);
             let sum: f32 = scores[..kv_seq_len]
                 .iter_mut()
@@ -1227,31 +1226,27 @@ mod tests {
 
         let top1_rate = top1_match_count as f32 / total_cases as f32;
         eprintln!(
-            "\n=== Tensor Oracle Summary ===\n  logit_max_abs_diff = {:.4e}  (gate: < 0.02)\n  top1_match_rate    = {:.4}    (gate: >= 0.95)\n  nan_count          = {}\n  max_synth_nll_delta= {:.4e}  (gate: < 0.01)",
-            global_max_logit_diff, top1_rate, nan_count, max_synth_nll_delta
+            "\n=== Tensor Oracle Summary ===\n  logit_max_abs_diff = {global_max_logit_diff:.4e}  (gate: < 0.02)\n  top1_match_rate    = {top1_rate:.4}    (gate: >= 0.95)\n  nan_count          = {nan_count}\n  max_synth_nll_delta= {max_synth_nll_delta:.4e}  (gate: < 0.01)"
         );
 
         assert_eq!(nan_count, 0, "f16 KV dequant introduced NaN in logits");
         assert!(
             global_max_logit_diff < 0.02,
-            "logit_max_abs_diff {:.4e} >= 0.02 gate",
-            global_max_logit_diff
+            "logit_max_abs_diff {global_max_logit_diff:.4e} >= 0.02 gate"
         );
         assert!(
             top1_rate >= 0.95,
-            "top1_match_rate {:.4} < 0.95 gate",
-            top1_rate
+            "top1_match_rate {top1_rate:.4} < 0.95 gate"
         );
         assert!(
             max_synth_nll_delta < 0.01,
-            "max synthetic NLL delta {:.4e} >= 0.01",
-            max_synth_nll_delta
+            "max synthetic NLL delta {max_synth_nll_delta:.4e} >= 0.01"
         );
     }
 
     /// Compute log softmax probability for target token (for synthetic NLL).
     fn softmax_log_prob(logits: &[f32], target: usize) -> f32 {
-        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
         let log_sum = sum.ln();
         (logits[target] - max_l) - log_sum

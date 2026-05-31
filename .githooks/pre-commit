@@ -11,7 +11,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Clippy
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 if [ $? -ne 0 ]; then
     echo "Clippy check failed. Fix warnings before committing."
     exit 1

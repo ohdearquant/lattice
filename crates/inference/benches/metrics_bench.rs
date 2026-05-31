@@ -60,7 +60,7 @@ fn naive_entropy_nats(logits: &[f32]) -> f32 {
     if logits.len() < 2 {
         return 0.0;
     }
-    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum_exp = 0.0_f32;
     let mut exps: Vec<f32> = logits
         .iter()

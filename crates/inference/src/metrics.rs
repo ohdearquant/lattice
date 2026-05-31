@@ -343,7 +343,7 @@ mod tests {
         let online_h = acc.entropy_nats();
 
         // Naive reference: softmax → -sum p log p.
-        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
         let naive_h: f32 = exps
@@ -557,7 +557,7 @@ mod tests {
         // 32 tokens at +3.0, 32 tokens at -3.0 → two-cluster split.
         // Both clusters uniform within themselves; compare online to naive.
         let mut logits = vec![3.0_f32; 32];
-        logits.extend(std::iter::repeat(-3.0_f32).take(32));
+        logits.extend(std::iter::repeat_n(-3.0_f32, 32));
 
         let mut acc = OnlineSoftmaxEntropy::new();
         for &l in &logits {
@@ -606,7 +606,7 @@ mod tests {
         assert!(h >= 0.0, "subnormal entropy must be non-negative, got {h}");
 
         // Verify within tolerance of naive reference.
-        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
         let sum_exp: f32 = exps.iter().sum();
         let naive_h: f32 = exps
