@@ -211,5 +211,9 @@ harness = false
 name = "pruning_bench"
 harness = false
 
+[[bench]]
+name = "kv_cache_f16_bench"
+harness = false
+
 [lints]
 workspace = true

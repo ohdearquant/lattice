@@ -681,4 +681,579 @@ mod tests {
         let would_be_f32 = 2 * 1 * 16 * kv_dim * std::mem::size_of::<f32>();
         assert_eq!(config.total_bytes() * 2, would_be_f32);
     }
+
+    // -----------------------------------------------------------------------
+    // Boundary / special-value conversion tests (f32→f16→f32 contract).
+    //
+    // These tests assert the *chosen contract* for each boundary rather than
+    // relying on roundtrip tolerance alone.  `f16::from_f32` follows IEEE-754:
+    //
+    //  * NaN input  → f16 NaN  → f32 NaN  (is_nan() propagates)
+    //  * ±∞ input   → f16 ±∞  → f32 ±∞  (exact preservation)
+    //  * +0.0 / -0.0 → f16 ±0 → f32 ±0  (sign bit preserved)
+    //  * f16::MAX (65504.0) roundtrips exactly within f16 representable range
+    //  * f32 values above f16 range (e.g. 1e38) overflow → f16::INFINITY
+    //  * f32 subnormals flush to ±0 in f16 (magnitude below f16 MIN_POSITIVE)
+    // -----------------------------------------------------------------------
+
+    /// Helper: store a single f32 value in layer 0, advance, read back via get_k.
+    fn roundtrip_single(val: f32) -> f32 {
+        let config = FlatKVCacheConfig {
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            max_seq_len: 4,
+        };
+        let mut cache = FlatKVCache::new(config);
+        cache.append_kv(0, &[val], &[0.0f32]);
+        cache.advance();
+        cache.get_k(0)[0]
+    }
+
+    #[test]
+    fn boundary_nan_propagates() {
+        // Contract: NaN input → NaN stored and read back.
+        let out = roundtrip_single(f32::NAN);
+        assert!(out.is_nan(), "expected NaN, got {out}");
+    }
+
+    #[test]
+    fn boundary_positive_infinity() {
+        // Contract: +∞ input → +∞ stored and read back.
+        let out = roundtrip_single(f32::INFINITY);
+        assert!(
+            out.is_infinite() && out.is_sign_positive(),
+            "expected +∞, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_negative_infinity() {
+        // Contract: -∞ input → -∞ stored and read back.
+        let out = roundtrip_single(f32::NEG_INFINITY);
+        assert!(
+            out.is_infinite() && out.is_sign_negative(),
+            "expected -∞, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_positive_zero() {
+        // Contract: +0.0 roundtrips as zero (sign not guaranteed by f16 spec but
+        // practically preserved; assert at minimum the value is zero).
+        let out = roundtrip_single(0.0f32);
+        assert_eq!(out, 0.0f32, "expected 0.0, got {out}");
+    }
+
+    #[test]
+    fn boundary_negative_zero() {
+        // Contract: -0.0 roundtrips as zero (sign preserved in IEEE-754 f16).
+        let out = roundtrip_single(-0.0f32);
+        assert_eq!(out, 0.0f32, "expected -0.0 (==0.0), got {out}");
+        assert!(
+            out.is_sign_negative(),
+            "expected sign bit to be negative for -0.0"
+        );
+    }
+
+    #[test]
+    fn boundary_f16_max_exact() {
+        // f16::MAX = 65504.0; this value is exactly representable in f16,
+        // so the roundtrip must be exact.
+        let f16_max = f16::MAX.to_f32(); // 65504.0
+        let out = roundtrip_single(f16_max);
+        assert_eq!(out, f16_max, "f16::MAX roundtrip must be exact, got {out}");
+    }
+
+    #[test]
+    fn boundary_overflow_to_infinity() {
+        // f32 values above f16 range (> 65504) overflow to ±∞ in f16.
+        // Contract: store overflows to +∞ and is read back as +∞.
+        let out = roundtrip_single(1e38_f32);
+        assert!(
+            out.is_infinite() && out.is_sign_positive(),
+            "expected +∞ (f32→f16 overflow), got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_f32_subnormal_flushes() {
+        // A real f32 subnormal (nonzero, below f32::MIN_POSITIVE) is too small
+        // for f16 and flushes to ±0. Use from_bits(1) = smallest positive f32 subnormal.
+        let tiny = f32::from_bits(1); // ~1.4e-45, a real subnormal
+        assert!(
+            tiny > 0.0 && tiny < f32::MIN_POSITIVE,
+            "should be a real f32 subnormal"
+        );
+        let out = roundtrip_single(tiny);
+        assert_eq!(
+            out, 0.0f32,
+            "f32 subnormal below f16 range should flush to 0, got {out}"
+        );
+    }
+
+    #[test]
+    fn boundary_f16_min_positive_subnormal_survives() {
+        // The smallest nonzero f16 value should survive the roundtrip.
+        let smallest_f16 = half::f16::MIN_POSITIVE_SUBNORMAL.to_f32();
+        assert!(
+            smallest_f16 > 0.0,
+            "f16 MIN_POSITIVE_SUBNORMAL should be positive"
+        );
+        let out = roundtrip_single(smallest_f16);
+        assert_eq!(
+            out, smallest_f16,
+            "f16 MIN_POSITIVE_SUBNORMAL should survive roundtrip, got {out}"
+        );
+    }
+
+    // -- Exact bit-pattern overflow and RNE tests (Defect 3 fix) ---------
+
+    #[test]
+    fn boundary_requested_overflow_inputs_map_to_infinity() {
+        // 65536.0 = 2^16 is above f16::MAX (65504.0) and must overflow to ±inf.
+        // These are the *exact* boundary values requested in the hardening pass.
+        assert_eq!(
+            f16::from_f32(65536.0_f32).to_bits(),
+            f16::INFINITY.to_bits(),
+            "65536.0 must overflow to +inf in f16"
+        );
+        assert_eq!(
+            f16::from_f32(-65536.0_f32).to_bits(),
+            f16::NEG_INFINITY.to_bits(),
+            "-65536.0 must overflow to -inf in f16"
+        );
+    }
+
+    #[test]
+    fn boundary_round_to_nearest_even_ties() {
+        // Verify IEEE-754 round-to-nearest-even at the exact halfway points.
+        //
+        // Case 1: 2^-25 is below the smallest f16 subnormal (2^-24); rounds to 0.
+        assert_eq!(
+            f16::from_f32(2.0_f32.powi(-25)).to_bits(),
+            0x0000,
+            "2^-25 must round to 0 (below subnormal range)"
+        );
+        // Case 2: 1.5 * 2^-24 is the midpoint between subnormal bit=1 and bit=2.
+        // RNE selects even mantissa → bit=2 → 0x0002.
+        assert_eq!(
+            f16::from_f32(1.5 * 2.0_f32.powi(-24)).to_bits(),
+            0x0002,
+            "1.5*2^-24 must round to subnormal bit=2 (RNE)"
+        );
+        // Case 3: 1.0 + 2^-11 is the midpoint between 0x3C00 (1.0) and 0x3C01.
+        // 0x3C00 has even mantissa LSB; RNE rounds to 0x3C00.
+        assert_eq!(
+            f16::from_f32(1.0_f32 + 2.0_f32.powi(-11)).to_bits(),
+            0x3c00,
+            "1.0 + 2^-11 must round to 1.0 = 0x3C00 (RNE, even mantissa wins)"
+        );
+        // Case 4: 1.0 + 3*2^-11 is the midpoint between 0x3C01 and 0x3C02.
+        // 0x3C02 has even mantissa LSB; RNE rounds to 0x3C02.
+        assert_eq!(
+            f16::from_f32(1.0_f32 + 3.0 * 2.0_f32.powi(-11)).to_bits(),
+            0x3c02,
+            "1.0 + 3*2^-11 must round to 0x3C02 (RNE, even mantissa wins)"
+        );
+    }
+
+    // -- Allocation-contract test (Defect 2 fix, Option B) ---------------
+
+    #[test]
+    fn constructed_cache_eagerly_initializes_configured_len() {
+        // Verifies that FlatKVCache::new immediately materializes all buffers
+        // at max_seq_len capacity (current eager-allocation contract, issue #12 deferred).
+        let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
+        let cache = FlatKVCache::new(config);
+        let kv_dim = cache.kv_dim(); // 2 * 4 = 8
+        let max_seq = cache.max_seq_len(); // 16
+        // num_layers * (K-side + V-side) * max_seq * kv_dim
+        // = 2 * 2 * 16 * 8 = 512
+        let expected_elems = cache.num_layers() * 2 * max_seq * kv_dim;
+        let actual_elems: usize = (0..cache.num_layers())
+            .map(|layer| cache.k_buffer(layer).len() + cache.v_buffer(layer).len())
+            .sum();
+        assert_eq!(
+            actual_elems, expected_elems,
+            "FlatKVCache eagerly allocates max_seq_len * kv_dim per layer per side"
+        );
+    }
+
+    /// Quality measurement: f32→f16→f32 roundtrip error over representative KV value ranges.
+    ///
+    /// Reports max absolute error, max relative error, and confirms they are within
+    /// the bounds implied by IEEE-754 binary16 (f16 epsilon = 2^-10 ≈ 9.77e-4).
+    #[test]
+    fn quality_measurement_f16_roundtrip_error() {
+        let n = 200_000usize;
+
+        // Ranges representing typical KV values in transformer models
+        let ranges: &[(&str, f32, f32)] = &[
+            ("tiny [-0.1, 0.1]", -0.1, 0.1),
+            ("small [-1.0, 1.0]", -1.0, 1.0),
+            ("typical [-5.0, 5.0]", -5.0, 5.0),
+            ("large [-10.0, 10.0]", -10.0, 10.0),
+        ];
+
+        // f16::MIN_POSITIVE is the smallest *normal* f16 value (~6.1e-5).
+        // Values below this may flush to a subnormal or zero — relative error near zero
+        // is by-design large (subnormal flush is expected behavior). We check only
+        // normal f16 values for the relative-error invariant.
+        let f16_min_normal = f16::MIN_POSITIVE.to_f32();
+
+        for (label, lo, hi) in ranges {
+            let mut max_abs = 0.0f32;
+            let mut max_rel_normal = 0.0f32;
+            for i in 0..n {
+                let t = i as f32 / (n - 1) as f32;
+                let v = lo + t * (hi - lo);
+                let v_h = f16::from_f32(v).to_f32();
+                let abs_err = (v - v_h).abs();
+                if abs_err > max_abs {
+                    max_abs = abs_err;
+                }
+                // Relative error only meaningful for normal f16 inputs
+                if v.abs() >= f16_min_normal {
+                    let rel_err = abs_err / v.abs();
+                    if rel_err > max_rel_normal {
+                        max_rel_normal = rel_err;
+                    }
+                }
+            }
+            // Max relative error for normal inputs must be <= 0.5 * f16::EPSILON
+            let half_eps = f16::EPSILON.to_f32() / 2.0;
+            assert!(
+                max_rel_normal <= half_eps + 1e-7,
+                "{label}: max relative error (normal inputs) {max_rel_normal:.2e} exceeds 0.5*ε ({half_eps:.2e})"
+            );
+        }
+
+        // Confirm the specific "< 0.1% relative error" claim for [-10, 10]
+        let mut max_rel_kv = 0.0f32;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let v = -10.0 + t * 20.0_f32;
+            let v_h = f16::from_f32(v).to_f32();
+            let rel_err = if v.abs() > 1e-10 {
+                (v - v_h).abs() / v.abs()
+            } else {
+                (v - v_h).abs()
+            };
+            if rel_err > max_rel_kv {
+                max_rel_kv = rel_err;
+            }
+        }
+        // Measured relative error must be < 0.1% (0.001)
+        assert!(
+            max_rel_kv < 0.001,
+            "max relative error for KV in [-10,10] is {:.4e}, expected < 0.001",
+            max_rel_kv
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tensor oracle: f32-KV reference vs f16-KV-via-FlatKVCache logit diff.
+    //
+    // Implements the mandatory fallback harness from quality_measurement_design.md:
+    //   - Builds deterministic Q/K/V tensors (xorshift32 PRNG, no model weights).
+    //   - Runs scaled dot-product attention with f32 KV directly.
+    //   - Stores same K/V in FlatKVCache (quantizes to f16), dequantizes via
+    //     the scratch-loop used by generate.rs, runs same attention.
+    //   - Projects both outputs through a deterministic W_out to produce logits.
+    //   - Asserts: logit_max_abs_diff < 0.02, top1_match_rate >= 0.95,
+    //              nan_count == 0, synthetic_nll_delta_abs < 0.01.
+    //
+    // This is NOT a PPL measurement. It is the CI tensor oracle only.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic xorshift32 PRNG (Marsaglia 2003).
+    fn xorshift32(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    /// Sample a f32 uniformly in [lo, hi] using xorshift32.
+    fn rand_f32(state: &mut u32, lo: f32, hi: f32) -> f32 {
+        let bits = xorshift32(state);
+        let t = (bits as f32) / (u32::MAX as f32);
+        lo + t * (hi - lo)
+    }
+
+    /// Scaled dot-product attention (q_seq_len=1 decode, GQA).
+    ///
+    /// Q:      [num_heads * head_dim]            (single query token)
+    /// K, V:   [kv_seq_len * num_kv_heads * head_dim]
+    /// output: [num_heads * head_dim]
+    ///
+    /// Groups = num_heads / num_kv_heads; each KV head is shared across `groups` Q heads.
+    fn sdpa_decode(
+        output: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        let groups = num_heads / num_kv_heads;
+        let kv_dim = num_kv_heads * head_dim;
+        let q_dim = num_heads * head_dim;
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+        output[..q_dim].fill(0.0);
+        let mut scores = vec![0.0f32; kv_seq_len];
+
+        for h in 0..num_heads {
+            let kv_h = h / groups;
+            let q_off = h * head_dim;
+
+            // Phase 1: QK^T
+            for ki in 0..kv_seq_len {
+                let k_off = ki * kv_dim + kv_h * head_dim;
+                let dot: f32 = (0..head_dim).map(|d| q[q_off + d] * k[k_off + d]).sum();
+                scores[ki] = dot * scale;
+            }
+
+            // Phase 2: stable softmax
+            let max_s = scores[..kv_seq_len]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores[..kv_seq_len]
+                .iter_mut()
+                .map(|s| {
+                    *s = (*s - max_s).exp();
+                    *s
+                })
+                .sum();
+            if sum > 0.0 {
+                scores[..kv_seq_len].iter_mut().for_each(|s| *s /= sum);
+            }
+
+            // Phase 3: weighted V sum
+            let out_off = h * head_dim;
+            for ki in 0..kv_seq_len {
+                let v_off = ki * kv_dim + kv_h * head_dim;
+                let w = scores[ki];
+                for d in 0..head_dim {
+                    output[out_off + d] += w * v[v_off + d];
+                }
+            }
+        }
+    }
+
+    /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.
+    ///
+    /// Produces actual measured logit_max_abs_diff and top1_match_rate.
+    #[test]
+    fn f16_kv_tensor_oracle_logit_diff() {
+        // Oracle parameters (matching design doc).
+        const NUM_HEADS: usize = 4;
+        const NUM_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 16;
+        const VOCAB: usize = 257;
+        const Q_DIM: usize = NUM_HEADS * HEAD_DIM; // 64
+        const KV_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 32
+
+        // KV context lengths and value ranges per design doc.
+        let seq_lens: &[usize] = &[1, 8, 64, 256];
+        let kv_ranges: &[(&str, f32, f32)] = &[
+            ("tiny", -0.1, 0.1),
+            ("typical", -5.0, 5.0),
+            ("outlier", -10.0, 10.0),
+        ];
+
+        // Deterministic W_out: [VOCAB, Q_DIM], scaled to [-0.05, 0.05].
+        let mut w_seed: u32 = 0xDEAD_BEEF;
+        let w_out: Vec<f32> = (0..VOCAB * Q_DIM)
+            .map(|_| rand_f32(&mut w_seed, -0.05, 0.05))
+            .collect();
+
+        let mut global_max_logit_diff = 0.0f32;
+        let mut top1_match_count = 0usize;
+        let mut total_cases = 0usize;
+        let mut nan_count = 0usize;
+        let mut max_synth_nll_delta = 0.0f32;
+
+        for &seq_len in seq_lens {
+            for &(range_name, lo, hi) in kv_ranges {
+                let mut seed: u32 = 0x1234_5678u32
+                    .wrapping_add(seq_len as u32)
+                    .wrapping_mul(0x9E37_79B9)
+                    .wrapping_add(range_name.len() as u32);
+
+                // Build deterministic Q (seq_len=1 decode query).
+                let q: Vec<f32> = (0..Q_DIM).map(|_| rand_f32(&mut seed, -1.0, 1.0)).collect();
+
+                // Build deterministic K_f32, V_f32.
+                let k_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                    .map(|_| rand_f32(&mut seed, lo, hi))
+                    .collect();
+                let v_f32: Vec<f32> = (0..seq_len * KV_DIM)
+                    .map(|_| rand_f32(&mut seed, lo, hi))
+                    .collect();
+
+                // ---- Reference path: f32 KV directly ----
+                let mut out_f32 = vec![0.0f32; Q_DIM];
+                sdpa_decode(
+                    &mut out_f32,
+                    &q,
+                    &k_f32,
+                    &v_f32,
+                    seq_len,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                );
+
+                // ---- f16 path: store in FlatKVCache, dequantize via k_buffer/v_buffer ----
+                let cfg = FlatKVCacheConfig {
+                    num_layers: 1,
+                    num_kv_heads: NUM_KV_HEADS,
+                    head_dim: HEAD_DIM,
+                    max_seq_len: seq_len,
+                };
+                let mut cache = FlatKVCache::new(cfg);
+
+                // Write K/V row by row (matching generate.rs prefill pattern).
+                {
+                    let k_layer = cache.k_buffer_mut(0);
+                    for (i, &val) in k_f32.iter().enumerate() {
+                        k_layer[i] = f16::from_f32(val);
+                    }
+                    let v_layer = cache.v_buffer_mut(0);
+                    for (i, &val) in v_f32.iter().enumerate() {
+                        v_layer[i] = f16::from_f32(val);
+                    }
+                }
+                cache.advance_by(seq_len);
+
+                // Dequantize via the same scratch-loop pattern as generate.rs:463-466.
+                let k_end = seq_len * KV_DIM;
+                let mut k_dequant = vec![0.0f32; k_end];
+                let mut v_dequant = vec![0.0f32; k_end];
+                for (i, &h) in cache.k_buffer(0)[..k_end].iter().enumerate() {
+                    k_dequant[i] = h.to_f32();
+                }
+                for (i, &h) in cache.v_buffer(0)[..k_end].iter().enumerate() {
+                    v_dequant[i] = h.to_f32();
+                }
+
+                let mut out_f16 = vec![0.0f32; Q_DIM];
+                sdpa_decode(
+                    &mut out_f16,
+                    &q,
+                    &k_dequant,
+                    &v_dequant,
+                    seq_len,
+                    NUM_HEADS,
+                    NUM_KV_HEADS,
+                    HEAD_DIM,
+                );
+
+                // ---- Project both outputs to logits via W_out ----
+                let mut logits_f32 = vec![0.0f32; VOCAB];
+                let mut logits_f16 = vec![0.0f32; VOCAB];
+                for v_idx in 0..VOCAB {
+                    let row_off = v_idx * Q_DIM;
+                    logits_f32[v_idx] = (0..Q_DIM)
+                        .map(|d| out_f32[d] * w_out[row_off + d])
+                        .sum::<f32>();
+                    logits_f16[v_idx] = (0..Q_DIM)
+                        .map(|d| out_f16[d] * w_out[row_off + d])
+                        .sum::<f32>();
+                }
+
+                // ---- Measure diff ----
+                let case_max_diff = logits_f32
+                    .iter()
+                    .zip(logits_f16.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+
+                let nans = logits_f16.iter().filter(|&&x| x.is_nan()).count();
+                nan_count += nans;
+
+                let top1_f32 = logits_f32
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                let top1_f16 = logits_f16
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap();
+
+                // Synthetic NLL delta on deterministic target token.
+                let target = (seq_len * 37 + 11) % VOCAB;
+                let nll_f32 = -softmax_log_prob(&logits_f32, target);
+                let nll_f16 = -softmax_log_prob(&logits_f16, target);
+                let nll_delta = (nll_f16 - nll_f32).abs();
+
+                if case_max_diff > global_max_logit_diff {
+                    global_max_logit_diff = case_max_diff;
+                }
+                if top1_f32 == top1_f16 {
+                    top1_match_count += 1;
+                }
+                if nll_delta > max_synth_nll_delta {
+                    max_synth_nll_delta = nll_delta;
+                }
+                total_cases += 1;
+
+                eprintln!(
+                    "  oracle seq={:3} range={:<8} logit_max_diff={:.2e}  top1={}  nll_delta={:.2e}",
+                    seq_len,
+                    range_name,
+                    case_max_diff,
+                    if top1_f32 == top1_f16 {
+                        "MATCH"
+                    } else {
+                        "DIFF"
+                    },
+                    nll_delta
+                );
+            }
+        }
+
+        let top1_rate = top1_match_count as f32 / total_cases as f32;
+        eprintln!(
+            "\n=== Tensor Oracle Summary ===\n  logit_max_abs_diff = {:.4e}  (gate: < 0.02)\n  top1_match_rate    = {:.4}    (gate: >= 0.95)\n  nan_count          = {}\n  max_synth_nll_delta= {:.4e}  (gate: < 0.01)",
+            global_max_logit_diff, top1_rate, nan_count, max_synth_nll_delta
+        );
+
+        assert_eq!(nan_count, 0, "f16 KV dequant introduced NaN in logits");
+        assert!(
+            global_max_logit_diff < 0.02,
+            "logit_max_abs_diff {:.4e} >= 0.02 gate",
+            global_max_logit_diff
+        );
+        assert!(
+            top1_rate >= 0.95,
+            "top1_match_rate {:.4} < 0.95 gate",
+            top1_rate
+        );
+        assert!(
+            max_synth_nll_delta < 0.01,
+            "max synthetic NLL delta {:.4e} >= 0.01",
+            max_synth_nll_delta
+        );
+    }
+
+    /// Compute log softmax probability for target token (for synthetic NLL).
+    fn softmax_log_prob(logits: &[f32], target: usize) -> f32 {
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+        let log_sum = sum.ln();
+        (logits[target] - max_l) - log_sum
+    }
 }
