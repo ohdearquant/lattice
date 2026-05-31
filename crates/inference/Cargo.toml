@@ -67,6 +67,11 @@ path = "src/bin/bench_decode_ab.rs"
 required-features = ["f16", "metal-gpu"]
 
 [[bin]]
+name = "ppl_metal"
+path = "src/bin/ppl_metal.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[bin]]
 name = "bench_logit_dump"
 path = "src/bin/bench_logit_dump.rs"
 required-features = ["f16", "metal-gpu"]
