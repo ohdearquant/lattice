@@ -31,33 +31,42 @@ if [[ ! -x "$LAT_BIN" ]]; then
         || { echo '{"error":"build failed"}'; exit 1; }
 fi
 
-# Measure at N1 (baseline)
-lattice_median() {
+# Measure at N1 (baseline). Returns "total_ms completion_tokens" (median by total_ms).
+lattice_measure() {
     local n=$1
     env BENCH_N="$n" BENCH_RUNS="$RUNS" LATTICE_MODEL_DIR="$Q8_DIR" "$LAT_BIN" 2>/dev/null \
-        | awk -F'total_ms=' '/^RESULT/{print $2}' \
+        | sed -n 's/^RESULT.*completion=\([0-9]*\).*total_ms=\([0-9.]*\)/\2 \1/p' \
         | sort -n \
-        | awk "NR==$(( (RUNS + 1) / 2 ))"
+        | awk "NR==$(( (RUNS + 1) / 2 )){print}"
 }
 
-T1=$(lattice_median $N1)
-if [[ -z "$T1" ]]; then
+BASELINE=$(lattice_measure $N1)
+if [[ -z "$BASELINE" ]]; then
     echo '{"error":"baseline measurement failed"}'
     exit 1
 fi
+T1=$(echo "$BASELINE" | awk '{print $1}')
+C1=$(echo "$BASELINE" | awk '{print $2}')
 
-# Collect (ctx, per_tok_ms) pairs
+# Collect (actual_ctx, per_tok_ms) pairs
 declare -a CTX_VALS=()
 declare -a PTM_VALS=()
 
 for CTX in "${CONTEXTS_ARR[@]}"; do
-    T2=$(lattice_median "$CTX")
-    if [[ -n "$T2" && "$T2" != "0" ]]; then
-        # per_tok_ms = (T2 - T1) / (CTX - N1)
-        PTM=$(echo "scale=6; ($T2 - $T1) / ($CTX - $N1)" | bc)
-        CTX_VALS+=("$CTX")
-        PTM_VALS+=("$PTM")
-        >&2 echo "  ctx=$CTX: T2=${T2}ms per_tok=${PTM}ms"
+    MEAS=$(lattice_measure "$CTX")
+    if [[ -n "$MEAS" ]]; then
+        T2=$(echo "$MEAS" | awk '{print $1}')
+        C2=$(echo "$MEAS" | awk '{print $2}')
+        # Use ACTUAL completion tokens, not requested — model may hit EOS early
+        ACTUAL_DELTA=$(( C2 - C1 ))
+        if (( ACTUAL_DELTA > 0 )); then
+            PTM=$(echo "scale=6; ($T2 - $T1) / $ACTUAL_DELTA" | bc)
+            CTX_VALS+=("$C2")
+            PTM_VALS+=("$PTM")
+            >&2 echo "  ctx=$C2 (req=$CTX): T2=${T2}ms per_tok=${PTM}ms"
+        else
+            >&2 echo "  ctx=$CTX: no token delta (C2=$C2, C1=$C1), skipping"
+        fi
     else
         >&2 echo "  ctx=$CTX: FAILED (skipping)"
     fi
