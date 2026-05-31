@@ -212,12 +212,10 @@ pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
         }
     }
 
-    let a_deq = a.to_f32();
-    let b_deq = b.to_f32();
-    a_deq.iter().zip(b_deq.iter()).map(|(&x, &y)| x * y).sum()
+    let (raw_dot, sum_a, sum_b) = dot_product_int4_packed_scalar(&a.data, &b.data, a.dims);
+    finish_int4_dot(raw_dot, sum_a, sum_b, a, b)
 }
 
-#[cfg(target_arch = "aarch64")]
 #[inline]
 fn finish_int4_dot(raw_dot: i32, sum_a: i32, sum_b: i32, a: &Int4Vector, b: &Int4Vector) -> f32 {
     let raw_dot = raw_dot as f32;
@@ -230,6 +228,38 @@ fn finish_int4_dot(raw_dot: i32, sum_a: i32, sum_b: i32, a: &Int4Vector, b: &Int
         - (b.params.max_abs * sum_a / scale_a)
         - (a.params.max_abs * sum_b / scale_b)
         + (a.dims as f32 * a.params.max_abs * b.params.max_abs)
+}
+
+#[inline]
+fn dot_product_int4_packed_scalar(a: &[u8], b: &[u8], dims: usize) -> (i32, i32, i32) {
+    let full_bytes = dims / 2;
+    let mut raw_dot = 0i32;
+    let mut sum_a = 0i32;
+    let mut sum_b = 0i32;
+
+    for i in 0..full_bytes {
+        let av = a[i];
+        let bv = b[i];
+        let ah = ((av >> 4) & 0x0f) as i32;
+        let al = (av & 0x0f) as i32;
+        let bh = ((bv >> 4) & 0x0f) as i32;
+        let bl = (bv & 0x0f) as i32;
+        raw_dot += ah * bh + al * bl;
+        sum_a += ah + al;
+        sum_b += bh + bl;
+    }
+
+    if dims % 2 == 1 {
+        let av = a[full_bytes];
+        let bv = b[full_bytes];
+        let ah = ((av >> 4) & 0x0f) as i32;
+        let bh = ((bv >> 4) & 0x0f) as i32;
+        raw_dot += ah * bh;
+        sum_a += ah;
+        sum_b += bh;
+    }
+
+    (raw_dot, sum_a, sum_b)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -440,6 +470,31 @@ mod tests {
             rel_error < 0.15,
             "INT4 dot product relative error too large: f32={f32_dot}, int4={int4_dot}, rel_error={rel_error}"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_packed_scalar_matches_neon_exact() {
+        // Directly compare dot_product_int4_packed_scalar against
+        // dot_product_int4_neon_unrolled on integer tuples. Both return
+        // (raw_dot, sum_a, sum_b) as i32 — integer domain, exact equality expected.
+        // This is the executing parity proof for the non-aarch64 fallback kernel.
+        for dim in [1usize, 3, 31, 127, 383, 384] {
+            let a_f32 = generate_vector(dim, 500 + dim as u64);
+            let b_f32 = generate_vector(dim, 600 + dim as u64);
+            let qa = Int4Vector::from_f32(&a_f32);
+            let qb = Int4Vector::from_f32(&b_f32);
+
+            let scalar_result = dot_product_int4_packed_scalar(&qa.data, &qb.data, dim);
+            // SAFETY: aarch64 always has NEON; data slices are correctly sized by
+            // Int4Vector::from_f32 (len = dims.div_ceil(2)).
+            let neon_result = unsafe { dot_product_int4_neon_unrolled(&qa.data, &qb.data, dim) };
+
+            assert_eq!(
+                scalar_result, neon_result,
+                "packed_scalar vs NEON integer mismatch at dim={dim}: scalar={scalar_result:?}, neon={neon_result:?}"
+            );
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

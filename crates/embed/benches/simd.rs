@@ -10,7 +10,8 @@ use lattice_embed::simd::{
     self, BinaryVector, Int4Vector, NormalizationHint, PreparedQuery, PreparedQueryWithMeta,
     QuantizationTier, QuantizedData, QuantizedVector, SimdConfig, approximate_cosine_distance,
     approximate_cosine_distance_prepared, approximate_cosine_distance_prepared_with_meta,
-    approximate_dot_product_prepared,
+    approximate_dot_product_prepared, approximate_int4_batch_prepared,
+    approximate_int8_batch_prepared,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1093,6 +1094,94 @@ fn bench_batch_cosine_non_normalized_query(c: &mut Criterion) {
     group.finish();
 }
 
+/// S1 batch-size sweep: typed prepared-batch APIs at 10/100/1000.
+///
+/// query_per_call: re-quantizes the query on every call (baseline cost).
+/// int8_batch_prepared / int4_batch_prepared: query quantized once, typed APIs.
+fn bench_prepared_batch_sizes(c: &mut Criterion) {
+    const DIM: usize = 384;
+    let query_f32 = generate_vector(DIM, 42);
+    let stored_f32: Vec<Vec<f32>> = (0..1000)
+        .map(|i| generate_vector(DIM, i as u64 + 1))
+        .collect();
+    let stored_int8: Vec<QuantizedVector> = stored_f32
+        .iter()
+        .map(|v| QuantizedVector::from_f32(v))
+        .collect();
+    let stored_int8_data: Vec<QuantizedData> = stored_int8
+        .iter()
+        .map(|q| QuantizedData::Int8(q.clone()))
+        .collect();
+    let stored_int4: Vec<Int4Vector> = stored_f32.iter().map(|v| Int4Vector::from_f32(v)).collect();
+    let stored_int4_data: Vec<QuantizedData> = stored_int4
+        .iter()
+        .map(|q| QuantizedData::Int4(q.clone()))
+        .collect();
+
+    let pre_q_int8 = PreparedQuery::from_f32(&query_f32, QuantizationTier::Int8);
+    let pre_q_int4 = PreparedQuery::from_f32(&query_f32, QuantizationTier::Int4);
+
+    let mut group = c.benchmark_group("tier_prepared_batch_sizes");
+    for count in [10usize, 100, 1000] {
+        group.throughput(Throughput::Elements(count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("int8_query_per_call", count),
+            &count,
+            |bench, &n| {
+                bench.iter(|| {
+                    let r: Vec<f32> = stored_int8_data[..n]
+                        .iter()
+                        .map(|s| approximate_cosine_distance(black_box(&query_f32), s))
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("int8_batch_prepared", count),
+            &count,
+            |bench, &n| {
+                bench.iter(|| {
+                    black_box(approximate_int8_batch_prepared(
+                        black_box(&pre_q_int8),
+                        black_box(&stored_int8[..n]),
+                    ))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("int4_query_per_call", count),
+            &count,
+            |bench, &n| {
+                bench.iter(|| {
+                    let r: Vec<f32> = stored_int4_data[..n]
+                        .iter()
+                        .map(|s| approximate_cosine_distance(black_box(&query_f32), s))
+                        .collect();
+                    black_box(r)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("int4_batch_prepared", count),
+            &count,
+            |bench, &n| {
+                bench.iter(|| {
+                    black_box(approximate_int4_batch_prepared(
+                        black_box(&pre_q_int4),
+                        black_box(&stored_int4[..n]),
+                    ))
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     simd_benches,
     bench_cosine_simd_vs_scalar,
@@ -1117,6 +1206,7 @@ criterion_group!(
     bench_query_batch_dot_product,
     bench_batch_cosine_normalized_query,
     bench_batch_cosine_non_normalized_query,
+    bench_prepared_batch_sizes,
 );
 
 criterion_main!(simd_benches);
