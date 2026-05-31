@@ -913,7 +913,15 @@ mod tests {
     #[test]
     fn test_f16_roundtrip() {
         let values = [
-            0.0f32, 1.0, -1.0, 0.5, -0.5, 3.14159, 100.0, -100.0, 0.001,
+            0.0f32,
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            std::f32::consts::PI,
+            100.0,
+            -100.0,
+            0.001,
             65504.0, // max finite f16
         ];
         for &v in &values {

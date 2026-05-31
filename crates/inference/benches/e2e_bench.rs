@@ -37,15 +37,12 @@ fn model_dir() -> Option<PathBuf> {
 }
 
 fn e2e_encode(c: &mut Criterion) {
-    let dir = match model_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!(
-                "Skipping e2e benchmark: no model files found.\n\
-                 Set LATTICE_INFERENCE_MODEL_DIR or place files at ~/.lattice/models/bge-small-en-v1.5/"
-            );
-            return;
-        }
+    let Some(dir) = model_dir() else {
+        eprintln!(
+            "Skipping e2e benchmark: no model files found.\n\
+             Set LATTICE_INFERENCE_MODEL_DIR or place files at ~/.lattice/models/bge-small-en-v1.5/"
+        );
+        return;
     };
 
     let model = BertModel::from_directory(&dir).expect("Failed to load model");
@@ -84,10 +81,7 @@ fn e2e_encode(c: &mut Criterion) {
 }
 
 fn e2e_encode_batch(c: &mut Criterion) {
-    let dir = match model_dir() {
-        Some(d) => d,
-        None => return,
-    };
+    let Some(dir) = model_dir() else { return };
 
     let model = BertModel::from_directory(&dir).expect("Failed to load model");
     let _ = model.encode("warmup");

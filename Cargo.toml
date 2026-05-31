@@ -16,6 +16,9 @@ license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
+# Half-precision floats
+half = { version = "2", features = ["std"] }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -59,6 +62,10 @@ arc-swap = "1.7"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# CLI + HTTP server (used by lattice binary)
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
 
 # Testing
 proptest = "1.0"

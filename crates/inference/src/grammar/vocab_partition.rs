@@ -196,7 +196,7 @@ impl VocabPartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, GrammarState, Rule, Symbol};
+    use crate::grammar::pda::{CompiledGrammar, GrammarBuilder, GrammarState, Rule, Symbol};
 
     /// Grammar: root = 'a' | 'b'
     fn or_grammar() -> CompiledGrammar {

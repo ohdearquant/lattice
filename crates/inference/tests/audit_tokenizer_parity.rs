@@ -3,37 +3,29 @@
 ///
 /// Run: cargo test -p lattice-inference --test audit_tokenizer_parity
 ///
-/// Requires the three HF model snapshots present in ~/.cache/huggingface/hub/.
-/// If a model directory is absent, its tests are skipped (not failed) so the
-/// test file can live in CI without downloading models.
+/// Tokenizer fixtures are committed under crates/inference/tests/fixtures/tokenizers/
+/// so these tests run on a clean checkout without downloading model weights.
 use std::path::PathBuf;
 
 use lattice_inference::{Tokenizer, load_tokenizer};
 
-fn hf_cache() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".cache/huggingface/hub")
+fn tokenizer_fixture_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tokenizers")
 }
 
 fn bge_dir() -> PathBuf {
-    hf_cache()
-        .join("models--BAAI--bge-small-en-v1.5")
-        .join("snapshots")
-        .join("5c38ec7c405ec4b44b94cc5a9bb96e735b38267a")
+    tokenizer_fixture_root().join("bge-small-en-v1.5")
 }
 
 fn e5_dir() -> PathBuf {
-    hf_cache()
-        .join("models--intfloat--multilingual-e5-small")
-        .join("snapshots")
-        .join("614241f622f53c4eeff9890bdc4f31cfecc418b3")
+    tokenizer_fixture_root().join("multilingual-e5-small")
 }
 
 fn qwen_dir() -> PathBuf {
-    hf_cache()
-        .join("models--Qwen--Qwen3-Embedding-0.6B")
-        .join("snapshots")
-        .join("97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3")
+    tokenizer_fixture_root().join("qwen3-embedding-0.6b")
 }
 
 struct Case {
@@ -71,11 +63,8 @@ fn check_parity(label: &str, tok: &dyn Tokenizer, cases: &[Case]) {
 #[test]
 fn bge_small_en_v15_wordpiece_parity() {
     let dir = bge_dir();
-    if !dir.exists() {
-        eprintln!("SKIP bge-small-en-v1.5: {}", dir.display());
-        return;
-    }
-    let tok = load_tokenizer(&dir).expect("load bge tokenizer");
+    let tok = load_tokenizer(&dir)
+        .unwrap_or_else(|e| panic!("load bge tokenizer fixture from {}: {e}", dir.display()));
     check_parity(
         "bge-small-en-v1.5 (WordPiece)",
         tok.as_ref(),
@@ -144,11 +133,8 @@ fn bge_small_en_v15_wordpiece_parity() {
 #[test]
 fn multilingual_e5_small_sentencepiece_parity() {
     let dir = e5_dir();
-    if !dir.exists() {
-        eprintln!("SKIP multilingual-e5-small: {}", dir.display());
-        return;
-    }
-    let tok = load_tokenizer(&dir).expect("load e5 tokenizer");
+    let tok = load_tokenizer(&dir)
+        .unwrap_or_else(|e| panic!("load e5 tokenizer fixture from {}: {e}", dir.display()));
     check_parity(
         "multilingual-e5-small (SentencePiece/Unigram)",
         tok.as_ref(),
@@ -215,11 +201,8 @@ fn multilingual_e5_small_sentencepiece_parity() {
 #[test]
 fn qwen3_embedding_0_6b_bpe_parity() {
     let dir = qwen_dir();
-    if !dir.exists() {
-        eprintln!("SKIP Qwen3-Embedding-0.6B: {}", dir.display());
-        return;
-    }
-    let tok = load_tokenizer(&dir).expect("load qwen tokenizer");
+    let tok = load_tokenizer(&dir)
+        .unwrap_or_else(|e| panic!("load qwen tokenizer fixture from {}: {e}", dir.display()));
     check_parity(
         "Qwen3-Embedding-0.6B (BPE)",
         tok.as_ref(),

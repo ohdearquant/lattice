@@ -293,43 +293,6 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cache_path_contains_dim_in_filename() {
-        let path = embedding_cache_path("qwen3-embedding-4b", 1024);
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(filename, "embed_qwen3-embedding-4b_1024d.bin");
-    }
-
-    #[test]
-    fn test_cache_path_different_dims_produce_different_paths() {
-        let path_1024 = embedding_cache_path("qwen3-embedding-4b", 1024);
-        let path_2560 = embedding_cache_path("qwen3-embedding-4b", 2560);
-        assert_ne!(path_1024, path_2560);
-        assert!(path_1024.to_string_lossy().contains("1024d"));
-        assert!(path_2560.to_string_lossy().contains("2560d"));
-    }
-
-    #[test]
-    fn test_cache_path_model_slug_differentiates_variants() {
-        let path_4b = embedding_cache_path("qwen3-embedding-4b", 2560);
-        let path_06b = embedding_cache_path("qwen3-embedding-0.6b", 1024);
-        assert_ne!(path_4b, path_06b);
-        assert!(path_4b.to_string_lossy().contains("qwen3-embedding-4b"));
-        assert!(path_06b.to_string_lossy().contains("qwen3-embedding-0.6b"));
-    }
-
-    #[test]
-    fn test_cache_path_same_model_same_dim_same_path() {
-        let p1 = embedding_cache_path("qwen3-embedding-4b", 1024);
-        let p2 = embedding_cache_path("qwen3-embedding-4b", 1024);
-        assert_eq!(p1, p2);
-    }
-}
-
 #[async_trait]
 impl EmbeddingService for NativeEmbeddingService {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
@@ -379,5 +342,42 @@ impl EmbeddingService for NativeEmbeddingService {
 
     fn name(&self) -> &'static str {
         "native-bert"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_path_contains_dim_in_filename() {
+        let path = embedding_cache_path("qwen3-embedding-4b", 1024);
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(filename, "embed_qwen3-embedding-4b_1024d.bin");
+    }
+
+    #[test]
+    fn test_cache_path_different_dims_produce_different_paths() {
+        let path_1024 = embedding_cache_path("qwen3-embedding-4b", 1024);
+        let path_2560 = embedding_cache_path("qwen3-embedding-4b", 2560);
+        assert_ne!(path_1024, path_2560);
+        assert!(path_1024.to_string_lossy().contains("1024d"));
+        assert!(path_2560.to_string_lossy().contains("2560d"));
+    }
+
+    #[test]
+    fn test_cache_path_model_slug_differentiates_variants() {
+        let path_4b = embedding_cache_path("qwen3-embedding-4b", 2560);
+        let path_06b = embedding_cache_path("qwen3-embedding-0.6b", 1024);
+        assert_ne!(path_4b, path_06b);
+        assert!(path_4b.to_string_lossy().contains("qwen3-embedding-4b"));
+        assert!(path_06b.to_string_lossy().contains("qwen3-embedding-0.6b"));
+    }
+
+    #[test]
+    fn test_cache_path_same_model_same_dim_same_path() {
+        let p1 = embedding_cache_path("qwen3-embedding-4b", 1024);
+        let p2 = embedding_cache_path("qwen3-embedding-4b", 1024);
+        assert_eq!(p1, p2);
     }
 }

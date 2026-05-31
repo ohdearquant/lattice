@@ -8,13 +8,9 @@
 //! `NativeEmbeddingService` uses internally.
 //!
 //! Tests operate at the **tokenized-ID level** so no model weight files are
-//! required.  Each test loads the tokenizer from the HF snapshot directory
-//! (the same path `BertModel::from_pretrained` resolves to), calls
-//! `tokenize()`, and asserts the IDs match the golden HF reference values
-//! from `audit_tokenizer_parity.rs`.
-//!
-//! Tests are skipped (not failed) when the HF snapshot is absent, matching
-//! the convention used by `audit_tokenizer_parity.rs`.
+//! required.  Tokenizer fixtures are committed under
+//! crates/inference/tests/fixtures/tokenizers/ and are read via a relative
+//! path from this crate's manifest directory so tests run on a clean checkout.
 //!
 //! Run:
 //!   cargo test -p lattice-embed --test tokenizer_parity_e2e
@@ -23,33 +19,24 @@ use lattice_inference::{Tokenizer, load_tokenizer};
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
-// HF snapshot path helpers — match audit_tokenizer_parity.rs
+// Repo fixture path helpers — read from committed inference tokenizer fixtures
 // ---------------------------------------------------------------------------
 
-fn hf_cache() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".cache/huggingface/hub")
+fn tokenizer_fixture_root() -> PathBuf {
+    // crates/embed → crates/inference/tests/fixtures/tokenizers
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../inference/tests/fixtures/tokenizers")
 }
 
 fn bge_dir() -> PathBuf {
-    hf_cache()
-        .join("models--BAAI--bge-small-en-v1.5")
-        .join("snapshots")
-        .join("5c38ec7c405ec4b44b94cc5a9bb96e735b38267a")
+    tokenizer_fixture_root().join("bge-small-en-v1.5")
 }
 
 fn e5_dir() -> PathBuf {
-    hf_cache()
-        .join("models--intfloat--multilingual-e5-small")
-        .join("snapshots")
-        .join("614241f622f53c4eeff9890bdc4f31cfecc418b3")
+    tokenizer_fixture_root().join("multilingual-e5-small")
 }
 
 fn qwen_dir() -> PathBuf {
-    hf_cache()
-        .join("models--Qwen--Qwen3-Embedding-0.6B")
-        .join("snapshots")
-        .join("97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3")
+    tokenizer_fixture_root().join("qwen3-embedding-0.6b")
 }
 
 // ---------------------------------------------------------------------------
@@ -100,15 +87,12 @@ fn check_embed_service_tokenizer_parity(label: &str, tok: &dyn Tokenizer, cases:
 #[test]
 fn embed_service_bge_tokenizer_parity() {
     let dir = bge_dir();
-    if !dir.exists() {
-        eprintln!(
-            "SKIP embed_service_bge_tokenizer_parity: {} not found",
+    let tok = load_tokenizer(&dir).unwrap_or_else(|e| {
+        panic!(
+            "load embed-path bge tokenizer fixture from {}: {e}",
             dir.display()
-        );
-        return;
-    }
-
-    let tok = load_tokenizer(&dir).expect("load bge tokenizer");
+        )
+    });
     check_embed_service_tokenizer_parity(
         "embed-path / bge-small-en-v1.5 (WordPiece)",
         tok.as_ref(),
@@ -157,15 +141,12 @@ fn embed_service_bge_tokenizer_parity() {
 #[test]
 fn embed_service_e5_tokenizer_parity() {
     let dir = e5_dir();
-    if !dir.exists() {
-        eprintln!(
-            "SKIP embed_service_e5_tokenizer_parity: {} not found",
+    let tok = load_tokenizer(&dir).unwrap_or_else(|e| {
+        panic!(
+            "load embed-path e5 tokenizer fixture from {}: {e}",
             dir.display()
-        );
-        return;
-    }
-
-    let tok = load_tokenizer(&dir).expect("load e5 tokenizer");
+        )
+    });
     check_embed_service_tokenizer_parity(
         "embed-path / multilingual-e5-small (SentencePiece)",
         tok.as_ref(),
@@ -215,15 +196,12 @@ fn embed_service_e5_tokenizer_parity() {
 #[test]
 fn embed_service_qwen_tokenizer_parity() {
     let dir = qwen_dir();
-    if !dir.exists() {
-        eprintln!(
-            "SKIP embed_service_qwen_tokenizer_parity: {} not found",
+    let tok = load_tokenizer(&dir).unwrap_or_else(|e| {
+        panic!(
+            "load embed-path qwen tokenizer fixture from {}: {e}",
             dir.display()
-        );
-        return;
-    }
-
-    let tok = load_tokenizer(&dir).expect("load qwen tokenizer");
+        )
+    });
     check_embed_service_tokenizer_parity(
         "embed-path / qwen3-embedding-0.6b (BPE)",
         tok.as_ref(),

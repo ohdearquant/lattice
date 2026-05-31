@@ -26,7 +26,8 @@ impl Layout {
 
 #[derive(Debug)]
 struct CurrentFixture {
-    cache: FlatKVCache,
+    k: Vec<f32>,
+    v: Vec<f32>,
     kv_seq_len: usize,
 }
 
@@ -40,21 +41,23 @@ impl CurrentFixture {
         cache.prefill_layer(0, &sequence_major_k, &sequence_major_v, kv_seq_len);
         cache.advance_by(kv_seq_len);
 
+        let k = cache.get_k(0);
+        let v = cache.get_v(0);
         assert_eq!(cache.seq_len(), kv_seq_len);
-        assert_eq!(cache.get_k(0).len(), kv_seq_len * KV_DIM);
-        assert_eq!(cache.get_v(0).len(), kv_seq_len * KV_DIM);
+        assert_eq!(k.len(), kv_seq_len * KV_DIM);
+        assert_eq!(v.len(), kv_seq_len * KV_DIM);
 
-        Self { cache, kv_seq_len }
+        Self { k, v, kv_seq_len }
     }
 
     #[inline]
     fn k(&self) -> &[f32] {
-        self.cache.get_k(0)
+        &self.k
     }
 
     #[inline]
     fn v(&self) -> &[f32] {
-        self.cache.get_v(0)
+        &self.v
     }
 }
 

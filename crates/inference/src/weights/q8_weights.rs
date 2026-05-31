@@ -664,8 +664,8 @@ mod tests {
         let mut c = vec![0.0f32; 2];
         matmul_bt_q8(&a, &q, &mut c, 1, 3, 2);
 
-        let expected0 = 0.01 * (1.0 * 127.0 + 2.0 * -64.0 + -1.0 * 0.0);
-        let expected1 = 0.02 * (1.0 * -127.0 + 2.0 * 0.0 + -1.0 * 64.0);
+        let expected0 = 0.01 * (1.0 * 127.0 + 2.0 * -64.0 + -0.0);
+        let expected1 = 0.02 * (1.0 * -127.0 + 2.0 * 0.0 + -64.0);
 
         assert!(approx_eq(c[0], expected0, 1e-6));
         assert!(approx_eq(c[1], expected1, 1e-6));

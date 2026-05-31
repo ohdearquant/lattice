@@ -13,6 +13,7 @@ use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -20,9 +21,9 @@ use std::time::Instant;
 /// Backing storage for Qwen model weights — either a single mmap'd file or
 /// an owned heap allocation for sharded checkpoints.
 ///
-/// Drop order within `QwenModel` guarantees that `weights` is dropped before
-/// this enum (RFC 1857 struct field ordering), keeping all tensor slice
-/// references valid for the model's lifetime.
+/// `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
+/// implements `Drop` to drop `weights` before `_storage`, keeping tensor
+/// slice references valid regardless of field declaration order.
 ///
 /// The inner fields are kept solely for their `Drop` effect (RAII backing store).
 #[allow(dead_code)]
@@ -392,11 +393,24 @@ pub struct QwenModel {
     /// Optional Metal GPU forward pass. When available, transformer layers run on GPU
     /// while embedding lookup and pooling stay on CPU.
     metal: Option<Mutex<MetalForwardPass>>,
-    // INVARIANT: `weights` MUST be declared before `_storage`.
-    // RFC 1857 guarantees struct fields are dropped in declaration order, so
-    // `weights` (which holds slices into `_storage`) is dropped first.
-    weights: QwenWeights<'static>,
-    _storage: SafetensorsStorage,
+    // Both fields are `ManuallyDrop` so that `Drop for QwenModel` can enforce
+    // explicit drop order: `weights` before `_storage`. This is independent of
+    // field declaration order — a reorder cannot cause use-after-free.
+    weights: ManuallyDrop<QwenWeights<'static>>,
+    _storage: ManuallyDrop<SafetensorsStorage>,
+}
+
+impl Drop for QwenModel {
+    fn drop(&mut self) {
+        // SAFETY: `weights` holds slice references into the data owned by `_storage`.
+        // We drop `weights` first to release those references, then drop `_storage`.
+        // Using `ManuallyDrop` here makes this ordering explicit and independent of
+        // field declaration order — a future field reorder cannot cause use-after-free.
+        unsafe {
+            ManuallyDrop::drop(&mut self.weights);
+            ManuallyDrop::drop(&mut self._storage);
+        }
+    }
 }
 
 impl QwenModel {
@@ -456,8 +470,8 @@ impl QwenModel {
                 }
             };
 
-            // SAFETY: The backing store (_storage / safetensors) outlives weights
-            // because it is dropped after weights (RFC 1857 struct field drop order).
+            // SAFETY: The safetensors backing is stored in `_storage`; `QwenModel::drop`
+            // explicitly drops `weights` before `_storage`, independent of field order.
             let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
 
             let rope_max = config
@@ -474,8 +488,8 @@ impl QwenModel {
                 buffers: Mutex::new(ForwardBuffers::new()),
                 cache: Mutex::new(HashMap::with_capacity(1024)),
                 metal,
-                weights,
-                _storage: SafetensorsStorage::Single(safetensors),
+                weights: ManuallyDrop::new(weights),
+                _storage: ManuallyDrop::new(SafetensorsStorage::Single(safetensors)),
             })
         } else if index_path.exists() {
             // --- Sharded path ---
@@ -515,10 +529,9 @@ impl QwenModel {
                 }
             };
 
-            // SAFETY: `weights_tmp` already has 'static lifetime from
-            // `load_qwen_weights_owned` — the slices point into `backing` which
-            // is a heap-allocated Box.  We store `backing` in `_storage` and
-            // declare `weights` before `_storage` so drop order is correct.
+            // SAFETY: `weights_tmp` contains slices into `backing`. `backing` is moved
+            // into `_storage`, and `QwenModel::drop` explicitly drops `weights` before
+            // `_storage`, independent of field declaration order.
             let weights: QwenWeights<'static> = weights_tmp;
 
             let rope_max = config
@@ -535,8 +548,8 @@ impl QwenModel {
                 buffers: Mutex::new(ForwardBuffers::new()),
                 cache: Mutex::new(HashMap::with_capacity(1024)),
                 metal,
-                weights,
-                _storage: SafetensorsStorage::Sharded(backing),
+                weights: ManuallyDrop::new(weights),
+                _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(backing)),
             })
         } else {
             Err(InferenceError::ModelNotFound(format!(
@@ -683,10 +696,14 @@ impl QwenModel {
         let mut ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
 
         let eos = self.inference_config.eos_token_id;
-        if ids.len() < max_len {
-            ids.push(eos);
-        } else {
-            if let Some(last) = ids.last_mut() {
+        // Only append EOS if the tokenizer has not already done so. Qwen3's
+        // tokenizer.json post_processor (TemplateProcessing) appends <|endoftext|>
+        // automatically; a second append would pool from a spurious extra EOS
+        // token instead of the real last-content token, causing embedding divergence.
+        if ids.last() != Some(&eos) {
+            if ids.len() < max_len {
+                ids.push(eos);
+            } else if let Some(last) = ids.last_mut() {
                 *last = eos;
             }
         }
@@ -1693,9 +1710,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_long_text_bench() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
         // Warmup
@@ -1716,9 +1732,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_multilingual() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
 
@@ -1761,9 +1776,8 @@ mod tests {
     #[test]
     #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
     fn test_qwen_encode_real_model() {
-        let model_dir = match std::env::var("LATTICE_INFERENCE_MODEL_DIR") {
-            Ok(v) => v,
-            Err(_) => return,
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
         };
 
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();

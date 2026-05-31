@@ -987,9 +987,9 @@ impl ShardedSafetensors {
     /// Load all Qwen3 weights from a sharded checkpoint into an owned backing store.
     ///
     /// Returns `(backing, weights)` where `weights` borrows from `backing`.
-    /// The caller MUST store `backing` in a `Box` and ensure `weights` does not
-    /// outlive it.  In `QwenModel` the `SafetensorsStorage::Sharded` variant
-    /// owns the `Box<ShardedQwenBacking>` and is dropped after `weights`.
+    /// The caller MUST keep `backing` alive until after `weights` is dropped.
+    /// `QwenModel` enforces this with `ManuallyDrop` fields and an explicit
+    /// `Drop` impl that drops `weights` before `_storage`.
     pub fn load_qwen_weights_owned(
         &mut self,
         num_layers: usize,
@@ -1170,17 +1170,18 @@ impl ShardedSafetensors {
         });
 
         // --- Build QwenWeights borrowing from the backing ---
-        // SAFETY: The backing is heap-allocated in a Box and will be stored alongside
-        // the QwenWeights<'static> in SafetensorsStorage::Sharded inside QwenModel.
-        // Field drop order (RFC 1857) guarantees backing outlives weights: `weights`
-        // is declared before `_safetensors` in QwenModel, so `_safetensors` (which
-        // owns the backing) is dropped last.
+        // SAFETY: The backing is heap-allocated in a Box; its address is stable.
+        // `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
+        // implements `Drop` to drop `weights` before `_storage`, ensuring the
+        // slice references in `weights` are released before `backing` is freed.
+        // This invariant is independent of field declaration order in `QwenModel`.
         let weights: QwenWeights<'static> = {
             #[allow(clippy::explicit_auto_deref)]
             let b: &ShardedQwenBacking = &*backing;
-            // SAFETY: We extend the lifetime of references into `b` to 'static.
-            // This is safe because `backing` lives in a Box that is co-located
-            // with the QwenWeights inside QwenModel and is dropped after it.
+            // SAFETY: We extend the borrow of `b` to 'static. This is sound because
+            // `backing` outlives any use of these references: `QwenModel` drops
+            // `weights` before `_storage` via an explicit `Drop` impl that uses
+            // `ManuallyDrop`, independent of field declaration order.
             let b: &'static ShardedQwenBacking = unsafe { &*(b as *const ShardedQwenBacking) };
 
             let embed_tokens = Tensor2D {
@@ -1800,7 +1801,7 @@ mod tests {
     }
 
     fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
-        let byte_len = values.len() * std::mem::size_of::<f32>();
+        let byte_len = std::mem::size_of_val(values);
         let header = format!(
             r#"{{"{name}":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{byte_len}]}}}}"#,
             values.len()
@@ -1969,8 +1970,7 @@ mod tests {
     ) {
         let bias_end = weight_end + 4; // one f32
         let header = format!(
-            r#"{{"classifier.weight":{{{},"data_offsets":[0,{weight_end}]}},"classifier.bias":{{"dtype":"F32","shape":[1],"data_offsets":[{weight_end},{bias_end}]}}}}"#,
-            weight_shape_header
+            r#"{{"classifier.weight":{{{weight_shape_header},"data_offsets":[0,{weight_end}]}},"classifier.bias":{{"dtype":"F32","shape":[1],"data_offsets":[{weight_end},{bias_end}]}}}}"#
         );
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());

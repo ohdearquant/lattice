@@ -1446,10 +1446,7 @@ mod tests {
             let batch_tok_s = total_tokens / batch_elapsed.as_secs_f64();
             let speedup = batch_tok_s / seq_tok_s;
 
-            println!(
-                "{:>6} | {:>14.2} | {:>14.2} | {:>7.2}x",
-                prompt_len, seq_tok_s, batch_tok_s, speedup
-            );
+            println!("{prompt_len:>6} | {seq_tok_s:>14.2} | {batch_tok_s:>14.2} | {speedup:>7.2}x");
         }
     }
 

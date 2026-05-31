@@ -85,7 +85,7 @@ fn bench_batch_cosine_one_vs_many(c: &mut Criterion) {
             .collect();
 
         // Prepare candidate-refs format for batch_cosine_one_vs_many
-        let candidate_refs: Vec<&[f32]> = candidates.iter().map(|c| c.as_slice()).collect();
+        let candidate_refs: Vec<&[f32]> = candidates.iter().map(Vec::as_slice).collect();
 
         group.bench_with_input(BenchmarkId::new("per_pair_16", dim), &dim, |bencher, _| {
             bencher.iter(|| {
@@ -127,8 +127,8 @@ fn bench_i8_dot_product(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("simd", dim), &dim, |bencher, _| {
             bencher.iter(|| {
                 std::hint::black_box(dot_product_i8_raw(
-                    std::hint::black_box(&a_q.data),
-                    std::hint::black_box(&b_q.data),
+                    std::hint::black_box(a_q.data()),
+                    std::hint::black_box(b_q.data()),
                 ))
             });
         });
@@ -136,9 +136,9 @@ fn bench_i8_dot_product(c: &mut Criterion) {
         // Scalar reference path
         group.bench_with_input(BenchmarkId::new("scalar", dim), &dim, |bencher, _| {
             bencher.iter(|| {
-                let sum: i32 = std::hint::black_box(&a_q.data)
+                let sum: i32 = std::hint::black_box(a_q.data())
                     .iter()
-                    .zip(std::hint::black_box(&b_q.data).iter())
+                    .zip(std::hint::black_box(b_q.data()).iter())
                     .map(|(&x, &y)| x as i32 * y as i32)
                     .sum();
                 std::hint::black_box(sum as f32)

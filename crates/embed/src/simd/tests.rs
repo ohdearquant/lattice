@@ -160,6 +160,28 @@ fn test_normalize_384_dim() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_neon_normalize_matches_scalar_multiple_dims() {
+    for dim in [1usize, 3, 16, 31, 127, 384, 768, 1536] {
+        let mut simd_v = generate_random_vector_seeded(dim, 700 + dim as u64);
+        let mut scalar_v = simd_v.clone();
+
+        normalize(&mut simd_v); // dispatches to NEON on aarch64
+        normalize::normalize_scalar(&mut scalar_v);
+
+        for (i, (s, sc)) in simd_v.iter().zip(scalar_v.iter()).enumerate() {
+            assert_close(
+                *s,
+                *sc,
+                1e-5,
+                1e-5,
+                &format!("neon normalize dim={dim} idx={i}"),
+            );
+        }
+    }
+}
+
 #[test]
 fn test_avx512_normalize_dimensions() {
     for dim in AVX512_TEST_DIMS {
@@ -789,7 +811,7 @@ fn test_batch_cosine_one_vs_many_matches_per_pair() {
     let candidates: Vec<Vec<f32>> = (0..8)
         .map(|i| generate_random_vector_seeded(384, 0x3333_0000 + i as u64))
         .collect();
-    let candidate_refs: Vec<&[f32]> = candidates.iter().map(|c| c.as_slice()).collect();
+    let candidate_refs: Vec<&[f32]> = candidates.iter().map(Vec::as_slice).collect();
 
     let batch = batch_cosine_one_vs_many(&query, &candidate_refs);
     assert_eq!(batch.len(), 8);

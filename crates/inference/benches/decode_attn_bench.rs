@@ -13,9 +13,12 @@
 //!
 //! CPU-only builds silently skip all benchmarks.
 
-use std::time::Duration;
+use criterion::{Criterion, criterion_group, criterion_main};
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use criterion::{BenchmarkId, Throughput, black_box};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // MSL — baseline (old 3-pass QK-recomputing kernel)

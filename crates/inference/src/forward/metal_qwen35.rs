@@ -13555,12 +13555,14 @@ kernel void decode_attention_reference(
             let logits = state.forward_step(42, 0);
             assert_eq!(logits.len(), cfg.vocab_size);
             let actual = &logits[..10];
-            // Math: token 42's embedding has a single non-zero element (=1.0). After
-            // input_layernorm (qwen35_rms_norm uses 1+gamma weights), the norm output
-            // is x * sqrt(hidden)/||x|| * (1 + gamma) = 1 * sqrt(512) * 2 = 45.2543.
-            // All attention and FFN weights are zero, so the residual stream stays at
-            // the input embedding. final_norm produces the same 45.2543 magnitude.
-            // Tied lm_head: logit[v] = embed[v, 0] * 45.2543 → -45.25, 0, 45.25 pattern.
+            // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
+            // All attention and FFN weights are zero → residual stream equals the
+            // raw embedding at every stage. final_norm then applies the shifted
+            // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
+            // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
+            //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
+            // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
+            // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
             let expected = [
                 -45.243256_f32,
                 0.0,

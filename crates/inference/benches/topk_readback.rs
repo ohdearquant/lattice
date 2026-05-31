@@ -34,6 +34,7 @@ use lattice_inference::sampling::{Candidate, CandidateSet, Sampler, SamplingConf
 const QWEN35_VOCAB_SIZE: usize = 248_320;
 
 /// Smaller vocab used for fast parity checks — tests first-pass + one merge pass.
+#[allow(dead_code)]
 const PARITY_VOCAB_SIZE: usize = 4096;
 
 /// Inline MSL source for the current (bitonic-sort) top-k kernels used in
@@ -1657,11 +1658,12 @@ fn bench_candidate_sampler(c: &mut Criterion) {
 /// CPU top-k oracle: returns up to k (token_id, logit) pairs sorted descending
 /// by logit.  NaN logits are excluded.  Ties broken by ascending token_id,
 /// matching the GPU `topk_better` comparator.
+#[allow(dead_code)]
 fn topk_cpu_oracle(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let mut indexed: Vec<(u32, f32)> = logits
         .iter()
         .enumerate()
-        .filter(|(_, &v)| !v.is_nan())
+        .filter(|&(_, &v)| !v.is_nan())
         .map(|(i, &v)| (i as u32, v))
         .collect();
     indexed.sort_by(|a, b| {

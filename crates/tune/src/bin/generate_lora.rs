@@ -51,7 +51,7 @@ fn main() {
     };
 
     // Load base model
-    println!("Loading model from {:?}...", model_dir);
+    println!("Loading model from {model_dir:?}...");
     let t0 = Instant::now();
 
     let mut model =
@@ -67,7 +67,7 @@ fn main() {
 
     // Load LoRA adapter
     if let Some(ref lora) = lora_path {
-        println!("Loading LoRA adapter from {:?}...", lora);
+        println!("Loading LoRA adapter from {lora:?}...");
         let t_lora = Instant::now();
 
         match lattice_tune::lora::LoraAdapter::from_safetensors(lora) {
@@ -79,6 +79,10 @@ fn main() {
                     adapter.config.scale(),
                     adapter.num_parameters()
                 );
+                if let Err(e) = adapter.validate_against(model.config()) {
+                    eprintln!("LoRA adapter incompatible with loaded model: {e}");
+                    std::process::exit(1);
+                }
                 model.set_lora(Box::new(adapter));
                 println!(
                     "  LoRA active (loaded in {}ms)",
@@ -95,9 +99,11 @@ fn main() {
     }
 
     // Configure generation
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
-    gen_cfg.max_new_tokens = max_tokens;
-    gen_cfg.seed = seed;
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
+        max_new_tokens: max_tokens,
+        seed,
+        ..lattice_inference::model::qwen35_config::GenerateConfig::default()
+    };
     if let Some(t) = temperature {
         gen_cfg.temperature = t;
     }

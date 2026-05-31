@@ -433,6 +433,80 @@ pub fn batch_approximate_cosine_distance_prepared_into(
     );
 }
 
+/// Compute cosine distances from a prepared INT8 query to a slice of INT8 candidates.
+///
+/// Panics if `query` is not an `Int8` `PreparedQuery`.
+/// The query is quantized once outside this function; no per-iteration `from_f32` is called.
+#[inline]
+pub fn approximate_int8_batch_prepared(
+    query: &PreparedQuery,
+    candidates: &[QuantizedVector],
+) -> Vec<f32> {
+    let PreparedQuery::Int8(q) = query else {
+        panic!("PreparedQuery tier must be Int8");
+    };
+    candidates
+        .iter()
+        .map(|candidate| 1.0 - cosine_similarity_i8_trusted(candidate, q))
+        .collect()
+}
+
+/// Like [`approximate_int8_batch_prepared`] but writes into a caller-supplied buffer.
+#[inline]
+pub fn approximate_int8_batch_prepared_into(
+    query: &PreparedQuery,
+    candidates: &[QuantizedVector],
+    out: &mut Vec<f32>,
+) {
+    let PreparedQuery::Int8(q) = query else {
+        panic!("PreparedQuery tier must be Int8");
+    };
+    out.clear();
+    out.reserve(candidates.len());
+    out.extend(
+        candidates
+            .iter()
+            .map(|candidate| 1.0 - cosine_similarity_i8_trusted(candidate, q)),
+    );
+}
+
+/// Compute cosine distances from a prepared INT4 query to a slice of INT4 candidates.
+///
+/// Panics if `query` is not an `Int4` `PreparedQuery`.
+/// The query is quantized once outside this function; no per-iteration `from_f32` is called.
+#[inline]
+pub fn approximate_int4_batch_prepared(
+    query: &PreparedQuery,
+    candidates: &[Int4Vector],
+) -> Vec<f32> {
+    let PreparedQuery::Int4(q) = query else {
+        panic!("PreparedQuery tier must be Int4");
+    };
+    candidates
+        .iter()
+        .map(|candidate| candidate.cosine_distance(q))
+        .collect()
+}
+
+/// Like [`approximate_int4_batch_prepared`] but writes into a caller-supplied buffer.
+#[inline]
+pub fn approximate_int4_batch_prepared_into(
+    query: &PreparedQuery,
+    candidates: &[Int4Vector],
+    out: &mut Vec<f32>,
+) {
+    let PreparedQuery::Int4(q) = query else {
+        panic!("PreparedQuery tier must be Int4");
+    };
+    out.clear();
+    out.reserve(candidates.len());
+    out.extend(
+        candidates
+            .iter()
+            .map(|candidate| candidate.cosine_distance(q)),
+    );
+}
+
 /// **Unstable**: tiered distance dispatch; tier mix and formula may change.
 ///
 /// This is the primary distance function for HNSW search with tiered storage.
@@ -621,6 +695,81 @@ mod tests {
         let full = int8.promote(QuantizationTier::Full);
         assert_eq!(full.tier(), QuantizationTier::Full);
         assert_eq!(full.dims(), 384);
+    }
+
+    #[test]
+    fn test_int8_batch_prepared_matches_per_item_prepared() {
+        let query = generate_vector(384, 42);
+        let prepared = PreparedQuery::from_f32(&query, QuantizationTier::Int8);
+        let candidates: Vec<QuantizedVector> = (0..32)
+            .map(|i| QuantizedVector::from_f32(&generate_vector(384, i + 1)))
+            .collect();
+        let wrapped: Vec<QuantizedData> = candidates
+            .iter()
+            .cloned()
+            .map(QuantizedData::Int8)
+            .collect();
+
+        let got = approximate_int8_batch_prepared(&prepared, &candidates);
+        for (i, item) in wrapped.iter().enumerate() {
+            let expected = approximate_cosine_distance_prepared(&prepared, item);
+            assert!(
+                (got[i] - expected).abs() < 1e-6,
+                "int8 batch prepared mismatch at candidate {i}: got={}, expected={}",
+                got[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_int4_batch_prepared_matches_per_item_prepared() {
+        let query = generate_vector(384, 42);
+        let prepared = PreparedQuery::from_f32(&query, QuantizationTier::Int4);
+        let candidates: Vec<Int4Vector> = (0..32)
+            .map(|i| Int4Vector::from_f32(&generate_vector(384, i + 1)))
+            .collect();
+        let wrapped: Vec<QuantizedData> = candidates
+            .iter()
+            .cloned()
+            .map(QuantizedData::Int4)
+            .collect();
+
+        let got = approximate_int4_batch_prepared(&prepared, &candidates);
+        for (i, item) in wrapped.iter().enumerate() {
+            let expected = approximate_cosine_distance_prepared(&prepared, item);
+            assert!(
+                (got[i] - expected).abs() < 1e-5,
+                "int4 batch prepared mismatch at candidate {i}: got={}, expected={}",
+                got[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_int4_batch_prepared_api_dispatch_parity() {
+        // Verify that approximate_int4_batch_prepared produces the same cosine distance
+        // as approximate_cosine_distance_prepared for each candidate. On aarch64 both
+        // sides dispatch to NEON; on other targets both use the packed scalar fallback.
+        // For direct scalar-vs-NEON integer parity, see int4::tests::test_packed_scalar_matches_neon_exact.
+        for dim in [1usize, 3, 31, 127, 383, 384] {
+            let query = generate_vector(dim, 700 + dim as u64);
+            let candidate = generate_vector(dim, 800 + dim as u64);
+            let prepared = PreparedQuery::from_f32(&query, QuantizationTier::Int4);
+            let q_cand = Int4Vector::from_f32(&candidate);
+            let wrapped = QuantizedData::Int4(q_cand.clone());
+
+            let batch_result = approximate_int4_batch_prepared(&prepared, &[q_cand]);
+            let per_item_result = approximate_cosine_distance_prepared(&prepared, &wrapped);
+
+            assert!(
+                (batch_result[0] - per_item_result).abs() < 1e-5,
+                "int4 batch prepared dispatch mismatch at dim={dim}: batch={}, per_item={}",
+                batch_result[0],
+                per_item_result
+            );
+        }
     }
 
     #[test]

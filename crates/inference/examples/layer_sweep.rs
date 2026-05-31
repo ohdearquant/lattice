@@ -81,12 +81,12 @@ fn main() {
     let num_layers = all_embeddings[0].len();
 
     for layer_idx in 0..num_layers {
-        print!("{:>6}", layer_idx);
+        print!("{layer_idx:>6}");
         for text_idx in 0..test_texts.len() {
             let layer_emb = &all_embeddings[text_idx][layer_idx];
             let full_emb = &all_embeddings[text_idx][num_layers - 1];
             let sim = cosine_sim(layer_emb, full_emb);
-            print!("  {:>10.4}", sim);
+            print!("  {sim:>10.4}");
         }
         println!();
     }
@@ -136,13 +136,13 @@ fn main() {
 
     for layer_idx in 0..num_layers {
         let mut total_delta = 0.0f32;
-        print!("{:>6}", layer_idx);
+        print!("{layer_idx:>6}");
         for (i, (emb_a, emb_b, emb_unrel)) in pair_embeddings.iter().enumerate() {
             let related = cosine_sim(&emb_a[layer_idx], &emb_b[layer_idx]);
             let unrelated = cosine_sim(&emb_a[layer_idx], &emb_unrel[layer_idx]);
             total_delta += related - unrelated;
             if i < 2 {
-                print!("  {:>12.4}  {:>12.4}", related, unrelated);
+                print!("  {related:>12.4}  {unrelated:>12.4}");
             }
         }
         println!("  {:>10.4}", total_delta / pairs.len() as f32);

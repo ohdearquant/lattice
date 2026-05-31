@@ -19,6 +19,7 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
 
 [dependencies]
+half.workspace = true
 memmap2 = "0.9"
 indexmap = "2"
 rustc-hash = "2"
@@ -27,6 +28,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+clap = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 sha2 = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
@@ -38,6 +42,10 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "lattice"
+path = "src/bin/lattice.rs"
 
 [[bin]]
 name = "backfill_qwen3"
@@ -197,6 +205,19 @@ harness = false
 
 [[bench]]
 name = "batch_throughput_bench"
+name = "metrics_bench"
+harness = false
+
+[[bench]]
+name = "pruning_bench"
+harness = false
+
+[[bench]]
+name = "kv_cache_f16_bench"
+harness = false
+
+[[bench]]
+name = "attention_dispatch_bench"
 harness = false
 
 [lints]

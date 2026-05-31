@@ -44,6 +44,7 @@ default = ["native"]
 native = ["dep:lattice-inference"]
 metal-gpu = ["lattice-inference/metal-gpu"]
 avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
+local = []
 
 [[example]]
 name = "basic_embed"
