@@ -77,15 +77,11 @@ jobs:
           cargo bench -p lattice-inference --bench elementwise_cpu_bench --no-run
           cargo bench -p lattice-embed --bench simd --no-run
 
-      - name: Run benches against baseline
-        if: steps.fetch_baseline.outputs.have_baseline == 'true'
+      - name: Run benches
         run: |
-          cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --baseline base --noplot
-          cargo bench -p lattice-embed --bench simd -- --baseline base --noplot
-
-      - name: Run benches without baseline (seed)
-        if: steps.fetch_baseline.outputs.have_baseline == 'false'
-        run: |
+          # --save-baseline saves new data AND compares against existing baseline
+          # if present. Unlike --baseline, it doesn't panic when a bench group
+          # has no prior baseline (e.g., newly added bench groups).
           cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline base --noplot
           cargo bench -p lattice-embed --bench simd -- --save-baseline base --noplot
 
@@ -98,15 +94,14 @@ jobs:
           && echo "gate=pass" >> "$GITHUB_OUTPUT" \
           || echo "gate=fail" >> "$GITHUB_OUTPUT"
 
-      - name: Note seed run
+      - name: Note no baseline
         if: steps.fetch_baseline.outputs.have_baseline == 'false'
         run: |
-          mkdir -p .
-          cat > report-${{ matrix.arch }}.md <<EOF
-          ### \`${{ matrix.arch }}\` — no baseline available
+          cat > report-${{ matrix.arch }}.md <<'EOF'
+          ### `${{ matrix.arch }}` — no baseline available
 
-          The \`perf-baselines\` branch has no data for this arch yet. Run
-          \`bench-update.yml\` on \`main\` to seed it. This PR is not gated.
+          The `perf-baselines` branch has no data for this arch yet. Run
+          `bench-update.yml` on `main` to seed it. This PR is not gated.
           EOF
 
       - name: Upload report
