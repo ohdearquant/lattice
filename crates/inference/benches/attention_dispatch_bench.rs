@@ -4,8 +4,7 @@
 //! The workload inside each branch is a trivial `black_box(0.0f32)` return so
 //! that the measurement isolates dispatch cost rather than attention math.
 //!
-//! Expected result: < 1 ns per dispatch (the compiler folds the match into a
-//! jump table or, for simple variants, a conditional move chain).
+//! Acceptance threshold: < 2.5 ns per dispatch (ADR-059 gate).
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use lattice_inference::attention::{AttentionKind, gqa::GqaConfig};
@@ -15,21 +14,21 @@ use lattice_inference::attention::{AttentionKind, gqa::GqaConfig};
 // ---------------------------------------------------------------------------
 
 /// Simulate the outcome of selecting an attention kernel.
-/// Returns a sentinel f32 that differs per variant so the optimizer cannot
-/// collapse the entire match into a single constant.
+/// Returns a raw sentinel f32 per variant — the caller black_boxes the input
+/// and output so per-arm opaque barriers don't inflate the dispatch measurement.
 #[inline(never)]
 fn dispatch_kind(kind: &AttentionKind) -> f32 {
     match kind {
-        AttentionKind::Mha => black_box(0.0f32),
-        AttentionKind::Gqa(_) => black_box(1.0f32),
-        AttentionKind::Flash => black_box(2.0f32),
-        AttentionKind::FlashCausal => black_box(3.0f32),
-        AttentionKind::Gdn => black_box(4.0f32),
-        AttentionKind::GdnFused => black_box(5.0f32),
-        AttentionKind::GatedGqa => black_box(6.0f32),
-        AttentionKind::Differential => black_box(7.0f32),
-        AttentionKind::NativeSparse => black_box(8.0f32),
-        AttentionKind::Decode => black_box(9.0f32),
+        AttentionKind::Mha => 0.0f32,
+        AttentionKind::Gqa(_) => 1.0f32,
+        AttentionKind::Flash => 2.0f32,
+        AttentionKind::FlashCausal => 3.0f32,
+        AttentionKind::Gdn => 4.0f32,
+        AttentionKind::GdnFused => 5.0f32,
+        AttentionKind::GatedGqa => 6.0f32,
+        AttentionKind::Differential => 7.0f32,
+        AttentionKind::NativeSparse => 8.0f32,
+        AttentionKind::Decode => 9.0f32,
     }
 }
 
@@ -73,7 +72,12 @@ fn bench_dispatch_vs_direct(c: &mut Criterion) {
         b.iter(|| {
             let kind = &kinds[i % kinds.len()];
             i = i.wrapping_add(1);
-            black_box(dispatch_kind(kind))
+            // Black-box the input so the compiler cannot specialize dispatch on
+            // a known-constant enum variant. Black-box the output to prevent
+            // dead-code elimination of the result.
+            let k = black_box(kind);
+            let result = dispatch_kind(k);
+            black_box(result);
         });
     });
 
@@ -114,6 +118,16 @@ fn bench_dispatch_vs_direct(c: &mut Criterion) {
             let kind = &kinds[i % kinds.len()];
             i = i.wrapping_add(1);
             black_box(kind.supports_kv_cache())
+        });
+    });
+
+    // --- tag() overhead ---
+    group.bench_function("tag_all_variants", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let kind = &kinds[i % kinds.len()];
+            i = i.wrapping_add(1);
+            black_box(kind.tag())
         });
     });
 
