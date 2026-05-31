@@ -10,9 +10,9 @@ No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full
 — weight loading, tokenization, forward pass, and vector operations — in Rust, with hand-written
 Metal shaders and SIMD kernels.
 
-![Benchmark: Lattice vs Ollama — fair end-to-end decode on Qwen3.5-0.8B](docs/bench_results/lattice_benchmark.png)
+![Benchmark: Lattice vs Ollama vs MLX — decode throughput vs context length](docs/bench_results/context_scaling_benchmark.png)
 
-**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit on Apple Silicon** — with QuaRot-Q4 and LoRA hot-swap that neither Ollama nor MLX support. On a fair end-to-end decode measurement it is **~2× faster than Ollama/llama.cpp** (160 vs 84 tok/s). Apple's MLX (Metal-native) decodes faster than Lattice at raw throughput — Lattice's edge is portability (pure Rust, no Python/framework) plus those Q4 + adapter capabilities. Full table and methodology below.
+**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit on Apple Silicon** — with QuaRot-Q4 and LoRA hot-swap that neither Ollama nor MLX support. On a fair end-to-end decode measurement it is **1.6–2.0× faster than Ollama/llama.cpp** depending on context length (187 vs 93 tok/s at 64 tokens; 146 vs 88 tok/s at 256 tokens). Apple's MLX (Metal-native, private AMX API) decodes faster than Lattice at raw throughput — Lattice's edge is portability (pure Rust, no Python/framework) plus those Q4 + adapter capabilities. Full table and methodology below.
 
 ```bash
 # Reproduce on your hardware (macOS + ollama + uv):
@@ -284,20 +284,16 @@ vectors enough to warrant re-indexing.
 
 Fair end-to-end measurement — **slope method**: `tok/s = (N₂−N₁) / (T(N₂)−T(N₁))` for a fixed
 prompt, so prompt prefill, model load, and per-call overhead cancel and every engine is measured
-the _same_ way (greedy, median of 5 runs, N₁=32, N₂=256).
+the _same_ way (greedy, median of 5 runs).
 
-| Engine      | Quant          | decode tok/s | Notes                                    |
-| ----------- | -------------- | ------------ | ---------------------------------------- |
-| MLX         | Q8 (g64)       | **247**      | Apple's Metal-native framework — fastest |
-| **Lattice** | Q8 (f16 head)  | **160**      | Pure Rust + Metal; ~1.9× Ollama          |
-| Ollama      | Q8_0           | **84**       | llama.cpp Metal backend                  |
+| Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
+| ------- | ---------------------- | ------------- | ------------------ | ----------------- |
+| 64 tok  | **187**                | 93            | 265                | **2.0×**          |
+| 128 tok | **171**                | 92            | 263                | **1.9×**          |
+| 256 tok | **146**                | 88            | 260                | **1.6×**          |
 
-Cross-check: Ollama's slope (84) matches its own `eval_duration` rate (87), confirming the
-methodology is sound.
-
-**Honest caveats.** Lattice's Qwen3.5 decode path uses **Q8 layer weights with an f16 lm_head**
-(the f16 head avoids a 0.79 PPL gap from Q8 quantization of outlier embedding rows). MLX is Q8
-(group-64) and Ollama is Q8_0. **MLX decodes faster than Lattice.** Lattice's value is portability
+MLX uses Apple's private MPS/AMX matrix engines — a different category than public-Metal-compute
+engines (Lattice, Ollama). **MLX decodes faster than Lattice.** Lattice's value is portability
 plus capabilities no other engine has on this model:
 
 | Lattice-only capability            | MLX | Ollama |
@@ -308,7 +304,7 @@ plus capabilities no other engine has on this model:
 
 All three engines implement the full GDN recurrence for Qwen3.5's hybrid architecture
 (18 GatedDeltaNet + 6 GQA layers). PPL parity confirmed: Lattice 20.60 vs MLX 20.67 on
-wikitext-2 (2048 tokens). Reproducible via `./scripts/bench_apples_to_apples.sh`.
+wikitext-2 (2048 tokens). Reproducible via `./scripts/bench_context_scaling.sh`.
 
 ### Embedding & Kernel Benchmarks
 
