@@ -1,0 +1,32 @@
+[
+  {
+    "engine": "lattice",
+    "context": 1009,
+    "response": 100,
+    "ttft_ms": 10206.6,
+    "decode_ms": 1513.4,
+    "total_ms": 11720.0,
+    "prefill_tok_s": 99,
+    "decode_tok_s": 66
+  },
+  {
+    "engine": "ollama",
+    "context": 1450,
+    "response": 100,
+    "ttft_ms": 479.9,
+    "decode_ms": 1194.1,
+    "total_ms": 1674.0,
+    "prefill_tok_s": 3022,
+    "decode_tok_s": 84
+  },
+  {
+    "engine": "mlx",
+    "context": 1000,
+    "response": 100,
+    "ttft_ms": 383.5,
+    "decode_ms": 405.8,
+    "total_ms": 789.3,
+    "prefill_tok_s": 2608.0,
+    "decode_tok_s": 246.0
+  }
+]
