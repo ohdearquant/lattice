@@ -36,7 +36,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
-    use lattice_inference::tokenizer::BpeTokenizer;
+    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
 
     let home = std::env::var("HOME")?;
     let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
@@ -116,9 +116,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Same continuation prompt as the original bench, single user turn.
-    let prompt = "The quick brown fox jumps over the lazy dog. \
-                  Once upon a time in a land far away, there lived a";
-    let history = vec![ChatMessage::user(prompt)];
+    // Optionally pad to a target context length (BENCH_PROMPT_TOKENS) by
+    // repeating filler text, so we can measure decode at real context depth
+    // (agentic workload: long context + short response).
+    let base = "The quick brown fox jumps over the lazy dog. \
+                Once upon a time in a land far away, there lived a wise old owl \
+                who knew many secrets. Every morning the sun rose over the \
+                mountains and cast long shadows across the quiet valley. ";
+    let prompt: String = match std::env::var("BENCH_PROMPT_TOKENS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(target) if target > 0 => {
+            let mut p = String::new();
+            while tokenizer.tokenize(&p).real_length < target {
+                p.push_str(base);
+            }
+            p
+        }
+        _ => base.to_string(),
+    };
+    eprintln!(
+        "[bench] prompt_tokens={}",
+        tokenizer.tokenize(&prompt).real_length
+    );
+    let history = vec![ChatMessage::user(&prompt)];
 
     // One warmup (not recorded).
     metal.reset_state();
