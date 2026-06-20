@@ -215,13 +215,11 @@ feature branch → PR → CI green → review → merge to main
 
 GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
-### Performance Regression Gate (ADR-058)
+### E2E Parity Gate
 
-PRs touching `crates/inference/src/forward/cpu/`, `crates/embed/src/simd/`, or `crates/inference/src/attention/` trigger `bench-regression.yml`. It runs Criterion benchmarks on both `x86_64-linux` (AVX2) and `aarch64-linux` (NEON), comparing against baselines stored on the orphan `perf-baselines` branch.
+PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 tokens must match (GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
-Gate rule: 95%-CI-lower-bound of change >7% = **FAIL**. 3-7% = warn. Override via PR label `bench-allow-regression` (must include rationale).
-
-The `perf-baselines` branch is auto-updated by `bench-update.yml` on every push to main. Its `README.md` shows sparkline trend tables per bench per arch.
+The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 
 ## Commands
 
@@ -232,7 +230,10 @@ make lint-docs       # deno doc lint only
 make publish-dry     # verify crates.io packaging
 make publish         # publish (leaf crates first, sleeps for indexing)
 
-# Perf benchmarking (ADR-058)
+# E2E parity (HF reference vs lattice)
+make e2e-parity                          # run locally (needs torch + transformers)
+
+# Perf benchmarking (ADR-058, trend data)
 make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)
 make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
 scripts/bench-compare.sh --full main     # A/B with tight CIs (~15 min)

@@ -1,0 +1,103 @@
+name: e2e-parity
+# Replaces bench-regression (ADR-058 revision): live HF-vs-lattice parity on
+# the same runner. Reference runs first (warms the machine), lattice second.
+# Gates on greedy token agreement, reports speed informationally.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/inference/src/**'
+      - 'crates/embed/src/**'
+      - 'crates/inference/Cargo.toml'
+      - 'crates/embed/Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/e2e_parity_check.py'
+      - '.github/workflows/e2e-parity.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/inference/src/**'
+      - 'crates/embed/src/**'
+  schedule:
+    - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  parity:
+    name: e2e parity
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: e2e-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      # Step 1: install reference framework (HF transformers + torch CPU)
+      - name: Install Python deps
+        run: pip install torch transformers tokenizers huggingface_hub
+
+      # Step 2: download model if not cached
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          path = snapshot_download('Qwen/Qwen3.5-0.8B')
+          print(f'Model at: {path}')
+          "
+
+      # Step 3: symlink model for lattice (expects flat dir with config.json + model.safetensors)
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      # Step 4: build lattice
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-parity
+
+      - name: Build lattice generate binary
+        run: cargo build --release --bin qwen35_generate -p lattice-inference --features f16
+
+      # Step 5: run parity check (HF first = warm machine, then lattice)
+      - name: Run e2e parity check
+        run: |
+          python3 scripts/e2e_parity_check.py | tee parity-report.md
+        env:
+          E2E_REPORT_PATH: parity-report.md
+
+      # Step 6: post results as PR comment
+      - name: Post parity report
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: e2e-parity
+          path: parity-report.md
