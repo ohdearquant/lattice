@@ -4,6 +4,8 @@ pub mod flash;
 pub mod flash_causal;
 pub mod gated;
 pub mod gdn;
+#[cfg(feature = "train-backward")]
+pub mod gdn_backward;
 pub mod gdn_fused;
 pub mod gqa;
 pub mod native_sparse;

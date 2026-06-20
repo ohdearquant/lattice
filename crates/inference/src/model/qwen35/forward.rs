@@ -57,6 +57,22 @@ impl Qwen35Model {
                 hidden,
             );
 
+            // Differential-test / trainer tap: scratch.residual holds the
+            // pre-input-layernorm residual h_in entering this layer (saved at
+            // line 39, untouched by the Full path); scratch.attn_out holds the
+            // gated o_proj output. h_in lets the trainer recompute
+            // h_mid = h_in + attn_out as LoRA changes; the diff test recomputes
+            // normed = rms_norm(h_in) and checks materialised attn == attn_out.
+            #[cfg(feature = "train-backward")]
+            if scratch.capture_attn_layer == Some(layer_i) {
+                scratch
+                    .captured_attn_input
+                    .extend_from_slice(&scratch.residual[..hidden]);
+                scratch
+                    .captured_attn_out
+                    .extend_from_slice(&scratch.attn_out[..hidden]);
+            }
+
             for i in 0..hidden {
                 scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
             }

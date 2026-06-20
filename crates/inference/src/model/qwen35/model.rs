@@ -97,6 +97,122 @@ impl Qwen35Model {
         &self.weights.embed_tokens
     }
 
+    /// **Unstable (train-backward)**: Return weight slices for a GQA layer that the
+    /// backward trainer needs to compute gradients.
+    ///
+    /// Returns `None` if the requested layer is not a full-attention (GQA) layer.
+    /// All returned slices are views into the model weight storage; their lifetime
+    /// is tied to `&self`.
+    ///
+    /// Shapes for Qwen3.5-0.8B (24 layers, 8 Q-heads, 2 KV-heads, head_dim=256):
+    ///   lm_head:  [vocab, hidden]
+    ///   final_norm: [hidden]
+    ///   embed: [vocab, hidden]
+    ///   q_proj: [2*q_dim, hidden]
+    ///   k_proj: [kv_dim, hidden]
+    ///   v_proj: [kv_dim, hidden]
+    ///   o_proj: [hidden, q_dim]
+    ///   q_norm: [head_dim]
+    ///   k_norm: [head_dim]
+    ///   pre_attn_norm: [hidden]  (input_layernorm)
+    ///   post_attn_norm: [hidden]  (post_attention_layernorm)
+    ///   gate_proj: [inter, hidden]
+    ///   up_proj: [inter, hidden]
+    ///   down_proj: [hidden, inter]
+    #[cfg(feature = "train-backward")]
+    #[allow(clippy::type_complexity)]
+    pub fn gqa_layer_weights(
+        &self,
+        layer: usize,
+    ) -> Option<(
+        &[f32], // q_proj
+        &[f32], // k_proj
+        &[f32], // v_proj
+        &[f32], // o_proj
+        &[f32], // q_norm
+        &[f32], // k_norm
+        &[f32], // pre_attn_norm
+        &[f32], // post_attn_norm
+        &[f32], // gate_proj
+        &[f32], // up_proj
+        &[f32], // down_proj
+    )> {
+        let (attn, common) = &self.weights.layers[layer];
+        let full = match attn {
+            AttentionWeights::Full(w) => w,
+            AttentionWeights::Linear(_) => return None,
+        };
+        let dense = match &common.ffn {
+            FeedForwardWeights::Dense(d) => d,
+            FeedForwardWeights::Moe(_) => return None,
+        };
+        Some((
+            &full.q_proj,
+            &full.k_proj,
+            &full.v_proj,
+            &full.o_proj,
+            &full.q_norm,
+            &full.k_norm,
+            &common.input_layernorm,
+            &common.post_attention_layernorm,
+            &dense.gate_proj,
+            &dense.up_proj,
+            &dense.down_proj,
+        ))
+    }
+
+    /// **Unstable (train-backward)**: Return GDN (linear-attention) layer weights
+    /// plus the layer's norm + Dense-FFN weights.
+    ///
+    /// Returns `None` if the layer is not a GatedDeltaNet layer or its FFN is not
+    /// Dense. Tuple is `(gdn_mixer, input_layernorm, post_attention_layernorm,
+    /// gate_proj, up_proj, down_proj)` — the GDN analogue of [`Self::gqa_layer_weights`].
+    /// `gdn_mixer` is the frozen linear-attention block; `input_layernorm` is the
+    /// pre-mixer shifted RMSNorm gamma. Used by the GDN differential test and the
+    /// full-depth backward tape (`gdn_backward` for dx through frozen GDN layers,
+    /// plus the layer's own FFN block).
+    #[cfg(feature = "train-backward")]
+    #[allow(clippy::type_complexity)]
+    pub fn gdn_layer_weights(
+        &self,
+        layer: usize,
+    ) -> Option<(
+        &crate::attention::gdn::GatedDeltaNetWeights,
+        &[f32], // input_layernorm
+        &[f32], // post_attention_layernorm
+        &[f32], // gate_proj
+        &[f32], // up_proj
+        &[f32], // down_proj
+    )> {
+        let (attn, common) = &self.weights.layers[layer];
+        let gdn = match attn {
+            AttentionWeights::Linear(w) => w,
+            AttentionWeights::Full(_) => return None,
+        };
+        let dense = match &common.ffn {
+            FeedForwardWeights::Dense(d) => d,
+            FeedForwardWeights::Moe(_) => return None,
+        };
+        Some((
+            gdn,
+            &common.input_layernorm,
+            &common.post_attention_layernorm,
+            &dense.gate_proj,
+            &dense.up_proj,
+            &dense.down_proj,
+        ))
+    }
+
+    /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.
+    #[cfg(feature = "train-backward")]
+    pub fn head_weights(&self) -> (&[f32], &[f32], &[f32]) {
+        (
+            self.weights.logits_weight(),
+            &self.weights.final_norm,
+            &self.weights.embed_tokens,
+        )
+    }
+
     /// **Unstable**: diagnostic weight statistics for a layer.
     pub fn layer_weight_stats(&self, layer: usize) -> Vec<(String, f32, f32)> {
         fn stats(name: &str, data: &[f32]) -> (String, f32, f32) {

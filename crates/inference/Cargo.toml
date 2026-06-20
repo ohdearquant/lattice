@@ -17,6 +17,7 @@ bench-internals = []
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
+train-backward = []
 
 [dependencies]
 half.workspace = true
@@ -75,6 +76,14 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_logit_dump"
 path = "src/bin/bench_logit_dump.rs"
 required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "diff_attn_layer23"
+required-features = ["train-backward", "f16"]
+
+[[example]]
+name = "diff_gdn_layer"
+required-features = ["train-backward", "f16"]
 
 [[example]]
 name = "bench_metal"
