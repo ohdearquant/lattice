@@ -162,24 +162,45 @@ impl Qwen35Model {
     }
 
     /// **Unstable (train-backward)**: Return GDN (linear-attention) layer weights
-    /// plus the layer's `input_layernorm` gamma.
+    /// plus the layer's norm + Dense-FFN weights.
     ///
-    /// Returns `None` if the requested layer is not a GatedDeltaNet layer. The
-    /// `GatedDeltaNetWeights` is the frozen mixer; `input_layernorm` is the
-    /// pre-mixer shifted RMSNorm gamma applied to `h_in` before the GDN. Used by
-    /// the GDN differential test (`gdn_forward_save` vs the real model) and the
-    /// full-depth backward tape's `gdn_backward` (dx propagation through frozen
-    /// GDN layers).
+    /// Returns `None` if the layer is not a GatedDeltaNet layer or its FFN is not
+    /// Dense. Tuple is `(gdn_mixer, input_layernorm, post_attention_layernorm,
+    /// gate_proj, up_proj, down_proj)` — the GDN analogue of [`Self::gqa_layer_weights`].
+    /// `gdn_mixer` is the frozen linear-attention block; `input_layernorm` is the
+    /// pre-mixer shifted RMSNorm gamma. Used by the GDN differential test and the
+    /// full-depth backward tape (`gdn_backward` for dx through frozen GDN layers,
+    /// plus the layer's own FFN block).
     #[cfg(feature = "train-backward")]
+    #[allow(clippy::type_complexity)]
     pub fn gdn_layer_weights(
         &self,
         layer: usize,
-    ) -> Option<(&crate::attention::gdn::GatedDeltaNetWeights, &[f32])> {
+    ) -> Option<(
+        &crate::attention::gdn::GatedDeltaNetWeights,
+        &[f32], // input_layernorm
+        &[f32], // post_attention_layernorm
+        &[f32], // gate_proj
+        &[f32], // up_proj
+        &[f32], // down_proj
+    )> {
         let (attn, common) = &self.weights.layers[layer];
-        match attn {
-            AttentionWeights::Linear(w) => Some((w, &common.input_layernorm)),
-            AttentionWeights::Full(_) => None,
-        }
+        let gdn = match attn {
+            AttentionWeights::Linear(w) => w,
+            AttentionWeights::Full(_) => return None,
+        };
+        let dense = match &common.ffn {
+            FeedForwardWeights::Dense(d) => d,
+            FeedForwardWeights::Moe(_) => return None,
+        };
+        Some((
+            gdn,
+            &common.input_layernorm,
+            &common.post_attention_layernorm,
+            &dense.gate_proj,
+            &dense.up_proj,
+            &dense.down_proj,
+        ))
     }
 
     /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.

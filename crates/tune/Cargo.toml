@@ -66,6 +66,11 @@ name = "train_grad_layer23"
 path = "src/bin/train_grad_layer23.rs"
 required-features = ["train-backward"]
 
+[[bin]]
+name = "train_grad_full"
+path = "src/bin/train_grad_full.rs"
+required-features = ["train-backward"]
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true

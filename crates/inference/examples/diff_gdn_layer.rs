@@ -60,7 +60,7 @@ fn main() {
         .capture_attn_io(&tokens, layer)
         .unwrap_or_else(|e| panic!("capture_attn_io: {e}"));
 
-    let (gdn_w, input_layernorm) = model
+    let (gdn_w, input_layernorm, _post_norm, _gate, _up, _down) = model
         .gdn_layer_weights(layer)
         .unwrap_or_else(|| panic!("layer {layer} is not a GatedDeltaNet layer"));
 
