@@ -54,15 +54,13 @@ If the gap you're investigating exceeds these bounds, the cause is structural (a
 
 **Be skeptical of comments that paraphrase config fields.** A comment that says "X uses field=true" without explaining what the field actually controls in the reference implementation is a footgun. The lattice RoPE comment said "Qwen3.5 uses mrope_interleaved=true" — technically matched config, but `mrope_interleaved` controls multimodal M-RoPE section interleaving (video/image tokens), not 1-D text RoPE pairing. The bug existed for months because nobody verified the comment against HF's `rotate_half` or MLX's `nn.RoPE`.
 
-### Regression Gate (ADR-058)
+### E2E Parity Gate
 
-PRs touching CPU kernel paths trigger `bench-regression.yml` in CI. It runs on both `x86_64-linux` (AVX2) and `aarch64-linux` (NEON) against baselines stored on the orphan `perf-baselines` branch.
+PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) and lattice on the same macOS runner, comparing greedy generation output. The reference runs first to warm the machine.
 
-- **>7% regression** (95% CI lower bound): blocks merge
-- **3-7%**: warning comment, doesn't block
-- **Override**: PR label `bench-allow-regression` with rationale
-
-The `perf-baselines` branch auto-updates on every push to main via `bench-update.yml`.
+- **Token parity**: first 5 greedy tokens must match HF exactly
+- **Speed**: reported informationally, not gated
+- **Baseline tracking**: `bench-update.yml` still collects Criterion micro-benchmarks on merge to main (trend data, not a gate)
 
 ## Session Protocol
 
@@ -94,7 +92,7 @@ The `perf-baselines` branch auto-updates on every push to main via `bench-update
 
 - **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
 - Default to `--quick` (~2 min). Use `--full` only when CIs are too wide to tell.
-- After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch. PRs touching CPU paths are gated by `bench-regression.yml` (>7% CI-lower = fail).
+- After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch (trend data, not a gate). PRs are gated by `e2e-parity.yml` (greedy token agreement vs HF).
 - For local baseline tracking: `make bench-ci` saves a local baseline, `make bench-gate` compares against the `perf-baselines` branch.
 - Do not claim "X% faster" without a measurement from this session. Stale numbers from prior sessions are not evidence.
 
