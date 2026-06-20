@@ -57,6 +57,12 @@ bench-gate:
 		cargo bench -p lattice-embed --bench simd -- --baseline base --noplot; \
 		python3 scripts/perf-bench-gate.py target/criterion "$$arch-local"
 
+# E2E parity: HF transformers (reference) vs lattice (greedy token agreement).
+# Requires: pip install torch transformers tokenizers
+e2e-parity:
+	cargo build --release --bin qwen35_generate -p lattice-inference --features f16
+	python3 scripts/e2e_parity_check.py
+
 # ADR-064: measure decode slope/intercept and output JSON.
 # Usage: make bench-decode                   (default 5 runs, ctx 64-1024)
 #        RUNS=3 make bench-decode            (faster)
