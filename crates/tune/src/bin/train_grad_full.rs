@@ -45,7 +45,7 @@ use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
 use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::Tokenizer;
-use lattice_tune::lora::AdamState;
+use lattice_tune::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
 const TOP_LAYER: usize = 23;
 
@@ -78,6 +78,8 @@ Options:
   --log-every   <N>      Print NLL every N steps (default: 5)
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
+  --json                 Emit @@lattice JSON events to stdout alongside human output
+  --save <PATH>          After training, write a PEFT safetensors adapter to PATH
   -h, --help             Print this help"
     );
 }
@@ -279,6 +281,7 @@ struct SeqCtx {
     seq_len: usize,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum MixerCache {
     Gqa(AttnCache),
     Gdn(GdnSaved),
@@ -740,6 +743,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd_eps: f32 = parse_arg(&args, "--fd-eps")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4e-3);
+    let emit_json = parse_flag(&args, "--json");
+    let save_path: Option<PathBuf> = parse_arg(&args, "--save").map(PathBuf::from);
 
     if first_layer > TOP_LAYER {
         return Err(format!("--first-layer {first_layer} must be <= {TOP_LAYER}").into());
@@ -1204,7 +1209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mean_nll = eval_chain_nll(
                 &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
             );
-            match eval_valid(&loras) {
+            let val_nll = eval_valid(&loras);
+            match val_nll {
                 Some(v) => println!(
                     "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
                     mean_nll - base_nll
@@ -1214,6 +1220,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mean_nll - base_nll
                 ),
             }
+            if emit_json {
+                let val_json = match val_nll {
+                    Some(v) => format!("{v:.6}"),
+                    None => "null".to_string(),
+                };
+                println!(
+                    "@@lattice {{\"ev\":\"train_step\",\"step\":{step},\"loss\":{mean_nll:.6},\"val_loss\":{val_json},\"lr\":{lr:.6}}}"
+                );
+            }
         }
     }
 
@@ -1221,7 +1236,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
     );
     let secs = tstep.elapsed().as_secs_f64();
-    match (base_valid, eval_valid(&loras)) {
+    let final_valid = eval_valid(&loras);
+    match (base_valid, final_valid) {
         (Some(b), Some(f)) => println!(
             "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
             final_nll - base_nll,
@@ -1232,5 +1248,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             final_nll - base_nll
         ),
     }
+
+    // Save PEFT adapter if --save was specified.
+    let saved_path: Option<String> = if let Some(ref out_path) = save_path {
+        let mut lora_layers = std::collections::HashMap::new();
+        for (slot, lp) in loras.iter().enumerate() {
+            let layer_idx = slot_layers[slot];
+            // q_proj: A=(rank, hidden), B=(2*q_dim, rank).
+            // b_q was allocated as vec![0.0; 2 * dims.q_dim * rank], so d_out = 2*q_dim.
+            lora_layers.insert(
+                (layer_idx, "q_proj".to_string()),
+                LoraLayer {
+                    a: lp.a_q.clone(),
+                    b: lp.b_q.clone(),
+                    d_in: dims.hidden,
+                    d_out: 2 * dims.q_dim,
+                    rank,
+                },
+            );
+            // v_proj: A=(rank, hidden), B=(kv_dim, rank).
+            lora_layers.insert(
+                (layer_idx, "v_proj".to_string()),
+                LoraLayer {
+                    a: lp.a_v.clone(),
+                    b: lp.b_v.clone(),
+                    d_in: dims.hidden,
+                    d_out: dims.kv_dim,
+                    rank,
+                },
+            );
+        }
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha,
+                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            },
+            lora_layers,
+        );
+        match adapter.save_safetensors(out_path) {
+            Ok(()) => {
+                println!("  adapter saved to {}", out_path.display());
+                Some(out_path.display().to_string())
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to save adapter to {}: {e}",
+                    out_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if emit_json {
+        let best_val_json = match base_valid {
+            Some(_) => {
+                let bv = eval_valid(&loras).unwrap_or(f32::INFINITY);
+                format!("{bv:.6}")
+            }
+            None => "null".to_string(),
+        };
+        let saved_json = match &saved_path {
+            Some(p) => format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\"")),
+            None => "null".to_string(),
+        };
+        println!(
+            "@@lattice {{\"ev\":\"train_done\",\"base_nll\":{base_nll:.6},\"final_nll\":{final_nll:.6},\"best_val\":{best_val_json},\"duration_s\":{secs:.3},\"saved\":{saved_json}}}"
+        );
+    }
+
     Ok(())
 }
