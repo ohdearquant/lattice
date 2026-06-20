@@ -668,6 +668,25 @@ fn top_k_indices(grad: &[f32], k: usize) -> Vec<usize> {
     idx
 }
 
+/// Deterministic strided probes that cover entries top-k would skip (e.g.
+/// zeroed-by-bug entries that self-select out of top-analytic).
+fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut rng = seed;
+    for _ in 0..count {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        out.push((rng as usize) % len);
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if parse_flag(&args, "-h") || parse_flag(&args, "--help") {
@@ -860,6 +879,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
     let tcache = Instant::now();
     let (caches, total_positions) = build_caches(&model, &train_samples, first_layer)?;
+    let logits_bytes = total_positions * d.vocab * 4;
+    const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+    if logits_bytes > MAX_LOGITS_BYTES {
+        return Err(format!(
+            "logits buffer would require {} MiB ({} positions × {} vocab × 4B), \
+             exceeds 2 GiB cap — reduce --seq-len or --max-train",
+            logits_bytes / (1024 * 1024),
+            total_positions,
+            d.vocab,
+        )
+        .into());
+    }
     println!(
         "  {} completion positions across {} samples in {:.1}s",
         total_positions,
@@ -966,7 +997,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "a_v" => &analytic[slot].a_v,
                     _ => &analytic[slot].b_v,
                 };
-                let idxs = top_k_indices(agrad, probe.min(alen));
+                let mut idxs = top_k_indices(agrad, probe.min(alen));
+                let seed = (slot as u64 * 4
+                    + match name {
+                        "a_q" => 0,
+                        "b_q" => 1,
+                        "a_v" => 2,
+                        _ => 3,
+                    })
+                    ^ 0xDEAD;
+                for p in strided_probes(alen, probe.min(alen), seed) {
+                    if !idxs.contains(&p) {
+                        idxs.push(p);
+                    }
+                }
                 let mut max_rel = 0.0f64;
                 let mut sum_rel = 0.0f64;
                 for &k in &idxs {
