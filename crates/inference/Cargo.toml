@@ -82,6 +82,10 @@ name = "diff_attn_layer23"
 required-features = ["train-backward", "f16"]
 
 [[example]]
+name = "diff_gdn_layer"
+required-features = ["train-backward", "f16"]
+
+[[example]]
 name = "bench_metal"
 required-features = ["f16", "metal-gpu"]
 

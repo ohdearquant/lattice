@@ -161,6 +161,27 @@ impl Qwen35Model {
         ))
     }
 
+    /// **Unstable (train-backward)**: Return GDN (linear-attention) layer weights
+    /// plus the layer's `input_layernorm` gamma.
+    ///
+    /// Returns `None` if the requested layer is not a GatedDeltaNet layer. The
+    /// `GatedDeltaNetWeights` is the frozen mixer; `input_layernorm` is the
+    /// pre-mixer shifted RMSNorm gamma applied to `h_in` before the GDN. Used by
+    /// the GDN differential test (`gdn_forward_save` vs the real model) and the
+    /// full-depth backward tape's `gdn_backward` (dx propagation through frozen
+    /// GDN layers).
+    #[cfg(feature = "train-backward")]
+    pub fn gdn_layer_weights(
+        &self,
+        layer: usize,
+    ) -> Option<(&crate::attention::gdn::GatedDeltaNetWeights, &[f32])> {
+        let (attn, common) = &self.weights.layers[layer];
+        match attn {
+            AttentionWeights::Linear(w) => Some((w, &common.input_layernorm)),
+            AttentionWeights::Full(_) => None,
+        }
+    }
+
     /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.
     #[cfg(feature = "train-backward")]
     pub fn head_weights(&self) -> (&[f32], &[f32], &[f32]) {
