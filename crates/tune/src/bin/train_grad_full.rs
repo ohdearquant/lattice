@@ -37,16 +37,14 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use lattice_inference_grad::attention::gdn::GatedDeltaNetWeights;
-use lattice_inference_grad::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
-use lattice_inference_grad::backward::attention_gqa::{
-    AttnCache, gqa_backward, gqa_forward_with_cache,
-};
-use lattice_inference_grad::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
-use lattice_inference_grad::backward::tape::{rms_norm_forward, swiglu_forward};
-use lattice_inference_grad::model::qwen35::Qwen35Model;
-use lattice_inference_grad::model::qwen35_config::Qwen35Config;
-use lattice_inference_grad::tokenizer::Tokenizer;
+use lattice_inference::attention::gdn::GatedDeltaNetWeights;
+use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
+use lattice_inference::backward::attention_gqa::{AttnCache, gqa_backward, gqa_forward_with_cache};
+use lattice_inference::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
+use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
+use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_inference::model::qwen35_config::Qwen35Config;
+use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 
 const TOP_LAYER: usize = 23;
@@ -710,6 +708,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_every: usize = parse_arg(&args, "--log-every")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    if log_every == 0 {
+        return Err("--log-every must be >= 1".into());
+    }
     let gradcheck = parse_flag(&args, "--gradcheck");
     let probe: usize = parse_arg(&args, "--probe")
         .and_then(|s| s.parse().ok())

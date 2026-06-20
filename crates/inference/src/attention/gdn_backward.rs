@@ -118,6 +118,10 @@ pub struct GdnSaved {
     pub q_norm: Vec<f32>,
     /// L2 norm of raw k: [seq_len, value_heads]
     pub k_norm: Vec<f32>,
+    /// Exact forward denominator sqrt(||q||^2 + eps) used to normalize q: [seq_len, value_heads]
+    pub q_eps_norm: Vec<f32>,
+    /// Exact forward denominator sqrt(||k||^2 + eps) used to normalize k: [seq_len, value_heads]
+    pub k_eps_norm: Vec<f32>,
 
     /// kv_mem = S_prev^T @ k_hat (retrieval before decay): [seq_len, value_heads, value_dim]
     pub kv_mem: Vec<f32>,
@@ -186,6 +190,8 @@ impl GdnSaved {
             v: vec![0.0; seq_len * value_heads * value_dim],
             q_norm: vec![0.0; seq_len * value_heads],
             k_norm: vec![0.0; seq_len * value_heads],
+            q_eps_norm: vec![0.0; seq_len * value_heads],
+            k_eps_norm: vec![0.0; seq_len * value_heads],
             kv_mem: vec![0.0; seq_len * value_heads * value_dim],
             s_after: vec![0.0; seq_len * value_heads * key_dim * value_dim],
             o_heads: vec![0.0; seq_len * value_heads * value_dim],
@@ -303,13 +309,19 @@ pub fn gdn_forward_save(
             saved.v[v_off..v_off + value_dim].copy_from_slice(v_slice);
 
             // L2-normalize q, k and save norms
-            let q_norm = l2_norm_sq(&q_raw).sqrt().max(1e-6_f32.sqrt());
-            let k_norm = l2_norm_sq(&k_raw).sqrt().max(1e-6_f32.sqrt());
+            let q_sum_sq = l2_norm_sq(&q_raw);
+            let k_sum_sq = l2_norm_sq(&k_raw);
+            let q_norm = q_sum_sq.sqrt().max(1e-6_f32.sqrt());
+            let k_norm = k_sum_sq.sqrt().max(1e-6_f32.sqrt());
             saved.q_norm[t * value_heads + h] = q_norm;
             saved.k_norm[t * value_heads + h] = k_norm;
-            // Use the same eps-stabilised formula as the forward
-            let q_eps_norm = (l2_norm_sq(&q_raw) + 1e-6).sqrt();
-            let k_eps_norm = (l2_norm_sq(&k_raw) + 1e-6).sqrt();
+            // Save the exact eps-stabilised denominator used for normalization.
+            // These differ from q_norm/k_norm when sum_sq < 1e-6 and must be
+            // used verbatim in the backward to avoid a ~29% gradient error near zero.
+            let q_eps_norm = (q_sum_sq + 1e-6).sqrt();
+            let k_eps_norm = (k_sum_sq + 1e-6).sqrt();
+            saved.q_eps_norm[t * value_heads + h] = q_eps_norm;
+            saved.k_eps_norm[t * value_heads + h] = k_eps_norm;
             for v in &mut q_raw {
                 *v /= q_eps_norm;
             }
@@ -633,9 +645,11 @@ pub fn gdn_backward(
                 d_v[j] = d_delta[j] * beta_h;
                 d_kv_mem[j] = -d_delta[j] * g_h * beta_h;
                 d_g_h += (-kv_mem_h[j] * beta_h) * d_delta[j];
-                // d_beta += (v[j] - kv_mem[j]*g) * d_delta[j]
-                //         = delta[j] / beta * d_delta[j]  if beta != 0
-                d_beta_h += delta[j] / beta_h.max(1e-7) * d_delta[j];
+                // d_beta += d(delta)/d(beta) * d_delta[j]
+                //         = (v[j] - kv_mem[j]*g) * d_delta[j]
+                // Computed directly from base without dividing by beta, which
+                // suppresses gradients for saturated (near-zero) beta values.
+                d_beta_h += (v_h[j] - kv_mem_h[j] * g_h) * d_delta[j];
             }
 
             // ---- 4d. Backward through kv_mem = S_{t-1}^T @ k ----
@@ -667,8 +681,8 @@ pub fn gdn_backward(
             //            = (d_q[i] - q_hat[i] * dot(q_hat, d_q)) / norm
             // Same for k.
 
-            let q_eps_norm = (saved.q_norm[t * value_heads + h].powi(2) + 1e-6).sqrt();
-            let k_eps_norm = (saved.k_norm[t * value_heads + h].powi(2) + 1e-6).sqrt();
+            let q_eps_norm = saved.q_eps_norm[t * value_heads + h];
+            let k_eps_norm = saved.k_eps_norm[t * value_heads + h];
 
             let dot_q = dot(&d_q, q_hat_h);
             let dot_k = dot(&d_k, k_hat_h);

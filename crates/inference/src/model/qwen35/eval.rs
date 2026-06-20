@@ -211,6 +211,23 @@ impl Qwen35Model {
             ));
         }
         let cfg = &self.config;
+        let max_context = self.max_context();
+        if tokens.len() > max_context {
+            return Err(InferenceError::Inference(format!(
+                "capture_attn_io: tokens.len() ({}) exceeds RoPE capacity ({max_context})",
+                tokens.len(),
+            )));
+        }
+        if let Some((bad_idx, &bad)) = tokens
+            .iter()
+            .enumerate()
+            .find(|&(_, &t)| (t as usize) >= cfg.vocab_size)
+        {
+            return Err(InferenceError::Inference(format!(
+                "capture_attn_io: tokens[{bad_idx}]={bad} >= vocab_size {}",
+                cfg.vocab_size
+            )));
+        }
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)

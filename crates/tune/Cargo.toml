@@ -21,7 +21,7 @@ safetensors = ["dep:safetensors"]
 # directly to inference model hooks. Requires lattice-inference as a dependency.
 # See ADR-031 §Downstream Usage and ADR-057 §D5.
 inference-hook = ["dep:lattice-inference"]
-train-backward = ["dep:lattice-inference-grad", "safetensors", "serde"]
+train-backward = ["dep:lattice-inference", "lattice-inference/train-backward", "lattice-inference/f16", "safetensors", "serde"]
 # SQLite-backed model registry storage
 sqlite = ["dep:rusqlite", "serde"]
 
@@ -46,10 +46,8 @@ safetensors = { workspace = true, optional = true }
 # SQLite storage (optional)
 rusqlite = { workspace = true, optional = true }
 
-# Inference hook (optional — for LoRA adapter injection)
+# Inference hook and training backward pass (optional — for LoRA adapter injection and gradients)
 lattice-inference = { version = "0.3.0", path = "../inference", optional = true, features = ["f16"] }
-# Inference with backward module (for train_grad)
-lattice-inference-grad = { package = "lattice-inference", version = "0.3.0", path = "../inference", optional = true, features = ["train-backward", "f16"] }
 
 [[bin]]
 name = "generate_lora"

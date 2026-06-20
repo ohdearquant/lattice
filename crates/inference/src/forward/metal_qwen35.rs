@@ -5021,6 +5021,9 @@ kernel void moe_shared_gate_add(
                     let ks = cfg.linear_conv_kernel_dim as u32;
 
                     // Batch: fused copy hidden → residual + norm hidden in-place.
+                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
+                    // the model is destroyed). Activation buffers hidden/residual are sized for
+                    // m * hidden f32 elements. The Metal command buffer enc is active.
                     unsafe {
                         self.dispatch_copy_and_rms_norm_batch(
                             enc,
@@ -6510,6 +6513,9 @@ kernel void moe_shared_gate_add(
                     let ks = cfg.linear_conv_kernel_dim as u32;
 
                     // Batch: fused copy hidden → residual + norm hidden in-place.
+                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
+                    // the model is destroyed). Activation buffers hidden/residual are sized for
+                    // m * hidden f32 elements. The Metal command buffer enc is active.
                     unsafe {
                         self.dispatch_copy_and_rms_norm_batch(
                             enc,
@@ -6740,6 +6746,9 @@ kernel void moe_shared_gate_add(
                     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
                     // Batch: fused copy hidden → residual + norm hidden in-place.
+                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
+                    // the model is destroyed). Activation buffers hidden/residual are sized for
+                    // m * hidden f32 elements. The Metal command buffer enc is active.
                     unsafe {
                         self.dispatch_copy_and_rms_norm_batch(
                             enc,

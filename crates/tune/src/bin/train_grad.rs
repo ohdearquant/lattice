@@ -20,9 +20,9 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use lattice_inference_grad::backward::ops::lora_vjp;
-use lattice_inference_grad::model::qwen35::Qwen35Model;
-use lattice_inference_grad::tokenizer::Tokenizer;
+use lattice_inference::backward::ops::lora_vjp;
+use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {

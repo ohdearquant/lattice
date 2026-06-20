@@ -659,7 +659,7 @@ mod tests {
         let cfg = TinyConfig::default();
         let seq = vec![1u32, 42, 7, 0];
         let target = 100u32;
-        let passed = gradcheck_lora(&seq, target, &cfg, 1e-3, 1e-1);
+        let passed = gradcheck_lora(&seq, target, &cfg, 1e-3, 5e-2);
         assert!(passed, "end-to-end LoRA gradcheck failed");
     }
 

@@ -374,6 +374,57 @@ mod tests {
         );
     }
 
+    /// Verify that each key advances its own independent timestep counter.
+    ///
+    /// The prior shared-counter bug caused the 2nd..Nth key stepped in a single
+    /// optimizer round to receive an inflated `t`, defeating Adam's warmup. This
+    /// test exercises the exact failure mode: step keys a/b/c/d once each, then
+    /// step only "a" again. Every key must reflect only its own update count.
+    #[test]
+    fn test_adam_per_key_timestep_no_cross_advance() {
+        let mut state = AdamState::new();
+        let grads = vec![0.1f32, 0.2];
+        let mut pa = vec![1.0f32, 1.0];
+        let mut pb = vec![2.0f32, 2.0];
+        let mut pc = vec![3.0f32, 3.0];
+        let mut pd = vec![4.0f32, 4.0];
+
+        // Step each key once.
+        for (key, params) in [
+            ("a", &mut pa),
+            ("b", &mut pb),
+            ("c", &mut pc),
+            ("d", &mut pd),
+        ] {
+            state.step(key, params, &grads, 0.01, 0.9, 0.999, 1e-8, 0.0, false);
+        }
+
+        assert_eq!(state.t["a"], 1, "key 'a' must be at t=1 after one step");
+        assert_eq!(state.t["b"], 1, "key 'b' must be at t=1 after one step");
+        assert_eq!(state.t["c"], 1, "key 'c' must be at t=1 after one step");
+        assert_eq!(state.t["d"], 1, "key 'd' must be at t=1 after one step");
+
+        // Step only "a" a second time.
+        state.step("a", &mut pa, &grads, 0.01, 0.9, 0.999, 1e-8, 0.0, false);
+
+        assert_eq!(
+            state.t["a"], 2,
+            "key 'a' must advance to t=2 on its second step"
+        );
+        assert_eq!(
+            state.t["b"], 1,
+            "key 'b' must not advance when only 'a' is stepped"
+        );
+        assert_eq!(
+            state.t["c"], 1,
+            "key 'c' must not advance when only 'a' is stepped"
+        );
+        assert_eq!(
+            state.t["d"], 1,
+            "key 'd' must not advance when only 'a' is stepped"
+        );
+    }
+
     // Integration tests for AdamW weight decay and Adam-vs-SGD convergence
     // require the train_lora loop (issue #88). They will land alongside that.
 }

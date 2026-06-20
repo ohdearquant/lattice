@@ -28,11 +28,11 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use lattice_inference_grad::backward::attention_gqa::{gqa_backward, gqa_forward_with_cache};
-use lattice_inference_grad::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
-use lattice_inference_grad::backward::tape::{rms_norm_forward, swiglu_forward};
-use lattice_inference_grad::model::qwen35::Qwen35Model;
-use lattice_inference_grad::tokenizer::Tokenizer;
+use lattice_inference::backward::attention_gqa::{gqa_backward, gqa_forward_with_cache};
+use lattice_inference::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
+use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
+use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 
 /// Top GQA (Full-attention) layer of Qwen3.5-0.8B. GQA layers are at
@@ -197,7 +197,7 @@ struct PosFwd {
 /// intermediates. The pre_attn_norm is computed but its backward is skipped:
 /// dx below layer 23 is discarded because the prefix is frozen.
 struct L23Fwd {
-    attn_cache: lattice_inference_grad::backward::attention_gqa::AttnCache,
+    attn_cache: lattice_inference::backward::attention_gqa::AttnCache,
     positions: Vec<PosFwd>,
 }
 
