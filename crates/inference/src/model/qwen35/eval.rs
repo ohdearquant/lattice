@@ -191,6 +191,73 @@ impl Qwen35Model {
         Ok(hiddens)
     }
 
+    /// **Unstable (train-backward)**: capture a Full-attention layer's I/O.
+    ///
+    /// Runs the real model forward over `tokens` and, for the given GQA `layer`,
+    /// records per position the pre-input-layernorm residual `h_in` and the
+    /// gated o_proj output. Returns `(inputs, outputs)`, each `[seq_len, hidden]`
+    /// row-major. The diff test recomputes `normed = rms_norm(h_in)` then runs
+    /// the materialised GQA forward; the trainer reuses `h_in` as the frozen
+    /// residual. Verifies forward-matches-real-model, not just self-consistency.
+    #[cfg(feature = "train-backward")]
+    pub fn capture_attn_io(
+        &self,
+        tokens: &[u32],
+        layer: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), InferenceError> {
+        if tokens.is_empty() {
+            return Err(InferenceError::Inference(
+                "capture_attn_io: need at least 1 token".to_string(),
+            ));
+        }
+        let cfg = &self.config;
+        let num_linear = cfg.num_linear_attention_layers();
+        let num_full = cfg.num_full_attention_layers();
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(num_full);
+        let mut scratch = ForwardScratch::new();
+        scratch.capture_attn_layer = Some(layer);
+
+        for (pos, &token_id) in tokens.iter().enumerate() {
+            self.forward_step(token_id, pos, &mut gdn_states, &mut kv_cache, &mut scratch);
+            if pos < tokens.len() - 1 {
+                kv_cache.seq_len += 1;
+            }
+        }
+
+        let hidden = cfg.hidden_size;
+        let expected = tokens.len() * hidden;
+        if scratch.captured_attn_input.len() != expected {
+            return Err(InferenceError::Inference(format!(
+                "capture_attn_io: layer {layer} captured {} elems, expected {expected} \
+                 (is layer {layer} a Full-attention layer?)",
+                scratch.captured_attn_input.len()
+            )));
+        }
+        Ok((scratch.captured_attn_input, scratch.captured_attn_out))
+    }
+
+    /// **Unstable (train-backward)**: RoPE cos/sin tables for `seq_len` positions.
+    ///
+    /// Returns `(cos, sin)`, each `[seq_len * rope_dim/2]` row-major with layout
+    /// `table[pos * half + i]`, matching `gqa_forward_with_cache`'s expectation
+    /// and the real model's `apply_partial_rope` indexing (`cos_at(pos*half+i)`).
+    #[cfg(feature = "train-backward")]
+    pub fn rope_cos_sin_tables(&self, seq_len: usize) -> (Vec<f32>, Vec<f32>) {
+        let half = self.config.rope_dim() / 2;
+        let mut cos_t = Vec::with_capacity(seq_len * half);
+        let mut sin_t = Vec::with_capacity(seq_len * half);
+        for pos in 0..seq_len {
+            for i in 0..half {
+                cos_t.push(self.rope.cos_at(pos * half + i));
+                sin_t.push(self.rope.sin_at(pos * half + i));
+            }
+        }
+        (cos_t, sin_t)
+    }
+
     /// **Unstable**: compute strided sliding-window perplexity over `tokens`.
     ///
     /// Mirrors the HuggingFace fixed-length-model recipe: walk the corpus in

@@ -112,7 +112,8 @@ pub fn make_tiny_weights(cfg: &TinyConfig) -> TinyWeights {
     // independent of A and both FD and analytic grad_A are identically zero —
     // a vacuous check. Random B makes the A-gradient path observable.
     let lora_a_q = rand_vec(&mut rng, cfg.lora_rank * cfg.hidden);
-    let lora_b_q = rand_vec(&mut rng, q_dim * cfg.lora_rank);
+    // B_q spans the full 2*q_dim q_proj output (Q rows + gate rows).
+    let lora_b_q = rand_vec(&mut rng, 2 * q_dim * cfg.lora_rank);
     let lora_a_v = rand_vec(&mut rng, cfg.lora_rank * cfg.hidden);
     let lora_b_v = rand_vec(&mut rng, kv_dim * cfg.lora_rank);
 
@@ -584,7 +585,7 @@ pub fn gradcheck_lora(seq: &[u32], target: u32, cfg: &TinyConfig, fd_eps: f32, t
         },
     );
     let fd_b_q = fd_check(
-        q_dim * cfg.lora_rank,
+        2 * q_dim * cfg.lora_rank,
         &|w: &mut TinyWeights, k: usize, delta: f32| {
             w.lora_b_q[k] += delta;
         },

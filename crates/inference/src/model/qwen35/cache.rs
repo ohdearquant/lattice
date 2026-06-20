@@ -64,6 +64,18 @@ pub(crate) struct ForwardScratch {
     pub(crate) router_logits: Vec<f32>,            // [num_experts]
     pub(crate) router_selected: Vec<(usize, f32)>, // [num_experts_per_tok]
     pub(crate) expert_out: Vec<f32>,               // [hidden]
+    // Differential-test / trainer capture (train-backward only): when
+    // `capture_attn_layer` is Some(L), `forward_step` appends layer L's
+    // pre-input-layernorm residual h_in and its gated o_proj output for each
+    // position processed. h_in lets the trainer recompute the layer as LoRA
+    // changes; the diff test recomputes normed = rms_norm(h_in) and checks the
+    // materialised GQA forward matches the real model's o_proj output.
+    #[cfg(feature = "train-backward")]
+    pub(crate) capture_attn_layer: Option<usize>,
+    #[cfg(feature = "train-backward")]
+    pub(crate) captured_attn_input: Vec<f32>,
+    #[cfg(feature = "train-backward")]
+    pub(crate) captured_attn_out: Vec<f32>,
 }
 
 impl ForwardScratch {
@@ -90,6 +102,12 @@ impl ForwardScratch {
             router_logits: Vec::new(),
             router_selected: Vec::new(),
             expert_out: Vec::new(),
+            #[cfg(feature = "train-backward")]
+            capture_attn_layer: None,
+            #[cfg(feature = "train-backward")]
+            captured_attn_input: Vec::new(),
+            #[cfg(feature = "train-backward")]
+            captured_attn_out: Vec::new(),
         }
     }
 

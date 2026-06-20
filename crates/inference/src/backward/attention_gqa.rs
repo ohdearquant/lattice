@@ -1,13 +1,19 @@
 // Materialised causal GQA self-attention backward pass.
 // Used for gradchecking and for the backward tape through layer-23.
+//
+// Models the real Qwen3.5 GATED attention: q_proj is [2*q_dim, hidden], its
+// output is per-head interleaved [Q_h | gate_h], the gate is applied as
+// context *= sigmoid(gate_z) before o_proj, and LoRA on q_proj spans the full
+// 2*q_dim. The Q half is normed+roped; the gate half is raw (no norm, no rope).
 
 use super::ops::{linear_vjp, lora_vjp, rope_backward};
+use crate::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
 
 /// All caches needed for the GQA attention backward.
 pub struct AttnCache {
     pub x_input: Vec<f32>,
-    /// Raw q_proj(x)+LoRA, BEFORE q_norm — the actual input to the q_norm
-    /// RMSNorm, required by its backward.
+    /// Raw q_proj(x)+LoRA Q-half, BEFORE q_norm — the actual input to the
+    /// q_norm RMSNorm, required by its backward. Deinterleaved (q_dim).
     pub q_raw: Vec<f32>,
     /// Raw k_proj(x), BEFORE k_norm — the actual input to the k_norm RMSNorm.
     pub k_raw: Vec<f32>,
@@ -16,7 +22,11 @@ pub struct AttnCache {
     pub v: Vec<f32>,
     pub q_h: Vec<Vec<f32>>,
     pub softmax_probs: Vec<Vec<f32>>,
+    /// UNGATED attention context (before the sigmoid gate). The gate backward
+    /// needs it: d_gate_z = d_context_gated · context_ungated · sigmoid'(gate_z).
     pub context: Vec<f32>,
+    /// Raw deinterleaved gate (gate half of q_proj output, no norm/rope), q_dim.
+    pub gate_z: Vec<f32>,
     pub h_q: Vec<f32>,
     pub h_v: Vec<f32>,
     pub num_q_heads: usize,
@@ -40,7 +50,7 @@ pub struct AttnGrads {
 /// Full materialised GQA backward for a single sequence (prefill/training mode).
 ///
 /// Shape conventions (all row-major f32):
-///   w_q: [2*q_dim, hidden]  (first q_dim rows = Q, next q_dim rows = gate_z — we only use first half)
+///   w_q: [2*q_dim, hidden]  (per-head interleaved [Q_h | gate_h]; both used)
 ///   w_k: [kv_dim, hidden]
 ///   w_v: [kv_dim, hidden]
 ///   w_o: [hidden, q_dim]
@@ -76,9 +86,10 @@ pub fn gqa_backward(
         v,
         q_h, // holds POST-rope q (used for the dL/dk score backward)
         softmax_probs,
-        context: _,
-        h_q, // LoRA q activation A_q·x
-        h_v, // LoRA v activation A_v·x
+        context, // UNGATED attention context (for the gate backward)
+        gate_z,  // raw deinterleaved gate (no norm/rope)
+        h_q,     // LoRA q activation A_q·x
+        h_v,     // LoRA v activation A_v·x
         num_q_heads,
         num_kv_heads,
         head_dim,
@@ -95,7 +106,8 @@ pub fn gqa_backward(
     let hidden = x_input.len() / seq_len;
 
     let mut grad_a_q = vec![0.0f32; lora_rank * hidden];
-    let mut grad_b_q = vec![0.0f32; q_dim * lora_rank];
+    // grad_B_q spans the full 2*q_dim q_proj output (Q rows + gate rows).
+    let mut grad_b_q = vec![0.0f32; 2 * q_dim * lora_rank];
     let mut grad_a_v = vec![0.0f32; lora_rank * hidden];
     let mut grad_b_v = vec![0.0f32; kv_dim * lora_rank];
     let mut dx_total = vec![0.0f32; seq_len * hidden];
@@ -109,10 +121,22 @@ pub fn gqa_backward(
     let mut d_q_post_rope = vec![0.0f32; seq_len * q_dim];
     let mut d_k_post_rope = vec![0.0f32; seq_len * kv_dim];
     let mut d_v = vec![0.0f32; seq_len * kv_dim];
+    // d_gate_z[t]: gradient w.r.t. the raw gate (gate half of q_proj output).
+    let mut d_gate_z = vec![0.0f32; seq_len * q_dim];
 
     for t in 0..*seq_len {
         let dy_t = &dy_out[t * hidden..(t + 1) * hidden];
-        let d_context_t = linear_vjp(w_o, dy_t, q_dim, hidden);
+        // o_proj backward gives the gradient w.r.t. the GATED context.
+        let d_context_gated = linear_vjp(w_o, dy_t, q_dim, hidden);
+        // Split the sigmoid gate: context_gated = context_ungated · sigmoid(gate_z).
+        //   d_context_ungated = d_context_gated · sigmoid(gate_z)
+        //   d_gate_z          = d_context_gated · context_ungated · sigmoid'(gate_z)
+        let mut d_context_t = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            let g = 1.0 / (1.0 + (-gate_z[t * q_dim + i]).exp());
+            d_context_t[i] = d_context_gated[i] * g;
+            d_gate_z[t * q_dim + i] = d_context_gated[i] * context[t * q_dim + i] * g * (1.0 - g);
+        }
 
         for qh in 0..*num_q_heads {
             let kvh = qh / groups;
@@ -158,7 +182,6 @@ pub fn gqa_backward(
 
     // ---- Phase 2: per-position rope → norm (RAW pre-norm input) → projection ----
     let eps = 1e-6f32;
-    let w_q_q_only = &w_q[..q_dim * hidden];
 
     for t in 0..*seq_len {
         let x_t = &x_input[t * hidden..(t + 1) * hidden];
@@ -180,23 +203,43 @@ pub fn gqa_backward(
             let mean_sq: f32 = q_head.iter().map(|xi| xi * xi).sum::<f32>() / *head_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
             let dg = &d_q_normed[start..start + head_dim];
+            // Shifted weight (1 + gamma) to match the forward's q_norm.
             let sum_xwg: f32 = (0..*head_dim)
-                .map(|j| q_head[j] * q_norm_w[j] * dg[j])
+                .map(|j| q_head[j] * (1.0 + q_norm_w[j]) * dg[j])
                 .sum();
             let inv3_over_d = inv_rms * inv_rms * inv_rms / *head_dim as f32;
             for j in 0..*head_dim {
                 d_q_raw[start + j] =
-                    q_norm_w[j] * dg[j] * inv_rms - q_head[j] * inv3_over_d * sum_xwg;
+                    (1.0 + q_norm_w[j]) * dg[j] * inv_rms - q_head[j] * inv3_over_d * sum_xwg;
             }
         }
-        let dx_q = linear_vjp(w_q_q_only, &d_q_raw, hidden, q_dim);
+        // Re-interleave the Q-half grad (d_q_raw, post norm/rope backward) with
+        // the gate-half grad (d_gate_z, no norm/rope) into the full 2*q_dim
+        // q_proj output gradient — the inverse of deinterleave_q_gate.
+        let mut d_q_and_gate = vec![0.0f32; 2 * q_dim];
+        for qh in 0..*num_q_heads {
+            let qsrc = qh * head_dim;
+            let dst = qh * 2 * head_dim;
+            d_q_and_gate[dst..dst + head_dim].copy_from_slice(&d_q_raw[qsrc..qsrc + head_dim]);
+            d_q_and_gate[dst + head_dim..dst + 2 * head_dim]
+                .copy_from_slice(&d_gate_z[t * q_dim + qsrc..t * q_dim + qsrc + head_dim]);
+        }
+        let dx_q = linear_vjp(w_q, &d_q_and_gate, hidden, 2 * q_dim);
         for j in 0..hidden {
             dx_t[j] += dx_q[j];
         }
         if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
             let h_q_t = &h_q[t * lora_rank..(t + 1) * lora_rank];
             let (gb, ga, dx_lora) = lora_vjp(
-                &d_q_raw, x_t, h_q_t, la, lb, lora_rank, hidden, q_dim, lora_scale,
+                &d_q_and_gate,
+                x_t,
+                h_q_t,
+                la,
+                lb,
+                lora_rank,
+                hidden,
+                2 * q_dim,
+                lora_scale,
             );
             for k in 0..ga.len() {
                 grad_a_q[k] += ga[k];
@@ -224,13 +267,14 @@ pub fn gqa_backward(
             let mean_sq: f32 = k_head.iter().map(|xi| xi * xi).sum::<f32>() / *head_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
             let dg = &d_k_normed[start..start + head_dim];
+            // Shifted weight (1 + gamma) to match the forward's k_norm.
             let sum_xwg: f32 = (0..*head_dim)
-                .map(|j| k_head[j] * k_norm_w[j] * dg[j])
+                .map(|j| k_head[j] * (1.0 + k_norm_w[j]) * dg[j])
                 .sum();
             let inv3_over_d = inv_rms * inv_rms * inv_rms / *head_dim as f32;
             for j in 0..*head_dim {
                 d_k_raw[start + j] =
-                    k_norm_w[j] * dg[j] * inv_rms - k_head[j] * inv3_over_d * sum_xwg;
+                    (1.0 + k_norm_w[j]) * dg[j] * inv_rms - k_head[j] * inv3_over_d * sum_xwg;
             }
         }
         let dx_k = linear_vjp(w_k, &d_k_raw, hidden, kv_dim);
@@ -318,18 +362,19 @@ pub fn gqa_forward_with_cache(
     let mut q_pre_rope = vec![0.0f32; seq_len * q_dim];
     let mut k_pre_rope = vec![0.0f32; seq_len * kv_dim];
     let mut v = vec![0.0f32; seq_len * kv_dim];
+    let mut gate_z = vec![0.0f32; seq_len * q_dim];
     let mut h_q = vec![0.0f32; seq_len * lora_rank];
     let mut h_v = vec![0.0f32; seq_len * lora_rank];
 
     for t in 0..seq_len {
         let x_t = &x[t * hidden..(t + 1) * hidden];
 
-        // q_proj (first q_dim rows of w_q)
-        let w_q_q = &w_q[..q_dim * hidden];
-        let q_t = &mut q_pre_rope[t * q_dim..(t + 1) * q_dim];
-        for i in 0..q_dim {
-            let row = &w_q_q[i * hidden..(i + 1) * hidden];
-            q_t[i] = row.iter().zip(x_t.iter()).map(|(a, b)| a * b).sum();
+        // q+gate projection: full 2*q_dim rows of w_q, LoRA on the full output,
+        // then deinterleave per head into Q (q_dim) and gate_z (q_dim).
+        let mut q_and_gate_t = vec![0.0f32; 2 * q_dim];
+        for i in 0..2 * q_dim {
+            let row = &w_q[i * hidden..(i + 1) * hidden];
+            q_and_gate_t[i] = row.iter().zip(x_t.iter()).map(|(a, b)| a * b).sum();
         }
         if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
             let h = &mut h_q[t * lora_rank..(t + 1) * lora_rank];
@@ -340,16 +385,23 @@ pub fn gqa_forward_with_cache(
                     .map(|(a, b)| a * b)
                     .sum();
             }
-            for i in 0..q_dim {
+            for i in 0..2 * q_dim {
                 let acc: f32 = lora_scale
                     * lb[i * lora_rank..(i + 1) * lora_rank]
                         .iter()
                         .zip(h.iter())
                         .map(|(b, hi)| b * hi)
                         .sum::<f32>();
-                q_t[i] += acc;
+                q_and_gate_t[i] += acc;
             }
         }
+        deinterleave_q_gate(
+            &q_and_gate_t,
+            &mut q_pre_rope[t * q_dim..(t + 1) * q_dim],
+            &mut gate_z[t * q_dim..(t + 1) * q_dim],
+            num_q_heads,
+            head_dim,
+        );
 
         // k_proj
         let k_t = &mut k_pre_rope[t * kv_dim..(t + 1) * kv_dim];
@@ -390,7 +442,9 @@ pub fn gqa_forward_with_cache(
     let q_raw = q_pre_rope.clone();
     let k_raw = k_pre_rope.clone();
 
-    // q_norm and k_norm (per-head RMSNorm)
+    // q_norm and k_norm (per-head RMSNorm). Qwen3.5 uses the SHIFTED weight
+    // `(1 + gamma)`, matching `qwen35_rms_norm` — plain `gamma` would diverge
+    // from the real model (a divergence the self-consistent gradcheck can't see).
     for t in 0..seq_len {
         for qh in 0..num_q_heads {
             let start = t * q_dim + qh * head_dim;
@@ -398,7 +452,7 @@ pub fn gqa_forward_with_cache(
             let mean_sq: f32 = q_head.iter().map(|xi| xi * xi).sum::<f32>() / head_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
             for (j, qj) in q_head.iter_mut().enumerate() {
-                *qj *= q_norm_w[j] * inv_rms;
+                *qj *= (1.0 + q_norm_w[j]) * inv_rms;
             }
         }
         for kvh in 0..num_kv_heads {
@@ -407,7 +461,7 @@ pub fn gqa_forward_with_cache(
             let mean_sq: f32 = k_head.iter().map(|xi| xi * xi).sum::<f32>() / head_dim as f32;
             let inv_rms = 1.0 / (mean_sq + eps).sqrt();
             for (j, kj) in k_head.iter_mut().enumerate() {
-                *kj *= k_norm_w[j] * inv_rms;
+                *kj *= (1.0 + k_norm_w[j]) * inv_rms;
             }
         }
     }
@@ -501,7 +555,17 @@ pub fn gqa_forward_with_cache(
         softmax_probs.push(probs_all);
     }
 
-    // O projection
+    // Sigmoid gate: cache the ungated context (needed by the gate backward),
+    // then gate in place — context_gated[i] = context[i] * sigmoid(gate_z[i]).
+    let context_ungated = context.clone();
+    for t in 0..seq_len {
+        apply_sigmoid_gate(
+            &mut context[t * q_dim..(t + 1) * q_dim],
+            &gate_z[t * q_dim..(t + 1) * q_dim],
+        );
+    }
+
+    // O projection (on the gated context)
     let mut output = vec![0.0f32; seq_len * hidden];
     for t in 0..seq_len {
         let ctx_t = &context[t * q_dim..(t + 1) * q_dim];
@@ -521,7 +585,8 @@ pub fn gqa_forward_with_cache(
         v,
         q_h: q_after_rope,
         softmax_probs,
-        context,
+        context: context_ungated,
+        gate_z,
         h_q,
         h_v,
         num_q_heads,
@@ -584,8 +649,10 @@ mod tests {
         // LoRA params for q and v. B MUST be non-zero: at B=0 the LoRA delta
         // B·(A·x) vanishes, the forward is independent of A, and grad_A is
         // identically zero on both sides — a vacuous check that validates nothing.
+        // B_q spans the full 2*q_dim q_proj output; the gate rows being non-zero
+        // de-vacuums the gate path (otherwise the sigmoid gate is untested).
         let lora_a_q = rand_vec(&mut rng, lora_rank * hidden, 0.05);
-        let lora_b_q = rand_vec(&mut rng, q_dim * lora_rank, 0.05);
+        let lora_b_q = rand_vec(&mut rng, 2 * q_dim * lora_rank, 0.05);
         let lora_a_v = rand_vec(&mut rng, lora_rank * hidden, 0.05);
         let lora_b_v = rand_vec(&mut rng, kv_dim * lora_rank, 0.05);
 
@@ -704,9 +771,9 @@ mod tests {
                 / (2.0 * fd_eps);
         }
 
-        // FD for grad_B_q
-        let mut fd_b_q = vec![0.0f32; q_dim * lora_rank];
-        for k in 0..q_dim * lora_rank {
+        // FD for grad_B_q (full 2*q_dim output rows)
+        let mut fd_b_q = vec![0.0f32; 2 * q_dim * lora_rank];
+        for k in 0..2 * q_dim * lora_rank {
             let mut bp = lora_b_q.clone();
             let mut bm = lora_b_q.clone();
             bp[k] += fd_eps;
