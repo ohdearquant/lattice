@@ -1056,14 +1056,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---- Training mode ----
-    // LoRA init: A small random, B zero (delta=0 at init reproduces the base;
-    // grad_B != 0 so B moves first).
+    // LoRA init: A ~ U(-1/sqrt(in), +1/sqrt(in)), B zero (delta=0 at init
+    // reproduces the base; grad_B != 0 so B moves first). The 1/sqrt(in)
+    // amplitude matches mlx_lm LoRALinear (tuner/lora.py) for on-par convergence.
+    let init_amp = 1.0 / (dims.hidden as f32).sqrt();
     let mut rng = 0xFEED_FACEu64;
     let mut loras: Vec<LoraParams> = (0..num_slots)
         .map(|_| LoraParams {
-            a_q: rand_fill(&mut rng, rank * dims.hidden, 0.02),
+            a_q: rand_fill(&mut rng, rank * dims.hidden, init_amp),
             b_q: vec![0.0; 2 * dims.q_dim * rank],
-            a_v: rand_fill(&mut rng, rank * dims.hidden, 0.02),
+            a_v: rand_fill(&mut rng, rank * dims.hidden, init_amp),
             b_v: vec![0.0; dims.kv_dim * rank],
         })
         .collect();

@@ -13,15 +13,22 @@ use crate::error::TuneError;
 ///
 /// Tracks per-parameter first and second moment estimates keyed by an
 /// arbitrary string (typically `"{layer_idx}_{module}_{param}"` where
-/// `param` is `"a"` or `"b"`).  All keys share a single global step counter
-/// `t` which is incremented on every call to [`step`](AdamState::step).
+/// `param` is `"a"` or `"b"`).  Each key advances its OWN Adam timestep, so
+/// bias correction reflects how many updates that tensor has received — not
+/// how many `step` calls occurred across all keys.  (A single shared counter
+/// over-advances `t` whenever one optimiser step updates several tensors, as
+/// LoRA training does — every tensor then bias-corrects with a `t` far larger
+/// than its true update count, inflating m̂/√v̂ and over-stepping early updates,
+/// which defeats Adam's warmup.  Per-key `t` matches MLX/PyTorch, which key the
+/// timestep per parameter.)
 pub struct AdamState {
     /// First moment estimates (exponential moving average of gradients).
     m: HashMap<String, Vec<f32>>,
     /// Second moment estimates (exponential moving average of squared gradients).
     v: HashMap<String, Vec<f32>>,
-    /// Global step counter (1-based: starts at 0, incremented before each bias correction).
-    pub t: usize,
+    /// Per-key step counter (1-based once a key has been stepped); each key's
+    /// own count drives its bias-correction denominators.
+    pub t: HashMap<String, usize>,
 }
 
 impl AdamState {
@@ -30,7 +37,7 @@ impl AdamState {
         Self {
             m: HashMap::new(),
             v: HashMap::new(),
-            t: 0,
+            t: HashMap::new(),
         }
     }
 
@@ -83,13 +90,20 @@ impl AdamState {
             .entry(key.to_string())
             .or_insert_with(|| vec![0.0f32; n]);
 
-        // Increment step counter once per call (shared across all keys so that
-        // bias-correction is epoch-consistent regardless of key ordering).
-        self.t += 1;
+        // Advance THIS key's own timestep. step() is called once per parameter
+        // tensor, so a single shared counter would treat the 2nd..Nth tensor of
+        // one optimiser step as if many steps had elapsed — bias-correcting with
+        // an inflated `t` (m̂/√v̂ runs too large, over-stepping early updates and
+        // defeating Adam's warmup). Per-key `t` matches MLX/PyTorch.
+        let t = {
+            let c = self.t.entry(key.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
 
-        // Bias-correction denominators.
-        let bc1 = 1.0 - beta1.powi(self.t as i32);
-        let bc2 = 1.0 - beta2.powi(self.t as i32);
+        // Bias-correction denominators (this key's own t).
+        let bc1 = 1.0 - beta1.powi(t as i32);
+        let bc2 = 1.0 - beta2.powi(t as i32);
 
         for i in 0..n {
             let g = grads[i];
@@ -354,7 +368,10 @@ mod tests {
         for (p, o) in params.iter().zip(original.iter()) {
             assert_ne!(p, o, "params must change after Adam step");
         }
-        assert_eq!(state.t, 1, "step counter must be 1 after first step");
+        assert_eq!(
+            state.t["test"], 1,
+            "key 'test' step counter must be 1 after first step"
+        );
     }
 
     // Integration tests for AdamW weight decay and Adam-vs-SGD convergence
