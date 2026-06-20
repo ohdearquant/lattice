@@ -460,7 +460,7 @@ fn forward_full(
     for t in (ctx.completion_start - 1)..seq - 1 {
         let (final_normed, inv_final) =
             rms_norm_forward(&h[t * hidden..(t + 1) * hidden], head.final_shift, d.eps);
-        let logits = lm_head_logits(head.lm_head, &final_normed, hidden, dims.vocab);
+        let logits = lm_head_logits(head.lm_head, &final_normed, hidden, d.vocab);
         positions.push(HeadPos {
             t,
             target: ctx.tokens[t + 1],
@@ -532,13 +532,13 @@ fn nll_and_grads(
         nll_sum += position_nll(&p.logits, p.target) as f64;
         let max = p.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum_exp: f32 = p.logits.iter().map(|&l| (l - max).exp()).sum();
-        let mut d_logits = vec![0.0f32; dims.vocab];
+        let mut d_logits = vec![0.0f32; d.vocab];
         for (v, dl) in d_logits.iter_mut().enumerate() {
             let prob = (p.logits[v] - max).exp() / sum_exp;
             let indicator = if v == p.target as usize { 1.0 } else { 0.0 };
             *dl = (prob - indicator) / n_comp;
         }
-        let d_final = linear_vjp(head.lm_head, &d_logits, hidden, dims.vocab);
+        let d_final = linear_vjp(head.lm_head, &d_logits, hidden, d.vocab);
         let d_h_t = rmsnorm_backward(
             &fwd.h_final[p.t * hidden..(p.t + 1) * hidden],
             head.final_shift,
