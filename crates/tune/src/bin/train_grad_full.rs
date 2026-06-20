@@ -68,7 +68,7 @@ fn usage() {
 
 Options:
   --model-dir   <PATH>   Model directory (default: $HOME/.lattice/models/qwen3.5-0.8b)
-  --data-dir    <PATH>   Dataset directory with train.jsonl (default: data/claude-logs-lora)
+  --data-dir    <PATH>   Dataset directory with train.jsonl + valid.jsonl (default: data/claude-logs-lora)
   --first-layer <N>      First materialised (trained) layer (default: 19)
   --steps       <N>      Adam steps (default: 25)
   --lr          <F>      Learning rate (default: 1e-3)
@@ -76,6 +76,7 @@ Options:
   --alpha       <F>      LoRA alpha (default: 16.0)
   --seq-len     <N>      Max tokens per sample (default: 64)
   --max-train   <N>      Training samples cap (default: 3)
+  --max-valid   <N>      Held-out valid.jsonl samples for eval, 0=off (default: 16)
   --log-every   <N>      Print NLL every N steps (default: 5)
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
@@ -141,6 +142,33 @@ fn load_jsonl(
         });
     }
     Ok(out)
+}
+
+/// Capture the frozen-prefix output (h_in entering `first_layer`) and RoPE
+/// tables per sample, yielding the `SeqCtx` set the tape forward consumes.
+/// Returns the caches plus the total number of masked completion positions.
+fn build_caches(
+    model: &Qwen35Model,
+    samples: &[Sample],
+    first_layer: usize,
+) -> Result<(Vec<SeqCtx>, usize), Box<dyn std::error::Error>> {
+    let mut caches = Vec::with_capacity(samples.len());
+    let mut total_positions = 0usize;
+    for s in samples {
+        let (h_in, _real_out) = model.capture_attn_io(&s.tokens, first_layer)?;
+        let seq_len = s.tokens.len();
+        let (cos, sin) = model.rope_cos_sin_tables(seq_len);
+        total_positions += seq_len - s.completion_start;
+        caches.push(SeqCtx {
+            h_in,
+            cos,
+            sin,
+            tokens: s.tokens.clone(),
+            completion_start: s.completion_start,
+            seq_len,
+        });
+    }
+    Ok((caches, total_positions))
 }
 
 #[derive(Clone, Copy)]
@@ -676,6 +704,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_train: usize = parse_arg(&args, "--max-train")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    let max_valid: usize = parse_arg(&args, "--max-valid")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let log_every: usize = parse_arg(&args, "--log-every")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
@@ -827,28 +858,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
     let tcache = Instant::now();
-    let mut caches = Vec::new();
-    let mut total_positions = 0usize;
-    for s in &train_samples {
-        let (h_in, _real_out) = model.capture_attn_io(&s.tokens, first_layer)?;
-        let seq_len = s.tokens.len();
-        let (cos, sin) = model.rope_cos_sin_tables(seq_len);
-        total_positions += seq_len - s.completion_start;
-        caches.push(SeqCtx {
-            h_in,
-            cos,
-            sin,
-            tokens: s.tokens.clone(),
-            completion_start: s.completion_start,
-            seq_len,
-        });
-    }
+    let (caches, total_positions) = build_caches(&model, &train_samples, first_layer)?;
     println!(
         "  {} completion positions across {} samples in {:.1}s",
         total_positions,
         caches.len(),
         tcache.elapsed().as_secs_f64()
     );
+
+    // Held-out validation caches (valid.jsonl) — eval-only, never trained on.
+    // The honest signal: train NLL falling while held-out NLL also falls is
+    // learning; train NLL falling while held-out rises is memorisation.
+    let valid_caches: Vec<SeqCtx> = if max_valid > 0 {
+        match load_jsonl(
+            &data_dir.join("valid.jsonl"),
+            &tokenizer as &dyn Tokenizer,
+            seq_len_cap,
+            max_valid,
+        ) {
+            Ok(vs) if !vs.is_empty() => {
+                let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
+                println!(
+                    "  held-out: {vpos} completion positions across {} valid samples",
+                    vc.len()
+                );
+                vc
+            }
+            _ => {
+                println!("  held-out: valid.jsonl absent/empty — eval disabled");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // TBV: with zero LoRA (delta exactly 0), the chain NLL must match the real
     // model's own compute_token_nlls — validates the whole assembled forward
@@ -1028,10 +1071,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut adam = AdamState::new();
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
 
+    let eval_valid = |loras: &[LoraParams]| -> Option<f32> {
+        (!valid_caches.is_empty()).then(|| {
+            eval_chain_nll(
+                &valid_caches,
+                &layers,
+                loras,
+                &head,
+                &dims,
+                &gdn_dims,
+                &cfg,
+                rank,
+                scale,
+            )
+        })
+    };
+
     let base_nll = eval_chain_nll(
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
     );
-    println!("\n  step    0  train NLL: {base_nll:.4}");
+    let base_valid = eval_valid(&loras);
+    match base_valid {
+        Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
+        None => println!("\n  step    0  train NLL: {base_nll:.4}"),
+    }
 
     let tstep = Instant::now();
     for step in 1..=steps {
@@ -1094,20 +1157,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mean_nll = eval_chain_nll(
                 &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
             );
-            println!(
-                "  step {step:4}  train NLL: {mean_nll:.4}  (delta from base: {:+.4})",
-                mean_nll - base_nll
-            );
+            match eval_valid(&loras) {
+                Some(v) => println!(
+                    "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
+                    mean_nll - base_nll
+                ),
+                None => println!(
+                    "  step {step:4}  train NLL: {mean_nll:.4}  (delta from base: {:+.4})",
+                    mean_nll - base_nll
+                ),
+            }
         }
     }
 
     let final_nll = eval_chain_nll(
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
     );
-    println!(
-        "\n=== done: base NLL {base_nll:.4} → final NLL {final_nll:.4} ({:+.4}) in {:.1}s ===",
-        final_nll - base_nll,
-        tstep.elapsed().as_secs_f64()
-    );
+    let secs = tstep.elapsed().as_secs_f64();
+    match (base_valid, eval_valid(&loras)) {
+        (Some(b), Some(f)) => println!(
+            "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
+            final_nll - base_nll,
+            f - b
+        ),
+        _ => println!(
+            "\n=== done: base NLL {base_nll:.4} → final NLL {final_nll:.4} ({:+.4}) in {secs:.1}s ===",
+            final_nll - base_nll
+        ),
+    }
     Ok(())
 }
