@@ -50,6 +50,9 @@ pub mod rope;
 pub mod sampling;
 pub mod speculative;
 
+#[cfg(feature = "train-backward")]
+pub mod backward;
+
 use std::path::PathBuf;
 
 /// Default model cache directory.

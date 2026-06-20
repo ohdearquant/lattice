@@ -137,6 +137,60 @@ impl Qwen35Model {
         Ok(nlls)
     }
 
+    /// **Unstable (train-backward)**: per-position final hidden states.
+    ///
+    /// Returns one `[hidden_size]` vector per input token: the residual stream
+    /// after the final RMSNorm — i.e. the exact vector `lm_head` is applied to
+    /// at that position. Base weights are frozen, so for lm_head-side LoRA these
+    /// are fixed inputs and can be cached across optimizer steps.
+    #[cfg(feature = "train-backward")]
+    pub fn forward_final_hidden(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let cfg = &self.config;
+        if tokens.len() < 2 {
+            return Err(InferenceError::Inference(format!(
+                "forward_final_hidden: need at least 2 tokens, got {}",
+                tokens.len()
+            )));
+        }
+        let max_context = self.max_context();
+        if tokens.len() > max_context {
+            return Err(InferenceError::Inference(format!(
+                "forward_final_hidden: tokens.len() ({}) exceeds RoPE capacity ({max_context})",
+                tokens.len(),
+            )));
+        }
+        if let Some((bad_idx, &bad)) = tokens
+            .iter()
+            .enumerate()
+            .find(|&(_, &t)| (t as usize) >= cfg.vocab_size)
+        {
+            return Err(InferenceError::Inference(format!(
+                "forward_final_hidden: tokens[{bad_idx}]={bad} >= vocab_size {}",
+                cfg.vocab_size
+            )));
+        }
+
+        let hidden = cfg.hidden_size;
+        let num_linear = cfg.num_linear_attention_layers();
+        let num_full = cfg.num_full_attention_layers();
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(num_full);
+        let mut scratch = ForwardScratch::new();
+
+        let mut hiddens = Vec::with_capacity(tokens.len());
+        for (pos, &token_id) in tokens.iter().enumerate() {
+            self.forward_step(token_id, pos, &mut gdn_states, &mut kv_cache, &mut scratch);
+            hiddens.push(scratch.hidden[..hidden].to_vec());
+            if pos < tokens.len() - 1 {
+                kv_cache.seq_len += 1;
+            }
+        }
+
+        Ok(hiddens)
+    }
+
     /// **Unstable**: compute strided sliding-window perplexity over `tokens`.
     ///
     /// Mirrors the HuggingFace fixed-length-model recipe: walk the corpus in
