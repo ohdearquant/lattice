@@ -131,12 +131,12 @@ struct FaderToggle: View {
 
                 Spacer()
 
-                // Swap stamp
+                // Selection stamp — shown when B side is active.
+                // The fader sets adapterPath for the NEXT generation; there is no hot-swap.
                 if isOnB {
-                    Text("0 ms reload")
+                    Text("applies next send")
                         .font(Theme.Fonts.cell)
                         .foregroundStyle(Theme.Palette.signal)
-                        .monospacedDigit()
                 }
 
                 Spacer()
@@ -172,7 +172,7 @@ struct FaderToggle: View {
             }
         )
 
-        Text(isOnB ? "Active: BASE + LoRA r8 · adapter swapped with 0 ms reload" : "Active: BASE")
+        Text(isOnB ? "Active: BASE + LoRA r8 · adapter applies next send" : "Active: BASE")
             .font(Theme.Fonts.readout)
             .foregroundStyle(Theme.Palette.inkDim)
             .padding(.horizontal, Theme.Space.lg)

@@ -247,9 +247,74 @@ enum LatticeBridge {
         return false
     }
 
+    /// Read the JSON header from a `.safetensors` file and return the `__metadata__` map.
+    ///
+    /// safetensors binary layout: bytes [0..8) = little-endian UInt64 N, bytes [8..8+N) = UTF-8
+    /// JSON. The JSON object may contain a `"__metadata__"` key whose value is [String: String].
+    /// Only the 8-byte length prefix and the N header bytes are read — the tensor payload is
+    /// never touched, so this is safe even for multi-hundred-MB adapter files.
+    ///
+    /// Returns nil on any failure (truncated file, bad JSON, missing key, N out of bounds).
+    static func readSafetensorsMetadata(_ url: URL) -> [String: String]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        // Read the 8-byte little-endian header length.
+        guard let lenData = try? handle.read(upToCount: 8), lenData.count == 8 else { return nil }
+        let n = lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+
+        // Sanity-bound: reject empty or suspiciously large headers.
+        guard n > 0, n <= 100_000_000 else { return nil }
+
+        guard let headerData = try? handle.read(upToCount: Int(n)), headerData.count == Int(n) else {
+            return nil
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any],
+              let meta = obj["__metadata__"] as? [String: String]
+        else { return nil }
+
+        return meta
+    }
+
+    /// Read adapter metadata from a PEFT-format `adapter_config.json` sibling file.
+    ///
+    /// Handles the standard PEFT keys (`r`, `lora_alpha`, `target_modules`). Used as a
+    /// fallback when the safetensors `__metadata__` block is absent or empty, for adapters
+    /// that were produced outside of lattice (e.g. imported from Hugging Face).
+    private static func readPeftAdapterConfig(sibling url: URL) -> (rank: Int?, alpha: Double?, targetModules: String?)? {
+        let configURL = url.deletingLastPathComponent().appendingPathComponent("adapter_config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        let rank = obj["r"] as? Int
+        let alpha: Double?
+        if let a = obj["lora_alpha"] as? Double {
+            alpha = a
+        } else if let a = obj["lora_alpha"] as? Int {
+            alpha = Double(a)
+        } else {
+            alpha = nil
+        }
+        let targetModules: String?
+        if let mods = obj["target_modules"] as? [String], !mods.isEmpty {
+            targetModules = mods.joined(separator: ", ")
+        } else {
+            targetModules = nil
+        }
+
+        return (rank: rank, alpha: alpha, targetModules: targetModules)
+    }
+
     /// Scan a directory of `.safetensors` adapter files into AdapterInfo.
     /// Excludes sharded model weights (model*.safetensors, model-*-of-*.safetensors,
     /// model.safetensors-*-of-*.safetensors) which are base model files, not adapters.
+    ///
+    /// Metadata resolution order for each adapter file:
+    ///   1. `__metadata__` block in the safetensors header (lattice-native format).
+    ///   2. Sibling `adapter_config.json` using PEFT keys `r`/`lora_alpha`/`target_modules`
+    ///      (for externally-imported adapters only).
+    ///   3. All three fields stay nil when neither source is present (honest result).
     static func discoverAdapters(in dir: URL) -> [AdapterInfo] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) else {
@@ -259,8 +324,29 @@ enum LatticeBridge {
             .filter { $0.pathExtension == "safetensors" && !isModelWeight($0.lastPathComponent) }
             .map { f in
                 let size = Int64((try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+
+                // --- Metadata resolution: safetensors __metadata__ first ---
+                var rank: Int? = nil
+                var alpha: Double? = nil
+                var targetModules: String? = nil
+
+                if let meta = readSafetensorsMetadata(f), !meta.isEmpty {
+                    rank = meta["rank"].flatMap { Int($0) }
+                    alpha = meta["alpha"].flatMap { Double($0) }
+                    // Normalize: split on commas, trim whitespace, rejoin.
+                    if let raw = meta["target_modules"], !raw.isEmpty {
+                        let parts = raw.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                        if !parts.isEmpty { targetModules = parts.joined(separator: ", ") }
+                    }
+                } else if let peft = readPeftAdapterConfig(sibling: f) {
+                    // --- Fallback: PEFT adapter_config.json for imported adapters ---
+                    rank = peft.rank
+                    alpha = peft.alpha
+                    targetModules = peft.targetModules
+                }
+
                 return AdapterInfo(name: f.deletingPathExtension().lastPathComponent, path: f,
-                                   rank: nil, alpha: nil, targetModules: nil, sizeBytes: size)
+                                   rank: rank, alpha: alpha, targetModules: targetModules, sizeBytes: size)
             }.sorted { $0.name < $1.name }
     }
 }
