@@ -7,7 +7,9 @@
 //!     --lora adapter.safetensors \
 //!     --prompt "Write a Rust function that checks if a number is prime" \
 //!     --max-tokens 64
+//!     [--json]   Emit @@lattice gen_token events for the Lattice Studio app.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -16,6 +18,34 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn parse_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|a| a == flag)
+}
+
+/// Escape a string as a JSON string literal (including surrounding double quotes).
+/// Does NOT depend on serde_json — this is a self-contained, correct escaper.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Other ASCII control characters: \u00XX
+                let code = c as u32;
+                out.push_str(&format!("\\u{code:04x}"));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn default_model_cache() -> PathBuf {
@@ -42,6 +72,8 @@ fn main() {
     let temperature: Option<f32> = parse_arg(&args, "--temperature").and_then(|s| s.parse().ok());
 
     let lora_path: Option<PathBuf> = parse_arg(&args, "--lora").map(PathBuf::from);
+
+    let emit_json = parse_flag(&args, "--json");
 
     let model_dir = if let Some(dir) = parse_arg(&args, "--model-dir") {
         PathBuf::from(dir)
@@ -115,31 +147,75 @@ fn main() {
     );
     println!("Generating...\n");
 
-    // Generate
     let t1 = Instant::now();
-    match model.generate(&prompt, &gen_cfg) {
-        Ok(output) => {
-            let gen_ms = t1.elapsed().as_millis();
-            let tok_s = if gen_ms > 0 {
-                output.generated_tokens as f64 / (gen_ms as f64 / 1000.0)
-            } else {
-                0.0
-            };
 
-            println!("--- Output ---");
-            println!("{}", output.text);
-            println!("--- Stats ---");
-            println!(
-                "Tokens: {} prompt + {} generated in {}ms ({:.1} tok/s)",
-                output.prompt_tokens, output.generated_tokens, gen_ms, tok_s
-            );
-            if lora_path.is_some() {
-                println!("LoRA: ACTIVE");
+    if emit_json {
+        // Streaming JSON mode: emit @@lattice gen_token events live.
+        let mut stdout = std::io::stdout();
+        let mut first_token_emitted = false;
+        let mut ttft_ms: f64 = 0.0;
+
+        let result = model.generate_streaming(&prompt, &gen_cfg, |delta| {
+            if !first_token_emitted {
+                ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                first_token_emitted = true;
+            }
+            let token_json = json_escape(delta);
+            writeln!(
+                stdout,
+                "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"done\":false}}"
+            )
+            .ok();
+            stdout.flush().ok();
+        });
+
+        match result {
+            Ok(output) => {
+                let gen_ms = t1.elapsed().as_millis();
+                let tok_s = if gen_ms > 0 {
+                    output.generated_tokens as f64 / (gen_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+                // Final done event with stats.
+                writeln!(
+                    stdout,
+                    "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
+                )
+                .ok();
+                stdout.flush().ok();
+            }
+            Err(e) => {
+                eprintln!("Generation failed: {e}");
+                std::process::exit(1);
             }
         }
-        Err(e) => {
-            eprintln!("Generation failed: {e}");
-            std::process::exit(1);
+    } else {
+        // Non-JSON mode: original atomic output block, unchanged.
+        match model.generate(&prompt, &gen_cfg) {
+            Ok(output) => {
+                let gen_ms = t1.elapsed().as_millis();
+                let tok_s = if gen_ms > 0 {
+                    output.generated_tokens as f64 / (gen_ms as f64 / 1000.0)
+                } else {
+                    0.0
+                };
+
+                println!("--- Output ---");
+                println!("{}", output.text);
+                println!("--- Stats ---");
+                println!(
+                    "Tokens: {} prompt + {} generated in {}ms ({:.1} tok/s)",
+                    output.prompt_tokens, output.generated_tokens, gen_ms, tok_s
+                );
+                if lora_path.is_some() {
+                    println!("LoRA: ACTIVE");
+                }
+            }
+            Err(e) => {
+                eprintln!("Generation failed: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

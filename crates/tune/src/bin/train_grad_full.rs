@@ -1143,9 +1143,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
     );
     let base_valid = eval_valid(&loras);
-    match base_valid {
-        Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
-        None => println!("\n  step    0  train NLL: {base_nll:.4}"),
+    if !emit_json {
+        match base_valid {
+            Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
+            None => println!("\n  step    0  train NLL: {base_nll:.4}"),
+        }
+    }
+    if emit_json {
+        let val_json = match base_valid {
+            Some(v) => format!("{v:.6}"),
+            None => "null".to_string(),
+        };
+        println!(
+            "@@lattice {{\"ev\":\"train_step\",\"step\":0,\"loss\":{base_nll:.6},\"val_loss\":{val_json},\"lr\":{lr:.6}}}"
+        );
     }
 
     let tstep = Instant::now();
@@ -1210,15 +1221,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
             );
             let val_nll = eval_valid(&loras);
-            match val_nll {
-                Some(v) => println!(
-                    "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
-                    mean_nll - base_nll
-                ),
-                None => println!(
-                    "  step {step:4}  train NLL: {mean_nll:.4}  (delta from base: {:+.4})",
-                    mean_nll - base_nll
-                ),
+            if !emit_json {
+                match val_nll {
+                    Some(v) => println!(
+                        "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
+                        mean_nll - base_nll
+                    ),
+                    None => println!(
+                        "  step {step:4}  train NLL: {mean_nll:.4}  (delta from base: {:+.4})",
+                        mean_nll - base_nll
+                    ),
+                }
             }
             if emit_json {
                 let val_json = match val_nll {
@@ -1237,16 +1250,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let secs = tstep.elapsed().as_secs_f64();
     let final_valid = eval_valid(&loras);
-    match (base_valid, final_valid) {
-        (Some(b), Some(f)) => println!(
-            "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
-            final_nll - base_nll,
-            f - b
-        ),
-        _ => println!(
-            "\n=== done: base NLL {base_nll:.4} → final NLL {final_nll:.4} ({:+.4}) in {secs:.1}s ===",
-            final_nll - base_nll
-        ),
+    if !emit_json {
+        match (base_valid, final_valid) {
+            (Some(b), Some(f)) => println!(
+                "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
+                final_nll - base_nll,
+                f - b
+            ),
+            _ => println!(
+                "\n=== done: base NLL {base_nll:.4} → final NLL {final_nll:.4} ({:+.4}) in {secs:.1}s ===",
+                final_nll - base_nll
+            ),
+        }
     }
 
     // Save PEFT adapter if --save was specified.
