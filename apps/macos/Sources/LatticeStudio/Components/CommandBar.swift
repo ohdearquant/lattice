@@ -357,10 +357,12 @@ struct CommandBar: View {
 
 extension CommandSpec {
     /// Standard commands wired to AppStore screens.
+    /// Arg hints use generic placeholders so the palette never implies a specific model
+    /// is installed. ContentView.handleCommand matches args against store.models at runtime.
     static let latticeDefaults: [CommandSpec] = [
-        CommandSpec(title: "train", args: ["qwen3.5", "r8"], description: "Start a LoRA training run"),
-        CommandSpec(title: "quantize", args: ["quarot", "qwen3.5"], description: "Quantize a model (Q4 or QuaRot)"),
-        CommandSpec(title: "chat", args: ["qwen3.5"], description: "Open chat / A-B compare"),
+        CommandSpec(title: "train", args: ["<model>", "<rank>"], description: "Start a LoRA training run"),
+        CommandSpec(title: "quantize", args: ["<method>", "<model>"], description: "Quantize a model (Q4 or QuaRot)"),
+        CommandSpec(title: "chat", args: ["<model>"], description: "Open chat / A-B compare"),
         CommandSpec(title: "models", args: [], description: "Browse downloaded models"),
         CommandSpec(title: "data", args: [], description: "Dataset prep and validation"),
         CommandSpec(title: "runs", args: [], description: "Browse run history"),

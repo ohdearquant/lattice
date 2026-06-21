@@ -23,9 +23,49 @@ final class AppStore {
 
     private var handle: RunHandle?
 
+    init() {
+        runs = Self.loadRunArchive()
+    }
+
     func onAppear() {
         refreshModels()
         binariesReady = LatticeBridge.prebuiltBinary(.lattice) != nil
+    }
+
+    // MARK: Run archive persistence
+
+    /// URL of the on-disk runs.json archive in the app's Application Support directory.
+    private static var runsArchiveURL: URL? {
+        guard let appSupport = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return nil }
+        let dir = appSupport.appendingPathComponent("LatticeStudio", isDirectory: true)
+        // Create the subdirectory on first access.
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("runs.json")
+    }
+
+    /// Decode the persisted run archive from disk. Returns an empty array on any failure
+    /// (missing file, corrupt JSON, schema mismatch) — honest empty, never fabricated.
+    private static func loadRunArchive() -> [RunRecord] {
+        guard let url = runsArchiveURL,
+              let data = try? Data(contentsOf: url) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([RunRecord].self, from: data)) ?? []
+    }
+
+    /// Atomically write the finished run archive to disk. Call only with completed records.
+    private func persistRunArchive() {
+        guard let url = Self.runsArchiveURL else { return }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .prettyPrinted
+        guard let data = try? encoder.encode(runs) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 
     func refreshModels() {
@@ -93,6 +133,11 @@ final class AppStore {
         case .quantLayer(let q):
             run.quantLayerIndex = q.i
             run.quantLayerCount = q.n
+            // Track the dominant quantized scheme (first non-passthrough scheme wins).
+            // F16 layers are kept as-is; the quantized scheme is what gives the after-bits.
+            if run.quantScheme == nil, q.scheme != "F16", q.scheme != "BF16" {
+                run.quantScheme = q.scheme
+            }
         case .quantDone(let q):
             run.quantBeforeMB = q.before_mb
             run.quantAfterMB = q.after_mb
@@ -124,6 +169,8 @@ final class AppStore {
             configSummary: nil, adapterPath: run.savedAdapterPath
         )
         runs.insert(rec, at: 0)
+        // Persist the archive immediately after appending the finished record.
+        persistRunArchive()
         if run.savedAdapterPath != nil { refreshModels() }
     }
 

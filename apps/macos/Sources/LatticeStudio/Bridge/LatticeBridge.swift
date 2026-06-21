@@ -161,17 +161,44 @@ enum LatticeBridge {
         var vocab: Int? = nil
         var layerSummary: String? = nil
         var dtype = format == .bf16 ? "BF16" : "Q4_0"
-        if let cfg = readConfig(dir.appendingPathComponent("config.json")) {
+        if let rawCfg = readConfig(dir.appendingPathComponent("config.json")) {
+            // Some models (e.g. MLX VLM repacks) nest text fields under `text_config`.
+            // Prefer the nested dict when present; fall back to top-level.
+            let cfg: [String: Any]
+            if let nested = rawCfg["text_config"] as? [String: Any] {
+                cfg = nested
+            } else {
+                cfg = rawCfg
+            }
             hidden = cfg["hidden_size"] as? Int
             vocab = cfg["vocab_size"] as? Int
-            if let nl = cfg["num_hidden_layers"] as? Int {
+            // Derive layer summary from real `layer_types` array when available.
+            if let layerTypes = cfg["layer_types"] as? [String] {
+                // Count each type and surface all non-zero counts.
+                var gdn = 0
+                var gqa = 0
+                var other: [String: Int] = [:]
+                for t in layerTypes {
+                    switch t {
+                    case "linear_attention": gdn += 1
+                    case "full_attention":   gqa += 1
+                    default:
+                        other[t, default: 0] += 1
+                    }
+                }
+                var parts: [String] = []
+                if gdn > 0 { parts.append("\(gdn) GDN") }
+                if gqa > 0 { parts.append("\(gqa) GQA") }
+                for (typeName, count) in other.sorted(by: { $0.key < $1.key }) {
+                    parts.append("\(count) \(typeName)")
+                }
+                layerSummary = parts.joined(separator: " · ")
+            } else if let nl = cfg["num_hidden_layers"] as? Int {
+                // No layer_types available; surface the raw count honestly.
                 layerSummary = "\(nl) layers"
             }
-            if let dt = cfg["torch_dtype"] as? String { dtype = dt.uppercased() }
-        }
-        // The Qwen3.5 flagship is a known hybrid; surface its layer split when recognizable.
-        if lower.contains("qwen3.5-0.8b") || lower.contains("qwen3.5") {
-            layerSummary = "18 GDN · 6 GQA"
+            // (If neither field is present, layerSummary stays nil and renders "—".)
+            if let dt = rawCfg["torch_dtype"] as? String { dtype = dt.uppercased() }
         }
 
         let params = parseParamCount(from: name)

@@ -68,10 +68,10 @@ struct AdapterInfo: Identifiable, Equatable {
 
 // MARK: - Runs (the lab notebook)
 
-enum RunKind: String, Equatable { case train = "LoRA", quantizeQ4 = "Q4", quantizeQuaRot = "QuaRot", chat = "Chat" }
-enum RunStatus: String, Equatable { case idle, running, paused, done, failed }
+enum RunKind: String, Equatable, Codable { case train = "LoRA", quantizeQ4 = "Q4", quantizeQuaRot = "QuaRot", chat = "Chat" }
+enum RunStatus: String, Equatable, Codable { case idle, running, paused, done, failed }
 
-struct RunRecord: Identifiable, Equatable {
+struct RunRecord: Identifiable, Equatable, Codable {
     var id: String
     var kind: RunKind
     var model: String
@@ -118,6 +118,7 @@ final class LiveRun {
     var quantLayerCount: Int = 0
     var verdict: String?
     var quantMaxAbs: Double?     // QuaRot forward-equivalence max abs error
+    var quantScheme: String?     // dominant quantization scheme seen in quant_layer events
 
     // Generation streaming (chat / generate_lora --json mode)
     var genText: String = ""       // accumulated incremental token deltas from gen_token events

@@ -346,6 +346,24 @@ struct QuantizeScreen: View {
             return String(format: "−%.0f%%", saved)
         }()
 
+        // Map the dominant quant scheme to a bit-width for the BITS row.
+        // Before-bits: BF16/F16 input → 16. After-bits: derived from scheme.
+        let beforeBits: Int = 16  // quantize always takes BF16/F16 input
+        let afterBits: Int? = {
+            guard let scheme = run.quantScheme else { return nil }
+            let s = scheme.uppercased()
+            if s.hasPrefix("Q4") { return 4 }
+            if s.hasPrefix("Q8") { return 8 }
+            if s == "F16" || s == "BF16" { return 16 }
+            return nil
+        }()
+        let bitsAfterStr = afterBits.map { "\($0)" } ?? "—"
+        let bitsDelta: String = {
+            guard let a = afterBits, a < beforeBits else { return "—" }
+            let saved = Double(beforeBits - a) / Double(beforeBits) * 100
+            return String(format: "−%.0f%%", saved)
+        }()
+
         var metrics: [ContrastMetric] = [
             ContrastMetric(
                 label: "SIZE",
@@ -356,10 +374,10 @@ struct QuantizeScreen: View {
             ),
             ContrastMetric(
                 label: "BITS",
-                beforeValue: "16",
-                afterValue: "4",
-                delta: "−75%",
-                deltaGood: true
+                beforeValue: "\(beforeBits)",
+                afterValue: bitsAfterStr,
+                delta: bitsDelta,
+                deltaGood: afterBits != nil
             ),
         ]
 
