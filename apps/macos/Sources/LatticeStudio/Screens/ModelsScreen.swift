@@ -279,6 +279,9 @@ struct ModelsScreen: View {
         if let vocab = model.vocab {
             ws.append(WellSpec("VOCAB", "\(vocab)"))
         }
+        if let ctx = model.contextLength {
+            ws.append(WellSpec("CTX", "\(ctx)"))
+        }
         if let layers = model.layerSummary {
             ws.append(WellSpec("LAYERS", layers))
         }

@@ -52,6 +52,7 @@ struct ModelInfo: Identifiable, Equatable {
     var layerSummary: String?   // e.g. "18 GDN · 6 GQA"
     var hidden: Int?
     var vocab: Int?
+    var contextLength: Int?     // max_position_embeddings; nil when config.json absent
     var isEmbedding: Bool = false
     var adapters: [AdapterInfo] = []
 }

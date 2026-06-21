@@ -160,6 +160,7 @@ enum LatticeBridge {
         var hidden: Int? = nil
         var vocab: Int? = nil
         var layerSummary: String? = nil
+        var contextLen: Int? = nil
         var dtype = format == .bf16 ? "BF16" : "Q4_0"
         if let rawCfg = readConfig(dir.appendingPathComponent("config.json")) {
             // Some models (e.g. MLX VLM repacks) nest text fields under `text_config`.
@@ -172,6 +173,10 @@ enum LatticeBridge {
             }
             hidden = cfg["hidden_size"] as? Int
             vocab = cfg["vocab_size"] as? Int
+            // Real max context (HF `max_position_embeddings`). `cfg` is the nested
+            // text_config for qwen3.5 or the top-level dict for flat configs, so one
+            // read covers both layouts. Stays nil (CTX well hidden) when no config.json.
+            contextLen = cfg["max_position_embeddings"] as? Int
             // Derive layer summary from real `layer_types` array when available.
             if let layerTypes = cfg["layer_types"] as? [String] {
                 // Count each type and surface all non-zero counts.
@@ -211,7 +216,7 @@ enum LatticeBridge {
         return ModelInfo(
             name: name, path: dir, format: format, params: params, dtype: dtype,
             sizeBytes: size, fileCount: files.count, hasTokenizer: names.contains("tokenizer.json"),
-            layerSummary: layerSummary, hidden: hidden, vocab: vocab, isEmbedding: isEmbedding,
+            layerSummary: layerSummary, hidden: hidden, vocab: vocab, contextLength: contextLen, isEmbedding: isEmbedding,
             adapters: adapters
         )
     }
