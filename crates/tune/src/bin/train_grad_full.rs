@@ -26,7 +26,7 @@
 // gradchecks cannot see.
 //
 // Qwen3.5 RMSNorm is SHIFTED (x·inv·(1+gamma)); rms_norm_forward/rmsnorm_backward
-// take plain gamma, so layer/final norms get (1+gamma) precomputed weights.
+// apply (1+gamma) internally, so layer/final norm fields carry raw gamma.
 // q_norm/k_norm are shifted inside gqa_forward_with_cache, so they stay raw.
 //
 // Usage: train_grad_full --model-dir <path> --data-dir <path> [--first-layer 19]
@@ -220,9 +220,10 @@ enum MixerKind {
 }
 
 /// Borrowed frozen weights for one materialised layer (lifetime tied to &model).
-/// Norm `*_shift` fields are the `(1 + gamma)` shifted layer norms; `q_norm`/
-/// `k_norm` are raw (gqa shifts internally). `lora_slot` indexes the mutable
-/// LoRA param array for GQA layers; `None` for frozen GDN layers.
+/// Norm `pre_norm`/`post_norm`/`final_norm` fields carry raw gamma; the shifted
+/// primitives (rms_norm_forward/rmsnorm_backward) apply (1+gamma) internally.
+/// `q_norm`/`k_norm` are raw (gqa shifts internally). `lora_slot` indexes the
+/// mutable LoRA param array for GQA layers; `None` for frozen GDN layers.
 struct LayerW<'a> {
     kind: MixerKind,
     // GQA mixer (valid iff kind == Gqa)
@@ -235,8 +236,8 @@ struct LayerW<'a> {
     // GDN mixer (valid iff kind == Gdn)
     gdn: Option<&'a GatedDeltaNetWeights>,
     // common
-    pre_shift: Vec<f32>,
-    post_shift: Vec<f32>,
+    pre_norm: Vec<f32>,
+    post_norm: Vec<f32>,
     w_gate: &'a [f32],
     w_up: &'a [f32],
     w_down: &'a [f32],
@@ -245,7 +246,7 @@ struct LayerW<'a> {
 
 struct Head<'a> {
     lm_head: &'a [f32],
-    final_shift: &'a [f32],
+    final_norm: &'a [f32],
 }
 
 /// Mutable LoRA factors for one GQA layer (q_proj + v_proj).
@@ -361,7 +362,7 @@ fn forward_full(
 
     for lw in layers {
         let h_layer_in = h.clone();
-        let (normed_pre, inv_pre) = rmsnorm_seq(&h, &lw.pre_shift, hidden, seq, d.eps);
+        let (normed_pre, inv_pre) = rmsnorm_seq(&h, &lw.pre_norm, hidden, seq, d.eps);
 
         let (mixer_out, mixer_cache) = match lw.kind {
             MixerKind::Gqa => {
@@ -423,7 +424,7 @@ fn forward_full(
             *a += *b;
         }
 
-        let (normed_ffn, inv_ffn) = rmsnorm_seq(&h_mid, &lw.post_shift, hidden, seq, d.eps);
+        let (normed_ffn, inv_ffn) = rmsnorm_seq(&h_mid, &lw.post_norm, hidden, seq, d.eps);
         let mut gate_pre = Vec::with_capacity(seq);
         let mut up_pre = Vec::with_capacity(seq);
         let mut h_next = h_mid.clone();
@@ -462,7 +463,7 @@ fn forward_full(
     let mut positions = Vec::new();
     for t in (ctx.completion_start - 1)..seq - 1 {
         let (final_normed, inv_final) =
-            rms_norm_forward(&h[t * hidden..(t + 1) * hidden], head.final_shift, d.eps);
+            rms_norm_forward(&h[t * hidden..(t + 1) * hidden], head.final_norm, d.eps);
         let logits = lm_head_logits(head.lm_head, &final_normed, hidden, d.vocab);
         positions.push(HeadPos {
             t,
@@ -544,7 +545,7 @@ fn nll_and_grads(
         let d_final = linear_vjp(head.lm_head, &d_logits, hidden, d.vocab);
         let d_h_t = rmsnorm_backward(
             &fwd.h_final[p.t * hidden..(p.t + 1) * hidden],
-            head.final_shift,
+            head.final_norm,
             p.inv_final,
             &d_final,
         );
@@ -575,7 +576,7 @@ fn nll_and_grads(
             );
             let d_hm = rmsnorm_backward(
                 &lf.h_mid[t * hidden..(t + 1) * hidden],
-                &lw.post_shift,
+                &lw.post_norm,
                 lf.inv_ffn[t],
                 &d_normed_ffn,
             );
@@ -632,7 +633,7 @@ fn nll_and_grads(
         for t in 0..seq {
             let d_hl = rmsnorm_backward(
                 &lf.h_layer_in[t * hidden..(t + 1) * hidden],
-                &lw.pre_shift,
+                &lw.pre_norm,
                 lf.inv_pre[t],
                 &d_normed_pre[t * hidden..(t + 1) * hidden],
             );
@@ -644,10 +645,6 @@ fn nll_and_grads(
     }
 
     (nll_sum as f32, fwd.positions.len(), grads)
-}
-
-fn shifted(gamma: &[f32]) -> Vec<f32> {
-    gamma.iter().map(|g| 1.0 + g).collect()
 }
 
 /// xorshift small-random fill in [-amp, amp].
@@ -790,10 +787,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (lm_head_s, final_norm_s, _embed) = model.head_weights();
     let lm_head = lm_head_s.to_vec();
-    let final_shift = shifted(final_norm_s);
+    let final_norm = final_norm_s.to_vec(); // raw gamma; rms_norm_forward applies (1+gamma)
     let head = Head {
         lm_head: &lm_head,
-        final_shift: &final_shift,
+        final_norm: &final_norm,
     };
 
     // Build the materialised layer stack [first_layer ..= 23], assigning a LoRA
@@ -815,8 +812,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 q_norm,
                 k_norm,
                 gdn: None,
-                pre_shift: shifted(pre),
-                post_shift: shifted(post),
+                pre_norm: pre.to_vec(),
+                post_norm: post.to_vec(),
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
@@ -832,8 +829,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 q_norm: &[],
                 k_norm: &[],
                 gdn: Some(gdn),
-                pre_shift: shifted(pre),
-                post_shift: shifted(post),
+                pre_norm: pre.to_vec(),
+                post_norm: post.to_vec(),
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
