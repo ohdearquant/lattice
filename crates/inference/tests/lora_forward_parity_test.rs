@@ -407,9 +407,7 @@ mod parity_tests {
                 // so context = 1.0 * v regardless of the score value
                 let _dot: f32 = q.iter().zip(k.iter()).map(|(qi, ki)| qi * ki).sum();
                 let ctx_off = qh * head_dim;
-                for d in 0..head_dim {
-                    context[ctx_off + d] = v[d]; // softmax=1 for single element
-                }
+                context[ctx_off..ctx_off + head_dim].copy_from_slice(&v[..head_dim]);
             }
 
             // 9. Sigmoid gate: context[i] *= sigmoid(gate_z[i])
@@ -584,5 +582,336 @@ mod parity_tests {
         );
         println!("  Verification: real_out[0..4]:      {:?}", &real_out[..4]);
         println!();
+    }
+
+    // ===================================================================
+    // TEST 4: Real-model LoRA forward parity
+    //
+    // Proves that the materialised GQA forward (gqa_forward_with_cache)
+    // matches the REAL loaded Qwen3.5-0.8B model at layer 23, WITH an
+    // identical nonzero LoRA on q_proj and v_proj injected into both paths.
+    //
+    // This closes the "self-consistent gradcheck" blind spot: prior
+    // gradchecks compared the materialised forward to itself; this
+    // compares it to the actual loaded model running real weights.
+    //
+    // Design:
+    //   1. Load the model from disk (skip gracefully if absent).
+    //   2. Build a nonzero LoRA for layer 23 (q_proj + v_proj only).
+    //   3. Inject LoRA into the real forward via a test-local LoraHook.
+    //   4. Run one token at position 0 through the real model, capturing
+    //      h_in (pre-input-layernorm residual) and attn_out (gated o_proj).
+    //   5. Apply input RMSNorm to h_in using the real layer-23 weights,
+    //      then call gqa_forward_with_cache with the same LoRA and identity
+    //      RoPE tables (position 0: cos=1, sin=0).
+    //   6. Assert max-abs-diff < 1e-3.
+    //
+    // Skip condition: model dir absent → print SKIP and return without fail.
+    // Feature gate: #[cfg(all(feature = "train-backward", feature = "f16"))]
+    //   (f16 enables BF16 dequant in from_safetensors).
+    // ===================================================================
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test4_real_model_lora_forward_parity_layer23() {
+        use lattice_inference::lora_hook::LoraHook;
+        use lattice_inference::model::qwen35::Qwen35Model;
+
+        // ------------------------------------------------------------------
+        // 1. Resolve model directory (env-var override with HF cache fallback)
+        // ------------------------------------------------------------------
+        let model_dir = std::env::var("LATTICE_QWEN35_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                std::path::PathBuf::from(home)
+                    .join(".cache/huggingface/hub")
+                    .join("models--Qwen--Qwen3.5-0.8B")
+                    .join("snapshots")
+                    .join("2fc06364715b967f1860aea9cf38778875588b17")
+            });
+
+        if !model_dir.is_dir() {
+            println!(
+                "SKIP: model not found at {} — set LATTICE_QWEN35_MODEL_DIR to run",
+                model_dir.display()
+            );
+            return;
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Load model and read real dims/eps from config
+        // ------------------------------------------------------------------
+        let mut model =
+            Qwen35Model::from_safetensors(&model_dir).expect("failed to load Qwen3.5-0.8B");
+
+        let cfg = model.config();
+        let hidden = cfg.hidden_size;
+        let num_q_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+        let head_dim = cfg.head_dim;
+        let rope_dim = cfg.rope_dim();
+        let eps = cfg.rms_norm_eps;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        println!(
+            "=== TEST 4: real-model LoRA forward parity (materialised vs loaded Qwen3.5 layer-23) ==="
+        );
+        println!(
+            "  dims: hidden={hidden} q_heads={num_q_heads} kv_heads={num_kv_heads} head_dim={head_dim}"
+        );
+        println!("        q_dim={q_dim} kv_dim={kv_dim} rope_dim={rope_dim}");
+        println!("  rms_norm_eps={eps:.2e}  (from model config — not hardcoded)");
+
+        // ------------------------------------------------------------------
+        // 3. Build nonzero LoRA for layer 23 only: q_proj + v_proj
+        //
+        //    q_proj LoRA shape: A=[rank, hidden], B=[2*q_dim, rank]  (q_proj
+        //      output is 2*q_dim due to per-head interleaved [Q|gate] layout)
+        //    v_proj LoRA shape: A=[rank, hidden], B=[kv_dim, rank]
+        // ------------------------------------------------------------------
+        let lora_rank = 4usize;
+        let lora_scale = 0.03f32;
+        let mut rng = 0x1234_ABCD_5678_EF01_u64;
+
+        let lora_a_q = rand_vec(&mut rng, lora_rank * hidden, 0.03);
+        let lora_b_q = rand_vec(&mut rng, 2 * q_dim * lora_rank, 0.03);
+        let lora_a_v = rand_vec(&mut rng, lora_rank * hidden, 0.03);
+        let lora_b_v = rand_vec(&mut rng, kv_dim * lora_rank, 0.03);
+
+        // ------------------------------------------------------------------
+        // 4. Test-local LoraHook: injects LoRA for (layer=23, q_proj)
+        //    and (layer=23, v_proj); no-op for everything else.
+        //
+        //    Convention matches gqa_forward_with_cache and production
+        //    forward.rs: output += scale * B @ (A @ x), row-major, A then B.
+        // ------------------------------------------------------------------
+        struct TestLoraHook {
+            layer: usize,
+            rank: usize,
+            scale: f32,
+            a_q: Vec<f32>,
+            b_q: Vec<f32>,
+            a_v: Vec<f32>,
+            b_v: Vec<f32>,
+        }
+
+        impl LoraHook for TestLoraHook {
+            fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+                if layer_idx != self.layer {
+                    return;
+                }
+                let (a, b, out_dim) = match module {
+                    "q_proj" => (&self.a_q, &self.b_q, output.len()),
+                    "v_proj" => (&self.a_v, &self.b_v, output.len()),
+                    _ => return,
+                };
+                let rank = self.rank;
+                let in_dim = x.len();
+                // h = A @ x  [rank]
+                let mut h = vec![0.0f32; rank];
+                for r in 0..rank {
+                    h[r] = a[r * in_dim..(r + 1) * in_dim]
+                        .iter()
+                        .zip(x.iter())
+                        .map(|(ai, xi)| ai * xi)
+                        .sum();
+                }
+                // output += scale * B @ h  [out_dim]
+                for i in 0..out_dim {
+                    let acc: f32 = b[i * rank..(i + 1) * rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(bi, hi)| bi * hi)
+                        .sum();
+                    output[i] += self.scale * acc;
+                }
+            }
+        }
+
+        model.set_lora(Box::new(TestLoraHook {
+            layer: 23,
+            rank: lora_rank,
+            scale: lora_scale,
+            a_q: lora_a_q.clone(),
+            b_q: lora_b_q.clone(),
+            a_v: lora_a_v.clone(),
+            b_v: lora_b_v.clone(),
+        }));
+
+        // ------------------------------------------------------------------
+        // 5. Run real forward for a single token at position 0.
+        //    capture_attn_io runs forward_step for each token in sequence;
+        //    with a single token [100], position=0, RoPE is identity (cos=1,
+        //    sin=0 for all dims since theta*0=0).
+        // ------------------------------------------------------------------
+        let tokens: Vec<u32> = vec![100];
+        let (h_in, captured_attn_out) = model
+            .capture_attn_io(&tokens, 23)
+            .expect("capture_attn_io failed for layer 23");
+
+        assert_eq!(
+            h_in.len(),
+            hidden,
+            "h_in length mismatch: got {} expected {hidden}",
+            h_in.len()
+        );
+        assert_eq!(
+            captured_attn_out.len(),
+            hidden,
+            "captured_attn_out length mismatch: got {} expected {hidden}",
+            captured_attn_out.len()
+        );
+
+        // ------------------------------------------------------------------
+        // 6. Get real layer-23 weights
+        // ------------------------------------------------------------------
+        let (w_q, w_k, w_v, w_o, q_norm_w, k_norm_w, pre_attn_norm, _post, _g, _u, _d) = model
+            .gqa_layer_weights(23)
+            .expect("layer 23 is a Full+Dense GQA layer");
+
+        // ------------------------------------------------------------------
+        // 7. Recompute input-layernorm: normed = rms_norm(h_in, pre_attn_norm)
+        //    using real shifted gamma (1+gamma)*inv_rms, matching qwen35_rms_norm.
+        //    The materialised forward expects already-normed input.
+        // ------------------------------------------------------------------
+        let mut normed_input = h_in.clone();
+        real_rms_norm_shifted(&mut normed_input, pre_attn_norm, hidden, eps);
+
+        // ------------------------------------------------------------------
+        // 8. Build identity RoPE tables for position 0: cos=1, sin=0.
+        //    rope_dim/2 entries per position; seq_len=1.
+        // ------------------------------------------------------------------
+        let half_rope = rope_dim / 2;
+        let cos_table = vec![1.0f32; half_rope]; // cos(0) = 1
+        let sin_table = vec![0.0f32; half_rope]; // sin(0) = 0
+
+        // ------------------------------------------------------------------
+        // 9. Run materialised forward (gqa_forward_with_cache)
+        //    with the same LoRA arrays and real weights.
+        // ------------------------------------------------------------------
+        let (materialised_out, _cache) = gqa_forward_with_cache(
+            &normed_input,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            q_norm_w,
+            k_norm_w,
+            Some(&lora_a_q),
+            Some(&lora_b_q),
+            Some(&lora_a_v),
+            Some(&lora_b_v),
+            lora_rank,
+            lora_scale,
+            1, // seq_len
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps,
+        );
+
+        // ------------------------------------------------------------------
+        // 10. Localisation baseline: run materialised forward with zero LoRA
+        //     to isolate the LoRA-injection contribution.
+        // ------------------------------------------------------------------
+        let zero_a_q = vec![0.0f32; lora_rank * hidden];
+        let zero_b_q = vec![0.0f32; 2 * q_dim * lora_rank];
+        let zero_a_v = vec![0.0f32; lora_rank * hidden];
+        let zero_b_v = vec![0.0f32; kv_dim * lora_rank];
+
+        // Materialised forward with zero LoRA (M0).
+        let (materialised_no_lora, _) = gqa_forward_with_cache(
+            &normed_input,
+            w_q,
+            w_k,
+            w_v,
+            w_o,
+            q_norm_w,
+            k_norm_w,
+            Some(&zero_a_q),
+            Some(&zero_b_q),
+            Some(&zero_a_v),
+            Some(&zero_b_v),
+            lora_rank,
+            lora_scale,
+            1,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps,
+        );
+
+        // True no-LoRA real baseline (R0): re-capture the real model with a
+        // zero-LoRA hook so d_no_lora compares materialised-no-LoRA (M0) vs
+        // real-no-LoRA (R0), isolating base f32 divergence from the LoRA delta.
+        // Comparing M0 against the with-LoRA capture (R1) would conflate the
+        // base gap with the LoRA-delta magnitude (they coincide numerically).
+        model.set_lora(Box::new(TestLoraHook {
+            layer: 23,
+            rank: lora_rank,
+            scale: lora_scale,
+            a_q: zero_a_q,
+            b_q: zero_b_q,
+            a_v: zero_a_v,
+            b_v: zero_b_v,
+        }));
+        let (_h_in_no_lora, captured_attn_out_no_lora) = model
+            .capture_attn_io(&tokens, 23)
+            .expect("capture_attn_io (no-LoRA baseline) failed for layer 23");
+
+        // ------------------------------------------------------------------
+        // 11. Measure and report
+        // ------------------------------------------------------------------
+        let d = max_abs_diff(&materialised_out, &captured_attn_out);
+        let d_no_lora = max_abs_diff(&materialised_no_lora, &captured_attn_out_no_lora);
+        let lora_contribution = max_abs_diff(&materialised_out, &materialised_no_lora);
+
+        println!();
+        println!(
+            "  Sample materialised_out[0..4]: {:?}",
+            &materialised_out[..4.min(hidden)]
+        );
+        println!(
+            "  Sample captured_attn_out[0..4]: {:?}",
+            &captured_attn_out[..4.min(hidden)]
+        );
+        println!();
+        println!("  Localisation:");
+        println!("    max-diff(materialised vs real), NO LoRA:   {d_no_lora:.6e}");
+        println!("    LoRA delta contribution (mat_lora - mat_no_lora): {lora_contribution:.6e}");
+        println!("    MEASURED max-diff(materialised vs real model): {d:.6e}");
+
+        if d < 1e-3 {
+            println!(
+                "  [PASS] max-diff < 1e-3: materialised GQA forward matches real model with LoRA."
+            );
+        } else {
+            println!("  [FAIL] max-diff >= 1e-3: divergence detected.");
+            println!("  Diagnosis hints:");
+            if d_no_lora < 1e-3 && d >= 1e-3 {
+                println!("    LoRA injection mismatch (no-LoRA passes, LoRA fails).");
+            } else if d_no_lora >= 1e-3 {
+                println!(
+                    "    Base forward divergence (no-LoRA fails); check norm eps, o_proj LoRA."
+                );
+            }
+        }
+        println!();
+
+        assert!(
+            d < 1e-3,
+            "TEST 4 FAILED: max-abs-diff(materialised vs real-model) = {d:.6e} >= 1e-3. \
+             No-LoRA baseline diff = {d_no_lora:.6e}. LoRA contribution = {lora_contribution:.6e}."
+        );
     }
 }
