@@ -24,7 +24,7 @@ private struct DatasetFileStat: Identifiable {
     let id: String         // the file path
     let url: URL
     let name: String       // last path component
-    let exampleCount: Int  // 0 if capped or 0 real lines
+    let exampleCount: Int  // real line count, capped at 5 000; 0 only if unreadable/empty
     let isCapped: Bool     // true when the file had > 5 000 lines
     let approxTokens: Int  // rough estimate: total chars / 4
     let avgLen: Int        // approxTokens / exampleCount (or 0)
@@ -368,7 +368,11 @@ struct DataScreen: View {
                 alignment: .trailing,
                 minWidth: 90,
                 isNumeric: true
-            ) { formatLargeNumber($0.approxTokens) },
+            ) { row in
+                // Capped files sum tokens over only the first 5 000 lines, so the
+                // total is a lower bound — mark it with "+" like the EXAMPLES column.
+                row.isCapped ? formatLargeNumber(row.approxTokens) + "+" : formatLargeNumber(row.approxTokens)
+            },
             ColumnDef(
                 id: "avg",
                 header: "AVG LEN",
