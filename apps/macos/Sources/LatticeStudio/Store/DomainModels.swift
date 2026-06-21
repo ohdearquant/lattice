@@ -53,6 +53,11 @@ struct ModelInfo: Identifiable, Equatable {
     var hidden: Int?
     var vocab: Int?
     var contextLength: Int?     // max_position_embeddings; nil when config.json absent
+    var attnHeads: Int?         // num_attention_heads (GQA query heads)
+    var kvHeads: Int?           // num_key_value_heads (GQA KV heads)
+    var headDim: Int?           // head_dim (explicit; NOT hidden/heads for qwen3.5)
+    var gdnKeyHeads: Int?       // linear_num_key_heads (GatedDeltaNet)
+    var gdnValueHeads: Int?     // linear_num_value_heads (GatedDeltaNet)
     var isEmbedding: Bool = false
     var adapters: [AdapterInfo] = []
 }

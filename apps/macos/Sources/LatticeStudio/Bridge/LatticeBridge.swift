@@ -161,6 +161,11 @@ enum LatticeBridge {
         var vocab: Int? = nil
         var layerSummary: String? = nil
         var contextLen: Int? = nil
+        var attnHeads: Int? = nil
+        var kvHeads: Int? = nil
+        var headDim: Int? = nil
+        var gdnKeyHeads: Int? = nil
+        var gdnValueHeads: Int? = nil
         var dtype = format == .bf16 ? "BF16" : "Q4_0"
         if let rawCfg = readConfig(dir.appendingPathComponent("config.json")) {
             // Some models (e.g. MLX VLM repacks) nest text fields under `text_config`.
@@ -177,6 +182,12 @@ enum LatticeBridge {
             // text_config for qwen3.5 or the top-level dict for flat configs, so one
             // read covers both layouts. Stays nil (CTX well hidden) when no config.json.
             contextLen = cfg["max_position_embeddings"] as? Int
+            // Attention head config — same nested-resolved cfg; honest-nil for flat/absent configs.
+            attnHeads = cfg["num_attention_heads"] as? Int
+            kvHeads = cfg["num_key_value_heads"] as? Int
+            headDim = cfg["head_dim"] as? Int
+            gdnKeyHeads = cfg["linear_num_key_heads"] as? Int
+            gdnValueHeads = cfg["linear_num_value_heads"] as? Int
             // Derive layer summary from real `layer_types` array when available.
             if let layerTypes = cfg["layer_types"] as? [String] {
                 // Count each type and surface all non-zero counts.
@@ -216,8 +227,10 @@ enum LatticeBridge {
         return ModelInfo(
             name: name, path: dir, format: format, params: params, dtype: dtype,
             sizeBytes: size, fileCount: files.count, hasTokenizer: names.contains("tokenizer.json"),
-            layerSummary: layerSummary, hidden: hidden, vocab: vocab, contextLength: contextLen, isEmbedding: isEmbedding,
-            adapters: adapters
+            layerSummary: layerSummary, hidden: hidden, vocab: vocab, contextLength: contextLen,
+            attnHeads: attnHeads, kvHeads: kvHeads, headDim: headDim,
+            gdnKeyHeads: gdnKeyHeads, gdnValueHeads: gdnValueHeads,
+            isEmbedding: isEmbedding, adapters: adapters
         )
     }
 

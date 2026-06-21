@@ -282,6 +282,15 @@ struct ModelsScreen: View {
         if let ctx = model.contextLength {
             ws.append(WellSpec("CTX", "\(ctx)"))
         }
+        if let h = model.attnHeads { ws.append(WellSpec("HEADS", "\(h)")) }
+        if let kv = model.kvHeads { ws.append(WellSpec("KV HEADS", "\(kv)")) }
+        if let hd = model.headDim { ws.append(WellSpec("HEAD DIM", "\(hd)")) }
+        // GatedDeltaNet linear-attention heads; show K/V, honest-nil each, omit when both absent.
+        if model.gdnKeyHeads != nil || model.gdnValueHeads != nil {
+            let k = model.gdnKeyHeads.map(String.init) ?? "—"
+            let v = model.gdnValueHeads.map(String.init) ?? "—"
+            ws.append(WellSpec("GDN HEADS", "\(k)/\(v)"))
+        }
         if let layers = model.layerSummary {
             ws.append(WellSpec("LAYERS", layers))
         }
