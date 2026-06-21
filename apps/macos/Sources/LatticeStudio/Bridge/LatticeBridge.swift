@@ -13,28 +13,34 @@ enum LatticeBinary {
     case generateLora         // lattice-tune, features: safetensors,inference-hook
     case lattice              // lattice-inference — `chat` / `serve` subcommands
     case qwen35Generate       // lattice-inference
+    case evalPerplexity       // lattice-inference — strided sliding-window perplexity (ADR-044)
+    case embed                // lattice-embed   — batch text embedding with cosine report
 
     var binName: String {
         switch self {
-        case .trainGradFull: "train_grad_full"
-        case .quantizeQ4: "quantize_q4"
+        case .trainGradFull:  "train_grad_full"
+        case .quantizeQ4:     "quantize_q4"
         case .quantizeQuaRot: "quantize_quarot"
-        case .generateLora: "generate_lora"
-        case .lattice: "lattice"
+        case .generateLora:   "generate_lora"
+        case .lattice:        "lattice"
         case .qwen35Generate: "qwen35_generate"
+        case .evalPerplexity: "eval_perplexity"
+        case .embed:          "embed"
         }
     }
     var crate: String {
         switch self {
         case .trainGradFull, .generateLora: "lattice-tune"
-        default: "lattice-inference"
+        case .embed:                        "lattice-embed"
+        default:                            "lattice-inference"
         }
     }
     var features: [String] {
         switch self {
         case .trainGradFull: ["train-backward"]
-        case .generateLora: ["safetensors", "inference-hook"]
-        default: []
+        case .generateLora:  ["safetensors", "inference-hook"]
+        case .evalPerplexity: ["f16", "metal-gpu"]
+        default:             []
         }
     }
 }
@@ -325,6 +331,144 @@ enum LatticeBridge {
         }
 
         return (rank: rank, alpha: alpha, targetModules: targetModules)
+    }
+
+    /// Read adapter metadata from an MLX-LM format `adapter_config.json` in a directory.
+    ///
+    /// Handles MLX-LM keys:
+    ///   - `lora_parameters.rank`   (Int)
+    ///   - `lora_parameters.scale`  (Double or Int)
+    ///   - `lora_parameters.dropout` (Double or Int)
+    ///   - `model`                  (String → baseModel)
+    ///   - `num_layers`             (Int)
+    ///
+    /// Returns nil when the file is absent, unreadable, or not a dictionary.
+    /// All individual fields can be independently nil (honest-nil policy).
+    static func readMlxAdapterConfig(dir: URL) -> (rank: Int?, scale: Double?, dropout: Double?, baseModel: String?, numLayers: Int?)? {
+        let configURL = dir.appendingPathComponent("adapter_config.json")
+        guard let data = try? Data(contentsOf: configURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        var rank: Int? = nil
+        var scale: Double? = nil
+        var dropout: Double? = nil
+
+        if let loraParams = obj["lora_parameters"] as? [String: Any] {
+            rank = loraParams["rank"] as? Int
+            if let s = loraParams["scale"] as? Double {
+                scale = s
+            } else if let s = loraParams["scale"] as? Int {
+                scale = Double(s)
+            }
+            if let d = loraParams["dropout"] as? Double {
+                dropout = d
+            } else if let d = loraParams["dropout"] as? Int {
+                dropout = Double(d)
+            }
+        }
+
+        let baseModel = obj["model"] as? String
+        let numLayers = obj["num_layers"] as? Int
+
+        return (rank: rank, scale: scale, dropout: dropout, baseModel: baseModel, numLayers: numLayers)
+    }
+
+    /// Scan a directory of adapter packages (subdirectories) into [AdapterInfo].
+    ///
+    /// A subdirectory qualifies as an adapter package if it contains:
+    ///   - `adapter_config.json`, OR
+    ///   - Any file matching `adapters.safetensors`, `adapter.safetensors`, or `*_adapters.safetensors`
+    ///
+    /// Metadata resolution order:
+    ///   1. `readMlxAdapterConfig` from `adapter_config.json` (MLX-LM format)
+    ///   2. `readPeftAdapterConfig` from sibling `adapter_config.json` (PEFT fallback, for rank/alpha)
+    ///   3. All config fields remain nil when neither source is present (honest).
+    ///
+    /// sizeBytes = sum of all `.safetensors` in the subdir.
+    /// checkpointCount = count of files matching `*_adapters.safetensors`.
+    /// Results are sorted by name.
+    static func discoverAdapterPackages(in root: URL) -> [AdapterInfo] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var result: [AdapterInfo] = []
+
+        for entry in entries {
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+
+            guard let children = try? fm.contentsOfDirectory(
+                at: entry,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            ) else { continue }
+
+            let childNames = Set(children.map { $0.lastPathComponent })
+
+            // Qualification: has config or any qualifying safetensors file
+            let hasConfig = childNames.contains("adapter_config.json")
+            let hasSafetensors = children.contains { f in
+                let name = f.lastPathComponent
+                return name == "adapters.safetensors"
+                    || name == "adapter.safetensors"
+                    || (name.hasSuffix("_adapters.safetensors") && f.pathExtension == "safetensors")
+            }
+            guard hasConfig || hasSafetensors else { continue }
+
+            // Size = sum of all .safetensors in the subdir
+            var sizeBytes: Int64 = 0
+            var checkpointCount = 0
+            for child in children where child.pathExtension == "safetensors" {
+                sizeBytes += Int64((try? child.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                if child.lastPathComponent.hasSuffix("_adapters.safetensors") {
+                    checkpointCount += 1
+                }
+            }
+
+            // Metadata resolution
+            var rank: Int? = nil
+            var alpha: Double? = nil
+            var scale: Double? = nil
+            var targetModules: String? = nil
+            var baseModel: String? = nil
+            var numLayers: Int? = nil
+
+            if let mlx = readMlxAdapterConfig(dir: entry) {
+                rank = mlx.rank
+                scale = mlx.scale
+                baseModel = mlx.baseModel
+                numLayers = mlx.numLayers
+                // MLX format has no alpha/targetModules; leave them nil
+            } else {
+                // PEFT fallback: pick any safetensors file in the dir as a sibling anchor
+                if let anySt = children.first(where: { $0.pathExtension == "safetensors" }),
+                   let peft = readPeftAdapterConfig(sibling: anySt) {
+                    rank = peft.rank
+                    alpha = peft.alpha
+                    targetModules = peft.targetModules
+                }
+            }
+
+            let info = AdapterInfo(
+                name: entry.lastPathComponent,
+                path: entry,
+                rank: rank,
+                alpha: alpha,
+                targetModules: targetModules,
+                sizeBytes: sizeBytes,
+                baseModel: baseModel,
+                scale: scale,
+                numLayers: numLayers,
+                checkpointCount: checkpointCount
+            )
+            result.append(info)
+        }
+
+        return result.sorted { $0.name < $1.name }
     }
 
     /// Scan a directory of `.safetensors` adapter files into AdapterInfo.

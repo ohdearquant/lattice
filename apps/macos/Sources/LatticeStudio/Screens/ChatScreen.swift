@@ -1,16 +1,23 @@
 import SwiftUI
 
-// MARK: - 04 CHAT
+// MARK: - 02 CHAT
 //
-// Redesigned as a friendly, minimal chat interface with progressive disclosure.
+// Redesigned as a focused, minimal chat interface with progressive disclosure.
 //
-// Layout (three zones):
-//   • TOP BAR      — slim 44pt strip: model Menu (left).
-//   • TRANSCRIPT   — scrollable column of chat bubbles, max-width 920pt, centered.
-//   • COMPOSER     — rounded TextEditor + Send CTA (bottom).
+// Layout (two zones inside ScreenScaffold):
+//   • TAB PICKER   — segmented control "Chat | History" (max 240pt, left-aligned).
+//                    In Chat tab: A/B mode picker on the right (max 160pt).
+//   • TRANSCRIPT   — scrollable column of chat bubbles (Chat tab), max-width 920pt, centered.
+//                    Single mode: one column of ChatTurn bubbles.
+//                    A/B compare mode: two equal columns (Base | Adapter), side by side.
+//                    OR run-history DataTable + live banner (History tab).
+//   • COMPOSER     — rounded TextEditor with Send/Stop as a 30×30 in-composer button
+//                    (bottom-trailing overlay). Chat tab only; hidden in History tab.
 //
-// All knobs (adapter, temperature, max tokens, seed) are hidden in a toggleable
-// right-side .inspector sidebar, shown via the window-toolbar toggle button or ⌘\.
+// ScreenScaffold supplies the indexed header "02 · CHAT" + a subtitle line showing
+// the active model and adapter. All knobs (model, adapter, temperature, max tokens,
+// seed) live in a toggleable right-side .inspector sidebar using InspectorShell.
+// Inspector content switches on chatTab: Chat → settings; History → selected-run detail.
 //
 // Generation model: unchanged from prior implementation.
 //   generate_lora prints output ATOMICALLY. A "message" lifecycle is:
@@ -21,10 +28,27 @@ import SwiftUI
 //   .onChange(of: store.liveRun?.status) fires when the subprocess exits.
 //   awaitingTurnID: UUID? tracks which turn receives the result.
 //
-// A/B comparison: dropped for this pass. Adapter is now a single advanced setting
-// in the settings inspector sidebar. One active adapter, no fader/variant label.
+// A/B comparison:
+//   AppStore holds a SINGLE handle + liveRun; each runGenerate STOPS any prior run.
+//   A/B is therefore SEQUENTIAL: base completes (onComplete fires on MainActor) →
+//   adapter run starts. onComplete is the sequencing primitive; status.onChange is
+//   single-mode only (it guards on awaitingTurnID which compare mode never sets).
 
-// MARK: - Local domain model
+// MARK: - ChatTab
+
+private enum ChatTab: String, CaseIterable {
+    case chat    = "Chat"
+    case history = "History"
+}
+
+// MARK: - ChatMode
+
+private enum ChatMode: String, CaseIterable {
+    case single  = "Single"
+    case compare = "A/B"
+}
+
+// MARK: - Local domain model (single mode)
 
 private struct ChatTurn: Identifiable {
     enum TurnStatus { case running, done, failed }
@@ -35,6 +59,28 @@ private struct ChatTurn: Identifiable {
     var status: TurnStatus = .running
     var tokensPerSecond: Double? = nil
 }
+
+// MARK: - Compare domain model
+
+private struct ComparePair: Identifiable {
+    enum Side { case base, adapter }
+
+    let id = UUID()
+    let prompt: String           // raw user text (for display)
+    let baseLabel: String        // base model name, snapshotted at creation so the
+    let adapterLabel: String     // attribution survives later picker changes (codex B2)
+    var baseText: String = ""
+    var baseTokS: Double? = nil
+    var baseDone: Bool = false
+    var adapterText: String = ""
+    var adapterTokS: Double? = nil
+    var adapterDone: Bool = false
+    var failed: Bool = false
+}
+
+// MARK: - A/B phase tracker
+
+private enum ABPhase { case idle, base, adapter }
 
 // MARK: - Typing indicator dots
 
@@ -68,6 +114,8 @@ private struct TypingDots: View {
 // MARK: - Settings inspector content
 
 private struct ChatInspector: View {
+    let modelOptions: [ModelInfo]
+    @Binding var selectedModelName: String
     let adapterOptions: [String]
     @Binding var selectedAdapterName: String
     @Binding var tempText: String
@@ -75,13 +123,20 @@ private struct ChatInspector: View {
     @Binding var seedText: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        InspectorShell(title: "Settings") {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                Text("Settings")
-                    .font(Theme.Fonts.sectionLabel)
-                    .tracking(0.5)
-                    .textCase(.uppercase)
-                    .foregroundStyle(Theme.Palette.textSecondary)
+                // Model
+                settingsRow(label: "Model") {
+                    Picker("", selection: $selectedModelName) {
+                        ForEach(modelOptions, id: \.name) { model in
+                            Text(model.name).tag(model.name)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .font(Theme.Fonts.body)
+                    .disabled(modelOptions.count <= 1)
+                }
 
                 // Adapter
                 settingsRow(label: "Adapter") {
@@ -113,11 +168,7 @@ private struct ChatInspector: View {
                     LatticeNumericField(prompt: "random", text: $seedText, width: 88)
                 }
             }
-            Spacer(minLength: 0)
         }
-        .padding(Theme.Space.lg)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Theme.Palette.panel)
     }
 
     @ViewBuilder
@@ -139,9 +190,23 @@ struct ChatScreen: View {
 
     // MARK: Local state
 
+    // Tab selection: Chat playground vs History (run notebook)
+    @State private var chatTab: ChatTab = .chat
+    // History tab: selected run (owned here so selection survives tab switches)
+    @State private var selectedRunID: String?
+
+    // Chat mode: single or A/B compare
+    @State private var chatMode: ChatMode = .single
+
+    // Single-mode state
     @State private var turns: [ChatTurn] = []
     @State private var composerText: String = ""
     @State private var awaitingTurnID: UUID?
+
+    // Compare-mode state
+    @State private var comparePairs: [ComparePair] = []
+    @State private var awaitingPairID: UUID? = nil
+    @State private var abPhase: ABPhase = .idle
 
     // Model selection
     @State private var selectedModelName: String = ""
@@ -182,37 +247,97 @@ struct ChatScreen: View {
         return selectedModel?.adapters.first { $0.name == selectedAdapterName }
     }
 
+    // isRunning is true while a single-mode run is in flight OR while either phase
+    // of A/B is active. This keeps the Stop button live and Send disabled in both modes.
     private var isRunning: Bool {
         store.liveRun(matching: [.chat])?.status == .running
+            || abPhase != .idle
     }
 
     private var canSend: Bool {
         !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !isRunning
+            && !(chatMode == .compare && selectedAdapter == nil)
+    }
+
+    // MARK: Subtitle
+
+    private var subtitle: String {
+        guard let model = selectedModel else { return "no models found" }
+        let adapterLabel = selectedAdapterName == "none" ? "no adapter" : selectedAdapterName
+        return "\(model.name) · \(adapterLabel)"
     }
 
     // MARK: Body
 
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            Rectangle()
-                .fill(Theme.Palette.hairline)
-                .frame(height: 1)
-            transcriptArea
-            composerBar
+        ScreenScaffold(screen: .chat, subtitle: subtitle) {
+            VStack(spacing: 0) {
+                // Tab / mode picker row
+                HStack {
+                    // Chat | History tab picker — max 240pt, left-aligned
+                    Picker("", selection: $chatTab) {
+                        ForEach(ChatTab.allCases, id: \.self) { tab in
+                            Text(tab.rawValue).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
+
+                    Spacer()
+
+                    // Single | A/B mode picker — only visible in Chat tab
+                    if chatTab == .chat {
+                        Picker("", selection: $chatMode) {
+                            ForEach(ChatMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 160)
+                        // Disable A/B when no adapter is available for the current model
+                        .disabled(chatMode == .single && adapterOptions.count <= 1)
+                    }
+                }
+                .padding(.horizontal, Theme.Space.lg)
+                .padding(.top, Theme.Space.md)
+                .padding(.bottom, Theme.Space.sm)
+
+                // Tab content
+                switch chatTab {
+                case .chat:
+                    switch chatMode {
+                    case .single:
+                        transcriptArea
+                    case .compare:
+                        compareTranscriptArea
+                    }
+                    composerBar
+                case .history:
+                    RunsContent(store: store, selectedRunID: $selectedRunID)
+                }
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.Palette.canvas)
         .inspector(isPresented: $store.inspectorPresented) {
-            ChatInspector(
-                adapterOptions: adapterOptions,
-                selectedAdapterName: $selectedAdapterName,
-                tempText: $tempText,
-                maxTokensText: $maxTokensText,
-                seedText: $seedText
-            )
-            .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
+            switch chatTab {
+            case .chat:
+                ChatInspector(
+                    modelOptions: chatModels,
+                    selectedModelName: $selectedModelName,
+                    adapterOptions: adapterOptions,
+                    selectedAdapterName: $selectedAdapterName,
+                    tempText: $tempText,
+                    maxTokensText: $maxTokensText,
+                    seedText: $seedText
+                )
+                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+            case .history:
+                RunsContent(store: store, selectedRunID: $selectedRunID)
+                    .inspectorPanel
+                    .inspectorColumnWidth(min: 260, ideal: 300, max: 320)
+            }
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
@@ -221,58 +346,42 @@ struct ChatScreen: View {
             selectedAdapterName = "none"
         }
         .onChange(of: store.liveRun?.status) { _, newStatus in
+            // This handler is SINGLE-MODE ONLY. It guards on awaitingTurnID,
+            // which compare mode never sets, so it is inert during A/B runs.
             handleRunStatusChange(newStatus)
         }
         .onChange(of: store.liveRun?.genText) { _, newText in
-            // Live streaming: genText is cumulative — assign, not append.
-            guard let turnID = awaitingTurnID,
-                  store.liveRun?.kind == .chat,
-                  let idx = turns.firstIndex(where: { $0.id == turnID })
-            else { return }
-            turns[idx].responseText = newText ?? ""
+            // Route streaming tokens to whichever mode is currently active.
+            guard store.liveRun?.kind == .chat else { return }
+
+            if chatMode == .single {
+                // Single mode: update the awaiting turn directly.
+                guard let turnID = awaitingTurnID,
+                      let idx = turns.firstIndex(where: { $0.id == turnID })
+                else { return }
+                turns[idx].responseText = newText ?? ""
+
+            } else {
+                // Compare mode: route to the correct column based on the current phase.
+                guard let pid = awaitingPairID,
+                      let idx = comparePairs.firstIndex(where: { $0.id == pid })
+                else { return }
+                switch abPhase {
+                case .base:
+                    comparePairs[idx].baseText = newText ?? ""
+                case .adapter:
+                    comparePairs[idx].adapterText = newText ?? ""
+                case .idle:
+                    break
+                }
+            }
         }
         .onChange(of: store.liveRun?.log.count) { _, _ in
             // Belt-and-suspenders: log.count changes are noted; status onChange is the handler.
         }
     }
 
-    // MARK: Top bar
-
-    private var topBar: some View {
-        HStack(spacing: Theme.Space.sm) {
-            // Model menu — left side, no caps label
-            if chatModels.isEmpty {
-                Text("No models")
-                    .font(Theme.Fonts.bodyStrong)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-            } else {
-                Menu {
-                    ForEach(chatModels, id: \.name) { model in
-                        Button(model.name) {
-                            selectedModelName = model.name
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(selectedModelName.isEmpty ? "Select model" : selectedModelName)
-                            .font(Theme.Fonts.bodyStrong)
-                            .foregroundStyle(Theme.Palette.ink)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-
-            Spacer()
-        }
-        .frame(height: 44)
-        .padding(.horizontal, Theme.Space.lg)
-        .background(Theme.Palette.canvas)
-    }
-
-    // MARK: Transcript
+    // MARK: - Single-mode transcript
 
     @ViewBuilder
     private var transcriptArea: some View {
@@ -326,12 +435,12 @@ struct ChatScreen: View {
         }
     }
 
-    // MARK: Turn bubbles
+    // MARK: - Turn bubbles (single mode)
 
     @ViewBuilder
     private func turnView(_ turn: ChatTurn) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            // User bubble — right-aligned
+            // User bubble — right-aligned, neutral panel surface (no teal)
             HStack {
                 Spacer(minLength: Theme.Space.xxl)
                 Text(turn.prompt)
@@ -342,16 +451,16 @@ struct ChatScreen: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                     .background(
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(Theme.Palette.selectionFill)
+                        RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                            .fill(Theme.Palette.panel)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(Theme.Palette.selectionBorder, lineWidth: 1)
+                                RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
                             )
                     )
             }
 
-            // Assistant bubble — left-aligned
+            // Assistant bubble — left-aligned, surfaceRaised fill
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     if turn.status == .running && turn.responseText.isEmpty {
@@ -396,15 +505,204 @@ struct ChatScreen: View {
     }
 
     private var assistantBubbleBackground: some View {
-        RoundedRectangle(cornerRadius: 14, style: .continuous)
+        RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
             .fill(Theme.Palette.surfaceRaised)
             .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
                     .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
             )
     }
 
-    // MARK: Composer
+    // MARK: - Compare transcript (A/B mode)
+
+    @ViewBuilder
+    private var compareTranscriptArea: some View {
+        if selectedAdapter == nil {
+            // No adapter selected — show inline hint, disable send via canSend guard
+            VStack {
+                Spacer()
+                    .frame(minHeight: 0)
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(-1)
+                Text("Select an adapter in Settings to compare against the base model.")
+                    .font(Theme.Fonts.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(Theme.Space.lg)
+                    .frame(maxWidth: .infinity)
+                Spacer()
+                    .frame(minHeight: 0)
+                    .frame(maxHeight: .infinity)
+            }
+        } else if comparePairs.isEmpty {
+            VStack {
+                Spacer()
+                    .frame(minHeight: 0)
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(-1)
+                EmptyStateView(
+                    systemImage: "arrow.left.arrow.right",
+                    title: "A/B Compare",
+                    message: "Send a message to compare the base model against the adapter side by side."
+                )
+                .frame(maxWidth: .infinity)
+                Spacer()
+                    .frame(minHeight: 0)
+                    .frame(maxHeight: .infinity)
+            }
+        } else {
+            // Two-column split view
+            HStack(alignment: .top, spacing: 0) {
+                // Base column
+                compareColumn(
+                    header: "Base",
+                    pairs: comparePairs,
+                    side: .base
+                )
+
+                // Hairline divider between columns
+                Rectangle()
+                    .fill(Theme.Palette.hairline)
+                    .frame(width: 1)
+                    .frame(maxHeight: .infinity)
+
+                // Adapter column
+                compareColumn(
+                    header: "Adapter",
+                    pairs: comparePairs,
+                    side: .adapter
+                )
+            }
+        }
+    }
+
+    // A single side of the two-column compare layout
+    @ViewBuilder
+    private func compareColumn(
+        header: String,
+        pairs: [ComparePair],
+        side: ComparePair.Side
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Column header
+            Text(header)
+                .font(Theme.Fonts.caption)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.vertical, Theme.Space.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(height: 1)
+
+            // Scrollable pair list
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    ForEach(pairs) { pair in
+                        comparePairCell(pair: pair, side: side)
+                            .id(pair.id)
+                    }
+                }
+                .padding(Theme.Space.md)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // One cell in a compare column: prompt label + response + tok/s + Δ chip
+    @ViewBuilder
+    private func comparePairCell(pair: ComparePair, side: ComparePair.Side) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+            // Prompt label
+            Text(pair.prompt)
+                .font(Theme.Fonts.caption)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(2)
+
+            // Per-pair attribution — which model/adapter produced this side.
+            // Read from the pair's snapshot, so a later picker change cannot relabel
+            // a completed result with the wrong model (codex B2).
+            Text(side == .base ? pair.baseLabel : pair.adapterLabel)
+                .font(Theme.Fonts.caption)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(1)
+
+            // Response area
+            let isThisSideStreaming: Bool = {
+                guard let pid = awaitingPairID, pid == pair.id else { return false }
+                switch side {
+                case .base:    return abPhase == .base    && !pair.baseDone
+                case .adapter: return abPhase == .adapter && !pair.adapterDone
+                }
+            }()
+
+            let responseText: String = side == .base ? pair.baseText : pair.adapterText
+            let isDone: Bool         = side == .base ? pair.baseDone : pair.adapterDone
+
+            if isThisSideStreaming && responseText.isEmpty {
+                // Typing indicator before any tokens
+                HStack(spacing: Theme.Space.xs) {
+                    TypingDots()
+                    Text("Thinking…")
+                        .font(Theme.Fonts.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(assistantBubbleBackground)
+            } else if !responseText.isEmpty || isDone {
+                Text(responseText.isEmpty ? "(no output)" : responseText)
+                    .font(Theme.Fonts.body)
+                    .foregroundStyle(pair.failed ? Theme.Palette.error : Theme.Palette.ink)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(assistantBubbleBackground)
+
+                // tok/s caption
+                let tokS: Double? = side == .base ? pair.baseTokS : pair.adapterTokS
+                if let tps = tokS {
+                    Text(String(format: "%.1f tok/s", tps))
+                        .font(Theme.Fonts.caption)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .monospacedDigit()
+                }
+
+                // Δ tok/s chip — only when both sides are done
+                if side == .adapter, pair.baseDone, pair.adapterDone,
+                   let baseS = pair.baseTokS, let adpS = pair.adapterTokS {
+                    let delta = adpS - baseS
+                    let positive = delta >= 0
+                    let label = positive
+                        ? String(format: "+%.1f tok/s", delta)
+                        : String(format: "%.1f tok/s", delta)
+                    Text(label)
+                        .font(Theme.Fonts.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(positive ? Theme.Palette.signal : Theme.Palette.crimson)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(positive
+                                      ? Theme.Palette.signal.opacity(0.12)
+                                      : Theme.Palette.crimson.opacity(0.12))
+                        )
+                }
+            } else {
+                // Waiting for this side to start (e.g. adapter not yet begun)
+                Text("Waiting…")
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+            }
+        }
+    }
+
+    // MARK: - Composer
 
     private var composerBar: some View {
         VStack(spacing: 0) {
@@ -412,79 +710,117 @@ struct ChatScreen: View {
                 .fill(Theme.Palette.hairline)
                 .frame(height: 1)
 
-            HStack(alignment: .bottom, spacing: Theme.Space.sm) {
-                // Multiline input
-                ZStack(alignment: .topLeading) {
-                    if composerText.isEmpty {
-                        Text("Message…")
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.textTertiary)
-                            .padding(.horizontal, 10)
-                            .padding(.top, 9)
-                            .allowsHitTesting(false)
-                    }
-                    TextEditor(text: $composerText)
-                        .font(Theme.Fonts.body)
-                        .foregroundStyle(Theme.Palette.ink)
-                        .scrollContentBackground(.hidden)
-                        .background(.clear)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 4)
-                }
-                .frame(minHeight: 52, maxHeight: 140)
-                .background(Theme.Palette.surfaceRaised)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
-                        .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
-                )
-
-                // Send / Stop button stack
-                VStack(alignment: .trailing, spacing: Theme.Space.xs) {
-                    if isRunning {
-                        // Stop button: visible while generation is in flight.
-                        Button {
-                            userStoppedTurnID = awaitingTurnID
-                            store.stopRun()
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "stop.fill")
-                                    .font(.system(size: 11, weight: .medium))
-                                Text("Stop")
-                                    .font(Theme.Fonts.bodyStrong)
-                            }
-                            .foregroundStyle(Theme.Palette.crimson)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                                    .strokeBorder(Theme.Palette.crimson.opacity(0.5), lineWidth: 1)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        Button(action: send) {
-                            Text("Send")
-                        }
-                        .buttonStyle(LatticePrimaryButtonStyle())
-                        .disabled(!canSend)
-                        .keyboardShortcut(.return, modifiers: .command)
-
-                        HStack(spacing: 4) {
-                            KeyCapChip("⌘↵")
-                            Text("send")
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                        }
-                    }
-                }
+            // Centered 920-column composer, matching transcript column
+            HStack {
+                composerField
+                    .frame(maxWidth: Theme.Space.chatMaxWidth)
+                    .frame(maxWidth: .infinity)
             }
             .padding(Theme.Space.lg)
             .background(Theme.Palette.canvas)
         }
     }
 
-    // MARK: Actions
+    // The text field with an in-compositor Send/Stop button at the bottom-trailing edge.
+    private var composerField: some View {
+        ZStack(alignment: .topLeading) {
+            // Placeholder
+            if composerText.isEmpty {
+                Text("Message…")
+                    .font(Theme.Fonts.body)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.top, 9)
+                    .allowsHitTesting(false)
+            }
+            // TextEditor — trailing padding reserves space for the 30×30 button
+            TextEditor(text: $composerText)
+                .font(Theme.Fonts.body)
+                .foregroundStyle(Theme.Palette.ink)
+                .scrollContentBackground(.hidden)
+                .background(.clear)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .padding(.trailing, 40)
+        }
+        .frame(minHeight: 44, maxHeight: 160)
+        .background(Theme.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+        )
+        // In-composer Send / Stop button at bottom-trailing
+        .overlay(alignment: .bottomTrailing) {
+            actionButton
+                .padding(7)
+        }
+    }
+
+    @ViewBuilder
+    private var actionButton: some View {
+        if isRunning {
+            // Stop button — works for both single and compare modes
+            Button {
+                if chatMode == .single {
+                    userStoppedTurnID = awaitingTurnID
+                } else {
+                    // In A/B mode, stop current run and mark the pair as done with partial text
+                    if let pid = awaitingPairID,
+                       let idx = comparePairs.firstIndex(where: { $0.id == pid }) {
+                        switch abPhase {
+                        case .base:
+                            comparePairs[idx].baseDone = true
+                        case .adapter:
+                            comparePairs[idx].adapterDone = true
+                        case .idle:
+                            break
+                        }
+                        comparePairs[idx].failed = true
+                    }
+                    abPhase = .idle
+                    awaitingPairID = nil
+                }
+                store.stopRun()
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.crimson)
+                    .frame(width: 30, height: 30)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                            .fill(Theme.Palette.crimson.opacity(0.12))
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Stop generation")
+        } else {
+            // Send button — dispatches to the appropriate mode handler
+            Button(action: {
+                switch chatMode {
+                case .single:
+                    send()
+                case .compare:
+                    sendCompare()
+                }
+            }) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(canSend ? Theme.Palette.onAccent : Theme.Palette.textTertiary)
+                    .frame(width: 30, height: 30)
+                    .background(
+                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                            .fill(canSend ? Theme.Palette.signal : Theme.Palette.wellSink)
+                    )
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend)
+            .keyboardShortcut(.return, modifiers: .command)
+            .help("Send  ⌘↵")
+        }
+    }
+
+    // MARK: - Actions
 
     private func applyDefaults() {
         // Pick the first bf16 model if the current selection is missing or not bf16-generative.
@@ -522,6 +858,8 @@ struct ChatScreen: View {
         buf += "<|im_start|>assistant\n"
         return buf
     }
+
+    // MARK: Single-mode send
 
     private func send() {
         let rawUserText = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -613,6 +951,8 @@ struct ChatScreen: View {
     }
 
     private func handleRunStatusChange(_ newStatus: RunStatus?) {
+        // SINGLE-MODE ONLY. awaitingTurnID is never set in compare mode,
+        // so this guard makes the handler inert during A/B runs.
         guard let status = newStatus,
               status == .done || status == .failed,
               let turnID = awaitingTurnID,
@@ -620,5 +960,138 @@ struct ChatScreen: View {
         else { return }
 
         resolveTurn(id: turnID, from: run, status: status)
+    }
+
+    // MARK: - A/B compare send (sequential: base → adapter via onComplete)
+
+    private func sendCompare() {
+        let rawUserText = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawUserText.isEmpty, !isRunning, let adapter = selectedAdapter else { return }
+
+        // Build ChatML using the single-mode turns history for context.
+        // Compare pairs are independent A/B experiments and are not fed back
+        // into the conversation context (they are evaluation runs, not multi-turn chat).
+        let chatMLPrompt = renderChatML(newUserText: rawUserText)
+
+        // Create the pair and set state before launching the run.
+        let pair = ComparePair(
+            prompt: rawUserText,
+            baseLabel: selectedModel?.name ?? (selectedModelName.isEmpty ? "base model" : selectedModelName),
+            adapterLabel: adapter.name
+        )
+        let pairID = pair.id
+        comparePairs.append(pair)
+        awaitingPairID = pairID
+        abPhase = .base
+
+        composerText = ""
+
+        // Parse settings — safe fallbacks.
+        let temperature = Double(tempText) ?? 0.7
+        let maxTokens = Int(maxTokensText) ?? 256
+        let seed: UInt64? = seedText.isEmpty ? nil : UInt64(seedText)
+
+        // Snapshot the adapter path now; the selection could change before the
+        // adapter phase starts if the user interacts with the inspector.
+        let adapterPath = adapter.path
+        let modelDir = selectedModel?.path
+        let modelName: String? = selectedModel == nil
+            ? (selectedModelName.isEmpty ? nil : selectedModelName)
+            : nil
+
+        // Phase 1: base run (adapterPath = nil)
+        let baseCfg = GenConfig(
+            modelDir: modelDir,
+            model: modelName,
+            adapterPath: nil,
+            prompt: chatMLPrompt,
+            maxTokens: maxTokens,
+            seed: seed,
+            temperature: temperature
+        )
+        let baseRun = store.runGenerate(baseCfg)
+
+        // onComplete fires on MainActor after AppStore.finish() is called.
+        // It sequences the adapter run as Phase 2.
+        baseRun.onComplete = { [adapterPath, modelDir, modelName, maxTokens, seed, temperature, chatMLPrompt, pairID] completed in
+            // Update base side result.
+            guard let idx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
+                self.abPhase = .idle
+                self.awaitingPairID = nil
+                return
+            }
+            self.comparePairs[idx].baseText = completed.genText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            self.comparePairs[idx].baseTokS = completed.genTokS
+            self.comparePairs[idx].baseDone = true
+
+            // Only sequence the adapter phase if the base run completed cleanly.
+            // A user Stop terminates the process with a non-zero code → status .failed
+            // (RunStatus has no distinct .stopped case), so guarding on .done is what
+            // prevents a stopped base with partial output from still launching phase 2
+            // (codex B1 — the old `failed && genText.isEmpty` check let it through).
+            guard completed.status == .done else {
+                self.comparePairs[idx].failed = true
+                self.comparePairs[idx].adapterDone = true
+                self.abPhase = .idle
+                self.awaitingPairID = nil
+                return
+            }
+
+            // Phase 2: adapter run
+            self.abPhase = .adapter
+
+            let adpCfg = GenConfig(
+                modelDir: modelDir,
+                model: modelName,
+                adapterPath: adapterPath,
+                prompt: chatMLPrompt,
+                maxTokens: maxTokens,
+                seed: seed,
+                temperature: temperature
+            )
+            let adpRun = self.store.runGenerate(adpCfg)
+
+            adpRun.onComplete = { [pairID] done2 in
+                guard let adpIdx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
+                    self.abPhase = .idle
+                    self.awaitingPairID = nil
+                    return
+                }
+                self.comparePairs[adpIdx].adapterText = done2.genText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.comparePairs[adpIdx].adapterTokS = done2.genTokS
+                self.comparePairs[adpIdx].adapterDone = true
+                if done2.status == .failed && done2.genText.isEmpty {
+                    self.comparePairs[adpIdx].failed = true
+                }
+                self.abPhase = .idle
+                self.awaitingPairID = nil
+            }
+
+            // Handle synchronous failure of the adapter run launch.
+            if adpRun.status == .failed {
+                guard let adpIdx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
+                    self.abPhase = .idle
+                    self.awaitingPairID = nil
+                    return
+                }
+                self.comparePairs[adpIdx].adapterDone = true
+                self.comparePairs[adpIdx].failed = true
+                self.abPhase = .idle
+                self.awaitingPairID = nil
+            }
+        }
+
+        // Handle synchronous failure of the base run launch.
+        if baseRun.status == .failed {
+            if let idx = comparePairs.firstIndex(where: { $0.id == pairID }) {
+                comparePairs[idx].baseDone = true
+                comparePairs[idx].adapterDone = true
+                comparePairs[idx].failed = true
+            }
+            abPhase = .idle
+            awaitingPairID = nil
+        }
     }
 }

@@ -3,18 +3,30 @@ import AppKit
 
 // MARK: - 03 TRAIN — LoRA Training Instrument
 //
-// The flagship screen. Two-pane layout:
-//   LEFT  (~360pt, OpaquePanel): configuration form built from ParamRow* primitives.
-//   RIGHT (fills):              live instrument — ReadoutWells, StripChart, HeroNumber.
+// Layout:
+//   main canvas = configure card (idle) OR live instrument (when a run is active).
+//   advanced knobs live in a toggleable right InspectorShell inspector
+//   (default-CLOSED on first visit; ⌘\ or toolbar button reveals it).
+//
+// Essentials card (idle, main body):
+//   MODEL — dropdown from store.workingModel ?? store.defaultModel
+//   DATASET — read-only from store.workingDataset; hint to Data tab if nil
+//   RANK — segmented picker 4 / 8 / 16 / 32
+//   LR — stepper
+//   STEPS — stepper
+//   START — LatticePrimaryButtonStyle CTA
+//
+// Advanced (inspector only):
+//   ARCHITECTURE: first layer
+//   LORA: alpha
+//   SEQUENCE: seq len, max train, max valid, log every
+//   SAVE ADAPTER: toggle + output path
 //
 // Scrub-to-freeze: when scrubStep != nil, the top ReadoutWells show that step's
 // TrainPoint values instead of the latest. A live/frozen indicator sits below the chart.
 //
 // Store ownership: store.liveRun is read-only here. The store creates and owns the run;
 // a re-render of this view must never reset it.
-//
-// Phase A re-parenting: the DATASET section now hosts directory selection + Scan
-// (formerly DataScreen) and a DisclosureGroup for builder scripts.
 
 struct TrainScreen: View {
     @Bindable var store: AppStore
@@ -24,14 +36,7 @@ struct TrainScreen: View {
     // MODEL
     @State private var selectedModelName: String = ""
 
-    // DATASET
-    @State private var dataDirPath: String = ""
-    @State private var isScanning: Bool = false
-    @State private var scanError: String? = nil
-    @State private var scannedFiles: [DatasetFileStat] = []
-    @State private var showBuilderScripts: Bool = false
-
-    // Numeric params (stored as Double for slider binding compatibility)
+    // Numeric params (stored as Double for stepper binding compatibility)
     @State private var firstLayer: Double = 19
     @State private var steps: Double = 25
     @State private var lr: Double = 1e-3
@@ -49,6 +54,9 @@ struct TrainScreen: View {
     // SCRUB
     @State private var scrubStep: Int? = nil
 
+    // Inspector open-once guard — keeps it CLOSED on first visit
+    @State private var didInitInspector = false
+
     // MARK: Derived helpers
 
     private var modelNames: [String] {
@@ -63,6 +71,12 @@ struct TrainScreen: View {
         store.liveRun(matching: [.train])?.status == .running
     }
 
+    private var firstLayerCaption: String {
+        let first = Int(firstLayer)
+        if first == 0 { return "adapts every layer" }
+        return "adapts layer \(first) to last · layers 0–\(first - 1) frozen"
+    }
+
     // MARK: Body
 
     var body: some View {
@@ -75,22 +89,15 @@ struct TrainScreen: View {
                 }
             }
         ) {
-            HStack(alignment: .top, spacing: 0) {
-                configColumn
-                    .frame(width: 360)
-
-                // 1px hairline separator between panes
-                Theme.Palette.hairline
-                    .frame(width: 1)
-                    .frame(maxHeight: .infinity)
-
-                liveInstrumentColumn
-                    .frame(maxWidth: .infinity)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            liveInstrumentColumn
+        }
+        .inspector(isPresented: $store.inspectorPresented) {
+            advancedInspector
+                .inspectorColumnWidth(min: 300, ideal: 320, max: 380)
         }
         .onAppear {
             applyDefaults()
+            closeInspectorOnce()
         }
         .onChange(of: store.targetModel?.name) { _, newName in
             // Only update model selection if the user hasn't already picked one manually
@@ -99,6 +106,14 @@ struct TrainScreen: View {
                 updateAdapterDefaultPath(modelName: name)
             }
         }
+    }
+
+    // MARK: Close inspector on first visit (progressive disclosure default)
+
+    private func closeInspectorOnce() {
+        guard !didInitInspector else { return }
+        didInitInspector = true
+        store.inspectorPresented = false
     }
 
     // MARK: Subtitle
@@ -149,233 +164,89 @@ struct TrainScreen: View {
         }
     }
 
-    // MARK: - LEFT: Config Column
+    // MARK: - Advanced Inspector (right inspector — opened via ⌘\ or toolbar)
 
-    private var configColumn: some View {
-        ScrollView(.vertical, showsIndicators: false) {
+    private var advancedInspector: some View {
+        InspectorShell(title: "Advanced") {
             VStack(spacing: 0) {
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 0) {
 
-                // Section header: MODEL
-                sectionLabel("MODEL")
+                        // ARCHITECTURE
+                        sectionLabel("ARCHITECTURE")
 
-                if modelNames.isEmpty {
-                    ParamRow(label: "MODEL", value: "— none found —")
-                } else {
-                    ParamRowMenu(
-                        label: "MODEL",
-                        options: modelNames,
-                        selection: Binding(
-                            get: {
-                                selectedModelName.isEmpty
-                                    ? (modelNames.first ?? "")
-                                    : selectedModelName
-                            },
-                            set: { newVal in
-                                selectedModelName = newVal
-                                updateAdapterDefaultPath(modelName: newVal)
-                            }
+                        ParamRowStepper(
+                            label: "FIRST LAYER",
+                            value: $firstLayer,
+                            range: 0...23,
+                            step: 1,
+                            format: "%.0f",
+                            caption: firstLayerCaption
                         )
-                    )
-                }
 
-                // Section header: DATASET
-                sectionLabel("DATASET")
+                        // LORA
+                        sectionLabel("LORA")
 
-                HStack(spacing: 0) {
-                    ParamRowField(
-                        label: "DATA DIR",
-                        text: $dataDirPath,
-                        placeholder: "path/to/data/"
-                    )
-                    // "Choose…" button inlined at the row edge
-                    Button("Choose…") {
-                        chooseDataDir()
-                    }
-                    .font(Theme.Fonts.cell)
-                    .foregroundStyle(Theme.Palette.inkDim)
-                    .buttonStyle(.plain)
-                    .padding(.trailing, Theme.Space.lg)
-                }
+                        ParamRowStepper(
+                            label: "ALPHA",
+                            value: $alpha,
+                            range: 1...64,
+                            step: 1,
+                            format: "%.0f"
+                        )
 
-                // Scan row: button + inline status
-                HStack(spacing: Theme.Space.sm) {
-                    Spacer()
-                    if isScanning {
-                        ProgressView()
-                            .progressViewStyle(.circular)
-                            .controlSize(.mini)
-                    }
-                    Button(isScanning ? "Scanning…" : "Scan") {
-                        scanDataset()
-                    }
-                    .font(Theme.Fonts.cell)
-                    .foregroundStyle(Theme.Palette.inkDim)
-                    .buttonStyle(.plain)
-                    .disabled(isScanning || dataDirPath.trimmingCharacters(in: .whitespaces).isEmpty)
-                    .padding(.trailing, Theme.Space.lg)
-                }
-                .frame(height: Theme.Space.rowHeight)
+                        // SEQUENCE
+                        sectionLabel("SEQUENCE")
 
-                // Scan error banner
-                if let err = scanError {
-                    HStack(spacing: Theme.Space.sm) {
-                        GatePill(.fail, label: "scan error")
-                        Text(err)
-                            .font(Theme.Fonts.cell)
-                            .foregroundStyle(Theme.Palette.inkDim)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer()
-                    }
-                    .padding(.horizontal, Theme.Space.lg)
-                    .padding(.bottom, Theme.Space.xs)
-                }
+                        ParamRowStepper(
+                            label: "SEQ LEN",
+                            value: $seqLen,
+                            range: 16...512,
+                            step: 16,
+                            format: "%.0f"
+                        )
 
-                // Scan summary (shown once files are available)
-                if !scannedFiles.isEmpty {
-                    let totalExamples = scannedFiles.reduce(0) { $0 + $1.exampleCount }
-                    let hasCapped = scannedFiles.contains { $0.isCapped }
-                    ParamRow(
-                        label: "DATASET",
-                        value: "\(scannedFiles.count) file\(scannedFiles.count == 1 ? "" : "s") · \(totalExamples)\(hasCapped ? "+" : "") examples"
-                    )
-                }
+                        ParamRowStepper(
+                            label: "MAX TRAIN",
+                            value: $maxTrain,
+                            range: 1...64,
+                            step: 1,
+                            format: "%.0f"
+                        )
 
-                // Builder scripts — collapsed by default
-                DisclosureGroup(isExpanded: $showBuilderScripts) {
-                    ForEach(builderScripts, id: \.name) { script in
-                        HStack(spacing: Theme.Space.sm) {
-                            Text(script.command)
-                                .font(Theme.Fonts.cell)
-                                .foregroundStyle(Theme.Palette.ink)
-                                .monospacedDigit()
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer()
-                            Button("Copy") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(script.command, forType: .string)
-                            }
-                            .font(Theme.Fonts.cell)
-                            .foregroundStyle(Theme.Palette.inkDim)
-                            .buttonStyle(.plain)
+                        ParamRowStepper(
+                            label: "MAX VALID",
+                            value: $maxValid,
+                            range: 0...64,
+                            step: 1,
+                            format: "%.0f"
+                        )
+
+                        ParamRowStepper(
+                            label: "LOG EVERY",
+                            value: $logEvery,
+                            range: 1...50,
+                            step: 1,
+                            format: "%.0f"
+                        )
+
+                        // SAVE ADAPTER
+                        sectionLabel("SAVE ADAPTER")
+
+                        ParamRowToggle(label: "SAVE ADAPTER", isOn: $saveAdapterEnabled)
+
+                        if saveAdapterEnabled {
+                            ParamRowField(
+                                label: "OUTPUT PATH",
+                                text: $saveAdapterPath,
+                                placeholder: "adapters/<model>-r<rank>.safetensors"
+                            )
                         }
-                        .frame(height: Theme.Space.rowHeight)
-                        .padding(.horizontal, Theme.Space.lg)
-                        .overlay(alignment: .bottom) {
-                            Theme.Palette.hairline.frame(height: 1)
-                        }
+
                     }
-                } label: {
-                    Text("BUILDER SCRIPTS")
-                        .instrumentLabel()
-                        .padding(.horizontal, Theme.Space.lg)
-                        .frame(height: Theme.Space.rowHeight)
                 }
-
-                // Section header: ARCHITECTURE
-                sectionLabel("ARCHITECTURE")
-
-                ParamRowSlider(
-                    label: "FIRST LAYER",
-                    value: $firstLayer,
-                    range: 0...23,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                // Section header: TRAINING
-                sectionLabel("TRAINING")
-
-                ParamRowSlider(
-                    label: "STEPS",
-                    value: $steps,
-                    range: 1...500,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                ParamRowSlider(
-                    label: "LR",
-                    value: $lr,
-                    range: 1e-5...5e-3,
-                    format: "%.1e"
-                )
-
-                // Section header: LORA
-                sectionLabel("LORA")
-
-                ParamRowPicker(
-                    label: "RANK",
-                    options: ["4", "8", "16", "32"],
-                    selection: $rankStr
-                )
-
-                ParamRowSlider(
-                    label: "ALPHA",
-                    value: $alpha,
-                    range: 1...64,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                // Section header: SEQUENCE
-                sectionLabel("SEQUENCE")
-
-                ParamRowSlider(
-                    label: "SEQ LEN",
-                    value: $seqLen,
-                    range: 16...512,
-                    step: 16,
-                    format: "%.0f"
-                )
-
-                ParamRowSlider(
-                    label: "MAX TRAIN",
-                    value: $maxTrain,
-                    range: 1...64,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                ParamRowSlider(
-                    label: "MAX VALID",
-                    value: $maxValid,
-                    range: 0...64,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                ParamRowSlider(
-                    label: "LOG EVERY",
-                    value: $logEvery,
-                    range: 1...50,
-                    step: 1,
-                    format: "%.0f"
-                )
-
-                // Section header: SAVE ADAPTER
-                sectionLabel("SAVE ADAPTER")
-
-                ParamRowToggle(label: "SAVE ADAPTER", isOn: $saveAdapterEnabled)
-
-                if saveAdapterEnabled {
-                    ParamRowField(
-                        label: "OUTPUT PATH",
-                        text: $saveAdapterPath,
-                        placeholder: "adapters/<model>-r<rank>.safetensors"
-                    )
-                }
-
-                // Spacer pushes CTA to bottom
-                Spacer(minLength: Theme.Space.xl)
-
-                // CTA — the ONE teal button on this screen
-                ctaButton
-
             }
         }
-        .instrumentPanel()
     }
 
     // MARK: Section label helper (11pt all-caps, hairline-ruled top)
@@ -395,61 +266,128 @@ struct TrainScreen: View {
         .padding(.top, Theme.Space.sm)
     }
 
-    // MARK: CTA button
-
-    private var ctaButton: some View {
-        HStack {
-            Spacer()
-
-            Button {
-                launchTraining()
-            } label: {
-                Text("▶ TRAIN")
-                    .font(Theme.Fonts.display(13, .semibold))
-                    .foregroundStyle(Theme.Palette.canvas)
-                .padding(.horizontal, Theme.Space.lg)
-                .padding(.vertical, Theme.Space.sm)
-                .background(isRunning ? Theme.Palette.inkDim : Theme.Palette.signal)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .disabled(isRunning)
-            .keyboardShortcut(.return, modifiers: .command)
-
-            Spacer()
-        }
-        .padding(.vertical, Theme.Space.lg)
-        .padding(.horizontal, Theme.Space.lg)
-    }
-
-    // MARK: - RIGHT: Live Instrument Column
+    // MARK: - Live Instrument Column (main canvas)
 
     @ViewBuilder
     private var liveInstrumentColumn: some View {
         if let run = store.liveRun(matching: [.train]) {
             activeRunView(run: run)
         } else {
-            emptyState
+            configureCard
         }
     }
 
-    // MARK: Empty state
+    // MARK: Configure card (idle state — essentials only)
 
-    private var emptyState: some View {
-        VStack(spacing: Theme.Space.lg) {
-            Spacer()
-            VStack(spacing: Theme.Space.sm) {
-                Text("03")
-                    .font(Theme.Fonts.mono(34, .bold))
-                    .foregroundStyle(Theme.Palette.hairline)
-                    .monospacedDigit()
-                Text("configure a run and press TRAIN")
-                    .font(Theme.Fonts.body)
-                    .foregroundStyle(Theme.Palette.inkDim)
+    private var configureCard: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+
+                OpaquePanel {
+                    VStack(spacing: 0) {
+
+                        // MODEL
+                        sectionLabel("MODEL")
+
+                        if modelNames.isEmpty {
+                            ParamRow(label: "MODEL", value: "— no models found —")
+                        } else {
+                            ParamRowMenu(
+                                label: "MODEL",
+                                options: modelNames,
+                                selection: Binding(
+                                    get: {
+                                        selectedModelName.isEmpty
+                                            ? (modelNames.first ?? "")
+                                            : selectedModelName
+                                    },
+                                    set: { newVal in
+                                        selectedModelName = newVal
+                                        updateAdapterDefaultPath(modelName: newVal)
+                                    }
+                                )
+                            )
+                        }
+
+                        // DATASET (read from store.workingDataset; set in Data tab)
+                        sectionLabel("DATASET")
+
+                        if let ds = store.workingDataset {
+                            ParamRow(label: "DATASET", value: ds.name)
+                        } else {
+                            HStack(spacing: Theme.Space.sm) {
+                                Text("DATASET")
+                                    .instrumentLabel()
+                                Spacer()
+                                Text("Choose a dataset in Data  \u{2318}2")
+                                    .font(Theme.Fonts.cell)
+                                    .foregroundStyle(Theme.Palette.inkDim)
+                                    .italic()
+                            }
+                            .frame(height: Theme.Space.rowHeight)
+                            .padding(.horizontal, Theme.Space.lg)
+                            .overlay(alignment: .bottom) {
+                                Theme.Palette.hairline.frame(height: 1)
+                            }
+                        }
+
+                        // RANK
+                        sectionLabel("LORA")
+
+                        ParamRowPicker(
+                            label: "RANK",
+                            options: ["4", "8", "16", "32"],
+                            selection: $rankStr
+                        )
+
+                        // TRAINING
+                        sectionLabel("TRAINING")
+
+                        ParamRowStepper(
+                            label: "LR",
+                            value: $lr,
+                            range: 1e-5...5e-3,
+                            format: "%.1e"
+                        )
+
+                        ParamRowStepper(
+                            label: "STEPS",
+                            value: $steps,
+                            range: 1...500,
+                            step: 1,
+                            format: "%.0f"
+                        )
+
+                        // START CTA
+                        Button("Train") { launchTraining() }
+                            .buttonStyle(LatticePrimaryButtonStyle())
+                            .frame(maxWidth: .infinity)
+                            .disabled(isRunning)
+                            .keyboardShortcut(.return, modifiers: .command)
+                            .padding(.horizontal, Theme.Space.lg)
+                            .padding(.vertical, Theme.Space.lg)
+
+                    }
+                }
+
+                // Hint: advanced knobs live in the inspector
+                HStack(spacing: Theme.Space.xs) {
+                    Text("Advanced options: rank alpha, sequence length, layer range, save adapter")
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                    Spacer()
+                    Text("\u{2318}\\")
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, Theme.Space.xs)
+
+                Spacer()
             }
-            Spacer()
+            .padding(Theme.Space.lg)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     // MARK: Active run view
@@ -614,7 +552,7 @@ struct TrainScreen: View {
                 Circle()
                     .fill(Theme.Palette.signal)
                     .frame(width: 5, height: 5)
-                Text("● LIVE")
+                Text("LIVE")
                     .font(Theme.Fonts.cell)
                     .foregroundStyle(Theme.Palette.inkDim)
                     .monospacedDigit()
@@ -664,16 +602,26 @@ struct TrainScreen: View {
                         store.pauseRun()
                     }
                 } label: {
-                    Text(run.status == .paused ? "▶ RESUME" : "❚❚ PAUSE")
-                        .font(Theme.Fonts.cell)
-                        .foregroundStyle(Theme.Palette.ink)
-                        .monospacedDigit()
-                        .padding(.horizontal, Theme.Space.sm)
-                        .padding(.vertical, 4)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                                .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
-                        )
+                    HStack(spacing: 4) {
+                        if run.status == .paused {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 10, weight: .medium))
+                            Text("Resume")
+                        } else {
+                            Image(systemName: "pause.fill")
+                                .font(.system(size: 10, weight: .medium))
+                            Text("Pause")
+                        }
+                    }
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.ink)
+                    .monospacedDigit()
+                    .padding(.horizontal, Theme.Space.sm)
+                    .padding(.vertical, 4)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                            .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                    )
                 }
                 .buttonStyle(.plain)
 
@@ -681,16 +629,20 @@ struct TrainScreen: View {
                 Button {
                     store.stopRun()
                 } label: {
-                    Text("■ STOP")
-                        .font(Theme.Fonts.cell)
-                        .foregroundStyle(Theme.Palette.crimson)
-                        .monospacedDigit()
-                        .padding(.horizontal, Theme.Space.sm)
-                        .padding(.vertical, 4)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                                .strokeBorder(Theme.Palette.crimson.opacity(0.5), lineWidth: 1)
-                        )
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10, weight: .medium))
+                        Text("Stop")
+                    }
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.crimson)
+                    .monospacedDigit()
+                    .padding(.horizontal, Theme.Space.sm)
+                    .padding(.vertical, 4)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                            .strokeBorder(Theme.Palette.crimson.opacity(0.5), lineWidth: 1)
+                    )
                 }
                 .buttonStyle(.plain)
             }
@@ -732,11 +684,6 @@ struct TrainScreen: View {
             }
         }
 
-        // Data dir: (repoRoot ?? "") + "/data"
-        if dataDirPath.isEmpty {
-            dataDirPath = (store.repoRootPath ?? "") + "/data"
-        }
-
         // Adapter default path
         if saveAdapterPath.isEmpty {
             updateAdapterDefaultPath(modelName: selectedModelName)
@@ -749,47 +696,17 @@ struct TrainScreen: View {
         saveAdapterPath = "\(base)/adapters/\(modelName)-r\(rank).safetensors"
     }
 
-    private func chooseDataDir() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.message = "Select the directory containing train.jsonl"
-        panel.prompt = "Select"
-        if panel.runModal() == .OK, let url = panel.url {
-            dataDirPath = url.path
-        }
-    }
-
-    private func scanDataset() {
-        let dir = dataDirPath.trimmingCharacters(in: .whitespaces)
-        guard !dir.isEmpty else { return }
-        isScanning = true
-        scanError = nil
-        scannedFiles = []
-        Task.detached(priority: .userInitiated) {
-            let result = await DataScreen.scanDirectory(path: dir)
-            await MainActor.run {
-                isScanning = false
-                switch result {
-                case .success(let stats):
-                    scannedFiles = stats
-                case .failure(let err):
-                    scanError = err.message
-                }
-            }
-        }
-    }
-
     private func launchTraining() {
         guard let modelInfo = resolvedModel else { return }
 
-        // Build data dir URL — if empty fall back to current directory
+        // Build data dir URL from the working dataset selected in the Data tab,
+        // falling back to the current directory if no dataset has been chosen yet.
         let dataURL: URL
-        if dataDirPath.isEmpty {
-            dataURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        if let dataset = store.workingDataset {
+            // Use the parent directory of the chosen dataset file
+            dataURL = dataset.url.deletingLastPathComponent()
         } else {
-            dataURL = URL(fileURLWithPath: dataDirPath)
+            dataURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
         // Resolve save path

@@ -161,6 +161,78 @@ struct GenConfig {
     }
 }
 
+// MARK: - EvalConfig
+
+/// Configuration for `eval_perplexity` (strided sliding-window perplexity, ADR-044).
+///
+/// Three measurement modes — pass the corresponding dir flag to select:
+///   • CPU BF16:    set `modelDir`  (embeds tokenizer; `tokenizerDir` not needed)
+///   • Metal Q4:   set `q4Dir`     + `tokenizerDir`
+///   • QuaRot Q4:  set `quarotDir` + optionally `q4Dir` for the delta comparison
+///
+/// `--json` is always appended to activate the structured `@@lattice perplexity` event
+/// protocol (shipped 2026-06-21). `--label` is included only when `label` is set
+/// (disambiguates rows in multi-pass runs). Adapter perplexity is NOT supported: the CPU
+/// forward path has no LoRA hook, so adapter A/B lives in Chat via generate_lora instead.
+///
+/// Flag names are taken verbatim from `crates/inference/src/bin/eval_perplexity.rs`
+/// arg-parser (verified 2026-06-21).
+struct EvalConfig {
+    /// CPU mode: directory with `config.json` + safetensors + `tokenizer.json`.
+    var modelDir: URL? = nil
+    /// Metal Q4 mode: `quantize_q4` output directory (unrotated 4-bit weights).
+    var q4Dir: URL? = nil
+    /// Metal QuaRot Q4 directory; when combined with `q4Dir` triggers the delta comparison.
+    var quarotDir: URL? = nil
+    /// Tokenizer directory (Metal modes); holds `tokenizer.json` from the source checkpoint.
+    var tokenizerDir: URL? = nil
+    /// UTF-8 text corpus file to score (required).
+    var corpusFile: URL
+    /// Cap total tokens after tokenization (nil = no cap — binary default).
+    var maxTokens: Int? = nil
+    /// Human label for this measurement row (e.g. "bf16", "q4", "adapter").
+    var label: String? = nil
+
+    /// The exact argument array passed to the subprocess.
+    var args: [String] {
+        var a: [String] = []
+        if let dir = modelDir    { a += ["--model-dir",      dir.path] }
+        if let dir = q4Dir       { a += ["--q4-dir",         dir.path] }
+        if let dir = quarotDir   { a += ["--quarot-q4-dir",  dir.path] }
+        if let dir = tokenizerDir { a += ["--tokenizer-dir", dir.path] }
+        a += ["--corpus-file", corpusFile.path]
+        if let mt = maxTokens    { a += ["--max-tokens",     String(mt)] }
+        if let lbl = label       { a += ["--label",          lbl] }
+        a.append("--json")       // structured @@lattice perplexity event protocol
+        return a
+    }
+}
+
+// MARK: - EmbedConfig
+
+/// Configuration for `embed` (batch text embedding with cosine similarity report).
+///
+/// The binary accepts a model identifier and one or more `--text` values.
+/// `--json` is always appended to emit the structured `@@lattice embed_done` event.
+///
+/// `model` is the only positional parameter; texts are each preceded by `--text`.
+struct EmbedConfig {
+    /// Model identifier — a short name resolvable by the embed binary (e.g. "bge-small-en-v1.5").
+    var model: String
+    /// Texts to embed. Each becomes one `--text <value>` flag pair.
+    var texts: [String]
+
+    /// The exact argument array passed to the subprocess.
+    var args: [String] {
+        var a: [String] = ["--model", model]
+        for text in texts {
+            a += ["--text", text]
+        }
+        a.append("--json")       // structured @@lattice embed_done event protocol
+        return a
+    }
+}
+
 // MARK: - AppStore typed convenience methods
 
 extension AppStore {
@@ -194,6 +266,49 @@ extension AppStore {
             args: config.args,
             kind: kind,
             model: modelName,
+            totalSteps: nil
+        )
+    }
+
+    /// Launch `eval_perplexity` with the given config.
+    ///
+    /// The returned `LiveRun` accumulates `perplexity` events in `run.perplexities`.
+    /// A single run may emit multiple rows (one per label). Use `run.onComplete` to
+    /// chain a follow-up run in A/B sequences (e.g. base eval → adapter eval).
+    @discardableResult
+    @MainActor
+    func runEval(_ config: EvalConfig) -> LiveRun {
+        // Derive a display name: prefer explicit model/q4/quarot dir name, then label.
+        let modelName: String
+        if let dir = config.modelDir {
+            modelName = dir.lastPathComponent
+        } else if let dir = config.q4Dir {
+            modelName = dir.lastPathComponent
+        } else if let dir = config.quarotDir {
+            modelName = dir.lastPathComponent
+        } else {
+            modelName = config.label ?? "eval"
+        }
+        return launch(
+            .evalPerplexity,
+            args: config.args,
+            kind: .eval,
+            model: modelName,
+            totalSteps: nil
+        )
+    }
+
+    /// Launch `embed` with the given config.
+    ///
+    /// The returned `LiveRun` receives a single `embed_done` event stored in `run.embed`.
+    @discardableResult
+    @MainActor
+    func runEmbed(_ config: EmbedConfig) -> LiveRun {
+        return launch(
+            .embed,
+            args: config.args,
+            kind: .embed,
+            model: config.model,
             totalSteps: nil
         )
     }

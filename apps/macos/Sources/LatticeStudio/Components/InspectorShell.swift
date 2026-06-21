@@ -6,11 +6,12 @@ import SwiftUI
 // Generalizes ChatScreen's `ChatInspector` into a standalone shell.
 //
 // Design laws:
-//   - Edge-attached (not a rounded card): fills its column, single 1px hairline on leading edge.
+//   - Edge-attached (not a rounded card): fills its column with the panel surface.
+//     The system .inspector presentation supplies the single left divider, so this
+//     shell draws no rule of its own (avoids a doubled hairline).
 //   - Background: Theme.Palette.panel (opaque, no glass).
 //   - Internal padding: Theme.Space.lg (16pt) on all sides.
-//   - Optional title in Theme.Fonts.inspectorTitle, top-aligned before content.
-//   - No external border radius; the leading hairline provides the depth line.
+//   - Optional title as an uppercase section label, matching ChatInspector.
 
 /// A reusable edge-attached configuration-inspector container.
 ///
@@ -42,8 +43,10 @@ struct InspectorShell<Content: View>: View {
             // Optional title row
             if let title {
                 Text(title)
-                    .font(Theme.Fonts.inspectorTitle)
-                    .foregroundStyle(Theme.Palette.ink)
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(0.5)
+                    .textCase(.uppercase)
+                    .foregroundStyle(Theme.Palette.textSecondary)
                     .padding(.bottom, Theme.Space.lg)
             }
 
@@ -52,11 +55,6 @@ struct InspectorShell<Content: View>: View {
         .padding(Theme.Space.lg)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.Palette.panel)
-        .overlay(alignment: .leading) {
-            // 1px hairline on leading edge — edge-attached depth line, not a rounded card border
-            Theme.Palette.hairline
-                .frame(width: 1)
-        }
     }
 }
 

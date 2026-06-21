@@ -11,6 +11,7 @@ import Observation
 final class AppStore {
     var selection: Screen = .models
     var models: [ModelInfo] = []
+    var adapters: [AdapterInfo] = []
     var runs: [RunRecord] = []
     var liveRun: LiveRun?
     var inspectorPresented = false
@@ -85,14 +86,32 @@ final class AppStore {
     func refreshModels() {
         Task.detached {
             let found = LatticeBridge.discoverModels()
-            await MainActor.run { self.models = found }
+            let foundAdapters: [AdapterInfo]
+            if let root = LatticeBridge.repoRoot {
+                foundAdapters = LatticeBridge.discoverAdapterPackages(in: root.appendingPathComponent("adapters", isDirectory: true))
+            } else {
+                foundAdapters = []
+            }
+            await MainActor.run {
+                self.models = found
+                self.adapters = foundAdapters
+            }
         }
+    }
+
+    /// Move adapter directory to Trash and refresh the adapter list.
+    func deleteAdapter(_ adapter: AdapterInfo) {
+        var trashURL: NSURL?
+        try? FileManager.default.trashItem(at: adapter.path, resultingItemURL: &trashURL)
+        refreshModels()
     }
 
     func model(named name: String) -> ModelInfo? { models.first { $0.name == name } }
 
     // The model currently targeted across TRAIN / QUANTIZE / CHAT. Set from MODELS via `use(_:on:)`.
     var workingModel: ModelInfo?
+    // The dataset currently selected in DATA. Consumed by TRAIN in a later task.
+    var workingDataset: DatasetFileStat?
     // Sensible default target: first non-embedding model, else first of any.
     var defaultModel: ModelInfo? { models.first { !$0.isEmbedding } ?? models.first }
     // The effective target a screen should drive: explicit working model, else the default.
@@ -192,6 +211,12 @@ final class AppStore {
                 run.genTokS = g.tok_s
                 run.genDone = true
             }
+        case .perplexity(let p):
+            // Append — a run may emit several rows (bf16/q4/quarot/adapter).
+            run.perplexities.append(p)
+        case .embedDone(let e):
+            // Replace — exactly one embed_done event per batch run.
+            run.embed = e
         case .status(let line):
             run.appendLog(line)
         case .unknown(let j):
@@ -212,6 +237,9 @@ final class AppStore {
         // Persist the archive immediately after appending the finished record.
         persistRunArchive()
         if run.savedAdapterPath != nil { refreshModels() }
+        // Fire the completion hook last — status, record, and disk state are all finalised.
+        // Used by screens to chain A/B follow-up runs (e.g. base eval → adapter eval).
+        run.onComplete?(run)
     }
 
     func pauseRun() { handle?.pause(); liveRun?.status = .paused }

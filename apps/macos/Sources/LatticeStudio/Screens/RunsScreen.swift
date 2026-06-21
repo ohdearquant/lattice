@@ -1,65 +1,47 @@
 import SwiftUI
 import AppKit
 
-// MARK: - 06 RUNS — the lab notebook
+// MARK: - Run-history embeddable views
 //
-// Layout:
-//   • Live banner (shown when store.liveRun != nil): teal GatePill(.run) + step/loss status
+// RunsScreen no longer renders a top-level screen. Its content is embedded inside
+// ChatScreen's "History" segment. The three building blocks are exposed as internal
+// (non-private) view-returning helpers on `RunsContent` so ChatScreen can compose them
+// without duplicating any logic.
+//
+// Layout (composed by ChatScreen .history tab):
+//   • Live banner (shown while store.liveRun is running/paused)
 //   • DataTable of store.runs: KIND · MODEL · STATUS · METRIC · DURATION · WHEN
-//   • Right inspector OpaquePanel: ReadoutWells of run summary + GatePill status +
-//     adapter path with "Reveal" affordance (when adapterPath != nil)
+//   • Empty state when store.runs.isEmpty
 //
-// Empty state when store.runs.isEmpty.
-// RunRecord does NOT store a point series — no chart replay in history rows.
+// Inspector content (composed by ChatScreen .history inspector branch):
+//   • Selected-run detail: ReadoutWells + GatePill + adapter "Reveal" affordance
 
-struct RunsScreen: View {
+// MARK: - RunsContent
+
+/// Stateful container for the run-history tab. Owns `selectedRunID` so selection
+/// survives tab switches within ChatScreen.
+struct RunsContent: View {
     @Bindable var store: AppStore
-
-    @State private var selectedRunID: String?
-
-    private var selectedRun: RunRecord? {
-        store.runs.first { $0.id == selectedRunID }
-    }
-
-    private var subtitle: String {
-        let count = store.runs.count
-        if count == 0 { return "no runs yet" }
-        return "\(count) run\(count == 1 ? "" : "s") logged"
-    }
+    @Binding var selectedRunID: String?
 
     var body: some View {
-        ScreenScaffold(
-            screen: .runs,
-            subtitle: subtitle
-        ) {
-            VStack(spacing: 0) {
-                // Live banner — only shown while a run is actively in-flight or paused.
-                // A completed or failed run drops out of the banner (it appears in the table).
-                if let live = store.liveRun,
-                   live.status == .running || live.status == .paused {
-                    liveBanner(live)
-                }
+        VStack(spacing: 0) {
+            if let live = store.liveRun,
+               live.status == .running || live.status == .paused {
+                liveBanner(live)
+            }
 
-                if store.runs.isEmpty {
-                    emptyState
-                } else {
-                    HSplitView {
-                        // Center: master runs table
-                        runsTable
-                            .frame(minWidth: 480)
-
-                        // Right inspector
-                        inspectorPanel
-                            .frame(minWidth: 260, idealWidth: 300, maxWidth: 320)
-                    }
-                }
+            if store.runs.isEmpty {
+                runsEmptyState
+            } else {
+                runsTable
             }
         }
     }
 
     // MARK: Live banner
 
-    private func liveBanner(_ live: LiveRun) -> some View {
+    func liveBanner(_ live: LiveRun) -> some View {
         HStack(spacing: Theme.Space.md) {
             GatePill(.run, label: live.kind.rawValue)
 
@@ -109,24 +91,13 @@ struct RunsScreen: View {
                 }
             }
 
-            // Status pill reflects live state
-            GatePill(liveGateStatus(live.status))
+            StatusBadge(runStatusBadge(live.status))
         }
         .padding(.horizontal, Theme.Space.lg)
         .padding(.vertical, Theme.Space.sm)
         .background(Theme.Palette.panel)
         .overlay(alignment: .bottom) {
             Theme.Palette.hairline.frame(height: 1)
-        }
-    }
-
-    private func liveGateStatus(_ status: RunStatus) -> GateStatus {
-        switch status {
-        case .running: .run
-        case .paused: .warn
-        case .done: .pass
-        case .failed: .fail
-        case .idle: .warn
         }
     }
 
@@ -166,8 +137,9 @@ struct RunsScreen: View {
                 id: "status",
                 header: "STATUS",
                 alignment: .leading,
-                minWidth: 64,
-                isNumeric: false
+                minWidth: 88,
+                isNumeric: false,
+                badge: { runStatusBadge($0.status) }
             ) { $0.status.rawValue.uppercased() },
 
             ColumnDef(
@@ -186,9 +158,8 @@ struct RunsScreen: View {
                     }
                     return "—"
                 case .quantizeQ4, .quantizeQuaRot:
-                    // For quant runs show configSummary if available (ratio/verdict), else "—"
                     return rec.configSummary ?? "—"
-                case .chat:
+                case .chat, .eval, .embed:
                     return "—"
                 }
             },
@@ -228,61 +199,82 @@ struct RunsScreen: View {
         ]
     }
 
-    // MARK: Inspector panel
+    // MARK: Empty state
 
-    @ViewBuilder
-    private var inspectorPanel: some View {
-        if let run = selectedRun {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                    runInspector(run)
+    var runsEmptyState: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.xl) {
+            OpaquePanel {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    Text("NO RUNS YET")
+                        .font(Theme.Fonts.title)
+                        .foregroundStyle(Theme.Palette.ink)
+
+                    Text("Runs you launch from TRAIN, QUANTIZE, or CHAT land here as lab notebook entries.")
+                        .font(Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(Theme.Space.lg)
+                .padding(Theme.Space.xl)
             }
-            .instrumentPanel()
-        } else {
-            VStack {
-                Spacer()
-                Text("SELECT A RUN")
-                    .instrumentLabel()
-                Spacer()
-            }
-            .frame(maxWidth: .infinity)
-            .instrumentPanel()
+
+            Spacer()
         }
     }
 
+    // MARK: Inspector panel
+
+    var inspectorPanel: some View {
+        Group {
+            if let run = store.runs.first(where: { $0.id == selectedRunID }) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                        runInspector(run)
+                    }
+                    .padding(Theme.Space.lg)
+                }
+                .instrumentPanel()
+            } else {
+                VStack {
+                    Spacer()
+                    Text("SELECT A RUN")
+                        .instrumentLabel()
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+                .instrumentPanel()
+            }
+        }
+    }
+
+    // MARK: Run inspector detail
+
     private func runInspector(_ run: RunRecord) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
-            // Header: kind + status pill
             HStack(spacing: Theme.Space.sm) {
                 Text(run.kind.rawValue)
                     .font(Theme.Fonts.title)
                     .foregroundStyle(Theme.Palette.ink)
 
-                GatePill(gatePillStatus(run.status), label: run.status.rawValue.uppercased())
+                StatusBadge(runStatusBadge(run.status))
             }
 
-            // Model name
             Text(run.model)
                 .font(Theme.Fonts.body)
                 .foregroundStyle(Theme.Palette.inkDim)
                 .lineLimit(1)
 
-            // Summary readout wells
             let wells = runWells(for: run)
             if !wells.isEmpty {
                 LazyVGrid(
-                    columns: [GridItem(.flexible()), GridItem(.flexible())],
-                    spacing: Theme.Space.sm
+                    columns: [GridItem(.flexible(), spacing: Theme.Space.md), GridItem(.flexible(), spacing: Theme.Space.md)],
+                    spacing: Theme.Space.md
                 ) {
                     ForEach(wells, id: \.label) { w in
-                        ReadoutWell(label: w.label, value: w.value, unit: w.unit)
+                        ReadoutWell(label: w.label, value: w.value, unit: w.unit, minHeight: 56)
                     }
                 }
             }
 
-            // Config summary (if stored)
             if let cfg = run.configSummary {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("CONFIG")
@@ -295,12 +287,13 @@ struct RunsScreen: View {
                 }
             }
 
-            // Adapter path — reveal affordance
             if let adapterPath = run.adapterPath {
                 adapterRevealRow(adapterPath)
             }
         }
     }
+
+    // MARK: Wells
 
     private struct WellSpec {
         let label: String
@@ -314,7 +307,6 @@ struct RunsScreen: View {
     private func runWells(for run: RunRecord) -> [WellSpec] {
         var ws: [WellSpec] = []
 
-        // Timing
         let startStr = relativeTimeString(run.startedAt)
         ws.append(WellSpec("STARTED", startStr))
 
@@ -328,7 +320,6 @@ struct RunsScreen: View {
             }
         }
 
-        // Metrics by kind
         switch run.kind {
         case .train:
             if let last = run.lastLoss {
@@ -339,15 +330,16 @@ struct RunsScreen: View {
             }
         case .quantizeQ4, .quantizeQuaRot:
             if let cfg = run.configSummary {
-                // configSummary carries the ratio/verdict text for quant runs
                 ws.append(WellSpec("RESULT", cfg))
             }
-        case .chat:
+        case .chat, .eval, .embed:
             break
         }
 
         return ws
     }
+
+    // MARK: Adapter reveal
 
     private func adapterRevealRow(_ path: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -379,54 +371,15 @@ struct RunsScreen: View {
         .readoutWellSurface()
     }
 
-    // MARK: Empty state
-
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.xl) {
-            OpaquePanel {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Text("NO RUNS YET")
-                        .font(Theme.Fonts.title)
-                        .foregroundStyle(Theme.Palette.ink)
-
-                    Text("Runs you launch from TRAIN, QUANTIZE, or CHAT land here as lab notebook entries.")
-                        .font(Theme.Fonts.body)
-                        .foregroundStyle(Theme.Palette.inkDim)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    HStack(spacing: Theme.Space.sm) {
-                        KeyCapChip("⌘2")
-                        Text("Train")
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.inkDim)
-
-                        KeyCapChip("⌘3")
-                        Text("Quantize")
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.inkDim)
-
-                        KeyCapChip("⌘4")
-                        Text("Chat")
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.inkDim)
-                    }
-                }
-                .padding(Theme.Space.xl)
-            }
-
-            Spacer()
-        }
-    }
-
     // MARK: Helpers
 
-    private func gatePillStatus(_ status: RunStatus) -> GateStatus {
+    func runStatusBadge(_ status: RunStatus) -> StatusBadge.Status {
         switch status {
-        case .running: .run
-        case .paused: .warn
-        case .done: .pass
-        case .failed: .fail
-        case .idle: .warn
+        case .running: .running
+        case .paused:  .warning
+        case .done:    .success
+        case .failed:  .error
+        case .idle:    .idle
         }
     }
 

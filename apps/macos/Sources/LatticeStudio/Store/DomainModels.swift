@@ -3,33 +3,29 @@ import SwiftUI
 // MARK: - Navigation
 
 enum Screen: String, CaseIterable, Identifiable, Hashable {
-    case models, chat, train, runs
+    case models, data, train, chat, embed
     var id: String { rawValue }
 
     var index: String {
         switch self {
-        case .models: "01"; case .chat: "02"; case .train: "03"; case .runs: "04"
+        case .models: "01"; case .data: "02"; case .train: "03"; case .chat: "04"; case .embed: "05"
         }
     }
     var title: String {
         switch self {
-        case .models: "MODELS"; case .chat: "CHAT"; case .train: "TRAIN"; case .runs: "RUNS"
+        case .models: "MODELS"; case .data: "DATA"; case .train: "TRAIN"; case .chat: "CHAT"; case .embed: "EMBEDDINGS"
         }
     }
     var shortcut: KeyEquivalent {
         switch self {
-        case .models: "1"; case .chat: "2"; case .train: "3"; case .runs: "4"
+        case .models: "1"; case .data: "2"; case .train: "3"; case .chat: "4"; case .embed: "5"
         }
     }
 
-    /// Whether this screen has a config inspector (toggle sidebar). Drives the
-    /// shared window-toolbar toggle visibility. Flip to `true` as each screen is converted.
-    var hasInspector: Bool {
-        switch self {
-        case .chat: true
-        default: false
-        }
-    }
+    /// Whether this screen has a right inspector (toggle sidebar). Drives the
+    /// shared window-toolbar toggle visibility. The embed screen is a self-contained
+    /// HSplitView tool and does not use the system inspector panel.
+    var hasInspector: Bool { self != .embed }
 }
 
 // MARK: - Models on disk
@@ -77,11 +73,23 @@ struct AdapterInfo: Identifiable, Equatable {
     var alpha: Double?
     var targetModules: String?
     var sizeBytes: Int64
+    // MLX-format fields (nil when absent or config unreadable — honest)
+    var baseModel: String? = nil
+    var scale: Double? = nil
+    var numLayers: Int? = nil
+    var checkpointCount: Int = 0
 }
 
 // MARK: - Runs (the lab notebook)
 
-enum RunKind: String, Equatable, Codable { case train = "LoRA", quantizeQ4 = "Q4", quantizeQuaRot = "QuaRot", chat = "Chat" }
+enum RunKind: String, Equatable, Codable {
+    case train = "LoRA"
+    case quantizeQ4 = "Q4"
+    case quantizeQuaRot = "QuaRot"
+    case chat = "Chat"
+    case eval = "Eval"   // eval_perplexity — measures PPL for one or more model variants
+    case embed = "Embed" // embed — produces embedding vectors and a pairwise cosine matrix
+}
 enum RunStatus: String, Equatable, Codable { case idle, running, paused, done, failed }
 
 struct RunRecord: Identifiable, Equatable, Codable {
@@ -137,6 +145,19 @@ final class LiveRun {
     var genText: String = ""       // accumulated incremental token deltas from gen_token events
     var genTokS: Double? = nil     // final tokens/sec from the done event (tok_s field)
     var genDone: Bool = false      // set true when the gen_token done event arrives
+
+    // Eval (eval_perplexity --json mode)
+    // A single run may emit multiple rows — one per measurement label (bf16/q4/quarot/adapter).
+    var perplexities: [LatticeEvent.Perplexity] = []
+
+    // Embed (embed --json mode)
+    // Exactly one embed_done event is expected per run (batch mode: all texts in one call).
+    var embed: LatticeEvent.EmbedDone? = nil
+
+    // Completion hook — fired by AppStore.finish() after status and RunRecord are set.
+    // Used by screens to chain a follow-up run (e.g. base eval → adapter eval A/B sequence).
+    // Closures cannot conform to Codable; never serialised to disk.
+    var onComplete: ((LiveRun) -> Void)? = nil
 
     // Shared
     var log: [String] = []

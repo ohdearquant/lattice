@@ -21,6 +21,8 @@ enum LatticeEvent: Equatable {
     case quantLayer(QuantLayer)
     case quantDone(QuantDone)
     case genToken(GenToken)
+    case perplexity(Perplexity)   // eval_perplexity --json: one row per measurement label
+    case embedDone(EmbedDone)     // embed --json: cosine matrix + optional preview vectors
     case status(String)        // free-form human status line (non-JSON stdout/stderr)
     case unknown(String)       // a JSON event whose tag we don't recognize
 
@@ -67,6 +69,51 @@ enum LatticeEvent: Equatable {
         var tok_s: Double?
         var ttft_ms: Double?
     }
+
+    // MARK: - Perplexity event (eval_perplexity --json)
+    //
+    // CONTRACT:
+    //   @@lattice {"ev":"perplexity","label":"bf16","ppl":13.62,"nll":2.611,"tokens":4096,"windows":8,"ms":5234}
+    //
+    // `ppl` is the only required field beyond `ev`. A run may emit multiple
+    // rows — one per measurement label (e.g. "bf16", "q4", "quarot", "adapter").
+    struct Perplexity: Codable, Equatable {
+        /// Human label for this measurement (e.g. "bf16", "q4", "quarot", "adapter").
+        var label: String?
+        /// Perplexity score (required).
+        var ppl: Double
+        /// Mean negative log-likelihood in nats (optional, derived from ppl but often emitted).
+        var nll: Double?
+        /// Total tokens scored in this run.
+        var tokens: Int?
+        /// Number of sliding windows evaluated.
+        var windows: Int?
+        /// Wall-clock milliseconds for this evaluation.
+        var ms: Double?
+    }
+
+    // MARK: - EmbedDone event (embed --json)
+    //
+    // CONTRACT:
+    //   @@lattice {"ev":"embed_done","model":"bge-small-en-v1.5","dims":384,"count":3,
+    //              "cosine":[[1.0,0.83],[0.83,1.0]],"preview":[[..8 floats..]],"ms":140}
+    //
+    // `dims` and `count` are required. `cosine` and `preview` carry the payload
+    // matrices; both may be absent for very large batches to keep the line bounded.
+    struct EmbedDone: Codable, Equatable {
+        /// Model identifier as reported by the binary (e.g. "bge-small-en-v1.5").
+        var model: String?
+        /// Output embedding dimensionality (required).
+        var dims: Int
+        /// Number of embeddings produced in this batch (required).
+        var count: Int
+        /// Pairwise cosine-similarity matrix [count × count]. Absent for large batches.
+        var cosine: [[Double]]?
+        /// Preview vectors — first 8 floats of each embedding. Absent for large batches.
+        var preview: [[Double]]?
+        /// Wall-clock milliseconds for this batch.
+        var ms: Double?
+    }
 }
 
 /// Tagged envelope used to peek the `ev` discriminator before decoding the full payload.
@@ -109,6 +156,8 @@ enum LatticeEventParser {
         case "quant_layer": return (try? decoder.decode(LatticeEvent.QuantLayer.self, from: data)).map(LatticeEvent.quantLayer) ?? .unknown(jsonText)
         case "quant_done":  return (try? decoder.decode(LatticeEvent.QuantDone.self, from: data)).map(LatticeEvent.quantDone) ?? .unknown(jsonText)
         case "gen_token":   return (try? decoder.decode(LatticeEvent.GenToken.self, from: data)).map(LatticeEvent.genToken) ?? .unknown(jsonText)
+        case "perplexity":  return (try? decoder.decode(LatticeEvent.Perplexity.self, from: data)).map(LatticeEvent.perplexity) ?? .unknown(jsonText)
+        case "embed_done":  return (try? decoder.decode(LatticeEvent.EmbedDone.self, from: data)).map(LatticeEvent.embedDone) ?? .unknown(jsonText)
         default:            return .unknown(jsonText)
         }
     }

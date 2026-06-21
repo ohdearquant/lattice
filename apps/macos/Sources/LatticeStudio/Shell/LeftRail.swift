@@ -65,6 +65,8 @@ struct LeftRail: View {
         case .quantizeQ4:     return "Quantizing"
         case .quantizeQuaRot: return "Quantizing"
         case .chat:           return "Generating"
+        case .eval:           return "Evaluating"
+        case .embed:          return "Embedding"
         }
     }
 
@@ -224,9 +226,10 @@ extension Screen {
     var symbol: String {
         switch self {
         case .models: "shippingbox"
-        case .chat:   "text.bubble"
+        case .data:   "tablecells"
         case .train:  "chart.line.uptrend.xyaxis"
-        case .runs:   "clock.arrow.circlepath"
+        case .chat:   "text.bubble"
+        case .embed:  "chart.dots.scatter"
         }
     }
 }

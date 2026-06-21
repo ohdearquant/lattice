@@ -45,6 +45,7 @@ struct ReadoutWell: View {
     let value: String
     let unit: String
     let delta: DeltaInfo?
+    let minHeight: CGFloat?
 
     struct DeltaInfo {
         let text: String
@@ -56,11 +57,12 @@ struct ReadoutWell: View {
         }
     }
 
-    init(label: String, value: String, unit: String = "", delta: DeltaInfo? = nil) {
+    init(label: String, value: String, unit: String = "", delta: DeltaInfo? = nil, minHeight: CGFloat? = nil) {
         self.label = label
         self.value = value
         self.unit = unit
         self.delta = delta
+        self.minHeight = minHeight
     }
 
     var body: some View {
@@ -96,7 +98,21 @@ struct ReadoutWell: View {
         }
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.sm)
+        .wellMinHeight(minHeight)
         .readoutWellSurface()
+    }
+}
+
+// MARK: - Min-height helper (opt-in; nil ⇒ intrinsic height, byte-identical to prior behavior)
+
+private extension View {
+    @ViewBuilder
+    func wellMinHeight(_ height: CGFloat?) -> some View {
+        if let height {
+            frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
+        } else {
+            self
+        }
     }
 }
 

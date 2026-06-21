@@ -109,16 +109,16 @@ let builderScripts: [BuilderScript] = [
 
 // MARK: - DataScreen
 //
-// NOTE: DataScreen is no longer a top-level nav destination (Phase A re-parenting).
-// Its source/scan/builder panels are embedded in TrainScreen; its file-table/preview
-// panels are reachable via the DATASET section there. This struct is preserved as an
-// embeddable view for potential future use but is not wired into ContentView routing.
+// Top-level nav destination (Screen.data, ⌘2).
+// Dataset builder / inspector for the lattice training pipeline.
+// The static `scanDirectory(path:)` helper backs this screen's own dataset scan.
 
 struct DataScreen: View {
     @Bindable var store: AppStore
 
     // MARK: Local state
 
+    @State private var didInitInspector = false
     @State private var dataDir: String = ""
     @State private var isScanning: Bool = false
     @State private var scanError: String? = nil
@@ -157,38 +157,119 @@ struct DataScreen: View {
     // MARK: Body
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.xl) {
-            // 1. SOURCE — path field + buttons
-            sourcePanel
+        ScreenScaffold(
+            screen: .data,
+            subtitle: subtitle
+        ) {
+            VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                // 1. SOURCE — path field + buttons
+                sourcePanel
 
-            // 2. SUMMARY — hero + readout wells
-            if !files.isEmpty {
-                summaryStrip
-            }
-
-            // 3. FILES TABLE + PREVIEW (HSplit)
-            if !files.isEmpty {
-                HSplitView {
-                    // Files table (left/center)
-                    filesTable
-                        .frame(minWidth: 400)
-
-                    // Preview panel (right)
-                    previewPanel
-                        .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
+                // 2. SUMMARY — hero + readout wells
+                if !files.isEmpty {
+                    summaryStrip
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
 
-            // 4. BUILDER scripts
-            builderPanel
+                // 3. FILES TABLE + PREVIEW (HSplit)
+                if !files.isEmpty {
+                    HSplitView {
+                        // Files table (left/center)
+                        filesTable
+                            .frame(minWidth: 400)
+
+                        // Preview panel (right)
+                        previewPanel
+                            .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+
+                // 4. BUILDER scripts
+                builderPanel
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .inspector(isPresented: $store.inspectorPresented) {
+            dataInspectorPanel
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 320)
+        }
         .onAppear {
+            openInspectorOnce()
             // Default to repoRootPath/data, or fall back to empty
             if dataDir.isEmpty {
                 dataDir = (store.repoRootPath ?? "") + "/data"
             }
+        }
+    }
+
+    private func openInspectorOnce() {
+        guard !didInitInspector else { return }
+        didInitInspector = true
+        store.inspectorPresented = true
+    }
+
+    // MARK: - Inspector panel
+
+    @ViewBuilder
+    private var dataInspectorPanel: some View {
+        if let file = selectedFile {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Text(file.name)
+                            .font(Theme.Fonts.title)
+                            .foregroundStyle(Theme.Palette.ink)
+                            .lineLimit(2)
+
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: Theme.Space.md), GridItem(.flexible(), spacing: Theme.Space.md)],
+                            spacing: Theme.Space.md
+                        ) {
+                            ReadoutWell(
+                                label: "EXAMPLES",
+                                value: file.isCapped ? "5 000+" : "\(file.exampleCount)"
+                            )
+                            ReadoutWell(
+                                label: "≈ TOKENS",
+                                value: formatLargeNumber(file.approxTokens)
+                            )
+                            ReadoutWell(
+                                label: "AVG LEN",
+                                value: "\(file.avgLen)",
+                                unit: "tok"
+                            )
+                            ReadoutWell(
+                                label: "SIZE",
+                                value: byteFormatter.string(fromByteCount: file.sizeBytes)
+                            )
+                        }
+
+                        if let schema = file.schema, !schema.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("SCHEMA")
+                                    .instrumentLabel()
+                                Text(schema.joined(separator: ", "))
+                                    .font(Theme.Fonts.cell)
+                                    .foregroundStyle(Theme.Palette.inkDim)
+                                    .lineLimit(3)
+                            }
+                            .padding(Theme.Space.sm)
+                            .readoutWellSurface()
+                        }
+                    }
+                }
+                .padding(Theme.Space.lg)
+            }
+            .instrumentPanel()
+        } else {
+            VStack {
+                Spacer()
+                Text("SELECT A FILE")
+                    .instrumentLabel()
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+            .instrumentPanel()
         }
     }
 
@@ -334,9 +415,11 @@ struct DataScreen: View {
         .onChange(of: selectedFileID) { _, newID in
             if let id = newID, let file = files.first(where: { $0.id == id }) {
                 loadPreview(for: file)
+                store.workingDataset = file
             } else {
                 previewPairs = []
                 previewError = nil
+                store.workingDataset = nil
             }
         }
     }
@@ -598,28 +681,6 @@ struct DataScreen: View {
         .padding(.horizontal, Theme.Space.lg)
         .overlay(alignment: .bottom) {
             Theme.Palette.hairline.frame(height: 1)
-        }
-    }
-
-    // MARK: - Trailing actions
-
-    private var trailingActions: some View {
-        HStack(spacing: Theme.Space.sm) {
-            if !files.isEmpty {
-                GatePill(.pass, label: "\(files.count) files ready")
-            }
-            Button {
-                scan()
-            } label: {
-                HStack(spacing: 4) {
-                    Text("Re-scan")
-                        .font(Theme.Fonts.body)
-                    KeyCapChip("⌘R")
-                }
-            }
-            .buttonStyle(OutlineButtonStyle())
-            .disabled(isScanning || dataDir.trimmingCharacters(in: .whitespaces).isEmpty)
-            .keyboardShortcut("r", modifiers: .command)
         }
     }
 

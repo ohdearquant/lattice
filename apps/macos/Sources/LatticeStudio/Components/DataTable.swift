@@ -27,6 +27,10 @@ struct ColumnDef<Row> {
     let minWidth: CGFloat
     let value: (Row) -> String
     let isNumeric: Bool
+    // When non-nil and it returns a status for a row, that cell renders a StatusBadge
+    // instead of plain text (used for the Runs STATUS column). Default nil ⇒ text cell,
+    // so existing columns (e.g. Models) are byte-identical.
+    let badge: ((Row) -> StatusBadge.Status?)?
 
     init(
         id: String,
@@ -34,6 +38,7 @@ struct ColumnDef<Row> {
         alignment: ColumnAlignment = .trailing,
         minWidth: CGFloat = 80,
         isNumeric: Bool = true,
+        badge: ((Row) -> StatusBadge.Status?)? = nil,
         value: @escaping (Row) -> String
     ) {
         self.id = id
@@ -42,6 +47,7 @@ struct ColumnDef<Row> {
         self.minWidth = minWidth
         self.isNumeric = isNumeric
         self.value = value
+        self.badge = badge
     }
 }
 
@@ -67,6 +73,9 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
     // Sort state
     @State private var sortColumnID: String? = nil
     @State private var sortAscending: Bool = true
+
+    // Hover state — a single raised-surface wash on the hovered row
+    @State private var hoveredID: Row.ID? = nil
 
     private var rowHeight: CGFloat {
         comfortable ? Theme.Space.rowHeightComfortable : Theme.Space.rowHeight
@@ -138,32 +147,55 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
 
     private func dataRow(row: Row) -> some View {
         let isSelected = selectedID == row.id
+        let isHovered = !isSelected && hoveredID == row.id
 
         return HStack(spacing: 0) {
-            // 2px teal left-border accent on selected row (no fill flood)
+            // 2pt signal leading marker on the selected row.
             Rectangle()
                 .fill(isSelected ? Theme.Palette.signal : .clear)
                 .frame(width: 2)
 
             ForEach(columns, id: \.id) { col in
-                let cellValue = col.value(row)
-                Text(cellValue)
-                    .font(col.isNumeric ? Theme.Fonts.cell : Theme.Fonts.body)
-                    .foregroundStyle(Theme.Palette.ink)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, Theme.Space.sm)
-                    .frame(minWidth: col.minWidth, maxWidth: .infinity, alignment: frameAlignment(col.alignment))
+                if let badge = col.badge, let status = badge(row) {
+                    StatusBadge(status)
+                        .padding(.horizontal, Theme.Space.sm)
+                        .frame(minWidth: col.minWidth, maxWidth: .infinity, alignment: frameAlignment(col.alignment))
+                } else {
+                    Text(col.value(row))
+                        .font(col.isNumeric ? Theme.Fonts.cell : Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.ink)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, Theme.Space.sm)
+                        .frame(minWidth: col.minWidth, maxWidth: .infinity, alignment: frameAlignment(col.alignment))
+                }
             }
         }
         .frame(height: rowHeight)
+        // Selected: selectionFill (teal @12%) under the 2pt marker. Hover: one raised wash.
+        .background(rowFill(isSelected: isSelected, isHovered: isHovered))
         .contentShape(Rectangle())
         .onTapGesture {
             selectedID = isSelected ? nil : row.id
         }
+        .onHover { inside in
+            if inside { hoveredID = row.id }
+            else if hoveredID == row.id { hoveredID = nil }
+        }
         .overlay(alignment: .bottom) {
             Theme.Palette.hairline.frame(height: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func rowFill(isSelected: Bool, isHovered: Bool) -> some View {
+        if isSelected {
+            Theme.Palette.selectionFill
+        } else if isHovered {
+            Theme.Palette.surfaceHover
+        } else {
+            Color.clear
         }
     }
 

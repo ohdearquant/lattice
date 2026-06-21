@@ -133,6 +133,99 @@ struct ParamRowSlider: View {
     }
 }
 
+// MARK: Stepper ParamRow
+
+/// A label + typed numeric entry with optional native Stepper buttons on a hairline-ruled line.
+///
+/// When `step > 0`, a native Stepper appears to the right of the field. When `step == 0`,
+/// only the typed field is shown — correct for free-range values like learning rate.
+///
+/// ```swift
+/// ParamRowStepper(label: "STEPS", value: $steps, range: 1...500, step: 1, format: "%.0f")
+/// ParamRowStepper(label: "LR", value: $lr, range: 1e-5...5e-3, format: "%.1e")
+/// ParamRowStepper(label: "FIRST LAYER", value: $firstLayer, range: 0...23, step: 1,
+///                 format: "%.0f", caption: "adapts layers 19–23 · 5 layers")
+/// ```
+struct ParamRowStepper: View {
+    let label: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var step: Double = 0
+    var format: String = "%.0f"
+    var unit: String = ""
+    var caption: String? = nil
+
+    @State private var text: String = ""
+    @FocusState private var focused: Bool
+
+    private func commit() {
+        guard let parsed = Double(text.trimmingCharacters(in: .whitespaces)) else {
+            text = String(format: format, value)
+            return
+        }
+        let clamped = min(max(parsed, range.lowerBound), range.upperBound)
+        value = clamped
+        text = String(format: format, clamped)
+    }
+
+    private var primaryRow: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Text(label)
+                .instrumentLabel()
+            Spacer()
+            TextField("", text: $text)
+                .font(Theme.Fonts.readout)
+                .foregroundStyle(Theme.Palette.ink)
+                .monospacedDigit()
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.plain)
+                .frame(width: 88)
+                .focused($focused)
+                .onSubmit { commit() }
+                .onChange(of: focused) { _, isFocused in
+                    if !isFocused { commit() }
+                }
+                .onChange(of: value) { _, newVal in
+                    if !focused { text = String(format: format, newVal) }
+                }
+            if !unit.isEmpty {
+                Text(unit)
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+            }
+            if step > 0 {
+                Stepper("", value: $value, in: range, step: step)
+                    .labelsHidden()
+            }
+        }
+        .frame(height: Theme.Space.rowHeightComfortable)
+    }
+
+    var body: some View {
+        Group {
+            if let caption {
+                VStack(alignment: .leading, spacing: 2) {
+                    primaryRow
+                    Text(caption)
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.bottom, Theme.Space.xs)
+                }
+            } else {
+                primaryRow
+            }
+        }
+        .padding(.horizontal, Theme.Space.lg)
+        .overlay(alignment: .bottom) {
+            Theme.Palette.hairline.frame(height: 1)
+        }
+        .onAppear {
+            text = String(format: format, value)
+        }
+    }
+}
+
 // MARK: Picker ParamRow
 
 /// A label + segmented picker on a hairline-ruled line.
@@ -239,6 +332,8 @@ struct ParamRowToggle: View {
 #Preview("ParamRow") {
     @Previewable @State var rank: Double = 8
     @Previewable @State var lr: Double = 2e-4
+    @Previewable @State var steps: Double = 25
+    @Previewable @State var firstLayer: Double = 19
     @Previewable @State var method: String = "Q4"
     @Previewable @State var dataset: String = "claude-lora.jsonl"
     @Previewable @State var comfortable: Bool = false
@@ -248,6 +343,9 @@ struct ParamRowToggle: View {
         ParamRow(label: "LAYERS", value: "18 GDN · 6 GQA")
         ParamRowSlider(label: "RANK", value: $rank, range: 1...64, step: 1, format: "%.0f")
         ParamRowSlider(label: "LR", value: $lr, range: 1e-5...1e-2, format: "%.2e")
+        ParamRowStepper(label: "STEPS", value: $steps, range: 1...500, step: 1, format: "%.0f",
+                        caption: "stepper with caption · \(Int(steps)) steps")
+        ParamRowStepper(label: "LR (TYPED)", value: $lr, range: 1e-5...5e-3, format: "%.1e")
         ParamRowPicker(label: "METHOD", options: ["Q4", "QuaRot"], selection: $method)
         ParamRowField(label: "DATASET", text: $dataset, placeholder: "path/to/data.jsonl")
         ParamRowToggle(label: "COMFORTABLE ROWS", isOn: $comfortable)

@@ -13,11 +13,9 @@ struct ContentView: View {
                 detail
             }
             .toolbar {
-                ToolbarItem(placement: .navigation) {
-                    Text(store.selection.title.localizedCapitalized)
-                        .font(Theme.Fonts.bodyStrong)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
+                // One header per screen: ScreenScaffold renders the indexed title in
+                // the content area. The former `.navigation` toolbar title duplicated it
+                // (complaint 4 — "title appears too many times"); removed.
                 if let run = store.liveRun, run.status == .running || run.status == .paused {
                     ToolbarItem(placement: .primaryAction) {
                         runStatusCapsule(run)
@@ -28,7 +26,7 @@ struct ContentView: View {
                         Button {
                             store.inspectorPresented.toggle()
                         } label: {
-                            Image(systemName: "sidebar.trailing")
+                            Image(systemName: "sidebar.right")
                         }
                         .help("Toggle settings (⌘\\)")
                         .foregroundStyle(store.inspectorPresented ? Theme.Palette.signal : Theme.Palette.textSecondary)
@@ -62,9 +60,10 @@ struct ContentView: View {
         }
         switch cmd {
         case "train":  retarget(); store.selection = .train
-        case "chat":   retarget(); store.selection = .chat
+        case "chat",
+             "runs":   retarget(); store.selection = .chat
         case "models": store.selection = .models
-        case "runs":   store.selection = .runs
+        case "data":   store.selection = .data
         case "stop":   store.stopRun()
         default:       break
         }
@@ -81,6 +80,8 @@ struct ContentView: View {
             case .quantizeQ4:     return "Quantizing"
             case .quantizeQuaRot: return "Quantizing"
             case .chat:           return "Generating"
+            case .eval:           return "Evaluating"
+            case .embed:          return "Embedding"
             }
         }()
         let stepLabel: String = {
@@ -93,7 +94,7 @@ struct ContentView: View {
         }()
 
         Button {
-            store.selection = .runs
+            store.selection = .chat
         } label: {
             HStack(spacing: 6) {
                 Circle()
@@ -126,9 +127,10 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch store.selection {
         case .models: ModelsScreen(store: store)
-        case .chat:   ChatScreen(store: store)
+        case .data:   DataScreen(store: store)
         case .train:  TrainScreen(store: store)
-        case .runs:   RunsScreen(store: store)
+        case .chat:   ChatScreen(store: store)
+        case .embed:  EmbeddingsScreen(store: store)
         }
     }
 

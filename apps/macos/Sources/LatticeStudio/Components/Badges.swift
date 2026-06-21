@@ -7,7 +7,8 @@ import SwiftUI
 // Design laws (spec §D):
 //   - FormatBadge: height 20, h-pad 7, radius 4 (Theme.Radius.badge), 11pt medium, neutral fill/border.
 //     Avoid assigning a different bright color to every model format.
-//   - StatusBadge: height 22, 6pt semantic dot, semantic text color, fill=semantic@12%, border=semantic@28%.
+//   - StatusBadge: height 22, 6pt semantic dot, ink text (AA on the tinted fill),
+//     fill=semantic@12%, border=semantic@28%.
 //     Only Running gets motion: opacity pulse 65%→100% over 1.2s (spec §F).
 
 // MARK: - FormatBadge
@@ -125,7 +126,7 @@ struct StatusBadge: View {
 
             Text(status.label)
                 .font(Theme.Fonts.controlText)
-                .foregroundStyle(status.color)
+                .foregroundStyle(Theme.Palette.ink)
         }
         .padding(.horizontal, 8)
         .frame(height: 22)
