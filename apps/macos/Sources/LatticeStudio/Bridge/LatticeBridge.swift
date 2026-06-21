@@ -166,6 +166,7 @@ enum LatticeBridge {
         var headDim: Int? = nil
         var gdnKeyHeads: Int? = nil
         var gdnValueHeads: Int? = nil
+        var intermediateSize: Int? = nil
         var dtype = format == .bf16 ? "BF16" : "Q4_0"
         if let rawCfg = readConfig(dir.appendingPathComponent("config.json")) {
             // Some models (e.g. MLX VLM repacks) nest text fields under `text_config`.
@@ -188,6 +189,7 @@ enum LatticeBridge {
             headDim = cfg["head_dim"] as? Int
             gdnKeyHeads = cfg["linear_num_key_heads"] as? Int
             gdnValueHeads = cfg["linear_num_value_heads"] as? Int
+            intermediateSize = cfg["intermediate_size"] as? Int
             // Derive layer summary from real `layer_types` array when available.
             if let layerTypes = cfg["layer_types"] as? [String] {
                 // Count each type and surface all non-zero counts.
@@ -230,6 +232,7 @@ enum LatticeBridge {
             layerSummary: layerSummary, hidden: hidden, vocab: vocab, contextLength: contextLen,
             attnHeads: attnHeads, kvHeads: kvHeads, headDim: headDim,
             gdnKeyHeads: gdnKeyHeads, gdnValueHeads: gdnValueHeads,
+            intermediateSize: intermediateSize,
             isEmbedding: isEmbedding, adapters: adapters
         )
     }

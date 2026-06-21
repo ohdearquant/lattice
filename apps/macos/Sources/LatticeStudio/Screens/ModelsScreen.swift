@@ -276,6 +276,11 @@ struct ModelsScreen: View {
         if let hidden = model.hidden {
             ws.append(WellSpec("HIDDEN", "\(hidden)"))
         }
+        // intermediate_size — FFN/MLP inner width (3584 for qwen3.5, ~3.5× hidden).
+        // Honest-nil: omitted when the model config has no intermediate_size.
+        if let ffn = model.intermediateSize {
+            ws.append(WellSpec("FFN", "\(ffn)"))
+        }
         if let vocab = model.vocab {
             ws.append(WellSpec("VOCAB", "\(vocab)"))
         }

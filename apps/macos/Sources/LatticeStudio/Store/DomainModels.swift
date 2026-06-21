@@ -58,6 +58,7 @@ struct ModelInfo: Identifiable, Equatable {
     var headDim: Int?           // head_dim (explicit; NOT hidden/heads for qwen3.5)
     var gdnKeyHeads: Int?       // linear_num_key_heads (GatedDeltaNet)
     var gdnValueHeads: Int?     // linear_num_value_heads (GatedDeltaNet)
+    var intermediateSize: Int?  // intermediate_size — FFN/MLP inner width (3584 for qwen3.5)
     var isEmbedding: Bool = false
     var adapters: [AdapterInfo] = []
 }
