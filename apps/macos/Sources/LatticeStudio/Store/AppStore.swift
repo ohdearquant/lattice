@@ -25,6 +25,12 @@ final class AppStore {
 
     init() {
         runs = Self.loadRunArchive()
+        // Reap trainer processes orphaned by a previous app crash or force-quit.
+        // Done synchronously at init so no orphan can race with an immediately-launched run.
+        let reaped = RunRegistry.reapOrphans()
+        if reaped > 0 {
+            print("[AppStore] reaped \(reaped) orphaned trainer process(es) from previous session")
+        }
     }
 
     func onAppear() {
@@ -34,8 +40,11 @@ final class AppStore {
 
     // MARK: Run archive persistence
 
-    /// URL of the on-disk runs.json archive in the app's Application Support directory.
-    private static var runsArchiveURL: URL? {
+    /// The shared `<AppSupport>/LatticeStudio` base directory.
+    ///
+    /// Used by both the runs.json archive and RunRegistry's active-runs subdirectory so
+    /// both always resolve to the same location.
+    nonisolated static var appSupportDir: URL? {
         guard let appSupport = try? FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -45,7 +54,12 @@ final class AppStore {
         let dir = appSupport.appendingPathComponent("LatticeStudio", isDirectory: true)
         // Create the subdirectory on first access.
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("runs.json")
+        return dir
+    }
+
+    /// URL of the on-disk runs.json archive in the app's Application Support directory.
+    private static var runsArchiveURL: URL? {
+        appSupportDir?.appendingPathComponent("runs.json")
     }
 
     /// Decode the persisted run archive from disk. Returns an empty array on any failure
@@ -108,9 +122,26 @@ final class AppStore {
         if let prior = handle, prior.isRunning { prior.stop() }
         let h = RunHandle()
         h.onEvent = { [weak self] ev in self?.consume(ev, into: run) }
-        h.onExit = { [weak self] code in self?.finish(run, code: code) }
         do {
             try h.start(spec)
+            // Register AFTER a successful start so we never record a pid that never launched.
+            let pid = h.pid
+            RunRegistry.register(
+                pid: pid,
+                binPath: spec.executable.path,
+                kind: kind.rawValue,
+                startedAt: run.startedAt
+            )
+            // Set onExit AFTER start so it captures `pid` (a value) rather than `h`. Capturing
+            // `h` would retain-cycle through h.onExit and leak the RunHandle + its Process +
+            // pipe file descriptors on every run. No fast-exit race: terminationHandler
+            // dispatches onExit onto the main queue, and we are still on the main actor here,
+            // so onExit is always assigned before it can fire.
+            h.onExit = { [weak self] code in
+                // Deregister before finish so the PID slot is freed even if finish throws.
+                RunRegistry.deregister(pid: pid)
+                self?.finish(run, code: code)
+            }
         } catch {
             run.status = .failed
             run.appendLog("launch failed: \(error.localizedDescription)")

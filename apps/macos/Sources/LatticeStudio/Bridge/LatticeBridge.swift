@@ -364,6 +364,8 @@ final class RunHandle {
     var onExit: ((Int32) -> Void)?
 
     var isRunning: Bool { process.isRunning }
+    /// The OS-assigned process identifier. Valid after `start(_:)` returns without throwing.
+    var pid: Int32 { process.processIdentifier }
 
     func start(_ spec: LaunchSpec, env: [String: String]? = nil) throws {
         process.executableURL = spec.executable
