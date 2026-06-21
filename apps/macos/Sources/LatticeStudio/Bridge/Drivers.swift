@@ -13,8 +13,8 @@ import Foundation
 /// Configuration for `train_grad_full` (multi-layer exact-gradient LoRA trainer).
 ///
 /// All defaults match the binary's own defaults so omitting a field is equivalent
-/// to not passing the flag. `--json` is always appended so the JSON event protocol
-/// is active when the binary gains that flag; older binaries ignore unknown flags.
+/// to not passing the flag. `--json` is always appended to activate the structured
+/// `@@lattice` event protocol (verified emitted by `train_grad_full --json`, 2026-06-21).
 struct TrainConfig {
     /// Full path to the BF16 model directory (must contain `model.safetensors` / index).
     var modelDir: URL
@@ -55,7 +55,7 @@ struct TrainConfig {
             "--max-train",   String(maxTrain),
             "--max-valid",   String(maxValid),
             "--log-every",   String(logEvery),
-            "--json",         // future --json mode; older binaries ignore unknown flags
+            "--json",         // structured @@lattice event protocol (verified train_grad_full)
         ]
         if let save = savePath {
             a += ["--save", save.path]

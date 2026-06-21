@@ -153,6 +153,15 @@ final class AppStore {
     private func consume(_ event: LatticeEvent, into run: LiveRun) {
         switch event {
         case .trainStep(let s):
+            // Step 0 carries the pre-training NLL, which equals train_done.base_nll
+            // (verified byte-identical against the binary). Capture it on the first event
+            // so "Δ FROM BASE" reads live from step 0 instead of "—" until the run ends.
+            // BEST VAL is deliberately NOT tracked here: the trainer computes its final
+            // held-out NLL once at completion (eval_valid on the saved final weights, not a
+            // best checkpoint), so any running minimum would diverge from the saved adapter
+            // and jump at trainDone. The live per-step held-out NLL is already shown in the
+            // HELD-OUT well; BEST VAL stays honest-nil until trainDone reports it.
+            if s.step == 0 { run.baseNLL = s.loss }
             run.points.append(TrainPoint(step: s.step, loss: s.loss, valLoss: s.val_loss,
                                          gradNorm: s.grad_norm, lr: s.lr, tokS: s.tok_s))
         case .trainEval(let e):
