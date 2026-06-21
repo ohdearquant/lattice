@@ -3,25 +3,31 @@ import SwiftUI
 // MARK: - Navigation
 
 enum Screen: String, CaseIterable, Identifiable, Hashable {
-    case models, train, quantize, chat, data, runs
+    case models, chat, train, runs
     var id: String { rawValue }
 
     var index: String {
         switch self {
-        case .models: "01"; case .train: "02"; case .quantize: "03"
-        case .chat: "04"; case .data: "05"; case .runs: "06"
+        case .models: "01"; case .chat: "02"; case .train: "03"; case .runs: "04"
         }
     }
     var title: String {
         switch self {
-        case .models: "MODELS"; case .train: "TRAIN"; case .quantize: "QUANTIZE"
-        case .chat: "CHAT"; case .data: "DATA"; case .runs: "RUNS"
+        case .models: "MODELS"; case .chat: "CHAT"; case .train: "TRAIN"; case .runs: "RUNS"
         }
     }
     var shortcut: KeyEquivalent {
         switch self {
-        case .models: "1"; case .train: "2"; case .quantize: "3"
-        case .chat: "4"; case .data: "5"; case .runs: "r"
+        case .models: "1"; case .chat: "2"; case .train: "3"; case .runs: "4"
+        }
+    }
+
+    /// Whether this screen has a config inspector (toggle sidebar). Drives the
+    /// shared window-toolbar toggle visibility. Flip to `true` as each screen is converted.
+    var hasInspector: Bool {
+        switch self {
+        case .chat: true
+        default: false
         }
     }
 }

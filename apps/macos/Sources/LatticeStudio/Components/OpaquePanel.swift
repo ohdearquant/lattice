@@ -2,9 +2,12 @@ import SwiftUI
 
 // MARK: - Primitive 1: OpaquePanel
 //
-// Law: "Numbers never touch glass."
-// Enforces opaque Theme.Palette.panel fill with 1px Theme.Palette.hairline border.
-// Corner radius is Theme.Radius.panel = 0px (panels are RULED, not carded).
+// Graphite Signal Lab design laws:
+//   - Dark graphite surfaces (#121820 panel, #080B0F wellSink).
+//   - 10pt continuous-radius cards — panels are CARDED, not ruled (0px era is over).
+//   - White-opacity hairlines: borderStandard = white 8%, no static drop shadows.
+//   - One cyan accent (#48D8C4) for signal / CTA — never decorative.
+//   - Numbers never touch glass — wells stay opaque.
 //
 // Usage:
 //   SomeView()
@@ -14,7 +17,7 @@ import SwiftUI
 //   OpaquePanel { ... }
 
 /// An opaque, hairline-bordered instrument panel container.
-/// Corner radius = 0 (ruled, not carded). No glass permitted inside.
+/// Corner radius = Theme.Radius.panel (10pt continuous). No glass permitted inside.
 struct OpaquePanel<Content: View>: View {
     private let content: Content
 
@@ -25,9 +28,10 @@ struct OpaquePanel<Content: View>: View {
     var body: some View {
         content
             .background(Theme.Palette.panel)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
             .overlay(
-                Rectangle()
-                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                    .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
             )
     }
 }
@@ -38,16 +42,17 @@ struct InstrumentPanelModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(Theme.Palette.panel)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
             .overlay(
-                Rectangle()
-                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
+                    .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
             )
     }
 }
 
 extension View {
-    /// Applies the opaque instrument-panel surface: Theme.Palette.panel fill + 1px hairline border.
-    /// Corner radius = 0 (ruled, not carded). No glass permitted on this surface.
+    /// Applies the opaque instrument-panel surface: Theme.Palette.panel fill + 1px white-opacity border.
+    /// Corner radius = Theme.Radius.panel (10pt continuous). No glass permitted on this surface.
     func instrumentPanel() -> some View {
         modifier(InstrumentPanelModifier())
     }
@@ -56,9 +61,9 @@ extension View {
 // MARK: - Readout Well Surface Style
 //
 // Recessed machined-in surface used inside readout wells.
-// Fill: Theme.Palette.wellSink
-// Border: 1px Theme.Palette.hairline
-// Corner radius: Theme.Radius.well = 6px
+// Fill: Theme.Palette.wellSink (#080B0F dark / #E8EDF2 light)
+// Border: 1px white-opacity hairline (borderStandard)
+// Corner radius: Theme.Radius.well (8pt continuous)
 // Inner top-shadow: 2px so it reads machined-in, not raised.
 
 struct ReadoutWellSurface: ViewModifier {
@@ -85,13 +90,13 @@ struct ReadoutWellSurface: ViewModifier {
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
-                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                    .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
             )
     }
 }
 
 extension View {
-    /// Applies the recessed readout-well surface: wellSink fill + 2px inner top-shadow + hairline border.
+    /// Applies the recessed readout-well surface: wellSink fill + 2px inner top-shadow + white-opacity border.
     func readoutWellSurface() -> some View {
         modifier(ReadoutWellSurface())
     }
@@ -100,7 +105,7 @@ extension View {
 // MARK: - Previews
 
 #Preview("OpaquePanel") {
-    VStack(spacing: 0) {
+    VStack(spacing: Theme.Space.md) {
         OpaquePanel {
             Text("Loss: 0.6121")
                 .font(Theme.Fonts.readout)
@@ -109,7 +114,7 @@ extension View {
         }
 
         HStack {
-            Text("INSTRUMENT PANEL — opaque, hairline-bordered, 0px radius")
+            Text("INSTRUMENT PANEL — opaque, 10pt card, white-opacity hairline")
                 .instrumentLabel()
                 .padding(Theme.Space.lg)
         }
@@ -126,4 +131,5 @@ extension View {
     }
     .background(Theme.Palette.canvas)
     .frame(width: 360)
+    .padding(Theme.Space.lg)
 }

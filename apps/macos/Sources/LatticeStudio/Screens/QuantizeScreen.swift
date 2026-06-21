@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-// MARK: - 03 QUANTIZE
+// MARK: - QUANTIZE (sheet, reached from Models → Quantize…)
 //
 // Layout: HSplitView — CONFIG panel (left, OpaquePanel) | LIVE/RESULT area (right, fills).
 //
@@ -82,13 +82,32 @@ struct QuantizeScreen: View {
     }
 
     // MARK: Body
+    //
+    // Presented as a sheet from ModelsScreen — no longer a top-level nav destination.
+    // Uses a plain VStack scaffold (index "—" · title "QUANTIZE") instead of ScreenScaffold
+    // so no Screen enum case is required.
 
     var body: some View {
-        ScreenScaffold(
-            screen: .quantize,
-            subtitle: subtitle,
-            trailing: { trailingActions }
-        ) {
+        VStack(alignment: .leading, spacing: Theme.Space.lg) {
+            // Sheet header — mirrors ScreenScaffold visually
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text("—")
+                            .font(Theme.Fonts.mono(13))
+                            .foregroundStyle(Theme.Palette.inkDim)
+                        Text("QUANTIZE")
+                            .font(Theme.Fonts.display(17, .bold))
+                            .foregroundStyle(Theme.Palette.ink)
+                    }
+                    Text(subtitle)
+                        .font(Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                }
+                Spacer(minLength: Theme.Space.lg)
+                trailingActions
+            }
+
             HSplitView {
                 configPanel
                     .frame(minWidth: 280, idealWidth: 300, maxWidth: 340)
@@ -96,7 +115,11 @@ struct QuantizeScreen: View {
                 livePanel
                     .frame(minWidth: 400)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(Theme.Space.xl)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
         .onChange(of: isQuaRot) { _, _ in refreshOutputDir() }

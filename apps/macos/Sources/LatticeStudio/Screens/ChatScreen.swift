@@ -2,35 +2,27 @@ import SwiftUI
 
 // MARK: - 04 CHAT
 //
+// Redesigned as a friendly, minimal chat interface with progressive disclosure.
+//
 // Layout (three zones):
-//   • CONFIG STRIP  — top OpaquePanel: MODEL picker, ADAPTER picker, FaderToggle (BASE/+ADAPTER),
-//                     max-tokens slider, temperature slider, seed field.
-//   • TRANSCRIPT    — scrollable VStack of ChatTurn bubbles. Each turn shows the user prompt
-//                     (right-aligned) then the model response on an opaque surface. While a run
-//                     is in-flight the response slot shows an animated "▍ generating…" placeholder
-//                     with a GatePill(.run). On completion the collected log text fills it in.
-//   • COMPOSER      — multiline TextField + teal Send button + ⌘↵ KeyCapChip hint.
+//   • TOP BAR      — slim 44pt strip: model Menu (left).
+//   • TRANSCRIPT   — scrollable column of chat bubbles, max-width 920pt, centered.
+//   • COMPOSER     — rounded TextEditor + Send CTA (bottom).
 //
-// Generation model:
-//   generate_lora prints output ATOMICALLY. Output arrives as .status lines into store.liveRun.log.
-//   A "message" lifecycle is: launch via store.runGenerate(GenConfig) → status == .running →
-//   collect store.liveRun.log → status == .done → copy cleaned output into the pending turn.
+// All knobs (adapter, temperature, max tokens, seed) are hidden in a toggleable
+// right-side .inspector sidebar, shown via the window-toolbar toggle button or ⌘\.
 //
-//   Cleaning rule: drop lines that start with "$ " (the command echo). The remaining lines are
-//   either loader status ("Adapter: …", "LoRA active …") or the generated text itself. We keep
-//   all non-echo lines and present them mono, separated by newlines, so the user sees any
-//   informational loader messages as subtle context before the generated text.
+// Generation model: unchanged from prior implementation.
+//   generate_lora prints output ATOMICALLY. A "message" lifecycle is:
+//   launch via store.runGenerate(GenConfig) → status == .running →
+//   collect store.liveRun.genText (cumulative) → status == .done → copy into pending turn.
 //
 // Completion detection:
-//   .onChange(of: store.liveRun?.status) fires when the subprocess exits and the store sets
-//   status to .done or .failed. We track `awaitingTurnID: UUID?` in @State; only the turn
-//   whose id matches gets updated, preventing stale binds across multiple generations.
+//   .onChange(of: store.liveRun?.status) fires when the subprocess exits.
+//   awaitingTurnID: UUID? tracks which turn receives the result.
 //
-// A/B usage pattern:
-//   The user sends a prompt, reads the BASE response, flips the fader to +ADAPTER, re-sends
-//   the SAME prompt. Two adjacent turns in the transcript provide the visual diff. We do NOT
-//   auto-run both variants — manual flip+resend is the v1 A/B story. This matches the reality
-//   that generate_lora runs synchronously and there is no lockstep-streaming path.
+// A/B comparison: dropped for this pass. Adapter is now a single advanced setting
+// in the settings inspector sidebar. One active adapter, no fader/variant label.
 
 // MARK: - Local domain model
 
@@ -39,10 +31,105 @@ private struct ChatTurn: Identifiable {
 
     let id = UUID()
     let prompt: String
-    let variantLabel: String   // "BASE" or "+ADAPTER <adapter-name>"
     var responseText: String = ""
     var status: TurnStatus = .running
     var tokensPerSecond: Double? = nil
+}
+
+// MARK: - Typing indicator dots
+
+private struct TypingDots: View {
+    @State private var phase: Int = 0
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(Theme.Palette.textTertiary)
+                    .frame(width: 6, height: 6)
+                    .scaleEffect(phase == i ? 1.25 : 0.85)
+                    .animation(
+                        .easeInOut(duration: 0.4)
+                            .repeatForever(autoreverses: true)
+                            .delay(Double(i) * 0.15),
+                        value: phase
+                    )
+            }
+        }
+        .onAppear { phase = 0 }
+        .task {
+            // nudge phase so each dot has a unique animation offset
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            phase = 1
+        }
+    }
+}
+
+// MARK: - Settings inspector content
+
+private struct ChatInspector: View {
+    let adapterOptions: [String]
+    @Binding var selectedAdapterName: String
+    @Binding var tempText: String
+    @Binding var maxTokensText: String
+    @Binding var seedText: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                Text("Settings")
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(0.5)
+                    .textCase(.uppercase)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+
+                // Adapter
+                settingsRow(label: "Adapter") {
+                    Picker("", selection: $selectedAdapterName) {
+                        ForEach(adapterOptions, id: \.self) { name in
+                            Text(name).tag(name)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .font(Theme.Fonts.body)
+                    .disabled(adapterOptions.count <= 1)
+                }
+
+                Divider()
+
+                // Temperature
+                settingsRow(label: "Temperature") {
+                    LatticeNumericField(prompt: "0.7", text: $tempText, width: 64)
+                }
+
+                // Max tokens
+                settingsRow(label: "Max tokens") {
+                    LatticeNumericField(prompt: "256", text: $maxTokensText, width: 72)
+                }
+
+                // Seed
+                settingsRow(label: "Seed") {
+                    LatticeNumericField(prompt: "random", text: $seedText, width: 88)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(Theme.Space.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Theme.Palette.panel)
+    }
+
+    @ViewBuilder
+    private func settingsRow<Control: View>(label: String, @ViewBuilder control: () -> Control) -> some View {
+        HStack {
+            Text(label)
+                .font(Theme.Fonts.caption)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            Spacer()
+            control()
+        }
+    }
 }
 
 // MARK: - ChatScreen
@@ -56,29 +143,33 @@ struct ChatScreen: View {
     @State private var composerText: String = ""
     @State private var awaitingTurnID: UUID?
 
-    // Config pickers
+    // Model selection
     @State private var selectedModelName: String = ""
-    @State private var selectedAdapterName: String = "none"
-    @State private var useAdapter: Bool = false
 
-    // Sampling params
-    @State private var maxTokens: Double = 64
-    @State private var temperature: Double = 0.7
+    // Settings (advanced, in inspector sidebar)
+    @State private var selectedAdapterName: String = "none"
+    @State private var tempText: String = "0.7"
+    @State private var maxTokensText: String = "256"
     @State private var seedText: String = ""
+
+    // User-initiated stop: tracks which turn was running when Stop was pressed.
+    // A turn whose id matches this value is treated as a clean stop (partial text
+    // kept, not marked .failed) rather than an error.
+    @State private var userStoppedTurnID: UUID? = nil
 
     // MARK: Derived helpers
 
+    // Only bf16 models can be chatted — q4/quarot require safetensors and
+    // generate_lora loads from_safetensors; embedding models are not generative.
     private var chatModels: [ModelInfo] {
-        store.models.filter { !$0.isEmbedding }
-    }
-
-    private var chatModelNames: [String] {
-        chatModels.map(\.name)
+        store.models.filter { $0.format == .bf16 }
     }
 
     private var selectedModel: ModelInfo? {
-        chatModels.first { $0.name == selectedModelName }
-            ?? store.targetModel
+        // If the current selection is still in the filtered list, keep it.
+        // Otherwise fall back to the first bf16 model (or nil if none exist).
+        if let m = chatModels.first(where: { $0.name == selectedModelName }) { return m }
+        return chatModels.first
     }
 
     private var adapterOptions: [String] {
@@ -87,13 +178,8 @@ struct ChatScreen: View {
     }
 
     private var selectedAdapter: AdapterInfo? {
-        guard useAdapter, selectedAdapterName != "none" else { return nil }
+        guard selectedAdapterName != "none" else { return nil }
         return selectedModel?.adapters.first { $0.name == selectedAdapterName }
-    }
-
-    private var hasAdapters: Bool {
-        guard let m = selectedModel else { return false }
-        return !m.adapters.isEmpty
     }
 
     private var isRunning: Bool {
@@ -105,43 +191,40 @@ struct ChatScreen: View {
             && !isRunning
     }
 
-    private var variantLabel: String {
-        if let adapter = selectedAdapter {
-            return "+ADAPTER \(adapter.name)"
-        }
-        return "BASE"
-    }
-
     // MARK: Body
 
     var body: some View {
-        ScreenScaffold(
-            screen: .chat,
-            subtitle: subtitleText,
-            trailing: { liveStatusBadge }
-        ) {
-            VStack(spacing: 0) {
-                configStrip
-                Divider().background(Theme.Palette.hairline)
-                transcriptArea
-                Divider().background(Theme.Palette.hairline)
-                composerBar
-            }
+        VStack(spacing: 0) {
+            topBar
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(height: 1)
+            transcriptArea
+            composerBar
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas)
+        .inspector(isPresented: $store.inspectorPresented) {
+            ChatInspector(
+                adapterOptions: adapterOptions,
+                selectedAdapterName: $selectedAdapterName,
+                tempText: $tempText,
+                maxTokensText: $maxTokensText,
+                seedText: $seedText
+            )
+            .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
         .onChange(of: selectedModelName) { _, _ in
-            // Reset adapter selection when model changes.
+            // Reset adapter when model changes.
             selectedAdapterName = "none"
-            useAdapter = false
         }
         .onChange(of: store.liveRun?.status) { _, newStatus in
             handleRunStatusChange(newStatus)
         }
         .onChange(of: store.liveRun?.genText) { _, newText in
-            // Live streaming: push incremental token text into the awaiting turn
-            // so the response renders token-by-token as the engine streams.
-            // genText is already cumulative, so assign (not append).
+            // Live streaming: genText is cumulative — assign, not append.
             guard let turnID = awaitingTurnID,
                   store.liveRun?.kind == .chat,
                   let idx = turns.firstIndex(where: { $0.id == turnID })
@@ -149,159 +232,44 @@ struct ChatScreen: View {
             turns[idx].responseText = newText ?? ""
         }
         .onChange(of: store.liveRun?.log.count) { _, _ in
-            // Belt-and-suspenders: if status fires before log is flushed,
-            // a log.count change while awaiting provides a secondary wake.
-            // No action here; status onChange is the actual handler.
+            // Belt-and-suspenders: log.count changes are noted; status onChange is the handler.
         }
     }
 
-    // MARK: Subtitle + live badge
+    // MARK: Top bar
 
-    private var subtitleText: String {
-        if let m = selectedModel {
-            return "\(m.name)\(hasAdapters ? " · \(m.adapters.count) adapter\(m.adapters.count == 1 ? "" : "s")" : " · no adapters")"
-        }
-        return "sample-test base vs +adapter"
-    }
-
-    @ViewBuilder
-    private var liveStatusBadge: some View {
-        if isRunning {
-            GatePill(.run, label: "GENERATING")
-        }
-    }
-
-    // MARK: Config strip
-
-    private var configStrip: some View {
-        OpaquePanel {
-            VStack(spacing: 0) {
-                modelAdapterRow
-                faderRow
-                Divider().background(Theme.Palette.hairline)
-                samplingRows
-            }
-        }
-    }
-
-    private var modelAdapterRow: some View {
-        HStack(spacing: 0) {
-            // MODEL picker — occupies left half
-            HStack {
-                Text("MODEL")
-                    .instrumentLabel()
-                Spacer()
-                if chatModelNames.isEmpty {
-                    Text("no models")
-                        .font(Theme.Fonts.readout)
-                        .foregroundStyle(Theme.Palette.inkDim)
-                } else {
-                    Picker("", selection: $selectedModelName) {
-                        ForEach(chatModelNames, id: \.self) { name in
-                            Text(name).tag(name)
+    private var topBar: some View {
+        HStack(spacing: Theme.Space.sm) {
+            // Model menu — left side, no caps label
+            if chatModels.isEmpty {
+                Text("No models")
+                    .font(Theme.Fonts.bodyStrong)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            } else {
+                Menu {
+                    ForEach(chatModels, id: \.name) { model in
+                        Button(model.name) {
+                            selectedModelName = model.name
                         }
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .font(Theme.Fonts.readout)
-                }
-            }
-            .frame(height: Theme.Space.rowHeightComfortable)
-            .padding(.horizontal, Theme.Space.lg)
-            .overlay(alignment: .bottom) {
-                Theme.Palette.hairline.frame(height: 1)
-            }
-            .overlay(alignment: .trailing) {
-                Theme.Palette.hairline.frame(width: 1)
-            }
-
-            // ADAPTER picker — occupies right half
-            HStack {
-                Text("ADAPTER")
-                    .instrumentLabel()
-                Spacer()
-                Picker("", selection: $selectedAdapterName) {
-                    ForEach(adapterOptions, id: \.self) { name in
-                        Text(name).tag(name)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(selectedModelName.isEmpty ? "Select model" : selectedModelName)
+                            .font(Theme.Fonts.bodyStrong)
+                            .foregroundStyle(Theme.Palette.ink)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Theme.Palette.textSecondary)
                     }
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .font(Theme.Fonts.readout)
-                .disabled(!hasAdapters)
+                .buttonStyle(.plain)
             }
-            .frame(height: Theme.Space.rowHeightComfortable)
-            .padding(.horizontal, Theme.Space.lg)
-            .overlay(alignment: .bottom) {
-                Theme.Palette.hairline.frame(height: 1)
-            }
+
+            Spacer()
         }
-    }
-
-    private var faderRow: some View {
-        VStack(spacing: 0) {
-            FaderToggle(
-                labelA: "BASE",
-                labelB: hasAdapters && selectedAdapterName != "none"
-                    ? "+ADAPTER \(selectedAdapterName)"
-                    : "+ADAPTER",
-                isOnB: $useAdapter
-            )
-            .disabled(!hasAdapters)
-            .opacity(hasAdapters ? 1 : 0.4)
-
-            if !hasAdapters {
-                Text("load a model with adapters to enable A/B comparison")
-                    .font(Theme.Fonts.cell)
-                    .foregroundStyle(Theme.Palette.inkDim)
-                    .padding(.horizontal, Theme.Space.lg)
-                    .padding(.bottom, Theme.Space.sm)
-            }
-        }
-        .overlay(alignment: .bottom) {
-            Theme.Palette.hairline.frame(height: 1)
-        }
-    }
-
-    private var samplingRows: some View {
-        HStack(spacing: 0) {
-            ParamRowSlider(
-                label: "MAX TOKENS",
-                value: $maxTokens,
-                range: 1...512,
-                step: 1,
-                format: "%.0f"
-            )
-            .overlay(alignment: .trailing) {
-                Theme.Palette.hairline.frame(width: 1)
-            }
-
-            ParamRowSlider(
-                label: "TEMP",
-                value: $temperature,
-                range: 0...1.5,
-                format: "%.2f"
-            )
-            .overlay(alignment: .trailing) {
-                Theme.Palette.hairline.frame(width: 1)
-            }
-
-            // SEED field — optional
-            HStack {
-                Text("SEED")
-                    .instrumentLabel()
-                Spacer()
-                TextField("random", text: $seedText)
-                    .font(Theme.Fonts.readout)
-                    .foregroundStyle(Theme.Palette.ink)
-                    .multilineTextAlignment(.trailing)
-                    .frame(maxWidth: 100)
-                    .textFieldStyle(.plain)
-                    .monospacedDigit()
-            }
-            .frame(height: Theme.Space.rowHeightComfortable)
-            .padding(.horizontal, Theme.Space.lg)
-        }
+        .frame(height: 44)
+        .padding(.horizontal, Theme.Space.lg)
+        .background(Theme.Palette.canvas)
     }
 
     // MARK: Transcript
@@ -309,17 +277,20 @@ struct ChatScreen: View {
     @ViewBuilder
     private var transcriptArea: some View {
         if turns.isEmpty {
-            emptyTranscript
+            emptyState
         } else {
             ScrollViewReader { proxy in
                 ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         ForEach(turns) { turn in
                             turnView(turn)
                                 .id(turn.id)
                         }
                     }
-                    .padding(Theme.Space.lg)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.vertical, Theme.Space.xl)
+                    .frame(maxWidth: Theme.Space.chatMaxWidth)
+                    .frame(maxWidth: .infinity)
                 }
                 .onChange(of: turns.count) { _, _ in
                     if let last = turns.last {
@@ -337,232 +308,306 @@ struct ChatScreen: View {
         }
     }
 
-    private var emptyTranscript: some View {
-        VStack(spacing: Theme.Space.sm) {
-            Text("ask the model something")
-                .font(Theme.Fonts.readout)
-                .foregroundStyle(Theme.Palette.inkDim)
-            Text("flip the fader to A/B the adapter")
-                .font(Theme.Fonts.cell)
-                .foregroundStyle(Theme.Palette.inkDim.opacity(0.7))
+    private var emptyState: some View {
+        VStack {
+            Spacer()
+                .frame(minHeight: 0)
+                .frame(maxHeight: .infinity)
+                .layoutPriority(-1)
+            EmptyStateView(
+                systemImage: "text.bubble",
+                title: "Try it out",
+                message: "Send a message to run this model locally on your Mac."
+            )
+            .frame(maxWidth: .infinity)
+            Spacer()
+                .frame(minHeight: 0)
+                .frame(maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+
+    // MARK: Turn bubbles
 
     @ViewBuilder
     private func turnView(_ turn: ChatTurn) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.xs) {
-            // User prompt — right-aligned with "YOU" label
-            HStack(alignment: .top, spacing: Theme.Space.sm) {
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("YOU")
-                        .instrumentLabel()
-                    Text(turn.prompt)
-                        .font(Theme.Fonts.mono(12))
-                        .foregroundStyle(Theme.Palette.ink)
-                        .monospacedDigit()
-                        .multilineTextAlignment(.trailing)
-                        .textSelection(.enabled)
-                }
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            // User bubble — right-aligned
+            HStack {
+                Spacer(minLength: Theme.Space.xxl)
+                Text(turn.prompt)
+                    .font(Theme.Fonts.body)
+                    .foregroundStyle(Theme.Palette.ink)
+                    .multilineTextAlignment(.trailing)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Theme.Palette.selectionFill)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(Theme.Palette.selectionBorder, lineWidth: 1)
+                            )
+                    )
             }
 
-            // Model response — left-aligned, labeled with variant, on opaque surface
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                // Header: variant label + gate pill
-                HStack(spacing: Theme.Space.sm) {
-                    Text(turn.variantLabel)
-                        .instrumentLabel()
-                    switch turn.status {
-                    case .running:
-                        GatePill(.run, label: "generating")
-                    case .done:
-                        GatePill(.pass, label: "done")
-                    case .failed:
-                        GatePill(.fail, label: "failed")
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.top, Theme.Space.sm)
+            // Assistant bubble — left-aligned
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if turn.status == .running && turn.responseText.isEmpty {
+                        // Typing indicator before any tokens arrive
+                        HStack(spacing: Theme.Space.xs) {
+                            TypingDots()
+                            Text("Thinking…")
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(assistantBubbleBackground)
+                    } else {
+                        // Response text — body font (prose-friendly, not mono)
+                        Text(turn.responseText.isEmpty ? "(no output)" : turn.responseText)
+                            .font(Theme.Fonts.body)
+                            .foregroundStyle(
+                                turn.status == .failed
+                                    ? Theme.Palette.error
+                                    : Theme.Palette.ink
+                            )
+                            .multilineTextAlignment(.leading)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(assistantBubbleBackground)
 
-                Divider()
-                    .background(Theme.Palette.hairline)
-
-                // Response text — mono, opaque surface (numbers never touch glass law)
-                if turn.status == .running && turn.responseText.isEmpty {
-                    generatingPlaceholder
-                        .padding(.horizontal, Theme.Space.md)
-                        .padding(.bottom, Theme.Space.sm)
-                } else {
-                    Text(turn.responseText.isEmpty ? "(no output)" : turn.responseText)
-                        .font(Theme.Fonts.mono(12))
-                        .foregroundStyle(
-                            turn.status == .failed
-                                ? Theme.Palette.crimson
-                                : Theme.Palette.ink
-                        )
-                        .monospacedDigit()
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, Theme.Space.md)
-                        .padding(.bottom, turn.tokensPerSecond != nil ? Theme.Space.xs : Theme.Space.sm)
-
-                    if let tps = turn.tokensPerSecond {
-                        Text(String(format: "%.1f tok/s", tps))
-                            .font(Theme.Fonts.cell)
-                            .foregroundStyle(Theme.Palette.signal)
-                            .monospacedDigit()
-                            .frame(maxWidth: .infinity, alignment: .trailing)
-                            .padding(.horizontal, Theme.Space.md)
-                            .padding(.bottom, Theme.Space.sm)
+                        // Optional tok/s — muted, small
+                        if let tps = turn.tokensPerSecond {
+                            Text(String(format: "%.1f tok/s", tps))
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                                .monospacedDigit()
+                                .padding(.leading, 4)
+                        }
                     }
                 }
+                Spacer(minLength: Theme.Space.xxl)
             }
-            .instrumentPanel()
         }
     }
 
-    private var generatingPlaceholder: some View {
-        HStack(spacing: Theme.Space.xs) {
-            Text("▍")
-                .font(Theme.Fonts.mono(12))
-                .foregroundStyle(Theme.Palette.signal)
-            Text("generating…")
-                .font(Theme.Fonts.mono(12))
-                .foregroundStyle(Theme.Palette.inkDim)
-        }
-        .padding(.vertical, Theme.Space.xs)
+    private var assistantBubbleBackground: some View {
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(Theme.Palette.surfaceRaised)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+            )
     }
 
     // MARK: Composer
 
     private var composerBar: some View {
-        HStack(alignment: .bottom, spacing: Theme.Space.sm) {
-            TextEditor(text: $composerText)
-                .font(Theme.Fonts.mono(13))
-                .foregroundStyle(Theme.Palette.ink)
-                .scrollContentBackground(.hidden)
-                .background(Theme.Palette.wellSink)
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(height: 1)
+
+            HStack(alignment: .bottom, spacing: Theme.Space.sm) {
+                // Multiline input
+                ZStack(alignment: .topLeading) {
+                    if composerText.isEmpty {
+                        Text("Message…")
+                            .font(Theme.Fonts.body)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .padding(.horizontal, 10)
+                            .padding(.top, 9)
+                            .allowsHitTesting(false)
+                    }
+                    TextEditor(text: $composerText)
+                        .font(Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.ink)
+                        .scrollContentBackground(.hidden)
+                        .background(.clear)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                }
+                .frame(minHeight: 52, maxHeight: 140)
+                .background(Theme.Palette.surfaceRaised)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
-                        .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                        .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
                 )
-                .frame(minHeight: 56, maxHeight: 120)
 
-            VStack(alignment: .trailing, spacing: Theme.Space.xs) {
-                // Send button — the one teal CTA on this screen
-                Button(action: send) {
-                    Text("Send")
-                        .font(Theme.Fonts.display(13, .semibold))
-                        .foregroundStyle(Theme.Palette.canvas)
-                        .padding(.horizontal, Theme.Space.lg)
-                        .padding(.vertical, Theme.Space.sm)
-                        .background(
-                            canSend
-                                ? Theme.Palette.signal
-                                : Theme.Palette.signal.opacity(0.35)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canSend)
-                .keyboardShortcut(.return, modifiers: .command)
+                // Send / Stop button stack
+                VStack(alignment: .trailing, spacing: Theme.Space.xs) {
+                    if isRunning {
+                        // Stop button: visible while generation is in flight.
+                        Button {
+                            userStoppedTurnID = awaitingTurnID
+                            store.stopRun()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "stop.fill")
+                                    .font(.system(size: 11, weight: .medium))
+                                Text("Stop")
+                                    .font(Theme.Fonts.bodyStrong)
+                            }
+                            .foregroundStyle(Theme.Palette.crimson)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                    .strokeBorder(Theme.Palette.crimson.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button(action: send) {
+                            Text("Send")
+                        }
+                        .buttonStyle(LatticePrimaryButtonStyle())
+                        .disabled(!canSend)
+                        .keyboardShortcut(.return, modifiers: .command)
 
-                // Keyboard hint
-                HStack(spacing: 4) {
-                    KeyCapChip("⌘↵")
-                    Text("to send")
-                        .font(Theme.Fonts.cell)
-                        .foregroundStyle(Theme.Palette.inkDim)
+                        HStack(spacing: 4) {
+                            KeyCapChip("⌘↵")
+                            Text("send")
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                    }
                 }
             }
+            .padding(Theme.Space.lg)
+            .background(Theme.Palette.canvas)
         }
-        .padding(Theme.Space.md)
-        .instrumentPanel()
     }
 
     // MARK: Actions
 
     private func applyDefaults() {
-        // Set selectedModelName to the current target model if not already set or stale.
+        // Pick the first bf16 model if the current selection is missing or not bf16-generative.
         if selectedModelName.isEmpty || chatModels.first(where: { $0.name == selectedModelName }) == nil {
-            selectedModelName = store.targetModel?.name ?? chatModelNames.first ?? ""
+            // Prefer the store's target model if it is bf16, otherwise take the first bf16 model.
+            let target = store.targetModel
+            if let t = target, t.format == .bf16 {
+                selectedModelName = t.name
+            } else {
+                selectedModelName = chatModels.first?.name ?? ""
+            }
         }
     }
 
-    private func send() {
-        let prompt = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty, !isRunning else { return }
+    /// Render completed turns + newUserText as Qwen ChatML, mirroring the
+    /// authoritative `render_prompt` in crates/inference/src/bin/lattice.rs
+    /// (the /v1/chat/completions serve path). The tokenizer carries
+    /// <|im_start|>/<|im_end|> as special tokens and GenerateConfig's default
+    /// stop_token_ids includes <|im_end|>, so the assistant turn terminates
+    /// correctly. No trailing <|im_end|> is added after the final assistant tag.
+    /// No system prompt is included (matches the serve path where system is optional).
+    private func renderChatML(newUserText: String) -> String {
+        var buf = ""
+        for turn in turns {
+            // Include only completed turns that have a successful, non-empty reply.
+            // Skip: currently-awaiting turn (status == .running), failed turns,
+            // and turns with empty responseText (nothing useful to provide as context).
+            guard turn.status == .done,
+                  !turn.responseText.isEmpty
+            else { continue }
+            buf += "<|im_start|>user\n\(turn.prompt)<|im_end|>\n"
+            buf += "<|im_start|>assistant\n\(turn.responseText)<|im_end|>\n"
+        }
+        buf += "<|im_start|>user\n\(newUserText)<|im_end|>\n"
+        buf += "<|im_start|>assistant\n"
+        return buf
+    }
 
-        // Build the turn before launch so it appears immediately.
-        let turn = ChatTurn(
-            prompt: prompt,
-            variantLabel: variantLabel
-        )
+    private func send() {
+        let rawUserText = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawUserText.isEmpty, !isRunning else { return }
+
+        // The user's visible bubble shows the RAW text they typed.
+        // The prompt sent to the binary is a full ChatML conversation string.
+        let turn = ChatTurn(prompt: rawUserText)
         let turnID = turn.id
         turns.append(turn)
         awaitingTurnID = turnID
 
         composerText = ""
 
-        // Build GenConfig.
-        // Use modelDir (URL) so the binary gets the exact path rather than a name lookup.
+        // Parse settings — safe fallbacks, never crash, never force-unwrap.
+        let temperature = Double(tempText) ?? 0.7
+        let maxTokens = Int(maxTokensText) ?? 256
         let seed: UInt64? = seedText.isEmpty ? nil : UInt64(seedText)
+
+        // Build the ChatML prompt AFTER the new turn is in the array so it is
+        // excluded by the guard (status == .running) in renderChatML.
+        let chatMLPrompt = renderChatML(newUserText: rawUserText)
+
         let cfg = GenConfig(
             modelDir: selectedModel?.path,
             model: selectedModel == nil ? (selectedModelName.isEmpty ? nil : selectedModelName) : nil,
             adapterPath: selectedAdapter?.path,
-            prompt: prompt,
-            maxTokens: Int(maxTokens),
+            prompt: chatMLPrompt,
+            maxTokens: maxTokens,
             seed: seed,
             temperature: temperature
         )
 
         let run = store.runGenerate(cfg)
 
-        // If the launch already failed synchronously, resolve the turn immediately.
+        // If the launch already failed synchronously, resolve immediately.
         // onChange(of: status) fires only on a transition; a run that is already
-        // .failed when assigned produces no observable change, so we must handle
-        // it here before returning.
+        // .failed when assigned produces no observable change, so we handle it here.
         if run.status == .failed {
             resolveTurn(id: turnID, from: run, status: .failed)
         }
     }
 
-    // Resolve the awaiting turn with the output from `run`.
+    // Resolve the awaiting turn with output from `run`.
     // Shared between the inline synchronous-failure path and handleRunStatusChange.
     private func resolveTurn(id turnID: UUID, from run: LiveRun, status: RunStatus) {
         guard let idx = turns.firstIndex(where: { $0.id == turnID }) else { return }
 
-        // Clear awaiting before mutating so we do not re-enter on re-render.
+        // Was this turn stopped cleanly by the user (Stop button)?
+        let wasUserStopped = (userStoppedTurnID == turnID)
+
+        // Clear both awaiting and userStoppedTurnID before mutating to avoid re-entry.
         awaitingTurnID = nil
+        userStoppedTurnID = nil
 
         let responseText: String
         if !run.genText.isEmpty {
             // Streaming path: genText holds the complete concatenated token stream.
-            // Trim trailing whitespace/newlines that the engine may emit at end-of-sequence.
             responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
-            // Non-streaming fallback (older binary without --json, or failure before any token):
-            // extract the generated text by dropping lines beginning with "$ " (command echo).
+            // Non-streaming fallback (older binary or failure before any token):
+            // drop lines beginning with "$ " (command echo).
             let cleaned = run.log
                 .filter { !$0.hasPrefix("$ ") }
                 .joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if cleaned.isEmpty && status == .failed {
-                // Use the last log line as an error hint; fall back to a generic message.
-                responseText = run.log.last ?? "generation failed to start"
+                responseText = wasUserStopped ? "Stopped." : (run.log.last ?? "Generation failed to start.")
             } else {
                 responseText = cleaned
             }
         }
 
         turns[idx].responseText = responseText
-        turns[idx].status = (status == .done) ? .done : .failed
-        if status == .done {
+
+        if wasUserStopped {
+            // Clean stop: keep whatever partial text arrived, mark done so it is
+            // not styled as an error. (If partial text is non-empty it reads
+            // naturally as a truncated reply; if empty it reads "Stopped.".)
+            turns[idx].status = .done
+        } else {
+            turns[idx].status = (status == .done) ? .done : .failed
+        }
+
+        if status == .done || wasUserStopped {
             turns[idx].tokensPerSecond = run.genTokS
         }
     }

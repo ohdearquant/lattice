@@ -27,9 +27,9 @@ struct LatticeStudioApp: App {
     @State private var store = AppStore()
 
     var body: some Scene {
-        WindowGroup("Lattice Studio", id: "main") {
+        WindowGroup("Lattice", id: "main") {
             ContentView(store: store)
-                .frame(minWidth: 1080, minHeight: 720)
+                .frame(minWidth: 1120, minHeight: 720)
                 .onAppear {
                     store.onAppear()
                     // Give the delegate a weak reference so applicationWillTerminate can

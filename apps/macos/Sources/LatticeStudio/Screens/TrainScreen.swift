@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-// MARK: - 02 TRAIN — LoRA Training Instrument
+// MARK: - 03 TRAIN — LoRA Training Instrument
 //
 // The flagship screen. Two-pane layout:
 //   LEFT  (~360pt, OpaquePanel): configuration form built from ParamRow* primitives.
@@ -12,6 +12,9 @@ import AppKit
 //
 // Store ownership: store.liveRun is read-only here. The store creates and owns the run;
 // a re-render of this view must never reset it.
+//
+// Phase A re-parenting: the DATASET section now hosts directory selection + Scan
+// (formerly DataScreen) and a DisclosureGroup for builder scripts.
 
 struct TrainScreen: View {
     @Bindable var store: AppStore
@@ -23,6 +26,10 @@ struct TrainScreen: View {
 
     // DATASET
     @State private var dataDirPath: String = ""
+    @State private var isScanning: Bool = false
+    @State private var scanError: String? = nil
+    @State private var scannedFiles: [DatasetFileStat] = []
+    @State private var showBuilderScripts: Bool = false
 
     // Numeric params (stored as Double for slider binding compatibility)
     @State private var firstLayer: Double = 19
@@ -188,6 +195,82 @@ struct TrainScreen: View {
                     .foregroundStyle(Theme.Palette.inkDim)
                     .buttonStyle(.plain)
                     .padding(.trailing, Theme.Space.lg)
+                }
+
+                // Scan row: button + inline status
+                HStack(spacing: Theme.Space.sm) {
+                    Spacer()
+                    if isScanning {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .controlSize(.mini)
+                    }
+                    Button(isScanning ? "Scanning…" : "Scan") {
+                        scanDataset()
+                    }
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+                    .buttonStyle(.plain)
+                    .disabled(isScanning || dataDirPath.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .padding(.trailing, Theme.Space.lg)
+                }
+                .frame(height: Theme.Space.rowHeight)
+
+                // Scan error banner
+                if let err = scanError {
+                    HStack(spacing: Theme.Space.sm) {
+                        GatePill(.fail, label: "scan error")
+                        Text(err)
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                    }
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.bottom, Theme.Space.xs)
+                }
+
+                // Scan summary (shown once files are available)
+                if !scannedFiles.isEmpty {
+                    let totalExamples = scannedFiles.reduce(0) { $0 + $1.exampleCount }
+                    let hasCapped = scannedFiles.contains { $0.isCapped }
+                    ParamRow(
+                        label: "DATASET",
+                        value: "\(scannedFiles.count) file\(scannedFiles.count == 1 ? "" : "s") · \(totalExamples)\(hasCapped ? "+" : "") examples"
+                    )
+                }
+
+                // Builder scripts — collapsed by default
+                DisclosureGroup(isExpanded: $showBuilderScripts) {
+                    ForEach(builderScripts, id: \.name) { script in
+                        HStack(spacing: Theme.Space.sm) {
+                            Text(script.command)
+                                .font(Theme.Fonts.cell)
+                                .foregroundStyle(Theme.Palette.ink)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer()
+                            Button("Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(script.command, forType: .string)
+                            }
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                            .buttonStyle(.plain)
+                        }
+                        .frame(height: Theme.Space.rowHeight)
+                        .padding(.horizontal, Theme.Space.lg)
+                        .overlay(alignment: .bottom) {
+                            Theme.Palette.hairline.frame(height: 1)
+                        }
+                    }
+                } label: {
+                    Text("BUILDER SCRIPTS")
+                        .instrumentLabel()
+                        .padding(.horizontal, Theme.Space.lg)
+                        .frame(height: Theme.Space.rowHeight)
                 }
 
                 // Section header: ARCHITECTURE
@@ -356,7 +439,7 @@ struct TrainScreen: View {
         VStack(spacing: Theme.Space.lg) {
             Spacer()
             VStack(spacing: Theme.Space.sm) {
-                Text("02")
+                Text("03")
                     .font(Theme.Fonts.mono(34, .bold))
                     .foregroundStyle(Theme.Palette.hairline)
                     .monospacedDigit()
@@ -675,6 +758,26 @@ struct TrainScreen: View {
         panel.prompt = "Select"
         if panel.runModal() == .OK, let url = panel.url {
             dataDirPath = url.path
+        }
+    }
+
+    private func scanDataset() {
+        let dir = dataDirPath.trimmingCharacters(in: .whitespaces)
+        guard !dir.isEmpty else { return }
+        isScanning = true
+        scanError = nil
+        scannedFiles = []
+        Task.detached(priority: .userInitiated) {
+            let result = await DataScreen.scanDirectory(path: dir)
+            await MainActor.run {
+                isScanning = false
+                switch result {
+                case .success(let stats):
+                    scannedFiles = stats
+                case .failure(let err):
+                    scanError = err.message
+                }
+            }
         }
     }
 

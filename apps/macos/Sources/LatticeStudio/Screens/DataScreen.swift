@@ -18,9 +18,9 @@ import AppKit
 // MARK: - Local data models
 
 /// One scanned JSONL file.
-private struct DataLoadError: Error { let message: String }
+struct DataLoadError: Error { let message: String }
 
-private struct DatasetFileStat: Identifiable {
+struct DatasetFileStat: Identifiable {
     let id: String         // the file path
     let url: URL
     let name: String       // last path component
@@ -88,13 +88,13 @@ private struct OutlineButtonStyle: ButtonStyle {
 
 // MARK: - Builder script definitions
 
-private struct BuilderScript {
+struct BuilderScript {
     let name: String
     let command: String
     let description: String
 }
 
-private let builderScripts: [BuilderScript] = [
+let builderScripts: [BuilderScript] = [
     BuilderScript(
         name: "build_claude_lora_dataset",
         command: "uv run scripts/build_claude_lora_dataset.py",
@@ -108,6 +108,11 @@ private let builderScripts: [BuilderScript] = [
 ]
 
 // MARK: - DataScreen
+//
+// NOTE: DataScreen is no longer a top-level nav destination (Phase A re-parenting).
+// Its source/scan/builder panels are embedded in TrainScreen; its file-table/preview
+// panels are reachable via the DATASET section there. This struct is preserved as an
+// embeddable view for potential future use but is not wired into ContentView routing.
 
 struct DataScreen: View {
     @Bindable var store: AppStore
@@ -152,39 +157,33 @@ struct DataScreen: View {
     // MARK: Body
 
     var body: some View {
-        ScreenScaffold(
-            screen: .data,
-            subtitle: subtitle,
-            trailing: { trailingActions }
-        ) {
-            VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                // 1. SOURCE — path field + buttons
-                sourcePanel
+        VStack(alignment: .leading, spacing: Theme.Space.xl) {
+            // 1. SOURCE — path field + buttons
+            sourcePanel
 
-                // 2. SUMMARY — hero + readout wells
-                if !files.isEmpty {
-                    summaryStrip
-                }
-
-                // 3. FILES TABLE + PREVIEW (HSplit)
-                if !files.isEmpty {
-                    HSplitView {
-                        // Files table (left/center)
-                        filesTable
-                            .frame(minWidth: 400)
-
-                        // Preview panel (right)
-                        previewPanel
-                            .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-
-                // 4. BUILDER scripts
-                builderPanel
+            // 2. SUMMARY — hero + readout wells
+            if !files.isEmpty {
+                summaryStrip
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            // 3. FILES TABLE + PREVIEW (HSplit)
+            if !files.isEmpty {
+                HSplitView {
+                    // Files table (left/center)
+                    filesTable
+                        .frame(minWidth: 400)
+
+                    // Preview panel (right)
+                    previewPanel
+                        .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            // 4. BUILDER scripts
+            builderPanel
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             // Default to repoRootPath/data, or fall back to empty
             if dataDir.isEmpty {
@@ -687,7 +686,7 @@ struct DataScreen: View {
 
     // MARK: - File IO (off main thread)
 
-    private static func scanDirectory(path: String) async -> Result<[DatasetFileStat], DataLoadError> {
+    static func scanDirectory(path: String) async -> Result<[DatasetFileStat], DataLoadError> {
         let dirURL = URL(fileURLWithPath: path, isDirectory: true)
         let fm = FileManager.default
 
@@ -739,7 +738,7 @@ struct DataScreen: View {
         return .success(stats)
     }
 
-    private static func parseStat(for url: URL) -> DatasetFileStat {
+    static func parseStat(for url: URL) -> DatasetFileStat {
         let fm = FileManager.default
 
         // File size

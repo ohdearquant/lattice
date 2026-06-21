@@ -13,7 +13,7 @@ final class AppStore {
     var models: [ModelInfo] = []
     var runs: [RunRecord] = []
     var liveRun: LiveRun?
-    var inspectorCollapsed = false
+    var inspectorPresented = false
     var commandBarOpen = false
     var binariesReady = false
     var rowComfortable = false

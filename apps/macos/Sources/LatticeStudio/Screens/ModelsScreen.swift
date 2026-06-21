@@ -23,6 +23,8 @@ struct ModelsScreen: View {
 
     // Local selection state — deselects when models list changes.
     @State private var selectedModelID: String?
+    // Quantize sheet: presented from the model inspector/action row (Phase A re-parenting).
+    @State private var showQuantizeSheet: Bool = false
 
     private var selectedModel: ModelInfo? {
         store.models.first { $0.id == selectedModelID }
@@ -53,6 +55,11 @@ struct ModelsScreen: View {
                         .frame(minWidth: 260, idealWidth: 300, maxWidth: 320)
                 }
             }
+        }
+        .sheet(isPresented: $showQuantizeSheet) {
+            QuantizeScreen(store: store)
+                .frame(minWidth: 760, idealWidth: 900, maxWidth: .infinity,
+                       minHeight: 540, idealHeight: 640, maxHeight: .infinity)
         }
     }
 
@@ -95,18 +102,18 @@ struct ModelsScreen: View {
                     HStack(spacing: 4) {
                         Text("Train →")
                             .font(Theme.Fonts.body)
-                        KeyCapChip("⌘2")
+                        KeyCapChip("⌘3")
                     }
                 }
                 .buttonStyle(PrimaryButtonStyle())
 
                 Button {
-                    store.use(model, on: .quantize)
+                    store.workingModel = model
+                    showQuantizeSheet = true
                 } label: {
                     HStack(spacing: 4) {
-                        Text("Quantize →")
+                        Text("Quantize…")
                             .font(Theme.Fonts.body)
-                        KeyCapChip("⌘3")
                     }
                 }
                 .buttonStyle(OutlineButtonStyle())
@@ -117,7 +124,7 @@ struct ModelsScreen: View {
                     HStack(spacing: 4) {
                         Text("Chat →")
                             .font(Theme.Fonts.body)
-                        KeyCapChip("⌘4")
+                        KeyCapChip("⌘2")
                     }
                 }
                 .buttonStyle(OutlineButtonStyle())

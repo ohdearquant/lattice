@@ -119,7 +119,7 @@ struct QuantConfig {
 ///
 /// Either `modelDir` or `model` must be provided; `modelDir` takes priority when both
 /// are set (the binary accepts both flags and uses whichever it sees).
-/// generate_lora prints output atomically — there are no per-token events.
+/// generate_lora streams per-token `gen_token` events in `--json` mode (always enabled via args).
 struct GenConfig {
     /// Full path to the model directory. Takes priority over `model` when set.
     var modelDir: URL? = nil

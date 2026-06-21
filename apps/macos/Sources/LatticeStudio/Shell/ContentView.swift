@@ -14,18 +14,25 @@ struct ContentView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .navigation) {
-                    HStack(spacing: 8) {
-                        Text(store.selection.index)
-                            .font(Theme.Fonts.mono(12)).foregroundStyle(Theme.Palette.inkDim)
-                        Text(store.selection.title)
-                            .font(Theme.Fonts.display(13, .semibold)).foregroundStyle(Theme.Palette.ink)
+                    Text(store.selection.title.localizedCapitalized)
+                        .font(Theme.Fonts.bodyStrong)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                if let run = store.liveRun, run.status == .running || run.status == .paused {
+                    ToolbarItem(placement: .primaryAction) {
+                        runStatusCapsule(run)
                     }
                 }
-                ToolbarItem(placement: .primaryAction) {
-                    Button { store.commandBarOpen.toggle() } label: {
-                        Label("Command", systemImage: "command")
+                if store.selection.hasInspector {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            store.inspectorPresented.toggle()
+                        } label: {
+                            Image(systemName: "sidebar.trailing")
+                        }
+                        .help("Toggle settings (⌘\\)")
+                        .foregroundStyle(store.inspectorPresented ? Theme.Palette.signal : Theme.Palette.textSecondary)
                     }
-                    .help("Command palette (⌘K)")
                 }
             }
         }
@@ -54,25 +61,74 @@ struct ContentView: View {
             }
         }
         switch cmd {
-        case "train":    retarget(); store.selection = .train
-        case "quantize": retarget(); store.selection = .quantize
-        case "chat":     retarget(); store.selection = .chat
-        case "models":   store.selection = .models
-        case "data":     store.selection = .data
-        case "runs":     store.selection = .runs
-        case "stop":     store.stopRun()
-        default:         break
+        case "train":  retarget(); store.selection = .train
+        case "chat":   retarget(); store.selection = .chat
+        case "models": store.selection = .models
+        case "runs":   store.selection = .runs
+        case "stop":   store.stopRun()
+        default:       break
         }
+    }
+
+    // Compact toolbar capsule shown while a run is active.
+    // Shows: status dot · model name · step counter — no invented fields.
+    // Clicking navigates to the Runs screen.
+    @ViewBuilder
+    private func runStatusCapsule(_ run: LiveRun) -> some View {
+        let activityLabel: String = {
+            switch run.kind {
+            case .train:          return "Training"
+            case .quantizeQ4:     return "Quantizing"
+            case .quantizeQuaRot: return "Quantizing"
+            case .chat:           return "Generating"
+            }
+        }()
+        let stepLabel: String = {
+            if run.kind == .train {
+                let s = "step \(run.currentStep)"
+                if let total = run.totalSteps { return s + "/\(total)" }
+                return s
+            }
+            return run.status == .paused ? "paused" : "running"
+        }()
+
+        Button {
+            store.selection = .runs
+        } label: {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Theme.Palette.running)
+                    .frame(width: 6, height: 6)
+                    .opacity(run.status == .paused ? 0.5 : 1.0)
+                Text(activityLabel)
+                    .font(Theme.Fonts.controlText)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(run.modelName)
+                    .font(Theme.Fonts.controlText)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1)
+                Text(stepLabel)
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Theme.Palette.running.opacity(0.12)
+                    .clipShape(Capsule())
+            )
+            .overlay(Capsule().strokeBorder(Theme.Palette.running.opacity(0.28), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help("View active run")
     }
 
     @ViewBuilder private var detail: some View {
         switch store.selection {
-        case .models:   ModelsScreen(store: store)
-        case .train:    TrainScreen(store: store)
-        case .quantize: QuantizeScreen(store: store)
-        case .chat:     ChatScreen(store: store)
-        case .data:     DataScreen(store: store)
-        case .runs:     RunsScreen(store: store)
+        case .models: ModelsScreen(store: store)
+        case .chat:   ChatScreen(store: store)
+        case .train:  TrainScreen(store: store)
+        case .runs:   RunsScreen(store: store)
         }
     }
 
@@ -84,7 +140,7 @@ struct ContentView: View {
                     .keyboardShortcut(s.shortcut, modifiers: .command)
             }
             Button("") { store.commandBarOpen.toggle() }.keyboardShortcut("k", modifiers: .command)
-            Button("") { store.inspectorCollapsed.toggle() }.keyboardShortcut("\\", modifiers: .command)
+            Button("") { store.inspectorPresented.toggle() }.keyboardShortcut("\\", modifiers: .command)
         }
         .opacity(0)
         .frame(width: 0, height: 0)
