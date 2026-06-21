@@ -155,7 +155,7 @@ struct FaderToggle: View {
 // MARK: - Previews
 
 #Preview("FaderToggle") {
-    @State var isOnB: Bool = false
+    @Previewable @State var isOnB: Bool = false
 
     return VStack(spacing: Theme.Space.xl) {
         Text("HOT-SWAP FADER")

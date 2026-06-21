@@ -237,11 +237,11 @@ struct ParamRowToggle: View {
 // MARK: - Previews
 
 #Preview("ParamRow") {
-    @State var rank: Double = 8
-    @State var lr: Double = 2e-4
-    @State var method: String = "Q4"
-    @State var dataset: String = "claude-lora.jsonl"
-    @State var comfortable: Bool = false
+    @Previewable @State var rank: Double = 8
+    @Previewable @State var lr: Double = 2e-4
+    @Previewable @State var method: String = "Q4"
+    @Previewable @State var dataset: String = "claude-lora.jsonl"
+    @Previewable @State var comfortable: Bool = false
 
     return VStack(spacing: 0) {
         ParamRow(label: "MODEL", value: "qwen3.5-0.8b")

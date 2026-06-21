@@ -197,6 +197,8 @@ struct StripChart: View {
 // MARK: - Previews
 
 #Preview("StripChart") {
+    @Previewable @State var scrubStep: Int? = nil
+
     let samplePoints: [TrainPoint] = (0..<60).map { i in
         let t = Double(i) / 60.0
         return TrainPoint(
@@ -208,8 +210,6 @@ struct StripChart: View {
             tokS: 1800 + Double.random(in: -50...50)
         )
     }
-
-    @State var scrubStep: Int? = nil
 
     return VStack(alignment: .leading, spacing: 0) {
         Text("STRIP CHART — LOSS + VAL LOSS")

@@ -371,7 +371,7 @@ extension CommandSpec {
 // MARK: - Previews
 
 #Preview("CommandBar") {
-    @State var isPresented: Bool = true
+    @Previewable @State var isPresented: Bool = true
 
     return ZStack {
         Theme.Palette.canvas

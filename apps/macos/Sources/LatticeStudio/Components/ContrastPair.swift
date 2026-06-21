@@ -197,7 +197,7 @@ struct ContrastPair: View {
 // MARK: - Previews
 
 #Preview("ContrastPair") {
-    @State var isComplete: Bool = false
+    @Previewable @State var isComplete: Bool = false
 
     return VStack(spacing: Theme.Space.lg) {
         ContrastPair(

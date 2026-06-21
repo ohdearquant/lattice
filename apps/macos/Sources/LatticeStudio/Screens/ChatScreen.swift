@@ -42,6 +42,7 @@ private struct ChatTurn: Identifiable {
     let variantLabel: String   // "BASE" or "+ADAPTER <adapter-name>"
     var responseText: String = ""
     var status: TurnStatus = .running
+    var tokensPerSecond: Double? = nil
 }
 
 // MARK: - ChatScreen
@@ -405,7 +406,17 @@ struct ChatScreen: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, Theme.Space.md)
-                        .padding(.bottom, Theme.Space.sm)
+                        .padding(.bottom, turn.tokensPerSecond != nil ? Theme.Space.xs : Theme.Space.sm)
+
+                    if let tps = turn.tokensPerSecond {
+                        Text(String(format: "%.1f tok/s", tps))
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.signal)
+                            .monospacedDigit()
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                            .padding(.horizontal, Theme.Space.md)
+                            .padding(.bottom, Theme.Space.sm)
+                    }
                 }
             }
             .instrumentPanel()
@@ -551,6 +562,9 @@ struct ChatScreen: View {
 
         turns[idx].responseText = responseText
         turns[idx].status = (status == .done) ? .done : .failed
+        if status == .done {
+            turns[idx].tokensPerSecond = run.genTokS
+        }
     }
 
     private func handleRunStatusChange(_ newStatus: RunStatus?) {

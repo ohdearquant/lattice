@@ -179,6 +179,8 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
 // MARK: - Previews
 
 #Preview("DataTable") {
+    @Previewable @State var selected: String? = "1"
+
     struct SampleRow: Identifiable {
         let id: String
         let name: String
@@ -194,8 +196,6 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
         SampleRow(id: "3", name: "qwen3.5-0.8b-quarot", params: "0.8B", format: "QuaRot Q4", sizeGB: "0.40", files: "5"),
         SampleRow(id: "4", name: "qwen3.5-2b", params: "2B", format: "BF16", sizeGB: "4.07", files: "4"),
     ]
-
-    @State var selected: String? = "1"
 
     return DataTable(
         rows: rows,
