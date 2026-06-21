@@ -29,6 +29,7 @@ private struct DatasetFileStat: Identifiable {
     let approxTokens: Int  // rough estimate: total chars / 4
     let avgLen: Int        // approxTokens / exampleCount (or 0)
     let sizeBytes: Int64
+    let schema: [String]?  // top-level JSON keys of the first row; nil if unreadable/non-object
 }
 
 /// One decoded example from a JSONL line.
@@ -382,6 +383,13 @@ struct DataScreen: View {
                 minWidth: 80,
                 isNumeric: true
             ) { byteFormatter.string(fromByteCount: $0.sizeBytes) },
+            ColumnDef(
+                id: "schema",
+                header: "SCHEMA",
+                alignment: .leading,
+                minWidth: 130,
+                isNumeric: false
+            ) { $0.schema?.joined(separator: ", ") ?? "—" },
         ]
     }
 
@@ -745,7 +753,7 @@ struct DataScreen: View {
             return DatasetFileStat(
                 id: url.path, url: url, name: url.lastPathComponent,
                 exampleCount: 0, isCapped: false,
-                approxTokens: 0, avgLen: 0, sizeBytes: sizeBytes
+                approxTokens: 0, avgLen: 0, sizeBytes: sizeBytes, schema: nil
             )
         }
 
@@ -758,10 +766,20 @@ struct DataScreen: View {
         let approxTokens = totalChars / 4
         let avgLen = exampleCount > 0 ? approxTokens / exampleCount : 0
 
+        // Real first-row schema: top-level JSON keys of the first example.
+        // Honest-nil when the line is not a JSON object (raw text, malformed, etc.).
+        var schema: [String]? = nil
+        if let first = lines.first,
+           let d = first.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+            schema = obj.keys.sorted()
+        }
+
         return DatasetFileStat(
             id: url.path, url: url, name: url.lastPathComponent,
             exampleCount: exampleCount, isCapped: isCapped,
-            approxTokens: approxTokens, avgLen: avgLen, sizeBytes: sizeBytes
+            approxTokens: approxTokens, avgLen: avgLen, sizeBytes: sizeBytes,
+            schema: schema
         )
     }
 
