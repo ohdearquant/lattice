@@ -100,7 +100,13 @@ final class AppStore {
             run.verdict = q.verdict
             run.quantMaxAbs = q.max_abs
         case .genToken(let g):
-            run.appendLog(g.token)
+            // Accumulate streamed text; do NOT write token deltas to the generic log
+            // so the log stays clean for loader status lines and error messages.
+            run.genText += g.token
+            if g.done == true {
+                run.genTokS = g.tok_s
+                run.genDone = true
+            }
         case .status(let line):
             run.appendLog(line)
         case .unknown(let j):

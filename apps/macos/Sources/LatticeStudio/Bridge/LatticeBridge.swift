@@ -78,10 +78,17 @@ enum LatticeBridge {
 
     static func prebuiltBinary(_ bin: LatticeBinary) -> URL? {
         let fm = FileManager.default
+        // (a) Bundled binary — preferred when running as a .app from /Applications.
+        if let resourceURL = Bundle.main.resourceURL {
+            let u = resourceURL.appendingPathComponent("bin/\(bin.binName)")
+            if fm.isExecutableFile(atPath: u.path) { return u }
+        }
+        // (b) Explicit LATTICE_BIN_DIR override — dev convenience.
         if let dir = ProcessInfo.processInfo.environment["LATTICE_BIN_DIR"] {
             let u = URL(fileURLWithPath: dir).appendingPathComponent(bin.binName)
             if fm.isExecutableFile(atPath: u.path) { return u }
         }
+        // (c) Repo-relative target/release — running from source checkout.
         if let root = repoRoot {
             let u = root.appendingPathComponent("target/release/\(bin.binName)")
             if fm.isExecutableFile(atPath: u.path) { return u }
@@ -168,10 +175,9 @@ enum LatticeBridge {
         }
 
         let params = parseParamCount(from: name)
-        // Scan for adapters: loose .safetensors in the model dir (excluding the base
-        // model.safetensors itself), plus anything in an `adapters/` subdirectory.
+        // Scan for adapters: loose .safetensors in the model dir (excluding model weight
+        // shards), plus anything in an `adapters/` subdirectory.
         let looseAdapters = discoverAdapters(in: dir)
-            .filter { $0.name != "model" }
         let adapterSubdir = dir.appendingPathComponent("adapters", isDirectory: true)
         let subdirAdapters = discoverAdapters(in: adapterSubdir)
         let adapters = (looseAdapters + subdirAdapters).sorted { $0.name < $1.name }
@@ -200,17 +206,35 @@ enum LatticeBridge {
         return "\(name[numR])\(name[unitR].uppercased())"
     }
 
+    /// Return true if a filename looks like a sharded model weight, not an adapter.
+    /// Matches: model.safetensors, model.safetensors.index.json,
+    ///          model-00001-of-00002.safetensors, model.safetensors-00001-of-00001.safetensors
+    private static func isModelWeight(_ filename: String) -> Bool {
+        let lower = filename.lowercased()
+        // Exact base weight
+        if lower == "model.safetensors" { return true }
+        // Shard patterns: model-00001-of-00002.safetensors
+        if lower.hasPrefix("model-") && lower.hasSuffix(".safetensors") { return true }
+        // Double-extension shard: model.safetensors-00001-of-00001.safetensors
+        if lower.hasPrefix("model.safetensors-") && lower.hasSuffix(".safetensors") { return true }
+        return false
+    }
+
     /// Scan a directory of `.safetensors` adapter files into AdapterInfo.
+    /// Excludes sharded model weights (model*.safetensors, model-*-of-*.safetensors,
+    /// model.safetensors-*-of-*.safetensors) which are base model files, not adapters.
     static func discoverAdapters(in dir: URL) -> [AdapterInfo] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles]) else {
             return []
         }
-        return files.filter { $0.pathExtension == "safetensors" }.map { f in
-            let size = Int64((try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-            return AdapterInfo(name: f.deletingPathExtension().lastPathComponent, path: f,
-                               rank: nil, alpha: nil, targetModules: nil, sizeBytes: size)
-        }.sorted { $0.name < $1.name }
+        return files
+            .filter { $0.pathExtension == "safetensors" && !isModelWeight($0.lastPathComponent) }
+            .map { f in
+                let size = Int64((try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                return AdapterInfo(name: f.deletingPathExtension().lastPathComponent, path: f,
+                                   rank: nil, alpha: nil, targetModules: nil, sizeBytes: size)
+            }.sorted { $0.name < $1.name }
     }
 }
 

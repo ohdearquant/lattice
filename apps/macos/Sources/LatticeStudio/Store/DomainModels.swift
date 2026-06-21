@@ -119,6 +119,11 @@ final class LiveRun {
     var verdict: String?
     var quantMaxAbs: Double?     // QuaRot forward-equivalence max abs error
 
+    // Generation streaming (chat / generate_lora --json mode)
+    var genText: String = ""       // accumulated incremental token deltas from gen_token events
+    var genTokS: Double? = nil     // final tokens/sec from the done event (tok_s field)
+    var genDone: Bool = false      // set true when the gen_token done event arrives
+
     // Shared
     var log: [String] = []
 

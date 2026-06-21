@@ -154,7 +154,7 @@ struct TrainScreen: View {
                 if modelNames.isEmpty {
                     ParamRow(label: "MODEL", value: "— none found —")
                 } else {
-                    ParamRowPicker(
+                    ParamRowMenu(
                         label: "MODEL",
                         options: modelNames,
                         selection: Binding(
@@ -321,12 +321,9 @@ struct TrainScreen: View {
             Button {
                 launchTraining()
             } label: {
-                HStack(spacing: Theme.Space.sm) {
-                    Text("▶ TRAIN")
-                        .font(Theme.Fonts.display(13, .semibold))
-                    KeyCapChip("⌘↵")
-                }
-                .foregroundStyle(Theme.Palette.canvas)
+                Text("▶ TRAIN")
+                    .font(Theme.Fonts.display(13, .semibold))
+                    .foregroundStyle(Theme.Palette.canvas)
                 .padding(.horizontal, Theme.Space.lg)
                 .padding(.vertical, Theme.Space.sm)
                 .background(isRunning ? Theme.Palette.inkDim : Theme.Palette.signal)

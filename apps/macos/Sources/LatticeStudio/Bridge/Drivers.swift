@@ -152,6 +152,7 @@ struct GenConfig {
             "--prompt",     prompt,
             "--max-tokens", String(maxTokens),
             "--temperature", String(temperature),
+            "--json",         // streaming gen_token event protocol; older binaries ignore unknown flags
         ]
         if let s = seed {
             a += ["--seed", String(s)]

@@ -3,6 +3,9 @@
 .swiftpm/
 DerivedData/
 
+# Packaging output (.app/.dmg/.zip — built by scripts/package-app.sh)
+dist/
+
 # Xcode
 *.xcodeproj
 *.xcworkspace

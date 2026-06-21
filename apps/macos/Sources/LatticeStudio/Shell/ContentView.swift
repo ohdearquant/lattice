@@ -30,6 +30,10 @@ struct ContentView: View {
             }
         }
         .navigationTitle("")
+        // One neutral tint for every system control (Slider/Picker/Toggle/field caret).
+        // Elements that should read teal set Theme.Palette.signal explicitly, so they are
+        // unaffected — this keeps the accent reserved for live data + the single CTA.
+        .tint(Theme.Palette.control)
         .background(shortcuts)
         .overlay {
             CommandBar(

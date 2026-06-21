@@ -39,6 +39,10 @@ enum Theme {
         static let ink       = Color.adaptive(light: 0x14161A, dark: 0xE8EAED) // primary text + numerals
         static let inkDim    = Color.adaptive(light: 0x5C636E, dark: 0x7C828D) // labels, units, axis ticks
 
+        /// Neutral steel for interactive controls (slider fill, segmented selection, toggle-on,
+        /// field caret). Spent so the accent below stays reserved for live data + the single CTA.
+        static let control   = Color.adaptive(light: 0x8A909B, dark: 0x6B7280)
+
         /// The one accent. Live trace, token stream, now-cursor, focus ring, the single CTA per screen.
         static let signal    = Color.adaptive(light: 0x00A892, dark: 0x00E5C7)
         static let signalGlow = Color.adaptive(light: 0x00A892, dark: 0x00E5C7, alpha: 0.12)

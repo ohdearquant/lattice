@@ -151,7 +151,7 @@ struct QuantizeScreen: View {
                 if quantizableModelNames.isEmpty {
                     ParamRow(label: "MODEL", value: "— no BF16 models found")
                 } else {
-                    ParamRowPicker(
+                    ParamRowMenu(
                         label: "MODEL",
                         options: quantizableModelNames,
                         selection: $selectedModelName

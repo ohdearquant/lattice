@@ -100,6 +100,8 @@ struct ParamRowSlider: View {
         HStack(spacing: Theme.Space.sm) {
             Text(label)
                 .instrumentLabel()
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .frame(width: 80, alignment: .leading)
 
             // Slider with live mono readout
@@ -156,6 +158,45 @@ struct ParamRowPicker: View {
             .pickerStyle(.segmented)
             .frame(maxWidth: 200)
             .labelsHidden()
+        }
+        .frame(height: Theme.Space.rowHeightComfortable)
+        .padding(.horizontal, Theme.Space.lg)
+        .overlay(alignment: .bottom) {
+            Theme.Palette.hairline.frame(height: 1)
+        }
+    }
+}
+
+// MARK: Menu ParamRow
+
+/// A label + dropdown menu picker on a hairline-ruled line.
+///
+/// Use this (not `ParamRowPicker`) for selections with many or long options — e.g. MODEL —
+/// where a segmented control would overflow the panel. The dropdown stays a fixed-width button
+/// showing the current selection and never grows with the option count.
+///
+/// ```swift
+/// ParamRowMenu(label: "MODEL", options: modelNames, selection: $selectedModelName)
+/// ```
+struct ParamRowMenu: View {
+    let label: String
+    let options: [String]
+    @Binding var selection: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .instrumentLabel()
+            Spacer()
+            Picker("", selection: $selection) {
+                ForEach(options, id: \.self) { opt in
+                    Text(opt).tag(opt)
+                }
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .font(Theme.Fonts.readout)
+            .fixedSize()
         }
         .frame(height: Theme.Space.rowHeightComfortable)
         .padding(.horizontal, Theme.Space.lg)

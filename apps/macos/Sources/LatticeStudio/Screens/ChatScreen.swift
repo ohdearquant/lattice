@@ -137,6 +137,16 @@ struct ChatScreen: View {
         .onChange(of: store.liveRun?.status) { _, newStatus in
             handleRunStatusChange(newStatus)
         }
+        .onChange(of: store.liveRun?.genText) { _, newText in
+            // Live streaming: push incremental token text into the awaiting turn
+            // so the response renders token-by-token as the engine streams.
+            // genText is already cumulative, so assign (not append).
+            guard let turnID = awaitingTurnID,
+                  store.liveRun?.kind == .chat,
+                  let idx = turns.firstIndex(where: { $0.id == turnID })
+            else { return }
+            turns[idx].responseText = newText ?? ""
+        }
         .onChange(of: store.liveRun?.log.count) { _, _ in
             // Belt-and-suspenders: if status fires before log is flushed,
             // a log.count change while awaiting provides a secondary wake.
@@ -266,7 +276,7 @@ struct ChatScreen: View {
             }
 
             ParamRowSlider(
-                label: "TEMPERATURE",
+                label: "TEMP",
                 value: $temperature,
                 range: 0...1.5,
                 format: "%.2f"
@@ -518,18 +528,25 @@ struct ChatScreen: View {
         // Clear awaiting before mutating so we do not re-enter on re-render.
         awaitingTurnID = nil
 
-        // Extract the generated text: drop lines beginning with "$ " (command echo).
-        let cleaned = run.log
-            .filter { !$0.hasPrefix("$ ") }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
         let responseText: String
-        if cleaned.isEmpty && status == .failed {
-            // Use the last log line as an error hint; fall back to a generic message.
-            responseText = run.log.last ?? "generation failed to start"
+        if !run.genText.isEmpty {
+            // Streaming path: genText holds the complete concatenated token stream.
+            // Trim trailing whitespace/newlines that the engine may emit at end-of-sequence.
+            responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
-            responseText = cleaned
+            // Non-streaming fallback (older binary without --json, or failure before any token):
+            // extract the generated text by dropping lines beginning with "$ " (command echo).
+            let cleaned = run.log
+                .filter { !$0.hasPrefix("$ ") }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if cleaned.isEmpty && status == .failed {
+                // Use the last log line as an error hint; fall back to a generic message.
+                responseText = run.log.last ?? "generation failed to start"
+            } else {
+                responseText = cleaned
+            }
         }
 
         turns[idx].responseText = responseText
