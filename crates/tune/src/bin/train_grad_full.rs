@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lattice_inference::attention::gdn::GatedDeltaNetWeights;
-use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
+use lattice_inference::attention::gdn_backward::{
+    GdnGrads, GdnSaved, gdn_backward, gdn_forward_save,
+};
 use lattice_inference::backward::attention_gqa::{AttnCache, gqa_backward, gqa_forward_with_cache};
 use lattice_inference::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
 use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
@@ -214,6 +216,7 @@ impl GdnDims {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MixerKind {
     Gqa,
     Gdn,
@@ -249,27 +252,77 @@ struct Head<'a> {
     final_norm: &'a [f32],
 }
 
-/// Mutable LoRA factors for one GQA layer (q_proj + v_proj).
+/// Mutable LoRA factors for one layer.
+///
+/// GQA layers populate a_q/b_q/a_v/b_v; GDN fields are empty Vec.
+/// GDN layers populate a_qkv/b_qkv/a_z/b_z/a_b/b_b/a_a/b_a/a_out/b_out;
+/// GQA fields are empty Vec.
 #[derive(Clone)]
 struct LoraParams {
+    // GQA fields (empty for GDN slots)
     a_q: Vec<f32>,
     b_q: Vec<f32>,
     a_v: Vec<f32>,
     b_v: Vec<f32>,
+    // GDN fields (empty for GQA slots)
+    a_qkv: Vec<f32>,
+    b_qkv: Vec<f32>,
+    a_z: Vec<f32>,
+    b_z: Vec<f32>,
+    a_b: Vec<f32>,
+    b_b: Vec<f32>,
+    a_a: Vec<f32>,
+    b_a: Vec<f32>,
+    a_out: Vec<f32>,
+    b_out: Vec<f32>,
 }
 
 impl LoraParams {
-    fn zeros(rank: usize, d: &Dims) -> Self {
+    fn zeros_gqa(rank: usize, d: &Dims) -> Self {
         Self {
             a_q: vec![0.0; rank * d.hidden],
             b_q: vec![0.0; 2 * d.q_dim * rank],
             a_v: vec![0.0; rank * d.hidden],
             b_v: vec![0.0; d.kv_dim * rank],
+            a_qkv: Vec::new(),
+            b_qkv: Vec::new(),
+            a_z: Vec::new(),
+            b_z: Vec::new(),
+            a_b: Vec::new(),
+            b_b: Vec::new(),
+            a_a: Vec::new(),
+            b_a: Vec::new(),
+            a_out: Vec::new(),
+            b_out: Vec::new(),
         }
+    }
+
+    fn zeros_gdn(rank: usize, d: &Dims, gd: &GdnDims) -> Self {
+        Self {
+            a_q: Vec::new(),
+            b_q: Vec::new(),
+            a_v: Vec::new(),
+            b_v: Vec::new(),
+            a_qkv: vec![0.0; rank * d.hidden],
+            b_qkv: vec![0.0; gd.qkv_dim * rank],
+            a_z: vec![0.0; rank * d.hidden],
+            b_z: vec![0.0; gd.output_dim * rank],
+            a_b: vec![0.0; rank * d.hidden],
+            b_b: vec![0.0; gd.num_kh * rank],
+            a_a: vec![0.0; rank * d.hidden],
+            b_a: vec![0.0; gd.num_kh * rank],
+            a_out: vec![0.0; rank * gd.output_dim],
+            b_out: vec![0.0; d.hidden * rank],
+        }
+    }
+
+    /// Backward-compatibility alias used in TBV and eval paths.
+    fn zeros(rank: usize, d: &Dims) -> Self {
+        Self::zeros_gqa(rank, d)
     }
 }
 
-/// LoRA gradients for one GQA layer (same shapes as LoraParams).
+/// LoRA gradients for one layer (same shapes as LoraParams).
 type Grads = LoraParams;
 
 /// One sample's frozen context entering `first_layer`.
@@ -408,12 +461,25 @@ fn forward_full(
                     d.eps,
                 );
                 let mut out = vec![0.0f32; seq * hidden];
+                let lora = &loras[lw.lora_slot.expect("GDN layer must have a LoRA slot")];
                 gdn_forward_save(
                     &normed_pre,
                     lw.gdn.expect("GDN layer must have GDN weights"),
                     cfg,
                     &mut saved,
                     &mut out,
+                    Some(&lora.a_qkv),
+                    Some(&lora.b_qkv),
+                    Some(&lora.a_z),
+                    Some(&lora.b_z),
+                    Some(&lora.a_b),
+                    Some(&lora.b_b),
+                    Some(&lora.a_a),
+                    Some(&lora.b_a),
+                    Some(&lora.a_out),
+                    Some(&lora.b_out),
+                    rank,
+                    scale,
                 );
                 (out, MixerCache::Gdn(saved))
             }
@@ -520,14 +586,21 @@ fn nll_and_grads(
     loras: &[LoraParams],
     head: &Head,
     d: &Dims,
+    gdn_dims: &GdnDims,
     num_slots: usize,
+    slot_kinds: &[MixerKind],
     rank: usize,
     scale: f32,
 ) -> (f32, usize, Vec<Grads>) {
     let hidden = d.hidden;
     let seq = fwd.h_final.len() / hidden;
     let n_comp = fwd.positions.len().max(1) as f32;
-    let mut grads: Vec<Grads> = (0..num_slots).map(|_| LoraParams::zeros(rank, d)).collect();
+    let mut grads: Vec<Grads> = (0..num_slots)
+        .map(|s| match slot_kinds[s] {
+            MixerKind::Gqa => LoraParams::zeros_gqa(rank, d),
+            MixerKind::Gdn => LoraParams::zeros_gdn(rank, d, gdn_dims),
+        })
+        .collect();
 
     // ---- Head + CE backward ----
     let mut d_h = vec![0.0f32; seq * hidden];
@@ -616,14 +689,29 @@ fn nll_and_grads(
                 g.dx
             }
             MixerCache::Gdn(saved) => {
-                let mut dx = vec![0.0f32; seq * hidden];
-                gdn_backward(
+                let slot = lw.lora_slot.expect("GDN layer must have a LoRA slot");
+                let g = gdn_backward(
                     &d_h_mid,
                     saved,
                     lw.gdn.expect("GDN layer must have GDN weights"),
-                    &mut dx,
                 );
-                dx
+                grads[slot] = Grads {
+                    a_q: Vec::new(),
+                    b_q: Vec::new(),
+                    a_v: Vec::new(),
+                    b_v: Vec::new(),
+                    a_qkv: g.grad_a_qkv,
+                    b_qkv: g.grad_b_qkv,
+                    a_z: g.grad_a_z,
+                    b_z: g.grad_b_z,
+                    a_b: g.grad_a_b,
+                    b_b: g.grad_b_b,
+                    a_a: g.grad_a_a,
+                    b_a: g.grad_b_a,
+                    a_out: g.grad_a_out,
+                    b_out: g.grad_b_out,
+                };
+                g.dx
             }
         };
 
@@ -794,15 +882,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build the materialised layer stack [first_layer ..= 23], assigning a LoRA
-    // slot to each GQA layer. All weight slices are borrowed from `model`.
+    // slot to each GQA or GDN layer. All weight slices are borrowed from `model`.
     let mut layers: Vec<LayerW> = Vec::new();
     let mut slot_layers: Vec<usize> = Vec::new(); // global layer index per slot
+    let mut slot_kinds: Vec<MixerKind> = Vec::new(); // GQA or GDN per slot
     for layer_idx in first_layer..=TOP_LAYER {
         if let Some((w_q, w_k, w_v, w_o, q_norm, k_norm, pre, post, gate, up, down)) =
             model.gqa_layer_weights(layer_idx)
         {
             let slot = slot_layers.len();
             slot_layers.push(layer_idx);
+            slot_kinds.push(MixerKind::Gqa);
             layers.push(LayerW {
                 kind: MixerKind::Gqa,
                 w_q,
@@ -820,6 +910,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lora_slot: Some(slot),
             });
         } else if let Some((gdn, pre, post, gate, up, down)) = model.gdn_layer_weights(layer_idx) {
+            let slot = slot_layers.len();
+            slot_layers.push(layer_idx);
+            slot_kinds.push(MixerKind::Gdn);
             layers.push(LayerW {
                 kind: MixerKind::Gdn,
                 w_q: &[],
@@ -834,7 +927,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
-                lora_slot: None,
+                lora_slot: Some(slot),
             });
         } else {
             return Err(
@@ -851,7 +944,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     println!(
-        "  materialised {} layers [{}]: {kinds}  ({} GQA LoRA slots at layers {:?})",
+        "  materialised {} layers [{}]: {kinds}  ({} LoRA slots at layers {:?})",
         layers.len(),
         (first_layer..=TOP_LAYER)
             .map(|i| i.to_string())
@@ -861,7 +954,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         slot_layers
     );
     if num_slots == 0 {
-        return Err("no GQA layers in range — nothing to train".into());
+        return Err("no trainable layers in range — nothing to train".into());
     }
 
     let tokenizer = model.tokenizer().clone();
@@ -931,7 +1024,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // model's own compute_token_nlls — validates the whole assembled forward
     // (every layer's shifted norms, GQA/GDN mixer, FFN, head) against the model.
     let zero_loras: Vec<LoraParams> = (0..num_slots)
-        .map(|_| LoraParams::zeros(rank, &dims))
+        .map(|s| match slot_kinds[s] {
+            MixerKind::Gqa => LoraParams::zeros_gqa(rank, &dims),
+            MixerKind::Gdn => LoraParams::zeros_gdn(rank, &dims, &gdn_dims),
+        })
         .collect();
     {
         let s0 = &train_samples[0];
@@ -968,44 +1064,122 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Non-zero A AND B so grad_A and the gate path are non-vacuous.
         let mut rng = 0x1234_5678u64;
         let mut loras: Vec<LoraParams> = (0..num_slots)
-            .map(|_| LoraParams {
-                a_q: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_q: rand_fill(&mut rng, 2 * dims.q_dim * rank, 0.05),
-                a_v: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_v: rand_fill(&mut rng, dims.kv_dim * rank, 0.05),
+            .map(|s| match slot_kinds[s] {
+                MixerKind::Gqa => LoraParams {
+                    a_q: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_q: rand_fill(&mut rng, 2 * dims.q_dim * rank, 0.05),
+                    a_v: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_v: rand_fill(&mut rng, dims.kv_dim * rank, 0.05),
+                    a_qkv: Vec::new(),
+                    b_qkv: Vec::new(),
+                    a_z: Vec::new(),
+                    b_z: Vec::new(),
+                    a_b: Vec::new(),
+                    b_b: Vec::new(),
+                    a_a: Vec::new(),
+                    b_a: Vec::new(),
+                    a_out: Vec::new(),
+                    b_out: Vec::new(),
+                },
+                MixerKind::Gdn => LoraParams {
+                    a_q: Vec::new(),
+                    b_q: Vec::new(),
+                    a_v: Vec::new(),
+                    b_v: Vec::new(),
+                    a_qkv: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_qkv: rand_fill(&mut rng, gdn_dims.qkv_dim * rank, 0.05),
+                    a_z: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_z: rand_fill(&mut rng, gdn_dims.output_dim * rank, 0.05),
+                    a_b: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_b: rand_fill(&mut rng, gdn_dims.num_kh * rank, 0.05),
+                    a_a: rand_fill(&mut rng, rank * dims.hidden, 0.05),
+                    b_a: rand_fill(&mut rng, gdn_dims.num_kh * rank, 0.05),
+                    a_out: rand_fill(&mut rng, rank * gdn_dims.output_dim, 0.05),
+                    b_out: rand_fill(&mut rng, dims.hidden * rank, 0.05),
+                },
             })
             .collect();
 
         let fwd = forward_full(
             &caches[0], &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
         );
-        let (_, _, analytic) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale);
+        let (_, _, analytic) = nll_and_grads(
+            &fwd,
+            &layers,
+            &loras,
+            &head,
+            &dims,
+            &gdn_dims,
+            num_slots,
+            &slot_kinds,
+            rank,
+            scale,
+        );
 
         println!("  fd-eps center {fd_eps:.0e}  (per-entry min over 0.25/0.5/1/2x)");
         let mut worst = 0.0f64;
         let mut all_pass = true;
         for slot in 0..num_slots {
             let layer_idx = slot_layers[slot];
-            for (name, alen) in [
-                ("a_q", analytic[slot].a_q.len()),
-                ("b_q", analytic[slot].b_q.len()),
-                ("a_v", analytic[slot].a_v.len()),
-                ("b_v", analytic[slot].b_v.len()),
-            ] {
-                let agrad = match name {
+            // Build the list of (name, len) pairs for this slot's kind.
+            let arrays: &[(&str, usize)] = match slot_kinds[slot] {
+                MixerKind::Gqa => &[
+                    ("a_q", analytic[slot].a_q.len()),
+                    ("b_q", analytic[slot].b_q.len()),
+                    ("a_v", analytic[slot].a_v.len()),
+                    ("b_v", analytic[slot].b_v.len()),
+                ],
+                MixerKind::Gdn => &[
+                    ("a_qkv", analytic[slot].a_qkv.len()),
+                    ("b_qkv", analytic[slot].b_qkv.len()),
+                    ("a_z", analytic[slot].a_z.len()),
+                    ("b_z", analytic[slot].b_z.len()),
+                    ("a_b", analytic[slot].a_b.len()),
+                    ("b_b", analytic[slot].b_b.len()),
+                    ("a_a", analytic[slot].a_a.len()),
+                    ("b_a", analytic[slot].b_a.len()),
+                    ("a_out", analytic[slot].a_out.len()),
+                    ("b_out", analytic[slot].b_out.len()),
+                ],
+            };
+            for &(name, alen) in arrays {
+                let agrad: &[f32] = match name {
                     "a_q" => &analytic[slot].a_q,
                     "b_q" => &analytic[slot].b_q,
                     "a_v" => &analytic[slot].a_v,
-                    _ => &analytic[slot].b_v,
+                    "b_v" => &analytic[slot].b_v,
+                    "a_qkv" => &analytic[slot].a_qkv,
+                    "b_qkv" => &analytic[slot].b_qkv,
+                    "a_z" => &analytic[slot].a_z,
+                    "b_z" => &analytic[slot].b_z,
+                    "a_b" => &analytic[slot].a_b,
+                    "b_b" => &analytic[slot].b_b,
+                    "a_a" => &analytic[slot].a_a,
+                    "b_a" => &analytic[slot].b_a,
+                    "a_out" => &analytic[slot].a_out,
+                    _ => &analytic[slot].b_out,
                 };
+                if alen == 0 {
+                    // skip arrays that don't belong to this slot's kind
+                    continue;
+                }
                 let mut idxs = top_k_indices(agrad, probe.min(alen));
-                let seed = (slot as u64 * 4
+                let seed = (slot as u64 * 10
                     + match name {
                         "a_q" => 0,
                         "b_q" => 1,
                         "a_v" => 2,
-                        _ => 3,
+                        "b_v" => 3,
+                        "a_qkv" => 0,
+                        "b_qkv" => 1,
+                        "a_z" => 2,
+                        "b_z" => 3,
+                        "a_b" => 4,
+                        "b_b" => 5,
+                        "a_a" => 6,
+                        "b_a" => 7,
+                        "a_out" => 8,
+                        _ => 9,
                     })
                     ^ 0xDEAD;
                 for p in strided_probes(alen, probe.min(alen), seed) {
@@ -1019,20 +1193,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let a = agrad[k];
                     // central FD on the chain NLL
                     let save = {
-                        let arr = match name {
+                        let arr: &mut Vec<f32> = match name {
                             "a_q" => &mut loras[slot].a_q,
                             "b_q" => &mut loras[slot].b_q,
                             "a_v" => &mut loras[slot].a_v,
-                            _ => &mut loras[slot].b_v,
+                            "b_v" => &mut loras[slot].b_v,
+                            "a_qkv" => &mut loras[slot].a_qkv,
+                            "b_qkv" => &mut loras[slot].b_qkv,
+                            "a_z" => &mut loras[slot].a_z,
+                            "b_z" => &mut loras[slot].b_z,
+                            "a_b" => &mut loras[slot].a_b,
+                            "b_b" => &mut loras[slot].b_b,
+                            "a_a" => &mut loras[slot].a_a,
+                            "b_a" => &mut loras[slot].b_a,
+                            "a_out" => &mut loras[slot].a_out,
+                            _ => &mut loras[slot].b_out,
                         };
                         arr[k]
                     };
                     let bump = |loras: &mut [LoraParams], val: f32| {
-                        let arr = match name {
+                        let arr: &mut Vec<f32> = match name {
                             "a_q" => &mut loras[slot].a_q,
                             "b_q" => &mut loras[slot].b_q,
                             "a_v" => &mut loras[slot].a_v,
-                            _ => &mut loras[slot].b_v,
+                            "b_v" => &mut loras[slot].b_v,
+                            "a_qkv" => &mut loras[slot].a_qkv,
+                            "b_qkv" => &mut loras[slot].b_qkv,
+                            "a_z" => &mut loras[slot].a_z,
+                            "b_z" => &mut loras[slot].b_z,
+                            "a_b" => &mut loras[slot].a_b,
+                            "b_b" => &mut loras[slot].b_b,
+                            "a_a" => &mut loras[slot].a_a,
+                            "b_a" => &mut loras[slot].b_a,
+                            "a_out" => &mut loras[slot].a_out,
+                            _ => &mut loras[slot].b_out,
                         };
                         arr[k] = val;
                     };
@@ -1109,11 +1303,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let init_amp = 1.0 / (dims.hidden as f32).sqrt();
     let mut rng = 0xFEED_FACEu64;
     let mut loras: Vec<LoraParams> = (0..num_slots)
-        .map(|_| LoraParams {
-            a_q: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_q: vec![0.0; 2 * dims.q_dim * rank],
-            a_v: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_v: vec![0.0; dims.kv_dim * rank],
+        .map(|s| match slot_kinds[s] {
+            MixerKind::Gqa => LoraParams {
+                a_q: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_q: vec![0.0; 2 * dims.q_dim * rank],
+                a_v: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_v: vec![0.0; dims.kv_dim * rank],
+                a_qkv: Vec::new(),
+                b_qkv: Vec::new(),
+                a_z: Vec::new(),
+                b_z: Vec::new(),
+                a_b: Vec::new(),
+                b_b: Vec::new(),
+                a_a: Vec::new(),
+                b_a: Vec::new(),
+                a_out: Vec::new(),
+                b_out: Vec::new(),
+            },
+            MixerKind::Gdn => LoraParams {
+                a_q: Vec::new(),
+                b_q: Vec::new(),
+                a_v: Vec::new(),
+                b_v: Vec::new(),
+                a_qkv: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_qkv: vec![0.0; gdn_dims.qkv_dim * rank],
+                a_z: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_z: vec![0.0; gdn_dims.output_dim * rank],
+                a_b: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_b: vec![0.0; gdn_dims.num_kh * rank],
+                a_a: rand_fill(&mut rng, rank * dims.hidden, init_amp),
+                b_a: vec![0.0; gdn_dims.num_kh * rank],
+                a_out: rand_fill(&mut rng, rank * gdn_dims.output_dim, init_amp),
+                b_out: vec![0.0; dims.hidden * rank],
+            },
         })
         .collect();
 
@@ -1162,55 +1384,181 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fwd = forward_full(
             ctx, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
         );
-        let (_nll, _n, grads) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale);
+        let (_nll, _n, grads) = nll_and_grads(
+            &fwd,
+            &layers,
+            &loras,
+            &head,
+            &dims,
+            &gdn_dims,
+            num_slots,
+            &slot_kinds,
+            rank,
+            scale,
+        );
 
         for slot in 0..num_slots {
             let li = slot_layers[slot];
-            adam.step(
-                &format!("l{li}_a_q"),
-                &mut loras[slot].a_q,
-                &grads[slot].a_q,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_b_q"),
-                &mut loras[slot].b_q,
-                &grads[slot].b_q,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_a_v"),
-                &mut loras[slot].a_v,
-                &grads[slot].a_v,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_b_v"),
-                &mut loras[slot].b_v,
-                &grads[slot].b_v,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
+            match slot_kinds[slot] {
+                MixerKind::Gqa => {
+                    adam.step(
+                        &format!("l{li}_a_q"),
+                        &mut loras[slot].a_q,
+                        &grads[slot].a_q,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_q"),
+                        &mut loras[slot].b_q,
+                        &grads[slot].b_q,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_a_v"),
+                        &mut loras[slot].a_v,
+                        &grads[slot].a_v,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_v"),
+                        &mut loras[slot].b_v,
+                        &grads[slot].b_v,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                }
+                MixerKind::Gdn => {
+                    adam.step(
+                        &format!("l{li}_a_qkv"),
+                        &mut loras[slot].a_qkv,
+                        &grads[slot].a_qkv,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_qkv"),
+                        &mut loras[slot].b_qkv,
+                        &grads[slot].b_qkv,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_a_z"),
+                        &mut loras[slot].a_z,
+                        &grads[slot].a_z,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_z"),
+                        &mut loras[slot].b_z,
+                        &grads[slot].b_z,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_a_b"),
+                        &mut loras[slot].a_b,
+                        &grads[slot].a_b,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_b"),
+                        &mut loras[slot].b_b,
+                        &grads[slot].b_b,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_a_a"),
+                        &mut loras[slot].a_a,
+                        &grads[slot].a_a,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_a"),
+                        &mut loras[slot].b_a,
+                        &grads[slot].b_a,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_a_out"),
+                        &mut loras[slot].a_out,
+                        &grads[slot].a_out,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                    adam.step(
+                        &format!("l{li}_b_out"),
+                        &mut loras[slot].b_out,
+                        &grads[slot].b_out,
+                        lr,
+                        beta1,
+                        beta2,
+                        eps_adam,
+                        0.0,
+                        false,
+                    );
+                }
+            }
         }
 
         if step % log_every == 0 || step == steps {
