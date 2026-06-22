@@ -172,20 +172,25 @@ fn print_report(report: &ConversionReport, elapsed_secs: f64) {
     eprintln!("Quantized (Q4_0):  {}", report.planned_quantized);
     eprintln!("Kept (F16):        {}", report.kept_f16);
     eprintln!(
-        "Input bytes:       {:.2} MB",
-        report.total_bytes_in as f64 / 1_048_576.0
+        "Input bytes:       {:.2} GB",
+        report.total_bytes_in as f64 / 1_073_741_824.0
     );
     eprintln!(
-        "Output bytes:      {:.2} MB",
-        report.total_bytes_out as f64 / 1_048_576.0
+        "Output bytes:      {:.2} GB",
+        report.total_bytes_out as f64 / 1_073_741_824.0
     );
     if report.total_bytes_in > 0 {
-        let ratio = report.total_bytes_out as f64 / report.total_bytes_in as f64;
-        eprintln!(
-            "Compression:       {:.2}x ({:.1}%)",
-            1.0 / ratio.max(f64::MIN_POSITIVE),
-            ratio * 100.0
-        );
+        if report.total_bytes_out == 0 {
+            // Dry-run: no bytes were written, so the ratio would be 1/MIN_POSITIVE (~4e307).
+            eprintln!("Compression:       N/A (dry run — no bytes written)");
+        } else {
+            let ratio = report.total_bytes_out as f64 / report.total_bytes_in as f64;
+            eprintln!(
+                "Compression:       {:.2}x ({:.1}%)",
+                1.0 / ratio.max(f64::MIN_POSITIVE),
+                ratio * 100.0
+            );
+        }
     }
     eprintln!(
         "Forward-equiv:     max_abs={:.3e}, mean_abs={:.3e} (tol={:.0e}, probes={:?})",

@@ -95,6 +95,20 @@ use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::tokenizer::common::Tokenizer;
 
+/// Emit a `@@lattice {"ev":"perplexity",...}` structured event line to stdout.
+fn emit_perplexity_event(label: &str, report: &PerplexityReport, elapsed_ms: u128) {
+    let obj = serde_json::json!({
+        "ev": "perplexity",
+        "label": label,
+        "ppl": report.ppl,
+        "nll": report.mean_nll,
+        "tokens": report.num_tokens_scored,
+        "windows": report.num_windows,
+        "ms": elapsed_ms,
+    });
+    println!("@@lattice {obj}");
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
@@ -111,6 +125,8 @@ fn main() -> ExitCode {
     let mut random_lora_rank: Option<usize> = None;
     let mut quarot_seed: Option<u64> = None;
     let mut lora_scale: Option<f32> = None;
+    let mut emit_json: bool = false;
+    let mut json_label: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -230,6 +246,16 @@ fn main() -> ExitCode {
                     Err(e) => return usage(&format!("--lora-scale: invalid f32: {e}")),
                 });
             }
+            "--json" => {
+                emit_json = true;
+            }
+            "--label" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--label requires an argument");
+                };
+                json_label = Some(v.clone());
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -335,6 +361,10 @@ fn main() -> ExitCode {
         };
         let elapsed = t_ppl.elapsed();
         print_report("CPU safetensors", &report, elapsed.as_secs_f64());
+        if emit_json {
+            let label = json_label.as_deref().unwrap_or("bf16");
+            emit_perplexity_event(label, &report, elapsed.as_millis());
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -374,6 +404,8 @@ fn main() -> ExitCode {
             random_lora_rank,
             quarot_seed,
             lora_scale.unwrap_or(1.0),
+            emit_json,
+            json_label.as_deref().or(Some("q4")),
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -398,6 +430,8 @@ fn main() -> ExitCode {
             random_lora_rank,
             quarot_seed,
             lora_scale.unwrap_or(1.0),
+            emit_json,
+            json_label.as_deref().or(Some("quarot")),
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -487,6 +521,8 @@ fn run_metal_q4(
     random_lora_rank: Option<usize>,
     quarot_seed: Option<u64>,
     lora_scale: f32,
+    emit_json: bool,
+    json_label: Option<&str>,
 ) -> Result<PerplexityReport, ExitCode> {
     let t_load = Instant::now();
     let mut state =
@@ -531,6 +567,10 @@ fn run_metal_q4(
     };
     let elapsed = t_ppl.elapsed();
     print_report(label, &report, elapsed.as_secs_f64());
+    if emit_json {
+        let ev_label = json_label.unwrap_or(label);
+        emit_perplexity_event(ev_label, &report, elapsed.as_millis());
+    }
     Ok(report)
 }
 
@@ -655,6 +695,11 @@ options:
                            omitted (None passed to load_lora_adapter, seed 0 for
                            matrix generation).
   --lora-scale <F>         LoRA scale factor (alpha/rank). Default 1.0.
+  --json                   Emit a structured @@lattice line to stdout for each target
+                           evaluated (machine-readable output for the macOS app).
+  --label <STRING>         Label to use in the --json event (overrides per-target default).
+                           Defaults: bf16 for --model-dir, q4 for --q4-dir, quarot
+                           for --quarot-q4-dir.
   -h, --help               Print this help and exit.
 
 The harness mirrors HuggingFace's fixed-length-model recipe: each non-

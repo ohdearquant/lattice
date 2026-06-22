@@ -76,19 +76,46 @@ impl IncrementalDetokenizer {
     }
 
     fn flush_complete(&mut self) -> String {
-        let valid = match std::str::from_utf8(&self.bytes[self.flushed..]) {
-            Ok(s) => s.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if valid == 0 {
-            return String::new();
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.bytes[self.flushed..]) {
+                // Entire remaining buffer is valid UTF-8: emit it all.
+                Ok(s) => {
+                    out.push_str(s);
+                    self.flushed = self.bytes.len();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // [flushed .. flushed + valid] is guaranteed valid by
+                        // valid_up_to, so from_utf8_lossy substitutes nothing.
+                        out.push_str(
+                            String::from_utf8_lossy(
+                                &self.bytes[self.flushed..self.flushed + valid],
+                            )
+                            .as_ref(),
+                        );
+                        self.flushed += valid;
+                    }
+                    match e.error_len() {
+                        // None: the error is an incomplete trailing codepoint,
+                        // not a malformed one. A later token may complete it, so
+                        // keep the tail buffered and emit no replacement char.
+                        None => return out,
+                        // Some(len): a genuinely invalid sequence of `len` bytes
+                        // that no future token can repair. Emit one U+FFFD (matching
+                        // from_utf8_lossy's maximal-subpart substitution), skip past
+                        // it, and continue — without this the stream would stall on
+                        // the bad byte until finish().
+                        Some(len) => {
+                            out.push('\u{FFFD}');
+                            self.flushed += len;
+                        }
+                    }
+                }
+            }
         }
-        // [flushed .. flushed + valid] is guaranteed valid UTF-8 by the check
-        // above, so from_utf8_lossy performs no substitution here.
-        let delta =
-            String::from_utf8_lossy(&self.bytes[self.flushed..self.flushed + valid]).into_owned();
-        self.flushed += valid;
-        delta
     }
 
     /// Flush any trailing incomplete bytes lossily. Call once after the final
@@ -165,6 +192,37 @@ mod tests {
         out.push_str(&d.flush_complete());
         out.push_str(&d.finish());
         assert_eq!(out, String::from_utf8_lossy(&[b'h', b'i', 0xE5, 0xA5]));
+        assert_eq!(out, d.text());
+    }
+
+    #[test]
+    fn incremental_flush_invalid_byte_does_not_stall_stream() {
+        // A lone continuation byte (0x80) is a malformed sequence no later token
+        // can complete. flush_complete must emit U+FFFD for it immediately and
+        // keep going, not buffer it until finish() (which would stall the stream).
+        let mut d = IncrementalDetokenizer::new();
+        d.bytes.extend_from_slice(&[0x80]);
+        let first = d.flush_complete();
+        assert_eq!(first, "\u{FFFD}", "invalid byte must flush immediately");
+        d.bytes.extend_from_slice(b"A");
+        let second = d.flush_complete();
+        assert_eq!(second, "A", "valid byte after invalid one must flush");
+        // Concatenated stream equals from_utf8_lossy over the whole byte buffer.
+        assert_eq!(
+            format!("{first}{second}"),
+            String::from_utf8_lossy(&[0x80, b'A'])
+        );
+    }
+
+    #[test]
+    fn incremental_flush_invalid_between_valid_matches_lossy() {
+        // Valid · invalid · valid in one buffer: one U+FFFD for the bad run, both
+        // valid runs verbatim — byte-for-byte equal to from_utf8_lossy.
+        let raw = [b'h', b'i', 0xFF, b'y', b'o'];
+        let mut d = IncrementalDetokenizer::new();
+        d.bytes.extend_from_slice(&raw);
+        let out = d.flush_complete();
+        assert_eq!(out, String::from_utf8_lossy(&raw));
         assert_eq!(out, d.text());
     }
 
