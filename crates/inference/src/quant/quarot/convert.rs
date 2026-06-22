@@ -158,9 +158,27 @@ fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
     })
 }
 
+/// Compute the byte count that `write_f16_file` would write for a tensor
+/// with `data_len` elements and `shape_len` dimensions, without performing
+/// any I/O. Used by both the real write path (as a cross-check) and the
+/// dry-run accounting path.
+///
+/// Layout mirrors `write_f16_file` exactly:
+/// ```text
+///   magic[4] version[4] ndim[4] dims[8*ndim] numel[8] payload[numel*2]
+/// ```
+fn f16_file_byte_count(data_len: usize, shape_len: usize) -> u64 {
+    // Header: magic(4) + version(4) + ndim(4) + shape(8*ndim) + numel(8)
+    let header: u64 = 4 + 4 + 4 + 8 * shape_len as u64 + 8;
+    // Payload: each f64 element becomes one f16 (2 bytes).
+    let payload: u64 = data_len as u64 * 2;
+    header + payload
+}
+
 fn write_mtp_weights_quarot(
     reader: &QuarotTensorReader,
     output_dir: &Path,
+    dry_run: bool,
     index_entries: &mut Vec<IndexEntry>,
     kept_f16: &mut usize,
     _planned_quantized: &mut usize,
@@ -193,16 +211,20 @@ fn write_mtp_weights_quarot(
         "mtp.pre_fc_norm_hidden.weight",
     ];
 
-    let mut write_as_f16 = |name: &str| -> Result<(), InferenceError> {
+    let mut process_as_f16 = |name: &str| -> Result<(), InferenceError> {
         if !reader.has_tensor(name) {
             return Ok(());
         }
         let (data, shape) = reader.read_tensor_f64(name)?;
         let sanitized = sanitize_tensor_name(name);
         let file_name = format!("{sanitized}.f16");
-        let out_path = output_dir.join(&file_name);
-        let bytes = write_f16_file(&out_path, &data, &shape)?;
-        *total_bytes_out += bytes as u64;
+        // Byte accounting uses the pure formula: same result as write_f16_file
+        // would return, derived from shape and numel without any I/O.
+        *total_bytes_out += f16_file_byte_count(data.len(), shape.len());
+        if !dry_run {
+            let out_path = output_dir.join(&file_name);
+            write_f16_file(&out_path, &data, &shape)?;
+        }
         *kept_f16 += 1;
         index_entries.push(IndexEntry {
             name: name.to_string(),
@@ -215,10 +237,10 @@ fn write_mtp_weights_quarot(
     };
 
     for name in &proj_names {
-        write_as_f16(name)?;
+        process_as_f16(name)?;
     }
     for name in &norm_names {
-        write_as_f16(name)?;
+        process_as_f16(name)?;
     }
 
     Ok(())
@@ -232,8 +254,11 @@ fn write_mtp_weights_quarot(
 /// files**.
 ///
 /// `opts.dry_run = true` runs the full pipeline + gate but skips every
-/// disk write, returning a report with `planned_quantized = 0`,
-/// `kept_f16 = 0`, `total_bytes_out = 0`. In dry-run the
+/// disk write, returning a report with real `planned_quantized`,
+/// `kept_f16`, and `total_bytes_out` values computed using the same
+/// formulas the write path applies (Q4: header + blocks×20; f16:
+/// header + numel×2). This lets callers preview the output size and
+/// compression ratio before committing the write. In dry-run the
 /// output-directory layout validation (same-path, non-empty checks) is
 /// also skipped — those constraints exist to keep the write path from
 /// corrupting source artifacts, and dry-run produces no writes by
@@ -374,23 +399,14 @@ pub fn convert_quarot_qwen35(
         },
     )?;
 
-    if opts.dry_run {
-        return Ok(ConversionReport {
-            planned_quantized: 0,
-            kept_f16: 0,
-            total_bytes_in,
-            total_bytes_out: 0,
-            forward_equivalence,
-            was_tied,
-        });
+    if !opts.dry_run {
+        fs::create_dir_all(output_dir).map_err(|e| {
+            InferenceError::Inference(format!(
+                "convert_quarot_qwen35: failed to create output directory {}: {e}",
+                output_dir.display()
+            ))
+        })?;
     }
-
-    fs::create_dir_all(output_dir).map_err(|e| {
-        InferenceError::Inference(format!(
-            "convert_quarot_qwen35: failed to create output directory {}: {e}",
-            output_dir.display()
-        ))
-    })?;
 
     let mut names: Vec<String> = working_set.keys().cloned().collect();
     names.sort();
@@ -413,40 +429,49 @@ pub fn convert_quarot_qwen35(
                     entry.shape
                 )));
             }
-            let q4 = quantize_f64_to_q4(&entry.data, &entry.shape);
-            let file_name = format!("{sanitized}.q4");
-            let out_path = output_dir.join(&file_name);
-            save_q4_file(&out_path, &q4).map_err(|e| {
-                InferenceError::Inference(format!(
-                    "convert_quarot_qwen35: failed to write {}: {e}",
-                    out_path.display()
-                ))
-            })?;
             // Q4 file footprint: 4-byte magic + 4 version + 4 ndim +
             // 8*ndim shape + 8 original_len + 20 bytes per block (asymmetric).
+            // Block count: original_len.div_ceil(32). Computed from shape WITHOUT
+            // quantizing so the dry-run path produces the same number without
+            // allocating the Q4 buffer.
             let header_bytes = (4 + 4 + 4 + 8 * entry.shape.len() + 8) as u64;
-            total_bytes_out += header_bytes + (q4.blocks.len() as u64).saturating_mul(20);
+            let n_blocks = entry.data.len().div_ceil(32) as u64;
+            total_bytes_out += header_bytes + n_blocks.saturating_mul(20);
+            if !opts.dry_run {
+                let q4 = quantize_f64_to_q4(&entry.data, &entry.shape);
+                let file_name = format!("{sanitized}.q4");
+                let out_path = output_dir.join(&file_name);
+                save_q4_file(&out_path, &q4).map_err(|e| {
+                    InferenceError::Inference(format!(
+                        "convert_quarot_qwen35: failed to write {}: {e}",
+                        out_path.display()
+                    ))
+                })?;
+                index_entries.push(IndexEntry {
+                    name: name.clone(),
+                    file: file_name,
+                    quantized: true,
+                    shape: entry.shape.clone(),
+                    numel: entry.data.len(),
+                });
+            }
             planned_quantized += 1;
-            index_entries.push(IndexEntry {
-                name: name.clone(),
-                file: file_name,
-                quantized: true,
-                shape: entry.shape.clone(),
-                numel: entry.data.len(),
-            });
         } else {
-            let file_name = format!("{sanitized}.f16");
-            let out_path = output_dir.join(&file_name);
-            let bytes = write_f16_file(&out_path, &entry.data, &entry.shape)?;
-            total_bytes_out += bytes as u64;
+            // f16 file footprint computed from shape and numel without writing.
+            total_bytes_out += f16_file_byte_count(entry.data.len(), entry.shape.len());
+            if !opts.dry_run {
+                let file_name = format!("{sanitized}.f16");
+                let out_path = output_dir.join(&file_name);
+                write_f16_file(&out_path, &entry.data, &entry.shape)?;
+                index_entries.push(IndexEntry {
+                    name: name.clone(),
+                    file: file_name,
+                    quantized: false,
+                    shape: entry.shape.clone(),
+                    numel: entry.data.len(),
+                });
+            }
             kept_f16 += 1;
-            index_entries.push(IndexEntry {
-                name: name.clone(),
-                file: file_name,
-                quantized: false,
-                shape: entry.shape.clone(),
-                numel: entry.data.len(),
-            });
         }
     }
 
@@ -454,6 +479,7 @@ pub fn convert_quarot_qwen35(
         write_mtp_weights_quarot(
             &reader,
             output_dir,
+            opts.dry_run,
             &mut index_entries,
             &mut kept_f16,
             &mut planned_quantized,
@@ -461,32 +487,34 @@ pub fn convert_quarot_qwen35(
         )?;
     }
 
-    let index_path = output_dir.join("quantize_index.json");
-    let index_record = QuantizeIndex {
-        quarot_seed: Some(opts.rotation_seed),
-        tensors: index_entries,
-    };
-    let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
-        InferenceError::Inference(format!(
-            "convert_quarot_qwen35: failed to serialize quantize_index.json: {e}"
-        ))
-    })?;
-    fs::write(&index_path, index_json).map_err(|e| {
-        InferenceError::Inference(format!(
-            "convert_quarot_qwen35: failed to write {}: {e}",
-            index_path.display()
-        ))
-    })?;
+    if !opts.dry_run {
+        let index_path = output_dir.join("quantize_index.json");
+        let index_record = QuantizeIndex {
+            quarot_seed: Some(opts.rotation_seed),
+            tensors: index_entries,
+        };
+        let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
+            InferenceError::Inference(format!(
+                "convert_quarot_qwen35: failed to serialize quantize_index.json: {e}"
+            ))
+        })?;
+        fs::write(&index_path, index_json).map_err(|e| {
+            InferenceError::Inference(format!(
+                "convert_quarot_qwen35: failed to write {}: {e}",
+                index_path.display()
+            ))
+        })?;
 
-    let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
-    output_config_json = inject_quarot_seed(&output_config_json, opts.rotation_seed)?;
-    let out_config_path = output_dir.join("config.json");
-    fs::write(&out_config_path, &output_config_json).map_err(|e| {
-        InferenceError::Inference(format!(
-            "convert_quarot_qwen35: failed to write {}: {e}",
-            out_config_path.display()
-        ))
-    })?;
+        let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
+        output_config_json = inject_quarot_seed(&output_config_json, opts.rotation_seed)?;
+        let out_config_path = output_dir.join("config.json");
+        fs::write(&out_config_path, &output_config_json).map_err(|e| {
+            InferenceError::Inference(format!(
+                "convert_quarot_qwen35: failed to write {}: {e}",
+                out_config_path.display()
+            ))
+        })?;
+    }
 
     Ok(ConversionReport {
         planned_quantized,
@@ -1105,9 +1133,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.planned_quantized, 0);
-        assert_eq!(report.kept_f16, 0);
-        assert_eq!(report.total_bytes_out, 0);
+        // Dry-run now computes real byte counts and tensor counts (so the
+        // Studio can show a meaningful compression ratio). The counts must be
+        // positive and identical to what a real write would produce.
+        assert!(
+            report.planned_quantized > 0,
+            "dry-run must report planned_quantized > 0"
+        );
+        assert!(report.kept_f16 > 0, "dry-run must report kept_f16 > 0");
+        assert!(
+            report.total_bytes_out > 0,
+            "dry-run must report total_bytes_out > 0"
+        );
         assert!(report.forward_equivalence.max_abs_error <= 1e-5);
         assert!(
             !output.exists(),
@@ -1204,6 +1241,130 @@ mod tests {
         assert!(
             !output.exists(),
             "MoE-rejected conversion must not create output dir"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Dry-run / real-write byte-count parity (codex finding fix gate)
+    // ------------------------------------------------------------------
+
+    /// Correctness gate: dry_run=true and dry_run=false on the same model
+    /// must produce identical total_bytes_out values (and both > 0).
+    /// Also verifies that dry-run wrote no output files.
+    #[test]
+    fn dry_run_bytes_out_matches_real_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output_dry = tmp.path().join("output_dry");
+        let output_real = tmp.path().join("output_real");
+        let cfg = tiny_cfg(false); // untied — no lm_head materialization side-effect
+        write_input_dir(&cfg, &input, 99);
+
+        let opts = ConversionOptions {
+            rotation_seed: 0xABCD_5678,
+            tolerance: 1e-5,
+            num_probe_tokens: 2,
+            dry_run: false,
+        };
+
+        let dry_report = convert_quarot_qwen35(
+            &input,
+            &output_dry,
+            &ConversionOptions {
+                dry_run: true,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+
+        let real_report = convert_quarot_qwen35(&input, &output_real, &opts).unwrap();
+
+        // Primary correctness assertion: byte counts are equal.
+        assert_eq!(
+            dry_report.total_bytes_out, real_report.total_bytes_out,
+            "dry-run total_bytes_out ({}) must equal real-write total_bytes_out ({})",
+            dry_report.total_bytes_out, real_report.total_bytes_out,
+        );
+        // Both must be positive — a zero here means accounting is broken.
+        assert!(
+            dry_report.total_bytes_out > 0,
+            "total_bytes_out must be > 0; got 0 (accounting is broken)"
+        );
+        // Tensor counts must also match.
+        assert_eq!(
+            dry_report.planned_quantized, real_report.planned_quantized,
+            "planned_quantized mismatch between dry and real"
+        );
+        assert_eq!(
+            dry_report.kept_f16, real_report.kept_f16,
+            "kept_f16 mismatch between dry and real"
+        );
+        // Dry-run must not have created an output directory.
+        assert!(
+            !output_dry.exists(),
+            "dry-run must not create the output directory"
+        );
+
+        // Non-circular guard: the reported total must equal the SUM of the
+        // actual on-disk tensor file sizes. A dry==real check alone is circular
+        // (both sides apply the same formula); this catches drift between the
+        // byte formula and what write_f16_file / save_q4_file actually write.
+        let mut on_disk: u64 = 0;
+        for dent in std::fs::read_dir(&output_real).unwrap() {
+            let path = dent.unwrap().path();
+            if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("q4") | Some("f16")
+            ) {
+                on_disk += std::fs::metadata(&path).unwrap().len();
+            }
+        }
+        assert_eq!(
+            real_report.total_bytes_out, on_disk,
+            "reported total_bytes_out ({}) must equal summed on-disk .q4/.f16 file sizes ({})",
+            real_report.total_bytes_out, on_disk,
+        );
+    }
+
+    /// Repeat the byte-count parity check with the tied model (triggers
+    /// lm_head materialization, which adds one extra planned tensor).
+    #[test]
+    fn dry_run_bytes_out_matches_real_write_tied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output_dry = tmp.path().join("output_dry");
+        let output_real = tmp.path().join("output_real");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 100);
+
+        let opts = ConversionOptions {
+            rotation_seed: 0xFACE_CAFE,
+            tolerance: 1e-5,
+            num_probe_tokens: 2,
+            dry_run: false,
+        };
+
+        let dry_report = convert_quarot_qwen35(
+            &input,
+            &output_dry,
+            &ConversionOptions {
+                dry_run: true,
+                ..opts.clone()
+            },
+        )
+        .unwrap();
+
+        let real_report = convert_quarot_qwen35(&input, &output_real, &opts).unwrap();
+
+        assert_eq!(
+            dry_report.total_bytes_out, real_report.total_bytes_out,
+            "tied: dry-run total_bytes_out ({}) must equal real-write total_bytes_out ({})",
+            dry_report.total_bytes_out, real_report.total_bytes_out,
+        );
+        assert!(dry_report.total_bytes_out > 0);
+        assert!(
+            !output_dry.exists(),
+            "dry-run must not create the output directory"
         );
     }
 
@@ -1376,8 +1537,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report.planned_quantized, 0);
-        assert_eq!(report.total_bytes_out, 0);
+        // Dry-run computes real byte counts; no files written.
+        assert!(
+            report.planned_quantized > 0,
+            "dry-run must compute planned_quantized > 0"
+        );
+        assert!(
+            report.total_bytes_out > 0,
+            "dry-run must compute total_bytes_out > 0"
+        );
 
         let listing_after = list_dir_recursive(&input);
         assert_eq!(
@@ -1411,9 +1579,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(report.planned_quantized, 0);
-        assert_eq!(report.kept_f16, 0);
-        assert_eq!(report.total_bytes_out, 0);
+        // Dry-run computes real byte counts; no files written.
+        assert!(
+            report.planned_quantized > 0,
+            "dry-run must compute planned_quantized > 0"
+        );
+        assert!(report.kept_f16 > 0, "dry-run must compute kept_f16 > 0");
+        assert!(
+            report.total_bytes_out > 0,
+            "dry-run must compute total_bytes_out > 0"
+        );
 
         // Stale file must survive bit-for-bit; no new files in output.
         assert!(stale.exists(), "stale file must not be deleted in dry-run");
