@@ -1075,6 +1075,7 @@ pub mod bench_support {
                 max_position_embeddings: 512,
                 mtp_num_hidden_layers: 0,
                 mtp_use_dedicated_embeddings: false,
+                quarot_rotation_seed: None,
             };
 
             let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 32
