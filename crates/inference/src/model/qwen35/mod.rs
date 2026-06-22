@@ -11,7 +11,7 @@
 
 mod cache;
 mod debug;
-mod detokenize;
+pub(crate) mod detokenize;
 mod eval;
 mod forward;
 mod generation;

@@ -575,20 +575,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let t1 = std::time::Instant::now();
 
         // generate_streaming: returns GenerateOutput (not Result), callback returns bool.
+        // A discarded stdout error (broken pipe) would let generation run to
+        // completion and still report success, so capture the first write/flush
+        // failure and stop the stream on it.
+        let mut stream_err: Option<std::io::Error> = None;
         let output = metal.generate_streaming(&prompt, &tokenizer, &gen_cfg, |delta, _token_id| {
             if !first_token_emitted {
                 ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
                 first_token_emitted = true;
             }
             let token_json = json_escape(delta);
-            writeln!(
+            let write_result = writeln!(
                 stdout,
                 "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"done\":false}}"
             )
-            .ok();
-            stdout.flush().ok();
+            .and_then(|()| stdout.flush());
+            if let Err(e) = write_result {
+                stream_err = Some(e);
+                return false; // downstream consumer is gone — stop generating
+            }
             true // continue generation
         });
+        if let Some(e) = stream_err {
+            return Err(format!("chat_metal: streaming stdout write failed: {e}").into());
+        }
 
         let gen_ms = t1.elapsed().as_millis();
         let tok_s = if gen_ms > 0 {
@@ -602,8 +612,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stdout,
             "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
         )
-        .ok();
-        stdout.flush().ok();
+        .and_then(|()| stdout.flush())
+        .map_err(|e| format!("chat_metal: streaming done-event write failed: {e}"))?;
 
         // Emit timing to stderr (not captured by app).
         let lora_tag = if has_lora { "+lora" } else { "" };
