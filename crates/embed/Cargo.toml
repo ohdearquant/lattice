@@ -46,6 +46,11 @@ metal-gpu = ["lattice-inference/metal-gpu"]
 avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
 local = []
 
+[[bin]]
+name = "embed"
+path = "src/bin/embed.rs"
+required-features = ["native"]
+
 [[example]]
 name = "basic_embed"
 required-features = ["native"]
