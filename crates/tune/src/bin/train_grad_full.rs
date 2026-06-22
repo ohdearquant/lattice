@@ -1624,30 +1624,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Save PEFT adapter if --save was specified.
     let saved_path: Option<String> = if let Some(ref out_path) = save_path {
         let mut lora_layers = std::collections::HashMap::new();
+        let mut gdn_skipped: usize = 0;
         for (slot, lp) in loras.iter().enumerate() {
             let layer_idx = slot_layers[slot];
+            let mut slot_contributed = false;
             // q_proj: A=(rank, hidden), B=(2*q_dim, rank).
             // b_q was allocated as vec![0.0; 2 * dims.q_dim * rank], so d_out = 2*q_dim.
-            lora_layers.insert(
-                (layer_idx, "q_proj".to_string()),
-                LoraLayer {
-                    a: lp.a_q.clone(),
-                    b: lp.b_q.clone(),
-                    d_in: dims.hidden,
-                    d_out: 2 * dims.q_dim,
-                    rank,
-                },
-            );
+            // GDN slots leave a_q/b_q empty — skip rather than emit a zero-byte tensor.
+            if !lp.a_q.is_empty() && !lp.b_q.is_empty() {
+                lora_layers.insert(
+                    (layer_idx, "q_proj".to_string()),
+                    LoraLayer {
+                        a: lp.a_q.clone(),
+                        b: lp.b_q.clone(),
+                        d_in: dims.hidden,
+                        d_out: 2 * dims.q_dim,
+                        rank,
+                    },
+                );
+                slot_contributed = true;
+            }
             // v_proj: A=(rank, hidden), B=(kv_dim, rank).
-            lora_layers.insert(
-                (layer_idx, "v_proj".to_string()),
-                LoraLayer {
-                    a: lp.a_v.clone(),
-                    b: lp.b_v.clone(),
-                    d_in: dims.hidden,
-                    d_out: dims.kv_dim,
-                    rank,
-                },
+            // GDN slots leave a_v/b_v empty — skip rather than emit a zero-byte tensor.
+            if !lp.a_v.is_empty() && !lp.b_v.is_empty() {
+                lora_layers.insert(
+                    (layer_idx, "v_proj".to_string()),
+                    LoraLayer {
+                        a: lp.a_v.clone(),
+                        b: lp.b_v.clone(),
+                        d_in: dims.hidden,
+                        d_out: dims.kv_dim,
+                        rank,
+                    },
+                );
+                slot_contributed = true;
+            }
+            if !slot_contributed {
+                gdn_skipped += 1;
+            }
+        }
+        if gdn_skipped > 0 {
+            eprintln!(
+                "warning: {gdn_skipped} GDN-attention layer(s) had no persistable q/v LoRA; \
+                saved adapter contains GQA/full-attention layers only \
+                (GDN-module LoRA persistence is a separate follow-up)"
             );
         }
         let adapter = LoraAdapter::new(
