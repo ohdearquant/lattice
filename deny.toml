@@ -1,0 +1,61 @@
+# cargo-deny configuration — supply-chain gate for the lattice workspace.
+# Enforced in CI by `.github/workflows/ci.yml` (job `cargo-deny`) via
+# EmbarkStudios/cargo-deny-action@v2.
+#
+# Split of concern (deliberate — keeps the merge gate smooth, never wedges):
+#   - licenses / bans / sources  → REQUIRED (deterministic; a green main cannot
+#     spontaneously turn red without a manifest or lockfile change).
+#   - advisories                 → INFORMATIONAL (run with continue-on-error in
+#     CI). New RUSTSEC entries land continuously with no code change of ours, so
+#     gating merges on them would let an unrelated upstream disclosure block the
+#     whole pipeline. They still surface in the job log for triage.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Confidence below this for a detected license text is treated as "no license".
+confidence-threshold = 0.8
+# Every entry below is genuinely present in the dependency tree (verified via
+# `cargo metadata`). The set is exactly: the licenses that appear standalone or
+# inside an `AND` (so they are *forced*), plus the permissive OR-alternatives
+# already in the tree. No copyleft: LGPL-2.1 appears only as an OR alternative
+# (MIT OR Apache-2.0 OR LGPL-2.1-or-later) and is never the only choice.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+]
+
+[bans]
+# Duplicate versions are ubiquitous in any non-trivial tree; surface them as a
+# warning rather than a hard failure so the gate stays smooth. Tighten later if
+# we want to actively dedupe.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Verified clean: every package in Cargo.lock resolves to crates.io, zero git
+# deps. Deny anything off the registry so a surprise source is caught.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+version = 2
+# Yanked crates are a real, deterministic problem — deny them. Vulnerability
+# advisories are denied by default under the v2 schema; in CI this whole check
+# runs continue-on-error (informational), so a fresh upstream disclosure cannot
+# wedge merges while still showing up in the log.
+yanked = "deny"
