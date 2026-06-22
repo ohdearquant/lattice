@@ -105,11 +105,10 @@ async fn main() -> ExitCode {
     let service = NativeEmbeddingService::with_model(model);
 
     // --download-only: ensure the model is present (downloading + checksum-verifying if
-    // needed) and loadable, then exit. A single warmup embedding forces the lazy
-    // ensure_model_files + model load without printing the similarity report.
+    // needed) and loadable, then exit without running any encode pass.
     if download_only {
-        match service.embed(&["warmup".to_string()], model).await {
-            Ok(_) => {
+        match service.ensure_loaded().await {
+            Ok(()) => {
                 eprintln!("Model {model} is downloaded and ready.");
                 if emit_json {
                     let obj = serde_json::json!({
