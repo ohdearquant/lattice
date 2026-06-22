@@ -312,6 +312,23 @@ impl GdnSaved {
 /// to each projection output and caches `h = A @ x` for the backward.
 /// When any pair is `None`, the forward is byte-identical to the no-LoRA path.
 #[allow(clippy::too_many_arguments)]
+/// The ten LoRA weight-matrix slices bound for one GDN forward, in fixed order:
+/// (a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out). Factored out to keep
+/// the `lora_bound` binding under clippy's type-complexity threshold (this module is
+/// `train-backward`-gated, so default clippy never lints it — see the app-bins gate).
+type LoraBound<'a> = (
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+);
+
 pub fn gdn_forward_save(
     inputs: &[f32],
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
@@ -356,18 +373,7 @@ pub fn gdn_forward_save(
     // Bind all ten LoRA slices at once.  If any pair is None or rank==0 the entire
     // LoRA path is skipped and the forward is byte-identical to the no-LoRA path.
     // Option<&[f32]> is Copy, so destructuring copies the refs — no heap allocation.
-    let lora_bound: Option<(
-        &[f32],
-        &[f32], // a_qkv, b_qkv
-        &[f32],
-        &[f32], // a_z,   b_z
-        &[f32],
-        &[f32], // a_b,   b_b
-        &[f32],
-        &[f32], // a_a,   b_a
-        &[f32],
-        &[f32], // a_out, b_out
-    )> = if lora_rank > 0 {
+    let lora_bound: Option<LoraBound> = if lora_rank > 0 {
         match (
             lora_a_qkv, lora_b_qkv, lora_a_z, lora_b_z, lora_a_b, lora_b_b, lora_a_a, lora_b_a,
             lora_a_out, lora_b_out,
@@ -389,6 +395,30 @@ pub fn gdn_forward_save(
     } else {
         None
     };
+
+    // Reset LoRA cache state unconditionally. `saved` is a reusable buffer; a
+    // prior LoRA-bound call would otherwise leave stale rank/matrices/h_* here.
+    // gdn_backward gates its LoRA-gradient path on saved.lora_rank, so a leftover
+    // nonzero rank after a no-LoRA call computes phantom gradients. The Some branch
+    // below repopulates these; the None path now stays truly LoRA-free.
+    saved.lora_rank = 0;
+    saved.lora_scale = 0.0;
+    saved.h_qkv.clear();
+    saved.h_z.clear();
+    saved.h_b.clear();
+    saved.h_a.clear();
+    saved.h_out.clear();
+    saved.gated_buf.clear();
+    saved.lora_a_qkv.clear();
+    saved.lora_b_qkv.clear();
+    saved.lora_a_z.clear();
+    saved.lora_b_z.clear();
+    saved.lora_a_b.clear();
+    saved.lora_b_b.clear();
+    saved.lora_a_a.clear();
+    saved.lora_b_a.clear();
+    saved.lora_a_out.clear();
+    saved.lora_b_out.clear();
 
     // Initialise LoRA cache buffers on the saved struct when LoRA is active.
     // Also clone the weight matrices so gdn_backward doesn't need them threaded through.

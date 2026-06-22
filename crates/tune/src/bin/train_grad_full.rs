@@ -38,9 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use lattice_inference::attention::gdn::GatedDeltaNetWeights;
-use lattice_inference::attention::gdn_backward::{
-    GdnGrads, GdnSaved, gdn_backward, gdn_forward_save,
-};
+use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
 use lattice_inference::backward::attention_gqa::{AttnCache, gqa_backward, gqa_forward_with_cache};
 use lattice_inference::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
 use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
@@ -314,11 +312,6 @@ impl LoraParams {
             a_out: vec![0.0; rank * gd.output_dim],
             b_out: vec![0.0; d.hidden * rank],
         }
-    }
-
-    /// Backward-compatibility alias used in TBV and eval paths.
-    fn zeros(rank: usize, d: &Dims) -> Self {
-        Self::zeros_gqa(rank, d)
     }
 }
 
@@ -1626,35 +1619,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut lora_layers = std::collections::HashMap::new();
         for (slot, lp) in loras.iter().enumerate() {
             let layer_idx = slot_layers[slot];
-            // q_proj: A=(rank, hidden), B=(2*q_dim, rank).
-            // b_q was allocated as vec![0.0; 2 * dims.q_dim * rank], so d_out = 2*q_dim.
-            lora_layers.insert(
-                (layer_idx, "q_proj".to_string()),
-                LoraLayer {
-                    a: lp.a_q.clone(),
-                    b: lp.b_q.clone(),
-                    d_in: dims.hidden,
-                    d_out: 2 * dims.q_dim,
-                    rank,
-                },
-            );
-            // v_proj: A=(rank, hidden), B=(kv_dim, rank).
-            lora_layers.insert(
-                (layer_idx, "v_proj".to_string()),
-                LoraLayer {
-                    a: lp.a_v.clone(),
-                    b: lp.b_v.clone(),
-                    d_in: dims.hidden,
-                    d_out: dims.kv_dim,
-                    rank,
-                },
-            );
+            match slot_kinds[slot] {
+                MixerKind::Gqa => {
+                    // q_proj: A=(rank, hidden), B=(2*q_dim, rank).
+                    // b_q was allocated as vec![0.0; 2 * dims.q_dim * rank], so d_out = 2*q_dim.
+                    lora_layers.insert(
+                        (layer_idx, "q_proj".to_string()),
+                        LoraLayer {
+                            a: lp.a_q.clone(),
+                            b: lp.b_q.clone(),
+                            d_in: dims.hidden,
+                            d_out: 2 * dims.q_dim,
+                            rank,
+                        },
+                    );
+                    // v_proj: A=(rank, hidden), B=(kv_dim, rank).
+                    lora_layers.insert(
+                        (layer_idx, "v_proj".to_string()),
+                        LoraLayer {
+                            a: lp.a_v.clone(),
+                            b: lp.b_v.clone(),
+                            d_in: dims.hidden,
+                            d_out: dims.kv_dim,
+                            rank,
+                        },
+                    );
+                }
+                MixerKind::Gdn => {
+                    // GDN trains five LoRA modules. Save each under the name and shape
+                    // the loader expects (crates/tune/src/lora/mod.rs). Previously this
+                    // loop wrote empty q_proj/v_proj for GDN slots (a_q/a_v are empty
+                    // for GDN) and omitted every GDN module, yielding a useless adapter.
+                    // in_proj_qkv: A=(rank, hidden), B=(qkv_dim, rank).
+                    lora_layers.insert(
+                        (layer_idx, "in_proj_qkv".to_string()),
+                        LoraLayer {
+                            a: lp.a_qkv.clone(),
+                            b: lp.b_qkv.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.qkv_dim,
+                            rank,
+                        },
+                    );
+                    // in_proj_z: A=(rank, hidden), B=(output_dim, rank).
+                    lora_layers.insert(
+                        (layer_idx, "in_proj_z".to_string()),
+                        LoraLayer {
+                            a: lp.a_z.clone(),
+                            b: lp.b_z.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.output_dim,
+                            rank,
+                        },
+                    );
+                    // in_proj_b (beta): A=(rank, hidden), B=(num_kh, rank).
+                    lora_layers.insert(
+                        (layer_idx, "in_proj_b".to_string()),
+                        LoraLayer {
+                            a: lp.a_b.clone(),
+                            b: lp.b_b.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.num_kh,
+                            rank,
+                        },
+                    );
+                    // in_proj_a (alpha): A=(rank, hidden), B=(num_kh, rank).
+                    lora_layers.insert(
+                        (layer_idx, "in_proj_a".to_string()),
+                        LoraLayer {
+                            a: lp.a_a.clone(),
+                            b: lp.b_a.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.num_kh,
+                            rank,
+                        },
+                    );
+                    // out_proj: A=(rank, output_dim), B=(hidden, rank).
+                    lora_layers.insert(
+                        (layer_idx, "out_proj".to_string()),
+                        LoraLayer {
+                            a: lp.a_out.clone(),
+                            b: lp.b_out.clone(),
+                            d_in: gdn_dims.output_dim,
+                            d_out: dims.hidden,
+                            rank,
+                        },
+                    );
+                }
+            }
+        }
+        // target_modules lists only the module names actually present in this run,
+        // so a pure-GQA, pure-GDN, or mixed adapter each declares the right set.
+        let mut target_modules: Vec<String> = Vec::new();
+        if slot_kinds.iter().any(|k| matches!(k, MixerKind::Gqa)) {
+            target_modules.push("q_proj".to_string());
+            target_modules.push("v_proj".to_string());
+        }
+        if slot_kinds.iter().any(|k| matches!(k, MixerKind::Gdn)) {
+            target_modules.push("in_proj_qkv".to_string());
+            target_modules.push("in_proj_z".to_string());
+            target_modules.push("in_proj_b".to_string());
+            target_modules.push("in_proj_a".to_string());
+            target_modules.push("out_proj".to_string());
         }
         let adapter = LoraAdapter::new(
             LoraConfig {
                 rank,
                 alpha,
-                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+                target_modules,
             },
             lora_layers,
         );
