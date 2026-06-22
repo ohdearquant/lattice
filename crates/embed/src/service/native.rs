@@ -152,6 +152,19 @@ impl NativeEmbeddingService {
             .unwrap_or(0)
     }
 
+    /// **Unstable**: download and load the model without producing any embeddings.
+    ///
+    /// Performs the same download + checksum-verify + model-load sequence as the
+    /// first call to `embed`, then returns `Ok(())` without running an encode pass.
+    /// Intended for use by the `--download-only` CLI flag so that the model is
+    /// warmed into the file-system cache without wasting a forward pass.
+    ///
+    /// Errors are the same as those from `embed`: network failures, checksum
+    /// mismatches, and unsupported model variants surface as `EmbedError`.
+    pub async fn ensure_loaded(&self) -> Result<()> {
+        self.ensure_model().await.map(|_| ())
+    }
+
     /// Ensure the model is loaded (cancellation-safe).
     ///
     /// Uses `std::sync::OnceLock` so the model loading runs to completion
