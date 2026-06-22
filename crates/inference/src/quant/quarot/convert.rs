@@ -83,7 +83,20 @@ pub struct ConversionReport {
     /// Tensors written as `.f16` (norms, biases, conv1d, `A_log`,
     /// `dt_bias`, etc.).
     pub kept_f16: usize,
-    /// Sum of input tensor sizes in bytes (8 × element count, f64).
+    /// Sum of on-disk byte sizes of the language-model tensors the pipeline
+    /// reads from the source checkpoint.
+    ///
+    /// Includes: every tensor in `required_names` (the language-model
+    /// subset, with `embed_tokens` counted once), plus the on-disk spans of
+    /// the MTP tensors that `write_mtp_weights_quarot` copies to the output
+    /// as `.f16` files (these are not in `required_names`). `embed_tokens`
+    /// is NOT double-counted for the tied lm_head: the output's
+    /// `lm_head_weight.q4` is a second Q4 copy of that one source tensor,
+    /// already accounted here.
+    ///
+    /// Note: the full multimodal file is ~1627 MiB for Qwen3.5-0.8B; this
+    /// field counts only the processed language-model subset (the vision
+    /// tower is not read), so it is smaller than the physical file footprint.
     pub total_bytes_in: u64,
     /// Sum of output tensor sizes in bytes (Q4 blocks + f16 payload +
     /// per-file headers).
@@ -283,11 +296,56 @@ pub fn convert_quarot_qwen35(
 
     let reader = QuarotTensorReader::open(input_dir)?;
     let required_names = qwen_required_tensor_names(&cfg);
-    let mut working_set = load_tensors_f64(&reader, &required_names)?;
-    let total_bytes_in: u64 = working_set
-        .values()
-        .map(|t| (t.data.len() as u64).saturating_mul(8))
+    // Measure the on-disk footprint of the language-model tensors the pipeline
+    // reads and writes, using SafeTensors header byte spans
+    // (`bytes_in = h.end - h.start`).  Same approach as `bin/quantize_q4`.  For a
+    // bf16 checkpoint each element is 2 bytes on disk, so this is far smaller
+    // than the 8-byte-per-element f64 working-copy size.
+    //
+    // This is the processed LM subset, intentionally SMALLER than the full
+    // multimodal checkpoint on disk: QuaRot does not read or rewrite the vision
+    // tower, so it is excluded from both the input and output bases (symmetric).
+    //
+    // `embed_tokens` is counted exactly ONCE (its real on-disk footprint).  When
+    // `tie_word_embeddings` is true the output un-ties and writes TWO Q4 tensors
+    // derived from it (`embed_tokens.q4` plus a materialized `lm_head_weight.q4`),
+    // but both are copies of the single embed tensor already counted here, so the
+    // lm_head is accounted on the input side.  Counting embed twice would make
+    // the reported input exceed the physical model file.
+    let mut total_bytes_in: u64 = required_names
+        .iter()
+        .map(|name| reader.tensor_byte_len(name))
+        .collect::<Result<Vec<u64>, _>>()?
+        .into_iter()
         .sum();
+    // MTP tensors ARE a genuine adjustment: `write_mtp_weights_quarot` copies
+    // them to output (kept as f16) but they are not in `required_names`, so add
+    // their on-disk spans once to keep the input and output bases symmetric.
+    if cfg.mtp_num_hidden_layers > 0 {
+        let mtp_names = [
+            "mtp.fc.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+        for name in &mtp_names {
+            if reader.has_tensor(name) {
+                total_bytes_in += reader.tensor_byte_len(name)?;
+            }
+        }
+    }
+    let mut working_set = load_tensors_f64(&reader, &required_names)?;
 
     let was_tied = cfg.tie_word_embeddings;
     if was_tied {
