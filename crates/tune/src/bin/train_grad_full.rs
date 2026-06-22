@@ -685,6 +685,18 @@ fn nll_and_grads(
                     b_q: g.grad_b_q,
                     a_v: g.grad_a_v,
                     b_v: g.grad_b_v,
+                    // GQA layer has no GDN LoRA factors → empty gradient (mirrors the
+                    // GDN branch, which leaves the GQA fields empty).
+                    a_qkv: Vec::new(),
+                    b_qkv: Vec::new(),
+                    a_z: Vec::new(),
+                    b_z: Vec::new(),
+                    a_b: Vec::new(),
+                    b_b: Vec::new(),
+                    a_a: Vec::new(),
+                    b_a: Vec::new(),
+                    a_out: Vec::new(),
+                    b_out: Vec::new(),
                 };
                 g.dx
             }
