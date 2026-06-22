@@ -549,6 +549,23 @@ impl QuarotTensorReader {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
     }
 
+    /// On-disk byte length of a named tensor (`end - start` from the
+    /// SafeTensors header). Use this to measure the real source footprint
+    /// — e.g. for bf16 weights each element occupies 2 bytes, not 8.
+    ///
+    /// Matches the pattern used by `bin/quantize_q4`:
+    /// ```ignore
+    /// let bytes_in = (h.end - h.start) as u64;
+    /// ```
+    pub fn tensor_byte_len(&self, name: &str) -> Result<u64, InferenceError> {
+        let shard = self.shard_for(name)?;
+        shard
+            .headers
+            .get(name)
+            .map(|h| (h.end - h.start) as u64)
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+    }
+
     /// Read a tensor and convert to a fresh `Vec<f64>`, returned alongside
     /// the shape. Element order is row-major (the on-disk safetensors
     /// convention).
