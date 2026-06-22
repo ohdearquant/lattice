@@ -172,12 +172,12 @@ fn print_report(report: &ConversionReport, elapsed_secs: f64) {
     eprintln!("Quantized (Q4_0):  {}", report.planned_quantized);
     eprintln!("Kept (F16):        {}", report.kept_f16);
     eprintln!(
-        "Input bytes:       {:.2} MB",
-        report.total_bytes_in as f64 / 1_048_576.0
+        "Input bytes:       {:.2} GB",
+        report.total_bytes_in as f64 / 1_073_741_824.0
     );
     eprintln!(
-        "Output bytes:      {:.2} MB",
-        report.total_bytes_out as f64 / 1_048_576.0
+        "Output bytes:      {:.2} GB",
+        report.total_bytes_out as f64 / 1_073_741_824.0
     );
     if report.total_bytes_in > 0 {
         if report.total_bytes_out == 0 {

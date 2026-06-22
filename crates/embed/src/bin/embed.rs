@@ -34,6 +34,8 @@ options:
                    Also accepts HuggingFace IDs like BAAI/bge-small-en-v1.5.
   --text <TEXT>    Text to embed. Repeat for multiple texts.
   --json           Emit a structured @@lattice {\"ev\":\"embed_done\",...} line to stdout.
+  --download-only  Ensure the model is downloaded and loadable, then exit (no --text needed).
+                   Emits @@lattice {\"ev\":\"download_done\",\"ok\":bool} with --json.
   -h, --help       Print this help and exit.
 ";
 
@@ -44,6 +46,7 @@ async fn main() -> ExitCode {
     let mut model_name: Option<String> = None;
     let mut texts: Vec<String> = Vec::new();
     let mut emit_json: bool = false;
+    let mut download_only: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -65,6 +68,9 @@ async fn main() -> ExitCode {
             "--json" => {
                 emit_json = true;
             }
+            "--download-only" => {
+                download_only = true;
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -74,7 +80,7 @@ async fn main() -> ExitCode {
         i += 1;
     }
 
-    if texts.is_empty() {
+    if !download_only && texts.is_empty() {
         return usage("at least one --text argument is required");
     }
 
@@ -96,7 +102,40 @@ async fn main() -> ExitCode {
     eprintln!();
     eprintln!("Generating embeddings (model loads on first call — may download ~130 MB)...");
 
-    let service = NativeEmbeddingService::default();
+    let service = NativeEmbeddingService::with_model(model);
+
+    // --download-only: ensure the model is present (downloading + checksum-verifying if
+    // needed) and loadable, then exit. A single warmup embedding forces the lazy
+    // ensure_model_files + model load without printing the similarity report.
+    if download_only {
+        match service.embed(&["warmup".to_string()], model).await {
+            Ok(_) => {
+                eprintln!("Model {model} is downloaded and ready.");
+                if emit_json {
+                    let obj = serde_json::json!({
+                        "ev": "download_done",
+                        "model": model.to_string(),
+                        "ok": true,
+                    });
+                    println!("@@lattice {obj}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                eprintln!("ERROR: model download/load failed: {err}");
+                if emit_json {
+                    let obj = serde_json::json!({
+                        "ev": "download_done",
+                        "model": model.to_string(),
+                        "ok": false,
+                        "error": err.to_string(),
+                    });
+                    println!("@@lattice {obj}");
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     let t0 = Instant::now();
     let embeddings = match service.embed(&texts, model).await {

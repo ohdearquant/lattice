@@ -71,6 +71,11 @@ fn main() {
 
     let temperature: Option<f32> = parse_arg(&args, "--temperature").and_then(|s| s.parse().ok());
 
+    let top_k: Option<usize> = parse_arg(&args, "--top-k").and_then(|s| s.parse().ok());
+    let top_p: Option<f32> = parse_arg(&args, "--top-p").and_then(|s| s.parse().ok());
+    let repetition_penalty: Option<f32> =
+        parse_arg(&args, "--repetition-penalty").and_then(|s| s.parse().ok());
+
     let lora_path: Option<PathBuf> = parse_arg(&args, "--lora").map(PathBuf::from);
 
     let emit_json = parse_flag(&args, "--json");
@@ -139,11 +144,25 @@ fn main() {
     if let Some(t) = temperature {
         gen_cfg.temperature = t;
     }
+    if let Some(k) = top_k {
+        gen_cfg.top_k = k;
+    }
+    if let Some(p) = top_p {
+        gen_cfg.top_p = p;
+    }
+    if let Some(r) = repetition_penalty {
+        gen_cfg.repetition_penalty = r;
+    }
 
     println!("\nPrompt: {prompt}");
     println!(
-        "Config: temp={}, top_k={}, seed={:?}, max_tokens={}",
-        gen_cfg.temperature, gen_cfg.top_k, gen_cfg.seed, max_tokens
+        "Config: temp={}, top_k={}, top_p={}, rep_penalty={}, seed={:?}, max_tokens={}",
+        gen_cfg.temperature,
+        gen_cfg.top_k,
+        gen_cfg.top_p,
+        gen_cfg.repetition_penalty,
+        gen_cfg.seed,
+        max_tokens
     );
     println!("Generating...\n");
 
