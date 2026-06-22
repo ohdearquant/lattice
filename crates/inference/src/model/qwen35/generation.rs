@@ -1,5 +1,5 @@
 use super::cache::{ForwardScratch, KvCache};
-use super::detokenize::decode_tokens;
+use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use crate::attention::gdn::GatedDeltaNetState;
@@ -80,6 +80,132 @@ impl Qwen35Model {
 
         Ok(GenerateOutput {
             text,
+            token_ids: generated_ids.clone(),
+            prompt_tokens: prompt_len,
+            generated_tokens: generated_ids.len(),
+        })
+    }
+
+    /// Streaming variant of [`generate`] — identical token sequence, but invokes
+    /// `on_token` with incremental text deltas after each generated token.
+    ///
+    /// # Parity safety
+    ///
+    /// The body below is a deliberate copy of `generate` rather than a refactor of
+    /// the shared path. This ensures that no change here can silently alter the
+    /// non-streaming `generate` path, which is pinned by the e2e-parity CI gate
+    /// (greedy token match vs HF transformers). `on_token` is the only addition.
+    pub fn generate_streaming(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<GenerateOutput, InferenceError> {
+        let cfg = &self.config;
+
+        let mut rng_state = initial_rng_state(gen_cfg.seed);
+
+        let input = self.tokenizer.tokenize(prompt);
+        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+        let prompt_len = prompt_ids.len();
+
+        if prompt_len == 0 {
+            return Err(InferenceError::Inference("empty prompt".into()));
+        }
+
+        let num_linear = cfg.num_linear_attention_layers();
+        let num_full = cfg.num_full_attention_layers();
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(num_full);
+        let mut scratch = ForwardScratch::new();
+
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+        let mut all_ids = prompt_ids.clone();
+
+        prefill_tokens(
+            self,
+            &prompt_ids,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+        );
+        kv_cache.seq_len = prompt_len;
+
+        let next_id = sample_token(
+            &scratch.logits[..cfg.vocab_size],
+            gen_cfg,
+            &all_ids,
+            &mut rng_state,
+        );
+
+        if should_stop_token(cfg, gen_cfg, next_id) {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+            });
+        }
+
+        generated_ids.push(next_id);
+        all_ids.push(next_id);
+
+        // Incremental detokenization: emit only complete-UTF-8 text deltas. A
+        // byte-level BPE codepoint can span several tokens, so we buffer raw bytes
+        // and never stream a partial codepoint (see IncrementalDetokenizer).
+        let mut detok = IncrementalDetokenizer::new();
+        let delta = detok.push(&self.tokenizer, next_id);
+        if !delta.is_empty() {
+            on_token(&delta);
+        }
+
+        // Decode loop (mirrors decode_loop free function exactly).
+        for _ in 1..gen_cfg.max_new_tokens {
+            let pos = kv_cache.seq_len;
+            let last_token = *all_ids
+                .last()
+                .expect("invariant: prompt or prior generation seeded all_ids");
+
+            self.forward_step(
+                last_token,
+                pos,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            kv_cache.seq_len += 1;
+
+            let next_id = sample_token(
+                &scratch.logits[..cfg.vocab_size],
+                gen_cfg,
+                &all_ids,
+                &mut rng_state,
+            );
+
+            if should_stop_token(cfg, gen_cfg, next_id) {
+                break;
+            }
+
+            generated_ids.push(next_id);
+            all_ids.push(next_id);
+
+            let delta = detok.push(&self.tokenizer, next_id);
+            if !delta.is_empty() {
+                on_token(&delta);
+            }
+        }
+
+        // Flush any trailing incomplete bytes (generation truncated mid-codepoint)
+        // so the streamed deltas concatenate to exactly the returned text.
+        let tail = detok.finish();
+        if !tail.is_empty() {
+            on_token(&tail);
+        }
+
+        Ok(GenerateOutput {
+            text: detok.text(),
             token_ids: generated_ids.clone(),
             prompt_tokens: prompt_len,
             generated_tokens: generated_ids.len(),
