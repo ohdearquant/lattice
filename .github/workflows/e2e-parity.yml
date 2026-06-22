@@ -2,18 +2,18 @@ name: e2e-parity
 # Replaces bench-regression (ADR-058 revision): live HF-vs-lattice parity on
 # the same runner. Reference runs first (warms the machine), lattice second.
 # Gates on greedy token agreement, reports speed informationally.
+#
+# Required-check shape: the workflow ALWAYS triggers (no `paths:` filter on the
+# PR event), but the expensive macOS `parity` job only runs when engine files
+# actually change. A cheap always-running `parity-gate` job is the *required*
+# status context — it passes when there is nothing to check and mirrors the
+# parity result when there is. This avoids the classic trap where a required
+# check is path-filtered, never reports on unrelated PRs, and wedges them on
+# "Expected — waiting for status to be reported".
 
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'crates/inference/src/**'
-      - 'crates/embed/src/**'
-      - 'crates/inference/Cargo.toml'
-      - 'crates/embed/Cargo.toml'
-      - 'Cargo.lock'
-      - 'scripts/e2e_parity_check.py'
-      - '.github/workflows/e2e-parity.yml'
   push:
     branches: [main]
     paths:
@@ -32,8 +32,41 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
+  # Decide whether the engine surface changed. Output drives both the expensive
+  # parity job and the required gate below.
+  changes:
+    name: detect-engine-changes
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.filter.outputs.engine }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
+            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+              || git diff --name-only "HEAD~1...HEAD")
+          else
+            CHANGED=$(git diff --name-only "HEAD~1...HEAD" 2>/dev/null || true)
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$'; then
+            echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "→ engine surface changed: parity REQUIRED"
+          else
+            echo "engine=false" >> "$GITHUB_OUTPUT"
+            echo "→ no engine change: parity not required"
+          fi
+
   parity:
     name: e2e parity
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -101,3 +134,33 @@ jobs:
         with:
           header: e2e-parity
           path: parity-report.md
+
+  # REQUIRED status check. Always runs, always reports. Passes when the engine
+  # did not change (nothing to verify); mirrors the parity job's verdict when it
+  # did. Fails closed if change-detection itself errored.
+  parity-gate:
+    name: parity-gate
+    needs: [changes, parity]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve gate
+        run: |
+          CHANGES_RESULT="${{ needs.changes.result }}"
+          ENGINE="${{ needs.changes.outputs.engine }}"
+          PARITY_RESULT="${{ needs.parity.result }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::change-detection did not succeed — failing closed."
+            exit 1
+          fi
+          if [ "$ENGINE" != "true" ]; then
+            echo "No engine change — parity not required. PASS."
+            exit 0
+          fi
+          if [ "$PARITY_RESULT" = "success" ]; then
+            echo "Engine changed and parity PASSED."
+            exit 0
+          fi
+          echo "::error::Engine changed and parity did not succeed (result=$PARITY_RESULT)."
+          exit 1

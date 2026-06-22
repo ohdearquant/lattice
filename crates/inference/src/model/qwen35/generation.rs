@@ -113,6 +113,17 @@ impl Qwen35Model {
             return Err(InferenceError::Inference("empty prompt".into()));
         }
 
+        // max_new_tokens == 0 means "generate nothing": return before sampling so
+        // we never emit a token the caller did not ask for.
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+            });
+        }
+
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
@@ -164,9 +175,9 @@ impl Qwen35Model {
         // Decode loop (mirrors decode_loop free function exactly).
         for _ in 1..gen_cfg.max_new_tokens {
             let pos = kv_cache.seq_len;
-            let last_token = *all_ids
-                .last()
-                .expect("invariant: prompt or prior generation seeded all_ids");
+            let Some(&last_token) = all_ids.last() else {
+                return Err(InferenceError::Inference("empty generation state".into()));
+            };
 
             self.forward_step(
                 last_token,
