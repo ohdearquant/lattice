@@ -35,6 +35,7 @@ mod inner {
         conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm, simd_l2_normalize,
         simd_matvec_transpose,
     };
+    use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
     use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
     use crate::sampling::CandidateSet;
@@ -11149,22 +11150,28 @@ kernel void moe_shared_gate_add(
                 };
             }
 
+            // Incremental detokenization: stream only complete-UTF-8 deltas. A
+            // byte-level BPE codepoint (CJK/emoji) can span several tokens, so
+            // per-token lossy decode would emit U+FFFD mojibake the caller cannot
+            // retract. Mirrors the non-Metal path (model::qwen35::generation).
+            let mut detok = IncrementalDetokenizer::new();
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            let token_text = decode_tokens(tokenizer, &[next_id]);
-            if !on_token(&token_text, next_id) {
+            let mut last_pushed_id = next_id;
+            let delta = detok.push(tokenizer, next_id);
+            if !delta.is_empty() && !on_token(&delta, next_id) {
                 if use_compact {
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                let text = decode_tokens(tokenizer, &generated_ids);
                 return GenerateOutput {
-                    text,
+                    text: detok.text(),
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                 };
             }
+            let mut stopped_by_caller = false;
 
             // Autoregressive decode with streaming
             for _ in 1..gen_cfg.max_new_tokens {
@@ -11206,8 +11213,10 @@ kernel void moe_shared_gate_add(
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
-                let token_text = decode_tokens(tokenizer, &[next_id]);
-                if !on_token(&token_text, next_id) {
+                last_pushed_id = next_id;
+                let delta = detok.push(tokenizer, next_id);
+                if !delta.is_empty() && !on_token(&delta, next_id) {
+                    stopped_by_caller = true;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -11220,7 +11229,16 @@ kernel void moe_shared_gate_add(
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
             }
 
-            let text = decode_tokens(tokenizer, &generated_ids);
+            // Flush trailing incomplete bytes (generation truncated mid-codepoint)
+            // so streamed deltas concatenate to exactly the returned text. Skip when
+            // the caller asked to stop — it is no longer consuming the stream.
+            if !stopped_by_caller {
+                let tail = detok.finish();
+                if !tail.is_empty() {
+                    on_token(&tail, last_pushed_id);
+                }
+            }
+            let text = detok.text();
             GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
