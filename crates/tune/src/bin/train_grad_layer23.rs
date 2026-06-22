@@ -18,7 +18,7 @@
 // every base weight is frozen; only the four LoRA factors move.
 //
 // Qwen3.5 RMSNorm is SHIFTED (x·inv·(1+gamma)); rms_norm_forward/rmsnorm_backward
-// use plain gamma, so the layer/final norms get (1+gamma) precomputed weights.
+// apply (1+gamma) internally, so the layer/final norm fields carry raw gamma.
 // q_norm/k_norm are shifted inside gqa_forward_with_cache, so they stay raw.
 //
 // Usage: train_grad_layer23 --model-dir <path> --data-dir <path> [--steps 25]
@@ -140,8 +140,9 @@ struct L23Cache {
     seq_len: usize,
 }
 
-/// Borrowed frozen weights for layer 23 + head. Norm `*_shift` fields are the
-/// `(1 + gamma)` shifted layer norms; `q_norm`/`k_norm` are raw (gqa shifts).
+/// Borrowed frozen weights for layer 23 + head. Norm `pre_norm`/`post_norm`/
+/// `final_norm` fields carry raw gamma; rms_norm_forward/rmsnorm_backward apply
+/// (1+gamma) internally. `q_norm`/`k_norm` are raw (gqa shifts internally).
 struct L23Weights<'a> {
     w_q: &'a [f32],
     w_k: &'a [f32],
@@ -153,9 +154,9 @@ struct L23Weights<'a> {
     w_up: &'a [f32],
     w_down: &'a [f32],
     lm_head: &'a [f32],
-    pre_shift: &'a [f32],
-    post_shift: &'a [f32],
-    final_shift: &'a [f32],
+    pre_norm: &'a [f32],
+    post_norm: &'a [f32],
+    final_norm: &'a [f32],
 }
 
 struct Lora<'a> {
@@ -221,7 +222,7 @@ fn forward_layer23(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> L
     let mut normed_pre_attn = vec![0.0f32; seq_len * h];
     for t in 0..seq_len {
         let x_t = &cache.h_in[t * h..(t + 1) * h];
-        let (n, _inv) = rms_norm_forward(x_t, w.pre_shift, d.eps);
+        let (n, _inv) = rms_norm_forward(x_t, w.pre_norm, d.eps);
         normed_pre_attn[t * h..(t + 1) * h].copy_from_slice(&n);
     }
 
@@ -261,7 +262,7 @@ fn forward_layer23(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> L
     let mut positions = Vec::new();
     for t in (cache.completion_start - 1)..seq_len - 1 {
         let h_mid_t = &post_attn[t * h..(t + 1) * h];
-        let (normed_ffn, inv_ffn) = rms_norm_forward(h_mid_t, w.post_shift, d.eps);
+        let (normed_ffn, inv_ffn) = rms_norm_forward(h_mid_t, w.post_norm, d.eps);
         let (ffn_out, gate_pre, up_pre) =
             swiglu_forward(&normed_ffn, w.w_gate, w.w_up, w.w_down, h, d.inter);
 
@@ -269,7 +270,7 @@ fn forward_layer23(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> L
         for (o, f) in h_out.iter_mut().zip(ffn_out.iter()) {
             *o += *f;
         }
-        let (final_normed, inv_final) = rms_norm_forward(&h_out, w.final_shift, d.eps);
+        let (final_normed, inv_final) = rms_norm_forward(&h_out, w.final_norm, d.eps);
         let logits = lm_head_logits(w.lm_head, &final_normed, h, d.vocab);
 
         positions.push(PosFwd {
@@ -341,7 +342,7 @@ fn nll_and_grads(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> (f3
         }
         // lm_head VJP → final_norm backward → into the residual at position t.
         let d_final = linear_vjp(w.lm_head, &d_logits, h, d.vocab);
-        let d_h_out = rmsnorm_backward(&p.post_ffn, w.final_shift, p.inv_final, &d_final);
+        let d_h_out = rmsnorm_backward(&p.post_ffn, w.final_norm, p.inv_final, &d_final);
         d_post_ffn[p.t * h..(p.t + 1) * h].copy_from_slice(&d_h_out);
     }
 
@@ -359,7 +360,7 @@ fn nll_and_grads(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> (f3
             h,
             d.inter,
         );
-        let d_h_mid = rmsnorm_backward(&p.post_attn, w.post_shift, p.inv_ffn, &d_normed_ffn);
+        let d_h_mid = rmsnorm_backward(&p.post_attn, w.post_norm, p.inv_ffn, &d_normed_ffn);
         for (j, dv) in d_h_mid.iter().enumerate() {
             d_attn_out[p.t * h + j] += *dv;
         }
@@ -393,10 +394,6 @@ fn nll_and_grads(cache: &L23Cache, w: &L23Weights, lora: &Lora, d: &Dims) -> (f3
             b_v: g.grad_b_v,
         },
     )
-}
-
-fn shifted(gamma: &[f32]) -> Vec<f32> {
-    gamma.iter().map(|g| 1.0 + g).collect()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -468,7 +465,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (lm_head_s, final_norm_s, _embed) = model.head_weights();
     let lm_head = lm_head_s.to_vec();
-    let final_shift = shifted(final_norm_s);
+    let final_norm = final_norm_s.to_vec(); // raw gamma; rms_norm_forward applies (1+gamma)
 
     let (w_q, w_k, w_v, w_o, q_norm, k_norm, pre_attn_norm, post_attn_norm, w_gate, w_up, w_down) =
         model
@@ -477,8 +474,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (w_q, w_k, w_v, w_o) = (w_q.to_vec(), w_k.to_vec(), w_v.to_vec(), w_o.to_vec());
     let (q_norm, k_norm) = (q_norm.to_vec(), k_norm.to_vec());
     let (w_gate, w_up, w_down) = (w_gate.to_vec(), w_up.to_vec(), w_down.to_vec());
-    let pre_shift = shifted(pre_attn_norm);
-    let post_shift = shifted(post_attn_norm);
+    let pre_norm = pre_attn_norm.to_vec(); // raw gamma
+    let post_norm = post_attn_norm.to_vec(); // raw gamma
 
     let weights = L23Weights {
         w_q: &w_q,
@@ -491,9 +488,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         w_up: &w_up,
         w_down: &w_down,
         lm_head: &lm_head,
-        pre_shift: &pre_shift,
-        post_shift: &post_shift,
-        final_shift: &final_shift,
+        pre_norm: &pre_norm,
+        post_norm: &post_norm,
+        final_norm: &final_norm,
     };
 
     let tokenizer = model.tokenizer().clone();

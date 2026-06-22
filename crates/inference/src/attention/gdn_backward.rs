@@ -1,9 +1,10 @@
 //! Reverse-mode backward (VJP) for a single GatedDeltaNet token sequence.
 //!
 //! Scope: computes grad_input (d_loss/d_input for each token) for a sequence
-//! processed through one GDN layer.  Parameter (weight) gradients are out of
-//! scope here — only input-gradients are needed for LoRA gradient flow through
-//! the 18 frozen GDN layers to reach lower GQA layers.
+//! processed through one GDN layer, AND (when LoRA is present) the LoRA weight
+//! gradients for each of the 5 GDN projections (qkv, z, b/beta, a/alpha, out).
+//! This is "surface-B" LoRA: mirrors the GQA surface-A implementation in
+//! backward/attention_gqa.rs, using the same lora_vjp primitive from ops.rs.
 //!
 //! # Forward recap (matches `gdn_fused.rs` hot path)
 //!
@@ -65,7 +66,33 @@
 //! eliminate catastrophic cancellation at eps = 1e-3.
 
 use crate::attention::gdn::{sigmoid, softplus};
+use crate::backward::ops::lora_vjp;
 use crate::model::qwen35_config::Qwen35Config;
+
+/// Gradients of the GDN layer w.r.t. LoRA params for all 5 projections.
+///
+/// Naming and layout mirror AttnGrads in backward/attention_gqa.rs.
+/// grad_a_* shape: [rank * d_in], grad_b_* shape: [d_out * rank].
+/// Fields are zero-length Vec when LoRA is absent (no-LoRA forward).
+pub struct GdnGrads {
+    /// in_proj_qkv LoRA: d_in=hidden, d_out=qkv_dim
+    pub grad_a_qkv: Vec<f32>,
+    pub grad_b_qkv: Vec<f32>,
+    /// in_proj_z LoRA: d_in=hidden, d_out=output_dim
+    pub grad_a_z: Vec<f32>,
+    pub grad_b_z: Vec<f32>,
+    /// in_proj_b (beta sigmoid) LoRA: d_in=hidden, d_out=num_kh
+    pub grad_a_b: Vec<f32>,
+    pub grad_b_b: Vec<f32>,
+    /// in_proj_a (alpha decay) LoRA: d_in=hidden, d_out=num_kh
+    pub grad_a_a: Vec<f32>,
+    pub grad_b_a: Vec<f32>,
+    /// out_proj LoRA: d_in=output_dim, d_out=hidden
+    pub grad_a_out: Vec<f32>,
+    pub grad_b_out: Vec<f32>,
+    /// Input gradient (always present): [seq_len, hidden_size]
+    pub dx: Vec<f32>,
+}
 
 /// Saved activations for one forward pass over a sequence.
 ///
@@ -140,6 +167,52 @@ pub struct GdnSaved {
     /// SiLU(z) per value-head: [seq_len, value_heads, value_dim]
     /// Stored because backward through gated_rms_norm needs it.
     pub silu_z: Vec<f32>,
+
+    // ---- LoRA caches (populated only when LoRA is present) ----
+    // h_* = A_proj @ x for each projection; shape [seq_len * lora_rank].
+    // Empty when LoRA absent.
+    /// LoRA rank used (0 = no LoRA)
+    pub lora_rank: usize,
+    /// LoRA scale factor
+    pub lora_scale: f32,
+
+    /// h_qkv = A_qkv @ x: [seq_len, lora_rank]
+    pub h_qkv: Vec<f32>,
+    /// h_z = A_z @ x: [seq_len, lora_rank]
+    pub h_z: Vec<f32>,
+    /// h_b = A_b @ x: [seq_len, lora_rank]  (beta sigmoid projection)
+    pub h_b: Vec<f32>,
+    /// h_a = A_a @ x: [seq_len, lora_rank]  (alpha decay projection)
+    pub h_a: Vec<f32>,
+    /// h_out = A_out @ gated_buf: [seq_len, lora_rank]  (output projection input)
+    pub h_out: Vec<f32>,
+    /// gated_buf (input to out_proj + LoRA_out): [seq_len, output_dim]
+    /// Needed for the out_proj LoRA backward (x side of that linear).
+    pub gated_buf: Vec<f32>,
+
+    // ---- LoRA weight matrices (cloned from forward params for backward) ----
+    // Storing these avoids threading 10 extra args through gdn_backward.
+    // Empty Vec when LoRA absent.
+    /// A_qkv: [rank, hidden]
+    pub lora_a_qkv: Vec<f32>,
+    /// B_qkv: [qkv_dim, rank]
+    pub lora_b_qkv: Vec<f32>,
+    /// A_z: [rank, hidden]
+    pub lora_a_z: Vec<f32>,
+    /// B_z: [output_dim, rank]
+    pub lora_b_z: Vec<f32>,
+    /// A_b: [rank, hidden]
+    pub lora_a_b: Vec<f32>,
+    /// B_b: [num_kh, rank]
+    pub lora_b_b: Vec<f32>,
+    /// A_a: [rank, hidden]
+    pub lora_a_a: Vec<f32>,
+    /// B_a: [num_kh, rank]
+    pub lora_b_a: Vec<f32>,
+    /// A_out: [rank, output_dim]
+    pub lora_a_out: Vec<f32>,
+    /// B_out: [hidden, rank]
+    pub lora_b_out: Vec<f32>,
 }
 
 impl GdnSaved {
@@ -197,6 +270,26 @@ impl GdnSaved {
             o_heads: vec![0.0; seq_len * value_heads * value_dim],
             rms_vals: vec![0.0; seq_len * value_heads],
             silu_z: vec![0.0; seq_len * value_heads * value_dim],
+            // LoRA caches: start empty; populated in gdn_forward_save when LoRA present.
+            lora_rank: 0,
+            lora_scale: 0.0,
+            h_qkv: Vec::new(),
+            h_z: Vec::new(),
+            h_b: Vec::new(),
+            h_a: Vec::new(),
+            h_out: Vec::new(),
+            gated_buf: Vec::new(),
+            // LoRA weight matrices: start empty; cloned from params in gdn_forward_save.
+            lora_a_qkv: Vec::new(),
+            lora_b_qkv: Vec::new(),
+            lora_a_z: Vec::new(),
+            lora_b_z: Vec::new(),
+            lora_a_b: Vec::new(),
+            lora_b_b: Vec::new(),
+            lora_a_a: Vec::new(),
+            lora_b_a: Vec::new(),
+            lora_a_out: Vec::new(),
+            lora_b_out: Vec::new(),
         }
     }
 }
@@ -211,15 +304,37 @@ impl GdnSaved {
 /// `inputs`:      [seq_len, hidden_size]
 /// `weights`:     frozen GDN layer weights
 /// `cfg`:         model config
-/// `norm_weight`: gamma for gated RMSNorm [value_dim]
 /// `saved`:       output struct, must be pre-allocated via `GdnSaved::new`
 /// `outputs`:     [seq_len, hidden_size] — written in-place
+///
+/// Optional LoRA parameters for the 5 GDN projections (qkv, z, b, a, out).
+/// When all five pairs are `Some`, the forward adds `scale * (x @ A^T) @ B^T`
+/// to each projection output and caches `h = A @ x` for the backward.
+/// When any pair is `None`, the forward is byte-identical to the no-LoRA path.
+#[allow(clippy::too_many_arguments)]
 pub fn gdn_forward_save(
     inputs: &[f32],
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
     _cfg: &Qwen35Config,
     saved: &mut GdnSaved,
     outputs: &mut [f32],
+    // LoRA params for in_proj_qkv: a=[rank,hidden], b=[qkv_dim,rank]
+    lora_a_qkv: Option<&[f32]>,
+    lora_b_qkv: Option<&[f32]>,
+    // LoRA params for in_proj_z: a=[rank,hidden], b=[output_dim,rank]
+    lora_a_z: Option<&[f32]>,
+    lora_b_z: Option<&[f32]>,
+    // LoRA params for in_proj_b (beta): a=[rank,hidden], b=[num_kh,rank]
+    lora_a_b: Option<&[f32]>,
+    lora_b_b: Option<&[f32]>,
+    // LoRA params for in_proj_a (alpha): a=[rank,hidden], b=[num_kh,rank]
+    lora_a_a: Option<&[f32]>,
+    lora_b_a: Option<&[f32]>,
+    // LoRA params for out_proj: a=[rank,output_dim], b=[hidden,rank]
+    lora_a_out: Option<&[f32]>,
+    lora_b_out: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
 ) {
     use crate::forward::cpu::matmul_bt;
 
@@ -238,6 +353,67 @@ pub fn gdn_forward_save(
     let buf_len = kernel_size.saturating_sub(1);
     let q_total = num_kh * key_dim;
 
+    // Bind all ten LoRA slices at once.  If any pair is None or rank==0 the entire
+    // LoRA path is skipped and the forward is byte-identical to the no-LoRA path.
+    // Option<&[f32]> is Copy, so destructuring copies the refs — no heap allocation.
+    let lora_bound: Option<(
+        &[f32],
+        &[f32], // a_qkv, b_qkv
+        &[f32],
+        &[f32], // a_z,   b_z
+        &[f32],
+        &[f32], // a_b,   b_b
+        &[f32],
+        &[f32], // a_a,   b_a
+        &[f32],
+        &[f32], // a_out, b_out
+    )> = if lora_rank > 0 {
+        match (
+            lora_a_qkv, lora_b_qkv, lora_a_z, lora_b_z, lora_a_b, lora_b_b, lora_a_a, lora_b_a,
+            lora_a_out, lora_b_out,
+        ) {
+            (
+                Some(a_qkv),
+                Some(b_qkv),
+                Some(a_z),
+                Some(b_z),
+                Some(a_b),
+                Some(b_b),
+                Some(a_a),
+                Some(b_a),
+                Some(a_out),
+                Some(b_out),
+            ) => Some((a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Initialise LoRA cache buffers on the saved struct when LoRA is active.
+    // Also clone the weight matrices so gdn_backward doesn't need them threaded through.
+    if let Some((a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out)) = lora_bound {
+        saved.lora_rank = lora_rank;
+        saved.lora_scale = lora_scale;
+        saved.h_qkv = vec![0.0f32; seq_len * lora_rank];
+        saved.h_z = vec![0.0f32; seq_len * lora_rank];
+        saved.h_b = vec![0.0f32; seq_len * lora_rank];
+        saved.h_a = vec![0.0f32; seq_len * lora_rank];
+        saved.h_out = vec![0.0f32; seq_len * lora_rank];
+        saved.gated_buf = vec![0.0f32; seq_len * output_dim];
+        // Clone weight matrices for backward use.
+        saved.lora_a_qkv = a_qkv.to_vec();
+        saved.lora_b_qkv = b_qkv.to_vec();
+        saved.lora_a_z = a_z.to_vec();
+        saved.lora_b_z = b_z.to_vec();
+        saved.lora_a_b = a_b.to_vec();
+        saved.lora_b_b = b_b.to_vec();
+        saved.lora_a_a = a_a.to_vec();
+        saved.lora_b_a = b_a.to_vec();
+        saved.lora_a_out = a_out.to_vec();
+        saved.lora_b_out = b_out.to_vec();
+    }
+
     // Rolling conv buffer (shared across time, updated per step)
     let mut conv_buf_live = vec![0.0f32; qkv_dim * buf_len];
 
@@ -252,13 +428,103 @@ pub fn gdn_forward_save(
         let qkv_out = &mut saved.qkv_proj[t * qkv_dim..(t + 1) * qkv_dim];
         matmul_bt(x, &weights.in_proj_qkv, qkv_out, 1, hidden, qkv_dim);
 
+        // LoRA for in_proj_qkv: output += scale * (x @ A_qkv^T) @ B_qkv^T
+        // Cache h_qkv = A_qkv @ x for the backward.
+        if let Some((a_qkv, b_qkv, _, _, _, _, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_qkv[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_qkv[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let qkv_out = &mut saved.qkv_proj[t * qkv_dim..(t + 1) * qkv_dim];
+            for i in 0..qkv_dim {
+                let acc: f32 = lora_scale
+                    * b_qkv[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                qkv_out[i] += acc;
+            }
+        }
+
         let z_out = &mut saved.z_proj[t * output_dim..(t + 1) * output_dim];
         matmul_bt(x, &weights.in_proj_z, z_out, 1, hidden, output_dim);
 
+        // LoRA for in_proj_z
+        if let Some((_, _, a_z, b_z, _, _, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_z[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_z[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let z_out = &mut saved.z_proj[t * output_dim..(t + 1) * output_dim];
+            for i in 0..output_dim {
+                let acc: f32 = lora_scale
+                    * b_z[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                z_out[i] += acc;
+            }
+        }
+
         let beta_out = &mut saved.beta_raw[t * num_kh..(t + 1) * num_kh];
         matmul_bt(x, &weights.in_proj_b, beta_out, 1, hidden, num_kh);
+
+        // LoRA for in_proj_b (beta, pre-sigmoid linear output)
+        if let Some((_, _, _, _, a_b, b_b, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_b[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_b[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let beta_out = &mut saved.beta_raw[t * num_kh..(t + 1) * num_kh];
+            for i in 0..num_kh {
+                let acc: f32 = lora_scale
+                    * b_b[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                beta_out[i] += acc;
+            }
+        }
+
         let alpha_out = &mut saved.alpha_proj[t * num_kh..(t + 1) * num_kh];
         matmul_bt(x, &weights.in_proj_a, alpha_out, 1, hidden, num_kh);
+
+        // LoRA for in_proj_a (alpha, pre-softplus linear output)
+        if let Some((_, _, _, _, _, _, a_a, b_a, _, _)) = lora_bound {
+            let h = &mut saved.h_a[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_a[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let alpha_out = &mut saved.alpha_proj[t * num_kh..(t + 1) * num_kh];
+            for i in 0..num_kh {
+                let acc: f32 = lora_scale
+                    * b_a[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                alpha_out[i] += acc;
+            }
+        }
 
         // sigmoid(beta)
         for kh in 0..num_kh {
@@ -409,8 +675,37 @@ pub fn gdn_forward_save(
             }
         }
 
+        // Save gated_buf when LoRA is active (needed as the x-side input for out_proj LoRA backward).
+        if lora_bound.is_some() {
+            saved.gated_buf[t * output_dim..(t + 1) * output_dim].copy_from_slice(&gated_buf);
+        }
+
         let y_t = &mut outputs[t * hidden..(t + 1) * hidden];
         matmul_bt(&gated_buf, &weights.out_proj, y_t, 1, output_dim, hidden);
+
+        // LoRA for out_proj: y_t += scale * (gated_buf @ A_out^T) @ B_out^T
+        // out_proj is [hidden, output_dim], so d_out=hidden, d_in=output_dim.
+        // Cache h_out = A_out @ gated_buf for the backward.
+        if let Some((_, _, _, _, _, _, _, _, a_out, b_out)) = lora_bound {
+            let h_slot = &mut saved.h_out[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h_slot[r] = a_out[r * output_dim..(r + 1) * output_dim]
+                    .iter()
+                    .zip(gated_buf.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let y_t = &mut outputs[t * hidden..(t + 1) * hidden];
+            for i in 0..hidden {
+                let acc: f32 = lora_scale
+                    * b_out[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h_slot.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                y_t[i] += acc;
+            }
+        }
     }
 }
 
@@ -420,16 +715,19 @@ pub fn gdn_forward_save(
 
 /// VJP of the GDN sequence forward.
 ///
+/// Returns a `GdnGrads` containing the input gradient (dx, always populated)
+/// and — when the saved activations carry LoRA caches (i.e. `gdn_forward_save`
+/// was called with LoRA params) — the weight gradients for each of the 5
+/// projections. When LoRA is absent, the grad_a_*/grad_b_* Vecs are empty.
+///
 /// `grad_outputs`:  [seq_len, hidden_size] — upstream gradient of loss w.r.t. output
 /// `saved`:         activations from `gdn_forward_save`
 /// `weights`:       same frozen weights used in forward
-/// `grad_inputs`:   [seq_len, hidden_size] — output, grad of loss w.r.t. input
 pub fn gdn_backward(
     grad_outputs: &[f32],
     saved: &GdnSaved,
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
-    grad_inputs: &mut [f32],
-) {
+) -> GdnGrads {
     let seq_len = saved.seq_len;
     let hidden = saved.hidden_size;
     let num_kh = saved.num_key_heads;
@@ -445,7 +743,63 @@ pub fn gdn_backward(
     let q_total = num_kh * key_dim;
     let gamma = &weights.norm_weight[..value_dim];
 
-    grad_inputs.fill(0.0);
+    let have_lora = saved.lora_rank > 0 && !saved.h_qkv.is_empty();
+    let lora_rank = saved.lora_rank;
+    let lora_scale = saved.lora_scale;
+
+    // Allocate LoRA weight grad accumulators (empty when no LoRA).
+    let mut grad_a_qkv = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_qkv = if have_lora {
+        vec![0.0f32; qkv_dim * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_z = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_z = if have_lora {
+        vec![0.0f32; output_dim * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_b = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_b = if have_lora {
+        vec![0.0f32; num_kh * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_a = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_a = if have_lora {
+        vec![0.0f32; num_kh * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_out = if have_lora {
+        vec![0.0f32; lora_rank * output_dim]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_out = if have_lora {
+        vec![0.0f32; hidden * lora_rank]
+    } else {
+        Vec::new()
+    };
+
+    let mut grad_inputs = vec![0.0f32; seq_len * hidden];
 
     // Adjoint state dS: accumulated across timesteps, flows backward.
     // dS[h] is dL/d(S_t) for head h, updated as t decreases.
@@ -464,10 +818,17 @@ pub fn gdn_backward(
 
     for t in (0..seq_len).rev() {
         let dy = &grad_outputs[t * hidden..(t + 1) * hidden];
+        let x_t = &saved.inputs[t * hidden..(t + 1) * hidden];
 
         // ---- 1. Backward through out_proj: d_gated_buf = W_out^T @ dy ----
         // W_out is [hidden, output_dim].  out = gated_buf @ W_out^T means
         // d_gated_buf[j] = sum_i W_out[i,j] * dy[i]
+        //
+        // When LoRA is present: y_t = base_out + scale*(gated_buf@A_out^T)@B_out^T
+        // The upstream gradient dy is w.r.t. the total y_t.
+        // lora_vjp(dy, gated_buf_t, h_out_t, a_out, b_out, rank, output_dim, hidden, scale)
+        // returns (grad_b_out delta, grad_a_out delta, d_gated_buf_lora_delta).
+        // d_gated_buf = W_out^T dy  +  lora_vjp dx contribution (d_gated_buf from LoRA path).
         let mut d_gated_buf = vec![0.0f32; output_dim];
         for j in 0..output_dim {
             let mut acc = 0.0f64;
@@ -475,6 +836,35 @@ pub fn gdn_backward(
                 acc += weights.out_proj[i * output_dim + j] as f64 * dy[i] as f64;
             }
             d_gated_buf[j] = acc as f32;
+        }
+
+        // LoRA weight grads for out_proj + dx contribution to d_gated_buf.
+        // out_proj layout: [hidden, output_dim] → d_in=output_dim, d_out=hidden.
+        // lora_vjp(g=dy, x=gated_buf_t, h=h_out_t, a=lora_a_out, b=lora_b_out,
+        //          rank, d_in=output_dim, d_out=hidden, scale)
+        if have_lora {
+            let gated_buf_t = &saved.gated_buf[t * output_dim..(t + 1) * output_dim];
+            let h_out_t = &saved.h_out[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                dy,
+                gated_buf_t,
+                h_out_t,
+                &saved.lora_a_out,
+                &saved.lora_b_out,
+                lora_rank,
+                output_dim,
+                hidden,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_out[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_out[k] += gb[k];
+            }
+            for j in 0..output_dim {
+                d_gated_buf[j] += dx_lora[j];
+            }
         }
 
         // ---- 2. Backward through gated RMSNorm for each value-head ----
@@ -525,8 +915,13 @@ pub fn gdn_backward(
             }
         }
 
-        // ---- 3. Accumulate d_z_proj → d_x via W_z^T ----
-        // z_proj = W_z @ x,  d_x += W_z^T @ d_z_proj
+        // ---- 3. Accumulate d_z_proj → d_x via W_z^T, then LoRA weight grads ----
+        // z_proj = W_z @ x  (+LoRA when present),  d_x += W_z^T @ d_z_proj
+        //
+        // d_z_proj IS the pre-nonlinearity linear-projection-output gradient for z.
+        // (z goes through SiLU in the gated RMSNorm; d_z_proj is the gradient
+        // w.r.t. the linear output of in_proj_z, BEFORE SiLU — that is what step 2
+        // computes via the SiLU backward inside the RMSNorm loop.)
         let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
         for j in 0..output_dim {
             let dz_j = d_z_proj[j];
@@ -537,12 +932,42 @@ pub fn gdn_backward(
                 dx_t[i] += weights.in_proj_z[j * hidden + i] * dz_j;
             }
         }
+        // LoRA weight grads for in_proj_z.
+        // g = d_z_proj, x = x_t, h = h_z_t, d_in=hidden, d_out=output_dim
+        if have_lora {
+            let h_z_t = &saved.h_z[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_z_proj,
+                x_t,
+                h_z_t,
+                &saved.lora_a_z,
+                &saved.lora_b_z,
+                lora_rank,
+                hidden,
+                output_dim,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_z[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_z[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
 
         // ---- 4. Per value-head recurrence backward ----
         // We process heads in REVERSE order (arbitrary — no inter-head deps).
         // We work with the per-head adjoint dS[h] which carries across time.
 
         let mut d_conv_out = vec![0.0f32; qkv_dim];
+        // Per key-head accumulators for alpha and beta scalar grads (multiple
+        // value-heads share one key-head, so we must sum across value-heads first
+        // before applying lora_vjp to avoid double-counting the d_in/d_out shape).
+        let mut d_alpha_kh = vec![0.0f32; num_kh]; // d_loss / d(alpha_proj[t, kh])
+        let mut d_beta_raw_kh = vec![0.0f32; num_kh]; // d_loss / d(beta_raw[t, kh])
 
         for h in 0..value_heads {
             let kh = h / ratio;
@@ -709,19 +1134,78 @@ pub fn gdn_backward(
             let sig = sigmoid(beta_raw_h);
             let d_beta_raw_h = d_beta_h * sig * (1.0 - sig);
 
-            // ---- 4i. Accumulate scalar grads into per-head gradient arrays ----
-            // We accumulate per-head d_alpha and d_beta_raw into d_alpha_proj / d_beta_proj
-            // arrays.  Since multiple value-heads share the same key-head, we sum.
-            // We'll accumulate directly into d_x via W_a^T and W_b^T below.
-            // Store in temporary scalars indexed by kh (accumulate across h sharing kh).
-            // Use a local accumulator since the inner-most scope is per-h.
-            // We immediately push to d_x to avoid extra allocations.
-            let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
-            for i in 0..hidden {
-                dx_t[i] += weights.in_proj_a[kh * hidden + i] * d_alpha_from_g;
-                dx_t[i] += weights.in_proj_b[kh * hidden + i] * d_beta_raw_h;
-            }
+            // ---- 4i. Accumulate per key-head scalar grads ----
+            // Multiple value-heads share the same key-head; accumulate into kh slots.
+            // These will be fed to W_a^T/W_b^T and lora_vjp after this loop.
+            d_alpha_kh[kh] += d_alpha_from_g;
+            d_beta_raw_kh[kh] += d_beta_raw_h;
         } // end per-head loop
+
+        // ---- Apply per key-head alpha/beta grads → d_x and LoRA weight grads ----
+        // d_alpha_proj[t, kh] = d_alpha_kh[kh]  (scalar per head)
+        // d_beta_raw[t, kh]   = d_beta_raw_kh[kh]
+        //
+        // For lora_vjp on the beta and alpha projections, we need the full
+        // d_proj_output vector of shape [num_kh].  We built those above.
+        //
+        // g for in_proj_b  = d_beta_raw_kh   (pre-sigmoid linear-output gradient)
+        // g for in_proj_a  = d_alpha_kh      (pre-softplus linear-output gradient)
+        let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
+        for kh in 0..num_kh {
+            let d_a = d_alpha_kh[kh];
+            let d_b = d_beta_raw_kh[kh];
+            for i in 0..hidden {
+                dx_t[i] += weights.in_proj_a[kh * hidden + i] * d_a;
+                dx_t[i] += weights.in_proj_b[kh * hidden + i] * d_b;
+            }
+        }
+        // LoRA weight grads for in_proj_a and in_proj_b.
+        // g = d_alpha_kh (full [num_kh] vector), x = x_t, h_a_t, d_in=hidden, d_out=num_kh
+        if have_lora {
+            let h_b_t = &saved.h_b[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_beta_raw_kh,
+                x_t,
+                h_b_t,
+                &saved.lora_a_b,
+                &saved.lora_b_b,
+                lora_rank,
+                hidden,
+                num_kh,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_b[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_b[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+
+            let h_a_t = &saved.h_a[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_alpha_kh,
+                x_t,
+                h_a_t,
+                &saved.lora_a_a,
+                &saved.lora_b_a,
+                lora_rank,
+                hidden,
+                num_kh,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_a[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_a[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
 
         // ---- 5. Backward through conv1d + SiLU ----
         //
@@ -778,6 +1262,9 @@ pub fn gdn_backward(
         // d_qkv_proj_all[t] now contains the complete gradient for token t because:
         //   - future-timestep conv contributions were written when t' > t was processed
         //   - current-timestep conv contribution was written in step 5 above
+        //
+        // g for in_proj_qkv = d_qkv_proj_all[t]  (pre-conv-SiLU linear-output gradient
+        // summed over time, complete only after all future-t conv contributions land).
         let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
         for j in 0..qkv_dim {
             let dq = d_qkv_proj_all[t * qkv_dim + j];
@@ -788,7 +1275,51 @@ pub fn gdn_backward(
                 dx_t[i] += weights.in_proj_qkv[j * hidden + i] * dq;
             }
         }
+        // LoRA weight grads for in_proj_qkv.
+        // The LoRA forward added scale*(x@A_qkv^T)@B_qkv^T to qkv_proj[t].
+        // That delta passed through conv1d+SiLU, whose backward already produced
+        // d_qkv_proj_all[t] as the full gradient w.r.t. qkv_proj[t] (both base
+        // and LoRA delta). So d_qkv_proj_all[t] is exactly the g for lora_vjp.
+        // x = x_t (the original input), h = h_qkv_t.
+        if have_lora {
+            let d_qkv_g = &d_qkv_proj_all[t * qkv_dim..(t + 1) * qkv_dim];
+            let h_qkv_t = &saved.h_qkv[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                d_qkv_g,
+                x_t,
+                h_qkv_t,
+                &saved.lora_a_qkv,
+                &saved.lora_b_qkv,
+                lora_rank,
+                hidden,
+                qkv_dim,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_qkv[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_qkv[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
     } // end reverse time loop
+
+    GdnGrads {
+        grad_a_qkv,
+        grad_b_qkv,
+        grad_a_z,
+        grad_b_z,
+        grad_a_b,
+        grad_b_b,
+        grad_a_a,
+        grad_b_a,
+        grad_a_out,
+        grad_b_out,
+        dx: grad_inputs,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,8 +1567,44 @@ mod tests {
             let mut out_p = vec![0.0f32; seq_len * hidden];
             let mut out_m = vec![0.0f32; seq_len * hidden];
 
-            gdn_forward_save(&inp_p_f32, weights, cfg, &mut saved_p, &mut out_p);
-            gdn_forward_save(&inp_m_f32, weights, cfg, &mut saved_m, &mut out_m);
+            gdn_forward_save(
+                &inp_p_f32,
+                weights,
+                cfg,
+                &mut saved_p,
+                &mut out_p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0.0,
+            );
+            gdn_forward_save(
+                &inp_m_f32,
+                weights,
+                cfg,
+                &mut saved_m,
+                &mut out_m,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0.0,
+            );
 
             let lp = linear_loss(&out_p, coeffs);
             let lm = linear_loss(&out_m, coeffs);
@@ -1099,9 +1666,27 @@ mod tests {
             cfg.rms_norm_eps,
         );
         let mut outputs = vec![0.0f32; seq_len * hidden];
-        gdn_forward_save(&inputs, &weights, &cfg, &mut saved, &mut outputs);
-        let mut analytic = vec![0.0f32; seq_len * hidden];
-        gdn_backward(&coeffs, &saved, &weights, &mut analytic);
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
+        let gdn_grads = gdn_backward(&coeffs, &saved, &weights);
+        let analytic = gdn_grads.dx;
 
         // FD
         let fd = fd_grad_inputs_linear(&inputs, &weights, &cfg, seq_len, hidden, eps, &coeffs);
@@ -1212,11 +1797,29 @@ mod tests {
             cfg.rms_norm_eps,
         );
         let mut outputs = vec![0.0f32; seq_len * hidden];
-        gdn_forward_save(&inputs, &weights, &cfg, &mut saved, &mut outputs);
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
 
         let grad_out = vec![0.0f32; seq_len * hidden];
-        let mut analytic = vec![0.0f32; seq_len * hidden];
-        gdn_backward(&grad_out, &saved, &weights, &mut analytic);
+        let gdn_grads = gdn_backward(&grad_out, &saved, &weights);
+        let analytic = gdn_grads.dx;
 
         for (i, &v) in analytic.iter().enumerate() {
             assert!(
@@ -1224,5 +1827,351 @@ mod tests {
                 "zero upstream grad should give zero input grad at [{i}], got {v}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // LoRA weight-grad gradcheck
+    // ---------------------------------------------------------------------------
+    //
+    // Finite-difference check for the 10 LoRA weight gradients (grad_a_*/grad_b_*).
+    // The existing gradcheck_gdn_backward tests only cover dx with LoRA OFF.
+    // This test runs gdn_forward_save with LoRA ON and checks that the weight grads
+    // returned by gdn_backward agree with central-difference estimates.
+    //
+    // DO NOT RUN this test manually until the AM gradcheck pass is scheduled.
+    // (Compile-gate only — verifies the test compiles under --all-targets.)
+
+    /// Helper: run one forward + backward with the given LoRA arrays and return the
+    /// full GdnGrads.  All ten LoRA slices must be Some.
+    #[allow(clippy::too_many_arguments)]
+    fn run_lora_forward_backward(
+        inputs: &[f32],
+        weights: &GatedDeltaNetWeights,
+        cfg: &Qwen35Config,
+        seq_len: usize,
+        coeffs: &[f32],
+        lora_rank: usize,
+        lora_scale: f32,
+        a_qkv: &[f32],
+        b_qkv: &[f32],
+        a_z: &[f32],
+        b_z: &[f32],
+        a_b: &[f32],
+        b_b: &[f32],
+        a_a: &[f32],
+        b_a: &[f32],
+        a_out: &[f32],
+        b_out: &[f32],
+    ) -> GdnGrads {
+        let hidden = cfg.hidden_size;
+        let num_kh = cfg.linear_num_key_heads;
+        let num_vh = cfg.linear_num_value_heads();
+        let key_dim = cfg.linear_key_head_dim;
+        let value_dim = cfg.linear_value_head_dim;
+        let kernel_size = cfg.linear_conv_kernel_dim;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let scale = 1.0 / (key_dim as f32).sqrt();
+
+        let mut saved = GdnSaved::new(
+            seq_len,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            hidden,
+            qkv_dim,
+            output_dim,
+            kernel_size,
+            scale,
+            cfg.rms_norm_eps,
+        );
+        let mut outputs = vec![0.0f32; seq_len * hidden];
+        gdn_forward_save(
+            inputs,
+            weights,
+            cfg,
+            &mut saved,
+            &mut outputs,
+            Some(a_qkv),
+            Some(b_qkv),
+            Some(a_z),
+            Some(b_z),
+            Some(a_b),
+            Some(b_b),
+            Some(a_a),
+            Some(b_a),
+            Some(a_out),
+            Some(b_out),
+            lora_rank,
+            lora_scale,
+        );
+        gdn_backward(coeffs, &saved, weights)
+    }
+
+    /// Central-difference estimate of d(loss)/d(param[idx]) for a single entry.
+    #[allow(clippy::too_many_arguments)]
+    fn fd_lora_weight_entry(
+        inputs: &[f32],
+        weights: &GatedDeltaNetWeights,
+        cfg: &Qwen35Config,
+        seq_len: usize,
+        coeffs: &[f32],
+        lora_rank: usize,
+        lora_scale: f32,
+        a_qkv: &[f32],
+        b_qkv: &[f32],
+        a_z: &[f32],
+        b_z: &[f32],
+        a_b: &[f32],
+        b_b: &[f32],
+        a_a: &[f32],
+        b_a: &[f32],
+        a_out: &[f32],
+        b_out: &[f32],
+        // Which of the 10 arrays to perturb, and which entry:
+        which: usize, // 0=a_qkv 1=b_qkv 2=a_z 3=b_z 4=a_b 5=b_b 6=a_a 7=b_a 8=a_out 9=b_out
+        idx: usize,
+        eps: f32,
+    ) -> f32 {
+        // Helper: clone an array, perturb entry [idx] by delta, re-run, return loss.
+        let perturbed_loss = |delta: f32| -> f32 {
+            let mut aq = a_qkv.to_vec();
+            let mut bq = b_qkv.to_vec();
+            let mut az = a_z.to_vec();
+            let mut bz = b_z.to_vec();
+            let mut ab = a_b.to_vec();
+            let mut bb = b_b.to_vec();
+            let mut aa = a_a.to_vec();
+            let mut ba = b_a.to_vec();
+            let mut ao = a_out.to_vec();
+            let mut bo = b_out.to_vec();
+            let arr: &mut Vec<f32> = match which {
+                0 => &mut aq,
+                1 => &mut bq,
+                2 => &mut az,
+                3 => &mut bz,
+                4 => &mut ab,
+                5 => &mut bb,
+                6 => &mut aa,
+                7 => &mut ba,
+                8 => &mut ao,
+                _ => &mut bo,
+            };
+            arr[idx] += delta;
+            let hidden = cfg.hidden_size;
+            let num_kh = cfg.linear_num_key_heads;
+            let num_vh = cfg.linear_num_value_heads();
+            let key_dim = cfg.linear_key_head_dim;
+            let value_dim = cfg.linear_value_head_dim;
+            let kernel_size = cfg.linear_conv_kernel_dim;
+            let qkv_dim = cfg.linear_qkv_dim();
+            let output_dim = cfg.linear_output_dim();
+            let scale = 1.0 / (key_dim as f32).sqrt();
+            let mut saved = GdnSaved::new(
+                seq_len,
+                num_kh,
+                num_vh,
+                key_dim,
+                value_dim,
+                hidden,
+                qkv_dim,
+                output_dim,
+                kernel_size,
+                scale,
+                cfg.rms_norm_eps,
+            );
+            let mut outputs = vec![0.0f32; seq_len * hidden];
+            gdn_forward_save(
+                inputs,
+                weights,
+                cfg,
+                &mut saved,
+                &mut outputs,
+                Some(&aq),
+                Some(&bq),
+                Some(&az),
+                Some(&bz),
+                Some(&ab),
+                Some(&bb),
+                Some(&aa),
+                Some(&ba),
+                Some(&ao),
+                Some(&bo),
+                lora_rank,
+                lora_scale,
+            );
+            outputs
+                .iter()
+                .zip(coeffs.iter())
+                .map(|(&y, &c)| y * c)
+                .sum()
+        };
+        let lp = perturbed_loss(eps);
+        let lm = perturbed_loss(-eps);
+        (lp - lm) / (2.0 * eps)
+    }
+
+    // Core helper that exercises weight-grad gradcheck for any fixture.
+    // Returns (max_rel_err, n_tested).
+    #[allow(clippy::too_many_arguments)]
+    fn run_lora_weight_gradcheck(
+        hidden: usize,
+        num_kh: usize,
+        num_vh: usize,
+        key_dim: usize,
+        value_dim: usize,
+        kernel_size: usize,
+        seq_len: usize,
+        lora_rank: usize,
+        lora_scale: f32,
+        weight_seed: u64,
+        input_seed: u64,
+        lora_seed: u64,
+        coeff_seed: u64,
+        eps: f32,
+    ) -> (f32, usize) {
+        let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
+        let weights = make_tiny_weights(
+            hidden,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            kernel_size,
+            weight_seed,
+        );
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+
+        // Inputs
+        let mut rng_in = Rng::new(input_seed);
+        let mut inputs = vec![0.0f32; seq_len * hidden];
+        rng_in.fill(&mut inputs, -0.5, 0.5);
+
+        // Upstream coeffs (linear loss)
+        let mut rng_c = Rng::new(coeff_seed);
+        let mut coeffs = vec![0.0f32; seq_len * hidden];
+        rng_c.fill(&mut coeffs, -1.0, 1.0);
+
+        // LoRA matrices — small random values so grad_A and grad_B are non-vacuous.
+        // Shapes: A=[rank, d_in], B=[d_out, rank] for each projection.
+        let mut rng_l = Rng::new(lora_seed);
+        let mut a_qkv = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_qkv = vec![0.0f32; qkv_dim * lora_rank]; // [qkv_dim, rank]
+        let mut a_z = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_z = vec![0.0f32; output_dim * lora_rank]; // [output_dim, rank]
+        let mut a_b = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_b = vec![0.0f32; num_kh * lora_rank]; // [num_kh, rank]
+        let mut a_a = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_a = vec![0.0f32; num_kh * lora_rank]; // [num_kh, rank]
+        let mut a_out = vec![0.0f32; lora_rank * output_dim]; // [rank, output_dim]
+        let mut b_out = vec![0.0f32; hidden * lora_rank]; // [hidden, rank]
+        for arr in [
+            &mut a_qkv, &mut b_qkv, &mut a_z, &mut b_z, &mut a_b, &mut b_b, &mut a_a, &mut b_a,
+            &mut a_out, &mut b_out,
+        ]
+        .iter_mut()
+        {
+            rng_l.fill(arr, -0.05, 0.05);
+        }
+
+        // Analytic weight grads via forward+backward.
+        let grads = run_lora_forward_backward(
+            &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv, &b_qkv, &a_z,
+            &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out,
+        );
+
+        // Collect (which_array, analytic_grad_slice, array_len) triples.
+        let analytic_arrays: [(&[f32], usize); 10] = [
+            (&grads.grad_a_qkv, a_qkv.len()),
+            (&grads.grad_b_qkv, b_qkv.len()),
+            (&grads.grad_a_z, a_z.len()),
+            (&grads.grad_b_z, b_z.len()),
+            (&grads.grad_a_b, a_b.len()),
+            (&grads.grad_b_b, b_b.len()),
+            (&grads.grad_a_a, a_a.len()),
+            (&grads.grad_b_a, b_a.len()),
+            (&grads.grad_a_out, a_out.len()),
+            (&grads.grad_b_out, b_out.len()),
+        ];
+
+        let mut max_rel = 0.0f32;
+        let mut n_tested = 0usize;
+
+        for (which, (analytic_slice, arr_len)) in analytic_arrays.iter().enumerate() {
+            // Sample up to 6 entries spread across each array.
+            let step = (arr_len / 6).max(1);
+            let mut idx = 0usize;
+            while idx < *arr_len {
+                let analytic_v = analytic_slice[idx];
+                let fd_v = fd_lora_weight_entry(
+                    &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv,
+                    &b_qkv, &a_z, &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out, which, idx, eps,
+                );
+                let mag = fd_v.abs().max(analytic_v.abs());
+                if mag >= 1e-4 {
+                    n_tested += 1;
+                    let rel = (fd_v - analytic_v).abs() / mag;
+                    if rel > max_rel {
+                        max_rel = rel;
+                    }
+                }
+                idx += step;
+            }
+        }
+
+        (max_rel, n_tested)
+    }
+
+    #[test]
+    fn gradcheck_gdn_lora_weight_grads() {
+        // Tiny GDN: hidden=32, num_kh=1, value_heads=1, key_dim=8, value_dim=8,
+        // kernel_size=3, seq=4; rank=2; scale=0.5.
+        let (max_rel, n_tested) = run_lora_weight_gradcheck(
+            32, 1, 1, 8, 8, 3, 4,    // hidden, num_kh, num_vh, key_dim, value_dim, kernel, seq
+            2,    // lora_rank
+            0.5,  // lora_scale
+            42,   // weight_seed
+            1337, // input_seed
+            777,  // lora_seed
+            999,  // coeff_seed
+            1e-3, // eps
+        );
+        assert!(
+            n_tested >= 10,
+            "lora weight gradcheck: too few testable entries ({n_tested}); \
+             increase array sizes or tighten threshold"
+        );
+        assert!(
+            max_rel < 1e-2,
+            "gdn lora weight gradcheck failed: max_rel={max_rel:.3e} \
+             (n_tested={n_tested})"
+        );
+    }
+
+    #[test]
+    fn gradcheck_gdn_lora_weight_grads_multi_head() {
+        // Multi-head variant: num_kh=2, value_heads=4 exercises alpha/beta head-sharing reduction.
+        let (max_rel, n_tested) = run_lora_weight_gradcheck(
+            32, 2, 4, 8, 8, 3,
+            4,    // hidden, num_kh=2, num_vh=4, key_dim=8, value_dim=8, kernel, seq
+            2,    // lora_rank
+            0.5,  // lora_scale
+            99,   // weight_seed
+            2024, // input_seed
+            555,  // lora_seed
+            111,  // coeff_seed
+            1e-3, // eps
+        );
+        assert!(
+            n_tested >= 10,
+            "lora weight gradcheck (multi-head): too few testable entries ({n_tested})"
+        );
+        assert!(
+            max_rel < 1e-2,
+            "gdn lora weight gradcheck (multi-head) failed: max_rel={max_rel:.3e} \
+             (n_tested={n_tested})"
+        );
     }
 }

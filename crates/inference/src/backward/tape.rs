@@ -67,6 +67,9 @@ pub struct BackwardTape {
 }
 
 /// RMSNorm forward + cache: returns (normed, inv_rms).
+///
+/// Convention: shifted gamma — y_i = x_i * (1 + w_i) * inv_rms
+/// Matches `qwen35_rms_norm` in norm.rs (required for Qwen3.5 pre-attn and pre-FFN norms).
 pub fn rms_norm_forward(x: &[f32], w: &[f32], eps: f32) -> (Vec<f32>, f32) {
     let d = x.len();
     let mean_sq: f32 = x.iter().map(|xi| xi * xi).sum::<f32>() / d as f32;
@@ -74,7 +77,7 @@ pub fn rms_norm_forward(x: &[f32], w: &[f32], eps: f32) -> (Vec<f32>, f32) {
     let normed: Vec<f32> = x
         .iter()
         .zip(w.iter())
-        .map(|(xi, wi)| xi * wi * inv_rms)
+        .map(|(xi, wi)| xi * (1.0 + wi) * inv_rms)
         .collect();
     (normed, inv_rms)
 }
@@ -132,12 +135,15 @@ mod tests {
     #[test]
     fn rms_norm_forward_roundtrip() {
         let x = vec![1.0f32, 2.0, 3.0, 4.0];
-        let w = vec![1.0f32; 4];
+        // Use w=0.5 (nonzero, non-unity) so shifted vs plain gamma produce distinct results.
+        // Shifted convention: y_i = x_i * (1 + w_i) * inv_rms = x_i * 1.5 * inv_rms
+        let w = vec![0.5f32; 4];
         let (normed, inv_rms) = rms_norm_forward(&x, &w, 1e-6);
         let mean_sq: f32 = x.iter().map(|xi| xi * xi).sum::<f32>() / 4.0;
         let expected_inv = 1.0 / (mean_sq + 1e-6f32).sqrt();
         assert!((inv_rms - expected_inv).abs() < 1e-6, "inv_rms mismatch");
-        let expected_norm: Vec<f32> = x.iter().map(|xi| xi * expected_inv).collect();
+        // Shifted gamma: expected = x_i * (1 + w_i) * inv_rms = x_i * 1.5 * inv_rms
+        let expected_norm: Vec<f32> = x.iter().map(|xi| xi * 1.5 * expected_inv).collect();
         for (a, b) in normed.iter().zip(expected_norm.iter()) {
             assert!((a - b).abs() < 1e-5, "normed mismatch {a} vs {b}");
         }

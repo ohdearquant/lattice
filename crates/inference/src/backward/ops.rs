@@ -133,9 +133,15 @@ pub fn lora_vjp(
 
 /// RMSNorm backward (weight frozen).
 ///
-/// Forward: y_i = (x_i / rms) * w_i   where rms = sqrt(mean(x^2) + eps)
+/// Forward: y_i = x_i * (1 + w_i) * inv_rms   where inv_rms = 1/sqrt(mean(x^2) + eps)
+/// Shifted-gamma convention — matches `qwen35_rms_norm` in norm.rs.
+///
 /// Backward: given g = dL/dy,
-///   dL/dx_i = (w_i * g_i) / rms  -  x_i / (D * rms^3) * Σ_j x_j * w_j * g_j
+///   dL/dx_j = (1 + w_j) * g_j * inv_rms  -  x_j * inv_rms^3/D * Σ_i g_i*(1+w_i)*x_i
+///
+/// Derivation: y_i = (1+w_i)*x_i*r, r = (mean(x^2)+eps)^(-1/2).
+///   ∂r/∂x_j = -x_j * r^3 / D
+///   dL/dx_j = (1+w_j)*r*g_j + Σ_i g_i*(1+w_i)*x_i * (-x_j*r^3/D)
 ///
 /// `x` is the pre-norm input, `w` is the RMSNorm weight (both length D).
 /// `inv_rms` = 1 / sqrt(mean(x^2) + eps) from the forward.
@@ -145,14 +151,14 @@ pub fn rmsnorm_backward(x: &[f32], w: &[f32], inv_rms: f32, g: &[f32]) -> Vec<f3
     assert_eq!(w.len(), d);
     assert_eq!(g.len(), d);
 
-    // sum_xwg = Σ_j x_j * w_j * g_j
-    let sum_xwg: f32 = (0..d).map(|j| x[j] * w[j] * g[j]).sum();
+    // sum_xwg = Σ_j x_j * (1 + w_j) * g_j
+    let sum_xwg: f32 = (0..d).map(|j| x[j] * (1.0 + w[j]) * g[j]).sum();
 
     let inv_rms3_over_d = inv_rms * inv_rms * inv_rms / d as f32;
 
     let mut dx = vec![0.0f32; d];
     for i in 0..d {
-        dx[i] = w[i] * g[i] * inv_rms - x[i] * inv_rms3_over_d * sum_xwg;
+        dx[i] = (1.0 + w[i]) * g[i] * inv_rms - x[i] * inv_rms3_over_d * sum_xwg;
     }
     dx
 }
@@ -457,7 +463,7 @@ mod tests {
             x.iter()
                 .zip(w.iter())
                 .zip(g.iter())
-                .map(|((&xi, &wi), &gi)| gi * xi * wi / r)
+                .map(|((&xi, &wi), &gi)| gi * xi * (1.0 + wi) / r)
                 .sum()
         };
 
