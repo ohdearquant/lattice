@@ -8,13 +8,18 @@ import AppKit
 //   advanced knobs live in a toggleable right InspectorShell inspector
 //   (default-CLOSED on first visit; ⌘\ or toolbar button reveals it).
 //
-// Essentials card (idle, main body):
-//   MODEL — dropdown from store.workingModel ?? store.defaultModel
-//   DATASET — read-only from store.workingDataset; hint to Data tab if nil
-//   RANK — segmented picker 4 / 8 / 16 / 32
-//   LR — stepper
-//   STEPS — stepper
-//   START — LatticePrimaryButtonStyle CTA
+// Configure card — two grouped OpaquePanel sections:
+//
+//   TARGET (model + dataset)
+//     MODEL  — dropdown from store.workingModel ?? store.defaultModel
+//     DATASET — inline folder picker; scans <repoRoot>/data on appear; "Browse…" for custom paths
+//
+//   LORA / TRAINING
+//     RANK   — segmented picker 4 / 8 / 16 / 32
+//     LR     — stepper
+//     STEPS  — stepper
+//
+//   TRAIN ⌘↵  — LatticePrimaryButtonStyle CTA (full-width, below both panels)
 //
 // Advanced (inspector only):
 //   ARCHITECTURE: first layer
@@ -27,6 +32,20 @@ import AppKit
 //
 // Store ownership: store.liveRun is read-only here. The store creates and owns the run;
 // a re-render of this view must never reset it.
+
+// MARK: - TrainingDataset
+//
+// The training binary takes --data-dir pointing at a FOLDER containing train.jsonl + valid.jsonl.
+// The selection unit is therefore the folder, not the individual file. We group the raw
+// DatasetFileStat results from DataScreen.scanDirectory by parent folder and require train.jsonl.
+
+private struct TrainingDataset: Identifiable {
+    let id: String              // folder path == the --data-dir argument
+    let name: String            // folder's last path component, shown in the menu
+    let folderURL: URL
+    let trainFile: DatasetFileStat   // the train.jsonl stat; assigned to store.workingDataset
+    let validCount: Int?        // valid.jsonl exampleCount when present; nil = honest-nil
+}
 
 struct TrainScreen: View {
     @Bindable var store: AppStore
@@ -57,14 +76,27 @@ struct TrainScreen: View {
     // Inspector open-once guard — keeps it CLOSED on first visit
     @State private var didInitInspector = false
 
+    // DATASET PICKER — inline scan within Train; no navigation required
+    @State private var availableDatasets: [TrainingDataset] = []
+    @State private var datasetFolder: String = ""     // folder being scanned; default <repoRoot>/data
+    @State private var isScanningDatasets: Bool = false
+    @State private var datasetScanError: String? = nil
+
     // MARK: Derived helpers
 
     private var modelNames: [String] {
-        store.models.filter { !$0.isEmbedding }.map(\.name)
+        // LoRA training requires BF16 weights — Q4 models carry no model.safetensors
+        // and train_grad_full errors immediately with "Model not found".
+        store.models.filter { $0.format == .bf16 && !$0.isEmbedding }.map(\.name)
     }
 
     private var resolvedModel: ModelInfo? {
-        store.models.first { $0.name == selectedModelName } ?? store.targetModel
+        // Only return a model that is bf16 — resolving to a Q4 target would pass a path
+        // that train_grad_full cannot load (no model.safetensors).
+        let candidate = store.models.first { $0.name == selectedModelName }
+        if let c = candidate, c.format == .bf16 { return c }
+        // Fall back to the working/default target only when it is also bf16.
+        return store.targetModel.flatMap { $0.format == .bf16 ? $0 : nil }
     }
 
     private var isRunning: Bool {
@@ -98,6 +130,10 @@ struct TrainScreen: View {
         .onAppear {
             applyDefaults()
             closeInspectorOnce()
+            if datasetFolder.isEmpty {
+                datasetFolder = (store.repoRootPath ?? "") + "/data"
+            }
+            scanDatasets()
         }
         .onChange(of: store.targetModel?.name) { _, newName in
             // Only update model selection if the user hasn't already picked one manually
@@ -277,18 +313,25 @@ struct TrainScreen: View {
         }
     }
 
-    // MARK: Configure card (idle state — essentials only)
+    // MARK: Configure card (idle state)
+    //
+    // Two carded groups separated by a gap — makes the hierarchy visible without section banners:
+    //
+    //   [TARGET]  model + dataset
+    //   [PARAMS]  rank + LR + steps
+    //   [TRAIN ⌘↵]  full-width CTA
+    //   [Advanced ⌘\]  footer hint
 
     private var configureCard: some View {
         ScrollView(.vertical, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
 
+                // ── TARGET — model + dataset ──────────────────────────────
                 OpaquePanel {
                     VStack(spacing: 0) {
+                        groupHeader("TARGET")
 
                         // MODEL
-                        sectionLabel("MODEL")
-
                         if modelNames.isEmpty {
                             ParamRow(label: "MODEL", value: "— no models found —")
                         } else {
@@ -309,39 +352,21 @@ struct TrainScreen: View {
                             )
                         }
 
-                        // DATASET (read from store.workingDataset; set in Data tab)
-                        sectionLabel("DATASET")
+                        // DATASET — inline status + actionable button
+                        datasetRow
+                    }
+                }
 
-                        if let ds = store.workingDataset {
-                            ParamRow(label: "DATASET", value: ds.name)
-                        } else {
-                            HStack(spacing: Theme.Space.sm) {
-                                Text("DATASET")
-                                    .instrumentLabel()
-                                Spacer()
-                                Text("Choose a dataset in Data  \u{2318}2")
-                                    .font(Theme.Fonts.cell)
-                                    .foregroundStyle(Theme.Palette.inkDim)
-                                    .italic()
-                            }
-                            .frame(height: Theme.Space.rowHeight)
-                            .padding(.horizontal, Theme.Space.lg)
-                            .overlay(alignment: .bottom) {
-                                Theme.Palette.hairline.frame(height: 1)
-                            }
-                        }
-
-                        // RANK
-                        sectionLabel("LORA")
+                // ── PARAMS — rank / LR / steps ───────────────────────────
+                OpaquePanel {
+                    VStack(spacing: 0) {
+                        groupHeader("LORA + TRAINING")
 
                         ParamRowPicker(
                             label: "RANK",
                             options: ["4", "8", "16", "32"],
                             selection: $rankStr
                         )
-
-                        // TRAINING
-                        sectionLabel("TRAINING")
 
                         ParamRowStepper(
                             label: "LR",
@@ -357,29 +382,36 @@ struct TrainScreen: View {
                             step: 1,
                             format: "%.0f"
                         )
-
-                        // START CTA
-                        Button("Train") { launchTraining() }
-                            .buttonStyle(LatticePrimaryButtonStyle())
-                            .frame(maxWidth: .infinity)
-                            .disabled(isRunning)
-                            .keyboardShortcut(.return, modifiers: .command)
-                            .padding(.horizontal, Theme.Space.lg)
-                            .padding(.vertical, Theme.Space.lg)
-
                     }
                 }
 
-                // Hint: advanced knobs live in the inspector
+                // ── TRAIN CTA ─────────────────────────────────────────────
+                Button("Train") { launchTraining() }
+                    .buttonStyle(LatticePrimaryButtonStyle(height: 34))
+                    .frame(maxWidth: .infinity)
+                    .disabled(isRunning || modelNames.isEmpty || store.workingDataset == nil)
+                    .keyboardShortcut(.return, modifiers: .command)
+
+                // Honest notice when no BF16 model is available (Q4-only setup)
+                if modelNames.isEmpty {
+                    HStack(spacing: Theme.Space.xs) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(Theme.Fonts.caption)
+                            .foregroundStyle(Theme.Palette.amber)
+                        Text("No BF16 model found — LoRA training requires a full-precision model. Quantized models cannot be trained.")
+                            .font(Theme.Fonts.caption)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                    }
+                    .padding(.horizontal, Theme.Space.xs)
+                }
+
+                // ── ADVANCED HINT ─────────────────────────────────────────
                 HStack(spacing: Theme.Space.xs) {
-                    Text("Advanced options: rank alpha, sequence length, layer range, save adapter")
-                        .font(Theme.Fonts.cell)
+                    Text("Advanced: alpha, sequence, layer range, save adapter")
+                        .font(Theme.Fonts.caption)
                         .foregroundStyle(Theme.Palette.inkDim)
                     Spacer()
-                    Text("\u{2318}\\")
-                        .font(Theme.Fonts.cell)
-                        .foregroundStyle(Theme.Palette.inkDim)
-                        .monospacedDigit()
+                    KeyCapChip("⌘\\")
                 }
                 .padding(.horizontal, Theme.Space.xs)
 
@@ -388,6 +420,235 @@ struct TrainScreen: View {
             .padding(Theme.Space.lg)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: Group header (dim all-caps label, no hairline — card border is enough)
+
+    @ViewBuilder
+    private func groupHeader(_ title: String) -> some View {
+        Text(title)
+            .instrumentLabel()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, Theme.Space.lg)
+            .padding(.top, Theme.Space.md)
+            .padding(.bottom, Theme.Space.xs)
+    }
+
+    // MARK: Dataset row — inline folder picker (no navigation to Data tab required)
+
+    @ViewBuilder
+    private var datasetRow: some View {
+        if isScanningDatasets {
+            datasetRowScanning
+        } else if !availableDatasets.isEmpty {
+            datasetRowMenu
+        } else {
+            datasetRowEmpty
+        }
+    }
+
+    // Sub-state: scanning in progress
+    private var datasetRowScanning: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Text("DATASET")
+                .instrumentLabel()
+            Spacer()
+            ProgressView()
+                .progressViewStyle(.circular)
+                .controlSize(.mini)
+            Text("scanning…")
+                .font(Theme.Fonts.cell)
+                .foregroundStyle(Theme.Palette.inkDim)
+        }
+        .frame(minHeight: Theme.Space.rowHeightComfortable)
+        .padding(.horizontal, Theme.Space.lg)
+        .padding(.vertical, Theme.Space.xs)
+        .overlay(alignment: .top) { Theme.Palette.hairline.frame(height: 1) }
+        .overlay(alignment: .bottom) { Theme.Palette.hairline.frame(height: 1) }
+    }
+
+    // Sub-state: datasets available — inline dropdown + count caption
+    private var datasetRowMenu: some View {
+        let selectedName = availableDatasets.first {
+            $0.trainFile.id == store.workingDataset?.id
+        }?.name ?? availableDatasets.first?.name ?? ""
+
+        let menuBinding = Binding<String>(
+            get: { selectedName },
+            set: { chosen in
+                if let match = availableDatasets.first(where: { $0.name == chosen }) {
+                    store.workingDataset = match.trainFile
+                }
+            }
+        )
+
+        let activeDS = availableDatasets.first { $0.name == selectedName }
+
+        return VStack(spacing: 0) {
+            ParamRowMenu(
+                label: "DATASET",
+                options: availableDatasets.map(\.name),
+                selection: menuBinding
+            )
+            if let ds = activeDS {
+                datasetCountCaption(ds: ds)
+            }
+        }
+    }
+
+    // Caption row: train/valid counts + Browse + optional Data tab link
+    private func datasetCountCaption(ds: TrainingDataset) -> some View {
+        var countText = "\(ds.trainFile.exampleCount) train"
+        if let v = ds.validCount { countText += " · \(v) valid" }
+        countText += " examples"
+
+        return HStack(spacing: Theme.Space.sm) {
+            Spacer()
+            Text(countText)
+                .font(Theme.Fonts.cell)
+                .foregroundStyle(Theme.Palette.inkDim)
+                .monospacedDigit()
+            Button("Browse…") { browseDatasetFolder() }
+                .buttonStyle(LatticeSecondaryButtonStyle())
+                .controlSize(.small)
+            Button("Inspect in Data") { store.selection = .data }
+                .font(Theme.Fonts.cell)
+                .foregroundStyle(Theme.Palette.inkDim)
+                .buttonStyle(.plain)
+        }
+        .padding(.horizontal, Theme.Space.lg)
+        .padding(.bottom, Theme.Space.xs)
+    }
+
+    // Sub-state: no datasets found or scan error
+    private var datasetRowEmpty: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: Theme.Space.sm) {
+                Text("DATASET")
+                    .instrumentLabel()
+                Spacer()
+                if let err = datasetScanError {
+                    GatePill(.fail, label: "scan error")
+                    Text(err)
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.amber)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                } else {
+                    Text("— no datasets found in \(datasetFolder) —")
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                }
+                Button("Browse…") { browseDatasetFolder() }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
+                    .controlSize(.small)
+            }
+            .frame(minHeight: Theme.Space.rowHeightComfortable)
+            .padding(.horizontal, Theme.Space.lg)
+            .padding(.vertical, Theme.Space.xs)
+            .overlay(alignment: .top) { Theme.Palette.hairline.frame(height: 1) }
+            .overlay(alignment: .bottom) { Theme.Palette.hairline.frame(height: 1) }
+
+            HStack(spacing: Theme.Space.sm) {
+                Spacer()
+                Text("build or inspect datasets in Data")
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+                Button("Open Data tab") { store.selection = .data }
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+                    .buttonStyle(.plain)
+            }
+            .padding(.horizontal, Theme.Space.lg)
+            .padding(.bottom, Theme.Space.xs)
+        }
+    }
+
+    // MARK: Dataset scan — groups DataScreen.scanDirectory results into training-ready folders
+
+    private func scanDatasets() {
+        let dir = datasetFolder.trimmingCharacters(in: .whitespaces)
+        guard !dir.isEmpty else { return }
+
+        isScanningDatasets = true
+        datasetScanError = nil
+
+        // Capture the current workingDataset before the async hop to preserve cross-tab selections.
+        let existingDataset = store.workingDataset
+
+        Task.detached(priority: .userInitiated) {
+            let result = await DataScreen.scanDirectory(path: dir)
+            await MainActor.run {
+                isScanningDatasets = false
+                switch result {
+                case .success(let stats):
+                    // Group by parent folder; only folders with train.jsonl qualify.
+                    let byFolder = Dictionary(grouping: stats) {
+                        $0.url.deletingLastPathComponent().path
+                    }
+                    var datasets: [TrainingDataset] = []
+                    for (folderPath, files) in byFolder {
+                        guard let trainFile = files.first(where: { $0.name == "train.jsonl" }) else {
+                            continue
+                        }
+                        let validFile = files.first(where: { $0.name == "valid.jsonl" })
+                        let folderURL = URL(fileURLWithPath: folderPath, isDirectory: true)
+                        datasets.append(TrainingDataset(
+                            id: folderPath,
+                            name: folderURL.lastPathComponent,
+                            folderURL: folderURL,
+                            trainFile: trainFile,
+                            validCount: validFile?.exampleCount
+                        ))
+                    }
+                    datasets.sort { $0.name < $1.name }
+
+                    // Preserve a cross-tab selection even when its folder isn't in the scanned set.
+                    if let existing = existingDataset {
+                        let existingFolder = existing.url.deletingLastPathComponent().path
+                        if !datasets.contains(where: { $0.id == existingFolder }) {
+                            let syntheticFolderURL = URL(fileURLWithPath: existingFolder, isDirectory: true)
+                            datasets.append(TrainingDataset(
+                                id: existingFolder,
+                                name: syntheticFolderURL.lastPathComponent,
+                                folderURL: syntheticFolderURL,
+                                trainFile: existing,
+                                validCount: nil
+                            ))
+                        }
+                    }
+
+                    availableDatasets = datasets
+
+                    // Auto-select first dataset when nothing is chosen yet.
+                    if store.workingDataset == nil, let first = datasets.first {
+                        store.workingDataset = first.trainFile
+                    }
+
+                case .failure(let err):
+                    datasetScanError = err.message
+                    availableDatasets = []
+                }
+            }
+        }
+    }
+
+    // MARK: Browse — NSOpenPanel for custom dataset folder
+
+    private func browseDatasetFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a folder containing train.jsonl"
+        panel.prompt = "Select"
+        if !datasetFolder.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: datasetFolder, isDirectory: true)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            datasetFolder = url.path
+            scanDatasets()
+        }
     }
 
     // MARK: Active run view
@@ -586,7 +847,16 @@ struct TrainScreen: View {
                     GatePill(.pass, label: "DONE")
                 }
             case .failed:
-                GatePill(.fail, label: "FAILED")
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    GatePill(.fail, label: "FAILED")
+                    if let reason = run.failureReason {
+                        Text(reason)
+                            .font(Theme.Fonts.caption)
+                            .foregroundStyle(Theme.Palette.crimson)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             case .idle:
                 EmptyView()
             }

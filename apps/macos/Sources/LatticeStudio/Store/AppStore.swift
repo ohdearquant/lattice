@@ -22,10 +22,93 @@ final class AppStore {
     var modelCachePath: String { LatticeBridge.modelCacheDir.path }
     var repoRootPath: String? { LatticeBridge.repoRoot?.path }
 
+    // MARK: - Hoisted Chat state (survives NavigationSplitView teardown)
+
+    // Single-mode conversation transcript.
+    var chatTurns: [ChatTurn] = []
+    // GPU/CPU inference mode. true = chat_metal (Metal GPU); false = generate_lora (CPU BF16).
+    // Honest-label contract: this flag selects the binary AND anchors the label in each turn
+    // bubble at send time. A GPU-flagged run NEVER appears with a CPU label, and vice versa.
+    var chatUseGPU: Bool = false
+    // Selections — survive navigation.
+    var chatSelectedModelName: String = ""
+    var chatSelectedAdapterName: String = "none"
+    // Generation knob text fields.
+    var chatTempText: String = "0.7"
+    var chatMaxTokensText: String = "256"
+    var chatSeedText: String = ""
+    var chatTopKText: String = "50"
+    var chatTopPText: String = "0.9"
+    var chatRepPenaltyText: String = "1.1"
+    // In-flight tracking — must be store-owned so a generation that finishes while
+    // the user is on another screen still lands in chatTurns.
+    var chatAwaitingTurnID: UUID? = nil
+    var chatUserStoppedTurnID: UUID? = nil
+
+    // MARK: - Hoisted Eval workspace state (Stage 1 — structural plumbing)
+
+    // Active tab in EvalScreen ("PPL" | "Compare" | "Similar").
+    var evalActiveTab: String = "PPL"
+    // Model selection (multi-select; survives navigation).
+    var evalSelectedModelNames: Set<String> = []
+    // Per-model adapter selection: modelName → adapterName.
+    var evalSelectedAdapterNames: [String: String] = [:]
+    // Generation knobs — separate from chat context; eval and chat are independent contexts.
+    var evalTempText: String = "0.7"
+    var evalMaxTokensText: String = "256"
+    var evalSeedText: String = ""
+    // Whether Compare tab generation should use the GPU Metal path.
+    // When true, each column dispatches to chat_metal (GPU Metal).
+    // When false, each column dispatches to generate_lora (CPU BF16).
+    // Honest-label contract: the label in EvalColumn.label is snapshotted at send time
+    // from the actual GenConfig.useGPU value so it always matches the binary that ran.
+    var evalUseGPU: Bool = false
+    // PPL corpus path (nil = use built-in default ~200-token corpus).
+    // Stored as a path string because URL is not directly @Observable-friendly.
+    var evalCorpusPath: String? = nil
+
+    // MARK: - Eval compare state (Stage 3 — N-way generation compare)
+
+    // Accumulated compare experiment pairs for the COMPARE tab.
+    // Each pair holds one EvalColumn per configured slot. Persists across navigation.
+    var evalComparePairs: [EvalComparePair] = []
+    // Index of the column currently being generated (0-based). -1 = idle.
+    var evalComparePhase: Int = -1
+    // ID of the pair currently being generated. nil = idle.
+    var evalCompareAwaitingPairID: UUID? = nil
+
+    // MARK: - Hoisted PPL state (survives ModelsScreen teardown)
+
+    /// Last measured perplexity per model ID. Keyed by ModelInfo.id (path).
+    /// Persisted across launches via ppl.json in the same AppSupport dir as runs.json.
+    var measuredPPL: [String: MeasuredPPL] = [:]
+
+    // MARK: - Get Models state
+
+    // Canonical names of models currently being downloaded.
+    var downloadingModels: Set<String> = []
+    // Per-model download errors; cleared when a download is retried or succeeds.
+    var downloadErrors: [String: String] = [:]
+    // Name of model currently being imported from disk ("" when idle).
+    var importingModel: String = ""
+    // Last import error; cleared at the start of each import attempt.
+    var importError: String? = nil
+
     private var handle: RunHandle?
+    // Dedicated handles for concurrent downloads — keyed by ObjectIdentifier so each
+    // download gets its own RunHandle and never evicts a training/eval job from `handle`.
+    var _downloadHandles: [ObjectIdentifier: RunHandle] = [:]
+
+    // Handles stopped to make way for a new run, kept alive here until their terminationHandler
+    // delivers onExit. RunHandle.terminationHandler captures [weak self], so once `launch()`
+    // reassigns `handle` the old handle would otherwise deallocate before its exit callback runs:
+    // finish() (and the run's onComplete) would never fire and an awaiting chat turn would hang
+    // .running forever. Each handle removes itself from this map inside its own onExit.
+    private var retiringHandles: [ObjectIdentifier: RunHandle] = [:]
 
     init() {
         runs = Self.loadRunArchive()
+        measuredPPL = Self.loadPPLArchive()
         // Reap trainer processes orphaned by a previous app crash or force-quit.
         // Done synchronously at init so no orphan can race with an immediately-launched run.
         let reaped = RunRegistry.reapOrphans()
@@ -83,6 +166,26 @@ final class AppStore {
         try? data.write(to: url, options: .atomic)
     }
 
+    // MARK: PPL archive persistence
+
+    private static var pplArchiveURL: URL? {
+        appSupportDir?.appendingPathComponent("ppl.json")
+    }
+
+    private static func loadPPLArchive() -> [String: MeasuredPPL] {
+        guard let url = pplArchiveURL,
+              let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: MeasuredPPL].self, from: data)) ?? [:]
+    }
+
+    func persistPPLArchive() {
+        guard let url = Self.pplArchiveURL else { return }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        guard let data = try? encoder.encode(measuredPPL) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
     func refreshModels() {
         Task.detached {
             let found = LatticeBridge.discoverModels()
@@ -92,8 +195,11 @@ final class AppStore {
             } else {
                 foundAdapters = []
             }
+            // Attach compatible adapters to each model so the Chat A/B picker
+            // (selectedModel.adapters) can offer them; the global list still backs MODELS.
+            let withAdapters = LatticeBridge.associateAdapters(foundAdapters, into: found)
             await MainActor.run {
-                self.models = found
+                self.models = withAdapters
                 self.adapters = foundAdapters
             }
         }
@@ -138,7 +244,14 @@ final class AppStore {
         }
         run.appendLog("$ \(spec.executable.lastPathComponent) \(args.joined(separator: " "))")
 
-        if let prior = handle, prior.isRunning { prior.stop() }
+        if let prior = handle, prior.isRunning {
+            // Retain the superseded handle until its onExit fires (see retiringHandles). The
+            // reassignment of `handle` below would otherwise drop its last strong reference, and
+            // its [weak self] terminationHandler could then no-op — stranding the prior run
+            // unresolved (a chat turn stuck .running with chatAwaitingTurnID never cleared).
+            retiringHandles[ObjectIdentifier(prior)] = prior
+            prior.stop()
+        }
         let h = RunHandle()
         h.onEvent = { [weak self] ev in self?.consume(ev, into: run) }
         do {
@@ -156,10 +269,15 @@ final class AppStore {
             // pipe file descriptors on every run. No fast-exit race: terminationHandler
             // dispatches onExit onto the main queue, and we are still on the main actor here,
             // so onExit is always assigned before it can fire.
+            // ObjectIdentifier (a value) lets onExit drop a superseded handle from
+            // retiringHandles without capturing `h` itself, which would re-introduce the
+            // retain cycle the comment above avoids.
+            let hid = ObjectIdentifier(h)
             h.onExit = { [weak self] code in
                 // Deregister before finish so the PID slot is freed even if finish throws.
                 RunRegistry.deregister(pid: pid)
                 self?.finish(run, code: code)
+                self?.retiringHandles.removeValue(forKey: hid)
             }
         } catch {
             run.status = .failed
@@ -217,6 +335,10 @@ final class AppStore {
         case .embedDone(let e):
             // Replace — exactly one embed_done event per batch run.
             run.embed = e
+        case .downloadDone:
+            // download_done events are handled by downloadModel's dedicated RunHandle;
+            // they should never reach a LiveRun's consume path.
+            break
         case .status(let line):
             run.appendLog(line)
         case .unknown(let j):
@@ -226,6 +348,15 @@ final class AppStore {
 
     private func finish(_ run: LiveRun, code: Int32) {
         run.status = (code == 0) ? .done : .failed
+        // Capture the failure reason from the log when the process exits non-zero.
+        // Look for the last non-empty log line that isn't a banner (===) or launch echo ($).
+        // This surfaces the actual engine error (e.g. "Error: load model: Model not found…")
+        // without fabricating anything — honest-nil when no such line exists.
+        if code != 0 {
+            run.failureReason = run.log.last(where: { line in
+                !line.isEmpty && !line.hasPrefix("$") && !line.hasPrefix("===")
+            })
+        }
         let rec = RunRecord(
             id: "\(run.kind.rawValue)-\(Int(run.startedAt.timeIntervalSince1970))",
             kind: run.kind, model: run.modelName, status: run.status, startedAt: run.startedAt,

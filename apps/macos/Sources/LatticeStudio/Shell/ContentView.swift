@@ -6,21 +6,36 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             LeftRail(store: store)
-                .navigationSplitViewColumnWidth(Theme.Space.railWidth)
+                // Sidebar: fixed ideal width with a collapse range so it never overlaps
+                // the detail column on narrow windows.
+                .navigationSplitViewColumnWidth(
+                    min: Theme.Space.sidebarMin,
+                    ideal: Theme.Space.railWidth,
+                    max: Theme.Space.sidebarMax
+                )
         } detail: {
             ZStack {
                 Theme.Palette.canvas.ignoresSafeArea()
                 detail
             }
+            // Enforce a minimum detail width so the split view never collapses the
+            // content area to zero on narrow resize — the window's own minWidth (1120)
+            // is the outer bound; this clamps at the column level.
+            .frame(minWidth: 640)
             .toolbar {
-                // One header per screen: ScreenScaffold renders the indexed title in
-                // the content area. The former `.navigation` toolbar title duplicated it
-                // (complaint 4 — "title appears too many times"); removed.
-                if let run = store.liveRun, run.status == .running || run.status == .paused {
-                    ToolbarItem(placement: .primaryAction) {
+                // Run-status capsule: always reserve the slot; hide the capsule content
+                // when there is no active run.  This prevents the toolbar from reflowing
+                // when a run starts or stops, which previously caused the Embeddings
+                // HSplitView to jump.
+                ToolbarItem(placement: .primaryAction) {
+                    if let run = store.liveRun, run.status == .running || run.status == .paused {
                         runStatusCapsule(run)
+                    } else {
+                        // Zero-size placeholder — keeps toolbar item count constant.
+                        Color.clear.frame(width: 0, height: 0)
                     }
                 }
+                // Inspector toggle: only rendered for screens that have an inspector.
                 if store.selection.hasInspector {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
@@ -94,7 +109,14 @@ struct ContentView: View {
         }()
 
         Button {
-            store.selection = .chat
+            // Jump to the screen that owns this run kind — not always Chat.
+            switch run.kind {
+            case .chat:                        store.selection = .chat
+            case .train:                       store.selection = .train
+            case .quantizeQ4, .quantizeQuaRot: store.selection = .models
+            case .eval:                        store.selection = .eval
+            case .embed:                       store.selection = .eval
+            }
         } label: {
             HStack(spacing: 6) {
                 Circle()
@@ -130,7 +152,7 @@ struct ContentView: View {
         case .data:   DataScreen(store: store)
         case .train:  TrainScreen(store: store)
         case .chat:   ChatScreen(store: store)
-        case .embed:  EmbeddingsScreen(store: store)
+        case .eval:   EvalScreen(store: store)
         }
     }
 

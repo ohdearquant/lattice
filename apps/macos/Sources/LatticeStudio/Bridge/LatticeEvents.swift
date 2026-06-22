@@ -22,7 +22,8 @@ enum LatticeEvent: Equatable {
     case quantDone(QuantDone)
     case genToken(GenToken)
     case perplexity(Perplexity)   // eval_perplexity --json: one row per measurement label
-    case embedDone(EmbedDone)     // embed --json: cosine matrix + optional preview vectors
+    case embedDone(EmbedDone)         // embed --json: cosine matrix + optional preview vectors
+    case downloadDone(DownloadDone)   // embed --download-only --json: one event on completion
     case status(String)        // free-form human status line (non-JSON stdout/stderr)
     case unknown(String)       // a JSON event whose tag we don't recognize
 
@@ -58,7 +59,9 @@ enum LatticeEvent: Equatable {
     struct QuantDone: Codable, Equatable {
         var before_mb: Double
         var after_mb: Double
-        var ratio: Double
+        var ratio: Double?     // nil on a QuaRot dry-run: nothing is written, so there is
+                               // no real compression ratio — forward-equivalence (max_abs)
+                               // is the meaningful signal instead. Honest-nil, not 0/1.
         var verdict: String?   // "PASS" | "WARN" | "FAIL"
         var max_abs: Double?   // QuaRot forward-equivalence
         var est_ppl_delta: Double?
@@ -114,6 +117,20 @@ enum LatticeEvent: Equatable {
         /// Wall-clock milliseconds for this batch.
         var ms: Double?
     }
+
+    // MARK: - DownloadDone event (embed --download-only --json)
+    //
+    // CONTRACT:
+    //   @@lattice {"ev":"download_done","model":"bge-small-en-v1.5","ok":true}
+    //   @@lattice {"ev":"download_done","model":"bge-small-en-v1.5","ok":false,"error":"<msg>"}
+    //
+    // Emitted exactly once per `embed --download-only --json` invocation.
+    // `ok` is required. `error` is present only on failure.
+    struct DownloadDone: Codable, Equatable {
+        var model: String?
+        var ok: Bool
+        var error: String?
+    }
 }
 
 /// Tagged envelope used to peek the `ev` discriminator before decoding the full payload.
@@ -157,8 +174,9 @@ enum LatticeEventParser {
         case "quant_done":  return (try? decoder.decode(LatticeEvent.QuantDone.self, from: data)).map(LatticeEvent.quantDone) ?? .unknown(jsonText)
         case "gen_token":   return (try? decoder.decode(LatticeEvent.GenToken.self, from: data)).map(LatticeEvent.genToken) ?? .unknown(jsonText)
         case "perplexity":  return (try? decoder.decode(LatticeEvent.Perplexity.self, from: data)).map(LatticeEvent.perplexity) ?? .unknown(jsonText)
-        case "embed_done":  return (try? decoder.decode(LatticeEvent.EmbedDone.self, from: data)).map(LatticeEvent.embedDone) ?? .unknown(jsonText)
-        default:            return .unknown(jsonText)
+        case "embed_done":     return (try? decoder.decode(LatticeEvent.EmbedDone.self, from: data)).map(LatticeEvent.embedDone) ?? .unknown(jsonText)
+        case "download_done":  return (try? decoder.decode(LatticeEvent.DownloadDone.self, from: data)).map(LatticeEvent.downloadDone) ?? .unknown(jsonText)
+        default:               return .unknown(jsonText)
         }
     }
 
@@ -211,9 +229,15 @@ final class QuantAccumulator {
         if let v = ratio    { self.ratio    = v }
         if let v = maxAbs   { self.maxAbs   = v }
         if let v = verdict  { self.verdict  = v }
-        guard let b = self.beforeMB, let a = self.afterMB, let r = self.ratio else { return nil }
+        // Emit once both size fields and a terminal metric are in. The terminal metric is
+        // the compression ratio for Q4 (its last summary line) OR the forward-equivalence
+        // max_abs for QuaRot (its last line, after Compression). A QuaRot dry-run writes
+        // nothing, so its Compression line is "N/A" and ratio stays nil — without the
+        // max_abs branch that run would never complete in the UI (the original bug).
+        guard let b = self.beforeMB, let a = self.afterMB,
+              (self.ratio != nil || self.maxAbs != nil) else { return nil }
         return .quantDone(LatticeEvent.QuantDone(
-            before_mb: b, after_mb: a, ratio: r,
+            before_mb: b, after_mb: a, ratio: self.ratio,
             verdict: self.verdict, max_abs: self.maxAbs, est_ppl_delta: nil
         ))
     }

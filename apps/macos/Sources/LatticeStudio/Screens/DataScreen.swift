@@ -1,23 +1,24 @@
 import SwiftUI
 import AppKit
 
-// MARK: - 05 DATA
+// MARK: - 02 DATA
 //
-// Dataset builder / inspector for the lattice training pipeline.
+// Dataset browser and inspector for the lattice training pipeline.
 //
-// Layout:
-//   SOURCE (OpaquePanel)    — data directory path field + Choose + Scan button
-//   SUMMARY (readout strip)  — HeroNumber (total examples) + ReadoutWells for files/tokens/avg/splits
-//   FILES TABLE (DataTable)  — one row per .jsonl file; selecting loads preview
-//   PREVIEW (OpaquePanel)    — first 5 prompt/completion pairs from the selected file
-//   BUILDER (OpaquePanel)    — two builder script commands with Copy buttons
+// Workflow (top → bottom):
+//   STEP 1 — POINT AT FOLDER: path field + Choose/Scan buttons. Defaults to <repoRoot>/data.
+//   STEP 2 — INSPECT: FILES TABLE (DataTable, one row per .jsonl) + PREVIEW HSplit.
+//             Selecting a file loads a preview and details in the right inspector.
+//   STEP 3 — SELECT FOR TRAINING: "Use for Training" button on the selected file sets
+//             store.workingDataset, which the TRAIN screen (⌘3) picks up.
+//             A persistent status bar shows the currently-selected training dataset.
+//   BUILDER SCRIPTS — two helper script commands (copy-only, v1 scope).
 //
-// File I/O is always off the main thread (Task.detached); state published on MainActor.
-// Cap: first 5 000 lines per file for counting; preview is the first 5 examples.
+// File I/O always runs off the main thread (Task.detached); state published on @MainActor.
+// Cap: first 5 000 lines per file for counting; preview shows the first 5 examples.
 
 // MARK: - Local data models
 
-/// One scanned JSONL file.
 struct DataLoadError: Error { let message: String }
 
 struct DatasetFileStat: Identifiable {
@@ -55,7 +56,7 @@ private let byteFormatter: ByteCountFormatter = {
     return f
 }()
 
-// MARK: - Button styles (mirrors ModelsScreen; local to this file)
+// MARK: - Button styles (local to this file; mirrors ModelsScreen)
 
 private struct PrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
@@ -108,20 +109,16 @@ let builderScripts: [BuilderScript] = [
 ]
 
 // MARK: - DataScreen
-//
-// Top-level nav destination (Screen.data, ⌘2).
-// Dataset builder / inspector for the lattice training pipeline.
-// The static `scanDirectory(path:)` helper backs this screen's own dataset scan.
 
 struct DataScreen: View {
     @Bindable var store: AppStore
 
     // MARK: Local state
 
-    @State private var didInitInspector = false
     @State private var dataDir: String = ""
     @State private var isScanning: Bool = false
     @State private var scanError: String? = nil
+    @State private var hasScanned: Bool = false  // true once scan() has been called
 
     @State private var files: [DatasetFileStat] = []
     @State private var selectedFileID: String? = nil
@@ -129,6 +126,9 @@ struct DataScreen: View {
     @State private var previewPairs: [PreviewPair] = []
     @State private var previewLoading: Bool = false
     @State private var previewError: String? = nil
+
+    // Transient confirmation flash after "Use for Training" is tapped
+    @State private var didConfirmTraining: Bool = false
 
     // MARK: Derived
 
@@ -149,7 +149,8 @@ struct DataScreen: View {
 
     private var subtitle: String {
         if isScanning { return "scanning…" }
-        if files.isEmpty { return "no files scanned yet — enter a directory and press Scan" }
+        if !hasScanned { return "point at a folder of .jsonl files — then inspect and select for training" }
+        if files.isEmpty { return "no .jsonl files found — try a different folder" }
         let cap = hasCappedFiles ? " · some files capped at 5 000 lines" : ""
         return "\(files.count) file\(files.count == 1 ? "" : "s") · \(totalExamples) examples\(cap)"
     }
@@ -162,30 +163,35 @@ struct DataScreen: View {
             subtitle: subtitle
         ) {
             VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                // 1. SOURCE — path field + buttons
+
+                // STEP 1 — POINT AT FOLDER
                 sourcePanel
 
-                // 2. SUMMARY — hero + readout wells
+                // Empty state: before first scan
+                if !hasScanned && !isScanning {
+                    firstScanEmptyState
+                }
+
+                // Empty state: scanned but nothing found
+                if hasScanned && !isScanning && files.isEmpty {
+                    noFilesEmptyState
+                }
+
+                // STEP 2 — INSPECT files and preview
                 if !files.isEmpty {
                     summaryStrip
+                    filesAndPreview
                 }
 
-                // 3. FILES TABLE + PREVIEW (HSplit)
+                // STEP 3 — TRAINING DATASET STATUS
                 if !files.isEmpty {
-                    HSplitView {
-                        // Files table (left/center)
-                        filesTable
-                            .frame(minWidth: 400)
-
-                        // Preview panel (right)
-                        previewPanel
-                            .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    trainingDatasetStatus
                 }
 
-                // 4. BUILDER scripts
-                builderPanel
+                // BUILDER SCRIPTS
+                if !files.isEmpty {
+                    builderPanel
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -194,18 +200,52 @@ struct DataScreen: View {
                 .inspectorColumnWidth(min: 260, ideal: 300, max: 320)
         }
         .onAppear {
-            openInspectorOnce()
-            // Default to repoRootPath/data, or fall back to empty
             if dataDir.isEmpty {
                 dataDir = (store.repoRootPath ?? "") + "/data"
             }
         }
     }
 
-    private func openInspectorOnce() {
-        guard !didInitInspector else { return }
-        didInitInspector = true
-        store.inspectorPresented = true
+    // MARK: - Empty states
+
+    private var firstScanEmptyState: some View {
+        VStack {
+            Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                EmptyStateView(
+                    systemImage: "tablecells",
+                    title: "Point at a folder of .jsonl files",
+                    message: "Enter a directory path above and press Scan. Each .jsonl file becomes one row — inspect its schema, row count, and first examples, then select it for LoRA training.",
+                    actionLabel: "Choose Directory"
+                ) {
+                    chooseDirectory()
+                }
+                Spacer()
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
+    }
+
+    private var noFilesEmptyState: some View {
+        VStack {
+            Spacer(minLength: 0)
+            HStack {
+                Spacer()
+                EmptyStateView(
+                    systemImage: "folder.badge.questionmark",
+                    title: "No .jsonl files found",
+                    message: "The folder has no .jsonl files at the top level or one level deep. Try choosing a different directory, or use the builder scripts below to create a dataset.",
+                    actionLabel: "Choose Different Directory"
+                ) {
+                    chooseDirectory()
+                }
+                Spacer()
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 220)
     }
 
     // MARK: - Inspector panel
@@ -222,7 +262,10 @@ struct DataScreen: View {
                             .lineLimit(2)
 
                         LazyVGrid(
-                            columns: [GridItem(.flexible(), spacing: Theme.Space.md), GridItem(.flexible(), spacing: Theme.Space.md)],
+                            columns: [
+                                GridItem(.flexible(), spacing: Theme.Space.md),
+                                GridItem(.flexible(), spacing: Theme.Space.md)
+                            ],
                             spacing: Theme.Space.md
                         ) {
                             ReadoutWell(
@@ -256,16 +299,28 @@ struct DataScreen: View {
                             .padding(Theme.Space.sm)
                             .readoutWellSurface()
                         }
+
+                        // "Use for Training" CTA in the inspector
+                        useForTrainingButton(file: file)
+                            .padding(.top, Theme.Space.sm)
                     }
                 }
                 .padding(Theme.Space.lg)
             }
             .instrumentPanel()
         } else {
-            VStack {
+            VStack(spacing: Theme.Space.sm) {
                 Spacer()
+                Image(systemName: "doc.text")
+                    .font(.system(size: 24))
+                    .foregroundStyle(Theme.Palette.textTertiary)
                 Text("SELECT A FILE")
                     .instrumentLabel()
+                Text("Select a .jsonl file from the table to inspect its schema, row count, and example pairs.")
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, Theme.Space.lg)
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -273,13 +328,25 @@ struct DataScreen: View {
         }
     }
 
-    // MARK: - SOURCE panel
+    // MARK: - SOURCE panel (Step 1)
 
     private var sourcePanel: some View {
         OpaquePanel {
             VStack(spacing: 0) {
+                // Section label
+                HStack {
+                    Text("STEP 1 — DATASET FOLDER")
+                        .instrumentLabel()
+                    Spacer()
+                }
+                .frame(height: Theme.Space.rowHeight)
+                .padding(.horizontal, Theme.Space.lg)
+                .overlay(alignment: .bottom) {
+                    Theme.Palette.hairline.frame(height: 1)
+                }
+
                 ParamRowField(
-                    label: "DATA DIR",
+                    label: "FOLDER",
                     text: $dataDir,
                     placeholder: "/path/to/data"
                 )
@@ -287,7 +354,6 @@ struct DataScreen: View {
                 HStack(spacing: Theme.Space.sm) {
                     Spacer()
 
-                    // Choose directory
                     Button {
                         chooseDirectory()
                     } label: {
@@ -296,7 +362,6 @@ struct DataScreen: View {
                     }
                     .buttonStyle(OutlineButtonStyle())
 
-                    // Scan — the one teal primary on this screen
                     Button {
                         scan()
                     } label: {
@@ -316,7 +381,6 @@ struct DataScreen: View {
                 .padding(.horizontal, Theme.Space.lg)
                 .padding(.vertical, Theme.Space.sm)
 
-                // Error banner
                 if let err = scanError {
                     HStack(spacing: Theme.Space.sm) {
                         GatePill(.fail, label: "scan error")
@@ -334,11 +398,10 @@ struct DataScreen: View {
         }
     }
 
-    // MARK: - SUMMARY strip
+    // MARK: - SUMMARY strip (Step 2 header)
 
     private var summaryStrip: some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
-            // Hero: total examples
             VStack(alignment: .leading, spacing: 0) {
                 HeroNumber(
                     value: totalExamples >= 5_000 && hasCappedFiles
@@ -352,35 +415,18 @@ struct DataScreen: View {
             .padding(Theme.Space.lg)
             .instrumentPanel()
 
-            // Readout wells
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 HStack(spacing: Theme.Space.sm) {
-                    ReadoutWell(
-                        label: "FILES",
-                        value: "\(files.count)"
-                    )
-                    ReadoutWell(
-                        label: "≈ TOKENS",
-                        value: formatLargeNumber(totalTokens)
-                    )
-                    ReadoutWell(
-                        label: "AVG LEN",
-                        value: "\(avgTokensPerExample)",
-                        unit: "tok"
-                    )
+                    ReadoutWell(label: "FILES", value: "\(files.count)")
+                    ReadoutWell(label: "≈ TOKENS", value: formatLargeNumber(totalTokens))
+                    ReadoutWell(label: "AVG LEN", value: "\(avgTokensPerExample)", unit: "tok")
                 }
 
                 if trainCount > 0 || validCount > 0 {
                     HStack(spacing: Theme.Space.sm) {
-                        ReadoutWell(
-                            label: "TRAIN",
-                            value: "\(trainCount)"
-                        )
+                        ReadoutWell(label: "TRAIN", value: "\(trainCount)")
                         if validCount > 0 {
-                            ReadoutWell(
-                                label: "VALID",
-                                value: "\(validCount)"
-                            )
+                            ReadoutWell(label: "VALID", value: "\(validCount)")
                         }
                         if hasCappedFiles {
                             VStack(alignment: .leading, spacing: 3) {
@@ -400,6 +446,33 @@ struct DataScreen: View {
         }
     }
 
+    // MARK: - FILES TABLE + PREVIEW (Step 2 body)
+
+    private var filesAndPreview: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            // Section label
+            HStack(spacing: Theme.Space.sm) {
+                Text("STEP 2 — SELECT A FILE TO INSPECT")
+                    .instrumentLabel()
+                if selectedFile == nil {
+                    Text("· click a row to preview it and see details in the inspector (⌘\\)")
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                }
+                Spacer()
+            }
+
+            HSplitView {
+                filesTable
+                    .frame(minWidth: 400)
+
+                previewPanel
+                    .frame(minWidth: 300, idealWidth: 400, maxWidth: 480)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
     // MARK: - FILES TABLE
 
     private var filesTable: some View {
@@ -415,11 +488,14 @@ struct DataScreen: View {
         .onChange(of: selectedFileID) { _, newID in
             if let id = newID, let file = files.first(where: { $0.id == id }) {
                 loadPreview(for: file)
-                store.workingDataset = file
+                // Open inspector automatically when a file is selected so the
+                // user can see the details without needing to know ⌘\.
+                if !store.inspectorPresented {
+                    store.inspectorPresented = true
+                }
             } else {
                 previewPairs = []
                 previewError = nil
-                store.workingDataset = nil
             }
         }
     }
@@ -433,7 +509,9 @@ struct DataScreen: View {
                 minWidth: 160,
                 isNumeric: false
             ) { row in
-                row.isCapped ? "\(row.name) *" : row.name
+                // Mark the currently-selected training dataset with a dot
+                let isTraining = store.workingDataset?.id == row.id
+                return (isTraining ? "● " : "") + (row.isCapped ? "\(row.name) *" : row.name)
             },
             ColumnDef(
                 id: "examples",
@@ -451,9 +529,9 @@ struct DataScreen: View {
                 minWidth: 90,
                 isNumeric: true
             ) { row in
-                // Capped files sum tokens over only the first 5 000 lines, so the
-                // total is a lower bound — mark it with "+" like the EXAMPLES column.
-                row.isCapped ? formatLargeNumber(row.approxTokens) + "+" : formatLargeNumber(row.approxTokens)
+                row.isCapped
+                    ? formatLargeNumber(row.approxTokens) + "+"
+                    : formatLargeNumber(row.approxTokens)
             },
             ColumnDef(
                 id: "avg",
@@ -504,20 +582,31 @@ struct DataScreen: View {
             }
             .padding(Theme.Space.lg)
             .instrumentPanel()
-        } else if previewPairs.isEmpty && selectedFileID == nil {
-            VStack {
+        } else if selectedFileID == nil {
+            VStack(spacing: Theme.Space.sm) {
                 Spacer()
+                Image(systemName: "text.alignleft")
+                    .font(.system(size: 24))
+                    .foregroundStyle(Theme.Palette.textTertiary)
                 Text("SELECT A FILE")
                     .instrumentLabel()
+                Text("Click any row in the table to preview its first examples here.")
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, Theme.Space.lg)
                 Spacer()
             }
             .frame(maxWidth: .infinity)
             .instrumentPanel()
         } else if previewPairs.isEmpty {
-            VStack {
+            VStack(spacing: Theme.Space.sm) {
                 Spacer()
                 Text("NO EXAMPLES")
                     .instrumentLabel()
+                Text("The file is empty or could not be parsed.")
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.inkDim)
                 Spacer()
             }
             .frame(maxWidth: .infinity)
@@ -525,7 +614,6 @@ struct DataScreen: View {
         } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.md) {
-                    // Preview header
                     HStack {
                         Text("PREVIEW")
                             .instrumentLabel()
@@ -542,7 +630,6 @@ struct DataScreen: View {
                     }
                     .padding(.horizontal, Theme.Space.sm)
 
-                    // Example pairs
                     ForEach(previewPairs) { pair in
                         exampleCard(pair)
                     }
@@ -555,7 +642,6 @@ struct DataScreen: View {
 
     private func exampleCard(_ pair: PreviewPair) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            // Header: example index
             HStack {
                 Text("EXAMPLE \(pair.id + 1)")
                     .instrumentLabel()
@@ -566,7 +652,6 @@ struct DataScreen: View {
             }
 
             if pair.isRaw {
-                // Raw unparsed line — show as-is
                 ScrollView(.horizontal, showsIndicators: false) {
                     Text(pair.prompt)
                         .font(Theme.Fonts.readout)
@@ -578,7 +663,6 @@ struct DataScreen: View {
                 .readoutWellSurface()
                 .padding(.vertical, 2)
             } else {
-                // PROMPT
                 VStack(alignment: .leading, spacing: 3) {
                     Text("PROMPT")
                         .instrumentLabel()
@@ -592,7 +676,6 @@ struct DataScreen: View {
                 .padding(Theme.Space.sm)
                 .readoutWellSurface()
 
-                // COMPLETION
                 VStack(alignment: .leading, spacing: 3) {
                     Text("COMPLETION")
                         .font(Theme.Fonts.label)
@@ -618,12 +701,132 @@ struct DataScreen: View {
         )
     }
 
+    // MARK: - STEP 3: TRAINING DATASET STATUS
+
+    /// Persistent bar that shows which dataset is queued for training and
+    /// exposes the "Use for Training" action for the currently selected file.
+    private var trainingDatasetStatus: some View {
+        OpaquePanel {
+            VStack(spacing: 0) {
+                // Section label
+                HStack {
+                    Text("STEP 3 — TRAINING DATASET")
+                        .instrumentLabel()
+                    Spacer()
+                    Text("consumed by TRAIN ⌘3")
+                        .font(Theme.Fonts.cell)
+                        .foregroundStyle(Theme.Palette.inkDim)
+                }
+                .frame(height: Theme.Space.rowHeight)
+                .padding(.horizontal, Theme.Space.lg)
+                .overlay(alignment: .bottom) {
+                    Theme.Palette.hairline.frame(height: 1)
+                }
+
+                // Current selection row
+                HStack(spacing: Theme.Space.sm) {
+                    if let ds = store.workingDataset {
+                        // Show dot + name to match the table indicator
+                        GatePill(.pass, label: "SELECTED")
+                        Text(ds.name)
+                            .font(Theme.Fonts.readout)
+                            .foregroundStyle(Theme.Palette.ink)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("·")
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                        Text(ds.isCapped ? "5 000+ examples" : "\(ds.exampleCount) examples")
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                        Spacer()
+                        // Navigate to TRAIN
+                        Button {
+                            store.selection = .train
+                        } label: {
+                            Text("Go to Train ⌘3")
+                                .font(Theme.Fonts.body)
+                        }
+                        .buttonStyle(PrimaryButtonStyle())
+                    } else {
+                        Image(systemName: "circle.dashed")
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .font(.system(size: 12))
+                        Text("No dataset selected for training")
+                            .font(Theme.Fonts.body)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                        Spacer()
+                        // Use selected file as training dataset
+                        if let file = selectedFile {
+                            useForTrainingButton(file: file)
+                        } else {
+                            Text("Select a file above")
+                                .font(Theme.Fonts.cell)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                    }
+                }
+                .frame(height: Theme.Space.rowHeight)
+                .padding(.horizontal, Theme.Space.lg)
+
+                // If a file is selected and it's NOT the current training dataset,
+                // offer to switch to it.
+                if let file = selectedFile, store.workingDataset?.id != file.id {
+                    HStack(spacing: Theme.Space.sm) {
+                        Text("Selected: \(file.name)")
+                            .font(Theme.Fonts.cell)
+                            .foregroundStyle(Theme.Palette.inkDim)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        useForTrainingButton(file: file)
+                    }
+                    .frame(height: Theme.Space.rowHeight)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .overlay(alignment: .top) {
+                        Theme.Palette.hairline.frame(height: 1)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The teal "Use for Training" button — sets store.workingDataset and shows a brief confirmation.
+    @ViewBuilder
+    private func useForTrainingButton(file: DatasetFileStat) -> some View {
+        if didConfirmTraining && store.workingDataset?.id == file.id {
+            // Brief confirmation label replaces the button
+            HStack(spacing: 4) {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Theme.Palette.signal)
+                    .font(.system(size: 11))
+                Text("Set for training")
+                    .font(Theme.Fonts.cell)
+                    .foregroundStyle(Theme.Palette.signal)
+            }
+        } else {
+            Button {
+                store.workingDataset = file
+                didConfirmTraining = true
+                // Clear the confirmation flash after 2 seconds
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(2))
+                    didConfirmTraining = false
+                }
+            } label: {
+                Text("Use for Training")
+                    .font(Theme.Fonts.body)
+            }
+            .buttonStyle(PrimaryButtonStyle())
+        }
+    }
+
     // MARK: - BUILDER panel
 
     private var builderPanel: some View {
         OpaquePanel {
             VStack(spacing: 0) {
-                // Section label row
                 HStack {
                     Text("BUILDER SCRIPTS")
                         .instrumentLabel()
@@ -648,7 +851,6 @@ struct DataScreen: View {
 
     private func scriptRow(_ script: BuilderScript) -> some View {
         HStack(spacing: Theme.Space.sm) {
-            // Command (mono)
             Text(script.command)
                 .font(Theme.Fonts.readout)
                 .foregroundStyle(Theme.Palette.ink)
@@ -658,7 +860,6 @@ struct DataScreen: View {
 
             Spacer()
 
-            // Description (dim)
             Text(script.description)
                 .font(Theme.Fonts.cell)
                 .foregroundStyle(Theme.Palette.inkDim)
@@ -666,7 +867,6 @@ struct DataScreen: View {
                 .truncationMode(.tail)
                 .frame(maxWidth: 280, alignment: .trailing)
 
-            // Copy button
             Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(script.command, forType: .string)
@@ -711,11 +911,13 @@ struct DataScreen: View {
         selectedFileID = nil
         previewPairs = []
         previewError = nil
+        didConfirmTraining = false
 
         Task.detached(priority: .userInitiated) {
             let result = await Self.scanDirectory(path: dir)
             await MainActor.run {
                 isScanning = false
+                hasScanned = true
                 switch result {
                 case .success(let stats):
                     files = stats
@@ -745,7 +947,7 @@ struct DataScreen: View {
         }
     }
 
-    // MARK: - File IO (off main thread)
+    // MARK: - File I/O (off main thread)
 
     static func scanDirectory(path: String) async -> Result<[DatasetFileStat], DataLoadError> {
         let dirURL = URL(fileURLWithPath: path, isDirectory: true)
@@ -756,7 +958,6 @@ struct DataScreen: View {
             return .failure(DataLoadError(message: "not a directory: \(path)"))
         }
 
-        // Collect .jsonl files: immediate children + one level of subdirectories
         var candidates: [URL] = []
 
         do {
@@ -769,7 +970,6 @@ struct DataScreen: View {
                 let vals = try? item.resourceValues(forKeys: [.isDirectoryKey])
                 let itemIsDir = vals?.isDirectory ?? false
                 if itemIsDir {
-                    // One level deep
                     if let sub = try? fm.contentsOfDirectory(
                         at: item,
                         includingPropertiesForKeys: [.isDirectoryKey],
@@ -802,7 +1002,6 @@ struct DataScreen: View {
     static func parseStat(for url: URL) -> DatasetFileStat {
         let fm = FileManager.default
 
-        // File size
         let sizeBytes: Int64
         if let attrs = try? fm.attributesOfItem(atPath: url.path),
            let sz = attrs[.size] as? Int64 {
@@ -811,7 +1010,6 @@ struct DataScreen: View {
             sizeBytes = 0
         }
 
-        // Read content (capped)
         let cap = 5_000
         guard let content = try? String(contentsOf: url, encoding: .utf8) else {
             return DatasetFileStat(
@@ -821,7 +1019,8 @@ struct DataScreen: View {
             )
         }
 
-        var lines = content.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        var lines = content.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         let isCapped = lines.count > cap
         if isCapped { lines = Array(lines.prefix(cap)) }
 
@@ -830,8 +1029,6 @@ struct DataScreen: View {
         let approxTokens = totalChars / 4
         let avgLen = exampleCount > 0 ? approxTokens / exampleCount : 0
 
-        // Real first-row schema: top-level JSON keys of the first example.
-        // Honest-nil when the line is not a JSON object (raw text, malformed, etc.).
         var schema: [String]? = nil
         if let first = lines.first,
            let d = first.data(using: .utf8),
@@ -842,8 +1039,7 @@ struct DataScreen: View {
         return DatasetFileStat(
             id: url.path, url: url, name: url.lastPathComponent,
             exampleCount: exampleCount, isCapped: isCapped,
-            approxTokens: approxTokens, avgLen: avgLen, sizeBytes: sizeBytes,
-            schema: schema
+            approxTokens: approxTokens, avgLen: avgLen, sizeBytes: sizeBytes, schema: schema
         )
     }
 
@@ -872,7 +1068,6 @@ struct DataScreen: View {
                     isRaw: false
                 ))
             } else {
-                // Could not parse as prompt/completion — show raw line
                 pairs.append(PreviewPair(
                     id: index,
                     prompt: line,
@@ -888,13 +1083,11 @@ struct DataScreen: View {
 
     // MARK: - Helpers
 
-    /// Truncate a string to `limit` characters with an ellipsis if longer.
     private func truncated(_ s: String, limit: Int) -> String {
         guard s.count > limit else { return s }
         return String(s.prefix(limit)) + "…"
     }
 
-    /// Format large numbers compactly: 1 234 → "1 234", 12 345 → "12.3k", 1 234 567 → "1.2M".
     private func formatLargeNumber(_ n: Int) -> String {
         switch n {
         case ..<10_000:

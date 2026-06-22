@@ -8,19 +8,22 @@ import AppKit
 // CONFIG:
 //   ParamRowPicker  MODEL  — BF16 models only
 //   FaderToggle             Q4 ↔ QuaRot
-//   ParamRowField   OUTPUT DIR  + "Choose…" button
+//   ParamRowField   OUTPUT DIR  + "Choose…" button   (defaults to modelCacheDir/<model>-<suffix>)
 //   ParamRowField   SEED  (QuaRot only, default "0xC0FFEE")
 //   ParamRowToggle  DRY RUN
+//   "Will write to: <path>"  resolved destination (honest-nil when no model selected)
 //   Primary CTA "▶ QUANTIZE"  (teal, disabled while running)
 //
 // LIVE / RESULT (driven by store.liveRun when kind is a quantize kind):
 //   While running: ReadoutWell LAYER progress + thin teal progress bar + GatePill(.run)
-//   Headline HeroNumber: ratio (counts up, .hero)
-//   MassBars: true-scale BF16 → method, appears once before/after MBs are non-nil
+//   MassBars: true-scale BF16 → method with animated ratio hero; or inline RATIO "—" on dry-run
 //   ContrastPair: SIZE / BITS / and for QuaRot a FORWARD-EQUIV row
 //   GatePill: PASS/WARN/FAIL from verdict (QuaRot), or PASS on done (Q4)
 //   Stop button while running
 //   Calm empty state when liveRun is nil or not a quantize kind
+//
+// Ratio rendered ONCE: inside MassBars (animated HeroNumber) when before/after MBs are known;
+// a plain "RATIO  —" ReadoutWell when they are absent (dry-run or mid-run). Never duplicated.
 
 struct QuantizeScreen: View {
     @Bindable var store: AppStore
@@ -230,6 +233,29 @@ struct QuantizeScreen: View {
 
                 Spacer()
 
+                // Destination path — "Will write to: <resolved path>" so Ocean knows
+                // the output is a NEW SIBLING in modelCacheDir, not an overwrite.
+                // Shows "—" when no model is selected (honest-nil).
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("WILL WRITE TO")
+                        .instrumentLabel()
+                        .padding(.horizontal, Theme.Space.lg)
+                    let destPath: String = {
+                        if outputDirText.isEmpty { return "—" }
+                        return outputDirText
+                    }()
+                    Text(destPath)
+                        .font(Theme.Fonts.mono(10))
+                        .foregroundStyle(Theme.Palette.inkDim)
+                        .lineLimit(3)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, Theme.Space.lg)
+                        .padding(.bottom, Theme.Space.sm)
+                }
+                .overlay(alignment: .top) {
+                    Theme.Palette.hairline.frame(height: 1)
+                }
+
                 // Primary CTA — exactly one teal-filled button per screen
                 Button {
                     launchQuantize()
@@ -266,10 +292,12 @@ struct QuantizeScreen: View {
                         progressStrip(run: run)
                     }
 
-                    // ── HERO RATIO (appears once ratio arrives) ─────────────
-                    heroRatioSection(run: run)
-
-                    // ── MASS BARS (appears once before+after arrive) ────────
+                    // ── RATIO + MASS BARS ────────────────────────────────────
+                    // The ratio is rendered EXACTLY ONCE.
+                    // When before/after MB arrive: MassBars owns the ratio (animated
+                    // HeroNumber at its top, true-scale bars beneath as context).
+                    // When MB values are absent (dry-run or mid-run before first event):
+                    // show an honest-nil ReadoutWell so the absence is explicit, not invisible.
                     if let before = run.quantBeforeMB, let after = run.quantAfterMB,
                        before > 0, after > 0 {
                         OpaquePanel {
@@ -281,6 +309,14 @@ struct QuantizeScreen: View {
                                 ratioLabel: "SMALLER",
                                 animated: true
                             )
+                            .padding(Theme.Space.lg)
+                        }
+                    } else {
+                        // Dry-run or pre-event: ratio is not yet known; show "—" explicitly.
+                        OpaquePanel {
+                            HStack(spacing: Theme.Space.lg) {
+                                ReadoutWell(label: "RATIO", value: "—")
+                            }
                             .padding(Theme.Space.lg)
                         }
                     }
@@ -331,26 +367,6 @@ struct QuantizeScreen: View {
                     .frame(height: 2)
                 }
             }
-            .padding(Theme.Space.lg)
-        }
-    }
-
-    // MARK: Hero ratio
-
-    @ViewBuilder
-    private func heroRatioSection(run: LiveRun) -> some View {
-        let ratioStr: String = {
-            if let r = run.quantRatio { return String(format: "%.2f×", r) }
-            return "—×"
-        }()
-
-        OpaquePanel {
-            HeroNumber(
-                value: ratioStr,
-                unit: "smaller",
-                size: .hero,
-                unitPosition: .below
-            )
             .padding(Theme.Space.lg)
         }
     }
@@ -442,13 +458,18 @@ struct QuantizeScreen: View {
             case .running:
                 return nil  // gate not shown while running
             case .done:
-                if run.kind == .quantizeQuaRot, let v = run.verdict {
+                if run.kind == .quantizeQuaRot {
+                    // Honest-nil: QuaRot's PASS is the forward-equivalence verdict parsed
+                    // from the "Forward-equiv: … (tol=…)" line. With no parsed verdict we
+                    // have NO basis to claim PASS — surface UNVERIFIED, never fabricate one.
+                    guard let v = run.verdict else { return .warn }
                     let upper = v.uppercased()
                     if upper.hasPrefix("PASS") { return .pass }
                     if upper.hasPrefix("WARN") { return .warn }
                     if upper.hasPrefix("FAIL") { return .fail }
+                    return .warn
                 }
-                // Q4 or QuaRot with no verdict string → PASS on done
+                // Q4 has no forward-equiv check — a clean completion is the pass condition.
                 return .pass
             case .failed:
                 return .fail
@@ -462,11 +483,13 @@ struct QuantizeScreen: View {
                 switch run.kind {
                 case .quantizeQuaRot:
                     if let v = run.verdict { return verdictLabel(v) }
-                    return gs == .pass ? "FORWARD-EQUIV PASS" : gs.label
+                    // No verdict parsed (e.g. a Forward-equiv line without tol=) → say so;
+                    // do not imply the equivalence check passed.
+                    return "FORWARD-EQUIV UNVERIFIED"
                 default:
-                    if let ratio = run.quantRatio,
-                       let after = run.quantAfterMB {
-                        return "Q4 ok \(sizeLabel(after)) \(String(format: "%.2f", ratio))× PASS"
+                    // Ratio already rendered once in MassBars — gate label omits it.
+                    if let after = run.quantAfterMB {
+                        return "Q4 ok \(sizeLabel(after)) PASS"
                     }
                     return "Q4 PASS"
                 }
@@ -508,11 +531,16 @@ struct QuantizeScreen: View {
         // Skip auto-derivation once the user has chosen a path explicitly via NSOpenPanel.
         guard outputDirText.isEmpty || !outputDirForced else { return }
         let suffix = isQuaRot ? "quarot" : "q4"
-        if let root = store.repoRootPath, !selectedModelName.isEmpty {
-            outputDirText = "\(root)/models/\(selectedModelName)-\(suffix)"
-        } else if !selectedModelName.isEmpty {
-            outputDirText = "models/\(selectedModelName)-\(suffix)"
+        guard !selectedModelName.isEmpty else {
+            outputDirText = ""
+            return
         }
+        // Default to modelCacheDir (<HOME>/.lattice/models or $LATTICE_MODEL_CACHE) so
+        // the quantized model appears immediately in the Models list after the run.
+        // The "-{suffix}" suffix makes it a NEW SIBLING directory — never an in-place
+        // overwrite of the source model. E.g. qwen3.5-0.8b → qwen3.5-0.8b-q4.
+        let cacheDir = LatticeBridge.modelCacheDir
+        outputDirText = cacheDir.appendingPathComponent("\(selectedModelName)-\(suffix)").path
     }
 
     /// True when the output dir was set via the chooser (not auto-derived).
@@ -543,8 +571,9 @@ struct QuantizeScreen: View {
         guard let model = resolvedModel else { return }
         let outputURL: URL
         if outputDirText.isEmpty {
+            // Fallback: derive from modelCacheDir (same policy as refreshOutputDir).
             let suffix = isQuaRot ? "quarot" : "q4"
-            outputURL = model.path.deletingLastPathComponent()
+            outputURL = LatticeBridge.modelCacheDir
                 .appendingPathComponent("\(model.name)-\(suffix)")
         } else {
             outputURL = URL(fileURLWithPath: outputDirText)

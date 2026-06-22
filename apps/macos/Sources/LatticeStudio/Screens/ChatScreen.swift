@@ -1,38 +1,35 @@
 import SwiftUI
 
-// MARK: - 02 CHAT
+// MARK: - 04 CHAT
 //
-// Redesigned as a focused, minimal chat interface with progressive disclosure.
+// Single-mode chat interface with run history.
 //
 // Layout (two zones inside ScreenScaffold):
 //   • TAB PICKER   — segmented control "Chat | History" (max 240pt, left-aligned).
-//                    In Chat tab: A/B mode picker on the right (max 160pt).
-//   • TRANSCRIPT   — scrollable column of chat bubbles (Chat tab), max-width 920pt, centered.
-//                    Single mode: one column of ChatTurn bubbles.
-//                    A/B compare mode: two equal columns (Base | Adapter), side by side.
+//                    In Chat tab: "New conversation" on the right.
+//   • TRANSCRIPT   — scrollable column of ChatTurn bubbles (Chat tab), max-width 920pt.
 //                    OR run-history DataTable + live banner (History tab).
 //   • COMPOSER     — rounded TextEditor with Send/Stop as a 30×30 in-composer button
 //                    (bottom-trailing overlay). Chat tab only; hidden in History tab.
 //
-// ScreenScaffold supplies the indexed header "02 · CHAT" + a subtitle line showing
-// the active model and adapter. All knobs (model, adapter, temperature, max tokens,
-// seed) live in a toggleable right-side .inspector sidebar using InspectorShell.
-// Inspector content switches on chatTab: Chat → settings; History → selected-run detail.
+// State ownership:
+//   All transcript + selection state lives in AppStore (hoisted from @State) so it
+//   survives NavigationSplitView teardown when Ocean navigates to another screen.
+//   ChatScreen reads/writes via @Bindable var store.
 //
-// Generation model: unchanged from prior implementation.
+// Generation model:
 //   generate_lora prints output ATOMICALLY. A "message" lifecycle is:
 //   launch via store.runGenerate(GenConfig) → status == .running →
 //   collect store.liveRun.genText (cumulative) → status == .done → copy into pending turn.
 //
 // Completion detection:
-//   .onChange(of: store.liveRun?.status) fires when the subprocess exits.
-//   awaitingTurnID: UUID? tracks which turn receives the result.
+//   Each run carries an onComplete hook (set in send()/retryTurn()) that
+//   AppStore.finish() fires when the subprocess exits — independent of ChatScreen being
+//   mounted, so a turn still resolves if Ocean navigates away mid-generation. It also
+//   fires with a failed status when another screen's launch() supersedes the run.
+//   store.chatAwaitingTurnID: UUID? tracks which turn receives the streamed text.
 //
-// A/B comparison:
-//   AppStore holds a SINGLE handle + liveRun; each runGenerate STOPS any prior run.
-//   A/B is therefore SEQUENTIAL: base completes (onComplete fires on MainActor) →
-//   adapter run starts. onComplete is the sequencing primitive; status.onChange is
-//   single-mode only (it guards on awaitingTurnID which compare mode never sets).
+// N-way generation compare (A/B and beyond) lives in EvalScreen (Stage 3).
 
 // MARK: - ChatTab
 
@@ -40,47 +37,6 @@ private enum ChatTab: String, CaseIterable {
     case chat    = "Chat"
     case history = "History"
 }
-
-// MARK: - ChatMode
-
-private enum ChatMode: String, CaseIterable {
-    case single  = "Single"
-    case compare = "A/B"
-}
-
-// MARK: - Local domain model (single mode)
-
-private struct ChatTurn: Identifiable {
-    enum TurnStatus { case running, done, failed }
-
-    let id = UUID()
-    let prompt: String
-    var responseText: String = ""
-    var status: TurnStatus = .running
-    var tokensPerSecond: Double? = nil
-}
-
-// MARK: - Compare domain model
-
-private struct ComparePair: Identifiable {
-    enum Side { case base, adapter }
-
-    let id = UUID()
-    let prompt: String           // raw user text (for display)
-    let baseLabel: String        // base model name, snapshotted at creation so the
-    let adapterLabel: String     // attribution survives later picker changes (codex B2)
-    var baseText: String = ""
-    var baseTokS: Double? = nil
-    var baseDone: Bool = false
-    var adapterText: String = ""
-    var adapterTokS: Double? = nil
-    var adapterDone: Bool = false
-    var failed: Bool = false
-}
-
-// MARK: - A/B phase tracker
-
-private enum ABPhase { case idle, base, adapter }
 
 // MARK: - Typing indicator dots
 
@@ -104,81 +60,8 @@ private struct TypingDots: View {
         }
         .onAppear { phase = 0 }
         .task {
-            // nudge phase so each dot has a unique animation offset
             try? await Task.sleep(nanoseconds: 50_000_000)
             phase = 1
-        }
-    }
-}
-
-// MARK: - Settings inspector content
-
-private struct ChatInspector: View {
-    let modelOptions: [ModelInfo]
-    @Binding var selectedModelName: String
-    let adapterOptions: [String]
-    @Binding var selectedAdapterName: String
-    @Binding var tempText: String
-    @Binding var maxTokensText: String
-    @Binding var seedText: String
-
-    var body: some View {
-        InspectorShell(title: "Settings") {
-            VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                // Model
-                settingsRow(label: "Model") {
-                    Picker("", selection: $selectedModelName) {
-                        ForEach(modelOptions, id: \.name) { model in
-                            Text(model.name).tag(model.name)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .font(Theme.Fonts.body)
-                    .disabled(modelOptions.count <= 1)
-                }
-
-                // Adapter
-                settingsRow(label: "Adapter") {
-                    Picker("", selection: $selectedAdapterName) {
-                        ForEach(adapterOptions, id: \.self) { name in
-                            Text(name).tag(name)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .font(Theme.Fonts.body)
-                    .disabled(adapterOptions.count <= 1)
-                }
-
-                Divider()
-
-                // Temperature
-                settingsRow(label: "Temperature") {
-                    LatticeNumericField(prompt: "0.7", text: $tempText, width: 64)
-                }
-
-                // Max tokens
-                settingsRow(label: "Max tokens") {
-                    LatticeNumericField(prompt: "256", text: $maxTokensText, width: 72)
-                }
-
-                // Seed
-                settingsRow(label: "Seed") {
-                    LatticeNumericField(prompt: "random", text: $seedText, width: 88)
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func settingsRow<Control: View>(label: String, @ViewBuilder control: () -> Control) -> some View {
-        HStack {
-            Text(label)
-                .font(Theme.Fonts.caption)
-                .foregroundStyle(Theme.Palette.textSecondary)
-            Spacer()
-            control()
         }
     }
 }
@@ -188,84 +71,82 @@ private struct ChatInspector: View {
 struct ChatScreen: View {
     @Bindable var store: AppStore
 
-    // MARK: Local state
+    // MARK: Local state (ephemeral; does NOT need to survive navigation)
 
     // Tab selection: Chat playground vs History (run notebook)
     @State private var chatTab: ChatTab = .chat
-    // History tab: selected run (owned here so selection survives tab switches)
+    // History tab: selected run (owned here so selection survives tab switches within Chat)
     @State private var selectedRunID: String?
-
-    // Chat mode: single or A/B compare
-    @State private var chatMode: ChatMode = .single
-
-    // Single-mode state
-    @State private var turns: [ChatTurn] = []
+    // Composer text is ephemeral — clearing on navigation is acceptable
     @State private var composerText: String = ""
-    @State private var awaitingTurnID: UUID?
 
-    // Compare-mode state
-    @State private var comparePairs: [ComparePair] = []
-    @State private var awaitingPairID: UUID? = nil
-    @State private var abPhase: ABPhase = .idle
+    // MARK: Store-backed derived helpers
 
-    // Model selection
-    @State private var selectedModelName: String = ""
-
-    // Settings (advanced, in inspector sidebar)
-    @State private var selectedAdapterName: String = "none"
-    @State private var tempText: String = "0.7"
-    @State private var maxTokensText: String = "256"
-    @State private var seedText: String = ""
-
-    // User-initiated stop: tracks which turn was running when Stop was pressed.
-    // A turn whose id matches this value is treated as a clean stop (partial text
-    // kept, not marked .failed) rather than an error.
-    @State private var userStoppedTurnID: UUID? = nil
-
-    // MARK: Derived helpers
-
-    // Only bf16 models can be chatted — q4/quarot require safetensors and
-    // generate_lora loads from_safetensors; embedding models are not generative.
+    // CPU mode (generate_lora): bf16 only — generate_lora loads from_safetensors.
+    // GPU mode (chat_metal): bf16 + q4 — Metal path supports both formats.
+    // Embedding models are never generative; excluded in both modes.
     private var chatModels: [ModelInfo] {
-        store.models.filter { $0.format == .bf16 }
+        if store.chatUseGPU {
+            store.models.filter { $0.format == .bf16 || $0.format == .q4 }
+        } else {
+            store.models.filter { $0.format == .bf16 }
+        }
     }
 
     private var selectedModel: ModelInfo? {
-        // If the current selection is still in the filtered list, keep it.
-        // Otherwise fall back to the first bf16 model (or nil if none exist).
-        if let m = chatModels.first(where: { $0.name == selectedModelName }) { return m }
+        if let m = chatModels.first(where: { $0.name == store.chatSelectedModelName }) { return m }
         return chatModels.first
     }
 
+    // All known adapters for the selected model (compatible + incompatible).
+    // The picker surfaces both so the user sees what exists and why some are unavailable.
+    private var allAdapters: [AdapterInfo] {
+        selectedModel?.adapters ?? []
+    }
+
     private var adapterOptions: [String] {
-        let adapters = selectedModel?.adapters.map(\.name) ?? []
-        return ["none"] + adapters
+        // All adapters appear in the picker — usable ones selectable, unusable ones shown
+        // with a reason so the user is never left wondering why an adapter is "missing".
+        return ["none"] + allAdapters.map(\.name)
     }
 
     private var selectedAdapter: AdapterInfo? {
-        guard selectedAdapterName != "none" else { return nil }
-        return selectedModel?.adapters.first { $0.name == selectedAdapterName }
+        guard store.chatSelectedAdapterName != "none" else { return nil }
+        // Only return an adapter that has a resolvable weight file — otherwise generation
+        // would silently run the base model under the adapter's label.
+        return selectedModel?.adapters.first {
+            $0.name == store.chatSelectedAdapterName && $0.weightFile != nil
+        }
     }
 
-    // isRunning is true while a single-mode run is in flight OR while either phase
-    // of A/B is active. This keeps the Stop button live and Send disabled in both modes.
+    /// Compatibility check for display. Returns nil when the adapter is usable, or a short
+    /// human-readable reason string when it cannot be loaded by `generate_lora`.
+    private func incompatibilityReason(for adapter: AdapterInfo) -> String? {
+        if adapter.weightFile == nil {
+            return "no weight file (.safetensors not found)"
+        }
+        return nil
+    }
+
+    // isRunning: true while a single-mode run is in-flight.
     private var isRunning: Bool {
         store.liveRun(matching: [.chat])?.status == .running
-            || abPhase != .idle
     }
 
     private var canSend: Bool {
         !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !isRunning
-            && !(chatMode == .compare && selectedAdapter == nil)
     }
 
-    // MARK: Subtitle
+    // MARK: Subtitle (model + disk availability; honest — never claims residency)
 
     private var subtitle: String {
         guard let model = selectedModel else { return "no models found" }
-        let adapterLabel = selectedAdapterName == "none" ? "no adapter" : selectedAdapterName
-        return "\(model.name) · \(adapterLabel)"
+        // "ready" when the model directory exists on disk; never claim "loaded" since
+        // the app shells out a fresh subprocess per generation and nothing stays in memory.
+        let diskStatus = FileManager.default.fileExists(atPath: model.path.path) ? "ready" : "not found"
+        let adapterLabel = selectedAdapter?.name ?? "no adapter"
+        return "\(model.name) · \(diskStatus) · \(adapterLabel)"
     }
 
     // MARK: Body
@@ -275,7 +156,7 @@ struct ChatScreen: View {
             VStack(spacing: 0) {
                 // Tab / mode picker row
                 HStack {
-                    // Chat | History tab picker — max 240pt, left-aligned
+                    // Chat | History tab picker
                     Picker("", selection: $chatTab) {
                         ForEach(ChatTab.allCases, id: \.self) { tab in
                             Text(tab.rawValue).tag(tab)
@@ -287,18 +168,18 @@ struct ChatScreen: View {
 
                     Spacer()
 
-                    // Single | A/B mode picker — only visible in Chat tab
+                    // "New conversation" — only visible in Chat tab
                     if chatTab == .chat {
-                        Picker("", selection: $chatMode) {
-                            ForEach(ChatMode.allCases, id: \.self) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
+                        // New conversation — clears transcript, keeps model/adapter/settings
+                        Button {
+                            newConversation()
+                        } label: {
+                            Label("New", systemImage: "square.and.pencil")
+                                .font(Theme.Fonts.body)
                         }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .frame(maxWidth: 160)
-                        // Disable A/B when no adapter is available for the current model
-                        .disabled(chatMode == .single && adapterOptions.count <= 1)
+                        .buttonStyle(LatticeSecondaryButtonStyle())
+                        .help("Start a new conversation (keeps model & settings)")
+                        .disabled(store.chatTurns.isEmpty)
                     }
                 }
                 .padding(.horizontal, Theme.Space.lg)
@@ -308,12 +189,7 @@ struct ChatScreen: View {
                 // Tab content
                 switch chatTab {
                 case .chat:
-                    switch chatMode {
-                    case .single:
-                        transcriptArea
-                    case .compare:
-                        compareTranscriptArea
-                    }
+                    transcriptArea
                     composerBar
                 case .history:
                     RunsContent(store: store, selectedRunID: $selectedRunID)
@@ -323,16 +199,8 @@ struct ChatScreen: View {
         .inspector(isPresented: $store.inspectorPresented) {
             switch chatTab {
             case .chat:
-                ChatInspector(
-                    modelOptions: chatModels,
-                    selectedModelName: $selectedModelName,
-                    adapterOptions: adapterOptions,
-                    selectedAdapterName: $selectedAdapterName,
-                    tempText: $tempText,
-                    maxTokensText: $maxTokensText,
-                    seedText: $seedText
-                )
-                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                settingsInspector
+                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
             case .history:
                 RunsContent(store: store, selectedRunID: $selectedRunID)
                     .inspectorPanel
@@ -341,43 +209,256 @@ struct ChatScreen: View {
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
-        .onChange(of: selectedModelName) { _, _ in
-            // Reset adapter when model changes.
-            selectedAdapterName = "none"
+        .onChange(of: store.chatUseGPU) { _, _ in
+            // Backend toggle changes the eligible model set (CPU drops Q4) — re-validate
+            // the selection so the picker never shows a model that isn't in chatModels.
+            applyDefaults()
         }
-        .onChange(of: store.liveRun?.status) { _, newStatus in
-            // This handler is SINGLE-MODE ONLY. It guards on awaitingTurnID,
-            // which compare mode never sets, so it is inert during A/B runs.
-            handleRunStatusChange(newStatus)
+        .onChange(of: store.chatSelectedModelName) { _, _ in
+            // Reset adapter when model changes.
+            store.chatSelectedAdapterName = "none"
         }
         .onChange(of: store.liveRun?.genText) { _, newText in
-            // Route streaming tokens to whichever mode is currently active.
+            // Route streaming tokens to the awaiting turn.
             guard store.liveRun?.kind == .chat else { return }
+            guard let turnID = store.chatAwaitingTurnID,
+                  let idx = store.chatTurns.firstIndex(where: { $0.id == turnID })
+            else { return }
+            store.chatTurns[idx].responseText = newText ?? ""
+        }
+    }
 
-            if chatMode == .single {
-                // Single mode: update the awaiting turn directly.
-                guard let turnID = awaitingTurnID,
-                      let idx = turns.firstIndex(where: { $0.id == turnID })
-                else { return }
-                turns[idx].responseText = newText ?? ""
+    // MARK: - Settings inspector (inline; binds directly to store)
 
-            } else {
-                // Compare mode: route to the correct column based on the current phase.
-                guard let pid = awaitingPairID,
-                      let idx = comparePairs.firstIndex(where: { $0.id == pid })
-                else { return }
-                switch abPhase {
-                case .base:
-                    comparePairs[idx].baseText = newText ?? ""
-                case .adapter:
-                    comparePairs[idx].adapterText = newText ?? ""
-                case .idle:
-                    break
+    @ViewBuilder
+    private var settingsInspector: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 0) {
+
+                // ── TARGET ──────────────────────────────────────────────────────────
+
+                Text("Target")
+                    .instrumentLabel()
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.top, Theme.Space.lg)
+                    .padding(.bottom, Theme.Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 0) {
+                    // Model picker — menu (may have many options; segmented would overflow)
+                    ParamRowMenu(
+                        label: "Model",
+                        options: chatModels.map(\.name),
+                        selection: Binding(
+                            get: { store.chatSelectedModelName },
+                            set: { store.chatSelectedModelName = $0 }
+                        )
+                    )
+                    .disabled(chatModels.count <= 1)
+
+                    // Backend — segmented CPU/GPU (two options; segmented is correct)
+                    ParamRowPicker(
+                        label: "Backend",
+                        options: ["CPU bf16", "GPU Metal"],
+                        selection: Binding(
+                            get: { store.chatUseGPU ? "GPU Metal" : "CPU bf16" },
+                            set: { store.chatUseGPU = ($0 == "GPU Metal") }
+                        )
+                    )
+
+                    // Disk status — honest, never claims "loaded"
+                    if let model = selectedModel {
+                        let exists = FileManager.default.fileExists(atPath: model.path.path)
+                        HStack(spacing: 6) {
+                            GatePill(exists ? .pass : .fail, label: exists ? "READY" : "NOT FOUND")
+                            if let liveRun = store.liveRun(matching: [.chat]),
+                               liveRun.status == .running {
+                                GatePill(.run, label: liveRun.genText.isEmpty ? "LOADING" : "GEN")
+                            }
+                            Spacer()
+                        }
+                        .frame(height: Theme.Space.rowHeight)
+                        .padding(.horizontal, Theme.Space.lg)
+                        .overlay(alignment: .bottom) {
+                            Theme.Palette.hairline.frame(height: 1)
+                        }
+                    }
+
+                    // Adapter picker — all adapters shown; incompatible ones labelled
+                    adapterPickerRow
                 }
+                .instrumentPanel()
+                .padding(.horizontal, Theme.Space.lg)
+
+                // ── SAMPLING ────────────────────────────────────────────────────────
+
+                Text("Sampling")
+                    .instrumentLabel()
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.top, Theme.Space.lg)
+                    .padding(.bottom, Theme.Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 0) {
+                    // Temperature — real flag: --temperature (default 0.7)
+                    ParamRowField(
+                        label: "Temperature",
+                        text: Binding(
+                            get: { store.chatTempText },
+                            set: { store.chatTempText = $0 }
+                        ),
+                        placeholder: "0.7"
+                    )
+
+                    // Top-k — real flag: --top-k (default 50)
+                    ParamRowField(
+                        label: "Top-k",
+                        text: Binding(
+                            get: { store.chatTopKText },
+                            set: { store.chatTopKText = $0 }
+                        ),
+                        placeholder: "50"
+                    )
+
+                    // Top-p — real flag: --top-p (default 0.9)
+                    ParamRowField(
+                        label: "Top-p",
+                        text: Binding(
+                            get: { store.chatTopPText },
+                            set: { store.chatTopPText = $0 }
+                        ),
+                        placeholder: "0.9"
+                    )
+
+                    // Repetition penalty — real flag: --repetition-penalty (default 1.1)
+                    ParamRowField(
+                        label: "Rep. penalty",
+                        text: Binding(
+                            get: { store.chatRepPenaltyText },
+                            set: { store.chatRepPenaltyText = $0 }
+                        ),
+                        placeholder: "1.1"
+                    )
+                }
+                .instrumentPanel()
+                .padding(.horizontal, Theme.Space.lg)
+
+                // ── GENERATION ──────────────────────────────────────────────────────
+
+                Text("Generation")
+                    .instrumentLabel()
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.top, Theme.Space.lg)
+                    .padding(.bottom, Theme.Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 0) {
+                    // Max tokens — real flag: --max-tokens (default 256)
+                    ParamRowField(
+                        label: "Max tokens",
+                        text: Binding(
+                            get: { store.chatMaxTokensText },
+                            set: { store.chatMaxTokensText = $0 }
+                        ),
+                        placeholder: "256"
+                    )
+
+                    // Seed — real flag: --seed (nil = non-deterministic)
+                    ParamRowField(
+                        label: "Seed",
+                        text: Binding(
+                            get: { store.chatSeedText },
+                            set: { store.chatSeedText = $0 }
+                        ),
+                        placeholder: "random"
+                    )
+                }
+                .instrumentPanel()
+                .padding(.horizontal, Theme.Space.lg)
+
+                // ── ACTIONS ─────────────────────────────────────────────────────────
+
+                Button("New conversation") {
+                    newConversation()
+                }
+                .buttonStyle(LatticeSecondaryButtonStyle())
+                .disabled(store.chatTurns.isEmpty)
+                .padding(.horizontal, Theme.Space.lg)
+                .padding(.top, Theme.Space.lg)
+                .padding(.bottom, Theme.Space.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .onChange(of: store.liveRun?.log.count) { _, _ in
-            // Belt-and-suspenders: log.count changes are noted; status onChange is the handler.
+        .background(Theme.Palette.panel)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// Adapter picker row that surfaces ALL adapters — compatible ones selectable,
+    /// incompatible ones shown with a reason so the user understands why they cannot be used.
+    @ViewBuilder
+    private var adapterPickerRow: some View {
+        HStack {
+            Text("Adapter")
+                .instrumentLabel()
+            Spacer()
+            Menu {
+                // "none" option always first
+                Button {
+                    store.chatSelectedAdapterName = "none"
+                } label: {
+                    if store.chatSelectedAdapterName == "none" {
+                        Label("none", systemImage: "checkmark")
+                    } else {
+                        Text("none")
+                    }
+                }
+
+                if !allAdapters.isEmpty {
+                    Divider()
+
+                    ForEach(allAdapters) { adapter in
+                        let reason = incompatibilityReason(for: adapter)
+                        let isSelected = store.chatSelectedAdapterName == adapter.name
+
+                        if let reason {
+                            // Incompatible: shown but disabled with a reason label.
+                            // The user sees it exists and WHY it cannot be used.
+                            Text("\(adapter.name) — \(reason)")
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                                .font(Theme.Fonts.caption)
+                        } else {
+                            Button {
+                                store.chatSelectedAdapterName = adapter.name
+                            } label: {
+                                if isSelected {
+                                    Label(adapter.name, systemImage: "checkmark")
+                                } else {
+                                    Text(adapter.name)
+                                }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                // Label shows current selection; incompatible selection shows "(incompatible)" hint
+                let selName = store.chatSelectedAdapterName
+                let isIncompatible: Bool = {
+                    guard selName != "none",
+                          let a = allAdapters.first(where: { $0.name == selName })
+                    else { return false }
+                    return incompatibilityReason(for: a) != nil
+                }()
+                Text(isIncompatible ? "\(selName) (!)" : selName)
+                    .font(Theme.Fonts.body)
+                    .foregroundStyle(isIncompatible ? Theme.Palette.amber : Theme.Palette.ink)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .frame(height: Theme.Space.rowHeight)
+        .padding(.horizontal, Theme.Space.lg)
+        .overlay(alignment: .bottom) {
+            Theme.Palette.hairline.frame(height: 1)
         }
     }
 
@@ -385,13 +466,13 @@ struct ChatScreen: View {
 
     @ViewBuilder
     private var transcriptArea: some View {
-        if turns.isEmpty {
+        if store.chatTurns.isEmpty {
             emptyState
         } else {
             ScrollViewReader { proxy in
                 ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
-                        ForEach(turns) { turn in
+                        ForEach(store.chatTurns) { turn in
                             turnView(turn)
                                 .id(turn.id)
                         }
@@ -401,15 +482,15 @@ struct ChatScreen: View {
                     .frame(maxWidth: Theme.Space.chatMaxWidth)
                     .frame(maxWidth: .infinity)
                 }
-                .onChange(of: turns.count) { _, _ in
-                    if let last = turns.last {
+                .onChange(of: store.chatTurns.count) { _, _ in
+                    if let last = store.chatTurns.last {
                         withAnimation(.easeOut(duration: Theme.Motion.focus)) {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
                 }
-                .onChange(of: turns.last?.responseText) { _, _ in
-                    if let last = turns.last {
+                .onChange(of: store.chatTurns.last?.responseText) { _, _ in
+                    if let last = store.chatTurns.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
@@ -464,38 +545,93 @@ struct ChatScreen: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     if turn.status == .running && turn.responseText.isEmpty {
-                        // Typing indicator before any tokens arrive
+                        // Typing indicator: distinguish "loading model" from "generating"
                         HStack(spacing: Theme.Space.xs) {
                             TypingDots()
-                            Text("Thinking…")
+                            let liveText = store.liveRun(matching: [.chat])?.genText ?? ""
+                            Text(liveText.isEmpty ? "Loading model…" : "Thinking…")
                                 .font(Theme.Fonts.caption)
                                 .foregroundStyle(Theme.Palette.textSecondary)
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
                         .background(assistantBubbleBackground)
-                    } else {
-                        // Response text — body font (prose-friendly, not mono)
-                        Text(turn.responseText.isEmpty ? "(no output)" : turn.responseText)
+
+                    } else if turn.status == .failed && turn.responseText.isEmpty {
+                        // Failed with NO output — show the engine reason, never silent "(no output)"
+                        let reason = turn.errorMessage ?? "Generation failed."
+                        Text(reason)
                             .font(Theme.Fonts.body)
-                            .foregroundStyle(
-                                turn.status == .failed
-                                    ? Theme.Palette.error
-                                    : Theme.Palette.ink
-                            )
+                            .foregroundStyle(Theme.Palette.error)
                             .multilineTextAlignment(.leading)
                             .textSelection(.enabled)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
                             .background(assistantBubbleBackground)
 
-                        // Optional tok/s — muted, small
+                        // Retry — re-launches the identical GenConfig
+                        if let cfg = turn.retryConfig {
+                            Button {
+                                retryTurn(turn: turn, config: cfg)
+                            } label: {
+                                Label("Retry", systemImage: "arrow.clockwise")
+                                    .font(Theme.Fonts.caption)
+                            }
+                            .buttonStyle(LatticeSecondaryButtonStyle())
+                            .disabled(isRunning)
+                            .padding(.leading, 4)
+                        }
+
+                    } else {
+                        // Normal response — ALWAYS ink color. Red is for errors only.
+                        // (Previous code used Theme.Palette.error for failed status regardless
+                        // of whether the text was a real error or a base/adapter reply.)
+                        Text(turn.responseText)
+                            .font(Theme.Fonts.body)
+                            .foregroundStyle(Theme.Palette.ink)
+                            .multilineTextAlignment(.leading)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(assistantBubbleBackground)
+
+                        // If the run failed but we got partial text, show the reason beneath
+                        if turn.status == .failed, let reason = turn.errorMessage {
+                            Text(reason)
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.error)
+                                .padding(.leading, 4)
+                        }
+
+                        // tok/s + honest hardware label — muted, small
+                        // The label was snapshotted at send time: "GPU Metal bf16", "CPU bf16", etc.
+                        // It is never updated retroactively so what launched is always what shows.
                         if let tps = turn.tokensPerSecond {
-                            Text(String(format: "%.1f tok/s", tps))
+                            let labelStr = turn.inferenceLabel.map { " · \($0)" } ?? ""
+                            Text(String(format: "%.1f tok/s\(labelStr)", tps))
                                 .font(Theme.Fonts.caption)
                                 .foregroundStyle(Theme.Palette.textTertiary)
                                 .monospacedDigit()
                                 .padding(.leading, 4)
+                        } else if let label = turn.inferenceLabel, turn.status == .running {
+                            // Show label while generating (before tok/s is known)
+                            Text(label)
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                                .padding(.leading, 4)
+                        }
+
+                        // Retry button for failed turns that do have partial text
+                        if turn.status == .failed, let cfg = turn.retryConfig {
+                            Button {
+                                retryTurn(turn: turn, config: cfg)
+                            } label: {
+                                Label("Retry", systemImage: "arrow.clockwise")
+                                    .font(Theme.Fonts.caption)
+                            }
+                            .buttonStyle(LatticeSecondaryButtonStyle())
+                            .disabled(isRunning)
+                            .padding(.leading, 4)
                         }
                     }
                 }
@@ -513,195 +649,6 @@ struct ChatScreen: View {
             )
     }
 
-    // MARK: - Compare transcript (A/B mode)
-
-    @ViewBuilder
-    private var compareTranscriptArea: some View {
-        if selectedAdapter == nil {
-            // No adapter selected — show inline hint, disable send via canSend guard
-            VStack {
-                Spacer()
-                    .frame(minHeight: 0)
-                    .frame(maxHeight: .infinity)
-                    .layoutPriority(-1)
-                Text("Select an adapter in Settings to compare against the base model.")
-                    .font(Theme.Fonts.body)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .padding(Theme.Space.lg)
-                    .frame(maxWidth: .infinity)
-                Spacer()
-                    .frame(minHeight: 0)
-                    .frame(maxHeight: .infinity)
-            }
-        } else if comparePairs.isEmpty {
-            VStack {
-                Spacer()
-                    .frame(minHeight: 0)
-                    .frame(maxHeight: .infinity)
-                    .layoutPriority(-1)
-                EmptyStateView(
-                    systemImage: "arrow.left.arrow.right",
-                    title: "A/B Compare",
-                    message: "Send a message to compare the base model against the adapter side by side."
-                )
-                .frame(maxWidth: .infinity)
-                Spacer()
-                    .frame(minHeight: 0)
-                    .frame(maxHeight: .infinity)
-            }
-        } else {
-            // Two-column split view
-            HStack(alignment: .top, spacing: 0) {
-                // Base column
-                compareColumn(
-                    header: "Base",
-                    pairs: comparePairs,
-                    side: .base
-                )
-
-                // Hairline divider between columns
-                Rectangle()
-                    .fill(Theme.Palette.hairline)
-                    .frame(width: 1)
-                    .frame(maxHeight: .infinity)
-
-                // Adapter column
-                compareColumn(
-                    header: "Adapter",
-                    pairs: comparePairs,
-                    side: .adapter
-                )
-            }
-        }
-    }
-
-    // A single side of the two-column compare layout
-    @ViewBuilder
-    private func compareColumn(
-        header: String,
-        pairs: [ComparePair],
-        side: ComparePair.Side
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Column header
-            Text(header)
-                .font(Theme.Fonts.caption)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.vertical, Theme.Space.sm)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Rectangle()
-                .fill(Theme.Palette.hairline)
-                .frame(height: 1)
-
-            // Scrollable pair list
-            ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    ForEach(pairs) { pair in
-                        comparePairCell(pair: pair, side: side)
-                            .id(pair.id)
-                    }
-                }
-                .padding(Theme.Space.md)
-            }
-        }
-        .frame(maxWidth: .infinity)
-    }
-
-    // One cell in a compare column: prompt label + response + tok/s + Δ chip
-    @ViewBuilder
-    private func comparePairCell(pair: ComparePair, side: ComparePair.Side) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.xs) {
-            // Prompt label
-            Text(pair.prompt)
-                .font(Theme.Fonts.caption)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .lineLimit(2)
-
-            // Per-pair attribution — which model/adapter produced this side.
-            // Read from the pair's snapshot, so a later picker change cannot relabel
-            // a completed result with the wrong model (codex B2).
-            Text(side == .base ? pair.baseLabel : pair.adapterLabel)
-                .font(Theme.Fonts.caption)
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .lineLimit(1)
-
-            // Response area
-            let isThisSideStreaming: Bool = {
-                guard let pid = awaitingPairID, pid == pair.id else { return false }
-                switch side {
-                case .base:    return abPhase == .base    && !pair.baseDone
-                case .adapter: return abPhase == .adapter && !pair.adapterDone
-                }
-            }()
-
-            let responseText: String = side == .base ? pair.baseText : pair.adapterText
-            let isDone: Bool         = side == .base ? pair.baseDone : pair.adapterDone
-
-            if isThisSideStreaming && responseText.isEmpty {
-                // Typing indicator before any tokens
-                HStack(spacing: Theme.Space.xs) {
-                    TypingDots()
-                    Text("Thinking…")
-                        .font(Theme.Fonts.caption)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(assistantBubbleBackground)
-            } else if !responseText.isEmpty || isDone {
-                Text(responseText.isEmpty ? "(no output)" : responseText)
-                    .font(Theme.Fonts.body)
-                    .foregroundStyle(pair.failed ? Theme.Palette.error : Theme.Palette.ink)
-                    .multilineTextAlignment(.leading)
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(assistantBubbleBackground)
-
-                // tok/s caption
-                let tokS: Double? = side == .base ? pair.baseTokS : pair.adapterTokS
-                if let tps = tokS {
-                    Text(String(format: "%.1f tok/s", tps))
-                        .font(Theme.Fonts.caption)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .monospacedDigit()
-                }
-
-                // Δ tok/s chip — only when both sides are done
-                if side == .adapter, pair.baseDone, pair.adapterDone,
-                   let baseS = pair.baseTokS, let adpS = pair.adapterTokS {
-                    let delta = adpS - baseS
-                    let positive = delta >= 0
-                    let label = positive
-                        ? String(format: "+%.1f tok/s", delta)
-                        : String(format: "%.1f tok/s", delta)
-                    Text(label)
-                        .font(Theme.Fonts.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(positive ? Theme.Palette.signal : Theme.Palette.crimson)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(positive
-                                      ? Theme.Palette.signal.opacity(0.12)
-                                      : Theme.Palette.crimson.opacity(0.12))
-                        )
-                }
-            } else {
-                // Waiting for this side to start (e.g. adapter not yet begun)
-                Text("Waiting…")
-                    .font(Theme.Fonts.caption)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-            }
-        }
-    }
-
     // MARK: - Composer
 
     private var composerBar: some View {
@@ -710,7 +657,6 @@ struct ChatScreen: View {
                 .fill(Theme.Palette.hairline)
                 .frame(height: 1)
 
-            // Centered 920-column composer, matching transcript column
             HStack {
                 composerField
                     .frame(maxWidth: Theme.Space.chatMaxWidth)
@@ -721,10 +667,9 @@ struct ChatScreen: View {
         }
     }
 
-    // The text field with an in-compositor Send/Stop button at the bottom-trailing edge.
     private var composerField: some View {
         ZStack(alignment: .topLeading) {
-            // Placeholder
+            // Placeholder — shown only when composer is empty
             if composerText.isEmpty {
                 Text("Message…")
                     .font(Theme.Fonts.body)
@@ -733,24 +678,29 @@ struct ChatScreen: View {
                     .padding(.top, 9)
                     .allowsHitTesting(false)
             }
-            // TextEditor — trailing padding reserves space for the 30×30 button
+            // TextEditor on macOS wraps NSTextView inside NSScrollView which shows
+            // always-on scrollers by default. `.scrollIndicators(.never)` suppresses
+            // them so the field looks like a native input area rather than a document.
             TextEditor(text: $composerText)
                 .font(Theme.Fonts.body)
                 .foregroundStyle(Theme.Palette.ink)
                 .scrollContentBackground(.hidden)
+                .scrollIndicators(.never)
                 .background(.clear)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
                 .padding(.trailing, 40)
         }
+        // Auto-grow: starts at 44pt (single line), expands up to 160pt when content fills.
+        // The outer frame clamps max height — the inner TextEditor fills it naturally.
         .frame(minHeight: 44, maxHeight: 160)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Theme.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
                 .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
         )
-        // In-composer Send / Stop button at bottom-trailing
         .overlay(alignment: .bottomTrailing) {
             actionButton
                 .padding(7)
@@ -760,27 +710,8 @@ struct ChatScreen: View {
     @ViewBuilder
     private var actionButton: some View {
         if isRunning {
-            // Stop button — works for both single and compare modes
             Button {
-                if chatMode == .single {
-                    userStoppedTurnID = awaitingTurnID
-                } else {
-                    // In A/B mode, stop current run and mark the pair as done with partial text
-                    if let pid = awaitingPairID,
-                       let idx = comparePairs.firstIndex(where: { $0.id == pid }) {
-                        switch abPhase {
-                        case .base:
-                            comparePairs[idx].baseDone = true
-                        case .adapter:
-                            comparePairs[idx].adapterDone = true
-                        case .idle:
-                            break
-                        }
-                        comparePairs[idx].failed = true
-                    }
-                    abPhase = .idle
-                    awaitingPairID = nil
-                }
+                store.chatUserStoppedTurnID = store.chatAwaitingTurnID
                 store.stopRun()
             } label: {
                 Image(systemName: "stop.fill")
@@ -795,14 +726,8 @@ struct ChatScreen: View {
             .buttonStyle(.plain)
             .help("Stop generation")
         } else {
-            // Send button — dispatches to the appropriate mode handler
             Button(action: {
-                switch chatMode {
-                case .single:
-                    send()
-                case .compare:
-                    sendCompare()
-                }
+                send()
             }) {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 13, weight: .semibold))
@@ -823,34 +748,30 @@ struct ChatScreen: View {
     // MARK: - Actions
 
     private func applyDefaults() {
-        // Pick the first bf16 model if the current selection is missing or not bf16-generative.
-        if selectedModelName.isEmpty || chatModels.first(where: { $0.name == selectedModelName }) == nil {
-            // Prefer the store's target model if it is bf16, otherwise take the first bf16 model.
+        if store.chatSelectedModelName.isEmpty ||
+           chatModels.first(where: { $0.name == store.chatSelectedModelName }) == nil {
             let target = store.targetModel
             if let t = target, t.format == .bf16 {
-                selectedModelName = t.name
+                store.chatSelectedModelName = t.name
             } else {
-                selectedModelName = chatModels.first?.name ?? ""
+                store.chatSelectedModelName = chatModels.first?.name ?? ""
             }
         }
     }
 
-    /// Render completed turns + newUserText as Qwen ChatML, mirroring the
-    /// authoritative `render_prompt` in crates/inference/src/bin/lattice.rs
-    /// (the /v1/chat/completions serve path). The tokenizer carries
-    /// <|im_start|>/<|im_end|> as special tokens and GenerateConfig's default
-    /// stop_token_ids includes <|im_end|>, so the assistant turn terminates
-    /// correctly. No trailing <|im_end|> is added after the final assistant tag.
-    /// No system prompt is included (matches the serve path where system is optional).
+    /// Clear conversation transcript while preserving model/adapter/settings selections.
+    private func newConversation() {
+        store.chatTurns = []
+        store.chatAwaitingTurnID = nil
+        store.chatUserStoppedTurnID = nil
+        if isRunning { store.stopRun() }
+    }
+
+    /// Build ChatML from completed turns (single-mode history as context).
     private func renderChatML(newUserText: String) -> String {
         var buf = ""
-        for turn in turns {
-            // Include only completed turns that have a successful, non-empty reply.
-            // Skip: currently-awaiting turn (status == .running), failed turns,
-            // and turns with empty responseText (nothing useful to provide as context).
-            guard turn.status == .done,
-                  !turn.responseText.isEmpty
-            else { continue }
+        for turn in store.chatTurns {
+            guard turn.status == .done, !turn.responseText.isEmpty else { continue }
             buf += "<|im_start|>user\n\(turn.prompt)<|im_end|>\n"
             buf += "<|im_start|>assistant\n\(turn.responseText)<|im_end|>\n"
         }
@@ -865,233 +786,190 @@ struct ChatScreen: View {
         let rawUserText = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rawUserText.isEmpty, !isRunning else { return }
 
-        // The user's visible bubble shows the RAW text they typed.
-        // The prompt sent to the binary is a full ChatML conversation string.
-        let turn = ChatTurn(prompt: rawUserText)
-        let turnID = turn.id
-        turns.append(turn)
-        awaitingTurnID = turnID
-
-        composerText = ""
-
-        // Parse settings — safe fallbacks, never crash, never force-unwrap.
-        let temperature = Double(tempText) ?? 0.7
-        let maxTokens = Int(maxTokensText) ?? 256
-        let seed: UInt64? = seedText.isEmpty ? nil : UInt64(seedText)
-
-        // Build the ChatML prompt AFTER the new turn is in the array so it is
-        // excluded by the guard (status == .running) in renderChatML.
+        let temperature = Double(store.chatTempText) ?? 0.7
+        let maxTokens = Int(store.chatMaxTokensText) ?? 256
+        let seed: UInt64? = store.chatSeedText.isEmpty ? nil : UInt64(store.chatSeedText)
+        let topK = Int(store.chatTopKText) ?? 50
+        let topP = Double(store.chatTopPText) ?? 0.9
+        let repetitionPenalty = Double(store.chatRepPenaltyText) ?? 1.1
         let chatMLPrompt = renderChatML(newUserText: rawUserText)
+        let useGPU = store.chatUseGPU
 
-        let cfg = GenConfig(
-            modelDir: selectedModel?.path,
-            model: selectedModel == nil ? (selectedModelName.isEmpty ? nil : selectedModelName) : nil,
-            adapterPath: selectedAdapter?.path,
+        // For Q4 models on the GPU path: the tokenizer lives in the bf16 sibling directory.
+        // The GPU binary (chat_metal) requires --tokenizer-dir when the model dir has no
+        // tokenizer.json. CPU path (generate_lora) ignores this flag.
+        let tokenizerDirURL: URL? = {
+            guard useGPU, let model = selectedModel, model.format == .q4 else { return nil }
+            // The bf16 sibling is the same name without a "-q4" / "-quarot" suffix.
+            let modelName = model.name
+            let baseName = modelName
+                .replacingOccurrences(of: "-q4", with: "", options: .caseInsensitive)
+                .replacingOccurrences(of: "-quarot", with: "", options: .caseInsensitive)
+            let siblingURL = LatticeBridge.modelCacheDir.appendingPathComponent(baseName, isDirectory: true)
+            let tokenizerJSON = siblingURL.appendingPathComponent("tokenizer.json")
+            return FileManager.default.fileExists(atPath: tokenizerJSON.path) ? siblingURL : nil
+        }()
+
+        // Honest hardware label — snapshotted at send time, never changes after dispatch.
+        // "GPU Metal q4" / "GPU Metal bf16" / "CPU bf16" / "GPU Metal bf16+LoRA" etc.
+        let inferenceLabel: String = {
+            let adapterTag = selectedAdapter != nil ? "+LoRA" : ""
+            if useGPU {
+                let fmtTag = (selectedModel?.format == .q4) ? "q4" : "bf16"
+                return "GPU Metal \(fmtTag)\(adapterTag)"
+            } else {
+                return "CPU bf16\(adapterTag)"
+            }
+        }()
+
+        // Snapshot GenConfig for Retry (plain types; no URL reference needed)
+        let retryCfg = ChatGenConfig(
+            modelDirPath: selectedModel?.path.path,
+            model: selectedModel == nil ? (store.chatSelectedModelName.isEmpty ? nil : store.chatSelectedModelName) : nil,
+            tokenizerDirPath: tokenizerDirURL?.path,
+            adapterFilePath: selectedAdapter?.weightFile?.path,
             prompt: chatMLPrompt,
             maxTokens: maxTokens,
             seed: seed,
-            temperature: temperature
+            temperature: temperature,
+            topK: topK,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            useGPU: useGPU
+        )
+
+        var turn = ChatTurn(prompt: rawUserText)
+        turn.retryConfig = retryCfg
+        turn.inferenceLabel = inferenceLabel
+        let turnID = turn.id
+        store.chatTurns.append(turn)
+        store.chatAwaitingTurnID = turnID
+
+        composerText = ""
+
+        let cfg = GenConfig(
+            modelDir: selectedModel?.path,
+            model: selectedModel == nil ? (store.chatSelectedModelName.isEmpty ? nil : store.chatSelectedModelName) : nil,
+            tokenizerDir: tokenizerDirURL,
+            adapterPath: selectedAdapter?.weightFile,
+            prompt: chatMLPrompt,
+            maxTokens: maxTokens,
+            seed: seed,
+            temperature: temperature,
+            topK: topK,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            useGPU: useGPU
         )
 
         let run = store.runGenerate(cfg)
 
-        // If the launch already failed synchronously, resolve immediately.
-        // onChange(of: status) fires only on a transition; a run that is already
-        // .failed when assigned produces no observable change, so we handle it here.
+        // Resolve via the run's own completion hook so the turn lands even if Ocean navigates
+        // away from Chat before generation finishes (the .onChange handlers only fire while
+        // ChatScreen is mounted). It also fires if another screen's launch() supersedes this
+        // run — finish() runs onComplete with a failed status, so the turn shows a real reason
+        // instead of a permanent spinner.
+        run.onComplete = { completed in
+            self.resolveTurn(id: turnID, from: completed, status: completed.status)
+        }
+
+        // Synchronous launch failure: no process started, so onComplete never fires.
         if run.status == .failed {
             resolveTurn(id: turnID, from: run, status: .failed)
         }
     }
 
-    // Resolve the awaiting turn with output from `run`.
-    // Shared between the inline synchronous-failure path and handleRunStatusChange.
+    /// Retry a failed/empty turn with its original GenConfig.
+    private func retryTurn(turn: ChatTurn, config: ChatGenConfig) {
+        guard !isRunning else { return }
+        guard let idx = store.chatTurns.firstIndex(where: { $0.id == turn.id }) else { return }
+
+        // Reset in-place to running state
+        store.chatTurns[idx].responseText = ""
+        store.chatTurns[idx].status = .running
+        store.chatTurns[idx].errorMessage = nil
+        store.chatTurns[idx].tokensPerSecond = nil
+        store.chatAwaitingTurnID = turn.id
+
+        let modelDir: URL? = config.modelDirPath.flatMap { URL(fileURLWithPath: $0) }
+        let tokenizerDir: URL? = config.tokenizerDirPath.flatMap { URL(fileURLWithPath: $0) }
+        let adapterPath: URL? = config.adapterFilePath.flatMap { URL(fileURLWithPath: $0) }
+        let cfg = GenConfig(
+            modelDir: modelDir,
+            model: config.model,
+            tokenizerDir: tokenizerDir,
+            adapterPath: adapterPath,
+            prompt: config.prompt,
+            maxTokens: config.maxTokens,
+            seed: config.seed,
+            temperature: config.temperature,
+            topK: config.topK,
+            topP: config.topP,
+            repetitionPenalty: config.repetitionPenalty,
+            useGPU: config.useGPU
+        )
+
+        let run = store.runGenerate(cfg)
+        run.onComplete = { [turnID = turn.id] completed in
+            self.resolveTurn(id: turnID, from: completed, status: completed.status)
+        }
+        if run.status == .failed {
+            resolveTurn(id: turn.id, from: run, status: .failed)
+        }
+    }
+
     private func resolveTurn(id turnID: UUID, from run: LiveRun, status: RunStatus) {
-        guard let idx = turns.firstIndex(where: { $0.id == turnID }) else { return }
+        guard let idx = store.chatTurns.firstIndex(where: { $0.id == turnID }) else { return }
+        // Idempotent: once a turn is resolved to .done/.failed, ignore repeat calls. The run's
+        // onComplete hook is authoritative; a synchronous-failure check can also land here.
+        guard store.chatTurns[idx].status == .running else { return }
 
-        // Was this turn stopped cleanly by the user (Stop button)?
-        let wasUserStopped = (userStoppedTurnID == turnID)
-
-        // Clear both awaiting and userStoppedTurnID before mutating to avoid re-entry.
-        awaitingTurnID = nil
-        userStoppedTurnID = nil
+        let wasUserStopped = (store.chatUserStoppedTurnID == turnID)
+        store.chatAwaitingTurnID = nil
+        store.chatUserStoppedTurnID = nil
 
         let responseText: String
         if !run.genText.isEmpty {
-            // Streaming path: genText holds the complete concatenated token stream.
             responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
-            // Non-streaming fallback (older binary or failure before any token):
-            // drop lines beginning with "$ " (command echo).
             let cleaned = run.log
                 .filter { !$0.hasPrefix("$ ") }
                 .joined(separator: "\n")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
             if cleaned.isEmpty && status == .failed {
-                responseText = wasUserStopped ? "Stopped." : (run.log.last ?? "Generation failed to start.")
+                responseText = wasUserStopped ? "Stopped." : ""
             } else {
                 responseText = cleaned
             }
         }
 
-        turns[idx].responseText = responseText
+        store.chatTurns[idx].responseText = responseText
 
         if wasUserStopped {
-            // Clean stop: keep whatever partial text arrived, mark done so it is
-            // not styled as an error. (If partial text is non-empty it reads
-            // naturally as a truncated reply; if empty it reads "Stopped.".)
-            turns[idx].status = .done
+            store.chatTurns[idx].status = .done
         } else {
-            turns[idx].status = (status == .done) ? .done : .failed
+            store.chatTurns[idx].status = (status == .done) ? .done : .failed
+        }
+
+        // Surface engine error for failed turns with no output.
+        if store.chatTurns[idx].status == .failed && responseText.isEmpty {
+            let errorLine = run.log
+                .filter { !$0.hasPrefix("$ ") }
+                .last { line in
+                    let lo = line.lowercased()
+                    return lo.contains("error") || lo.contains("nan") ||
+                           lo.contains("unrecognized") || lo.contains("failed") ||
+                           lo.contains("panic")
+                }
+                ?? run.log.filter { !$0.hasPrefix("$ ") }.last
+                ?? "Generation failed to start."
+            store.chatTurns[idx].errorMessage = errorLine
         }
 
         if status == .done || wasUserStopped {
-            turns[idx].tokensPerSecond = run.genTokS
+            store.chatTurns[idx].tokensPerSecond = run.genTokS
         }
     }
 
-    private func handleRunStatusChange(_ newStatus: RunStatus?) {
-        // SINGLE-MODE ONLY. awaitingTurnID is never set in compare mode,
-        // so this guard makes the handler inert during A/B runs.
-        guard let status = newStatus,
-              status == .done || status == .failed,
-              let turnID = awaitingTurnID,
-              let run = store.liveRun(matching: [.chat])
-        else { return }
-
-        resolveTurn(id: turnID, from: run, status: status)
-    }
-
-    // MARK: - A/B compare send (sequential: base → adapter via onComplete)
-
-    private func sendCompare() {
-        let rawUserText = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawUserText.isEmpty, !isRunning, let adapter = selectedAdapter else { return }
-
-        // Build ChatML using the single-mode turns history for context.
-        // Compare pairs are independent A/B experiments and are not fed back
-        // into the conversation context (they are evaluation runs, not multi-turn chat).
-        let chatMLPrompt = renderChatML(newUserText: rawUserText)
-
-        // Create the pair and set state before launching the run.
-        let pair = ComparePair(
-            prompt: rawUserText,
-            baseLabel: selectedModel?.name ?? (selectedModelName.isEmpty ? "base model" : selectedModelName),
-            adapterLabel: adapter.name
-        )
-        let pairID = pair.id
-        comparePairs.append(pair)
-        awaitingPairID = pairID
-        abPhase = .base
-
-        composerText = ""
-
-        // Parse settings — safe fallbacks.
-        let temperature = Double(tempText) ?? 0.7
-        let maxTokens = Int(maxTokensText) ?? 256
-        let seed: UInt64? = seedText.isEmpty ? nil : UInt64(seedText)
-
-        // Snapshot the adapter path now; the selection could change before the
-        // adapter phase starts if the user interacts with the inspector.
-        let adapterPath = adapter.path
-        let modelDir = selectedModel?.path
-        let modelName: String? = selectedModel == nil
-            ? (selectedModelName.isEmpty ? nil : selectedModelName)
-            : nil
-
-        // Phase 1: base run (adapterPath = nil)
-        let baseCfg = GenConfig(
-            modelDir: modelDir,
-            model: modelName,
-            adapterPath: nil,
-            prompt: chatMLPrompt,
-            maxTokens: maxTokens,
-            seed: seed,
-            temperature: temperature
-        )
-        let baseRun = store.runGenerate(baseCfg)
-
-        // onComplete fires on MainActor after AppStore.finish() is called.
-        // It sequences the adapter run as Phase 2.
-        baseRun.onComplete = { [adapterPath, modelDir, modelName, maxTokens, seed, temperature, chatMLPrompt, pairID] completed in
-            // Update base side result.
-            guard let idx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
-                self.abPhase = .idle
-                self.awaitingPairID = nil
-                return
-            }
-            self.comparePairs[idx].baseText = completed.genText
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            self.comparePairs[idx].baseTokS = completed.genTokS
-            self.comparePairs[idx].baseDone = true
-
-            // Only sequence the adapter phase if the base run completed cleanly.
-            // A user Stop terminates the process with a non-zero code → status .failed
-            // (RunStatus has no distinct .stopped case), so guarding on .done is what
-            // prevents a stopped base with partial output from still launching phase 2
-            // (codex B1 — the old `failed && genText.isEmpty` check let it through).
-            guard completed.status == .done else {
-                self.comparePairs[idx].failed = true
-                self.comparePairs[idx].adapterDone = true
-                self.abPhase = .idle
-                self.awaitingPairID = nil
-                return
-            }
-
-            // Phase 2: adapter run
-            self.abPhase = .adapter
-
-            let adpCfg = GenConfig(
-                modelDir: modelDir,
-                model: modelName,
-                adapterPath: adapterPath,
-                prompt: chatMLPrompt,
-                maxTokens: maxTokens,
-                seed: seed,
-                temperature: temperature
-            )
-            let adpRun = self.store.runGenerate(adpCfg)
-
-            adpRun.onComplete = { [pairID] done2 in
-                guard let adpIdx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
-                    self.abPhase = .idle
-                    self.awaitingPairID = nil
-                    return
-                }
-                self.comparePairs[adpIdx].adapterText = done2.genText
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                self.comparePairs[adpIdx].adapterTokS = done2.genTokS
-                self.comparePairs[adpIdx].adapterDone = true
-                if done2.status == .failed && done2.genText.isEmpty {
-                    self.comparePairs[adpIdx].failed = true
-                }
-                self.abPhase = .idle
-                self.awaitingPairID = nil
-            }
-
-            // Handle synchronous failure of the adapter run launch.
-            if adpRun.status == .failed {
-                guard let adpIdx = self.comparePairs.firstIndex(where: { $0.id == pairID }) else {
-                    self.abPhase = .idle
-                    self.awaitingPairID = nil
-                    return
-                }
-                self.comparePairs[adpIdx].adapterDone = true
-                self.comparePairs[adpIdx].failed = true
-                self.abPhase = .idle
-                self.awaitingPairID = nil
-            }
-        }
-
-        // Handle synchronous failure of the base run launch.
-        if baseRun.status == .failed {
-            if let idx = comparePairs.firstIndex(where: { $0.id == pairID }) {
-                comparePairs[idx].baseDone = true
-                comparePairs[idx].adapterDone = true
-                comparePairs[idx].failed = true
-            }
-            abPhase = .idle
-            awaitingPairID = nil
-        }
-    }
 }

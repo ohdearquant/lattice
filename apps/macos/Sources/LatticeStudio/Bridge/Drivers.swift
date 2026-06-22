@@ -115,17 +115,27 @@ struct QuantConfig {
 
 // MARK: - GenConfig
 
-/// Configuration for `generate_lora` (single-shot generation with optional adapter).
+/// Configuration for `generate_lora` (CPU BF16) or `chat_metal` (GPU Metal bf16/q4).
 ///
 /// Either `modelDir` or `model` must be provided; `modelDir` takes priority when both
 /// are set (the binary accepts both flags and uses whichever it sees).
-/// generate_lora streams per-token `gen_token` events in `--json` mode (always enabled via args).
+///
+/// Both binaries emit identical `@@lattice gen_token` streaming events, so the app
+/// parser needs no changes when switching between CPU and GPU paths.
+///
+/// Honest-label contract: the *caller* (ChatScreen.send) sets `useGPU` to select the
+/// binary and also embeds the label string in the bubble at send time. There is no path
+/// where a CPU run appears labelled as GPU.
 struct GenConfig {
     /// Full path to the model directory. Takes priority over `model` when set.
     var modelDir: URL? = nil
     /// Model name under `$LATTICE_MODEL_CACHE / $HOME/.lattice/models/`. Used when
     /// `modelDir` is nil.
     var model: String? = nil
+    /// Tokenizer directory override. Required for Q4 models (no embedded tokenizer.json).
+    /// When set, `--tokenizer-dir` is appended to the arg array.
+    /// Ignored by `generate_lora` (unknown flag, silently dropped).
+    var tokenizerDir: URL? = nil
     /// Path to a `.safetensors` LoRA adapter file. Nil = run base model only.
     var adapterPath: URL? = nil
     /// Text prompt fed to the model.
@@ -136,6 +146,18 @@ struct GenConfig {
     var seed: UInt64? = nil
     /// Sampling temperature. Default 0.7.
     var temperature: Double = 0.7
+    /// Top-k nucleus cutoff. Default 50. Passed as `--top-k` to both binaries.
+    /// (verified: generate_lora + chat_metal both accept this flag, 2026-06-22).
+    var topK: Int = 50
+    /// Top-p nucleus cutoff. Default 0.9. Passed as `--top-p` to both binaries.
+    /// (verified: generate_lora + chat_metal both accept this flag, 2026-06-22).
+    var topP: Double = 0.9
+    /// Repetition penalty. Default 1.1. Passed as `--repetition-penalty` to both binaries.
+    /// (verified: generate_lora + chat_metal both accept this flag, 2026-06-22).
+    var repetitionPenalty: Double = 1.1
+    /// When true, dispatch to `chat_metal` (GPU Metal) instead of `generate_lora` (CPU).
+    /// Setting this to true on a non-bf16 model is valid: chat_metal auto-detects Q4.
+    var useGPU: Bool = false
 
     /// The exact argument array passed to the subprocess.
     var args: [String] {
@@ -145,14 +167,20 @@ struct GenConfig {
         } else if let name = model {
             a += ["--model", name]
         }
+        if let tokDir = tokenizerDir {
+            a += ["--tokenizer-dir", tokDir.path]
+        }
         if let adapter = adapterPath {
             a += ["--lora", adapter.path]
         }
         a += [
-            "--prompt",     prompt,
-            "--max-tokens", String(maxTokens),
+            "--prompt",      prompt,
+            "--max-tokens",  String(maxTokens),
             "--temperature", String(temperature),
-            "--json",         // streaming gen_token event protocol; older binaries ignore unknown flags
+            "--top-k",       String(topK),
+            "--top-p",       String(topP),
+            "--repetition-penalty", String(repetitionPenalty),
+            "--json",         // streaming gen_token event protocol; both binaries honour this flag
         ]
         if let s = seed {
             a += ["--seed", String(s)]
@@ -230,6 +258,20 @@ struct EmbedConfig {
         }
         a.append("--json")       // structured @@lattice embed_done event protocol
         return a
+    }
+}
+
+// MARK: - DownloadConfig
+
+/// Configuration for `embed --model <name> --download-only --json`.
+///
+/// Verified contract: the embed binary emits exactly one `@@lattice download_done` event
+/// on stdout, then exits 0 (success) or 1 (failure). No `--text` is needed.
+struct DownloadConfig {
+    var canonicalName: String
+
+    var args: [String] {
+        ["--model", canonicalName, "--download-only", "--json"]
     }
 }
 
@@ -313,7 +355,147 @@ extension AppStore {
         )
     }
 
-    /// Launch `generate_lora` (single-shot; output arrives as one `.status` burst).
+    /// Download an embedding model via `embed --model <name> --download-only --json`.
+    ///
+    /// Spawns a dedicated RunHandle (separate from `liveRun`) so downloads do not evict
+    /// a running training/eval job. State changes (downloadingModels, downloadErrors) are
+    /// always published on the main actor. On success, calls refreshModels() so the new
+    /// model appears in the table and the "Get Models" sheet flips the row to INSTALLED.
+    @MainActor
+    func downloadModel(canonicalName: String) {
+        downloadErrors.removeValue(forKey: canonicalName)
+        downloadingModels.insert(canonicalName)
+
+        guard let spec = LatticeBridge.launchSpec(.embed, args: DownloadConfig(canonicalName: canonicalName).args) else {
+            downloadingModels.remove(canonicalName)
+            downloadErrors[canonicalName] = "embed binary not found — run `make build` first"
+            return
+        }
+
+        let h = RunHandle()
+        let hid = ObjectIdentifier(h)
+        var sawDone = false
+
+        h.onEvent = { [weak self] ev in
+            guard let self = self else { return }
+            if case .downloadDone(let d) = ev {
+                sawDone = true
+                self.downloadingModels.remove(canonicalName)
+                if d.ok {
+                    self.refreshModels()
+                } else {
+                    self.downloadErrors[canonicalName] = d.error ?? "download failed (no error message)"
+                }
+            }
+        }
+        h.onExit = { [weak self] code in
+            guard let self = self else { return }
+            self._downloadHandles.removeValue(forKey: hid)
+            // Guard against a binary that exits without emitting download_done.
+            if !sawDone {
+                self.downloadingModels.remove(canonicalName)
+                if code != 0 {
+                    self.downloadErrors[canonicalName] = "embed exited with code \(code)"
+                } else {
+                    self.refreshModels()
+                }
+            }
+        }
+
+        do {
+            try h.start(spec)
+            // Stash after successful start so the handle lives until onExit fires.
+            _downloadHandles[hid] = h
+        } catch {
+            downloadingModels.remove(canonicalName)
+            downloadErrors[canonicalName] = "launch failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Import a model folder from disk into the model cache.
+    ///
+    /// Validates that the chosen folder contains `config.json` AND at least one
+    /// `.safetensors` file before touching the cache. Copies off the main thread;
+    /// publishes state on the main actor. Calls refreshModels() on success.
+    @MainActor
+    func importModel(from url: URL) {
+        let folderName = url.lastPathComponent
+        importError = nil
+        importingModel = folderName
+
+        Task.detached(priority: .userInitiated) {
+            let fm = FileManager.default
+
+            // Validate: must have config.json
+            let configURL = url.appendingPathComponent("config.json")
+            guard fm.fileExists(atPath: configURL.path) else {
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.importError = "'\(folderName)' has no config.json — not a model directory"
+                }
+                return
+            }
+
+            // Validate: must have at least one .safetensors file
+            let children = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+            let hasSafetensors = children.contains { $0.pathExtension == "safetensors" }
+            guard hasSafetensors else {
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.importError = "'\(folderName)' has no .safetensors files — not a model directory"
+                }
+                return
+            }
+
+            let dest = LatticeBridge.modelCacheDir.appendingPathComponent(folderName, isDirectory: true)
+
+            // Refuse to overwrite an existing model to prevent silent data loss.
+            if fm.fileExists(atPath: dest.path) {
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.importError = "'\(folderName)' already exists in the model cache — remove it first if you want to replace it"
+                }
+                return
+            }
+
+            // Ensure the model cache directory exists.
+            do {
+                try fm.createDirectory(at: LatticeBridge.modelCacheDir, withIntermediateDirectories: true)
+            } catch {
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.importError = "could not create model cache directory: \(error.localizedDescription)"
+                }
+                return
+            }
+
+            // Copy to a hidden staging sibling on the same volume, then atomically rename
+            // into place. A crash mid-copy leaves only `.importing-<name>` (skipped by
+            // discoverModels via skipsHiddenFiles), never a half-written model at `dest`.
+            let staging = LatticeBridge.modelCacheDir.appendingPathComponent(".importing-\(folderName)", isDirectory: true)
+            try? fm.removeItem(at: staging)
+            do {
+                try fm.copyItem(at: url, to: staging)
+                try fm.moveItem(at: staging, to: dest)
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.refreshModels()
+                }
+            } catch {
+                try? fm.removeItem(at: staging)
+                await MainActor.run {
+                    self.importingModel = ""
+                    self.importError = "copy failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// Launch `generate_lora` (CPU BF16) or `chat_metal` (GPU Metal), per `config.useGPU`.
+    ///
+    /// Both binaries emit identical `@@lattice gen_token` streaming events. The caller
+    /// (ChatScreen.send) must embed the honest hardware label ("GPU Metal" / "CPU bf16") in
+    /// the turn bubble AT SEND TIME — this method never inspects or fabricates that label.
     @discardableResult
     @MainActor
     func runGenerate(_ config: GenConfig) -> LiveRun {
@@ -327,10 +509,11 @@ extension AppStore {
             let prefix = config.prompt.prefix(24)
             modelName = prefix.isEmpty ? "generate_lora" : "\(prefix)…"
         }
+        let binary: LatticeBinary = config.useGPU ? .chatMetal : .generateLora
         return launch(
-            .generateLora,
+            binary,
             args: config.args,
-            kind: .chat,     // closest RunKind for inference; no .generate case exists
+            kind: .chat,
             model: modelName,
             totalSteps: nil
         )

@@ -11,6 +11,7 @@ enum LatticeBinary {
     case quantizeQ4           // lattice-inference
     case quantizeQuaRot       // lattice-inference
     case generateLora         // lattice-tune, features: safetensors,inference-hook
+    case chatMetal            // lattice-inference, features: f16,metal-gpu — GPU Metal inference
     case lattice              // lattice-inference — `chat` / `serve` subcommands
     case qwen35Generate       // lattice-inference
     case evalPerplexity       // lattice-inference — strided sliding-window perplexity (ADR-044)
@@ -22,6 +23,7 @@ enum LatticeBinary {
         case .quantizeQ4:     "quantize_q4"
         case .quantizeQuaRot: "quantize_quarot"
         case .generateLora:   "generate_lora"
+        case .chatMetal:      "chat_metal"
         case .lattice:        "lattice"
         case .qwen35Generate: "qwen35_generate"
         case .evalPerplexity: "eval_perplexity"
@@ -37,10 +39,11 @@ enum LatticeBinary {
     }
     var features: [String] {
         switch self {
-        case .trainGradFull: ["train-backward"]
-        case .generateLora:  ["safetensors", "inference-hook"]
+        case .trainGradFull:  ["train-backward"]
+        case .generateLora:   ["safetensors", "inference-hook"]
         case .evalPerplexity: ["f16", "metal-gpu"]
-        default:             []
+        case .chatMetal:      ["f16", "metal-gpu"]
+        default:              []
         }
     }
 }
@@ -59,7 +62,25 @@ enum LatticeBridge {
         if let env = ProcessInfo.processInfo.environment["LATTICE_REPO_ROOT"] {
             return URL(fileURLWithPath: env, isDirectory: true)
         }
-        var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        // Walk up from the cwd first (dev / CLI / `swift run` launch), then from the app
+        // bundle's own location. A Finder-launched .app has cwd=/, so the cwd walk fails;
+        // but a packaged .app living inside a checkout (apps/macos/dist/LatticeStudio.app)
+        // still finds the repo root via its bundle path — which is what makes adapter
+        // discovery work in the packaged app. A .app moved outside any checkout (e.g.
+        // /Applications) resolves neither and returns nil: honest, there is no source tree.
+        for start in [
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+            Bundle.main.bundleURL
+        ] {
+            if let root = ascendToRepoRoot(from: start) { return root }
+        }
+        return nil
+    }
+
+    /// Ascend up to 10 levels from `start` looking for a directory that holds both
+    /// `crates/` and `Cargo.toml` — the lattice workspace root.
+    private static func ascendToRepoRoot(from start: URL) -> URL? {
+        var dir = start
         for _ in 0..<10 {
             let crates = dir.appendingPathComponent("crates", isDirectory: true)
             let cargo = dir.appendingPathComponent("Cargo.toml")
@@ -453,7 +474,7 @@ enum LatticeBridge {
                 }
             }
 
-            let info = AdapterInfo(
+            var info = AdapterInfo(
                 name: entry.lastPathComponent,
                 path: entry,
                 rank: rank,
@@ -465,10 +486,62 @@ enum LatticeBridge {
                 numLayers: numLayers,
                 checkpointCount: checkpointCount
             )
+            info.weightFile = AdapterInfo.resolveWeightFile(at: entry)
             result.append(info)
         }
 
         return result.sorted { $0.name < $1.name }
+    }
+
+    /// Attach globally-discovered adapter packages (from `<repoRoot>/adapters`) to the
+    /// local models they are compatible with, so per-model UI — chiefly the Chat A/B
+    /// adapter picker, which reads `selectedModel.adapters` — can offer them.
+    ///
+    /// The global scan (`discoverAdapterPackages`) already surfaces every adapter in the
+    /// MODELS table, but those adapters carry no model association, so the per-model
+    /// picker stayed empty. This bridges that gap.
+    ///
+    /// Compatibility policy (Ocean, 2026-06-21 — "compatible-only"):
+    ///   - An adapter that declares a base model (MLX `model` field, e.g.
+    ///     "Qwen/Qwen3.5-0.8B") attaches ONLY to the local model whose name equals the
+    ///     normalized base (org prefix stripped + lowercased → "qwen3.5-0.8b"). This
+    ///     deliberately excludes the q4 / quarot variants: `generate_lora` is bf16-only.
+    ///   - An adapter with NO declared base (lattice-native packages) attaches as a
+    ///     permissive fallback to every non-embedding bf16 model in the qwen3.5 family,
+    ///     since its true base is unknown and bf16 is the only loadable target.
+    ///
+    /// Existing per-model adapters (from the model-cache scan) are preserved; the merge
+    /// de-dupes by adapter path and keeps the list sorted by name. A model that matches
+    /// no adapter is returned unchanged.
+    static func associateAdapters(_ adapters: [AdapterInfo], into models: [ModelInfo]) -> [ModelInfo] {
+        guard !adapters.isEmpty else { return models }
+
+        func normalizedBase(_ s: String) -> String {
+            (s.split(separator: "/").last.map(String.init) ?? s).lowercased()
+        }
+        let declared = adapters.filter { ($0.baseModel?.isEmpty == false) }
+        let undeclared = adapters.filter { ($0.baseModel?.isEmpty != false) }
+
+        return models.map { model in
+            let modelKey = model.name.lowercased()
+            var matched: [AdapterInfo] = []
+            for a in declared where normalizedBase(a.baseModel ?? "") == modelKey {
+                matched.append(a)
+            }
+            if !model.isEmbedding, model.format == .bf16, modelKey.contains("qwen3.5") {
+                matched.append(contentsOf: undeclared)
+            }
+            guard !matched.isEmpty else { return model }
+
+            var merged = model.adapters
+            let existing = Set(merged.map { $0.path.path })
+            for a in matched where !existing.contains(a.path.path) {
+                merged.append(a)
+            }
+            var copy = model
+            copy.adapters = merged.sorted { $0.name < $1.name }
+            return copy
+        }
     }
 
     /// Scan a directory of `.safetensors` adapter files into AdapterInfo.
@@ -510,8 +583,10 @@ enum LatticeBridge {
                     targetModules = peft.targetModules
                 }
 
-                return AdapterInfo(name: f.deletingPathExtension().lastPathComponent, path: f,
-                                   rank: rank, alpha: alpha, targetModules: targetModules, sizeBytes: size)
+                var info = AdapterInfo(name: f.deletingPathExtension().lastPathComponent, path: f,
+                                       rank: rank, alpha: alpha, targetModules: targetModules, sizeBytes: size)
+                info.weightFile = AdapterInfo.resolveWeightFile(at: f)
+                return info
             }.sorted { $0.name < $1.name }
     }
 }

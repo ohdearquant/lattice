@@ -27,3 +27,15 @@ Thumbs.db
 *.bin
 *.onnx
 *.gguf
+
+# Local agent data + caches (large; never commit)
+/.claude/
+
+# Swift build + app packaging output
+/apps/macos/.build/
+/apps/macos/dist/
+
+# Runtime artifacts: downloaded models, trained adapters, built datasets (not source)
+/models/
+/adapters/
+/data/

@@ -229,7 +229,7 @@ extension Screen {
         case .data:   "tablecells"
         case .train:  "chart.line.uptrend.xyaxis"
         case .chat:   "text.bubble"
-        case .embed:  "chart.dots.scatter"
+        case .eval:   "waveform.path.ecg"
         }
     }
 }

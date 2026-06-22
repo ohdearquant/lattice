@@ -59,7 +59,7 @@ echo "    Swift binary: $(du -sh "$SWIFT_BIN" | awk '{print $1}')"
 # --- Step 2: Cargo release builds ---
 if [ "$SKIP_CARGO" = false ]; then
     echo ""
-    echo "==> [2/6] cargo build --release (8 engine binaries)"
+    echo "==> [2/6] cargo build --release (9 engine binaries)"
     # lattice-inference binaries (no extra features)
     for BIN in quantize_q4 quantize_quarot lattice qwen35_generate; do
         echo "    cargo build --release -p lattice-inference --bin $BIN"
@@ -81,6 +81,11 @@ if [ "$SKIP_CARGO" = false ]; then
     cargo build --release -p lattice-inference --bin eval_perplexity \
         --features "f16,metal-gpu" \
         --manifest-path "$REPO_ROOT/Cargo.toml"
+    # lattice-inference: chat_metal is the GPU (Metal) generation path for Chat (bf16/Q4 + LoRA-on-Metal)
+    echo "    cargo build --release -p lattice-inference --bin chat_metal --features f16,metal-gpu"
+    cargo build --release -p lattice-inference --bin chat_metal \
+        --features "f16,metal-gpu" \
+        --manifest-path "$REPO_ROOT/Cargo.toml"
     # lattice-embed: embed CLI (native default features)
     echo "    cargo build --release -p lattice-embed --bin embed"
     cargo build --release -p lattice-embed --bin embed \
@@ -88,13 +93,13 @@ if [ "$SKIP_CARGO" = false ]; then
 fi
 
 TARGET_RELEASE="$REPO_ROOT/target/release"
-for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed; do
+for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal; do
     if [ ! -x "$TARGET_RELEASE/$BIN" ]; then
         echo "ERROR: $TARGET_RELEASE/$BIN not found"
         exit 1
     fi
 done
-echo "    All 8 engine binaries present"
+echo "    All 9 engine binaries present"
 
 # --- Step 3: Construct .app bundle ---
 echo ""
@@ -108,11 +113,11 @@ cp "$SWIFT_BIN" "$BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$BUNDLE/Contents/MacOS/$APP_NAME"
 
 # Engine binaries
-for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed; do
+for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal; do
     cp "$TARGET_RELEASE/$BIN" "$BUNDLE/Contents/Resources/bin/$BIN"
     chmod +x "$BUNDLE/Contents/Resources/bin/$BIN"
 done
-echo "    Copied 8 engine binaries → Contents/Resources/bin/"
+echo "    Copied 9 engine binaries → Contents/Resources/bin/"
 
 # App icon
 ICNS_SRC="$MACOS_DIR/Resources/LatticeStudio.icns"

@@ -31,10 +31,6 @@ private let byteFormatter: ByteCountFormatter = {
     return f
 }()
 
-// MARK: - PPL phase tracker (mirrors ABPhase in ChatScreen)
-
-private enum PPLPhase { case idle, base, quant }
-
 struct ModelsScreen: View {
     @Bindable var store: AppStore
 
@@ -45,15 +41,8 @@ struct ModelsScreen: View {
     @State private var selectedAdapterID: String?
     // Quantize sheet: presented from the model inspector/action row (Phase A re-parenting).
     @State private var showQuantizeSheet: Bool = false
+    @State private var showGetModelsSheet: Bool = false
     @State private var didInitInspector = false
-
-    // QUALITY (perplexity) section state
-    @State private var pplPhase: PPLPhase = .idle
-    @State private var pplBase: LatticeEvent.Perplexity?       // bf16 result
-    @State private var pplQuant: LatticeEvent.Perplexity?      // q4/quarot result
-    @State private var pplCorpusURL: URL?                      // nil = use embedded default
-    @State private var pplError: String?
-    @State private var pplMeasuredModelID: String?             // results belong to this model only
 
     private var selectedModel: ModelInfo? {
         store.models.first { $0.id == selectedModelID }
@@ -127,16 +116,12 @@ struct ModelsScreen: View {
                 .frame(minWidth: 760, idealWidth: 900, maxWidth: .infinity,
                        minHeight: 540, idealHeight: 640, maxHeight: .infinity)
         }
-        .onAppear { openInspectorOnce() }
-        // Reset perplexity results when the selected model changes so results never
-        // bleed across model selections.
-        .onChange(of: selectedModelID) { _, _ in
-            pplPhase = .idle
-            pplBase = nil
-            pplQuant = nil
-            pplError = nil
-            pplMeasuredModelID = nil
+        .sheet(isPresented: $showGetModelsSheet) {
+            GetModelsSheet(store: store)
+                .frame(minWidth: 680, idealWidth: 760, maxWidth: .infinity,
+                       minHeight: 500, idealHeight: 620, maxHeight: .infinity)
         }
+        .onAppear { openInspectorOnce() }
     }
 
     // Open the detail inspector once on first appear (replaces the previously always-visible column).
@@ -150,6 +135,16 @@ struct ModelsScreen: View {
 
     private var actionRow: some View {
         HStack(spacing: Theme.Space.sm) {
+            // Get Models — primary (the discovery CTA; no model selection required)
+            Button {
+                showGetModelsSheet = true
+            } label: {
+                Text("Get Models")
+                    .font(Theme.Fonts.body)
+            }
+            .buttonStyle(LatticePrimaryButtonStyle())
+            .help("Browse and download models or import from disk")
+
             // Refresh — secondary
             Button {
                 store.refreshModels()
@@ -206,7 +201,16 @@ struct ModelsScreen: View {
                             .font(Theme.Fonts.body)
                     }
                     .buttonStyle(LatticeSecondaryButtonStyle())
-                    .help("Send selected model to Chat (⌘2)")
+                    .help("Send selected model to Chat (⌘4)")
+
+                    Button {
+                        store.use(model, on: .eval)
+                    } label: {
+                        Text("Eval →")
+                            .font(Theme.Fonts.body)
+                    }
+                    .buttonStyle(LatticeSecondaryButtonStyle())
+                    .help("Send selected model to Eval workspace (⌘5)")
                 }
 
             case .adapters:
@@ -459,7 +463,6 @@ struct ModelsScreen: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.xl) {
                     modelInspector(model)
-                    qualitySection(model)
                     if !model.adapters.isEmpty {
                         adapterList(model.adapters)
                     }
@@ -551,351 +554,6 @@ struct ModelsScreen: View {
         ws.append(WellSpec("FILES", "\(model.fileCount)"))
         ws.append(WellSpec("TOKENIZER", model.hasTokenizer ? "yes" : "—"))
         return ws
-    }
-
-    // MARK: QUALITY (perplexity) section
-
-    // Default corpus — ~200 tokens of diverse English text for quick PPL measurement.
-    private static let defaultCorpus = """
-    The transformer architecture has become the dominant approach for natural language processing tasks. \
-    Attention mechanisms allow models to weigh the importance of different tokens in a sequence. \
-    Large language models are trained on vast corpora of text drawn from books, articles, and web pages. \
-    Quantization reduces the memory footprint of these models by representing weights with fewer bits. \
-    A four-bit quantized model can run on consumer hardware that would otherwise be unable to hold the full-precision weights. \
-    Perplexity is a standard metric for evaluating how well a language model predicts a held-out corpus. \
-    Lower perplexity indicates that the model assigns higher probability to the observed tokens. \
-    Rotation-based methods such as QuaRot redistribute the magnitude of activations before quantization to reduce error. \
-    The goal is to preserve as much of the original model quality as possible while shrinking the storage and compute requirements. \
-    Inference engines must balance throughput, latency, and memory to serve these models efficiently on edge devices and in the cloud.
-    """
-
-    /// Returns the corpus URL to use: custom if set, else writes the default to a temp file.
-    private func corpusURL() -> URL? {
-        if let u = pplCorpusURL { return u }
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lattice_ppl_corpus.txt")
-        do {
-            try Self.defaultCorpus.write(to: tmp, atomically: true, encoding: .utf8)
-            return tmp
-        } catch {
-            pplError = "Could not write corpus: \(error.localizedDescription)"
-            return nil
-        }
-    }
-
-    /// Try to find the bf16 sibling of a quantized model.
-    /// Matching rule: strip a trailing "-q4", "-quarot", or "-quarot-q4" suffix (case-insensitive)
-    /// and look for a bf16 model whose name equals the stripped base name.
-    /// Fallback: bf16 model whose name is the quant name's prefix at a "-" boundary.
-    private func pplSibling(for quantModel: ModelInfo) -> ModelInfo? {
-        guard quantModel.format.isQuantized else { return nil }
-
-        let quantName = quantModel.name.lowercased()
-        let suffixes = ["-quarot-q4", "-quarot", "-q4"]
-        var baseName: String? = nil
-        for suffix in suffixes {
-            if quantName.hasSuffix(suffix) {
-                baseName = String(quantName.dropLast(suffix.count))
-                break
-            }
-        }
-
-        let bf16 = store.models.filter { $0.format == .bf16 }
-        // Primary: exact match after suffix removal — authoritative, and never lost to a
-        // shorter substring. store.models is name-sorted, so a single-predicate
-        // `.first { exact || contains }` would let a bare-substring bf16 model that sorts
-        // earlier win the race over the true exact sibling (codex/critic B1).
-        if let base = baseName,
-           let exact = bf16.first(where: { $0.name.lowercased() == base }) {
-            return exact
-        }
-        // Fallback: a bf16 model whose name is the quant's prefix at a "-" boundary
-        // (e.g. "qwen3.5-0.8b" for "qwen3.5-0.8b-q4"); prefer the longest such match.
-        return bf16
-            .filter { quantName.hasPrefix($0.name.lowercased() + "-") }
-            .max(by: { $0.name.count < $1.name.count })
-    }
-
-    /// Launch the perplexity measurement for the given model.
-    /// For quantized models with a bf16 sibling: sequential bf16 → quant chain (sendCompare pattern).
-    /// For quantized models without a sibling but with tokenizer: quant-only.
-    /// For bf16 models: bf16-only baseline.
-    private func measurePerplexity(model: ModelInfo) {
-        guard let corpus = corpusURL() else { return }
-
-        pplError = nil
-        pplBase = nil
-        pplQuant = nil
-        pplMeasuredModelID = model.id
-
-        if model.format == .bf16 {
-            // BF16 baseline-only path
-            pplPhase = .base
-            let cfg = EvalConfig(modelDir: model.path, corpusFile: corpus, label: "bf16")
-            let run = store.runEval(cfg)
-
-            run.onComplete = { [modelID = model.id] finished in
-                guard self.pplMeasuredModelID == modelID else { return }
-                if finished.status == .failed || finished.perplexities.first == nil {
-                    self.pplError = finished.status == .failed
-                        ? "BF16 eval failed. Check the log."
-                        : "No perplexity result returned."
-                }
-                self.pplBase = finished.perplexities.first
-                self.pplPhase = .idle
-            }
-
-            if run.status == .failed {
-                pplError = "BF16 eval failed to launch."
-                pplPhase = .idle
-                pplMeasuredModelID = nil
-            }
-            return
-        }
-
-        // Quantized model path
-        if let sibling = pplSibling(for: model) {
-            // Sequential chain: bf16 sibling → then quant
-            pplPhase = .base
-            let baseCfg = EvalConfig(modelDir: sibling.path, corpusFile: corpus, label: "bf16")
-            let baseRun = store.runEval(baseCfg)
-
-            baseRun.onComplete = { [modelID = model.id, modelPath = model.path,
-                                    siblingPath = sibling.path, modelFormat = model.format] finished in
-                guard self.pplMeasuredModelID == modelID else { return }
-
-                if finished.status == .failed || finished.perplexities.first == nil {
-                    self.pplError = finished.status == .failed
-                        ? "BF16 eval failed. Check the log."
-                        : "No perplexity result returned from BF16 eval."
-                    self.pplPhase = .idle
-                    return
-                }
-                self.pplBase = finished.perplexities.first
-
-                // Phase 2: quant eval
-                self.pplPhase = .quant
-
-                guard let corpus2 = self.corpusURL() else {
-                    self.pplPhase = .idle
-                    return
-                }
-
-                let quantCfg: EvalConfig
-                if modelFormat == .quarot {
-                    quantCfg = EvalConfig(quarotDir: modelPath, tokenizerDir: siblingPath,
-                                          corpusFile: corpus2, label: "quarot")
-                } else {
-                    quantCfg = EvalConfig(q4Dir: modelPath, tokenizerDir: siblingPath,
-                                          corpusFile: corpus2, label: "q4")
-                }
-                let quantRun = self.store.runEval(quantCfg)
-
-                quantRun.onComplete = { [modelID] done2 in
-                    guard self.pplMeasuredModelID == modelID else { return }
-                    if done2.status == .failed || done2.perplexities.first == nil {
-                        self.pplError = done2.status == .failed
-                            ? "Quant eval failed. Check the log."
-                            : "No perplexity result returned from quant eval."
-                    }
-                    self.pplQuant = done2.perplexities.first
-                    self.pplPhase = .idle
-                }
-
-                if quantRun.status == .failed {
-                    self.pplError = "Quant eval failed to launch."
-                    self.pplPhase = .idle
-                }
-            }
-
-            if baseRun.status == .failed {
-                pplError = "BF16 eval failed to launch."
-                pplPhase = .idle
-                pplMeasuredModelID = nil
-            }
-
-        } else if model.hasTokenizer {
-            // No sibling but has its own tokenizer: quant-only
-            pplPhase = .quant
-            let quantCfg: EvalConfig
-            if model.format == .quarot {
-                quantCfg = EvalConfig(quarotDir: model.path, tokenizerDir: model.path,
-                                      corpusFile: corpus, label: "quarot")
-            } else {
-                quantCfg = EvalConfig(q4Dir: model.path, tokenizerDir: model.path,
-                                      corpusFile: corpus, label: "q4")
-            }
-            let run = store.runEval(quantCfg)
-
-            run.onComplete = { [modelID = model.id] finished in
-                guard self.pplMeasuredModelID == modelID else { return }
-                if finished.status == .failed || finished.perplexities.first == nil {
-                    self.pplError = finished.status == .failed
-                        ? "Quant eval failed. Check the log."
-                        : "No perplexity result returned."
-                }
-                self.pplQuant = finished.perplexities.first
-                self.pplPhase = .idle
-            }
-
-            if run.status == .failed {
-                pplError = "Quant eval failed to launch."
-                pplPhase = .idle
-                pplMeasuredModelID = nil
-            }
-        }
-        // else: no button rendered — handled in qualitySection view
-    }
-
-    @ViewBuilder
-    private func qualitySection(_ model: ModelInfo) -> some View {
-        let sibling = model.format.isQuantized ? pplSibling(for: model) : nil
-        let canMeasure: Bool = {
-            if model.format == .bf16 { return true }
-            if sibling != nil { return true }
-            if model.hasTokenizer { return true }
-            return false
-        }()
-        let methodLabel = model.format == .quarot ? "QUAROT" : "Q4"
-
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // Section header + hairline
-            Text("QUALITY (PERPLEXITY)")
-                .instrumentLabel()
-                .padding(.bottom, 2)
-            Theme.Palette.hairline.frame(height: 1)
-
-            if !canMeasure {
-                // Honest disabled state: no button, explain why
-                Text("Perplexity needs the BF16 source (for its tokenizer). Keep the source model in the list to compare.")
-                    .font(Theme.Fonts.caption)
-                    .foregroundStyle(Theme.Palette.inkDim)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                // Corpus selector row
-                HStack(spacing: Theme.Space.sm) {
-                    if let customURL = pplCorpusURL {
-                        Text(customURL.lastPathComponent)
-                            .font(Theme.Fonts.caption)
-                            .foregroundStyle(Theme.Palette.ink)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Button("Use default") {
-                            pplCorpusURL = nil
-                        }
-                        .buttonStyle(LatticeSecondaryButtonStyle())
-                        .font(Theme.Fonts.caption)
-                    } else {
-                        Text("Default corpus")
-                            .font(Theme.Fonts.caption)
-                            .foregroundStyle(Theme.Palette.inkDim)
-                    }
-                    Spacer()
-                    Button("Choose corpus…") {
-                        let panel = NSOpenPanel()
-                        panel.canChooseFiles = true
-                        panel.canChooseDirectories = false
-                        panel.allowsMultipleSelection = false
-                        panel.allowedContentTypes = [.plainText]
-                        panel.title = "Select corpus text file"
-                        if panel.runModal() == .OK, let url = panel.url {
-                            pplCorpusURL = url
-                        }
-                    }
-                    .buttonStyle(LatticeSecondaryButtonStyle())
-                    .font(Theme.Fonts.caption)
-                }
-
-                // Action button
-                let buttonLabel: String = {
-                    if model.format == .bf16 { return "Measure perplexity" }
-                    if sibling != nil { return "Measure perplexity vs BF16" }
-                    return "Measure perplexity"
-                }()
-
-                Button(buttonLabel) {
-                    measurePerplexity(model: model)
-                }
-                .buttonStyle(LatticeSecondaryButtonStyle())
-                .disabled(pplPhase != .idle)
-
-                // In-progress indicator
-                if pplPhase != .idle {
-                    VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                        HStack(spacing: Theme.Space.sm) {
-                            ProgressView()
-                                .controlSize(.small)
-                            GatePill(.run, label: pplPhase == .base ? "MEASURING BF16…" : "MEASURING \(methodLabel)…")
-                        }
-                        Text("CPU BF16 eval takes ~15s")
-                            .font(Theme.Fonts.caption)
-                            .foregroundStyle(Theme.Palette.inkDim)
-                    }
-                }
-
-                // Error display
-                if let err = pplError {
-                    GatePill(.fail, label: err)
-                }
-
-                // Results — only when they belong to the currently selected model
-                if pplMeasuredModelID == selectedModelID,
-                   pplBase != nil || pplQuant != nil {
-
-                    let bf16Value = pplBase.map { String(format: "%.3f", $0.ppl) } ?? "—"
-                    let quantValue = pplQuant.map { String(format: "%.3f", $0.ppl) } ?? "—"
-                    let deltaValue: String = {
-                        if let base = pplBase, let quant = pplQuant {
-                            let d = quant.ppl - base.ppl
-                            return d >= 0
-                                ? String(format: "+%.3f", d)
-                                : String(format: "%.3f", d)
-                        }
-                        return "—"
-                    }()
-
-                    // 2-column grid of ReadoutWells
-                    let showDelta = model.format != .bf16
-                    let pplWells: [WellSpec] = {
-                        var ws: [WellSpec] = []
-                        ws.append(WellSpec("BF16 PPL", bf16Value))
-                        if showDelta {
-                            ws.append(WellSpec("\(methodLabel) PPL", quantValue))
-                            ws.append(WellSpec("ΔPPL", deltaValue))
-                        }
-                        return ws
-                    }()
-
-                    LazyVGrid(
-                        columns: [
-                            GridItem(.flexible(), spacing: Theme.Space.md),
-                            GridItem(.flexible(), spacing: Theme.Space.md)
-                        ],
-                        spacing: Theme.Space.md
-                    ) {
-                        ForEach(pplWells, id: \.label) { well in
-                            ReadoutWell(label: well.label, value: well.value,
-                                        unit: well.unit, minHeight: 56)
-                        }
-                    }
-
-                    // Quality verdict — only when both PPLs present (honest: no verdict with one value)
-                    if let base = pplBase, let quant = pplQuant {
-                        let delta = quant.ppl - base.ppl
-                        if delta < 0.5 {
-                            GatePill(.pass, label: "MINIMAL LOSS (Δ<0.5)")
-                        } else if delta < 1.5 {
-                            GatePill(.warn, label: "MODERATE LOSS")
-                        } else {
-                            GatePill(.fail, label: "SIGNIFICANT LOSS")
-                        }
-                    } else if model.format == .bf16, pplBase != nil {
-                        // Honest baseline label
-                        GatePill(.pass, label: "BASELINE")
-                    }
-                }
-            }
-        }
     }
 
     private func adapterList(_ adapters: [AdapterInfo]) -> some View {
