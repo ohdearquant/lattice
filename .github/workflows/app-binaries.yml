@@ -1,0 +1,41 @@
+name: app-binaries
+# Regression gate: build every binary the macOS Studio app ships, each with its
+# required-features. `cargo build --workspace` skips required-features bins, so
+# this is the only CI that compiles chat_metal / eval_perplexity / train_grad_full
+# / generate_lora / embed with the features the app actually builds them with.
+# See scripts/build-app-bins.sh for the rationale and the two regressions that
+# motivated it.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'scripts/build-app-bins.sh'
+      - '.github/workflows/app-binaries.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build-app-bins:
+    name: build app-shipped binaries
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: app-binaries
+      - name: Build all app-shipped binaries (required-features included)
+        run: ./scripts/build-app-bins.sh
