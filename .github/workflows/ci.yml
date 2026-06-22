@@ -1,20 +1,14 @@
 name: CI
 
+# NOTE: no `paths-ignore`. Every job here is (or can be) a *required* status
+# check, and a required check that never runs leaves a PR stuck on "Expected —
+# waiting for status to be reported" forever. So CI always runs on every PR to
+# main; the cargo cache keeps doc-only re-runs cheap (nothing recompiles).
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE*'
-      - '.github/ISSUE_TEMPLATE/**'
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,6 +19,7 @@ jobs:
     name: CI
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
     steps:
@@ -51,3 +46,86 @@ jobs:
           cargo clean -p lattice-tune 2>/dev/null || true
           cargo clean -p lattice-transport 2>/dev/null || true
       - run: ./scripts/ci.sh
+
+  # The default `cargo test/clippy --workspace` only ever compiles DEFAULT
+  # features. Feature-gated code (safetensors serialization, the inference-hook
+  # bridge, train-backward, metal-gpu kernels) is invisible to it — that is how
+  # two real LoRA save/load bugs shipped in `safetensors`-gated code that
+  # default CI never built. This job compiles the gated surfaces so they cannot
+  # silently rot. `--no-run` on test targets = type-check + codegen without
+  # spending runner time executing.
+  feature-matrix:
+    name: feature-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: feature-matrix
+          cache-on-failure: true
+      - name: tune — safetensors + inference-hook + serde (compile tests)
+        run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
+      - name: tune — train-backward (compile tests)
+        run: cargo test -p lattice-tune --features train-backward --no-run
+      - name: inference — f16 + train-backward
+        run: cargo build -p lattice-inference --features f16,train-backward
+      - name: embed — local
+        run: cargo build -p lattice-embed --features local
+      - name: fann — no default features
+        run: cargo build -p lattice-fann --no-default-features
+      # Metal kernels only exist on macOS; gate so Linux does not try to build them.
+      - name: inference — metal-gpu (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo build -p lattice-inference --features metal-gpu
+      - name: embed — metal-gpu (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo build -p lattice-embed --features metal-gpu
+
+  # The benchmark harnesses live behind their own feature flags / target gates
+  # and are never built by `cargo test`. A `Qwen35Config` field added to the
+  # struct but not to the bench's literal initializer (exactly what happened
+  # with `quarot_rotation_seed`) only surfaces when the benches are compiled.
+  # Runs on Apple Silicon because the inference benches are NEON (aarch64) code;
+  # on x86 they are cfg'd out and the gate would be vacuous.
+  bench-compile:
+    name: bench-compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-compile
+          cache-on-failure: true
+      - name: inference benches (bench-internals)
+        run: cargo bench -p lattice-inference --features bench-internals --no-run
+      - name: embed benches
+        run: cargo bench -p lattice-embed --no-run
+
+  # Supply-chain gate. licenses/bans/sources are deterministic and REQUIRED:
+  # a green main cannot turn red without a manifest/lockfile change. Advisories
+  # run separately as informational (continue-on-error) because fresh RUSTSEC
+  # entries land with no change of ours and must not wedge merges.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: licenses + bans + sources (required)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources
+      - name: advisories (informational)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        continue-on-error: true
+        with:
+          command: check advisories
