@@ -4107,6 +4107,13 @@ kernel void gdn_chunk_norm_silu_c32(
         pub(crate) engine: MetalQwen35Engine,
         pub(crate) session: InferenceSession,
         pub(crate) lora: Option<MetalLoraAdapter>,
+        /// Per-instance flag: use the chunked-parallel GDN prefill scan (C=32).
+        ///
+        /// Defaults to `true` (default-ON) unless `LATTICE_GDN_CHUNKED=0` or
+        /// `LATTICE_GDN_CHUNKED=false` is set at construction time. Toggle this
+        /// field directly in tests to switch paths without touching the process
+        /// environment (thread-safe under parallel test execution).
+        pub(crate) use_gdn_chunked: bool,
     }
 
     // ---------------------------------------------------------------------------
@@ -5331,10 +5338,15 @@ kernel void gdn_chunk_norm_silu_c32(
         ) -> Result<Self, String> {
             let engine = MetalQwen35Engine::new(weights, cfg)?;
             let session = engine.new_session(max_cache_len)?;
+            let use_gdn_chunked = !matches!(
+                std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
+                Ok("0") | Ok("false")
+            );
             Ok(Self {
                 engine,
                 session,
                 lora: None,
+                use_gdn_chunked,
             })
         }
 
@@ -7446,7 +7458,7 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut linear_idx = 0usize;
             let mut full_idx = 0usize;
 
-            let chunked_requested = Self::gdn_chunked_prefill_requested();
+            let chunked_requested = self.use_gdn_chunked;
             let chunked_supported = Self::supports_gdn_chunked_prefill(&cfg);
             if chunked_requested && !chunked_supported {
                 tracing::warn!(
@@ -9867,7 +9879,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 let use_q36 =
                     key_d == 128 && val_d == 128 && hidden == 5120 && num_h == 16 && num_vh == 48;
                 // Chunked GDN prefill is prefill-only; single-token decode always uses serial path.
-                if Self::gdn_chunked_prefill_requested() && !use_q36 {
+                if self.use_gdn_chunked && !use_q36 {
                     tracing::debug!(
                         "chunked GDN prefill is prefill-only; encode_gdn_layer keeps serial recurrence"
                     );
@@ -11027,13 +11039,6 @@ kernel void gdn_chunk_norm_silu_c32(
         // -----------------------------------------------------------------------
         // GDN chunked-scan helpers (default ON; LATTICE_GDN_CHUNKED=0 opts out)
         // -----------------------------------------------------------------------
-
-        fn gdn_chunked_prefill_requested() -> bool {
-            !matches!(
-                std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
-                Ok("0") | Ok("false")
-            )
-        }
 
         fn supports_gdn_chunked_prefill(cfg: &Qwen35Config) -> bool {
             cfg.hidden_size == 1024
@@ -13637,6 +13642,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     position: 0,
                 },
                 lora: None,
+                use_gdn_chunked: !matches!(
+                    std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
+                    Ok("0") | Ok("false")
+                ),
             })
         }
 
@@ -15103,6 +15112,7 @@ kernel void decode_attention_reference(
                 engine,
                 session,
                 lora: None,
+                use_gdn_chunked: true,
             }
         }
 
@@ -15299,6 +15309,7 @@ kernel void decode_attention_reference(
                 engine,
                 session: session_a,
                 lora: None,
+                use_gdn_chunked: true,
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
@@ -17502,19 +17513,19 @@ kernel void decode_attention_reference(
             const MAX_REL_SIG_THRESHOLD: f32 = 5e-2;
             let mut best: Option<(f32, f32, usize)> = None;
             for attempt in 0..3 {
-                // Chunked path (default ON; no override needed).
+                // Chunked path (ON via per-instance flag).
+                state.use_gdn_chunked = true;
                 state.reset_state();
                 let _ = state.forward_prefill(&tokens);
                 let chunked_snap = state.snapshot_gdn_states();
-                // Serial token-by-token reference.
-                // SAFETY: single-threaded test (RUST_TEST_THREADS=1); no other thread reads the var.
-                unsafe { std::env::set_var("LATTICE_GDN_CHUNKED", "0") };
+                // Serial token-by-token reference (chunked OFF via per-instance flag).
+                state.use_gdn_chunked = false;
                 state.reset_state();
                 for (pos, &tok) in tokens.iter().enumerate() {
                     let _ = state.forward_step(tok, pos);
                 }
                 let serial_snap = state.snapshot_gdn_states();
-                unsafe { std::env::remove_var("LATTICE_GDN_CHUNKED") };
+                state.use_gdn_chunked = true;
 
                 let (max_abs, max_rel_sig, over) = diff(&chunked_snap, &serial_snap);
                 eprintln!(
@@ -17542,13 +17553,17 @@ kernel void decode_attention_reference(
             );
         }
 
-        /// CI parity gate: chunked-GDN forward_prefill vs serial forward_prefill must agree on
-        /// logits within max_abs_diff < 1e-2 and argmax must match.  Exercises the chunked path
-        /// deterministically regardless of the LATTICE_GDN_CHUNKED env var by toggling the flag
-        /// explicitly around each run.  Runs in CI wherever the model is present.
+        /// Boundary-sweep parity gate: chunked-GDN `forward_prefill` vs serial `forward_prefill`
+        /// must produce matching argmax at EVERY position for prompts that straddle the C=32 chunk
+        /// boundary and the 512 max_prefill boundary.
         ///
-        /// Uses `forward_prefill` (the batched path) for both sides so the only difference is
-        /// whether GDN layers use the chunked-scan kernels or the serial recurrence.
+        /// Both paths are selected via `state.use_gdn_chunked` (no process-env mutation), so the
+        /// test is sound under parallel execution.
+        ///
+        /// This is a LOCAL/manual gate: `cargo test -p lattice-inference gdn_chunked
+        /// --features "f16,metal-gpu" -- --nocapture` with the model present.  The production
+        /// cross-framework gate is `e2e-parity.yml`, which runs HF-vs-lattice greedy-token parity
+        /// on macOS and includes an 816-token oversize prompt that forces the >512 chunked path.
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn gdn_chunked_prefill_vs_serial_prefill_logit_parity() {
@@ -17567,48 +17582,112 @@ kernel void decode_attention_reference(
                 eprintln!("skipping: no Metal device");
                 return;
             };
-            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+
+            let max_ctx = 1024usize;
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), max_ctx)
                 .expect("construct Metal state");
-            let tokens = long_real_text_tokens(model.tokenizer());
+            let vocab = model.config().vocab_size;
 
-            // Serial path: opt out of chunked scan.
-            // SAFETY: single-threaded test (RUST_TEST_THREADS=1).
-            unsafe { std::env::set_var("LATTICE_GDN_CHUNKED", "0") };
-            state.reset_state();
-            let serial_logits = state.forward_prefill(&tokens);
+            // Token source: a long real-text prompt; truncate to each sweep length below.
+            let base_tokens = long_real_text_tokens(model.tokenizer());
 
-            // Chunked path: remove opt-out so chunked is the default.
-            unsafe { std::env::remove_var("LATTICE_GDN_CHUNKED") };
-            state.reset_state();
-            let chunked_logits = state.forward_prefill(&tokens);
+            // Sweep lengths chosen to straddle C=32 chunk boundaries and the 512 max_prefill
+            // boundary.  Skip lengths that exceed the model's max context.
+            let sweep_lengths: &[usize] = &[1, 31, 32, 33, 64, 511, 512, 513, 1009];
 
-            assert_eq!(serial_logits.len(), model.config().vocab_size);
-            assert_eq!(chunked_logits.len(), model.config().vocab_size);
+            // Evidence table: (len, all-position max_abs_diff, argmax flip count)
+            let mut evidence: Vec<(usize, f32, usize)> = Vec::new();
+            let mut any_flip = false;
 
-            let max_abs_diff = serial_logits
-                .iter()
-                .zip(chunked_logits.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f32, f32::max);
+            // Regression bound derived from this sweep: within max_prefill (n≤512) the
+            // worst observed all-position max_abs_diff is 1.10e-4; at n=513 (which spans
+            // two batch-chunk command buffers, triggering an additional round of FP
+            // rounding across the chunk boundary) the worst observed value is 7.38e-3.
+            // We use 1e-2 — the existing final-row bound — as the global regression
+            // guard.  The argmax assertion below is the correctness gate.
+            const MAX_ABS_BOUND: f32 = 1e-2;
 
-            eprintln!(
-                "gdn_chunked_prefill_vs_serial_prefill_logit_parity: \
-                 max_abs_diff={max_abs_diff:.6} argmax_serial={} argmax_chunked={} tokens={}",
-                argmax_f32(&serial_logits),
-                argmax_f32(&chunked_logits),
-                tokens.len()
-            );
+            for &n in sweep_lengths {
+                if n > max_ctx {
+                    eprintln!("  len={n}: skipped (exceeds max_ctx={max_ctx})");
+                    continue;
+                }
+                // Pad base_tokens with repeated token 1 if needed.
+                let tokens: Vec<u32> = if n <= base_tokens.len() {
+                    base_tokens[..n].to_vec()
+                } else {
+                    let mut v = base_tokens.clone();
+                    v.resize(n, 1u32);
+                    v
+                };
 
+                // Serial path (chunked OFF): collect per-position logits via all_logits.
+                state.use_gdn_chunked = false;
+                state.reset_state();
+                let serial_all = state.forward_prefill_all_logits(&tokens);
+                assert_eq!(
+                    serial_all.len(),
+                    n * vocab,
+                    "serial all_logits len mismatch at n={n}"
+                );
+
+                // Chunked path (chunked ON): collect per-position logits via all_logits.
+                state.use_gdn_chunked = true;
+                state.reset_state();
+                let chunked_all = state.forward_prefill_all_logits(&tokens);
+                assert_eq!(
+                    chunked_all.len(),
+                    n * vocab,
+                    "chunked all_logits len mismatch at n={n}"
+                );
+
+                // Compare at every position.
+                let mut max_abs = 0.0f32;
+                let mut flips = 0usize;
+                for pos in 0..n {
+                    let s = &serial_all[pos * vocab..(pos + 1) * vocab];
+                    let c = &chunked_all[pos * vocab..(pos + 1) * vocab];
+                    let pos_max = s
+                        .iter()
+                        .zip(c.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    max_abs = max_abs.max(pos_max);
+                    if argmax_f32(s) != argmax_f32(c) {
+                        flips += 1;
+                    }
+                }
+
+                eprintln!("  len={n:4}: all-pos max_abs_diff={max_abs:.2e}  argmax_flips={flips}");
+                evidence.push((n, max_abs, flips));
+                if flips > 0 {
+                    any_flip = true;
+                }
+            }
+
+            // Restore default after sweep.
+            state.use_gdn_chunked = true;
+
+            eprintln!("Evidence table (boundary sweep, per-instance flag, no env mutation):");
+            eprintln!("  len | all-pos max_abs_diff | argmax_flips");
+            for (n, d, f) in &evidence {
+                eprintln!("  {n:4} | {d:.2e}             | {f}");
+            }
+
+            // Assert no argmax flips across all lengths and positions.
             assert!(
-                max_abs_diff < 1e-2,
-                "chunked GDN prefill logits diverge from serial prefill beyond 1e-2: \
-                 max_abs_diff={max_abs_diff:.6}"
+                !any_flip,
+                "argmax flips detected across boundary sweep — default-on is unsafe. \
+                 Evidence: {evidence:?}"
             );
-            assert_eq!(
-                argmax_f32(&serial_logits),
-                argmax_f32(&chunked_logits),
-                "argmax mismatch between serial and chunked GDN prefill"
-            );
+
+            // Assert all-position max_abs_diff stays within the evidence-based bound.
+            for (n, max_abs, _) in &evidence {
+                assert!(
+                    *max_abs < MAX_ABS_BOUND,
+                    "len={n}: all-position max_abs_diff={max_abs:.2e} exceeds bound {MAX_ABS_BOUND:.2e}"
+                );
+            }
         }
 
         /// Localization probe: run the SERIAL token-by-token path twice and diff the final GDN
@@ -17650,36 +17729,30 @@ kernel void decode_attention_reference(
                     .fold(0.0f32, f32::max)
             };
 
-            // Serial path, twice. Opt out of chunked to force serial recurrence.
-            // SAFETY: single-threaded test (RUST_TEST_THREADS=1).
-            unsafe { std::env::set_var("LATTICE_GDN_CHUNKED", "0") };
+            // Serial path, twice (chunked OFF via per-instance flag).
+            state.use_gdn_chunked = false;
             state.reset_state();
-            let _ = {
-                for (pos, &tok) in tokens.iter().enumerate() {
-                    let _ = state.forward_step(tok, pos);
-                }
-            };
+            for (pos, &tok) in tokens.iter().enumerate() {
+                let _ = state.forward_step(tok, pos);
+            }
             let serial_a = snap_state(&state);
             state.reset_state();
             for (pos, &tok) in tokens.iter().enumerate() {
                 let _ = state.forward_step(tok, pos);
             }
             let serial_b = snap_state(&state);
-            unsafe { std::env::remove_var("LATTICE_GDN_CHUNKED") };
 
             // Batched prefill with chunked GDN OFF (batched producers + serial GDN consumer), twice.
-            // Isolates the batched-producer race from the chunked GDN kernels.
-            // SAFETY: single-threaded test.
-            unsafe { std::env::set_var("LATTICE_GDN_CHUNKED", "0") };
+            state.use_gdn_chunked = false;
             state.reset_state();
             let _ = state.forward_prefill(&tokens);
             let prefill_nochunk_a = snap_state(&state);
             state.reset_state();
             let _ = state.forward_prefill(&tokens);
             let prefill_nochunk_b = snap_state(&state);
-            unsafe { std::env::remove_var("LATTICE_GDN_CHUNKED") };
 
-            // Chunked path, twice (default ON; no override needed).
+            // Chunked path, twice (chunked ON via per-instance flag).
+            state.use_gdn_chunked = true;
             state.reset_state();
             let _ = state.forward_prefill(&tokens);
             let chunked_a = snap_state(&state);
