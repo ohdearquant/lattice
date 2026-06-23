@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -9,11 +9,15 @@ pub(super) const TILE: u32 = 16;
 ///
 /// Must match the `@workgroup_size(RMS_WG)` annotation in the WGSL source.
 /// Changing this value requires a corresponding shader recompile.
+// Kept as the documented WGSL workgroup-size contract; the shader source embeds
+// the literal, so Rust does not read this constant directly.
+#[allow(dead_code)]
 pub(super) const RMS_WG: u32 = 256;
 /// Workgroup size for the softmax compute shader (threads per group).
 ///
 /// Must match the `@workgroup_size(SOFTMAX_WG)` annotation in the WGSL source.
 /// Changing this value requires a corresponding shader recompile.
+#[allow(dead_code)]
 pub(super) const SOFTMAX_WG: u32 = 128;
 pub(super) const ELEM_WG: u32 = 256;
 pub(super) const ROPE_WG: u32 = 64;

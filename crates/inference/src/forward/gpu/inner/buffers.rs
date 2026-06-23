@@ -3,9 +3,7 @@ use std::sync::{Arc, atomic::Ordering};
 use wgpu::util::DeviceExt;
 
 use super::api::checked_mul;
-use super::api::{
-    GpuForwardError, GpuRuntimeConfig, Qwen3Config, Qwen3LayerWeights, Qwen3Weights, Result,
-};
+use super::api::{GpuRuntimeConfig, Qwen3Config, Qwen3LayerWeights, Qwen3Weights, Result};
 use super::params::{AllocationStats, PARAM_SLOT_BYTES};
 use super::util::bytes_f32;
 

@@ -76,6 +76,11 @@ jobs:
         run: cargo test -p lattice-tune --features train-backward --no-run
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
+      # wgpu-gpu is excluded from default builds and was silently broken under
+      # --all-features (gpu/inner module-resolution rot) until #194. Build it on
+      # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
+      - name: inference — wgpu-gpu
+        run: cargo build -p lattice-inference --features wgpu-gpu
       - name: embed — local
         run: cargo build -p lattice-embed --features local
       - name: fann — no default features

@@ -11,7 +11,7 @@ use super::dispatch::{
     dispatch_rope, dispatch_silu,
 };
 use super::params::{AllocationStats, EXTRA_PARAM_SLOTS, PARAM_SLOTS_PER_LAYER, ParamPacker};
-use super::pipelines::{BindGroupLayouts, Pipelines, create_bind_group_layouts, create_pipelines};
+use super::pipelines::{Pipelines, create_bind_group_layouts, create_pipelines};
 use super::util::{build_rope_tables, bytes_f32};
 
 /// **Unstable**: GPU model state holding device, pipelines, and weight buffers; layout evolving.
