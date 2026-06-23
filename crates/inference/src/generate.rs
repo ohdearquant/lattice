@@ -39,6 +39,19 @@ pub struct GenerateConfig {
     /// The `GrammarEngine` is shared via `Arc` so it can be reused across
     /// requests with the same schema without re-compilation.
     pub grammar: Option<Arc<GrammarEngine>>,
+    /// Opt-in KV cache capacity cap in tokens (issue #12).
+    ///
+    /// When `None` (default), the cache is sized to `prompt_len + max_new_tokens`,
+    /// which is the exact working set for this request — no over-allocation occurs.
+    ///
+    /// When `Some(n)`, the cache is capped to at most `n` tokens regardless of
+    /// `max_new_tokens`. This is useful on memory-constrained devices where the
+    /// caller knows the workload is short. If generation reaches the cap, it stops
+    /// at that point rather than panicking.
+    ///
+    /// The cap is clamped to `[1, prompt_len + max_new_tokens]` at call time, so
+    /// values that exceed the natural request size have no effect.
+    pub kv_cache_capacity: Option<usize>,
 }
 
 impl std::fmt::Debug for GenerateConfig {
@@ -49,6 +62,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("eos_token_id", &self.eos_token_id)
             .field("include_prompt", &self.include_prompt)
             .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
+            .field("kv_cache_capacity", &self.kv_cache_capacity)
             .finish()
     }
 }
@@ -61,6 +75,7 @@ impl Default for GenerateConfig {
             eos_token_id: None,
             include_prompt: false,
             grammar: None,
+            kv_cache_capacity: None,
         }
     }
 }
@@ -165,6 +180,24 @@ fn grow(buf: &mut Vec<f32>, n: usize) {
 // Public generate() entry point
 // ---------------------------------------------------------------------------
 
+/// Reject a `kv_cache_capacity` smaller than the prompt: prefill writes
+/// `prompt_len` tokens in a single pass, so a cache that cannot hold the prompt
+/// would overflow during prefill (issue #12). Only enforced when the caller
+/// opted into a cap; `None` keeps the full `max_seq` sizing and is always valid.
+fn check_kv_cache_capacity(
+    requested: Option<usize>,
+    effective_cap: usize,
+    prompt_len: usize,
+) -> Result<(), InferenceError> {
+    if requested.is_some() && effective_cap < prompt_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "kv_cache_capacity ({effective_cap}) is smaller than the prompt length \
+             ({prompt_len}); the cache must hold at least the prompt"
+        )));
+    }
+    Ok(())
+}
+
 /// **Unstable**: text generation entry point for Qwen3 models; the full
 /// generation loop (prefill, decode, sampling) is under active design.
 ///
@@ -199,17 +232,24 @@ pub fn generate(
 
     // 2. Initialize KV cache and scratch (allocate once per request)
     let max_seq = prompt_len + config.max_new_tokens;
+    // Effective cache capacity: honour the caller's opt-in cap (issue #12).
+    // Clamped to [1, max_seq] so over-large caps and zero are both safe.
+    let effective_cap = config
+        .kv_cache_capacity
+        .map(|c| c.max(1).min(max_seq))
+        .unwrap_or(max_seq);
+    check_kv_cache_capacity(config.kv_cache_capacity, effective_cap, prompt_len)?;
     let cache_cfg = FlatKVCacheConfig::for_qwen3(
         cfg.num_hidden_layers,
         cfg.num_key_value_heads,
         cfg.head_dim,
-        max_seq,
+        effective_cap,
     );
     let mut cache = FlatKVCache::new(cache_cfg);
     let mut scratch = ForwardScratch::new();
     // Size scratch for the largest possible call (prefill at prompt_len tokens).
     // Decode calls use seq_len=1, which is always within this capacity.
-    scratch.ensure_capacity(cfg, prompt_len.max(1), max_seq);
+    scratch.ensure_capacity(cfg, prompt_len.max(1), effective_cap);
 
     // 3. Initialize sampler
     let mut sampler = Sampler::new(config.sampling.clone());
@@ -226,7 +266,7 @@ pub fn generate(
         &mut cache,
         0,
         &mut scratch,
-        max_seq,
+        effective_cap,
     )?;
 
     // Apply grammar masking on the logit buffer in-place before sampling.
@@ -261,11 +301,22 @@ pub fn generate(
     // 7. Decode loop: one token at a time
     if !stopped_by_eos {
         for step in 0..config.max_new_tokens.saturating_sub(1) {
+            // Stop cleanly when the cache is at capacity (set by kv_cache_capacity).
+            if cache.is_full() {
+                break;
+            }
             let pos = prompt_len + step + 1; // +1 because first token already generated
             let input = [*generated_ids
                 .last()
                 .expect("invariant: first generated token exists before decode loop")];
-            forward_with_cache(model, &input, &mut cache, pos - 1, &mut scratch, max_seq)?;
+            forward_with_cache(
+                model,
+                &input,
+                &mut cache,
+                pos - 1,
+                &mut scratch,
+                effective_cap,
+            )?;
 
             // Apply grammar masking before sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
@@ -1132,5 +1183,123 @@ mod tests {
         let old_len = scratch.hidden.len();
         scratch.ensure_capacity(&cfg, 1, 64);
         assert_eq!(scratch.hidden.len(), old_len);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #12: FlatKVCache allocation scales with kv_cache_capacity cap.
+    //
+    // Verifies:
+    //   (a) A cap of 128 allocates far fewer bytes than a cap of 4096.
+    //   (b) Default (None) matches the uncapped natural size.
+    //   (c) kv_cache_capacity clamp: a cap larger than max_seq is silently ignored.
+    //   (d) GenerateConfig::default() has kv_cache_capacity == None.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn kv_cache_capacity_below_prompt_len_is_rejected() {
+        // requested cap smaller than the prompt → Err, not an OOB prefill panic
+        assert!(check_kv_cache_capacity(Some(8), 8, 32).is_err());
+        // cap exactly equal to prompt_len holds the prompt → Ok
+        assert!(check_kv_cache_capacity(Some(32), 32, 32).is_ok());
+        // cap larger than prompt → Ok
+        assert!(check_kv_cache_capacity(Some(64), 64, 16).is_ok());
+        // no cap requested → never rejected (default full-size behaviour)
+        assert!(check_kv_cache_capacity(None, 100, 32).is_ok());
+    }
+
+    #[test]
+    fn kv_cache_capacity_allocates_fewer_bytes() {
+        use crate::kv_cache::{FlatKVCache, FlatKVCacheConfig};
+
+        // Qwen3-0.6B-like parameters (28 layers, 8 KV heads, head_dim 128).
+        let num_layers = 28usize;
+        let num_kv_heads = 8usize;
+        let head_dim = 128usize;
+
+        let cap_small = 128usize;
+        let cap_large = 4096usize;
+
+        let bytes_small =
+            FlatKVCacheConfig::for_qwen3(num_layers, num_kv_heads, head_dim, cap_small)
+                .total_bytes();
+        let bytes_large =
+            FlatKVCacheConfig::for_qwen3(num_layers, num_kv_heads, head_dim, cap_large)
+                .total_bytes();
+
+        // cap=128 must allocate strictly fewer bytes than cap=4096
+        assert!(
+            bytes_small < bytes_large,
+            "cap=128 bytes ({bytes_small}) should be less than cap=4096 bytes ({bytes_large})"
+        );
+
+        // The ratio must match the cap ratio exactly (linear scaling)
+        assert_eq!(
+            bytes_large / bytes_small,
+            cap_large / cap_small,
+            "allocation should scale linearly with cap"
+        );
+
+        // Concrete numbers for the record (f16 storage, 2 bytes per element)
+        // bytes_small = 2 * 28 * 128 * (8*128) * 2 = 2 * 28 * 128 * 1024 * 2 = 14,680,064 (~14 MB)
+        // bytes_large = 2 * 28 * 4096 * 1024 * 2  = 469,762,048 (~448 MB)
+        let mb_small = bytes_small as f64 / (1024.0 * 1024.0);
+        let mb_large = bytes_large as f64 / (1024.0 * 1024.0);
+        assert!(
+            mb_small < 20.0,
+            "cap=128 should be under 20 MB, got {mb_small:.1} MB"
+        );
+        assert!(
+            mb_large > 400.0,
+            "cap=4096 should be over 400 MB, got {mb_large:.1} MB"
+        );
+
+        // Verify the FlatKVCache actually materializes these sizes
+        let cache_small = FlatKVCache::new(FlatKVCacheConfig::for_qwen3(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            cap_small,
+        ));
+        let cache_large = FlatKVCache::new(FlatKVCacheConfig::for_qwen3(
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            cap_large,
+        ));
+        assert_eq!(cache_small.memory_bytes(), bytes_small);
+        assert_eq!(cache_large.memory_bytes(), bytes_large);
+    }
+
+    #[test]
+    fn kv_cache_capacity_default_is_none() {
+        let cfg = GenerateConfig::default();
+        assert!(
+            cfg.kv_cache_capacity.is_none(),
+            "default must be None to preserve backward-compatible allocation"
+        );
+    }
+
+    #[test]
+    fn kv_cache_capacity_clamp_above_max_seq() {
+        // A cap larger than max_seq must not panic; it is silently clamped.
+        // We exercise the clamping formula directly without calling generate().
+        let prompt_len = 10usize;
+        let max_new_tokens = 50usize;
+        let max_seq = prompt_len + max_new_tokens; // 60
+
+        // Simulate the clamping logic from generate()
+        let effective =
+            |cap: Option<usize>| -> usize { cap.map(|c| c.max(1).min(max_seq)).unwrap_or(max_seq) };
+
+        assert_eq!(effective(None), 60, "None -> full max_seq");
+        assert_eq!(
+            effective(Some(100)),
+            60,
+            "cap > max_seq -> clamped to max_seq"
+        );
+        assert_eq!(effective(Some(60)), 60, "cap == max_seq -> unchanged");
+        assert_eq!(effective(Some(30)), 30, "cap < max_seq -> respected");
+        assert_eq!(effective(Some(0)), 1, "cap=0 -> clamped to 1");
+        assert_eq!(effective(Some(1)), 1, "cap=1 -> 1 (minimum)");
     }
 }
