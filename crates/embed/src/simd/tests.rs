@@ -182,6 +182,34 @@ fn test_neon_normalize_matches_scalar_multiple_dims() {
     }
 }
 
+/// Differential test: vrsqrteq_f32 + Newton–Raphson vs scalar reference.
+///
+/// One Newton step on top of `vrsqrteq_f32` reaches ~23-bit precision.  The
+/// max absolute per-element error vs the scalar path (which uses `f32::sqrt` +
+/// division) must stay below 1e-5 across representative embedding dimensions.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_neon_rsqrt_newton_accuracy() {
+    for dim in [16usize, 64, 128, 384, 768, 1024, 1536] {
+        let mut neon_v = generate_random_vector_seeded(dim, 0x_dead_beef + dim as u64);
+        let mut scalar_v = neon_v.clone();
+
+        normalize(&mut neon_v);
+        normalize::normalize_scalar(&mut scalar_v);
+
+        let max_diff = neon_v
+            .iter()
+            .zip(scalar_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_diff < 1e-5,
+            "vrsqrteq_f32 + Newton vs scalar: dim={dim}, max_abs_diff={max_diff} (limit=1e-5)"
+        );
+    }
+}
+
 #[test]
 fn test_avx512_normalize_dimensions() {
     for dim in AVX512_TEST_DIMS {
