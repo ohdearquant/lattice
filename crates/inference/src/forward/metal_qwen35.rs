@@ -38,7 +38,6 @@ mod inner {
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
     use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
-    use crate::sampling::CandidateSet;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
     use crate::weights::q4_weights::quantize_row_q4_0;
@@ -2472,7 +2471,7 @@ kernel void moe_shared_gate_add(
     /// `payload_offset` is 0.  Dispatch helpers always bind via
     /// `enc.set_buffer(slot, Some(&qw.buffer), qw.payload_offset)` so both cases
     /// are handled uniformly.
-    struct Q4WeightBuf {
+    pub(crate) struct Q4WeightBuf {
         buffer: Buffer,
         /// Byte offset of Q4 payload within `buffer`.
         payload_offset: u64,
@@ -2641,7 +2640,7 @@ kernel void moe_shared_gate_add(
     }
 
     /// Weights for a GatedDeltaNet (linear attention) layer on GPU.
-    struct MetalGdnLayerWeights {
+    pub(crate) struct MetalGdnLayerWeights {
         in_proj_qkv: Q4WeightBuf,  // [qkv_dim, hidden] — Q4/Q8
         in_proj_z: Q4WeightBuf,    // [output_dim, hidden] — Q4/Q8
         in_proj_qkvz: Q4WeightBuf, // [qkv_dim+output_dim, hidden] — Q4/Q8; concat of qkv||z rows for fused decode GEMV
@@ -2655,7 +2654,7 @@ kernel void moe_shared_gate_add(
     }
 
     /// Weights for a full-attention (GQA) layer on GPU.
-    struct MetalFullLayerWeights {
+    pub(crate) struct MetalFullLayerWeights {
         q_proj: Q4WeightBuf, // [2*q_dim, hidden] (Q + gate_z interleaved) — Q4/Q8
         k_proj: Q4WeightBuf, // [kv_dim, hidden] — Q4/Q8
         v_proj: Q4WeightBuf, // [kv_dim, hidden] — Q4/Q8
@@ -2665,7 +2664,7 @@ kernel void moe_shared_gate_add(
     }
 
     /// Per-layer weights on GPU, discriminated by layer type.
-    enum MetalLayerAttnWeights {
+    pub(crate) enum MetalLayerAttnWeights {
         Linear(MetalGdnLayerWeights),
         Full(MetalFullLayerWeights),
     }
@@ -2718,7 +2717,7 @@ kernel void moe_shared_gate_add(
     }
 
     /// Common per-layer weights (norms + MLP) on GPU.
-    struct MetalCommonLayerWeights {
+    pub(crate) struct MetalCommonLayerWeights {
         input_layernorm: Buffer,          // [hidden] — f32 (norm)
         post_attention_layernorm: Buffer, // [hidden] — f32 (norm)
         ffn: MetalFfnWeights,
@@ -2753,7 +2752,7 @@ kernel void moe_shared_gate_add(
         mlp: MetalMtpDenseMlpWeights,
     }
 
-    struct MetalMtpWeights {
+    pub(crate) struct MetalMtpWeights {
         fc: Buffer,                    // f16, [hidden, 2*hidden]
         pre_fc_norm_embedding: Buffer, // [hidden]
         pre_fc_norm_hidden: Buffer,    // [hidden]
@@ -2761,10 +2760,11 @@ kernel void moe_shared_gate_add(
         norm: Buffer, // [hidden]
     }
 
-    struct MetalMtpCache {
+    pub(crate) struct MetalMtpCache {
         k_buf: Buffer,
         v_buf: Buffer,
         seq_len: usize,
+        #[allow(dead_code)] // capacity bound stored for future MTP bounds checking
         max_cache_len: usize,
     }
 
@@ -2774,7 +2774,7 @@ kernel void moe_shared_gate_add(
         }
     }
 
-    struct MetalMtpActivations {
+    pub(crate) struct MetalMtpActivations {
         fused: Buffer,       // [2*hidden] — normed embedding concat normed hidden
         hidden: Buffer,      // [hidden]
         residual: Buffer,    // [hidden]
@@ -2790,12 +2790,6 @@ kernel void moe_shared_gate_add(
         logits: Buffer,      // [vocab]
     }
 
-    struct MetalMtpRuntime {
-        weights: MetalMtpWeights,
-        cache: MetalMtpCache,
-        activations: MetalMtpActivations,
-    }
-
     /// Per-session MTP mutable state (cache + activations only; weights live on the engine).
     pub(crate) struct MetalMtpSession {
         pub(crate) cache: MetalMtpCache,
@@ -2805,7 +2799,8 @@ kernel void moe_shared_gate_add(
     /// Per-speculation-round GDN state checkpoint pool.
     ///
     /// Stores up to `max_tokens + 1` snapshots (slot 0 = base, slot k = after k tokens).
-    struct MetalGdnCheckpointPool {
+    pub(crate) struct MetalGdnCheckpointPool {
+        #[allow(dead_code)] // capacity bound stored for future slot-overflow safety checks
         max_tokens: usize,
         conv_slots: Vec<Vec<Buffer>>, // [slot][linear_layer]
         s_slots: Vec<Vec<Buffer>>,    // [slot][linear_layer]
@@ -2864,7 +2859,9 @@ kernel void moe_shared_gate_add(
     }
 
     struct MetalVerifyOutput {
-        logits: Vec<Vec<f32>>,  // per-token full-vocab logits
+        logits: Vec<Vec<f32>>, // per-token full-vocab logits
+        #[allow(dead_code)]
+        // pre-final hidden retained for MTP chaining; not yet consumed by callers
         final_hidden: Vec<f32>, // pre-final hidden of last verified row
     }
 
@@ -2905,7 +2902,7 @@ kernel void moe_shared_gate_add(
     }
 
     /// Reusable activation buffers on GPU (pre-allocated for single-token decode).
-    struct MetalQwen35Activations {
+    pub(crate) struct MetalQwen35Activations {
         hidden: Buffer,      // [hidden_size]
         residual: Buffer,    // [hidden_size]
         attn_out: Buffer,    // [max(q_dim, hidden_size)] for attention output
@@ -2936,19 +2933,22 @@ kernel void moe_shared_gate_add(
     }
 
     /// KV cache for full-attention layers stored in Metal unified memory.
-    struct MetalKvCache {
+    pub(crate) struct MetalKvCache {
         /// k_cache[full_layer_idx]: flat [max_cache_len * kv_dim]
         k_bufs: Vec<Buffer>,
         /// v_cache[full_layer_idx]: flat [max_cache_len * kv_dim]
         v_bufs: Vec<Buffer>,
         /// Current number of tokens cached.
         seq_len: usize,
+        #[allow(dead_code)]
+        // stride dimension stored for CPU-side append_kv; not needed on GPU path
         kv_dim: usize,
         max_cache_len: usize,
     }
 
     /// Compiled MSL pipeline state objects.
-    struct MetalQwen35Pipelines {
+    #[allow(dead_code)] // pipeline handles for kernels staged for future dispatch paths
+    pub(crate) struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
         gemv_decode_wide: ComputePipelineState,
         gemv_q8: ComputePipelineState,
@@ -3011,7 +3011,7 @@ kernel void moe_shared_gate_add(
     /// Computed once by `choose_gpu_topk_route`; stored in `compact_route` so
     /// the dispatch path doesn't re-evaluate env vars per token.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum GpuTopkRoute {
+    pub(crate) enum GpuTopkRoute {
         /// CPU fallback — no GPU top-k dispatch; `compact_topk` stays 0.
         CpuFallback,
         /// k=1 two-stage simdgroup argmax — reserved for a future faster kernel.
@@ -3046,7 +3046,7 @@ kernel void moe_shared_gate_add(
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum QuantFormat {
+    pub(crate) enum QuantFormat {
         Q8_0,
         Q4_0,
     }
@@ -3155,11 +3155,14 @@ kernel void moe_shared_gate_add(
         pub(crate) gdn_checkpoints: Option<MetalGdnCheckpointPool>,
         pub(crate) last_pre_final_hidden: Vec<f32>,
         /// Authoritative decode cursor; kept in sync with kv_cache.seq_len.
+        #[allow(dead_code)]
+        // read by tests; written by set_position for future concurrent API
         pub(crate) position: usize,
     }
 
     impl InferenceSession {
         /// Set both the logical position and the KV cache sequence length atomically.
+        #[allow(dead_code)] // reserved for the concurrent Engine::forward_step API (ADR roadmap)
         pub(crate) fn set_position(&mut self, position: usize) {
             self.position = position;
             self.kv_cache.seq_len = position;
@@ -3185,6 +3188,8 @@ kernel void moe_shared_gate_add(
         projections: Vec<std::collections::HashMap<String, MetalLoraProjection>>,
         scale: f32,
         intermediate: Buffer,
+        #[allow(dead_code)]
+        // max rank used to size `intermediate` buffer at load time; stored for adapter introspection
         max_rank: u32,
     }
 
@@ -3540,6 +3545,7 @@ kernel void moe_shared_gate_add(
     /// Read f32 slice from a Metal shared-mode buffer starting at a given element offset.
     ///
     /// SAFETY: Same requirements as `read_buffer`; `offset_f32 + len` must be within bounds.
+    #[allow(dead_code)] // debug/calibration helper used for CPU-side readback at non-zero offsets
     unsafe fn read_buffer_offset(buf: &Buffer, offset_f32: usize, len: usize) -> Vec<f32> {
         let ptr = (buf.contents() as *const f32).add(offset_f32);
         std::slice::from_raw_parts(ptr, len).to_vec()
@@ -3551,6 +3557,7 @@ kernel void moe_shared_gate_add(
     ///
     /// SAFETY: Buffer must be StorageModeShared with sufficient length and no
     /// concurrent GPU writes (command buffer completed or not yet submitted).
+    #[allow(dead_code)] // CPU-side f16 readback helper; used in debugging and future calibration paths
     unsafe fn read_buffer_f16(buf: &Buffer, len: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const u16;
         let mut out = vec![0.0f32; len];
@@ -3648,6 +3655,7 @@ kernel void moe_shared_gate_add(
         ///
         /// Returns `Err` if the cache is full; callers must handle this before calling
         /// to avoid a buffer overflow in release builds.
+        #[allow(dead_code)] // CPU-side KV append; superseded by GPU copy_offset dispatch but retained for the debug path
         fn append_kv(
             &mut self,
             full_layer_idx: usize,
@@ -6810,10 +6818,10 @@ kernel void moe_shared_gate_add(
                         let v_off = (t * kv_dim) as u64 * 4;
                         let ao_off = (t * q_dim) as u64 * 4;
 
-                        // Scatter Q + gate from interleaved q_proj
-                        // SAFETY: Per-token q/gate offsets are within the batch
-                        // activation buffers, and q_dim is num_q_heads * head_dim.
-                        unsafe {
+                        // Scatter Q + gate from interleaved q_proj.
+                        // Per-token q/gate offsets are within the batch activation buffers;
+                        // q_dim is num_q_heads * head_dim.
+                        {
                             enc.set_compute_pipeline_state(&self.engine.pipelines.scatter_q_gate);
                             enc.set_buffer(0, Some(&self.session.activations.q), q_off);
                             enc.set_buffer(1, Some(&self.session.activations.q_separated), qs_off);
@@ -6858,10 +6866,10 @@ kernel void moe_shared_gate_add(
                             );
                         }
 
-                        // Partial RoPE for Q and K
-                        // SAFETY: RoPE table buffers cover max positions and
-                        // per-token Q/K offsets are within activation buffers.
-                        unsafe {
+                        // Partial RoPE for Q and K.
+                        // RoPE table buffers cover max positions and per-token Q/K
+                        // offsets are within activation buffers sized from the same config.
+                        {
                             let pos = t as u32;
                             enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope);
                             enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
@@ -8119,6 +8127,7 @@ kernel void moe_shared_gate_add(
         ///
         /// Requires `LATTICE_GDN_CPU=1`. Not available in release builds.
         #[cfg(debug_assertions)]
+        #[allow(dead_code)] // debug-assertions-only path; called when LATTICE_GDN_CPU=1
         fn gdn_layer_step_by_idx(
             &mut self,
             layer_idx: usize,
@@ -8360,6 +8369,7 @@ kernel void moe_shared_gate_add(
         /// writes gated norm output to gdn_z buffer (read by CMD B for out_proj).
         /// Requires `LATTICE_GDN_CPU=1`. Not available in release builds.
         #[cfg(debug_assertions)]
+        #[allow(dead_code)] // debug-assertions-only path; called when LATTICE_GDN_CPU=1
         fn gdn_cpu_recurrence(&mut self, layer_idx: usize, state_idx: usize, cfg: &Qwen35Config) {
             let hidden = cfg.hidden_size;
             let num_heads = cfg.linear_num_key_heads;
@@ -8518,6 +8528,7 @@ kernel void moe_shared_gate_add(
         // Full attention layer: fully on GPU
         // ===================================================================
 
+        #[allow(dead_code)] // single-token full-attention step; superseded by batch prefill path but retained as reference
         fn full_attention_layer_step_by_idx(
             &mut self,
             layer_idx: usize,
@@ -10409,6 +10420,7 @@ kernel void moe_shared_gate_add(
             );
         }
 
+        #[allow(dead_code)] // element-wise add dispatch helper; used by full_attention_layer_step_by_idx
         fn dispatch_add(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -10874,6 +10886,7 @@ kernel void moe_shared_gate_add(
         cs.sample_top_p(cfg.top_p, r)
     }
 
+    #[allow(dead_code)] // numerically stable softplus; staged for GDN a_log activation path
     fn softplus(x: f32) -> f32 {
         if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
     }
