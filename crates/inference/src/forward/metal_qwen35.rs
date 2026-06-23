@@ -8185,6 +8185,7 @@ kernel void moe_shared_gate_add(
                 }
             }
             self.session.kv_cache.reset();
+            self.session.position = 0;
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
@@ -15789,6 +15790,100 @@ kernel void decode_attention_reference(
                 "argmax mismatch between step loop and chunked prefill"
             );
             // Both paths must advance the session cursor to the full prompt length.
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(state.session.position, tokens.len());
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn metal_qwen35_chunked_prefill_length_1_final_chunk_matches_step_loop() {
+            // Degenerate-boundary gate: a prompt of exactly max_prefill + 1 tokens
+            // decomposes into chunks [max_prefill, 1]. The length-1 final chunk
+            // goes through forward_prefill_batched_chunk with n=1 (single-iteration
+            // per-token loops, m=1 GEMMs) — NOT the forward_step fast path. This
+            // path is unreachable by the 600-700 token parity test above.
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping length-1 final-chunk parity test: model files missing at {}",
+                    model_dir.display()
+                );
+                return;
+            }
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            assert!(
+                model.config().num_active_linear_attention_layers() > 0,
+                "prompt must exercise at least one GDN layer"
+            );
+
+            let Some(device) = Device::system_default() else {
+                eprintln!("skipping length-1 final-chunk parity test: no Metal device");
+                return;
+            };
+            let _ = device;
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal qwen3.5-0.8b state");
+
+            // Trim to exactly max_prefill + 1 so the final chunk has length 1.
+            let mut tokens = long_real_text_tokens(model.tokenizer());
+            let target = state.session.max_prefill + 1;
+            assert!(
+                tokens.len() >= target,
+                "helper produced {} tokens, need >= {target}",
+                tokens.len()
+            );
+            tokens.truncate(target);
+            assert_eq!(
+                tokens.len(),
+                state.session.max_prefill + 1,
+                "prompt must be exactly max_prefill + 1 for a length-1 final chunk"
+            );
+
+            // Path A: token-by-token reference.
+            state.reset_state();
+            let mut step_logits = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                step_logits = state.forward_step(tok, pos);
+            }
+
+            // Path B: chunked batched prefill (final chunk length 1).
+            state.reset_state();
+            let prefill_logits = state.forward_prefill(&tokens);
+
+            assert_eq!(step_logits.len(), model.config().vocab_size);
+            assert_eq!(prefill_logits.len(), model.config().vocab_size);
+
+            let max_abs_diff = step_logits
+                .iter()
+                .zip(prefill_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            eprintln!(
+                "length-1 final-chunk parity: max_abs_diff={max_abs_diff:.6}, \
+                 argmax_step={}, argmax_prefill={}, tokens={}",
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                tokens.len()
+            );
+
+            assert!(
+                max_abs_diff < 1e-2,
+                "length-1 final-chunk logits diverged from step loop: max_abs_diff={max_abs_diff}"
+            );
+            assert_eq!(
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                "argmax mismatch on length-1 final chunk"
+            );
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
             assert_eq!(state.session.position, tokens.len());
         }
