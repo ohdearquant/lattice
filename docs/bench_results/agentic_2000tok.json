@@ -1,0 +1,35 @@
+[
+  {
+    "engine": "lattice",
+    "context": 2017,
+    "response": 100,
+    "ttft_ms": 3803.4,
+    "decode_ms": 3217.7,
+    "total_ms": 7021.2,
+    "prefill_tok_s": 530,
+    "decode_tok_s": 31,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 2890,
+    "response": 100,
+    "ttft_ms": 251.9,
+    "decode_ms": 602.7,
+    "total_ms": 854.6,
+    "prefill_tok_s": 11472,
+    "decode_tok_s": 166,
+    "source": "live"
+  },
+  {
+    "engine": "mlx",
+    "context": 2017,
+    "response": 100,
+    "ttft_ms": 474.3,
+    "decode_ms": 634.8,
+    "total_ms": 1109.1,
+    "prefill_tok_s": 4252,
+    "decode_tok_s": 158,
+    "source": "live"
+  }
+]
