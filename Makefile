@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-decode-slopefit
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick
 
 check:
 	cargo check --workspace
@@ -81,3 +81,13 @@ bench-decode-slopefit:
 #        make bench-compare BASE=main HEAD=pr/x (explicit refs)
 bench-compare:
 	./scripts/bench-compare.sh $(or $(BASE),origin/main) $(or $(HEAD),HEAD)
+
+# Agentic-workload benchmark: lattice vs ollama vs MLX at 1000/2000/4000-token context.
+# Prereqs: bench_decode_ab binary built, ollama serve running, mlx_lm available.
+# Build binary: cargo build --release --bin bench_decode_ab -p lattice-inference --features "f16,metal-gpu"
+bench-agentic:
+	uv run python3 scripts/bench_compare_1k.py --sweep
+
+# Fast sanity check: ctx=1000 only, 3 runs.
+bench-agentic-quick:
+	uv run python3 scripts/bench_compare_1k.py --ctx 1000 --runs 3

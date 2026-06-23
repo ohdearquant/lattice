@@ -1,0 +1,129 @@
+[
+  {
+    "engine": "lattice",
+    "context": 1009,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 3052.0,
+    "decode_ms": 1557.6,
+    "total_ms": 4609.6,
+    "prefill_tok_s": 331,
+    "decode_tok_s": 64,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 1450,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 355.1,
+    "decode_ms": 684.1,
+    "total_ms": 1039.2,
+    "prefill_tok_s": 4083,
+    "decode_tok_s": 146,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": 263.2,
+      "prompt_eval_ms": 14.3,
+      "eval_ms": 684.1,
+      "prompt_eval_count": 1450
+    }
+  },
+  {
+    "engine": "mlx",
+    "context": 1009,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 317.3,
+    "decode_ms": 694.9,
+    "total_ms": 1012.2,
+    "prefill_tok_s": 3180,
+    "decode_tok_s": 144,
+    "source": "live"
+  },
+  {
+    "engine": "lattice",
+    "context": 2017,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 3827.7,
+    "decode_ms": 1443.8,
+    "total_ms": 5271.5,
+    "prefill_tok_s": 527,
+    "decode_tok_s": 69,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 2890,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 258.1,
+    "decode_ms": 605.7,
+    "total_ms": 863.8,
+    "prefill_tok_s": 11197,
+    "decode_tok_s": 165,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": 236.9,
+      "prompt_eval_ms": 15.0,
+      "eval_ms": 605.7,
+      "prompt_eval_count": 2890
+    }
+  },
+  {
+    "engine": "mlx",
+    "context": 2017,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 463.1,
+    "decode_ms": 632.1,
+    "total_ms": 1095.1,
+    "prefill_tok_s": 4356,
+    "decode_tok_s": 158,
+    "source": "live"
+  },
+  {
+    "engine": "lattice",
+    "context": 4033,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 9070.8,
+    "decode_ms": 7702.8,
+    "total_ms": 16773.6,
+    "prefill_tok_s": 445,
+    "decode_tok_s": 13,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 5818,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 257.7,
+    "decode_ms": 624.7,
+    "total_ms": 882.4,
+    "prefill_tok_s": 22574,
+    "decode_tok_s": 160,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": null,
+      "prompt_eval_ms": null,
+      "eval_ms": null,
+      "prompt_eval_count": null,
+      "note": "breakdown not captured for this context (predates schema update); pattern from ctx=1000/2000 shows prompt_eval_ms ~14-15ms constant regardless of context depth, confirming full prefix-cache hit"
+    }
+  },
+  {
+    "engine": "mlx",
+    "context": 4033,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 954.5,
+    "decode_ms": 624.1,
+    "total_ms": 1578.6,
+    "prefill_tok_s": 4225,
+    "decode_tok_s": 160,
+    "source": "live"
+  }
+]

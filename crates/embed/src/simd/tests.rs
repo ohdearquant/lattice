@@ -182,6 +182,57 @@ fn test_neon_normalize_matches_scalar_multiple_dims() {
     }
 }
 
+/// Differential test: vrsqrteq_f32 + Newton–Raphson vs scalar reference.
+///
+/// Two Newton steps on top of `vrsqrteq_f32` converge to full f32 precision
+/// (~2^-23 relative).  The max absolute per-element error vs the scalar path
+/// (which uses `f32::sqrt` + division) must stay below 1e-6 — issue #149's
+/// accuracy gate — across representative embedding dimensions.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_neon_rsqrt_newton_accuracy() {
+    for dim in [16usize, 64, 128, 384, 768, 1024, 1536] {
+        let mut neon_v = generate_random_vector_seeded(dim, 0x_dead_beef + dim as u64);
+        let mut scalar_v = neon_v.clone();
+
+        normalize(&mut neon_v);
+        normalize::normalize_scalar(&mut scalar_v);
+
+        let max_diff = neon_v
+            .iter()
+            .zip(scalar_v.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_diff < 1e-6,
+            "vrsqrteq_f32 + Newton vs scalar: dim={dim}, max_abs_diff={max_diff} (limit=1e-6)"
+        );
+    }
+}
+
+/// Subnormal-norm guard: ‖v‖ ≲ 7e-20 drives norm_sq subnormal, where
+/// `vrsqrteq`/Newton overflow to inf.  The NEON path must fall back to the
+/// scalar reciprocal and stay finite + byte-consistent with `normalize_scalar`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_neon_normalize_subnormal_norm_finite() {
+    let dim = 64usize;
+    let mut neon_v = vec![1e-21_f32; dim];
+    let mut scalar_v = neon_v.clone();
+
+    normalize(&mut neon_v);
+    normalize::normalize_scalar(&mut scalar_v);
+
+    for (i, (&a, &b)) in neon_v.iter().zip(scalar_v.iter()).enumerate() {
+        assert!(a.is_finite(), "NEON normalize non-finite at [{i}]: {a}");
+        assert!(
+            (a - b).abs() < 1e-5,
+            "subnormal-norm NEON vs scalar mismatch at [{i}]: {a} vs {b}"
+        );
+    }
+}
+
 #[test]
 fn test_avx512_normalize_dimensions() {
     for dim in AVX512_TEST_DIMS {
