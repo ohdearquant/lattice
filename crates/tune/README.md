@@ -322,13 +322,15 @@ let finetuned = RegisteredModel::new("intent_classifier", "1.1.0")
 
 ## Feature Flags
 
-| Feature       | Default | Description                                |
-| ------------- | ------- | ------------------------------------------ |
-| `std`         | Yes     | Standard library support                   |
-| `serde`       | No      | Serialization (propagates to lattice-fann) |
-| `gpu`         | No      | GPU-accelerated training                   |
-| `gpu-tests`   | No      | GPU tests requiring hardware               |
-| `safetensors` | No      | Safe checkpoint serialization              |
+| Feature          | Default | Description                                                  |
+| ---------------- | ------- | ------------------------------------------------------------ |
+| `std`            | Yes     | Standard library support                                     |
+| `serde`          | No      | Serialization (propagates to lattice-fann)                   |
+| `gpu`            | No      | GPU-accelerated training                                     |
+| `gpu-tests`      | No      | GPU tests requiring hardware                                 |
+| `safetensors`    | No      | Safe checkpoint serialization                                |
+| `inference-hook` | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`) |
+| `train-backward` | No      | Backward/gradient training surface (pulls in `lattice-inference`) |
 
 ```toml
 [dependencies]
@@ -336,6 +338,27 @@ lattice-tune = { version = "0.1" }                           # Default
 lattice-tune = { version = "0.1", features = ["serde"] }     # With serialization
 lattice-tune = { version = "0.1", features = ["gpu"] }       # GPU training
 lattice-tune = { version = "0.1", features = ["safetensors"] } # Safe checkpoints
+```
+
+### Injecting an adapter into `lattice-inference`
+
+Enable `inference-hook` to get `impl lattice_inference::lora_hook::LoraHook for
+LoraAdapter`, so a trained adapter can be handed to a running inference engine
+as a `Box<dyn LoraHook>`:
+
+```toml
+[dependencies]
+lattice-tune = { version = "0.3", features = ["inference-hook"] }
+lattice-inference = "0.3" # provides the LoraHook trait
+```
+
+```rust,ignore
+use lattice_tune::lora::LoraAdapter;
+use lattice_inference::lora_hook::LoraHook; // not re-exported at the crate root
+
+let adapter: LoraAdapter = /* LoraAdapter::load_peft_safetensors(...) */;
+let hook: Box<dyn LoraHook> = Box::new(adapter);
+// the engine calls hook.apply(layer_idx, module, x, output) on each projection
 ```
 
 ## Dependencies
