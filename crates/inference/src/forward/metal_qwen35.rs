@@ -2807,7 +2807,18 @@ kernel void gdn_chunk_materialize_c32(
                 for (uint si = 0u; si < 4u; si++) s += sg_buf[si];
                 float a  = exp(a_log[kh]);
                 float sp = log(1.0f + exp(s + dt_bias[kh]));
-                out_bla[head_row * 2u + 1u] = -a * sp;
+                // Floor the per-token log-decay so the chunked cumulative-log scan stays
+                // closed under saturated decay.  An overflowing softplus drives -a*sp to
+                // -inf; the prefix-log differences in gdn_chunk_solve_c32 then form
+                // -inf - -inf = NaN and poison all downstream GDN state (gamma_logs, qk_l,
+                // k_right, S_all).  The serial recurrence maps the same input to
+                // g = exp(-inf) = 0 (a finite full reset).  -88 reproduces that
+                // (exp(-88) ~ 6e-39 ~ 0) while keeping the cumsum and its differences
+                // finite; it only ever clamps values whose exp is already ~0, so finite
+                // inputs are bit-unchanged.  fmax (not max) also sanitises a NaN from
+                // exp(a_log)=inf * sp=0.  Mirrored by GDN_LOG_ALPHA_FLOOR in the CPU
+                // algebra regression test.
+                out_bla[head_row * 2u + 1u] = fmax(-a * sp, -88.0f);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -17379,6 +17390,105 @@ kernel void decode_attention_reference(
                 .expect("0.8B shape should be supported");
             assert_eq!(p.n_tokens, 33);
             assert_eq!(p.num_chunks, 2); // ceil(33/32) = 2
+        }
+
+        /// Regression for the chunked log-decay NaN edge (codex review of PR #235).
+        ///
+        /// `gdn_chunk_materialize_c32` stores each token's log-decay `-a*sp` and
+        /// `gdn_chunk_solve_c32` forms decay ratios as `exp(cumsum[j] - cumsum[k])`.
+        /// When a softplus overflows, the unclamped `-a*sp` is `-inf`; once it enters
+        /// the cumulative sum, every later prefix is `-inf` and a same-token difference
+        /// is `-inf - -inf = NaN`, poisoning all downstream GDN state. The serial
+        /// recurrence maps the same token to `g = exp(-inf) = 0` (a finite full reset).
+        /// The kernel floors `-a*sp` at -88 (`fmax`) so the chunked log-difference
+        /// representation reproduces the serial gate-product while staying finite.
+        ///
+        /// This mirrors that algebra on the CPU: the clamped chunked decay ratios must
+        /// be finite and equal the serial product of per-token gates, and the unclamped
+        /// form must still produce NaN (proving the floor is load-bearing).
+        #[test]
+        fn gdn_chunked_log_decay_floor_matches_serial_under_saturation() {
+            // Must match the `fmax(-a*sp, -88.0f)` floor in MSL_SOURCE.
+            const GDN_LOG_ALPHA_FLOOR: f32 = -88.0;
+
+            let c = 8usize;
+            let sat_idx = 3usize;
+
+            // Per-token raw log-decay `-a*sp`. The saturated token overflows softplus
+            // (s + dt_bias huge) so its raw value is -inf; the rest are ordinary.
+            let raw_log_alpha: Vec<f32> = (0..c)
+                .map(|i| {
+                    if i == sat_idx {
+                        let a = (0.5f32).exp();
+                        let sp = (1.0f32 + (200.0f32).exp()).ln(); // overflow -> inf
+                        -a * sp
+                    } else {
+                        let a = (0.3f32).exp();
+                        let sp = (1.0f32 + (-0.5f32 + 0.1f32 * i as f32).exp()).ln();
+                        -a * sp
+                    }
+                })
+                .collect();
+            assert!(
+                raw_log_alpha[sat_idx].is_infinite() && raw_log_alpha[sat_idx] < 0.0,
+                "setup: saturated token must give -inf, got {}",
+                raw_log_alpha[sat_idx]
+            );
+
+            // Serial reference gate g[m] = exp(log_alpha[m]); the -inf token -> exactly 0.
+            let g_serial: Vec<f32> = raw_log_alpha.iter().map(|&x| x.exp()).collect();
+            assert_eq!(
+                g_serial[sat_idx], 0.0,
+                "serial gate at the saturated token must be exactly 0"
+            );
+
+            // Chunked path: floor, cumulative-sum, decay ratios via log differences.
+            let clamped: Vec<f32> = raw_log_alpha
+                .iter()
+                .map(|&x| x.max(GDN_LOG_ALPHA_FLOOR))
+                .collect();
+            let mut cumsum = vec![0.0f32; c];
+            let mut acc = 0.0f32;
+            for j in 0..c {
+                acc += clamped[j];
+                cumsum[j] = acc;
+            }
+
+            // Every causal ratio L[j][k] (j >= k) must be finite and equal the serial
+            // product prod_{m=k+1..j} g[m].
+            let mut max_abs = 0.0f32;
+            for j in 0..c {
+                for k in 0..=j {
+                    let l_chunked = (cumsum[j] - cumsum[k]).exp();
+                    assert!(
+                        l_chunked.is_finite(),
+                        "chunked decay ratio L[{j}][{k}] is non-finite ({l_chunked}) after floor"
+                    );
+                    let mut p_serial = 1.0f32;
+                    for m in (k + 1)..=j {
+                        p_serial *= g_serial[m];
+                    }
+                    max_abs = max_abs.max((l_chunked - p_serial).abs());
+                }
+            }
+            assert!(
+                max_abs < 1e-5,
+                "floored chunked decay ratios diverge from serial gate products: max_abs={max_abs:.3e}"
+            );
+
+            // Negative control: without the floor, the log-difference is NaN — the exact
+            // failure the floor exists to prevent.
+            let mut cumsum_raw = vec![0.0f32; c];
+            let mut acc_raw = 0.0f32;
+            for j in 0..c {
+                acc_raw += raw_log_alpha[j];
+                cumsum_raw[j] = acc_raw;
+            }
+            let unclamped_ratio = (cumsum_raw[sat_idx + 1] - cumsum_raw[sat_idx]).exp();
+            assert!(
+                unclamped_ratio.is_nan(),
+                "regression target: unclamped log-difference must be NaN, got {unclamped_ratio}"
+            );
         }
 
         /// Verify supports_gdn_chunked_prefill accepts 0.8B.
