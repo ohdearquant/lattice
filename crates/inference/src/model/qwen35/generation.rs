@@ -26,6 +26,18 @@ impl Qwen35Model {
             return Err(InferenceError::Inference("empty prompt".into()));
         }
 
+        // max_new_tokens == 0 means "generate nothing": return before sampling so
+        // we never emit a token the caller did not ask for. Mirrors the identical
+        // guard in generate_streaming, which this function is otherwise a copy of.
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+            });
+        }
+
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
