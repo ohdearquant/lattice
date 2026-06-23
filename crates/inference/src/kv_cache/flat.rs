@@ -863,7 +863,8 @@ mod tests {
     #[test]
     fn constructed_cache_eagerly_initializes_configured_len() {
         // Verifies that FlatKVCache::new immediately materializes all buffers
-        // at max_seq_len capacity (current eager-allocation contract, issue #12 deferred).
+        // at max_seq_len capacity (eager-allocation contract; issue #12 resolved by
+        // capping max_seq_len via GenerateConfig::kv_cache_capacity in generate()).
         let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
         let cache = FlatKVCache::new(config);
         let kv_dim = cache.kv_dim(); // 2 * 4 = 8
