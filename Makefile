@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-decode-slopefit
 
 check:
 	cargo check --workspace
@@ -68,6 +68,13 @@ e2e-parity:
 #        RUNS=3 make bench-decode            (faster)
 bench-decode:
 	./scripts/bench_decode_slope.sh
+
+# ADR-064 Phase-0: decode slope/intercept fit (Theil-Sen + bootstrap CI).
+# Usage: make bench-decode-slopefit                     (smoke grid {64,256,512})
+#        SLOPEFIT_FULL=1 make bench-decode-slopefit     (full grid up to 16K ctx)
+#        SLOPEFIT_CONTEXTS="64 512 2048" make bench-decode-slopefit
+bench-decode-slopefit:
+	./scripts/bench_decode_slopefit.sh
 
 # A/B benchmark across git refs. Uses worktree for base, leaves working tree untouched.
 # Usage: make bench-compare                     (origin/main vs HEAD)
