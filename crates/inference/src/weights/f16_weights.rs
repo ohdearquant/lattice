@@ -872,10 +872,12 @@ pub fn load_f16_weights(
         )?;
 
         let ffn = if cfg.is_moe() {
-            let num_experts = cfg.num_experts.expect("MoE config has num_experts");
-            let top_k = cfg
-                .num_experts_per_tok
-                .expect("MoE config has num_experts_per_tok");
+            let num_experts = cfg.num_experts.ok_or_else(|| {
+                InferenceError::InvalidInput("MoE config missing num_experts".into())
+            })?;
+            let top_k = cfg.num_experts_per_tok.ok_or_else(|| {
+                InferenceError::InvalidInput("MoE config missing num_experts_per_tok".into())
+            })?;
             let moe_inter = cfg.moe_intermediate_size();
             let shared_inter = cfg.shared_expert_intermediate_size();
 

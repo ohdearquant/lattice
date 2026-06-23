@@ -101,10 +101,12 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
     prefix: &str,
     hidden: usize,
 ) -> Result<FeedForwardWeights, InferenceError> {
-    let num_experts = cfg.num_experts.expect("MoE config has num_experts");
-    let top_k = cfg
-        .num_experts_per_tok
-        .expect("MoE config has num_experts_per_tok");
+    let num_experts = cfg
+        .num_experts
+        .ok_or_else(|| InferenceError::InvalidInput("MoE config missing num_experts".into()))?;
+    let top_k = cfg.num_experts_per_tok.ok_or_else(|| {
+        InferenceError::InvalidInput("MoE config missing num_experts_per_tok".into())
+    })?;
     let moe_inter = cfg.moe_intermediate_size();
     let shared_inter = cfg.shared_expert_intermediate_size();
 
@@ -320,4 +322,65 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
         final_norm,
         layers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::qwen35_config::Qwen35Config;
+
+    struct NullTensorSource;
+
+    impl TensorSource for NullTensorSource {
+        fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
+            Ok(false)
+        }
+        fn tensor_shape(&mut self, _name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(None)
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            Err(InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    #[test]
+    fn moe_missing_num_experts_returns_err_not_panic() {
+        let mut cfg = Qwen35Config::qwen36_35b_a3b();
+        cfg.num_experts = None;
+        cfg.num_experts_per_tok = Some(8);
+        let mut src = NullTensorSource;
+        let result = load_moe_ffn_weights(&mut src, &cfg, "layers.0", cfg.hidden_size);
+        match result {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("num_experts"),
+                    "message should name the field: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn moe_missing_num_experts_per_tok_returns_err_not_panic() {
+        let mut cfg = Qwen35Config::qwen36_35b_a3b();
+        cfg.num_experts = Some(256);
+        cfg.num_experts_per_tok = None;
+        let mut src = NullTensorSource;
+        let result = load_moe_ffn_weights(&mut src, &cfg, "layers.0", cfg.hidden_size);
+        match result {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("num_experts_per_tok"),
+                    "message should name the field: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
 }
