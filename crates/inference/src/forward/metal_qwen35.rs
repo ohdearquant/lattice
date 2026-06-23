@@ -16636,6 +16636,19 @@ kernel void decode_attention_reference(
             r
         }
 
+        /// Serializes GPU-heavy model tests onto the single shared Metal device.
+        /// Concurrent GPU execution amplifies the pre-existing ADR-065 attention
+        /// race, which perturbs the *serial* GDN reference that the cross-algorithm
+        /// parity tests compare against — producing false-positive failures under
+        /// `cargo test`'s default multi-threading. The chunked scan itself is
+        /// deterministic (see `gdn_chunked_b_vs_b_self_consistency`); serializing
+        /// device access keeps the serial reference clean run-to-run.
+        fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+            use std::sync::Mutex;
+            static GPU_LOCK: Mutex<()> = Mutex::new(());
+            GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
             use std::collections::HashMap;
             let mut vocab: HashMap<String, u32> = HashMap::new();
@@ -17525,6 +17538,7 @@ kernel void decode_attention_reference(
                 eprintln!("skipping: no Metal device");
                 return;
             };
+            let _gpu = gpu_test_lock();
             let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
                 .expect("construct Metal state");
             let tokens = long_real_text_tokens(model.tokenizer());
@@ -17577,6 +17591,7 @@ kernel void decode_attention_reference(
                 eprintln!("skipping: no Metal device");
                 return;
             };
+            let _gpu = gpu_test_lock();
             use crate::speculative::MtpTargetVerifier as _;
             let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
                 .expect("construct Metal state");
@@ -17620,21 +17635,26 @@ kernel void decode_attention_reference(
             // The chunked GDN scan is itself deterministic — gdn_chunked_b_vs_b_self_consistency and
             // the race-localization probe both show chunked-vs-chunked state diff = 0.0 across many
             // runs.  The only remaining nondeterminism is the pre-existing batched/decode attention
-            // race (ADR-065), which perturbs the residual stream on ~1-in-N runs and pollutes EITHER
-            // side of this cross-algorithm comparison (the serial forward_step reference is itself
-            // occasionally perturbed by ~1e-3, rarely more).  That race is out of scope here.  So we
-            // recompute BOTH the chunked and serial snapshots per attempt and keep the best: a single
-            // clean comparison proves the chunked scan correct, and we only fail if every attempt
-            // diverges (which would indicate a real, deterministic chunked-scan bug).
+            // race (ADR-065), which perturbs the residual stream on ~1-in-N runs.  GPU access is
+            // serialized via gpu_test_lock() so that race is not amplified by device contention, but
+            // it can still occasionally perturb the *serial* forward_step reference by ~1e-3.
+            //
+            // So the chunked snapshot — the path actually under test — is computed exactly ONCE
+            // outside the retry loop.  The loop re-samples only the serial reference and keeps the
+            // best comparison.  A flaky chunked attempt can therefore never be masked by best-of-N:
+            // if the single chunked snapshot were wrong, every attempt would diverge and the gate
+            // would fail.  We only tolerate retries cleaning the known-racy serial reference.
             const MAX_ABS_THRESHOLD: f32 = 5e-3;
             const MAX_REL_SIG_THRESHOLD: f32 = 5e-2;
+
+            // Chunked path (ON via per-instance flag) — computed once, held fixed.
+            state.use_gdn_chunked = true;
+            state.reset_state();
+            let _ = state.forward_prefill(&tokens);
+            let chunked_snap = state.snapshot_gdn_states();
+
             let mut best: Option<(f32, f32, usize)> = None;
             for attempt in 0..3 {
-                // Chunked path (ON via per-instance flag).
-                state.use_gdn_chunked = true;
-                state.reset_state();
-                let _ = state.forward_prefill(&tokens);
-                let chunked_snap = state.snapshot_gdn_states();
                 // Serial token-by-token reference (chunked OFF via per-instance flag).
                 state.use_gdn_chunked = false;
                 state.reset_state();
@@ -17674,8 +17694,11 @@ kernel void decode_attention_reference(
         /// must produce matching argmax at EVERY position for prompts that straddle the C=32 chunk
         /// boundary and the 512 max_prefill boundary.
         ///
-        /// Both paths are selected via `state.use_gdn_chunked` (no process-env mutation), so the
-        /// test is sound under parallel execution.
+        /// Both paths are selected via `state.use_gdn_chunked` (no process-env mutation), so there
+        /// are no setenv races. GPU access is additionally serialized via `gpu_test_lock()` so the
+        /// pre-existing ADR-065 attention race is not amplified by concurrent device contention,
+        /// and the deterministic chunked logits are computed once per length while only the serial
+        /// reference is retried — a flaky chunked attempt cannot be masked by best-of-N.
         ///
         /// This is a LOCAL/manual gate: `cargo test -p lattice-inference gdn_chunked
         /// --features "f16,metal-gpu" -- --nocapture` with the model present.  The production
@@ -17699,6 +17722,7 @@ kernel void decode_attention_reference(
                 eprintln!("skipping: no Metal device");
                 return;
             };
+            let _gpu = gpu_test_lock();
 
             let max_ctx = 1024usize;
             let mut state = MetalQwen35State::new(model.weights(), model.config(), max_ctx)
@@ -17741,11 +17765,25 @@ kernel void decode_attention_reference(
                     v
                 };
 
-                // Best-of-N: the chunked scan is deterministic, but the serial reference is
-                // perturbed by the ADR-065 race on a minority of runs.  Keep the attempt with
-                // the smallest max_abs (and its flip count); a single clean comparison proves
-                // the chunked algorithm correct, so stop early once one attempt is within bound
-                // and flip-free.  Mirrors gdn_chunked_state_vs_serial_state_diff.
+                // Chunked path (chunked ON) — the path under test.  Deterministic
+                // (gdn_chunked_b_vs_b_self_consistency), so compute it exactly ONCE and hold it
+                // fixed; the best-of-N below re-samples only the serial reference.  This is what
+                // makes the gate sound: a flaky chunked result would diverge on every attempt and
+                // fail the gate, never get masked by a lucky retry.
+                state.use_gdn_chunked = true;
+                state.reset_state();
+                let chunked_all = state.forward_prefill_all_logits(&tokens);
+                assert_eq!(
+                    chunked_all.len(),
+                    n * vocab,
+                    "chunked all_logits len mismatch at n={n}"
+                );
+
+                // Best-of-N: the serial reference is perturbed by the ADR-065 race on a minority
+                // of runs.  Keep the attempt with the smallest max_abs (and its flip count); a
+                // single clean comparison proves the chunked algorithm correct, so stop early once
+                // one attempt is within bound and flip-free.  Mirrors
+                // gdn_chunked_state_vs_serial_state_diff.
                 let mut best_max_abs = f32::MAX;
                 let mut best_flips = usize::MAX;
                 for _ in 0..ATTEMPTS {
@@ -17757,16 +17795,6 @@ kernel void decode_attention_reference(
                         serial_all.len(),
                         n * vocab,
                         "serial all_logits len mismatch at n={n}"
-                    );
-
-                    // Chunked path (chunked ON): per-position logits via all_logits.
-                    state.use_gdn_chunked = true;
-                    state.reset_state();
-                    let chunked_all = state.forward_prefill_all_logits(&tokens);
-                    assert_eq!(
-                        chunked_all.len(),
-                        n * vocab,
-                        "chunked all_logits len mismatch at n={n}"
                     );
 
                     // Compare at every position.
@@ -17850,6 +17878,7 @@ kernel void decode_attention_reference(
                 eprintln!("skipping: no Metal device");
                 return;
             };
+            let _gpu = gpu_test_lock();
             use crate::speculative::MtpTargetVerifier as _;
             let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
                 .expect("construct Metal state");
