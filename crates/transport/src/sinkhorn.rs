@@ -347,6 +347,14 @@ impl SinkhornResult {
     where
         C: CostMatrix + ?Sized,
     {
+        if row >= self.log_u.len() || col >= self.log_v.len() {
+            return Err(SinkhornError::DimensionMismatch {
+                expected_rows: self.log_u.len(),
+                got_rows: row,
+                expected_cols: self.log_v.len(),
+                got_cols: col,
+            });
+        }
         let value = cost.cost(row, col);
         if !value.is_finite() {
             return Err(SinkhornError::NonFiniteCost { row, col, value });
