@@ -3531,6 +3531,43 @@ kernel void moe_shared_gate_add(
         f32::from_bits(f32_bits)
     }
 
+    /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
+    /// to f32, writing into a pre-allocated destination buffer.
+    ///
+    /// On aarch64 the inner loop uses `vcvt_f32_f16` (4 lanes per instruction) with a
+    /// scalar remainder tail. On other targets the scalar `f16_to_f32` is used throughout.
+    ///
+    /// # Safety
+    /// - `src` must point to at least `n` contiguous, initialized u16 values.
+    /// - `dst` must point to at least `n` contiguous, writable f32 values.
+    /// - `n` may be zero (no-op).
+    unsafe fn convert_f16_row(src: *const u16, dst: *mut f32, n: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            // SAFETY: src has n u16 values; dst has n f32 values; we process 4 per iteration
+            // then handle the remainder scalarly. NEON is always present on aarch64.
+            let mut i = 0usize;
+            while i + 4 <= n {
+                let v_u16 = vld1_u16(src.add(i));
+                let v_f16 = vreinterpret_f16_u16(v_u16);
+                let v_f32 = vcvt_f32_f16(v_f16);
+                vst1q_f32(dst.add(i), v_f32);
+                i += 4;
+            }
+            while i < n {
+                *dst.add(i) = f16_to_f32(*src.add(i));
+                i += 1;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..n {
+                *dst.add(i) = f16_to_f32(*src.add(i));
+            }
+        }
+    }
+
     /// Read f32 slice from a Metal shared-mode buffer.
     ///
     /// SAFETY: Buffer must be StorageModeShared with sufficient length and no
@@ -3561,9 +3598,8 @@ kernel void moe_shared_gate_add(
     unsafe fn read_buffer_f16(buf: &Buffer, len: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const u16;
         let mut out = vec![0.0f32; len];
-        for i in 0..len {
-            out[i] = f16_to_f32(*ptr.add(i));
-        }
+        // SAFETY: ptr has len u16 values; out.as_mut_ptr() has len f32 values.
+        convert_f16_row(ptr, out.as_mut_ptr(), len);
         out
     }
 
@@ -4950,9 +4986,8 @@ kernel void moe_shared_gate_add(
                     );
                     let src = src_base.add(id as usize * hidden);
                     let dst = dst_base.add(t * hidden);
-                    for i in 0..hidden {
-                        *dst.add(i) = f16_to_f32(*src.add(i));
-                    }
+                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
+                    convert_f16_row(src, dst, hidden);
                 }
             }
 
@@ -5605,9 +5640,8 @@ kernel void moe_shared_gate_add(
             unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(pending_token as usize * hidden);
-                for i in 0..hidden {
-                    normed_embed[i] = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
+                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
             }
 
             if let Some(ref rot) = self.engine.quarot_rotation {
@@ -6094,9 +6128,8 @@ kernel void moe_shared_gate_add(
             unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16).add(embed_offset);
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                for i in 0..hidden {
-                    *dst.add(i) = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
+                convert_f16_row(src, dst, hidden);
             }
 
             if profiling {
@@ -6298,9 +6331,8 @@ kernel void moe_shared_gate_add(
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(token_id as usize * hidden);
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                for i in 0..hidden {
-                    *dst.add(i) = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
+                convert_f16_row(src, dst, hidden);
             }
 
             let mut active_layer_idx = 0usize;
@@ -6439,9 +6471,8 @@ kernel void moe_shared_gate_add(
                     );
                     let src = src_base.add(id as usize * hidden);
                     let dst = dst_base.add(t * hidden);
-                    for i in 0..hidden {
-                        *dst.add(i) = f16_to_f32(*src.add(i));
-                    }
+                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
+                    convert_f16_row(src, dst, hidden);
                 }
             }
 
@@ -10725,7 +10756,10 @@ kernel void moe_shared_gate_add(
             let first_input: Vec<f32> = unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(last_id as usize * hidden);
-                (0..hidden).map(|i| f16_to_f32(*src.add(i))).collect()
+                let mut out = vec![0.0f32; hidden];
+                // SAFETY: embed_tokens row has hidden u16 values; out has hidden f32 values.
+                convert_f16_row(src, out.as_mut_ptr(), hidden);
+                out
             };
 
             let mut traces: Vec<LayerTrace> = Vec::with_capacity(active_indices.len());
@@ -12455,6 +12489,44 @@ kernel void moe_shared_gate_add(
                 max_err < 1e-4,
                 "max roundtrip error for typical weights: {max_err}"
             );
+        }
+
+        /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` (NEON
+        /// on aarch64, scalar on other targets) produces bit-identical output to the
+        /// scalar `f16_to_f32` reference for every pattern.
+        ///
+        /// NaN comparison policy: both outputs are NaN ⇒ pass (any NaN payload is
+        /// acceptable; the bit pattern of a NaN is not architecturally meaningful).
+        /// Non-NaN values are compared by exact bit equality, which is correct because
+        /// f16→f32 widening is lossless for every representable value including
+        /// subnormals, ±0, and ±∞.
+        #[test]
+        fn test_convert_f16_row_matches_scalar_all_patterns() {
+            let mut src = [0u16; 65536];
+            for (i, v) in src.iter_mut().enumerate() {
+                *v = i as u16;
+            }
+            let mut neon_out = vec![0.0f32; 65536];
+            // SAFETY: src and neon_out are both 65536 elements, stack-allocated and valid.
+            unsafe {
+                convert_f16_row(src.as_ptr(), neon_out.as_mut_ptr(), 65536);
+            }
+            for bits in 0u16..=0xffffu16 {
+                let scalar = f16_to_f32(bits);
+                let fast = neon_out[bits as usize];
+                if scalar.is_nan() {
+                    assert!(
+                        fast.is_nan(),
+                        "bits=0x{bits:04x}: scalar=NaN but fast={fast}"
+                    );
+                } else {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        fast.to_bits(),
+                        "bits=0x{bits:04x}: scalar={scalar} fast={fast}"
+                    );
+                }
+            }
         }
 
         #[test]
