@@ -102,6 +102,35 @@
 //! println!("Loaded: {}", loaded.full_name());
 //! ```
 //!
+//! # Consuming the `inference-hook` bridge
+//!
+//! To inject a trained [`LoraAdapter`] into a running
+//! `lattice-inference` forward pass, enable the `inference-hook` feature. It
+//! pulls in `lattice-inference` and provides `impl
+//! lattice_inference::lora_hook::LoraHook for LoraAdapter`, so an adapter can be
+//! handed to the engine as a `Box<dyn LoraHook>`:
+//!
+//! ```toml
+//! [dependencies]
+//! lattice-tune = { version = "0.3", features = ["inference-hook"] }
+//! lattice-inference = "0.3" # provides the LoraHook trait
+//! ```
+//!
+//! ```ignore
+//! use lattice_tune::lora::LoraAdapter;
+//! use lattice_inference::lora_hook::LoraHook;
+//!
+//! let adapter: LoraAdapter = /* load via LoraAdapter::load_peft_safetensors(...) */;
+//! let hook: Box<dyn LoraHook> = Box::new(adapter);
+//! // hand `hook` to the inference engine; on each projection it calls
+//! // hook.apply(layer_idx, module, x, output)
+//! ```
+//!
+//! The trait path is `lattice_inference::lora_hook::LoraHook` (it is not
+//! re-exported at the inference crate root). Without the `inference-hook`
+//! feature, `LoraAdapter` is a pure training type and carries no dependency on
+//! `lattice-inference`.
+//!
 //! # Design Principles
 //!
 //! 1. **Data-first**: Well-defined training example format with full traceability
