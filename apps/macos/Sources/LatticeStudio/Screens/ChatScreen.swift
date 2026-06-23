@@ -1,20 +1,15 @@
 import SwiftUI
 
-// MARK: - 04 CHAT
+// MARK: - 02 CHAT
 //
-// Single-mode chat interface with run history.
+// Single-mode chat interface.
 //
-// Layout (two zones inside ScreenScaffold):
-//   • TAB PICKER   — segmented control "Chat | History" (max 240pt, left-aligned).
-//                    In Chat tab: "New conversation" on the right.
-//   • TRANSCRIPT   — scrollable column of ChatTurn bubbles (Chat tab), max-width 920pt.
-//                    OR run-history DataTable + live banner (History tab).
-//   • COMPOSER     — rounded TextEditor with Send/Stop as a 30×30 in-composer button
-//                    (bottom-trailing overlay). Chat tab only; hidden in History tab.
+// Layout (inside ScreenScaffold):
+//   • TRANSCRIPT — scrollable column of ChatTurn bubbles, max-width 920pt.
+//   • COMPOSER   — rounded TextEditor with Send/Stop as a 30×30 in-composer button.
 //
 // State ownership:
-//   All transcript + selection state lives in AppStore (hoisted from @State) so it
-//   survives NavigationSplitView teardown when Ocean navigates to another screen.
+//   All transcript state lives in AppStore so it survives NavigationSplitView teardown.
 //   ChatScreen reads/writes via @Bindable var store.
 //
 // Generation model:
@@ -25,18 +20,7 @@ import SwiftUI
 // Completion detection:
 //   Each run carries an onComplete hook (set in send()/retryTurn()) that
 //   AppStore.finish() fires when the subprocess exits — independent of ChatScreen being
-//   mounted, so a turn still resolves if Ocean navigates away mid-generation. It also
-//   fires with a failed status when another screen's launch() supersedes the run.
-//   store.chatAwaitingTurnID: UUID? tracks which turn receives the streamed text.
-//
-// N-way generation compare (A/B and beyond) lives in EvalScreen (Stage 3).
-
-// MARK: - ChatTab
-
-private enum ChatTab: String, CaseIterable {
-    case chat    = "Chat"
-    case history = "History"
-}
+//   mounted, so a turn still resolves if Ocean navigates away mid-generation.
 
 // MARK: - Typing indicator dots
 
@@ -73,10 +57,6 @@ struct ChatScreen: View {
 
     // MARK: Local state (ephemeral; does NOT need to survive navigation)
 
-    // Tab selection: Chat playground vs History (run notebook)
-    @State private var chatTab: ChatTab = .chat
-    // History tab: selected run (owned here so selection survives tab switches within Chat)
-    @State private var selectedRunID: String?
     // Composer text is ephemeral — clearing on navigation is acceptable
     @State private var composerText: String = ""
 
@@ -98,36 +78,6 @@ struct ChatScreen: View {
         return chatModels.first
     }
 
-    // All known adapters for the selected model (compatible + incompatible).
-    // The picker surfaces both so the user sees what exists and why some are unavailable.
-    private var allAdapters: [AdapterInfo] {
-        selectedModel?.adapters ?? []
-    }
-
-    private var adapterOptions: [String] {
-        // All adapters appear in the picker — usable ones selectable, unusable ones shown
-        // with a reason so the user is never left wondering why an adapter is "missing".
-        return ["none"] + allAdapters.map(\.name)
-    }
-
-    private var selectedAdapter: AdapterInfo? {
-        guard store.chatSelectedAdapterName != "none" else { return nil }
-        // Only return an adapter that has a resolvable weight file — otherwise generation
-        // would silently run the base model under the adapter's label.
-        return selectedModel?.adapters.first {
-            $0.name == store.chatSelectedAdapterName && $0.weightFile != nil
-        }
-    }
-
-    /// Compatibility check for display. Returns nil when the adapter is usable, or a short
-    /// human-readable reason string when it cannot be loaded by `generate_lora`.
-    private func incompatibilityReason(for adapter: AdapterInfo) -> String? {
-        if adapter.weightFile == nil {
-            return "no weight file (.safetensors not found)"
-        }
-        return nil
-    }
-
     // isRunning: true while a single-mode run is in-flight.
     private var isRunning: Bool {
         store.liveRun(matching: [.chat])?.status == .running
@@ -145,8 +95,7 @@ struct ChatScreen: View {
         // "ready" when the model directory exists on disk; never claim "loaded" since
         // the app shells out a fresh subprocess per generation and nothing stays in memory.
         let diskStatus = FileManager.default.fileExists(atPath: model.path.path) ? "ready" : "not found"
-        let adapterLabel = selectedAdapter?.name ?? "no adapter"
-        return "\(model.name) · \(diskStatus) · \(adapterLabel)"
+        return "\(model.name) · \(diskStatus)"
     }
 
     // MARK: Body
@@ -154,58 +103,13 @@ struct ChatScreen: View {
     var body: some View {
         ScreenScaffold(screen: .chat, subtitle: subtitle) {
             VStack(spacing: 0) {
-                // Tab / mode picker row
-                HStack {
-                    // Chat | History tab picker
-                    Picker("", selection: $chatTab) {
-                        ForEach(ChatTab.allCases, id: \.self) { tab in
-                            Text(tab.rawValue).tag(tab)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 240)
-
-                    Spacer()
-
-                    // "New conversation" — only visible in Chat tab
-                    if chatTab == .chat {
-                        // New conversation — clears transcript, keeps model/adapter/settings
-                        Button {
-                            newConversation()
-                        } label: {
-                            Label("New", systemImage: "square.and.pencil")
-                                .font(Theme.Fonts.body)
-                        }
-                        .buttonStyle(LatticeSecondaryButtonStyle())
-                        .help("Start a new conversation (keeps model & settings)")
-                        .disabled(store.chatTurns.isEmpty)
-                    }
-                }
-                .padding(.horizontal, Theme.Space.lg)
-                .padding(.top, Theme.Space.md)
-                .padding(.bottom, Theme.Space.sm)
-
-                // Tab content
-                switch chatTab {
-                case .chat:
-                    transcriptArea
-                    composerBar
-                case .history:
-                    RunsContent(store: store, selectedRunID: $selectedRunID)
-                }
+                transcriptArea
+                composerBar
             }
         }
         .inspector(isPresented: $store.inspectorPresented) {
-            switch chatTab {
-            case .chat:
-                settingsInspector
-                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
-            case .history:
-                RunsContent(store: store, selectedRunID: $selectedRunID)
-                    .inspectorPanel
-                    .inspectorColumnWidth(min: 260, ideal: 300, max: 320)
-            }
+            settingsInspector
+                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
@@ -213,10 +117,6 @@ struct ChatScreen: View {
             // Backend toggle changes the eligible model set (CPU drops Q4) — re-validate
             // the selection so the picker never shows a model that isn't in chatModels.
             applyDefaults()
-        }
-        .onChange(of: store.chatSelectedModelName) { _, _ in
-            // Reset adapter when model changes.
-            store.chatSelectedAdapterName = "none"
         }
         .onChange(of: store.liveRun?.genText) { _, newText in
             // Route streaming tokens to the awaiting turn.
@@ -283,9 +183,6 @@ struct ChatScreen: View {
                             Theme.Palette.hairline.frame(height: 1)
                         }
                     }
-
-                    // Adapter picker — all adapters shown; incompatible ones labelled
-                    adapterPickerRow
                 }
                 .instrumentPanel()
                 .padding(.horizontal, Theme.Space.lg)
@@ -391,75 +288,6 @@ struct ChatScreen: View {
         }
         .background(Theme.Palette.panel)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    /// Adapter picker row that surfaces ALL adapters — compatible ones selectable,
-    /// incompatible ones shown with a reason so the user understands why they cannot be used.
-    @ViewBuilder
-    private var adapterPickerRow: some View {
-        HStack {
-            Text("Adapter")
-                .instrumentLabel()
-            Spacer()
-            Menu {
-                // "none" option always first
-                Button {
-                    store.chatSelectedAdapterName = "none"
-                } label: {
-                    if store.chatSelectedAdapterName == "none" {
-                        Label("none", systemImage: "checkmark")
-                    } else {
-                        Text("none")
-                    }
-                }
-
-                if !allAdapters.isEmpty {
-                    Divider()
-
-                    ForEach(allAdapters) { adapter in
-                        let reason = incompatibilityReason(for: adapter)
-                        let isSelected = store.chatSelectedAdapterName == adapter.name
-
-                        if let reason {
-                            // Incompatible: shown but disabled with a reason label.
-                            // The user sees it exists and WHY it cannot be used.
-                            Text("\(adapter.name) — \(reason)")
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                                .font(Theme.Fonts.caption)
-                        } else {
-                            Button {
-                                store.chatSelectedAdapterName = adapter.name
-                            } label: {
-                                if isSelected {
-                                    Label(adapter.name, systemImage: "checkmark")
-                                } else {
-                                    Text(adapter.name)
-                                }
-                            }
-                        }
-                    }
-                }
-            } label: {
-                // Label shows current selection; incompatible selection shows "(incompatible)" hint
-                let selName = store.chatSelectedAdapterName
-                let isIncompatible: Bool = {
-                    guard selName != "none",
-                          let a = allAdapters.first(where: { $0.name == selName })
-                    else { return false }
-                    return incompatibilityReason(for: a) != nil
-                }()
-                Text(isIncompatible ? "\(selName) (!)" : selName)
-                    .font(Theme.Fonts.body)
-                    .foregroundStyle(isIncompatible ? Theme.Palette.amber : Theme.Palette.ink)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-        }
-        .frame(height: Theme.Space.rowHeight)
-        .padding(.horizontal, Theme.Space.lg)
-        .overlay(alignment: .bottom) {
-            Theme.Palette.hairline.frame(height: 1)
-        }
     }
 
     // MARK: - Single-mode transcript
@@ -811,14 +639,13 @@ struct ChatScreen: View {
         }()
 
         // Honest hardware label — snapshotted at send time, never changes after dispatch.
-        // "GPU Metal q4" / "GPU Metal bf16" / "CPU bf16" / "GPU Metal bf16+LoRA" etc.
+        // "GPU Metal q4" / "GPU Metal bf16" / "CPU bf16"
         let inferenceLabel: String = {
-            let adapterTag = selectedAdapter != nil ? "+LoRA" : ""
             if useGPU {
                 let fmtTag = (selectedModel?.format == .q4) ? "q4" : "bf16"
-                return "GPU Metal \(fmtTag)\(adapterTag)"
+                return "GPU Metal \(fmtTag)"
             } else {
-                return "CPU bf16\(adapterTag)"
+                return "CPU bf16"
             }
         }()
 
@@ -827,7 +654,7 @@ struct ChatScreen: View {
             modelDirPath: selectedModel?.path.path,
             model: selectedModel == nil ? (store.chatSelectedModelName.isEmpty ? nil : store.chatSelectedModelName) : nil,
             tokenizerDirPath: tokenizerDirURL?.path,
-            adapterFilePath: selectedAdapter?.weightFile?.path,
+            adapterFilePath: nil,
             prompt: chatMLPrompt,
             maxTokens: maxTokens,
             seed: seed,
@@ -851,7 +678,7 @@ struct ChatScreen: View {
             modelDir: selectedModel?.path,
             model: selectedModel == nil ? (store.chatSelectedModelName.isEmpty ? nil : store.chatSelectedModelName) : nil,
             tokenizerDir: tokenizerDirURL,
-            adapterPath: selectedAdapter?.weightFile,
+            adapterPath: nil,
             prompt: chatMLPrompt,
             maxTokens: maxTokens,
             seed: seed,

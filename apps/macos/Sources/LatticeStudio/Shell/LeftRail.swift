@@ -226,10 +226,7 @@ extension Screen {
     var symbol: String {
         switch self {
         case .models: "shippingbox"
-        case .data:   "tablecells"
-        case .train:  "chart.line.uptrend.xyaxis"
         case .chat:   "text.bubble"
-        case .eval:   "waveform.path.ecg"
         }
     }
 }

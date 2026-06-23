@@ -361,9 +361,7 @@ extension CommandSpec {
     /// is installed. ContentView.handleCommand matches args against store.models at runtime.
     static let latticeDefaults: [CommandSpec] = [
         CommandSpec(title: "models", args: [], description: "Browse downloaded models"),
-        CommandSpec(title: "data", args: [], description: "Manage training datasets"),
-        CommandSpec(title: "train", args: ["<model>", "<rank>"], description: "Start a LoRA training run"),
-        CommandSpec(title: "chat", args: ["<model>"], description: "Open chat / A-B compare"),
+        CommandSpec(title: "chat", args: ["<model>"], description: "Open chat"),
         CommandSpec(title: "stop", args: [], description: "Stop the current run"),
     ]
 }

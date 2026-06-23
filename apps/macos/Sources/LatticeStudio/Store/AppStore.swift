@@ -216,8 +216,6 @@ final class AppStore {
 
     // The model currently targeted across TRAIN / QUANTIZE / CHAT. Set from MODELS via `use(_:on:)`.
     var workingModel: ModelInfo?
-    // The dataset currently selected in DATA. Consumed by TRAIN in a later task.
-    var workingDataset: DatasetFileStat?
     // Sensible default target: first non-embedding model, else first of any.
     var defaultModel: ModelInfo? { models.first { !$0.isEmbedding } ?? models.first }
     // The effective target a screen should drive: explicit working model, else the default.

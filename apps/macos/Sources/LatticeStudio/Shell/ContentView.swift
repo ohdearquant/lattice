@@ -65,7 +65,7 @@ struct ContentView: View {
     }
 
     // Route a ⌘K command to a screen / action. A leading model-name argument
-    // (e.g. `train qwen3.5 r8`) preselects the working model for that screen.
+    // preselects the working model for that screen.
     private func handleCommand(_ cmd: String, _ args: [String]) {
         func retarget() {
             guard let arg = args.first(where: { !$0.isEmpty })?.lowercased() else { return }
@@ -74,11 +74,8 @@ struct ContentView: View {
             }
         }
         switch cmd {
-        case "train":  retarget(); store.selection = .train
-        case "chat",
-             "runs":   retarget(); store.selection = .chat
+        case "chat":   retarget(); store.selection = .chat
         case "models": store.selection = .models
-        case "data":   store.selection = .data
         case "stop":   store.stopRun()
         default:       break
         }
@@ -109,13 +106,12 @@ struct ContentView: View {
         }()
 
         Button {
-            // Jump to the screen that owns this run kind — not always Chat.
+            // Jump to the screen that owns this run kind.
             switch run.kind {
-            case .chat:                        store.selection = .chat
-            case .train:                       store.selection = .train
-            case .quantizeQ4, .quantizeQuaRot: store.selection = .models
-            case .eval:                        store.selection = .eval
-            case .embed:                       store.selection = .eval
+            case .chat:
+                store.selection = .chat
+            default:
+                store.selection = .models
             }
         } label: {
             HStack(spacing: 6) {
@@ -149,10 +145,7 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch store.selection {
         case .models: ModelsScreen(store: store)
-        case .data:   DataScreen(store: store)
-        case .train:  TrainScreen(store: store)
         case .chat:   ChatScreen(store: store)
-        case .eval:   EvalScreen(store: store)
         }
     }
 

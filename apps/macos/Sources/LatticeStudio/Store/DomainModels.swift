@@ -3,29 +3,26 @@ import SwiftUI
 // MARK: - Navigation
 
 enum Screen: String, CaseIterable, Identifiable, Hashable {
-    case models, data, train, chat, eval
+    case models, chat
     var id: String { rawValue }
 
     var index: String {
         switch self {
-        case .models: "01"; case .data: "02"; case .train: "03"; case .chat: "04"; case .eval: "05"
+        case .models: "01"; case .chat: "02"
         }
     }
     var title: String {
         switch self {
-        case .models: "MODELS"; case .data: "DATA"; case .train: "TRAIN"; case .chat: "CHAT"; case .eval: "EVAL"
+        case .models: "MODELS"; case .chat: "CHAT"
         }
     }
     var shortcut: KeyEquivalent {
         switch self {
-        case .models: "1"; case .data: "2"; case .train: "3"; case .chat: "4"; case .eval: "5"
+        case .models: "1"; case .chat: "2"
         }
     }
 
-    /// Whether this screen has a right inspector (toggle sidebar). Drives the
-    /// shared window-toolbar toggle visibility. The eval screen uses a left config
-    /// rail (like embed did) and does not use the system inspector panel.
-    var hasInspector: Bool { self != .eval }
+    var hasInspector: Bool { return true }
 }
 
 // MARK: - Models on disk
