@@ -180,6 +180,24 @@ fn grow(buf: &mut Vec<f32>, n: usize) {
 // Public generate() entry point
 // ---------------------------------------------------------------------------
 
+/// Reject a `kv_cache_capacity` smaller than the prompt: prefill writes
+/// `prompt_len` tokens in a single pass, so a cache that cannot hold the prompt
+/// would overflow during prefill (issue #12). Only enforced when the caller
+/// opted into a cap; `None` keeps the full `max_seq` sizing and is always valid.
+fn check_kv_cache_capacity(
+    requested: Option<usize>,
+    effective_cap: usize,
+    prompt_len: usize,
+) -> Result<(), InferenceError> {
+    if requested.is_some() && effective_cap < prompt_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "kv_cache_capacity ({effective_cap}) is smaller than the prompt length \
+             ({prompt_len}); the cache must hold at least the prompt"
+        )));
+    }
+    Ok(())
+}
+
 /// **Unstable**: text generation entry point for Qwen3 models; the full
 /// generation loop (prefill, decode, sampling) is under active design.
 ///
@@ -220,6 +238,7 @@ pub fn generate(
         .kv_cache_capacity
         .map(|c| c.max(1).min(max_seq))
         .unwrap_or(max_seq);
+    check_kv_cache_capacity(config.kv_cache_capacity, effective_cap, prompt_len)?;
     let cache_cfg = FlatKVCacheConfig::for_qwen3(
         cfg.num_hidden_layers,
         cfg.num_key_value_heads,
@@ -1175,6 +1194,18 @@ mod tests {
     //   (c) kv_cache_capacity clamp: a cap larger than max_seq is silently ignored.
     //   (d) GenerateConfig::default() has kv_cache_capacity == None.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn kv_cache_capacity_below_prompt_len_is_rejected() {
+        // requested cap smaller than the prompt → Err, not an OOB prefill panic
+        assert!(check_kv_cache_capacity(Some(8), 8, 32).is_err());
+        // cap exactly equal to prompt_len holds the prompt → Ok
+        assert!(check_kv_cache_capacity(Some(32), 32, 32).is_ok());
+        // cap larger than prompt → Ok
+        assert!(check_kv_cache_capacity(Some(64), 64, 16).is_ok());
+        // no cap requested → never rejected (default full-size behaviour)
+        assert!(check_kv_cache_capacity(None, 100, 32).is_ok());
+    }
 
     #[test]
     fn kv_cache_capacity_allocates_fewer_bytes() {
