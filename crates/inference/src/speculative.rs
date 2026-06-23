@@ -1892,6 +1892,13 @@ pub fn generate_with_speculation<F>(
 where
     F: FnMut(u32, usize) -> Vec<f32>,
 {
+    // An empty prompt cannot seed the n-gram speculator or the decode history,
+    // so there is nothing to generate from. Return early instead of panicking on
+    // `all_tokens.last()` in the first decode step.
+    if prompt_tokens.is_empty() {
+        return Vec::new();
+    }
+
     let speculator = NgramSpeculator::new(prompt_tokens.to_vec(), max_ngram, max_draft);
     let mut generated: Vec<u32> = Vec::new();
     let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
@@ -3186,5 +3193,13 @@ mod tests {
                  stale f16 dequant scratch is contaminating attention output"
             );
         }
+    }
+
+    #[test]
+    fn generate_with_speculation_empty_prompt_returns_empty() {
+        // Empty prompt cannot seed speculation; must return empty, not panic on
+        // `all_tokens.last()` in the first decode step.
+        let out = generate_with_speculation(&[], 8, 999, |_tok, _pos| vec![0.0; 4], 3, 4);
+        assert!(out.is_empty());
     }
 }
