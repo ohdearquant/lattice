@@ -272,19 +272,23 @@ pub struct DenseCostMatrix {
 }
 
 impl DenseCostMatrix {
-    /// Create from pre-computed data. Panics in debug mode if dimensions mismatch.
+    /// Create from pre-computed data.
+    ///
+    /// Panics if `rows × cols` overflows `usize` or does not equal `data.len()`.
     ///
     /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(rows: usize, cols: usize, data: Vec<f32>) -> Self {
         // FP-030: validate shape in release builds too — a caller-provided
         // dimension mismatch corrupts every subsequent cost() lookup.
+        // checked_mul guards rows × cols against silently wrapping in release,
+        // which could otherwise let a corrupt (rows, cols) pass the length check.
+        let Some(expected) = rows.checked_mul(cols) else {
+            panic!("DenseCostMatrix: dimensions {rows}×{cols} overflow usize");
+        };
         assert_eq!(
-            rows * cols,
+            expected,
             data.len(),
-            "DenseCostMatrix: expected {} elements ({}×{}), got {}",
-            rows * cols,
-            rows,
-            cols,
+            "DenseCostMatrix: expected {expected} elements ({rows}×{cols}), got {}",
             data.len()
         );
         Self { rows, cols, data }

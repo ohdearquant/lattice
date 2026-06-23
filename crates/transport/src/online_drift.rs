@@ -17,12 +17,20 @@ use crate::{
 /// Minimum `window_size` enforced by `OnlineDriftConfig::normalized`.
 pub const MIN_ONLINE_DRIFT_WINDOW_SIZE: usize = 128;
 
+/// Maximum `window_size` enforced by `OnlineDriftConfig::normalized`.
+///
+/// Each drift check builds three `W×W` Sinkhorn workspaces, so memory scales as
+/// O(W²). This cap bounds one detector's workspace footprint to roughly
+/// 3 × 4096² × 4 bytes ≈ 192 MB, preventing a deserialized config with an
+/// oversized window from exhausting memory.
+pub const MAX_ONLINE_DRIFT_WINDOW_SIZE: usize = 4096;
+
 /// Configuration for streaming Sinkhorn drift detection.
 ///
 /// **Stable** (provisional): aggregate config for the online drift API; new fields would be additive with `Default`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnlineDriftConfig {
-    /// Sliding window size W. Values below 128 are raised to 128 (O(W²) cost per check).
+    /// Sliding window size W. Clamped to `[128, 4096]` by `normalized` (O(W²) cost per check).
     pub window_size: usize,
     /// Compute divergence every N observed samples once both windows are full.
     pub check_interval: usize,
@@ -46,7 +54,9 @@ impl Default for OnlineDriftConfig {
 
 impl OnlineDriftConfig {
     fn normalized(mut self) -> Self {
-        self.window_size = self.window_size.max(MIN_ONLINE_DRIFT_WINDOW_SIZE);
+        self.window_size = self
+            .window_size
+            .clamp(MIN_ONLINE_DRIFT_WINDOW_SIZE, MAX_ONLINE_DRIFT_WINDOW_SIZE);
         self.check_interval = self.check_interval.max(1);
         self
     }
@@ -237,6 +247,30 @@ impl OnlineDriftDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_size_above_max_is_clamped() {
+        let config = OnlineDriftConfig {
+            window_size: usize::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.normalized().window_size,
+            MAX_ONLINE_DRIFT_WINDOW_SIZE
+        );
+    }
+
+    #[test]
+    fn window_size_below_min_is_raised() {
+        let config = OnlineDriftConfig {
+            window_size: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.normalized().window_size,
+            MIN_ONLINE_DRIFT_WINDOW_SIZE
+        );
+    }
 
     // Deterministic linear congruential generator so tests don't need `rand`.
     struct Lcg {

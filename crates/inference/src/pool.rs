@@ -329,8 +329,20 @@ pub fn last_token_pool(
     seq_len: usize,
     hidden_size: usize,
 ) -> Vec<f32> {
-    debug_assert_eq!(hidden_states.len(), seq_len * hidden_size);
-    debug_assert_eq!(attention_mask.len(), seq_len);
+    assert!(seq_len > 0, "seq_len must be non-zero for last_token_pool");
+    let expected_hidden = seq_len
+        .checked_mul(hidden_size)
+        .expect("invariant: seq_len * hidden_size must fit usize");
+    assert_eq!(
+        hidden_states.len(),
+        expected_hidden,
+        "hidden_states length must match seq_len * hidden_size"
+    );
+    assert_eq!(
+        attention_mask.len(),
+        seq_len,
+        "attention_mask length must match seq_len"
+    );
 
     // Find the last non-padding position.
     let last_pos = (0..seq_len)
@@ -735,5 +747,18 @@ mod tests {
             out.push(unit * 0.04 - 0.02);
         }
         out
+    }
+
+    #[test]
+    #[should_panic(expected = "hidden_states length must match seq_len * hidden_size")]
+    fn last_token_pool_rejects_short_hidden_states() {
+        // seq_len=2, hidden_size=4 needs 8 elements; pass 4.
+        let _ = last_token_pool(&[0.0; 4], &[1, 1], 2, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "seq_len must be non-zero")]
+    fn last_token_pool_rejects_zero_seq_len() {
+        let _ = last_token_pool(&[], &[], 0, 4);
     }
 }

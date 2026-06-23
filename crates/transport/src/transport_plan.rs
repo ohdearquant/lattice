@@ -72,6 +72,15 @@ pub fn extract_sparse_plan<C>(
 where
     C: CostMatrix + ?Sized,
 {
+    if result.log_u.len() != cost.rows() || result.log_v.len() != cost.cols() {
+        return Err(SinkhornError::DimensionMismatch {
+            expected_rows: cost.rows(),
+            got_rows: result.log_u.len(),
+            expected_cols: cost.cols(),
+            got_cols: result.log_v.len(),
+        });
+    }
+
     let log_threshold = if threshold <= 0.0 {
         f32::NEG_INFINITY
     } else {

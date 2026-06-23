@@ -285,6 +285,7 @@ unsafe fn simd_dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
 /// - biases: [num_outputs]
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "LayerData"))]
 pub struct Layer {
     /// Number of input neurons
     num_inputs: usize,
@@ -296,6 +297,36 @@ pub struct Layer {
     biases: Vec<f32>,
     /// Activation function
     activation: Activation,
+}
+
+/// Deserialization shadow for [`Layer`] that routes through [`Layer::with_weights`].
+///
+/// A corrupt or hand-crafted serialized layer whose `weights`/`biases` lengths
+/// disagree with its dimensions is rejected with a `FannError` instead of
+/// triggering an out-of-bounds panic during `forward`.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct LayerData {
+    num_inputs: usize,
+    num_outputs: usize,
+    weights: Vec<f32>,
+    biases: Vec<f32>,
+    activation: Activation,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<LayerData> for Layer {
+    type Error = FannError;
+
+    fn try_from(data: LayerData) -> Result<Self, Self::Error> {
+        Layer::with_weights(
+            data.num_inputs,
+            data.num_outputs,
+            data.weights,
+            data.biases,
+            data.activation,
+        )
+    }
 }
 
 impl Layer {

@@ -73,7 +73,14 @@ impl BinaryVector {
     /// **Unstable**: dequantize to float32; output semantics may change.
     ///
     /// Binary quantization is lossy: 1 -> +1.0, 0 -> -1.0.
+    ///
+    /// Returns an empty `Vec` if the packed buffer is shorter than `dims.div_ceil(8)`
+    /// bytes — i.e. the vector was constructed with mismatched fields.
     pub fn to_f32(&self) -> Vec<f32> {
+        let required_bytes = self.dims.div_ceil(8);
+        if self.data.len() < required_bytes {
+            return Vec::new();
+        }
         let mut result = Vec::with_capacity(self.dims);
         for i in 0..self.dims {
             let byte_idx = i / 8;
@@ -116,9 +123,17 @@ impl BinaryVector {
 /// **Unstable**: free function dispatches to NEON or scalar; may become private in a future cleanup.
 ///
 /// Uses popcount on XOR of the packed bytes.
+///
+/// Returns `u32::MAX` if dimensions differ or if either packed buffer is shorter than
+/// `dims.div_ceil(8)` bytes (malformed public-field construction).
 #[inline]
 pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     if a.dims != b.dims {
+        return u32::MAX;
+    }
+
+    let required_bytes = a.dims.div_ceil(8);
+    if a.data.len() < required_bytes || b.data.len() < required_bytes {
         return u32::MAX;
     }
 
@@ -127,12 +142,13 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
         if config.neon_enabled {
-            debug_assert_eq!(a.data.len(), b.data.len());
-            // SAFETY: NEON is available on aarch64. Matching dimensions require
-            // matching packed-byte lengths for vectors built by the constructor;
-            // the debug guard catches public-field invariant violations. The callee
-            // uses unaligned loads and chunk/remainder bounds within those slices.
-            return unsafe { hamming_distance_neon(&a.data, &b.data) };
+            // SAFETY: NEON is available on aarch64. Both slices have been verified above
+            // to contain at least `required_bytes` elements, which is the exact packed
+            // length for `dims` bits. The callee uses unaligned loads and chunk/remainder
+            // bounds strictly within those slices; no out-of-bounds read is possible.
+            return unsafe {
+                hamming_distance_neon(&a.data[..required_bytes], &b.data[..required_bytes])
+            };
         }
     }
 
@@ -141,7 +157,7 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
         let _ = config;
     }
 
-    hamming_distance_scalar(&a.data, &b.data)
+    hamming_distance_scalar(&a.data[..required_bytes], &b.data[..required_bytes])
 }
 
 /// Scalar Hamming distance using u64 chunks and count_ones().
@@ -400,5 +416,75 @@ mod tests {
             scalar_result, dispatch_result,
             "Scalar and dispatched Hamming should match"
         );
+    }
+
+    // --- Issue #211 regression tests -------------------------------------------------
+
+    #[test]
+    fn test_hamming_short_data_returns_max() {
+        // dims=128 requires 16 bytes; supply only 4 — must return u32::MAX, not OOB.
+        let a = BinaryVector {
+            dims: 128,
+            data: vec![0xFFu8; 4],
+            norm: 1.0,
+        };
+        let b = BinaryVector {
+            dims: 128,
+            data: vec![0x00u8; 4],
+            norm: 1.0,
+        };
+        assert_eq!(
+            hamming_distance_binary(&a, &b),
+            u32::MAX,
+            "Short data must yield u32::MAX, not an OOB read"
+        );
+    }
+
+    #[test]
+    fn test_hamming_one_side_short_returns_max() {
+        // a is correct length, b is too short.
+        let a = BinaryVector {
+            dims: 128,
+            data: vec![0xFFu8; 16],
+            norm: 1.0,
+        };
+        let b = BinaryVector {
+            dims: 128,
+            data: vec![0x00u8; 8],
+            norm: 1.0,
+        };
+        assert_eq!(hamming_distance_binary(&a, &b), u32::MAX);
+    }
+
+    #[test]
+    fn test_hamming_correct_data_still_works() {
+        // Verify the guard does not break the normal path.
+        let v = generate_vector(128, 42);
+        let bv = BinaryVector::from_f32(&v);
+        assert_eq!(bv.hamming_distance(&bv), 0);
+    }
+
+    #[test]
+    fn test_binary_to_f32_short_data_returns_empty() {
+        // dims=128 requires 16 bytes; supply only 4.
+        let bv = BinaryVector {
+            dims: 128,
+            data: vec![0xFFu8; 4],
+            norm: 1.0,
+        };
+        let result = bv.to_f32();
+        assert!(
+            result.is_empty(),
+            "to_f32 on malformed BinaryVector must return empty Vec"
+        );
+    }
+
+    #[test]
+    fn test_binary_to_f32_exact_length_works() {
+        // Exactly the right number of bytes — must succeed.
+        let v = generate_vector(128, 7);
+        let bv = BinaryVector::from_f32(&v);
+        let deq = bv.to_f32();
+        assert_eq!(deq.len(), 128);
     }
 }

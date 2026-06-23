@@ -2358,6 +2358,290 @@ kernel void moe_shared_gate_add(
     if (gid >= hidden) return;
     scratch_out[gid] = fma(gate_val, expert_out[gid], scratch_out[gid]);
 }
+
+// ===== Batch scatter Q and gate from interleaved q_proj output (Win 1) =====
+// Processes num_tokens rows in one dispatch.
+// Source: q[num_tokens, num_heads * 2 * head_dim] with (Q_h, gate_h) per head.
+// Output: q_out[num_tokens, num_heads * head_dim], gate_out same shape.
+kernel void scatter_q_gate_batch(
+    device const float* qg_interleaved [[buffer(0)]],
+    device float* q_out                [[buffer(1)]],
+    device float* gate_out             [[buffer(2)]],
+    constant uint& num_tokens          [[buffer(3)]],
+    constant uint& num_heads           [[buffer(4)]],
+    constant uint& head_dim            [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint q_dim = num_heads * head_dim;
+    uint total = num_tokens * q_dim;
+    if (gid >= total) return;
+
+    uint t    = gid / q_dim;
+    uint rem  = gid % q_dim;
+    uint head = rem / head_dim;
+    uint d    = rem % head_dim;
+
+    // Source row: token t, head layout (Q_h, gate_h) per head in q_proj output.
+    uint src_base = t * (2u * q_dim) + head * (2u * head_dim);
+    q_out[gid]    = qg_interleaved[src_base + d];
+    gate_out[gid] = qg_interleaved[src_base + head_dim + d];
+}
+
+// ===== Batch per-head RMS norm (Win 1) =====
+// One threadgroup per (token, head) pair; same math as per_head_rms_norm.
+kernel void per_head_rms_norm_batch(
+    device float* x              [[buffer(0)]],
+    device const float* gamma    [[buffer(1)]],
+    constant uint& num_tokens    [[buffer(2)]],
+    constant uint& num_heads     [[buffer(3)]],
+    constant uint& head_dim      [[buffer(4)]],
+    constant float& eps          [[buffer(5)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    if (gid >= num_tokens * num_heads) return;
+
+    uint t    = gid / num_heads;
+    uint head = gid % num_heads;
+    uint base = t * (num_heads * head_dim) + head * head_dim;
+
+    constexpr uint NORM_WG = 256;
+    threadgroup float shared[NORM_WG];
+
+    float local_sum = 0.0f;
+    for (uint i = lid; i < head_dim; i += tgs) {
+        float v = x[base + i];
+        local_sum += v * v;
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (lid < s) shared[lid] += shared[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = rsqrt(shared[0] / float(head_dim) + eps);
+
+    // Qwen3.5 shifted RMSNorm: same (1 + gamma) convention as per_head_rms_norm.
+    for (uint i = lid; i < head_dim; i += tgs) {
+        x[base + i] = x[base + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Batch stride-half partial RoPE (Win 1) =====
+// Extends partial_rope_interleaved to num_tokens rows.
+// RoPE absolute position for token t is base_pos + t, not chunk-local t.
+kernel void partial_rope_batch(
+    device float* x                 [[buffer(0)]],
+    device const float* cos_tab     [[buffer(1)]],
+    device const float* sin_tab     [[buffer(2)]],
+    constant uint& num_tokens       [[buffer(3)]],
+    constant uint& num_heads        [[buffer(4)]],
+    constant uint& head_dim         [[buffer(5)]],
+    constant uint& half_rope_dim    [[buffer(6)]],
+    constant uint& base_pos         [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total_pairs = num_tokens * num_heads * half_rope_dim;
+    if (gid >= total_pairs) return;
+
+    uint pair = gid % half_rope_dim;
+    uint head = (gid / half_rope_dim) % num_heads;
+    uint t    = gid / (num_heads * half_rope_dim);
+
+    uint base    = t * (num_heads * head_dim) + head * head_dim;
+    // Absolute position keeps RoPE consistent across chunk boundaries.
+    uint cs_base = (base_pos + t) * half_rope_dim;
+
+    float cos_val = cos_tab[cs_base + pair];
+    float sin_val = sin_tab[cs_base + pair];
+
+    // Stride-half pairing: (pair, half_rope_dim + pair), matching HF rotate_half.
+    uint idx0 = base + pair;
+    uint idx1 = base + half_rope_dim + pair;
+    float x0 = x[idx0];
+    float x1 = x[idx1];
+    x[idx0] = x0 * cos_val - x1 * sin_val;
+    x[idx1] = x0 * sin_val + x1 * cos_val;
+}
+
+// ===== Batch K/V cache store (Win 1) =====
+// Copies num_tokens rows of K and V into cache buffers in one dispatch.
+// Cache layout is token-major: cache[row * kv_dim + d] where row = base_pos + t.
+kernel void copy_kv_cache_batch(
+    device const float* k_src   [[buffer(0)]],
+    device const float* v_src   [[buffer(1)]],
+    device float* k_cache       [[buffer(2)]],
+    device float* v_cache       [[buffer(3)]],
+    constant uint& num_tokens   [[buffer(4)]],
+    constant uint& kv_dim       [[buffer(5)]],
+    constant uint& base_pos     [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = num_tokens * kv_dim;
+    if (gid >= total) return;
+
+    uint t = gid / kv_dim;
+    uint d = gid % kv_dim;
+    uint src = t * kv_dim + d;
+    uint dst = (base_pos + t) * kv_dim + d;
+    k_cache[dst] = k_src[src];
+    v_cache[dst] = v_src[src];
+}
+
+// ===== Batched causal prefill attention (Win 2) =====
+// Replaces the per-token decode_attention loop for full-attention prefill chunks.
+// Grid: [num_kv_heads, num_tokens, 1]. Threads: [256, 1, 1] — one thread per output dim.
+// One threadgroup per (kv_head, query_token) processes all Q heads in the GQA group.
+kernel void prefill_attention_batched_causal(
+    device const float* q          [[buffer(0)]],
+    device const float* k_cache    [[buffer(1)]],
+    device const float* v_cache    [[buffer(2)]],
+    device float* out              [[buffer(3)]],
+    constant uint& base_pos        [[buffer(4)]],
+    constant uint& num_tokens      [[buffer(5)]],
+    constant uint& cache_len_total [[buffer(6)]],
+    constant uint& head_dim        [[buffer(7)]],
+    constant uint& num_q_heads     [[buffer(8)]],
+    constant uint& num_kv_heads    [[buffer(9)]],
+    constant uint& q_dim           [[buffer(10)]],
+    constant uint& kv_dim          [[buffer(11)]],
+    constant float& scale          [[buffer(12)]],
+    uint3 gid3 [[threadgroup_position_in_grid]],
+    uint3 lid3 [[thread_position_in_threadgroup]],
+    uint3 tgs3 [[threads_per_threadgroup]])
+{
+    constexpr uint HEAD_DIM    = 256;
+    constexpr uint MAX_GRP     = 8;
+    constexpr uint TILE_TOKENS = 256;
+
+    // Extract scalar thread/threadgroup indices from the 3D vectors.
+    const uint lid = lid3.x;
+    const uint tgs = tgs3.x;
+
+    if (head_dim != HEAD_DIM || num_kv_heads == 0) return;
+    const uint kvh = gid3.x;
+    const uint qt  = gid3.y;
+    if (kvh >= num_kv_heads || qt >= num_tokens) return;
+    if ((num_q_heads % num_kv_heads) != 0) return;
+    const uint group_size = num_q_heads / num_kv_heads;
+    if (group_size == 0 || group_size > MAX_GRP) return;
+    const uint qh_base = kvh * group_size;
+
+    // Causal bound: query token qt at absolute position base_pos+qt
+    // sees only cache rows [0 .. base_pos+qt+1] to exclude future tokens.
+    const uint causal_len = min(cache_len_total, base_pos + qt + 1u);
+    if (causal_len == 0) {
+        for (uint qi = 0; qi < group_size; qi++) {
+            out[qt * q_dim + (qh_base + qi) * HEAD_DIM + lid] = 0.0f;
+        }
+        return;
+    }
+
+    // Threadgroup memory — same layout and size as decode_attention (~17 KB).
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM];
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS];
+    threadgroup float reduce_s[TILE_TOKENS];
+    threadgroup float m_s    [MAX_GRP];
+    threadgroup float l_s    [MAX_GRP];
+    threadgroup float alpha_s[MAX_GRP];
+
+    if (lid < group_size) {
+        m_s[lid] = -INFINITY;
+        l_s[lid] = 0.0f;
+    }
+
+    // Load Q for all GQA query heads from this token's row in q_separated[N, q_dim].
+    const uint q_row_base = qt * q_dim + qh_base * HEAD_DIM;
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) {
+        q_s[idx] = q[q_row_base + idx];
+    }
+
+    float acc[MAX_GRP];
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tiled online-softmax — same structure as decode_attention.
+    for (uint tile_start = 0; tile_start < causal_len; tile_start += TILE_TOKENS) {
+        const uint tile_count = min(TILE_TOKENS, causal_len - tile_start);
+
+        if (lid < tile_count) {
+            float dot[MAX_GRP];
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f;
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM;
+            for (uint d = 0; d < HEAD_DIM; d++) {
+                const float kd = k_cache[k_base + d];
+                for (uint qi = 0; qi < group_size; qi++) {
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd;
+                }
+            }
+            for (uint qi = 0; qi < group_size; qi++) {
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online-softmax rescale: when a later tile raises the max, rescale the prior
+        // accumulator by alpha=exp(m_old-m_new) to preserve the running weighted sum.
+        for (uint qi = 0; qi < group_size; qi++) {
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs >> 1; s > 0; s >>= 1) {
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const float tile_max = reduce_s[0];
+
+            if (lid == 0) {
+                const float m_old = m_s[qi];
+                const float m_new = max(m_old, tile_max);
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f;
+                m_s[qi]     = m_new;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lid < tile_count) {
+                score_s[qi * TILE_TOKENS + lid] =
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = tgs >> 1; s > 0; s >>= 1) {
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (lid == 0) {
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (uint qi = 0; qi < group_size; qi++) {
+            acc[qi] *= alpha_s[qi];
+        }
+
+        const uint d = lid;
+        for (uint local_t = 0; local_t < tile_count; local_t++) {
+            const float v = v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d];
+            for (uint qi = 0; qi < group_size; qi++) {
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write output at the query token's row: out[qt * q_dim + qh * HEAD_DIM + lid].
+    for (uint qi = 0; qi < group_size; qi++) {
+        const uint qh  = qh_base + qi;
+        const float dn = l_s[qi];
+        out[qt * q_dim + qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f;
+    }
+}
 "#;
 
     const MSL_Q4_TILED_SOURCE: &str = concat!(
@@ -3000,6 +3284,13 @@ kernel void moe_shared_gate_add(
         moe_scale_add: ComputePipelineState,
         moe_shared_gate_add: ComputePipelineState,
         moe_zero_buf: ComputePipelineState,
+        // Win 1 batch prefill prep kernels (ADR-126A)
+        scatter_q_gate_batch: ComputePipelineState,
+        per_head_rms_norm_batch: ComputePipelineState,
+        partial_rope_batch: ComputePipelineState,
+        copy_kv_cache_batch: ComputePipelineState,
+        // Win 2 batched causal prefill attention (ADR-126B)
+        prefill_attention_batched: ComputePipelineState,
     }
 
     // -----------------------------------------------------------------------
@@ -3531,6 +3822,43 @@ kernel void moe_shared_gate_add(
         f32::from_bits(f32_bits)
     }
 
+    /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
+    /// to f32, writing into a pre-allocated destination buffer.
+    ///
+    /// On aarch64 the inner loop uses `vcvt_f32_f16` (4 lanes per instruction) with a
+    /// scalar remainder tail. On other targets the scalar `f16_to_f32` is used throughout.
+    ///
+    /// # Safety
+    /// - `src` must point to at least `n` contiguous, initialized u16 values.
+    /// - `dst` must point to at least `n` contiguous, writable f32 values.
+    /// - `n` may be zero (no-op).
+    unsafe fn convert_f16_row(src: *const u16, dst: *mut f32, n: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            // SAFETY: src has n u16 values; dst has n f32 values; we process 4 per iteration
+            // then handle the remainder scalarly. NEON is always present on aarch64.
+            let mut i = 0usize;
+            while i + 4 <= n {
+                let v_u16 = vld1_u16(src.add(i));
+                let v_f16 = vreinterpret_f16_u16(v_u16);
+                let v_f32 = vcvt_f32_f16(v_f16);
+                vst1q_f32(dst.add(i), v_f32);
+                i += 4;
+            }
+            while i < n {
+                *dst.add(i) = f16_to_f32(*src.add(i));
+                i += 1;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..n {
+                *dst.add(i) = f16_to_f32(*src.add(i));
+            }
+        }
+    }
+
     /// Read f32 slice from a Metal shared-mode buffer.
     ///
     /// SAFETY: Buffer must be StorageModeShared with sufficient length and no
@@ -3561,9 +3889,8 @@ kernel void moe_shared_gate_add(
     unsafe fn read_buffer_f16(buf: &Buffer, len: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const u16;
         let mut out = vec![0.0f32; len];
-        for i in 0..len {
-            out[i] = f16_to_f32(*ptr.add(i));
-        }
+        // SAFETY: ptr has len u16 values; out.as_mut_ptr() has len f32 values.
+        convert_f16_row(ptr, out.as_mut_ptr(), len);
         out
     }
 
@@ -3857,6 +4184,11 @@ kernel void moe_shared_gate_add(
                 moe_scale_add: make_pipeline("moe_scale_add")?,
                 moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
                 moe_zero_buf: make_pipeline("zero_buf")?,
+                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+                partial_rope_batch: make_pipeline("partial_rope_batch")?,
+                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+                prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
             };
 
             // Upload per-layer weights
@@ -4950,9 +5282,8 @@ kernel void moe_shared_gate_add(
                     );
                     let src = src_base.add(id as usize * hidden);
                     let dst = dst_base.add(t * hidden);
-                    for i in 0..hidden {
-                        *dst.add(i) = f16_to_f32(*src.add(i));
-                    }
+                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
+                    convert_f16_row(src, dst, hidden);
                 }
             }
 
@@ -5605,9 +5936,8 @@ kernel void moe_shared_gate_add(
             unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(pending_token as usize * hidden);
-                for i in 0..hidden {
-                    normed_embed[i] = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
+                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
             }
 
             if let Some(ref rot) = self.engine.quarot_rotation {
@@ -6094,9 +6424,8 @@ kernel void moe_shared_gate_add(
             unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16).add(embed_offset);
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                for i in 0..hidden {
-                    *dst.add(i) = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
+                convert_f16_row(src, dst, hidden);
             }
 
             if profiling {
@@ -6298,9 +6627,8 @@ kernel void moe_shared_gate_add(
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(token_id as usize * hidden);
                 let dst = self.session.activations.hidden.contents() as *mut f32;
-                for i in 0..hidden {
-                    *dst.add(i) = f16_to_f32(*src.add(i));
-                }
+                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
+                convert_f16_row(src, dst, hidden);
             }
 
             let mut active_layer_idx = 0usize;
@@ -6360,7 +6688,9 @@ kernel void moe_shared_gate_add(
         /// Uses batch GEMM (M=prompt_len) for projections instead of per-token GEMV,
         /// giving ~10-20x speedup on prefill for typical prompt lengths.
         ///
-        /// Falls back to sequential forward_step for prompts longer than max_prefill.
+        /// Prompts longer than max_prefill without active LoRA are processed in
+        /// max_prefill-sized batched chunks; LoRA-active prompts remain on the
+        /// per-token forward_step fallback.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
             self.forward_prefill_impl(token_ids, false)
         }
@@ -6387,18 +6717,14 @@ kernel void moe_shared_gate_add(
                 };
             }
             if n == 1 {
-                let logits = self.forward_step(token_ids[0], 0);
-                return logits;
+                return self.forward_step(token_ids[0], 0);
             }
-            // Sequential fallback (LoRA or oversize) — only supports last-token mode.
-            // For all_positions mode under these conditions, caller must reduce window
-            // or quantize a Q4 dir without LoRA.
-            if self.lora.is_some() || n > self.session.max_prefill {
+            if self.lora.is_some() {
+                // Batched helper does not apply LoRA adapters; stay on sequential path.
                 if all_positions {
                     panic!(
-                        "forward_prefill_all_logits: n={n} exceeds max_prefill ({}) or LoRA active — \
-                         reduce window or run without LoRA",
-                        self.session.max_prefill
+                        "forward_prefill_all_logits: LoRA active — \
+                         batch/all-position prefill does not apply LoRA"
                     );
                 }
                 let mut last_logits = Vec::new();
@@ -6407,11 +6733,61 @@ kernel void moe_shared_gate_add(
                 }
                 return last_logits;
             }
-
             assert!(
                 n <= self.session.kv_cache.max_cache_len,
                 "prefill length {} exceeds max_cache_len {}",
                 n,
+                self.session.kv_cache.max_cache_len
+            );
+            let max_prefill = self.session.max_prefill;
+            if n <= max_prefill {
+                return self.forward_prefill_batched_chunk(token_ids, 0, all_positions);
+            }
+            // Chunked batched prefill: each chunk is one command buffer (preserving the
+            // n≤512 fast path within each chunk). GDN recurrent state threads across
+            // boundaries automatically — session GPU buffers are mutated in place and
+            // never reset between chunks within a single request.
+            if all_positions {
+                let mut all_logits = Vec::with_capacity(n * vocab);
+                let mut start_pos = 0usize;
+                for chunk in token_ids.chunks(max_prefill) {
+                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, start_pos, true));
+                    start_pos += chunk.len();
+                }
+                all_logits
+            } else {
+                let mut last_logits = Vec::new();
+                let mut start_pos = 0usize;
+                for chunk in token_ids.chunks(max_prefill) {
+                    last_logits = self.forward_prefill_batched_chunk(chunk, start_pos, false);
+                    start_pos += chunk.len();
+                }
+                last_logits
+            }
+        }
+
+        /// Batched single-command-buffer prefill for a contiguous token slice starting
+        /// at absolute position `start_pos`.
+        ///
+        /// Writes full-attention K/V rows `start_pos..start_pos+n` and advances GDN
+        /// recurrent state in the session GPU buffers. Called by `forward_prefill_impl`
+        /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
+        /// buffer, all 24 layers, final logits).
+        fn forward_prefill_batched_chunk(
+            &mut self,
+            token_ids: &[u32],
+            start_pos: usize,
+            all_positions: bool,
+        ) -> Vec<f32> {
+            let n = token_ids.len();
+            debug_assert!(
+                n <= self.session.max_prefill,
+                "forward_prefill_batched_chunk: n={n} exceeds max_prefill={}",
+                self.session.max_prefill
+            );
+            assert!(
+                start_pos + n <= self.session.kv_cache.max_cache_len,
+                "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
                 self.session.kv_cache.max_cache_len
             );
             let cfg = self.engine.config.clone();
@@ -6439,9 +6815,8 @@ kernel void moe_shared_gate_add(
                     );
                     let src = src_base.add(id as usize * hidden);
                     let dst = dst_base.add(t * hidden);
-                    for i in 0..hidden {
-                        *dst.add(i) = f16_to_f32(*src.add(i));
-                    }
+                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
+                    convert_f16_row(src, dst, hidden);
                 }
             }
 
@@ -6809,156 +7184,125 @@ kernel void moe_shared_gate_add(
                         );
                     }
 
-                    // Per-token: scatter, norm, RoPE, cache store, attention, gate
-                    for t in 0..n {
-                        let q_off = (t * 2 * q_dim) as u64 * 4;
-                        let qs_off = (t * q_dim) as u64 * 4;
-                        let gz_off = (t * q_dim) as u64 * 4;
-                        let k_off = (t * kv_dim) as u64 * 4;
-                        let v_off = (t * kv_dim) as u64 * 4;
-                        let ao_off = (t * q_dim) as u64 * 4;
+                    // Win 1: batch scatter, norm, RoPE, and KV store — one dispatch each
+                    // instead of n dispatches. Attention loop (Win 2) kept per-token.
+                    {
+                        let base_pos = start_pos as u32;
+                        let num_tok = m;
+                        let nqh = num_q_heads as u32;
+                        let nkh = num_kv_heads as u32;
+                        let hd = head_dim as u32;
+                        let kvd = kv_dim as u32;
+                        // SAFETY: Layer norm weight pointers are live for the command buffer duration.
+                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
 
-                        // Scatter Q + gate from interleaved q_proj.
-                        // Per-token q/gate offsets are within the batch activation buffers;
-                        // q_dim is num_q_heads * head_dim.
-                        {
-                            enc.set_compute_pipeline_state(&self.engine.pipelines.scatter_q_gate);
-                            enc.set_buffer(0, Some(&self.session.activations.q), q_off);
-                            enc.set_buffer(1, Some(&self.session.activations.q_separated), qs_off);
-                            enc.set_buffer(2, Some(&self.session.activations.gate_z), gz_off);
-                            let nh = num_q_heads as u32;
-                            let hd = head_dim as u32;
-                            enc.set_bytes(3, 4, &nh as *const u32 as *const _);
-                            enc.set_bytes(4, 4, &hd as *const u32 as *const _);
-                            let wg = 256u64;
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(q_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
-                        }
+                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
+                        self.dispatch_per_head_rms_norm_batch(
+                            enc,
+                            &self.session.activations.q_separated,
+                            qn_ref,
+                            num_tok,
+                            nqh,
+                            hd,
+                            cfg.rms_norm_eps,
+                        );
+                        self.dispatch_per_head_rms_norm_batch(
+                            enc,
+                            &self.session.activations.k,
+                            kn_ref,
+                            num_tok,
+                            nkh,
+                            hd,
+                            cfg.rms_norm_eps,
+                        );
+                        self.dispatch_partial_rope_batch(
+                            enc,
+                            &self.session.activations.q_separated,
+                            num_tok,
+                            nqh,
+                            hd,
+                            half_rope_dim,
+                            base_pos,
+                        );
+                        self.dispatch_partial_rope_batch(
+                            enc,
+                            &self.session.activations.k,
+                            num_tok,
+                            nkh,
+                            hd,
+                            half_rope_dim,
+                            base_pos,
+                        );
+                        self.dispatch_copy_kv_cache_batch(
+                            enc,
+                            &self.session.activations.k,
+                            &self.session.activations.v,
+                            &self.session.kv_cache.k_bufs[full_idx],
+                            &self.session.kv_cache.v_bufs[full_idx],
+                            num_tok,
+                            kvd,
+                            base_pos,
+                        );
+                    }
 
-                        // Per-head RMS norm Q and K
-                        // SAFETY: Q/K norm buffers are live and per-token offsets
-                        // are within activation buffers sized from the same config.
-                        unsafe {
-                            enc.set_compute_pipeline_state(
-                                &self.engine.pipelines.per_head_rms_norm,
-                            );
-                            enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
-                            enc.set_buffer(1, Some(&*w_qn), 0);
-                            let nh = num_q_heads as u32;
-                            let hd = head_dim as u32;
-                            enc.set_bytes(2, 4, &nh as *const u32 as *const _);
-                            enc.set_bytes(3, 4, &hd as *const u32 as *const _);
-                            enc.set_bytes(4, 4, &cfg.rms_norm_eps as *const f32 as *const _);
-                            enc.dispatch_thread_groups(
-                                MTLSize::new(nh as u64, 1, 1),
-                                MTLSize::new(256, 1, 1),
-                            );
-
-                            enc.set_buffer(0, Some(&self.session.activations.k), k_off);
-                            enc.set_buffer(1, Some(&*w_kn), 0);
-                            let nkh = num_kv_heads as u32;
-                            enc.set_bytes(2, 4, &nkh as *const u32 as *const _);
-                            enc.dispatch_thread_groups(
-                                MTLSize::new(nkh as u64, 1, 1),
-                                MTLSize::new(256, 1, 1),
-                            );
-                        }
-
-                        // Partial RoPE for Q and K.
-                        // RoPE table buffers cover max positions and per-token Q/K
-                        // offsets are within activation buffers sized from the same config.
-                        {
-                            let pos = t as u32;
-                            enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope);
-                            enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
-                            enc.set_buffer(1, Some(&self.engine.rope_cos), 0);
-                            enc.set_buffer(2, Some(&self.engine.rope_sin), 0);
-                            let nh = num_q_heads as u32;
-                            let hd = head_dim as u32;
-                            enc.set_bytes(3, 4, &nh as *const u32 as *const _);
-                            enc.set_bytes(4, 4, &hd as *const u32 as *const _);
-                            enc.set_bytes(5, 4, &half_rope_dim as *const u32 as *const _);
-                            enc.set_bytes(6, 4, &pos as *const u32 as *const _);
-                            let wg = 256u64;
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(q_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
-
-                            enc.set_buffer(0, Some(&self.session.activations.k), k_off);
-                            let nkh = num_kv_heads as u32;
-                            enc.set_bytes(3, 4, &nkh as *const u32 as *const _);
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(kv_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
-                        }
-
-                        // Store K, V to cache
-                        {
-                            let dst_offset = (t * kv_dim) as u32;
-                            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
-                            enc.set_buffer(0, Some(&self.session.activations.k), k_off);
-                            enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                            let cnt = kv_dim as u32;
-                            enc.set_bytes(2, 4, &cnt as *const u32 as *const _);
-                            enc.set_bytes(3, 4, &dst_offset as *const u32 as *const _);
-                            let wg = 256u64;
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(kv_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
-
-                            enc.set_buffer(0, Some(&self.session.activations.v), v_off);
-                            enc.set_buffer(1, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(kv_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
-                        }
-
-                        // Causal attention: query Q[t] against cache[0..t+1]
-                        {
-                            let cache_len = (t + 1) as u32;
-                            enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
-                            enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
-                            enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                            enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                            enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
-                            enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+                    // Win 2: batched causal prefill attention — one dispatch for all n tokens.
+                    // Falls back to the per-token loop only if shape validation fails.
+                    if self
+                        .dispatch_prefill_attention_batched(
+                            enc,
+                            &self.session.kv_cache.k_bufs[full_idx],
+                            &self.session.kv_cache.v_bufs[full_idx],
+                            start_pos as u32,
+                            m,
+                            head_dim as u32,
+                            num_q_heads as u32,
+                            num_kv_heads as u32,
+                            q_dim as u32,
+                            kv_dim as u32,
+                            scale,
+                        )
+                        .is_err()
+                    {
+                        for t in 0..n {
+                            let abs_pos = start_pos + t;
+                            let qs_off = (t * q_dim) as u64 * 4;
+                            let ao_off = (t * q_dim) as u64 * 4;
+                            let cache_len = (abs_pos + 1) as u32;
                             let hd = head_dim as u32;
                             let nqh = num_q_heads as u32;
                             let nkh = num_kv_heads as u32;
                             let qd = q_dim as u32;
                             let kvd = kv_dim as u32;
-                            enc.set_bytes(5, 4, &hd as *const u32 as *const _);
-                            enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
-                            enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
-                            enc.set_bytes(8, 4, &qd as *const u32 as *const _);
-                            enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
-                            enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-                            enc.dispatch_thread_groups(
-                                MTLSize::new(nqh as u64, 1, 1),
-                                MTLSize::new(256, 1, 1),
-                            );
-                        }
-
-                        // Sigmoid gate
-                        {
-                            let cnt = q_dim as u32;
-                            enc.set_compute_pipeline_state(&self.engine.pipelines.sigmoid_gate);
-                            enc.set_buffer(0, Some(&self.session.activations.attn_out), ao_off);
-                            enc.set_buffer(1, Some(&self.session.activations.gate_z), gz_off);
-                            enc.set_bytes(2, 4, &cnt as *const u32 as *const _);
-                            let wg = 256u64;
-                            enc.dispatch_threads(
-                                MTLSize::new(div_ceil(q_dim as u64, wg) * wg, 1, 1),
-                                MTLSize::new(wg, 1, 1),
-                            );
+                            // Per-token q/attn_out offsets are within batch activation buffers.
+                            {
+                                enc.set_compute_pipeline_state(
+                                    &self.engine.pipelines.decode_attention,
+                                );
+                                enc.set_buffer(
+                                    0,
+                                    Some(&self.session.activations.q_separated),
+                                    qs_off,
+                                );
+                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
+                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
+                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
+                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
+                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
+                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
+                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
+                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
+                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                                enc.dispatch_thread_groups(
+                                    MTLSize::new(nqh as u64, 1, 1),
+                                    MTLSize::new(256, 1, 1),
+                                );
+                            }
                         }
                     }
+
+                    // Sigmoid gate over all n*q_dim outputs in one dispatch.
+                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
 
                     // Batch: O projection (attn_out[N, q_dim] → ffn_out[N, hidden])
                     // SAFETY: O-projection pointer is live and dimensions match
@@ -7190,7 +7534,7 @@ kernel void moe_shared_gate_add(
                 self.session.last_pre_final_hidden =
                     unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
             }
-            self.session.kv_cache.seq_len = n;
+            self.session.set_position(start_pos + n);
 
             if let Some(pb) = ppl_buf {
                 // SAFETY: GPU completed, ppl_buf is StorageModeShared and sized n*vocab.
@@ -8102,6 +8446,7 @@ kernel void moe_shared_gate_add(
                 }
             }
             self.session.kv_cache.reset();
+            self.session.position = 0;
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
@@ -10210,6 +10555,155 @@ kernel void moe_shared_gate_add(
             );
         }
 
+        fn dispatch_scatter_q_gate_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            num_tokens: u32,
+            num_heads: u32,
+            head_dim: u32,
+        ) {
+            let total = num_tokens * num_heads * head_dim;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.scatter_q_gate_batch);
+            enc.set_buffer(0, Some(&self.session.activations.q), 0);
+            enc.set_buffer(1, Some(&self.session.activations.q_separated), 0);
+            enc.set_buffer(2, Some(&self.session.activations.gate_z), 0);
+            enc.set_bytes(3, 4, &num_tokens as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+            enc.set_bytes(5, 4, &head_dim as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        fn dispatch_per_head_rms_norm_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            gamma: &Buffer,
+            num_tokens: u32,
+            num_heads: u32,
+            head_dim: u32,
+            eps: f32,
+        ) {
+            let total_groups = num_tokens * num_heads;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.per_head_rms_norm_batch);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(gamma), 0);
+            enc.set_bytes(2, 4, &num_tokens as *const u32 as *const _);
+            enc.set_bytes(3, 4, &num_heads as *const u32 as *const _);
+            enc.set_bytes(4, 4, &head_dim as *const u32 as *const _);
+            enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new(total_groups as u64, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch_partial_rope_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            num_tokens: u32,
+            num_heads: u32,
+            head_dim: u32,
+            half_rope_dim: u32,
+            base_pos: u32,
+        ) {
+            let total_pairs = num_tokens * num_heads * half_rope_dim;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope_batch);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(&self.engine.rope_cos), 0);
+            enc.set_buffer(2, Some(&self.engine.rope_sin), 0);
+            enc.set_bytes(3, 4, &num_tokens as *const u32 as *const _);
+            enc.set_bytes(4, 4, &num_heads as *const u32 as *const _);
+            enc.set_bytes(5, 4, &head_dim as *const u32 as *const _);
+            enc.set_bytes(6, 4, &half_rope_dim as *const u32 as *const _);
+            enc.set_bytes(7, 4, &base_pos as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(total_pairs as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch_copy_kv_cache_batch(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            k_src: &Buffer,
+            v_src: &Buffer,
+            k_cache: &Buffer,
+            v_cache: &Buffer,
+            num_tokens: u32,
+            kv_dim: u32,
+            base_pos: u32,
+        ) {
+            let total = num_tokens * kv_dim;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch);
+            enc.set_buffer(0, Some(k_src), 0);
+            enc.set_buffer(1, Some(v_src), 0);
+            enc.set_buffer(2, Some(k_cache), 0);
+            enc.set_buffer(3, Some(v_cache), 0);
+            enc.set_bytes(4, 4, &num_tokens as *const u32 as *const _);
+            enc.set_bytes(5, 4, &kv_dim as *const u32 as *const _);
+            enc.set_bytes(6, 4, &base_pos as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch_prefill_attention_batched(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            k_cache: &Buffer,
+            v_cache: &Buffer,
+            base_pos: u32,
+            num_tokens: u32,
+            head_dim: u32,
+            num_q_heads: u32,
+            num_kv_heads: u32,
+            q_dim: u32,
+            kv_dim: u32,
+            scale: f32,
+        ) -> Result<(), String> {
+            validate_flash_decode_shape(
+                head_dim as usize,
+                num_q_heads as usize,
+                num_kv_heads as usize,
+                q_dim as usize,
+                kv_dim as usize,
+            )?;
+            let cache_len_total = base_pos.checked_add(num_tokens).ok_or_else(|| {
+                "prefill_attention_batched: base_pos + num_tokens overflow".to_string()
+            })?;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.prefill_attention_batched);
+            enc.set_buffer(0, Some(&self.session.activations.q_separated), 0);
+            enc.set_buffer(1, Some(k_cache), 0);
+            enc.set_buffer(2, Some(v_cache), 0);
+            enc.set_buffer(3, Some(&self.session.activations.attn_out), 0);
+            enc.set_bytes(4, 4, &base_pos as *const u32 as *const _);
+            enc.set_bytes(5, 4, &num_tokens as *const u32 as *const _);
+            enc.set_bytes(6, 4, &cache_len_total as *const u32 as *const _);
+            enc.set_bytes(7, 4, &head_dim as *const u32 as *const _);
+            enc.set_bytes(8, 4, &num_q_heads as *const u32 as *const _);
+            enc.set_bytes(9, 4, &num_kv_heads as *const u32 as *const _);
+            enc.set_bytes(10, 4, &q_dim as *const u32 as *const _);
+            enc.set_bytes(11, 4, &kv_dim as *const u32 as *const _);
+            enc.set_bytes(12, 4, &scale as *const f32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(num_kv_heads as u64, num_tokens as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            Ok(())
+        }
+
         fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef, count: u32) {
             enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
             enc.set_buffer(0, Some(&self.session.activations.gate), 0);
@@ -10725,7 +11219,10 @@ kernel void moe_shared_gate_add(
             let first_input: Vec<f32> = unsafe {
                 let src = (self.engine.embed_tokens.contents() as *const u16)
                     .add(last_id as usize * hidden);
-                (0..hidden).map(|i| f16_to_f32(*src.add(i))).collect()
+                let mut out = vec![0.0f32; hidden];
+                // SAFETY: embed_tokens row has hidden u16 values; out has hidden f32 values.
+                convert_f16_row(src, out.as_mut_ptr(), hidden);
+                out
             };
 
             let mut traces: Vec<LayerTrace> = Vec::with_capacity(active_indices.len());
@@ -11663,6 +12160,11 @@ kernel void moe_shared_gate_add(
                 moe_scale_add: make_pipeline("moe_scale_add")?,
                 moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
                 moe_zero_buf: make_pipeline("zero_buf")?,
+                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+                partial_rope_batch: make_pipeline("partial_rope_batch")?,
+                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+                prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
             };
 
             let hidden = cfg.hidden_size;
@@ -12455,6 +12957,44 @@ kernel void moe_shared_gate_add(
                 max_err < 1e-4,
                 "max roundtrip error for typical weights: {max_err}"
             );
+        }
+
+        /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` (NEON
+        /// on aarch64, scalar on other targets) produces bit-identical output to the
+        /// scalar `f16_to_f32` reference for every pattern.
+        ///
+        /// NaN comparison policy: both outputs are NaN ⇒ pass (any NaN payload is
+        /// acceptable; the bit pattern of a NaN is not architecturally meaningful).
+        /// Non-NaN values are compared by exact bit equality, which is correct because
+        /// f16→f32 widening is lossless for every representable value including
+        /// subnormals, ±0, and ±∞.
+        #[test]
+        fn test_convert_f16_row_matches_scalar_all_patterns() {
+            let mut src = [0u16; 65536];
+            for (i, v) in src.iter_mut().enumerate() {
+                *v = i as u16;
+            }
+            let mut neon_out = vec![0.0f32; 65536];
+            // SAFETY: src and neon_out are both 65536 elements, stack-allocated and valid.
+            unsafe {
+                convert_f16_row(src.as_ptr(), neon_out.as_mut_ptr(), 65536);
+            }
+            for bits in 0u16..=0xffffu16 {
+                let scalar = f16_to_f32(bits);
+                let fast = neon_out[bits as usize];
+                if scalar.is_nan() {
+                    assert!(
+                        fast.is_nan(),
+                        "bits=0x{bits:04x}: scalar=NaN but fast={fast}"
+                    );
+                } else {
+                    assert_eq!(
+                        scalar.to_bits(),
+                        fast.to_bits(),
+                        "bits=0x{bits:04x}: scalar={scalar} fast={fast}"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -15522,6 +16062,322 @@ kernel void decode_attention_reference(
                     );
                 }
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // Chunked batched prefill parity tests
+        // -----------------------------------------------------------------------
+
+        /// Build a token sequence of 650-700 tokens from varied prose paragraphs.
+        /// Uses the provided tokenizer; grows text by appending paragraphs until
+        /// the encoded length is ≥ 650, then truncates to ≤ 680.
+        fn long_real_text_tokens(tokenizer: &BpeTokenizer) -> Vec<u32> {
+            let paragraphs = [
+                "During a late engineering review, the team walked through the inference trace \
+                 one layer at a time. They checked where state changed, which buffers were reused, \
+                 and how a long request should preserve every earlier token.",
+                "The prompt continued with ordinary prose about debugging, benchmarks, release notes, \
+                 and careful handoffs. It used full sentences, punctuation, and varied vocabulary \
+                 so tokenization looked like real input rather than a repeated numeric pattern.",
+                "A second reviewer asked for evidence at the boundary between chunks. The answer \
+                 described rotary positions, cache rows, recurrent memory, and causal attention \
+                 in concrete terms before any optimization was accepted.",
+                "Verification across chunk boundaries requires that each token's absolute position \
+                 index matches the RoPE table row, the KV cache write offset, and the attention \
+                 causal mask — all three must use the same absolute coordinate, not a chunk-local one.",
+            ];
+            let mut text = String::new();
+            let mut ids = Vec::new();
+            for i in 0..256usize {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(paragraphs[i % paragraphs.len()]);
+                let input = tokenizer.tokenize(&text);
+                ids = input.input_ids[..input.real_length].to_vec();
+                if ids.len() >= 650 {
+                    break;
+                }
+            }
+            if ids.len() > 680 {
+                ids.truncate(680);
+            }
+            ids
+        }
+
+        fn argmax_f32(xs: &[f32]) -> usize {
+            let mut best = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &x) in xs.iter().enumerate() {
+                if x > best_val {
+                    best_val = x;
+                    best = i;
+                }
+            }
+            best
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn metal_qwen35_chunked_prefill_long_prompt_matches_step_loop() {
+            // Parity gate: chunked forward_prefill must agree with token-by-token
+            // forward_step on a prompt longer than max_prefill (≈512).
+            // Tests that RoPE offsets, KV cache rows, attention cache_len, and
+            // GDN recurrent state all thread correctly across chunk boundaries.
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping chunked prefill parity test: model files missing at {}",
+                    model_dir.display()
+                );
+                return;
+            }
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            assert!(
+                model.config().num_active_linear_attention_layers() > 0,
+                "prompt must exercise at least one GDN layer"
+            );
+
+            let Some(device) = Device::system_default() else {
+                eprintln!("skipping chunked prefill parity test: no Metal device");
+                return;
+            };
+            let _ = device;
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal qwen3.5-0.8b state");
+
+            let tokens = long_real_text_tokens(model.tokenizer());
+            assert!(
+                tokens.len() > state.session.max_prefill,
+                "prompt ({} tokens) must exceed max_prefill ({})",
+                tokens.len(),
+                state.session.max_prefill
+            );
+            assert!(
+                (600..=700).contains(&tokens.len()),
+                "prompt length {} out of expected 600-700 range",
+                tokens.len()
+            );
+
+            // Path A: token-by-token reference.
+            state.reset_state();
+            let mut step_logits = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                step_logits = state.forward_step(tok, pos);
+            }
+
+            // Path B: chunked batched prefill.
+            state.reset_state();
+            let prefill_logits = state.forward_prefill(&tokens);
+
+            assert_eq!(step_logits.len(), model.config().vocab_size);
+            assert_eq!(prefill_logits.len(), model.config().vocab_size);
+
+            let max_abs_diff = step_logits
+                .iter()
+                .zip(prefill_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            eprintln!(
+                "chunked prefill parity: max_abs_diff={max_abs_diff:.6}, \
+                 argmax_step={}, argmax_prefill={}, tokens={}",
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                tokens.len()
+            );
+
+            assert!(
+                max_abs_diff < 1e-2,
+                "chunked prefill logits diverged from step loop: max_abs_diff={max_abs_diff}"
+            );
+            assert_eq!(
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                "argmax mismatch between step loop and chunked prefill"
+            );
+            // Both paths must advance the session cursor to the full prompt length.
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(state.session.position, tokens.len());
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn metal_qwen35_chunked_prefill_length_1_final_chunk_matches_step_loop() {
+            // Degenerate-boundary gate: a prompt of exactly max_prefill + 1 tokens
+            // decomposes into chunks [max_prefill, 1]. The length-1 final chunk
+            // goes through forward_prefill_batched_chunk with n=1 (single-iteration
+            // per-token loops, m=1 GEMMs) — NOT the forward_step fast path. This
+            // path is unreachable by the 600-700 token parity test above.
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping length-1 final-chunk parity test: model files missing at {}",
+                    model_dir.display()
+                );
+                return;
+            }
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            assert!(
+                model.config().num_active_linear_attention_layers() > 0,
+                "prompt must exercise at least one GDN layer"
+            );
+
+            let Some(device) = Device::system_default() else {
+                eprintln!("skipping length-1 final-chunk parity test: no Metal device");
+                return;
+            };
+            let _ = device;
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal qwen3.5-0.8b state");
+
+            // Trim to exactly max_prefill + 1 so the final chunk has length 1.
+            let mut tokens = long_real_text_tokens(model.tokenizer());
+            let target = state.session.max_prefill + 1;
+            assert!(
+                tokens.len() >= target,
+                "helper produced {} tokens, need >= {target}",
+                tokens.len()
+            );
+            tokens.truncate(target);
+            assert_eq!(
+                tokens.len(),
+                state.session.max_prefill + 1,
+                "prompt must be exactly max_prefill + 1 for a length-1 final chunk"
+            );
+
+            // Path A: token-by-token reference.
+            state.reset_state();
+            let mut step_logits = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                step_logits = state.forward_step(tok, pos);
+            }
+
+            // Path B: chunked batched prefill (final chunk length 1).
+            state.reset_state();
+            let prefill_logits = state.forward_prefill(&tokens);
+
+            assert_eq!(step_logits.len(), model.config().vocab_size);
+            assert_eq!(prefill_logits.len(), model.config().vocab_size);
+
+            let max_abs_diff = step_logits
+                .iter()
+                .zip(prefill_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            eprintln!(
+                "length-1 final-chunk parity: max_abs_diff={max_abs_diff:.6}, \
+                 argmax_step={}, argmax_prefill={}, tokens={}",
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                tokens.len()
+            );
+
+            assert!(
+                max_abs_diff < 1e-2,
+                "length-1 final-chunk logits diverged from step loop: max_abs_diff={max_abs_diff}"
+            );
+            assert_eq!(
+                argmax_f32(&step_logits),
+                argmax_f32(&prefill_logits),
+                "argmax mismatch on length-1 final chunk"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(state.session.position, tokens.len());
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn metal_qwen35_prefill_all_logits_long_prompt_no_longer_panics() {
+            // Regression gate: forward_prefill_all_logits must NOT panic when
+            // n > max_prefill and LoRA is inactive. Old code panicked; new code
+            // chunks the request and concatenates per-chunk all-position logits.
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping all-logits long-prompt test: model files missing at {}",
+                    model_dir.display()
+                );
+                return;
+            }
+
+            let Some(device) = Device::system_default() else {
+                eprintln!("skipping all-logits long-prompt test: no Metal device");
+                return;
+            };
+            let _ = device;
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal qwen3.5-0.8b state");
+
+            let tokens = long_real_text_tokens(model.tokenizer());
+            assert!(tokens.len() > state.session.max_prefill);
+
+            // Must not panic; returns n * vocab_size f32 values.
+            state.reset_state();
+            let flat = state.forward_prefill_all_logits(&tokens);
+            assert_eq!(
+                flat.len(),
+                tokens.len() * model.config().vocab_size,
+                "all-logits output length must be n * vocab_size"
+            );
+
+            // Final row of all-logits must agree with token-by-token final logits.
+            let vocab = model.config().vocab_size;
+            let final_row = &flat[(tokens.len() - 1) * vocab..tokens.len() * vocab];
+
+            state.reset_state();
+            let mut step_logits = Vec::new();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                step_logits = state.forward_step(tok, pos);
+            }
+
+            let max_abs_diff = step_logits
+                .iter()
+                .zip(final_row.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            eprintln!(
+                "all-logits final-row parity: max_abs_diff={max_abs_diff:.6}, \
+                 argmax_step={}, argmax_all_logits_final={}",
+                argmax_f32(&step_logits),
+                argmax_f32(final_row)
+            );
+
+            assert!(
+                max_abs_diff < 1e-2,
+                "all-logits final row diverged from step loop: max_abs_diff={max_abs_diff}"
+            );
+            assert_eq!(
+                argmax_f32(&step_logits),
+                argmax_f32(final_row),
+                "argmax mismatch between step loop and all-logits final row"
+            );
         }
     }
 

@@ -121,6 +121,9 @@ impl Int4Vector {
     ///
     /// Reverses the quantization: `v[i] = q[i] / scale - max_abs`
     ///
+    /// Returns an empty `Vec` if the packed buffer is shorter than `dims.div_ceil(2)`
+    /// bytes — i.e. the vector was constructed with mismatched fields.
+    ///
     /// # Precision
     ///
     /// INT4 unsigned symmetric quantization maps `[-max_abs, max_abs]` to `[0, 15]`
@@ -132,6 +135,11 @@ impl Int4Vector {
     /// `test_int4_dot_product_vs_f32` and `test_int4_roundtrip_accuracy`).
     /// Use `Int8` tier when higher fidelity is required.
     pub fn to_f32(&self) -> Vec<f32> {
+        let required_bytes = self.dims.div_ceil(2);
+        if self.data.len() < required_bytes {
+            return Vec::new();
+        }
+
         let scale = if self.params.scale.is_finite() && self.params.scale != 0.0 {
             self.params.scale
         } else {
@@ -570,6 +578,39 @@ mod tests {
         // but the key invariant is no panics and finite output.
         for &val in &deq {
             assert!(val.is_finite(), "Dequantized value should be finite");
+        }
+    }
+
+    // --- Issue #211 regression tests -------------------------------------------------
+
+    #[test]
+    fn test_int4_to_f32_short_data_returns_empty() {
+        // dims=128 requires 64 bytes; supply only 4.
+        let q = Int4Vector {
+            dims: 128,
+            data: vec![0xFFu8; 4],
+            params: Int4Params {
+                scale: 7.5,
+                max_abs: 1.0,
+            },
+            norm: 1.0,
+        };
+        let result = q.to_f32();
+        assert!(
+            result.is_empty(),
+            "to_f32 on malformed Int4Vector must return empty Vec"
+        );
+    }
+
+    #[test]
+    fn test_int4_to_f32_exact_length_works() {
+        // Exactly the right number of bytes — must succeed and not index OOB.
+        let v: Vec<f32> = (0..128).map(|i| (i as f32) / 64.0 - 1.0).collect();
+        let q = Int4Vector::from_f32(&v);
+        let deq = q.to_f32();
+        assert_eq!(deq.len(), 128);
+        for &val in &deq {
+            assert!(val.is_finite());
         }
     }
 }

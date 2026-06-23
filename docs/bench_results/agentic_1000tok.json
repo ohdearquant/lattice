@@ -1,0 +1,44 @@
+[
+  {
+    "engine": "lattice",
+    "context": 1009,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 3052.0,
+    "decode_ms": 1557.6,
+    "total_ms": 4609.6,
+    "prefill_tok_s": 331,
+    "decode_tok_s": 64,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 1450,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 355.1,
+    "decode_ms": 684.1,
+    "total_ms": 1039.2,
+    "prefill_tok_s": 4083,
+    "decode_tok_s": 146,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": 263.2,
+      "prompt_eval_ms": 14.3,
+      "eval_ms": 684.1,
+      "prompt_eval_count": 1450
+    }
+  },
+  {
+    "engine": "mlx",
+    "context": 1009,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 317.3,
+    "decode_ms": 694.9,
+    "total_ms": 1012.2,
+    "prefill_tok_s": 3180,
+    "decode_tok_s": 144,
+    "source": "live"
+  }
+]

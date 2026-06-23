@@ -684,4 +684,24 @@ mod lora_serving {
             "an adapter keyed to a non-existent layer must not affect output"
         );
     }
+
+    #[test]
+    fn generate_max_new_tokens_zero_returns_empty() {
+        // Contract: max_new_tokens == 0 means "generate nothing". The non-streaming
+        // generate() previously sampled and returned one token anyway, while the
+        // streaming variant already guarded this. The guard returns before any
+        // forward pass, so a synthetic model is sufficient to exercise it.
+        let cfg = test_config();
+        let model = build_model(cfg.clone(), 0xBEEF_F00D);
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens: 0,
+            ..Default::default()
+        };
+        let out = model
+            .generate("abc", &gen_cfg)
+            .expect("generate with max_new_tokens=0 succeeds");
+        assert_eq!(out.generated_tokens, 0, "no tokens may be generated");
+        assert!(out.token_ids.is_empty(), "token_ids must be empty");
+        assert!(out.prompt_tokens > 0, "prompt must still be counted");
+    }
 }

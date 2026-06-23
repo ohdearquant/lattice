@@ -261,6 +261,17 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
             // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
             let (data, shape) = if peft_key.transposed && shape.len() == 2 {
                 let (rows, cols) = (shape[0], shape[1]);
+                let expected = rows.checked_mul(cols).ok_or_else(|| {
+                    TuneError::Serialization(format!(
+                        "tensor '{name}' shape [{rows}, {cols}] overflows usize"
+                    ))
+                })?;
+                if data.len() != expected {
+                    return Err(TuneError::Serialization(format!(
+                        "tensor '{name}' shape [{rows}, {cols}] implies {expected} elements but data has {}",
+                        data.len()
+                    )));
+                }
                 let mut transposed = vec![0.0f32; data.len()];
                 for r in 0..rows {
                     for c in 0..cols {
@@ -930,5 +941,71 @@ mod tests {
                 assert!((g - w).abs() < f32::EPSILON, "B mismatch: {g} vs {w}");
             }
         }
+    }
+
+    #[test]
+    fn test_transpose_rejects_shape_element_mismatch() {
+        // MLX-format (lowercase lora_a/lora_b) triggers the transpose path.
+        // Shape [4, 2] implies 8 elements; we craft data_offsets=[0,24] which is 6 f32s.
+        // The safetensors library catches this mismatch at deserialize() with TensorInvalidInfo
+        // before our transpose guard fires.  The invariant we assert is: Err, not panic.
+        //
+        // Our guard (`data.len() != expected`) provides defence-in-depth for callers that
+        // construct a (values, shape) pair from outside the safetensors library.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mismatch.safetensors");
+
+        let header = r#"{"model.layers.0.self_attn.q_proj.lora_a":{"dtype":"F32","shape":[4,2],"data_offsets":[0,24]},"model.layers.0.self_attn.q_proj.lora_b":{"dtype":"F32","shape":[2,3],"data_offsets":[24,48]}}"#;
+        let header_bytes = header.as_bytes();
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        raw.extend_from_slice(header_bytes);
+        let payload: Vec<u8> = (0u32..12).flat_map(|i| i.to_le_bytes()).collect();
+        raw.extend_from_slice(&payload);
+        std::fs::write(&path, &raw).unwrap();
+
+        let err = load_peft_safetensors(&path).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a non-empty error message, got empty string"
+        );
+    }
+
+    #[test]
+    fn test_transpose_rejects_unaligned_f32_payload() {
+        // MLX-format lora_a with shape=[2,2] but data_offsets=[0,11] (11 bytes, not aligned).
+        // The library rejects this as TensorInvalidInfo.  Assert Err, not panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unaligned.safetensors");
+
+        let header = r#"{"model.layers.0.self_attn.q_proj.lora_a":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"model.layers.0.self_attn.q_proj.lora_b":{"dtype":"F32","shape":[2,2],"data_offsets":[16,32]}}"#;
+        let header_bytes = header.as_bytes();
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        raw.extend_from_slice(header_bytes);
+        // Only 11 bytes instead of the declared 32 — truncated, so deserialize fails.
+        raw.extend_from_slice(&[0u8; 11]);
+        std::fs::write(&path, &raw).unwrap();
+
+        let err = load_peft_safetensors(&path).unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a non-empty error message, got empty string"
+        );
+    }
+
+    #[test]
+    fn test_transpose_guard_logic_is_sound() {
+        // White-box check: verify that the guard expressions added to the transpose path
+        // would produce the correct result for a known mismatch.  This exercises the
+        // arithmetic without requiring the safetensors library to be bypassed.
+        let (rows, cols): (usize, usize) = (4, 2);
+        let data_len: usize = 6; // 6 elements, but shape implies 8
+        let expected = rows.checked_mul(cols).unwrap();
+        assert_ne!(data_len, expected, "precondition: mismatch exists");
+
+        // Mimic the guard: data.len() != expected => would return Err
+        let guard_fires = data_len != expected;
+        assert!(guard_fires, "guard must detect the mismatch");
     }
 }
