@@ -1044,7 +1044,7 @@ kernel void fused_qk_norm_rope(
     ///
     /// Derived values injected:
     /// - `half_dim = head_dim / 2`  (RoPE rotation pairs, also threadgroup size)
-    /// `FA_HEAD_DIM4` is derived from `FA_HEAD_DIM` inside the MSL, not injected separately.
+    ///   `FA_HEAD_DIM4` is derived from `FA_HEAD_DIM` inside the MSL, not injected separately.
     fn msl_source_for(head_dim: usize, gqa_groups: usize) -> String {
         let half_dim = head_dim / 2;
         let threads = head_dim / 2;

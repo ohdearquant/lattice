@@ -3045,16 +3045,11 @@ kernel void moe_shared_gate_add(
         GpuTopkRoute::CpuFallback
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
     pub(crate) enum QuantFormat {
+        #[default]
         Q8_0,
         Q4_0,
-    }
-
-    impl Default for QuantFormat {
-        fn default() -> Self {
-            QuantFormat::Q8_0
-        }
     }
 
     impl QuantFormat {
@@ -3247,8 +3242,7 @@ kernel void moe_shared_gate_add(
     ) -> Result<(), String> {
         if head_dim != METAL_FLASH_HEAD_DIM {
             return Err(format!(
-                "Metal FlashAttention decode supports head_dim={} only; got {}",
-                METAL_FLASH_HEAD_DIM, head_dim
+                "Metal FlashAttention decode supports head_dim={METAL_FLASH_HEAD_DIM} only; got {head_dim}"
             ));
         }
         if num_q_heads == 0 || num_kv_heads == 0 {
@@ -3264,8 +3258,7 @@ kernel void moe_shared_gate_add(
         let group_size = num_q_heads / num_kv_heads;
         if group_size == 0 || group_size > METAL_FLASH_MAX_GQA_GROUP {
             return Err(format!(
-                "Metal FlashAttention decode supports GQA group size 1..={}; got {}",
-                METAL_FLASH_MAX_GQA_GROUP, group_size
+                "Metal FlashAttention decode supports GQA group size 1..={METAL_FLASH_MAX_GQA_GROUP}; got {group_size}"
             ));
         }
         let expected_q_dim = num_q_heads
@@ -4101,7 +4094,7 @@ kernel void moe_shared_gate_add(
                                 &format!("L{i}.gdn.z.{quant_tag}"),
                             )),
                             in_proj_qkvz: {
-                                let mut combined = gdn_w.in_proj_qkv.to_vec();
+                                let mut combined = gdn_w.in_proj_qkv.clone();
                                 combined.extend_from_slice(&gdn_w.in_proj_z);
                                 Q4WeightBuf::from_buffer(make_buffer_quant(
                                     &device,
@@ -4449,9 +4442,8 @@ kernel void moe_shared_gate_add(
                 ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
                 ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
                 ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
-                    "module '{}' is not yet supported in Metal forward (consumed inside \
-                     fused GDN recurrence kernel); target other GDN modules instead",
-                    module
+                    "module '{module}' is not yet supported in Metal forward (consumed inside \
+                     fused GDN recurrence kernel); target other GDN modules instead"
                 ))),
                 ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
                 // MLP projections (shared across both layer types)
@@ -4461,19 +4453,16 @@ kernel void moe_shared_gate_add(
                 // Wrong layer-type combinations
                 ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
                     Err(InferenceError::Inference(format!(
-                        "module '{}' is a full-attention projection but layer {} is GDN",
-                        module, layer_idx
+                        "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
                     )))
                 }
                 ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
                     Err(InferenceError::Inference(format!(
-                        "module '{}' is a GDN projection but layer {} is full-attention",
-                        module, layer_idx
+                        "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
                     )))
                 }
                 _ => Err(InferenceError::Inference(format!(
-                    "unknown LoRA module '{}'",
-                    module
+                    "unknown LoRA module '{module}'"
                 ))),
             }
         }
@@ -4525,8 +4514,7 @@ kernel void moe_shared_gate_add(
             }
             if !scale.is_finite() {
                 return Err(InferenceError::Inference(format!(
-                    "load_lora_adapter: scale must be finite, got {}",
-                    scale
+                    "load_lora_adapter: scale must be finite, got {scale}"
                 )));
             }
 
@@ -5041,9 +5029,10 @@ kernel void moe_shared_gate_add(
                 if is_linear {
                     // GDN layer: batch projections + sequential recurrence (causal dependency).
                     let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Linear(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Linear(gdn_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -5261,9 +5250,10 @@ kernel void moe_shared_gate_add(
                 } else {
                     // Full-attention layer: batch QKV/O/MLP projections, sequential per-token ops.
                     let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Full(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Full(full_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &full_w.q_proj as *const Q4WeightBuf,
@@ -6577,9 +6567,10 @@ kernel void moe_shared_gate_add(
                 if is_linear {
                     // ========= GDN layer: batch projections + sequential recurrence =========
                     let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Linear(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Linear(gdn_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -6818,9 +6809,10 @@ kernel void moe_shared_gate_add(
                 } else {
                     // ========= Full attention layer: batch proj + sequential attention =========
                     let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Full(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Full(full_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &full_w.q_proj as *const Q4WeightBuf,
@@ -7356,16 +7348,13 @@ kernel void moe_shared_gate_add(
                 } else {
                     self.verify_tokens_batched(&[pending_token, draft.token_id], pos)
                 };
-                let verify_out = match verify_result {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Fallback: accept pending, advance normally.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = draft.token_id;
-                        continue;
-                    }
+                let Ok(verify_out) = verify_result else {
+                    // Fallback: accept pending, advance normally.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = draft.token_id;
+                    continue;
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
@@ -7377,23 +7366,20 @@ kernel void moe_shared_gate_add(
                 //   draft_logits          = [draft.logits]   (q(·) for draft position)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
-                let rs = match crate::speculative::rejection_sample_draft(
+                let Ok(rs) = crate::speculative::rejection_sample_draft(
                     &[draft.token_id],
                     std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
                     false,
                     None,
-                ) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Fallback: accept pending, advance normally.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = draft.token_id;
-                        continue;
-                    }
+                ) else {
+                    // Fallback: accept pending, advance normally.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = draft.token_id;
+                    continue;
                 };
 
                 if rs.accepted_count == 1 {
@@ -7593,19 +7579,16 @@ kernel void moe_shared_gate_add(
                 self.restore_gdn_slot_blocking(0);
 
                 let t_verify = std::time::Instant::now();
-                let verify_out = match self.verify_tokens_batched(&verify_input, pos) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Verification failed: accept pending, use draft as next pending.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = argmax_logits(&first_draft_logits);
-                        if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
-                            break;
-                        }
-                        continue 'round;
+                let Ok(verify_out) = self.verify_tokens_batched(&verify_input, pos) else {
+                    // Verification failed: accept pending, use draft as next pending.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = argmax_logits(&first_draft_logits);
+                    if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
                     }
+                    continue 'round;
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
@@ -8103,7 +8086,7 @@ kernel void moe_shared_gate_add(
             // Text tokens start at position `visual_tokens`.
             let prompt_len = total_len;
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-            let mut all_ids: Vec<u32> = text_ids.to_vec();
+            let mut all_ids: Vec<u32> = text_ids.clone();
 
             // Process all text tokens sequentially at their offset positions.
             let mut last_logits = Vec::new();
@@ -8243,9 +8226,9 @@ kernel void moe_shared_gate_add(
                 w_norm,
                 w_out_proj,
             ) = {
-                let gdn_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!("gdn_layer_step called on non-linear layer"),
+                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!("gdn_layer_step called on non-linear layer")
                 };
                 (
                     &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -8466,9 +8449,9 @@ kernel void moe_shared_gate_add(
             let kernel_size = cfg.linear_conv_kernel_dim;
 
             let (w_in_proj_b, w_in_proj_a, w_a_log, w_dt_bias, w_conv1d, w_norm) = {
-                let gdn_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &gdn_w.in_proj_b as *const Buffer,
@@ -8632,9 +8615,9 @@ kernel void moe_shared_gate_add(
             // Extract weight buffer pointers to avoid holding borrow on layer_weights.
             // SAFETY: layer_weights is never mutated during forward pass.
             let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let full_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Full(w) => w,
-                    _ => unreachable!("full_attention_layer_step called on non-full layer"),
+                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!("full_attention_layer_step called on non-full layer")
                 };
                 (
                     &full_w.q_proj as *const Q4WeightBuf,
@@ -8814,9 +8797,10 @@ kernel void moe_shared_gate_add(
                 w_norm,
                 w_out_proj,
             ) = {
-                let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Linear(gdn_w) =
+                    &self.engine.layer_weights[compact_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &gdn_w.in_proj_qkvz as *const Q4WeightBuf,
@@ -8853,7 +8837,7 @@ kernel void moe_shared_gate_add(
             // H4 fusion: one wider GEMV writes QKV||Z rows to gdn_qkvz (saves 1 dispatch/GDN layer).
             // SAFETY: w_in_proj_qkvz holds contiguous Q4 rows [0..qkv_d) from qkv and
             // [qkv_d..qkv_d+out_d) from z; output gdn_qkvz is (qkv_d+out_d) floats.
-            let proj_t0 = profiling.then(|| std::time::Instant::now());
+            let proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -8915,7 +8899,7 @@ kernel void moe_shared_gate_add(
             // SAFETY: All buffers are StorageModeShared and live for the
             // command buffer; dimensions in GdnRecurParams are derived from
             // the model config used to allocate the GDN state buffers.
-            let gdn_t0 = profiling.then(|| std::time::Instant::now());
+            let gdn_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 #[repr(C)]
                 struct GdnRecurParams {
@@ -9005,7 +8989,7 @@ kernel void moe_shared_gate_add(
                 } else {
                     // Fallback: H2+H4 fused kernel or generic
                     let recur_pipe = use_q36
-                        .then(|| self.engine.pipelines.gdn_recurrence_q36.as_ref())
+                        .then_some(self.engine.pipelines.gdn_recurrence_q36.as_ref())
                         .flatten()
                         .unwrap_or(&self.engine.pipelines.gdn_recurrence);
                     enc.set_compute_pipeline_state(recur_pipe);
@@ -9037,7 +9021,7 @@ kernel void moe_shared_gate_add(
             // Output projection — reads norm output from Z portion of fused buffer.
             // SAFETY: w_out_proj and gdn_qkvz are live for this command buffer;
             // z_byte_off points to out_d norm values written by gdn_recurrence.
-            let out_proj_t0 = profiling.then(|| std::time::Instant::now());
+            let out_proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_gemm(
                     enc,
@@ -9069,7 +9053,7 @@ kernel void moe_shared_gate_add(
 
             // MLP: fused residual+add+norm replaces 4 dispatches with 1
             // residual = residual + attn_out; hidden = norm(residual)
-            let mlp_t0 = profiling.then(|| std::time::Instant::now());
+            let mlp_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_fused_residual_add_norm(
                 enc,
                 &self.session.activations.residual,
@@ -9187,9 +9171,9 @@ kernel void moe_shared_gate_add(
             let inter = cfg.intermediate_size;
             // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
             let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                    MetalLayerAttnWeights::Full(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &full_w.q_proj as *const Q4WeightBuf,
@@ -9230,7 +9214,7 @@ kernel void moe_shared_gate_add(
             // SAFETY: Raw layer weight pointers were taken from
             // self.engine.layer_weights and remain valid while self is borrowed;
             // dispatch dimensions match the preallocated activation buffers.
-            let gqa_proj_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -9346,7 +9330,7 @@ kernel void moe_shared_gate_add(
             );
 
             // Decode attention + gating + O projection
-            let gqa_attn_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_attn_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_decode_attention(
                 enc,
                 &self.session.kv_cache.k_bufs[full_idx],
@@ -9365,7 +9349,7 @@ kernel void moe_shared_gate_add(
             }
             // SAFETY: The O-projection buffer pointer is live for the command
             // buffer and dimensions match [hidden, q_dim].
-            let gqa_oproj_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_oproj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -9398,7 +9382,7 @@ kernel void moe_shared_gate_add(
             }
 
             // MLP: fused residual+add+norm replaces 4 dispatches with 1
-            let gqa_mlp_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_mlp_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_fused_residual_add_norm(
                 enc,
                 &self.session.activations.residual,
@@ -9841,7 +9825,7 @@ kernel void moe_shared_gate_add(
             }
 
             // === Final RMS norm + logits (same command buffer) ===
-            let final_t0 = profiling.then(|| std::time::Instant::now());
+            let final_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_rms_norm(
                 enc,
                 &self.session.activations.hidden,
@@ -11548,7 +11532,7 @@ kernel void moe_shared_gate_add(
             let path = q4_dir.join("quantize_index.json");
             let bytes = std::fs::read(&path).ok()?;
             let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            v.get("quarot_seed").and_then(|s| s.as_u64())
+            v.get("quarot_seed").and_then(serde_json::Value::as_u64)
         }
 
         /// Create a new [`MetalQwen35State`] by loading pre-quantized Q4/F16 files directly

@@ -1,29 +1,29 @@
-/// Metal GPU generation — JSON event mode for Lattice Studio app, plus interactive REPL.
-///
-/// # Usage — JSON streaming mode (used by Lattice Studio)
-///
-/// ```
-/// chat_metal --model ~/.lattice/models/qwen3.5-0.8b --prompt "Hello" --max-tokens 64 --json
-/// chat_metal --model qwen3.5-0.8b-q4 --prompt "Hello" --max-tokens 64 --json
-/// chat_metal --model qwen3.5-0.8b --lora adapter.safetensors --prompt "..." --json
-/// ```
-///
-/// Emits `@@lattice` gen_token events identical to `generate_lora` so the app parser
-/// needs no changes. Every response bubble produced by this binary is labelled
-/// "GPU Metal" — never CPU. (The app selects the binary; it does not label after the fact.)
-///
-/// # Usage — interactive REPL (legacy; no --json)
-///
-/// ```
-/// cargo run --release -p lattice-inference --bin chat_metal --features "f16,metal-gpu"
-/// ```
-///
-/// # LoRA loading
-///
-/// Loads PEFT-format or MLX-format `.safetensors` adapters inline using `SafetensorsFile`.
-/// The `lattice-tune` crate is not a dependency of `lattice-inference`; we replicate the
-/// minimal key-parsing logic here. Alpha defaults to `rank` (scale = 1.0), matching the
-/// tune crate's own default when no `__metadata__` alpha field is present.
+//! Metal GPU generation — JSON event mode for Lattice Studio app, plus interactive REPL.
+//!
+//! # Usage — JSON streaming mode (used by Lattice Studio)
+//!
+//! ```
+//! chat_metal --model ~/.lattice/models/qwen3.5-0.8b --prompt "Hello" --max-tokens 64 --json
+//! chat_metal --model qwen3.5-0.8b-q4 --prompt "Hello" --max-tokens 64 --json
+//! chat_metal --model qwen3.5-0.8b --lora adapter.safetensors --prompt "..." --json
+//! ```
+//!
+//! Emits `@@lattice` gen_token events identical to `generate_lora` so the app parser
+//! needs no changes. Every response bubble produced by this binary is labelled
+//! "GPU Metal" — never CPU. (The app selects the binary; it does not label after the fact.)
+//!
+//! # Usage — interactive REPL (legacy; no --json)
+//!
+//! ```
+//! cargo run --release -p lattice-inference --bin chat_metal --features "f16,metal-gpu"
+//! ```
+//!
+//! # LoRA loading
+//!
+//! Loads PEFT-format or MLX-format `.safetensors` adapters inline using `SafetensorsFile`.
+//! The `lattice-tune` crate is not a dependency of `lattice-inference`; we replicate the
+//! minimal key-parsing logic here. Alpha defaults to `rank` (scale = 1.0), matching the
+//! tune crate's own default when no `__metadata__` alpha field is present.
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -143,7 +143,11 @@ fn load_lora_safetensors(
     let sf = SafetensorsFile::open(path)?;
 
     // Collect all tensor names.
-    let names: Vec<String> = sf.tensor_names().iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = sf
+        .tensor_names()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
 
     // We need to pair lora_A and lora_B tensors by layer and module.
     // Supported key formats:
@@ -213,8 +217,7 @@ fn load_lora_safetensors(
 
     if parsed.is_empty() {
         return Err(format!(
-            "no LoRA tensors found in {:?} (checked PEFT and MLX key formats)",
-            path
+            "no LoRA tensors found in {path:?} (checked PEFT and MLX key formats)"
         )
         .into());
     }
@@ -237,15 +240,11 @@ fn load_lora_safetensors(
     let mut layers: Vec<LoraLayerData> = Vec::new();
 
     for ((layer_idx, module), (a_name, b_name)) in &groups {
-        let (a_name, b_name) = match (a_name, b_name) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                eprintln!(
-                    "[chat_metal] skipping layer {} module {}: missing A or B tensor",
-                    layer_idx, module
-                );
-                continue;
-            }
+        let (Some(a_name), Some(b_name)) = (a_name, b_name) else {
+            eprintln!(
+                "[chat_metal] skipping layer {layer_idx} module {module}: missing A or B tensor"
+            );
+            continue;
         };
 
         let (a_data, a_shape) = sf.get_f32_tensor(a_name)?;
@@ -262,8 +261,7 @@ fn load_lora_safetensors(
             // MLX A: (d_in, rank) → transpose to (rank, d_in)
             if a_shape.len() != 2 || b_shape.len() != 2 {
                 return Err(format!(
-                    "unexpected shape for MLX LoRA tensors at layer {} module {}",
-                    layer_idx, module
+                    "unexpected shape for MLX LoRA tensors at layer {layer_idx} module {module}"
                 )
                 .into());
             }
@@ -273,8 +271,7 @@ fn load_lora_safetensors(
             let b_d_out = b_shape[1];
             if a_rank != b_rank {
                 return Err(format!(
-                    "rank mismatch at layer {} module {}: A rank={} B rank={}",
-                    layer_idx, module, a_rank, b_rank
+                    "rank mismatch at layer {layer_idx} module {module}: A rank={a_rank} B rank={b_rank}"
                 )
                 .into());
             }
@@ -297,18 +294,17 @@ fn load_lora_safetensors(
             // PEFT A: (rank, d_in), B: (d_out, rank) — already correct layout.
             if a_shape.len() != 2 || b_shape.len() != 2 {
                 return Err(format!(
-                    "unexpected shape for PEFT LoRA tensors at layer {} module {}",
-                    layer_idx, module
+                    "unexpected shape for PEFT LoRA tensors at layer {layer_idx} module {module}"
                 )
                 .into());
             }
             let rank = a_shape[0];
             let d_in = a_shape[1];
             let d_out = b_shape[0];
-            if b_shape[1] != rank {
+            let b_rank_check = b_shape[1];
+            if b_rank_check != rank {
                 return Err(format!(
-                    "rank mismatch at layer {} module {}: A rank={} B rank={}",
-                    layer_idx, module, rank, b_shape[1]
+                    "rank mismatch at layer {layer_idx} module {module}: A rank={rank} B rank={b_rank_check}"
                 )
                 .into());
             }
@@ -319,8 +315,7 @@ fn load_lora_safetensors(
         if let Some(prev) = rank_global {
             if prev != rank {
                 eprintln!(
-                    "[chat_metal] warning: rank mismatch across layers ({} vs {}); using first",
-                    prev, rank
+                    "[chat_metal] warning: rank mismatch across layers ({prev} vs {rank}); using first"
                 );
             }
         } else {
@@ -385,7 +380,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let max_tokens: usize = parse_arg(&args, "--max-tokens")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(if emit_json { 512 } else { 512 });
+        .unwrap_or(512);
 
     let seed: Option<u64> = parse_arg(&args, "--seed").and_then(|s| s.parse().ok());
 
@@ -562,11 +557,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── JSON streaming mode (used by Lattice Studio app) ────────────────────
 
     if emit_json {
-        let prompt = match prompt_opt {
-            Some(p) => p,
-            None => {
-                return Err("--json mode requires --prompt".into());
-            }
+        let Some(prompt) = prompt_opt else {
+            return Err("--json mode requires --prompt".into());
         };
 
         let mut stdout = std::io::stdout();
