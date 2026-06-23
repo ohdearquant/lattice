@@ -367,6 +367,12 @@ pub fn try_approximate_dot_product_prepared(
 /// The stored vector's unit claim is verified lazily via [`is_unit_norm`]; callers
 /// that batch many lookups against a fixed stored set should pre-check once and
 /// use the cheaper overload directly.
+///
+/// # Panics
+///
+/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
+/// match the stored-data tier. The unit-norm `Full` fast path returns directly and
+/// never reaches the delegate.
 #[inline]
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
@@ -404,6 +410,12 @@ pub fn approximate_dot_product_prepared(query: &PreparedQuery, stored: &Quantize
 }
 
 /// Compute cosine distances from one prepared query to a slice of stored vectors.
+///
+/// # Panics
+///
+/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
+/// match any stored vector's tier. Use [`try_approximate_cosine_distance_prepared`]
+/// per item when tiers are not statically guaranteed to match.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -418,6 +430,11 @@ pub fn batch_approximate_cosine_distance_prepared(
 /// Like [`batch_approximate_cosine_distance_prepared`] but writes into a caller-supplied buffer.
 ///
 /// Clears and reuses the buffer to avoid allocations across repeated searches.
+///
+/// # Panics
+///
+/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
+/// match any stored vector's tier.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared_into(
     query: &PreparedQuery,
@@ -435,8 +452,11 @@ pub fn batch_approximate_cosine_distance_prepared_into(
 
 /// Compute cosine distances from a prepared INT8 query to a slice of INT8 candidates.
 ///
-/// Panics if `query` is not an `Int8` `PreparedQuery`.
 /// The query is quantized once outside this function; no per-iteration `from_f32` is called.
+///
+/// # Panics
+///
+/// Panics if `query` is not an `Int8` `PreparedQuery`.
 #[inline]
 pub fn approximate_int8_batch_prepared(
     query: &PreparedQuery,
@@ -452,6 +472,10 @@ pub fn approximate_int8_batch_prepared(
 }
 
 /// Like [`approximate_int8_batch_prepared`] but writes into a caller-supplied buffer.
+///
+/// # Panics
+///
+/// Panics if `query` is not an `Int8` `PreparedQuery`.
 #[inline]
 pub fn approximate_int8_batch_prepared_into(
     query: &PreparedQuery,
@@ -472,8 +496,11 @@ pub fn approximate_int8_batch_prepared_into(
 
 /// Compute cosine distances from a prepared INT4 query to a slice of INT4 candidates.
 ///
-/// Panics if `query` is not an `Int4` `PreparedQuery`.
 /// The query is quantized once outside this function; no per-iteration `from_f32` is called.
+///
+/// # Panics
+///
+/// Panics if `query` is not an `Int4` `PreparedQuery`.
 #[inline]
 pub fn approximate_int4_batch_prepared(
     query: &PreparedQuery,
@@ -489,6 +516,10 @@ pub fn approximate_int4_batch_prepared(
 }
 
 /// Like [`approximate_int4_batch_prepared`] but writes into a caller-supplied buffer.
+///
+/// # Panics
+///
+/// Panics if `query` is not an `Int4` `PreparedQuery`.
 #[inline]
 pub fn approximate_int4_batch_prepared_into(
     query: &PreparedQuery,
