@@ -15,4 +15,5 @@ mod tests;
 pub use api::{GpuForwardError, GpuRuntimeConfig, Qwen3Config, Qwen3LayerWeights, Qwen3Weights};
 pub use state::GpuModelState;
 
+#[cfg(test)]
 pub use util::build_rope_tables;

@@ -1,11 +1,7 @@
 use super::api::checked_mul;
 use super::api::{GpuForwardError, Result};
 
-pub(super) fn build_rope_tables(
-    head_dim: usize,
-    max_seq_len: usize,
-    theta: f64,
-) -> (Vec<f32>, Vec<f32>) {
+pub fn build_rope_tables(head_dim: usize, max_seq_len: usize, theta: f64) -> (Vec<f32>, Vec<f32>) {
     let half_dim = head_dim / 2;
     let mut cos = Vec::with_capacity(max_seq_len * half_dim);
     let mut sin = Vec::with_capacity(max_seq_len * half_dim);
