@@ -169,7 +169,15 @@ pub struct PageTable {
 
 impl PageTable {
     /// **Unstable**: create an empty page table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_size == 0`: it is the divisor in [`PageTable::resolve`],
+    /// so a zero would otherwise surface as a cryptic divide-by-zero. This is
+    /// the authoritative guard for every `PageTable` (the `PagedKVCache`
+    /// constructors and `SequenceManager::add` both route through here).
     pub fn new(page_size: usize) -> Self {
+        assert!(page_size > 0, "PageTable page_size must be non-zero");
         Self {
             entries: Vec::new(),
             seq_len: 0,
@@ -1132,6 +1140,15 @@ mod tests {
         let mut config = make_config(4);
         config.page_size = 0;
         let _ = PagedKVCache::new(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "page_size must be non-zero")]
+    fn page_table_zero_page_size_panics() {
+        // Regression for #244: `PageTable::new` is the authoritative chokepoint
+        // (`SequenceManager::add` reaches it directly, bypassing the
+        // `PagedKVCache` config guard), so the guard must live here too.
+        let _ = PageTable::new(0);
     }
 
     #[test]
