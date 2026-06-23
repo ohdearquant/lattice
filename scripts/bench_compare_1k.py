@@ -4,10 +4,29 @@
 Three-way comparison: lattice (pure-Rust Metal) vs ollama (llama.cpp Metal)
 vs MLX (mlx_lm, Apple MLX).
 
-Methodology (identical across engines):
+Methodology:
   TTFT   = prefill latency (wall time to generate 1 token)
   Total  = wall time for prefill + RESP-token decode
   Decode = Total - TTFT  ->  decode_tok_s = RESP / (decode_ms / 1000)
+
+  NOTE ON METHODOLOGY DIFFERENCES:
+  Lattice and MLX use exact tokenizer-padded prompts (iterative BASE repetition
+  until the tokenizer confirms the target token count is reached). Ollama uses
+  a character-count heuristic that overshoots — the reported context for ollama
+  will be higher than the target (e.g. 1450 vs 1000). Additionally, ollama
+  (llama.cpp Metal) appears to prefix-cache repeated filler text, so its
+  reported TTFT and `prefill_tok_s` are NOT representative of fresh-token
+  prefill throughput: they reflect cache lookup + overhead, not actual
+  quadratic attention over new tokens. The raw ollama API fields
+  (`load_ms`, `prompt_eval_ms`, `eval_ms`, `prompt_eval_count`) are stored
+  in the JSON for diagnosability. The `prefill_tok_s` column is labelled
+  `prefill_tok_s*` (asterisked) for ollama in table output.
+
+  The lattice-vs-MLX decode comparison is apples-to-apples: same tokenizer,
+  same prompt token count, same RESP budget, same methodology. Precision
+  differs (lattice Q8 safetensors, MLX bf16), so lattice's decode gap is
+  conservative: MLX runs ~2x heavier weights and is still faster, meaning
+  the real gap is larger than the raw tok/s ratio implies.
 
 Usage:
   uv run python3 scripts/bench_compare_1k.py              # default: ctx=1000
@@ -122,7 +141,7 @@ def bench_lattice(ctx: int, runs: int) -> dict:
     total_ms, _ = _lattice_one_run(RESP, ctx, runs)
     actual_ctx = pt if pt is not None else ctx
     decode_ms = total_ms - ttft_ms
-    return _mk("lattice", actual_ctx, ttft_ms, total_ms, decode_ms, live=True)
+    return _mk("lattice", actual_ctx, ttft_ms, total_ms, decode_ms, live=True, runs=runs)
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +204,9 @@ def bench_ollama(ctx: int, runs: int, model: str = OLLAMA_MODEL) -> dict:
 
     ttfts: list[float] = []
     totals: list[float] = []
+    load_mss: list[float] = []
+    prompt_eval_mss: list[float] = []
+    eval_mss: list[float] = []
     pcount: Optional[int] = None
 
     for i in range(runs):
@@ -209,6 +231,9 @@ def bench_ollama(ctx: int, runs: int, model: str = OLLAMA_MODEL) -> dict:
         load_ms = r.get("load_duration", 0) / 1e6
         ttfts.append(load_ms + prompt_eval_ms)
         totals.append(load_ms + prompt_eval_ms + eval_ms)
+        load_mss.append(load_ms)
+        prompt_eval_mss.append(prompt_eval_ms)
+        eval_mss.append(eval_ms)
         if pcount is None:
             pcount = r.get("prompt_eval_count")
 
@@ -220,7 +245,18 @@ def bench_ollama(ctx: int, runs: int, model: str = OLLAMA_MODEL) -> dict:
     actual_ctx = pcount if pcount is not None else ctx
     ttft_ms = median(ttfts)
     total_ms = median(totals)
-    return _mk("ollama", actual_ctx, ttft_ms, total_ms, total_ms - ttft_ms, live=True)
+    row = _mk("ollama", actual_ctx, ttft_ms, total_ms, total_ms - ttft_ms,
+              live=True, runs=runs)
+    # Store raw ollama API timing breakdown for diagnosability.
+    # NOTE: prompt_eval_ms here reflects llama.cpp prefix-cache lookup, NOT
+    # fresh-token prefill — see module docstring for caveats on prefill_tok_s.
+    row["ollama_breakdown"] = {
+        "load_ms": round(median(load_mss), 1),
+        "prompt_eval_ms": round(median(prompt_eval_mss), 1),
+        "eval_ms": round(median(eval_mss), 1),
+        "prompt_eval_count": pcount,
+    }
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +353,7 @@ def bench_mlx(ctx: int, runs: int, model: str = MLX_MODEL) -> dict:
 
     ttft_ms = median(ttfts)
     total_ms = median(totals)
-    return _mk("mlx", actual_ctx, ttft_ms, total_ms, total_ms - ttft_ms, live=True)
+    return _mk("mlx", actual_ctx, ttft_ms, total_ms, total_ms - ttft_ms, live=True, runs=runs)
 
 
 def _mlx_from_json(ctx: int) -> Optional[dict]:
@@ -351,13 +387,14 @@ def _make_prompt(n_tokens_approx: int) -> str:
 
 
 def _mk(engine: str, ctx, ttft_ms: float, total_ms: float, decode_ms: float,
-        live: bool = True) -> dict:
+        live: bool = True, runs: int = DEFAULT_RUNS) -> dict:
     decode_tok_s = RESP / (decode_ms / 1000) if decode_ms > 0 else 0
     prefill_tok_s = ctx / (ttft_ms / 1000) if ttft_ms > 0 else 0
     row = {
         "engine": engine,
         "context": ctx,
         "response": RESP,
+        "runs": runs,
         "ttft_ms": round(ttft_ms, 1),
         "decode_ms": round(decode_ms, 1),
         "total_ms": round(total_ms, 1),
@@ -372,11 +409,12 @@ def _mk(engine: str, ctx, ttft_ms: float, total_ms: float, decode_ms: float,
     return row
 
 
-def _unavailable(engine: str, ctx: int, reason: str) -> dict:
+def _unavailable(engine: str, ctx: int, reason: str, runs: int = 0) -> dict:
     return {
         "engine": engine,
         "context": ctx,
         "response": RESP,
+        "runs": runs,
         "ttft_ms": None,
         "decode_ms": None,
         "total_ms": None,
@@ -412,27 +450,52 @@ def _fmt_val(v) -> str:
 
 
 def print_table(rows: list[dict], ctx: int) -> str:
-    """Print and return a markdown table for the given context depth."""
+    """Print and return a markdown table for the given context depth.
+
+    Ollama's prefill_tok_s is asterisked (*) because it reflects
+    prefix-cache lookup rather than fresh-token prefill throughput.
+    Precision note is included below the table.
+    """
     header = (
         f"\n## Agentic Workload: ~{ctx}-token context, {RESP}-token response\n\n"
-        "| Engine | Ctx (tok) | TTFT (ms) | Decode (ms) | Total (ms) "
-        "| Prefill t/s | Decode t/s | Source |\n"
-        "|--------|-----------|-----------|-------------|-----------|"
-        "-------------|------------|--------|\n"
+        "| Engine | Precision | Ctx (tok) | TTFT (ms) | Decode (ms) | Total (ms) "
+        "| Prefill t/s | Decode t/s | Runs | Source |\n"
+        "|--------|-----------|-----------|-----------|-------------|-----------|"
+        "-------------|------------|------|--------|\n"
     )
+    _PRECISION = {
+        "lattice": "Q8 sf",
+        "ollama": "Q8_0",
+        "mlx": "bf16",
+    }
     lines = [header]
     for r in rows:
+        engine = r["engine"]
+        precision = _PRECISION.get(engine, "?")
+        # Mark ollama prefill as a cache artifact, not fresh-prefill throughput.
+        prefill_val = _fmt_val(r["prefill_tok_s"])
+        if engine == "ollama" and r["prefill_tok_s"] is not None:
+            prefill_val = prefill_val + "*"
         line = (
-            f"| {r['engine']:<10} "
+            f"| {engine:<10} "
+            f"| {precision:<9} "
             f"| {_fmt_val(r['context']):>9} "
             f"| {_fmt_val(r['ttft_ms']):>9} "
             f"| {_fmt_val(r['decode_ms']):>11} "
             f"| {_fmt_val(r['total_ms']):>9} "
-            f"| {_fmt_val(r['prefill_tok_s']):>11} "
+            f"| {prefill_val:>11} "
             f"| {_fmt_val(r['decode_tok_s']):>10} "
+            f"| {r.get('runs', '?'):>4} "
             f"| {r.get('source','?'):<6} |\n"
         )
         lines.append(line)
+    footnote = (
+        "\n*ollama prefill tok/s reflects llama.cpp prefix-cache lookup (repeated filler text), "
+        "NOT fresh-token prefill throughput. See module docstring.\n"
+        "Precision note: MLX runs bf16 (~2x memory bandwidth vs lattice Q8). "
+        "The lattice decode gap is conservative — bandwidth-adjusted, the gap is larger.\n"
+    )
+    lines.append(footnote)
     table = "".join(lines)
     print(table)
     return table

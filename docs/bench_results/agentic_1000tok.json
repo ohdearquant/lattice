@@ -3,33 +3,42 @@
     "engine": "lattice",
     "context": 1009,
     "response": 100,
-    "ttft_ms": 1825.9,
-    "decode_ms": 1340.1,
-    "total_ms": 3166.0,
-    "prefill_tok_s": 553,
-    "decode_tok_s": 75,
+    "runs": 3,
+    "ttft_ms": 3052.0,
+    "decode_ms": 1557.6,
+    "total_ms": 4609.6,
+    "prefill_tok_s": 331,
+    "decode_tok_s": 64,
     "source": "live"
   },
   {
     "engine": "ollama",
     "context": 1450,
     "response": 100,
-    "ttft_ms": 250.3,
-    "decode_ms": 595.2,
-    "total_ms": 845.5,
-    "prefill_tok_s": 5794,
-    "decode_tok_s": 168,
-    "source": "live"
+    "runs": 3,
+    "ttft_ms": 355.1,
+    "decode_ms": 684.1,
+    "total_ms": 1039.2,
+    "prefill_tok_s": 4083,
+    "decode_tok_s": 146,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": 263.2,
+      "prompt_eval_ms": 14.3,
+      "eval_ms": 684.1,
+      "prompt_eval_count": 1450
+    }
   },
   {
     "engine": "mlx",
     "context": 1009,
     "response": 100,
-    "ttft_ms": 345.6,
-    "decode_ms": 604.4,
-    "total_ms": 950.1,
-    "prefill_tok_s": 2919,
-    "decode_tok_s": 165,
+    "runs": 3,
+    "ttft_ms": 317.3,
+    "decode_ms": 694.9,
+    "total_ms": 1012.2,
+    "prefill_tok_s": 3180,
+    "decode_tok_s": 144,
     "source": "live"
   }
 ]
