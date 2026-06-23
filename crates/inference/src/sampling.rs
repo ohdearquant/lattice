@@ -85,11 +85,7 @@ impl CandidateSet {
         }
         for c in &mut self.candidates {
             if previous_ids.contains(&c.token_id) {
-                if c.logit > 0.0 {
-                    c.logit /= penalty;
-                } else {
-                    c.logit *= penalty;
-                }
+                c.logit = penalized_logit(c.logit, penalty);
             }
         }
     }
@@ -148,6 +144,13 @@ impl CandidateSet {
 
         // Softmax — reuse the provided scratch buffer.
         let max_logit = self.candidates[0].logit;
+        // A non-finite max (+INF, or all-NaN/-INF) makes (logit - max).exp() produce
+        // NaN probabilities, which the weighted-sample loop never selects — it would
+        // fall through to the worst candidate. The argmax (candidates[0] after the
+        // descending sort) is the correct answer for an infinite-logit token.
+        if !max_logit.is_finite() {
+            return self.candidates[0].token_id;
+        }
         probs.clear();
         probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
         let sum: f32 = probs.iter().sum();
@@ -281,11 +284,7 @@ impl Sampler {
             for &tok in &self.recent_tokens {
                 let idx = tok as usize;
                 if idx < self.logit_scratch.len() {
-                    if self.logit_scratch[idx] > 0.0 {
-                        self.logit_scratch[idx] /= penalty;
-                    } else {
-                        self.logit_scratch[idx] *= penalty;
-                    }
+                    self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
                 }
             }
             let token = argmax_f32(&self.logit_scratch);
@@ -302,11 +301,7 @@ impl Sampler {
             for &tok in &self.recent_tokens {
                 let idx = tok as usize;
                 if idx < adj.len() {
-                    if adj[idx] > 0.0 {
-                        adj[idx] /= self.config.repetition_penalty;
-                    } else {
-                        adj[idx] *= self.config.repetition_penalty;
-                    }
+                    adj[idx] = penalized_logit(adj[idx], self.config.repetition_penalty);
                 }
             }
         }
@@ -345,6 +340,21 @@ impl Sampler {
     /// **Unstable**: reset sampler state for a new generation sequence.
     pub fn reset(&mut self) {
         self.recent_tokens.clear();
+    }
+}
+
+/// Apply repetition penalty to one logit. A penalty of 1.0, or any non-finite
+/// or non-positive value, is treated as "no penalty" so an invalid config can
+/// never flip a logit's sign or produce an infinity.
+#[inline(always)]
+fn penalized_logit(logit: f32, penalty: f32) -> f32 {
+    if penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0 {
+        return logit;
+    }
+    if logit > 0.0 {
+        logit / penalty
+    } else {
+        logit * penalty
     }
 }
 
@@ -492,10 +502,17 @@ fn select_top_k(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Candidate
 
 fn select_top_k_scalar(logits: &[f32], k: usize, inv_temp: f32, out: &mut Vec<Candidate>) {
     out.clear();
-    if k == 0 || logits.is_empty() {
+    if logits.is_empty() {
         return;
     }
-    let k = k.min(logits.len());
+    // k == 0 means "top-k disabled" (SamplingConfig::top_k docs): keep every
+    // candidate, matching retain_top_k. Returning an empty set here would force
+    // sample_top_p_with_scratch to always emit token 0.
+    let k = if k == 0 {
+        logits.len()
+    } else {
+        k.min(logits.len())
+    };
 
     // Phase 1: seed the heap with the first k elements, scaled by inv_temp.
     // NaN seeds are replaced with NEG_INFINITY so the heap root is never NaN.
@@ -536,10 +553,15 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
     use std::arch::aarch64::*;
 
     out.clear();
-    if k == 0 || logits.is_empty() {
+    if logits.is_empty() {
         return;
     }
-    let k = k.min(logits.len());
+    // k == 0 means "top-k disabled": keep every candidate (mirror of the scalar path).
+    let k = if k == 0 {
+        logits.len()
+    } else {
+        k.min(logits.len())
+    };
 
     // Phase 1: scalar heap seed (k ≤ 256, no NEON benefit here), scaled by inv_temp.
     // NaN seeds are replaced with NEG_INFINITY so the heap root is never NaN.
@@ -1023,6 +1045,96 @@ mod tests {
         assert!(
             (out[1].logit - 1.5).abs() < 1e-6,
             "logit[2] must be 3.0*0.5=1.5"
+        );
+    }
+
+    #[test]
+    fn test_select_top_k_zero_keeps_all() {
+        // k == 0 ("disabled") must keep ALL candidates, never an empty set.
+        let logits = vec![1.0f32, 5.0, 3.0, 9.0, 2.0];
+        let mut scalar_out = Vec::new();
+        select_top_k_scalar(&logits, 0, 1.0, &mut scalar_out);
+        assert_eq!(scalar_out.len(), 5, "scalar: k=0 must keep all candidates");
+        let mut dispatch_out = Vec::new();
+        select_top_k(&logits, 0, 1.0, &mut dispatch_out);
+        assert_eq!(
+            dispatch_out.len(),
+            5,
+            "dispatch: k=0 must keep all candidates"
+        );
+    }
+
+    #[test]
+    fn test_top_k_zero_is_no_filtering_not_token_zero() {
+        // Regression: top_k=0 used to make select_top_k return empty, so the sampler
+        // could only ever emit token 0. With it disabled it must sample across the vocab.
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,   // disabled
+            top_p: 1.0, // disabled
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(42);
+        let logits = vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let mut counts = [0u32; 8];
+        for _ in 0..400 {
+            counts[sampler.sample(&logits) as usize] += 1;
+        }
+        let nonzero = counts.iter().filter(|&&c| c > 0).count();
+        assert!(
+            nonzero >= 5,
+            "top_k=0 must sample across the vocab, got counts={counts:?}"
+        );
+    }
+
+    #[test]
+    fn test_sample_top_p_handles_pos_inf_logit() {
+        // A +INF logit must select that token, not poison the softmax and fall
+        // through to the worst candidate.
+        let mut cs = CandidateSet {
+            candidates: vec![
+                Candidate {
+                    token_id: 0,
+                    logit: 1.0,
+                },
+                Candidate {
+                    token_id: 1,
+                    logit: f32::INFINITY,
+                },
+                Candidate {
+                    token_id: 2,
+                    logit: 2.0,
+                },
+            ],
+        };
+        let mut scratch = Vec::new();
+        let tok = cs.sample_top_p_with_scratch(1.0, 0.999, &mut scratch);
+        assert_eq!(tok, 1, "+INF logit token must be selected");
+    }
+
+    #[test]
+    fn test_penalized_logit_invalid_penalty_is_noop() {
+        // Non-positive or non-finite penalties must not flip a logit's sign.
+        for &bad in &[0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                penalized_logit(5.0, bad),
+                5.0,
+                "positive logit unchanged for penalty={bad}"
+            );
+            assert_eq!(
+                penalized_logit(-5.0, bad),
+                -5.0,
+                "negative logit unchanged for penalty={bad}"
+            );
+        }
+        // Valid penalty still applies as before.
+        assert!(
+            (penalized_logit(2.0, 2.0) - 1.0).abs() < 1e-6,
+            "2.0/2.0 == 1.0"
+        );
+        assert!(
+            (penalized_logit(-2.0, 2.0) - -4.0).abs() < 1e-6,
+            "-2.0*2.0 == -4.0"
         );
     }
 }
