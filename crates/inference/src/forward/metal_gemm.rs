@@ -234,6 +234,7 @@ kernel void gemm_nn(
     }
 
     /// Report whether Metal GPU is available and initialized.
+    #[allow(dead_code)] // public API for callers to probe Metal availability before dispatch
     pub fn is_available() -> bool {
         get_metal().is_some()
     }
