@@ -211,6 +211,28 @@ fn test_neon_rsqrt_newton_accuracy() {
     }
 }
 
+/// Subnormal-norm guard: ‖v‖ ≲ 7e-20 drives norm_sq subnormal, where
+/// `vrsqrteq`/Newton overflow to inf.  The NEON path must fall back to the
+/// scalar reciprocal and stay finite + byte-consistent with `normalize_scalar`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn test_neon_normalize_subnormal_norm_finite() {
+    let dim = 64usize;
+    let mut neon_v = vec![1e-21_f32; dim];
+    let mut scalar_v = neon_v.clone();
+
+    normalize(&mut neon_v);
+    normalize::normalize_scalar(&mut scalar_v);
+
+    for (i, (&a, &b)) in neon_v.iter().zip(scalar_v.iter()).enumerate() {
+        assert!(a.is_finite(), "NEON normalize non-finite at [{i}]: {a}");
+        assert!(
+            (a - b).abs() < 1e-5,
+            "subnormal-norm NEON vs scalar mismatch at [{i}]: {a} vs {b}"
+        );
+    }
+}
+
 #[test]
 fn test_avx512_normalize_dimensions() {
     for dim in AVX512_TEST_DIMS {

@@ -335,10 +335,17 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     let norm_sq_v = vdupq_n_f32(norm_sq);
     let y0 = vrsqrteq_f32(norm_sq_v);
     let y1 = vmulq_f32(y0, vrsqrtsq_f32(norm_sq_v, vmulq_f32(y0, y0)));
-    let inv_norm_vec = vmulq_f32(y1, vrsqrtsq_f32(norm_sq_v, vmulq_f32(y1, y1)));
-    // Extract a scalar inv_norm for the remainder tail (cheaper than NEON on 1-3 elements).
-    // SAFETY: inv_norm_vec is a valid float32x4_t with 4 identical lanes.
-    let inv_norm = vgetq_lane_f32(inv_norm_vec, 0);
+    let y2 = vmulq_f32(y1, vrsqrtsq_f32(norm_sq_v, vmulq_f32(y1, y1)));
+    // SAFETY: y2 has 4 identical lanes (norm_sq_v is a broadcast), so lane 0 is the
+    // scalar inv_norm used for both the NEON broadcast and the 1-3 element tail.
+    let mut inv_norm = vgetq_lane_f32(y2, 0);
+    // vrsqrte/Newton overflow to inf for a subnormal-but-nonzero norm_sq (‖v‖ ≲ 7e-20),
+    // where the AVX2/scalar lanes stay finite via 1.0/sqrt; fall back to keep NEON
+    // byte-consistent with them rather than scaling the vector to inf/NaN.
+    if !inv_norm.is_finite() {
+        inv_norm = 1.0 / norm_sq.sqrt();
+    }
+    let inv_norm_vec = vdupq_n_f32(inv_norm);
 
     // Second pass: scale by inverse norm with 4x unrolling
     for i in 0..chunks {
