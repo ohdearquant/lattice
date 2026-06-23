@@ -197,6 +197,18 @@ pub fn generate(
         return Err(InferenceError::InvalidInput("Empty prompt".into()));
     }
 
+    // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+    // so we never emit a token the caller did not ask for.
+    if config.max_new_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: Vec::new(),
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped_by_eos: false,
+        });
+    }
+
     // 2. Initialize KV cache and scratch (allocate once per request)
     let max_seq = prompt_len + config.max_new_tokens;
     let cache_cfg = FlatKVCacheConfig::for_qwen3(
