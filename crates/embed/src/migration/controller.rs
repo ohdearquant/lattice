@@ -139,6 +139,17 @@ impl MigrationController {
                 total,
                 skipped,
             } => {
+                // Guard: processed + skipped must not reach total before this skip is
+                // counted. Equality means the budget is already exhausted (duplicate or
+                // retried skip); allow only while strictly less than total.
+                if *processed + *skipped >= *total {
+                    return Err(MigrationError::InvalidTransition {
+                        from: format!("{:?}", self.state),
+                        to: format!(
+                            "InProgress (skip rejected: processed + skipped would exceed total ({total}))",
+                        ),
+                    });
+                }
                 self.skip_reasons.push(reason);
                 self.state = MigrationState::InProgress {
                     processed: *processed,

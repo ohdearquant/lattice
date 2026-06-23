@@ -527,3 +527,55 @@ fn test_lifecycle_with_skips() {
     assert!(ctrl.state().is_terminal());
     assert_eq!(ctrl.state().skipped(), 2);
 }
+
+#[test]
+fn test_record_skip_rejects_exceeding_total() {
+    let plan = MigrationPlan {
+        id: "skip-cap".to_string(),
+        source_model: EmbeddingModel::BgeSmallEnV15,
+        target_model: EmbeddingModel::BgeBaseEnV15,
+        total_embeddings: 2,
+        batch_size: 10,
+        created_at: "2026-01-27T00:00:00Z".to_string(),
+    };
+    let mut ctrl = MigrationController::new(plan);
+    ctrl.start().unwrap();
+
+    // First two skips exhaust the budget (processed=0, so 0+0<2, 0+1<2).
+    assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
+    assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
+    assert_eq!(ctrl.state().skipped(), 2);
+
+    // Third skip must be rejected (0+2 >= 2); skipped count must not change.
+    assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_err());
+    assert_eq!(ctrl.state().skipped(), 2);
+}
+
+#[test]
+fn test_all_skipped_still_completes() {
+    let plan = MigrationPlan {
+        id: "all-skipped-complete".to_string(),
+        source_model: EmbeddingModel::BgeSmallEnV15,
+        target_model: EmbeddingModel::BgeBaseEnV15,
+        total_embeddings: 2,
+        batch_size: 10,
+        created_at: "2026-01-27T00:00:00Z".to_string(),
+    };
+    let mut ctrl = MigrationController::new(plan);
+    ctrl.start().unwrap();
+
+    // Skipping all items is legitimate: effective_total becomes 0.
+    assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
+    assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
+
+    // record_progress(0) should complete because effective_total == 0.
+    ctrl.record_progress(0).unwrap();
+
+    assert!(
+        ctrl.state().is_terminal(),
+        "expected Completed, got {:?}",
+        ctrl.state()
+    );
+    assert_eq!(ctrl.state().skipped(), 2);
+    assert_eq!(ctrl.state().processed(), 0);
+}

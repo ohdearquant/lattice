@@ -3,7 +3,7 @@
 use crate::backfill::{
     BackfillConfig, BackfillCoordinator, EmbeddingRoute, EmbeddingRoutingConfig, RoutingPhase,
 };
-use crate::migration::{MigrationPlan, MigrationState};
+use crate::migration::{MigrationPlan, MigrationState, SkipReason};
 use crate::model::EmbeddingModel;
 
 fn test_plan() -> MigrationPlan {
@@ -551,4 +551,44 @@ fn test_routing_config_lifecycle_full() {
     assert_eq!(routing.query_model, EmbeddingModel::BgeBaseEnV15);
     assert_eq!(routing.write_models.len(), 2);
     assert!(routing.migration_id.is_some());
+}
+
+#[test]
+fn test_next_batch_size_accounts_for_skipped() {
+    let plan = MigrationPlan {
+        id: "batch-skipped".to_string(),
+        source_model: EmbeddingModel::BgeSmallEnV15,
+        target_model: EmbeddingModel::BgeBaseEnV15,
+        total_embeddings: 10,
+        batch_size: 100, // larger than total so batch_size is not the limit
+        created_at: "2026-01-27T00:00:00Z".to_string(),
+    };
+    let config = BackfillConfig {
+        batch_size: 50,
+        ..BackfillConfig::default()
+    };
+    let mut coord = BackfillCoordinator::new(plan, config);
+    coord.start().unwrap();
+
+    // Skip 3 items; processed = 0.
+    for _ in 0..3 {
+        coord
+            .controller
+            .record_skip(SkipReason::ContentDeleted)
+            .unwrap();
+    }
+
+    // Effective remaining = 10 - 0 - 3 = 7; batch_size = 50 -> 7.
+    assert_eq!(coord.next_batch_size(), 7);
+
+    // Process the remaining 7 effective items; migration should complete.
+    coord.record_batch(7).unwrap();
+    assert!(
+        coord.state().is_terminal(),
+        "expected Completed, got {:?}",
+        coord.state()
+    );
+
+    // After completion, next_batch_size must be 0.
+    assert_eq!(coord.next_batch_size(), 0);
 }
