@@ -1,0 +1,15 @@
+# SwiftPM build products & local tooling
+.build/
+.swiftpm/
+DerivedData/
+
+# Packaging output (.app/.dmg/.zip — built by scripts/package-app.sh)
+dist/
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# macOS
+.DS_Store
