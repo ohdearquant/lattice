@@ -243,5 +243,9 @@ harness = false
 name = "attention_dispatch_bench"
 harness = false
 
+[[bench]]
+name = "f16_convert_bench"
+harness = false
+
 [lints]
 workspace = true
