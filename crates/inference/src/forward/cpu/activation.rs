@@ -275,8 +275,16 @@ pub fn add_bias(x: &mut [f32], bias: &[f32], dim: usize) {
 /// in a single pass, saving one full traversal of the data compared to calling
 /// `add_bias` then `gelu` separately.
 pub fn add_bias_gelu(x: &mut [f32], bias: &[f32], dim: usize) {
-    debug_assert_eq!(bias.len(), dim);
-    debug_assert_eq!(x.len() % dim, 0);
+    assert_eq!(
+        bias.len(),
+        dim,
+        "add_bias_gelu: bias length must equal dim before the SIMD kernels index it"
+    );
+    assert_eq!(
+        x.len() % dim,
+        0,
+        "add_bias_gelu: x length must be a multiple of dim"
+    );
 
     let config = simd_config();
 
@@ -463,5 +471,29 @@ unsafe fn add_bias_gelu_avx2(x: &mut [f32], bias: &[f32], dim: usize) {
             let inner = 0.797_884_6 * (v + 0.044_715 * x3);
             *ptr.add(i) = 0.5 * v * (1.0 + fast_tanh(inner));
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn add_bias_gelu_accepts_valid_lengths() {
+        let dim = 4;
+        let bias = vec![0.1, -0.2, 0.3, -0.4];
+        let mut x = vec![1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 0.0, 1.5]; // 2 rows × dim
+        add_bias_gelu(&mut x, &bias, dim);
+        assert_eq!(x.len(), 8);
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[should_panic(expected = "bias length must equal dim")]
+    fn add_bias_gelu_rejects_short_bias() {
+        // dim=4 needs bias.len()==4; a short bias would OOB the unsafe SIMD kernel.
+        let mut x = vec![0.0; 8];
+        let bias = vec![0.0; 3];
+        add_bias_gelu(&mut x, &bias, 4);
     }
 }

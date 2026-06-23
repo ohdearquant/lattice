@@ -10,9 +10,21 @@ use super::simd::simd_config;
 ///
 /// Layer normalization (in-place).
 pub fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usize, eps: f32) {
-    debug_assert_eq!(gamma.len(), hidden);
-    debug_assert_eq!(beta.len(), hidden);
-    debug_assert_eq!(x.len() % hidden, 0);
+    assert_eq!(
+        gamma.len(),
+        hidden,
+        "layer_norm: gamma length must equal hidden before the SIMD kernels index it"
+    );
+    assert_eq!(
+        beta.len(),
+        hidden,
+        "layer_norm: beta length must equal hidden before the SIMD kernels index it"
+    );
+    assert_eq!(
+        x.len() % hidden,
+        0,
+        "layer_norm: x length must be a multiple of hidden"
+    );
 
     let config = simd_config();
 
@@ -243,5 +255,31 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
         for i in (chunks * 32)..hidden {
             *out_ptr.add(i) = (*out_ptr.add(i) - mean) * inv_std * *g_ptr.add(i) + *b_ptr.add(i);
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn layer_norm_accepts_valid_lengths() {
+        let hidden = 4;
+        let gamma = vec![1.0; hidden];
+        let beta = vec![0.0; hidden];
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0]; // 2 rows
+        layer_norm(&mut x, &gamma, &beta, hidden, 1e-5);
+        assert_eq!(x.len(), 8);
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[should_panic(expected = "gamma length must equal hidden")]
+    fn layer_norm_rejects_short_gamma() {
+        // hidden=4 needs gamma.len()==4; a short gamma would OOB the unsafe SIMD kernel.
+        let mut x = vec![0.0; 8];
+        let gamma = vec![1.0; 3];
+        let beta = vec![0.0; 4];
+        layer_norm(&mut x, &gamma, &beta, 4, 1e-5);
     }
 }
