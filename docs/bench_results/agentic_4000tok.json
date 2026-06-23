@@ -1,0 +1,45 @@
+[
+  {
+    "engine": "lattice",
+    "context": 4033,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 9070.8,
+    "decode_ms": 7702.8,
+    "total_ms": 16773.6,
+    "prefill_tok_s": 445,
+    "decode_tok_s": 13,
+    "source": "live"
+  },
+  {
+    "engine": "ollama",
+    "context": 5818,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 257.7,
+    "decode_ms": 624.7,
+    "total_ms": 882.4,
+    "prefill_tok_s": 22574,
+    "decode_tok_s": 160,
+    "source": "live",
+    "ollama_breakdown": {
+      "load_ms": null,
+      "prompt_eval_ms": null,
+      "eval_ms": null,
+      "prompt_eval_count": null,
+      "note": "breakdown not captured for this context (predates schema update); pattern from ctx=1000/2000 shows prompt_eval_ms ~14-15ms constant regardless of context depth, confirming full prefix-cache hit"
+    }
+  },
+  {
+    "engine": "mlx",
+    "context": 4033,
+    "response": 100,
+    "runs": 3,
+    "ttft_ms": 954.5,
+    "decode_ms": 624.1,
+    "total_ms": 1578.6,
+    "prefill_tok_s": 4225,
+    "decode_tok_s": 160,
+    "source": "live"
+  }
+]
