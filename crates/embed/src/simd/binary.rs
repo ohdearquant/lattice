@@ -147,7 +147,7 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
             // length for `dims` bits. The callee uses unaligned loads and chunk/remainder
             // bounds strictly within those slices; no out-of-bounds read is possible.
             return unsafe {
-                hamming_distance_neon(&a.data[..required_bytes], &b.data[..required_bytes])
+                hamming_distance_neon(&a.data[..required_bytes], &b.data[..required_bytes], a.dims)
             };
         }
     }
@@ -157,15 +157,24 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
         let _ = config;
     }
 
-    hamming_distance_scalar(&a.data[..required_bytes], &b.data[..required_bytes])
+    hamming_distance_scalar(&a.data[..required_bytes], &b.data[..required_bytes], a.dims)
 }
 
 /// Scalar Hamming distance using u64 chunks and count_ones().
-fn hamming_distance_scalar(a: &[u8], b: &[u8]) -> u32 {
+///
+/// `dims` is the true dimension count; the slice `a`/`b` has length `dims.div_ceil(8)`.
+/// When `dims % 8 != 0` the final byte contains `8 - (dims % 8)` padding bits that must
+/// not be counted. Bit 7 (MSB) holds the first dimension of each byte (see
+/// `from_f32_with_threshold`), so the `r = dims % 8` valid bits are the top `r` bits:
+/// mask = `0xFF << (8 - r)`.
+fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
     let mut total: u32 = 0;
 
+    // Number of fully-populated 8-byte chunks (all bits valid).
+    let full_bytes = dims / 8; // bytes where every bit is a real dimension
+    let chunks = full_bytes / 8;
+
     // Process 8 bytes at a time as u64
-    let chunks = a.len() / 8;
     for c in 0..chunks {
         let offset = c * 8;
         let a_u64 = u64::from_ne_bytes([
@@ -191,10 +200,18 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8]) -> u32 {
         total += (a_u64 ^ b_u64).count_ones();
     }
 
-    // Handle remaining bytes
+    // Handle the remaining full bytes (between the last u64 chunk and the partial byte)
     let remainder_start = chunks * 8;
-    for i in remainder_start..a.len() {
+    for i in remainder_start..full_bytes {
         total += (a[i] ^ b[i]).count_ones();
+    }
+
+    // Handle the single partial byte (if dims is not a multiple of 8).
+    // The `r` valid bits occupy the top `r` bits of the byte (MSB = dim 0 within byte).
+    let r = dims % 8;
+    if r != 0 {
+        let mask = 0xFFu8 << (8 - r); // top `r` bits set, bottom `(8-r)` clear
+        total += ((a[full_bytes] ^ b[full_bytes]) & mask).count_ones();
     }
 
     total
@@ -205,13 +222,17 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8]) -> u32 {
 /// `vcnt` counts set bits in each byte of a NEON register.
 /// We XOR the two vectors, apply vcnt, then horizontally sum.
 ///
+/// `dims` is the true dimension count. When `dims % 8 != 0`, the final byte holds
+/// padding bits in its low bits; only the top `dims % 8` bits (MSB = first dim) are
+/// counted, matching the scalar path's masking logic.
+///
 /// # Safety
 ///
 /// Caller must ensure running on aarch64 (NEON is mandatory).
-/// `a` and `b` must have equal length.
+/// `a` and `b` must have equal length == `dims.div_ceil(8)`.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn hamming_distance_neon(a: &[u8], b: &[u8]) -> u32 {
+unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {
     // SA-163/164: verify equal-length backing slices before the SIMD loop.
     debug_assert_eq!(
         a.len(),
@@ -220,9 +241,11 @@ unsafe fn hamming_distance_neon(a: &[u8], b: &[u8]) -> u32 {
         a.len(),
         b.len()
     );
-    let len = a.len();
+
+    // Only full bytes (where every bit is a real dimension) go through the SIMD loop.
+    let full_bytes = dims / 8;
     const SIMD_WIDTH: usize = 16;
-    let chunks = len / SIMD_WIDTH;
+    let chunks = full_bytes / SIMD_WIDTH;
 
     // Accumulate popcount bytes into u16 to avoid overflow
     // (max 8 bits per byte, 16 bytes per register = 128 per chunk, fits u8 for ~1 chunk)
@@ -250,10 +273,18 @@ unsafe fn hamming_distance_neon(a: &[u8], b: &[u8]) -> u32 {
     let total = vgetq_lane_u64(sum_u64, 0) + vgetq_lane_u64(sum_u64, 1);
     let mut result = total as u32;
 
-    // Handle remainder
+    // Handle remaining full bytes (between last SIMD chunk and the partial byte)
     let remainder_start = chunks * SIMD_WIDTH;
-    for i in remainder_start..len {
+    for i in remainder_start..full_bytes {
         result += (a[i] ^ b[i]).count_ones();
+    }
+
+    // Handle the single partial byte (if dims is not a multiple of 8).
+    // Top `r` bits are real dimensions; bottom `(8 - r)` bits are padding.
+    let r = dims % 8;
+    if r != 0 {
+        let mask = 0xFFu8 << (8 - r); // top `r` bits set, bottom `(8-r)` clear
+        result += ((a[full_bytes] ^ b[full_bytes]) & mask).count_ones();
     }
 
     result
@@ -409,7 +440,7 @@ mod tests {
         let ba = BinaryVector::from_f32(&a);
         let bb = BinaryVector::from_f32(&b);
 
-        let scalar_result = hamming_distance_scalar(&ba.data, &bb.data);
+        let scalar_result = hamming_distance_scalar(&ba.data, &bb.data, ba.dims);
         let dispatch_result = ba.hamming_distance(&bb);
 
         assert_eq!(
@@ -486,5 +517,73 @@ mod tests {
         let bv = BinaryVector::from_f32(&v);
         let deq = bv.to_f32();
         assert_eq!(deq.len(), 128);
+    }
+
+    // --- Issue #249 regression: padding-bit masking in Hamming distance -------------
+
+    /// Vectors with 12 dimensions use 2 bytes, with 4 padding bits in byte 1 (the low
+    /// nibble). Two vectors that agree on all 12 real dimensions but differ in their
+    /// padding bits must report Hamming distance 0, not 4.
+    ///
+    /// Before the fix, XOR-popcount over the raw final byte counted those 4 spurious
+    /// differing padding bits. After the fix, the mask `0xFF << (8 - 4) = 0xF0` zeroes
+    /// the low nibble before counting, giving the correct answer.
+    #[test]
+    fn test_hamming_ignores_padding_bits() {
+        // 12 dims → 2 bytes; the last 4 bits of byte 1 are padding.
+        // Build via pub fields so we can inject arbitrary padding.
+        let clean = BinaryVector {
+            dims: 12,
+            // byte 1: top nibble = 4 valid dims, low nibble = 0 (zero padding)
+            data: vec![0b10101010u8, 0b11110000u8],
+            norm: 1.0,
+        };
+        let dirty = BinaryVector {
+            dims: 12,
+            // same valid bits in top nibble of byte 1, non-zero garbage in low-nibble padding
+            data: vec![0b10101010u8, 0b11111111u8],
+            norm: 1.0,
+        };
+
+        // Both vectors agree on all 12 real dimensions; Hamming distance must be 0.
+        assert_eq!(
+            hamming_distance_scalar(&clean.data, &dirty.data, 12),
+            0,
+            "scalar: padding bits must not be counted"
+        );
+        assert_eq!(
+            clean.hamming_distance(&dirty),
+            0,
+            "dispatch: padding bits must not be counted"
+        );
+
+        // Cosine distance approximation must also be 0.0 for identical valid bits.
+        assert_eq!(
+            clean.cosine_distance_approx(&dirty),
+            0.0,
+            "cosine_distance_approx: padding bits must not be counted"
+        );
+    }
+
+    /// Verifies that the partial-byte mask counts real differing bits correctly.
+    ///
+    /// byte 0: 0b10101010 ^ 0b01010101 = 0b11111111 → 8 differing bits.
+    /// byte 1 (masked with 0xF0): (0b11110000 ^ 0b00000000) & 0xF0 = 0b11110000 → 4 bits.
+    /// Total: 12, which equals `dims` (every real dimension differs).
+    #[test]
+    fn test_hamming_partial_byte_count() {
+        let a = BinaryVector {
+            dims: 12,
+            data: vec![0b10101010u8, 0b11110000u8],
+            norm: 1.0,
+        };
+        let b = BinaryVector {
+            dims: 12,
+            data: vec![0b01010101u8, 0b00000000u8],
+            norm: 1.0,
+        };
+
+        assert_eq!(hamming_distance_scalar(&a.data, &b.data, 12), 12);
+        assert_eq!(a.hamming_distance(&b), 12);
     }
 }

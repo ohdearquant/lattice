@@ -292,7 +292,9 @@ impl Trainer for BackpropTrainer {
                     grads.fill(0.0);
                 }
 
-                // Accumulate gradients over batch
+                // Accumulate gradients over batch; keep batch error separate so
+                // SkipBatch can discard it without inflating epoch_error.
+                let mut batch_error = 0.0_f32;
                 for &idx in &indices[batch_start..batch_end] {
                     let error = self.compute_gradients(
                         network,
@@ -301,7 +303,7 @@ impl Trainer for BackpropTrainer {
                         &mut weight_grads,
                         &mut bias_grads,
                     )?;
-                    epoch_error += error;
+                    batch_error += error;
                 }
 
                 // Check for NaN/Inf gradients before applying
@@ -314,7 +316,8 @@ impl Trainer for BackpropTrainer {
                             )));
                         }
                         GradientGuardStrategy::Sanitize => {
-                            // Replace NaN/Inf with zeros and continue
+                            // Replace NaN/Inf with zeros and continue; batch is
+                            // still applied (sanitized) so we commit its error.
                             for grads in weight_grads.iter_mut() {
                                 sanitize_gradients(grads);
                             }
@@ -328,7 +331,8 @@ impl Trainer for BackpropTrainer {
                             );
                         }
                         GradientGuardStrategy::SkipBatch => {
-                            // Skip this batch entirely
+                            // Discard both gradients AND error for this batch so
+                            // epoch_error stays proportional to batch_count.
                             tracing::warn!(
                                 "Epoch {}: skipping batch due to NaN/Inf gradients ({})",
                                 epoch,
@@ -348,7 +352,16 @@ impl Trainer for BackpropTrainer {
                     actual_batch_size,
                 );
 
+                // Commit error and sample count only for non-skipped batches.
+                epoch_error += batch_error;
                 batch_count += actual_batch_size;
+            }
+
+            // Every batch was skipped — error metric is undefined; fail loudly.
+            if batch_count == 0 {
+                return Err(FannError::NumericInstability(
+                    "all batches skipped due to NaN/Inf gradients".into(),
+                ));
             }
 
             // Average error
@@ -365,10 +378,12 @@ impl Trainer for BackpropTrainer {
                 });
             }
 
-            // Check for NaN (numeric instability)
-            if avg_error.is_nan() {
+            // Catch both NaN and +Inf (the latter arises when every batch skips
+            // but batch_count is somehow non-zero due to partial skips and a
+            // very large accumulated error).
+            if avg_error.is_nan() || avg_error.is_infinite() {
                 return Err(FannError::NumericInstability(
-                    "NaN error during training".into(),
+                    "non-finite error during training".into(),
                 ));
             }
         }
@@ -476,6 +491,46 @@ mod tests {
 
         let result = trainer.train(&mut network, &inputs, &targets, &config);
         assert!(matches!(result, Err(FannError::TrainingError(_))));
+    }
+
+    #[test]
+    fn test_skip_batch_all_skipped_returns_error() {
+        // Targets containing NaN propagate into gradients (diff = output - NaN = NaN),
+        // triggering the gradient guard on every batch.  With SkipBatch the whole
+        // epoch completes with batch_count == 0, which must be an Err not an Ok
+        // with a non-finite final_error.
+        let mut network = NetworkBuilder::new()
+            .input(2)
+            .hidden(2, Activation::Tanh)
+            .output(1, Activation::Linear)
+            .build_with_seed(1)
+            .unwrap();
+
+        let inputs = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0]];
+        // NaN targets guarantee NaN in every gradient computation.
+        let targets = vec![vec![f32::NAN], vec![f32::NAN]];
+
+        let mut trainer = BackpropTrainer::new();
+        let config = TrainingConfig::new()
+            .learning_rate(0.1)
+            .momentum(0.0)
+            .max_epochs(1)
+            .batch_size(2)
+            .shuffle(false)
+            .gradient_guard(GradientGuardStrategy::SkipBatch);
+
+        let result = trainer.train(&mut network, &inputs, &targets, &config);
+        assert!(
+            matches!(result, Err(FannError::NumericInstability(_))),
+            "expected NumericInstability, got {result:?}"
+        );
+        // Confirm the error text is informative (not just any instability error).
+        if let Err(FannError::NumericInstability(msg)) = result {
+            assert!(
+                msg.contains("all batches skipped"),
+                "unexpected message: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! Q4_0 per-block weight quantization for large models (e.g., Qwen3.6-27B).
+//! Q4 per-block weight quantization for large models (e.g., Qwen3.6-27B).
 //!
-//! ## Format
+//! ## Format (v2 — asymmetric scale + bias, 20 bytes per block)
 //!
-//! Every 32 consecutive weights are packed into one [`Q4Block`]:
-//! - `scale: u16` — the per-block scale stored as an IEEE-754 f16 bit pattern
+//! Every 32 consecutive weights are packed into one [`Q4Block`] of 20 bytes:
+//! - `scale: u16` — per-block scale, stored as an IEEE-754 f16 bit pattern
+//! - `bias: u16`  — per-block bias (zero-point), stored as an IEEE-754 f16 bit pattern
 //! - `packed: [u8; 16]` — 32 nibbles in **sequential-pairs** layout
 //!
 //! ### Nibble layout (sequential pairs — NOT llama.cpp split-half)
@@ -12,26 +13,35 @@
 //! byte[b] = (q[2b+1] << 4) | q[2b]     b ∈ 0..16
 //! ```
 //!
-//! where `q[i] = clamp(round(weight[i] / scale) + 8, 0, 15)` and `scale = abs_max / 7`.
-//! This matches the nibble convention used by the existing `gemv_q4_decode` Metal kernel
-//! in `forward/metal_qwen35.rs`.
+//! The low nibble holds `q[2b]`, the high nibble `q[2b+1]`. This matches the
+//! nibble convention used by the `gemv_q4_decode` Metal kernel in
+//! `forward/metal_qwen35.rs`.
 //!
-//! ### Dequantization
+//! ### Dequantization (both encode modes share this)
 //!
 //! ```text
-//! weight[2b]   = (byte[b] & 0x0F) as f32 - 8.0) * scale
-//! weight[2b+1] = ((byte[b] >>  4) as f32 - 8.0) * scale
+//! weight[2b]   = (byte[b] & 0x0F) as f32 * scale + bias
+//! weight[2b+1] = (byte[b] >>  4)  as f32 * scale + bias
 //! ```
+//!
+//! ### Encode modes (same on-disk layout)
+//!
+//! - **Asymmetric** (default): `scale = (max - min) / 15`, `bias = min`,
+//!   `q[i] = clamp(round((weight[i] - min) / scale), 0, 15)`. Optimal for raw
+//!   weights with a non-zero distributional center.
+//! - **Symmetric** (Hadamard-rotated, zero-mean weights): `scale = abs_max / 7`,
+//!   `bias = -8 * scale`, `q[i] = clamp(round(weight[i] / scale) + 8, 0, 15)`, so
+//!   the shared dequant reduces to `(q - 8) * scale`.
 //!
 //! ## File format (`.q4`)
 //!
 //! ```text
-//! magic       b"KHQ4"           4 bytes
-//! version     1u32 LE           4 bytes
-//! ndim        u32 LE            4 bytes
-//! shape[i]    u64 LE × ndim
-//! original_len u64 LE           8 bytes
-//! blocks      [Q4Block; n_blocks]   n_blocks × 18 bytes
+//! magic        b"KHQ4"               4 bytes
+//! version      2u32 LE               4 bytes   (v1 = legacy symmetric 18-byte blocks; rejected on load)
+//! ndim         u32 LE                4 bytes
+//! shape[i]     u64 LE × ndim
+//! original_len u64 LE                8 bytes
+//! blocks       [Q4Block; n_blocks]   n_blocks × 20 bytes
 //! ```
 
 // Q4 quantization operates on raw byte/u16 slices; unsafe is limited to
@@ -280,7 +290,7 @@ pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4B
 /// The input is processed 32 elements at a time; the last block is zero-padded
 /// if `src.len()` is not a multiple of 32.
 ///
-/// Returns raw bytes containing tightly-packed [`Q4Block`]s (18 bytes each).
+/// Returns raw bytes containing tightly-packed [`Q4Block`]s (20 bytes each).
 pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
     let n_blocks = src.len().div_ceil(32);
     let mut out = Vec::with_capacity(n_blocks * 20);
@@ -301,7 +311,7 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
 
 /// Dequantize Q4_0 blocks (raw bytes) back to f32 values.
 ///
-/// `data` must be a multiple of 18 bytes (one block per 18 bytes).
+/// `data` must be a multiple of 20 bytes (one block per 20 bytes).
 /// Returns exactly `n_weights` values; the caller is responsible for ensuring
 /// `n_weights <= (data.len() / 20) * 32`.
 pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
@@ -327,7 +337,7 @@ pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
 /// Quantize a row-major f32 tensor into Q4_0 blocks, one row at a time.
 ///
 /// `src` has shape `[rows, cols]`. Each row is quantized independently into
-/// `cols.div_ceil(32)` blocks. Returns raw bytes (18 bytes per block).
+/// `cols.div_ceil(32)` blocks. Returns raw bytes (20 bytes per block).
 pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     assert_eq!(
         src.len(),
@@ -545,11 +555,11 @@ pub fn stream_quantize_shard(
 /// File format:
 /// ```text
 /// magic        b"KHQ4"   4 bytes
-/// version      1u32 LE   4 bytes
+/// version      2u32 LE   4 bytes
 /// ndim         u32 LE    4 bytes
 /// shape[i]     u64 LE × ndim
 /// original_len u64 LE    8 bytes
-/// blocks       [Q4Block; n]  n × 18 bytes
+/// blocks       [Q4Block; n]  n × 20 bytes
 /// ```
 pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Result<()> {
     use std::io::Write;
@@ -561,7 +571,7 @@ pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Resul
         f.write_all(&(dim as u64).to_le_bytes())?;
     }
     f.write_all(&(tensor.original_len as u64).to_le_bytes())?;
-    // SAFETY: Q4Block is #[repr(C)] with size 18; its alignment is 2 (the
+    // SAFETY: Q4Block is #[repr(C)] with size 20; its alignment is 2 (the
     // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
     // rule). Casting to a `&[u8]` is valid because the target element type is
     // `u8` (alignment 1 ≤ source alignment 2). The resulting slice has length

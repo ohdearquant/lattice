@@ -1,0 +1,212 @@
+//! ADR-064 Phase-0: decode slope/intercept fit harness.
+//!
+//! Sweeps a context grid, runs greedy decode at each point, and emits
+//! per-(ctx, tokens, ms) lines that the post-processor fits with a
+//! robust linear model (Theil-Sen + bootstrap CI).
+//!
+//! # Determinism
+//!
+//! `MetalQwen35State::generate()` (not `chat_completion`) is called with a raw
+//! continuation prompt — no chat template — so the model is never in a completed
+//! conversation state and won't emit `<|im_end|>` naturally.  We additionally
+//! set `stop_token_ids: vec![]` and accept that `eos_token_id` (248044) remains
+//! a stop condition built into `generate()`.  In practice, at all grid points
+//! {64, 256, 512} the greedy continuation of a padded filler text reaches
+//! `max_new_tokens` before EOS (verified in smoke run).  If EOS fires early at
+//! a specific context, the actual token count is reported and the post-processor
+//! uses it, so measurements remain comparable on a per-token basis.
+//!
+//! Forcing decode past EOS would require modifying the forward hot path, which
+//! is forbidden by issue #168 hard constraints.  Honest-nil applies: CI will be
+//! wider where EOS fires, and the fit notes the actual token counts.
+//!
+//! # Dispatch / command-buffer counters
+//!
+//! The engine does not expose dispatch or command-buffer counts through the
+//! public `MetalQwen35State` API.  Those fields are emitted as `null` in the
+//! final JSON per ADR-064 §Honest-nil policy.
+//!
+//! # Env vars
+//!
+//!   LATTICE_MODEL_DIR     model dir  (default ~/.lattice/models/qwen3.5-0.8b)
+//!   LATTICE_TOKENIZER_DIR tokenizer  (default LATTICE_MODEL_DIR)
+//!   SLOPEFIT_CONTEXTS     space-separated ctx values (default "64 256 512")
+//!   SLOPEFIT_WARMUP       warmup tokens per point    (default 32)
+//!   SLOPEFIT_MEASURE      measured tokens per point  (default 256)
+//!   SLOPEFIT_REPEATS      in-process repeats         (default 7)
+//!   SLOPEFIT_FULL         set to "1" to add [1024,2048,4096,8192,16384] to grid
+//!
+//! # Output (stdout)
+//!
+//!   One tagged line per measured repeat:
+//!     SLOPEFIT ctx=<N> tokens=<actual> warmup_ms=0.0 measure_ms=<f> rep=<i>
+//!
+//!   The post-processor (`scripts/bench_decode_slopefit.py`) reads these lines
+//!   and produces the final JSON.
+
+fn main() {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        eprintln!("bench_decode_slopefit requires macOS + --features metal-gpu.");
+        std::process::exit(1);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        if let Err(e) = run() {
+            eprintln!("bench_decode_slopefit failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
+    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
+
+    let home = std::env::var("HOME")?;
+    let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
+        .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
+    let dir = std::path::Path::new(&model_dir_str);
+
+    let warmup_tokens: usize = std::env::var("SLOPEFIT_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let measure_tokens: usize = std::env::var("SLOPEFIT_MEASURE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let repeats: usize = std::env::var("SLOPEFIT_REPEATS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+
+    // Build the context grid.  Default is the smoke grid {64, 256, 512}.
+    // SLOPEFIT_FULL=1 appends the production tail {1024,2048,4096,8192,16384}.
+    let mut grid: Vec<usize> = if let Ok(v) = std::env::var("SLOPEFIT_CONTEXTS") {
+        v.split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect()
+    } else {
+        vec![64, 256, 512]
+    };
+    if std::env::var("SLOPEFIT_FULL").as_deref() == Ok("1") {
+        for &c in &[1024usize, 2048, 4096, 8192, 16384] {
+            if !grid.contains(&c) {
+                grid.push(c);
+            }
+        }
+    }
+    grid.sort_unstable();
+    grid.dedup();
+
+    // Detect Q4 dir (same heuristic as bench_decode_ab).
+    let is_q4_dir = !dir.join("model.safetensors").exists()
+        && std::fs::read_dir(dir)
+            .ok()
+            .and_then(|mut entries| {
+                entries.find(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
+                        .unwrap_or(false)
+                })
+            })
+            .is_some();
+
+    let tokenizer_dir_str =
+        std::env::var("LATTICE_TOKENIZER_DIR").unwrap_or_else(|_| model_dir_str.clone());
+    let tokenizer_dir = std::path::Path::new(&tokenizer_dir_str);
+
+    eprintln!(
+        "[slopefit] loading {model_dir_str} ({})",
+        if is_q4_dir { "Q4" } else { "safetensors" }
+    );
+
+    // Load model — same dual ownership pattern as bench_decode_ab.
+    let mut metal: MetalQwen35State;
+    let tokenizer: BpeTokenizer;
+
+    if is_q4_dir {
+        let cfg = if dir.join("config.json").exists() {
+            Qwen35Config::from_config_json(&dir.join("config.json"))
+                .map_err(|e| format!("config.json parse: {e}"))?
+        } else {
+            Qwen35Config::qwen35_0_8b()
+        };
+        metal =
+            MetalQwen35State::from_q4_dir(dir, &tokenizer_dir.join("tokenizer.json"), &cfg, 4096)
+                .map_err(|e| format!("Metal Q4 init: {e}"))?;
+        tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
+    } else {
+        let model = Qwen35Model::from_safetensors(dir).expect("load model");
+        let cfg = model.config().clone();
+        metal = MetalQwen35State::new(model.weights(), &cfg, 4096).expect("init metal");
+        tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
+    }
+
+    // Raw continuation prompt — no chat template — so the model sees a partial
+    // sentence and produces a continuation rather than a completed conversation.
+    // This avoids the early EOS that chat_completion triggers via im_end.
+    // The base text is intentionally left incomplete (no closing punctuation)
+    // so greedy continuation runs as a prose generation, not a Q&A exchange.
+    let base = "The quick brown fox jumps over the lazy dog and then continues \
+                running through the meadow past the old stone wall while the sun \
+                sets slowly over the distant mountains painting the sky in shades \
+                of orange and gold as the evening breeze stirs the tall grass and \
+                the river flows gently southward toward the ancient city where ";
+
+    // Greedy, stop_token_ids empty — EOS token (248044) still stops generation
+    // via the hard-coded path in generate().  The prompt design above avoids
+    // natural EOS in the first 256 tokens on the 0.8B model (verified empirically).
+    let make_cfg = |n_tokens: usize| GenerateConfig {
+        max_new_tokens: n_tokens,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(42),
+        stop_token_ids: vec![],
+        enable_thinking: false,
+        enable_mtp: None,
+        grammar: None,
+    };
+
+    eprintln!(
+        "[slopefit] grid={grid:?} warmup={warmup_tokens} measure={measure_tokens} repeats={repeats}"
+    );
+
+    for &ctx in &grid {
+        // Pad prompt to approximately `ctx` tokens by repeating the base text.
+        let mut prompt = String::new();
+        while tokenizer.tokenize(&prompt).real_length < ctx {
+            prompt.push_str(base);
+        }
+        let actual_prompt_tokens = tokenizer.tokenize(&prompt).real_length;
+
+        eprintln!("[slopefit] ctx={ctx} actual_prompt_tokens={actual_prompt_tokens}");
+
+        for rep in 0..repeats {
+            // Warmup phase: unrecorded decode primes Metal pipeline caches.
+            metal.reset_state();
+            let _ = metal.generate(&prompt, &tokenizer, &make_cfg(warmup_tokens));
+
+            // Measurement phase: fresh reset → identical KV state each repeat.
+            metal.reset_state();
+            let t = std::time::Instant::now();
+            let result = metal.generate(&prompt, &tokenizer, &make_cfg(measure_tokens));
+            let measure_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let actual_tokens = result.generated_tokens;
+
+            println!(
+                "SLOPEFIT ctx={ctx} tokens={actual_tokens} warmup_ms=0.0 measure_ms={measure_ms:.3} rep={rep}"
+            );
+        }
+    }
+
+    Ok(())
+}

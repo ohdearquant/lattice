@@ -20,6 +20,14 @@ let package = Package(
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
+        ),
+        .testTarget(
+            name: "LatticeStudioTests",
+            dependencies: ["LatticeStudio"],
+            path: "Tests/LatticeStudioTests",
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
         )
     ]
 )

@@ -2559,6 +2559,42 @@ mod tests {
     }
 
     #[test]
+    fn generate_does_not_overrun_budget_on_multi_token_draft() {
+        // Regression for #242: the speculative branch committed every accepted
+        // draft token (plus a rejection-fallback token) without re-checking the
+        // budget, so a multi-token draft could return more than `max_new_tokens`.
+        //
+        // The suffix [7,8,9] recurs at pos 0, so `speculate(&prompt)` drafts
+        // prompt[3..7] = [0,7,8,9] on the very first step. The forward_fn below
+        // makes the target agree with all four (accepted == 4), so a budget of 1
+        // would have returned 4 tokens before the fix.
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+        let eos = 999u32;
+        for max_new in 1..=3 {
+            let out = generate_with_speculation(
+                &prompt,
+                max_new,
+                eos,
+                |tok: u32, _pos: usize| match tok {
+                    0 => logits_with_argmax(1000, 7),
+                    7 => logits_with_argmax(1000, 8),
+                    8 => logits_with_argmax(1000, 9),
+                    _ => logits_with_argmax(1000, 5),
+                },
+                5,
+                4,
+            );
+            assert!(
+                out.len() <= max_new,
+                "budget {max_new} overrun: produced {} tokens {:?}",
+                out.len(),
+                out
+            );
+            assert_eq!(out.len(), max_new, "should fill the budget exactly");
+        }
+    }
+
+    #[test]
     fn generate_eos_in_draft_stops_early() {
         // Prompt: [1, 2, 3, 99, 5] where eos=99.
         //

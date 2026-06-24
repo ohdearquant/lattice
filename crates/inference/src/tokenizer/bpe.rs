@@ -206,7 +206,13 @@ impl BpeTokenizer {
         let id_to_token = invert_vocab(&vocab)?;
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
-            merge_ranks.entry(left).or_default().insert(right, rank);
+            // First occurrence defines the rank: merges are listed in priority
+            // order, so a duplicate pair must not demote it to a later rank.
+            merge_ranks
+                .entry(left)
+                .or_default()
+                .entry(right)
+                .or_insert(rank);
         }
 
         let mut special_tokens = added_tokens;
@@ -534,12 +540,16 @@ impl BpeTokenizer {
                 continue;
             }
 
-            let mut recovered = false;
+            // Byte-fallback: decompose the unmatched token into single
+            // characters. Commit only if EVERY character resolves — a partial
+            // match must roll back, otherwise the resolved ids are orphaned
+            // alongside the <unk> pushed below.
+            let fallback_start = out.len();
+            let mut recovered = true;
             for ch in token.chars() {
                 let one = ch.to_string();
                 if let Some(&id) = self.inner.vocab.get(one.as_str()) {
                     out.push(id);
-                    recovered = true;
                 } else {
                     recovered = false;
                     break;
@@ -548,6 +558,7 @@ impl BpeTokenizer {
             if recovered {
                 continue;
             }
+            out.truncate(fallback_start);
 
             if let Some(unk_id) = self.inner.unk_id {
                 out.push(unk_id);
@@ -1184,5 +1195,37 @@ mod tests {
         // prior generate.rs detokenize block discarded the text entirely.
         assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
         assert_eq!(tokenizer.decode(&[]), Some(String::new()));
+    }
+
+    #[test]
+    fn test_bpe_duplicate_merge_keeps_first_rank() {
+        // Regression (#259): a duplicate merge pair must keep its FIRST rank.
+        // First-wins: a+b (rank 0) merges before b+c (rank 1) → ["ab","c"].
+        // The old last-wins overwrite demoted a+b to rank 2 → ["a","bc"].
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2), ("ab", 3), ("bc", 4)] {
+            vocab.insert(s.to_string(), i);
+        }
+        let merges = vec![
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "c".to_string()),
+            ("a".to_string(), "b".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("abc"), vec![3, 2]);
+    }
+
+    #[test]
+    fn test_bpe_partial_byte_fallback_rolls_back() {
+        // Regression (#259): a merged token absent from vocab whose chars only
+        // partially resolve must roll back and emit a single <unk>, not leave
+        // the resolved id orphaned. "ab" merges to "ab" (not in vocab); 'a'
+        // resolves but 'b' does not → must be [<unk>]=[1], not [id(a),<unk>].
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        vocab.insert("<unk>".to_string(), 1u32);
+        let merges = vec![("a".to_string(), "b".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![1]);
     }
 }

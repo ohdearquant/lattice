@@ -169,7 +169,15 @@ pub struct PageTable {
 
 impl PageTable {
     /// **Unstable**: create an empty page table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_size == 0`: it is the divisor in [`PageTable::resolve`],
+    /// so a zero would otherwise surface as a cryptic divide-by-zero. This is
+    /// the authoritative guard for every `PageTable` (the `PagedKVCache`
+    /// constructors and `SequenceManager::add` both route through here).
     pub fn new(page_size: usize) -> Self {
+        assert!(page_size > 0, "PageTable page_size must be non-zero");
         Self {
             entries: Vec::new(),
             seq_len: 0,
@@ -278,10 +286,21 @@ impl PagedKVCache {
     /// Passing `None` preserves existing behavior. Passing `Some(cache)` enables
     /// `restore_prefix` and `promote_to_prefix` without changing the hot append
     /// and gather paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.page_size == 0`. `page_size` is the divisor in the
+    /// logical-page math (`PageTable::resolve`), so a zero would otherwise
+    /// surface later as a cryptic divide-by-zero in the hot path. This mirrors
+    /// the prefix path, which already rejects a zero `prefix_page_size`.
     pub fn with_prefix_cache(
         config: PagedKVCacheConfig,
         prefix_cache: Option<Arc<Mutex<PrefixPageCache>>>,
     ) -> Self {
+        assert!(
+            config.page_size > 0,
+            "PagedKVCacheConfig.page_size must be non-zero"
+        );
         let fpp = config.floats_per_page();
         let pool = PagePool::new(config.max_pages, fpp);
         let table = PageTable::new(config.page_size);
@@ -1110,6 +1129,26 @@ mod tests {
         for layer in 0..2 {
             cache.append_kv_layer(layer, &k, &v);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "page_size must be non-zero")]
+    fn paged_zero_page_size_panics_at_construction() {
+        // Regression for #244: page_size == 0 is the divisor in PageTable::resolve,
+        // so it must be rejected at construction with a clear message instead of
+        // surfacing later as a cryptic divide-by-zero in the hot path.
+        let mut config = make_config(4);
+        config.page_size = 0;
+        let _ = PagedKVCache::new(config);
+    }
+
+    #[test]
+    #[should_panic(expected = "page_size must be non-zero")]
+    fn page_table_zero_page_size_panics() {
+        // Regression for #244: `PageTable::new` is the authoritative chokepoint
+        // (`SequenceManager::add` reaches it directly, bypassing the
+        // `PagedKVCache` config guard), so the guard must live here too.
+        let _ = PageTable::new(0);
     }
 
     #[test]

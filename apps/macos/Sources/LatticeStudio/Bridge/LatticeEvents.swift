@@ -275,16 +275,16 @@ enum HumanLineParser {
     // Without validation:
     //   "  step    0  train NLL: 4.1234"
     //   "  step   10  train NLL: 3.80  (delta from base: -0.32)"
-    private static let reTrainStepFull = try! NSRegularExpression(
+    static let reTrainStepFull = try? NSRegularExpression(
         pattern: #"^\s*step\s+(\d+)\s+train NLL:\s*([0-9]+(?:\.[0-9]+)?)\s+held-out NLL:\s*([0-9]+(?:\.[0-9]+)?)"#
     )
-    private static let reTrainStepNoVal = try! NSRegularExpression(
+    static let reTrainStepNoVal = try? NSRegularExpression(
         pattern: #"^\s*step\s+(\d+)\s+train NLL:\s*([0-9]+(?:\.[0-9]+)?)"#
     )
 
     private static func parseTrainStep(_ line: String) -> LatticeEvent? {
         // Full variant first (with held-out NLL).
-        if let m = reTrainStepFull.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+        if let m = reTrainStepFull?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
             guard let stepR  = Range(m.range(at: 1), in: line),
                   let lossR  = Range(m.range(at: 2), in: line),
                   let valR   = Range(m.range(at: 3), in: line),
@@ -297,7 +297,7 @@ enum HumanLineParser {
             ))
         }
         // No-val variant.
-        if let m = reTrainStepNoVal.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+        if let m = reTrainStepNoVal?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
             guard let stepR = Range(m.range(at: 1), in: line),
                   let lossR = Range(m.range(at: 2), in: line),
                   let step  = Int(line[stepR]),
@@ -317,17 +317,17 @@ enum HumanLineParser {
     // Without validation:
     //   "=== done: base NLL 4.1234 → final NLL 3.1234 (-1.0000) in 12.3s ==="
     // Unicode right arrow (→ U+2192) or ASCII "->" both accepted.
-    private static let reDoneFull = try! NSRegularExpression(
+    static let reDoneFull = try? NSRegularExpression(
         pattern: #"^=== done: train ([0-9]+\.[0-9]+)[-→>]+([0-9]+\.[0-9]+)\s*\([^)]+\)\s*\|\s*held-out ([0-9]+\.[0-9]+)[-→>]+([0-9]+\.[0-9]+)\s*\([^)]+\)\s*in ([0-9]+(?:\.[0-9]+)?)s"#
     )
-    private static let reDoneNoVal = try! NSRegularExpression(
+    static let reDoneNoVal = try? NSRegularExpression(
         pattern: #"^=== done: base NLL ([0-9]+\.[0-9]+)[-→> ]+final NLL ([0-9]+\.[0-9]+)\s*\([^)]+\)\s*in ([0-9]+(?:\.[0-9]+)?)s"#
     )
 
     private static func parseTrainDone(_ line: String) -> LatticeEvent? {
         guard line.hasPrefix("===") && line.contains("done:") else { return nil }
 
-        if let m = reDoneFull.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+        if let m = reDoneFull?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
             guard let baseR  = Range(m.range(at: 1), in: line),
                   let finR   = Range(m.range(at: 2), in: line),
                   let _      = Range(m.range(at: 3), in: line),  // held-out base (not stored)
@@ -342,7 +342,7 @@ enum HumanLineParser {
                 best_val: bestVal, duration_s: dur, saved: nil
             ))
         }
-        if let m = reDoneNoVal.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
+        if let m = reDoneNoVal?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
             guard let baseR  = Range(m.range(at: 1), in: line),
                   let finR   = Range(m.range(at: 2), in: line),
                   let durR   = Range(m.range(at: 3), in: line),
@@ -362,13 +362,13 @@ enum HumanLineParser {
     // "[1/24] Q4_0  model.layers.0...weight  shape=[2048, 1024]  178.0MB→22.2MB  0.45s"
     // "[2/24] F16   model.layers.0.input_layernorm.weight  shape=[1024]  0.0MB  ..."
     // The size part is optional (F16 lines may omit the → part).
-    private static let reQuantLayer = try! NSRegularExpression(
+    static let reQuantLayer = try? NSRegularExpression(
         pattern: #"^\s*\[(\d+)/(\d+)\]\s+(\S+)\s+(\S+)\s+shape=\[[^\]]+\](?:\s+([0-9]+(?:\.[0-9]+)?)(MB|GB)[-→>]+([0-9]+(?:\.[0-9]+)?)(MB|GB))?"#
     )
 
     private static func parseQuantLayer(_ line: String) -> LatticeEvent? {
         guard line.contains("/") && line.contains("shape=") else { return nil }
-        guard let m = reQuantLayer.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else { return nil }
+        guard let m = reQuantLayer?.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else { return nil }
         guard let iR      = Range(m.range(at: 1), in: line),
               let nR      = Range(m.range(at: 2), in: line),
               let schemeR = Range(m.range(at: 3), in: line),
@@ -413,34 +413,34 @@ enum HumanLineParser {
     //   "Output bytes:      6912.00 MB"
     //   "Compression:       4.00x (25.0%)"
     //   "Forward-equiv:     max_abs=1.234e-06, mean_abs=4.567e-07 (tol=1e-05, ...)"
-    private static let reInputSize  = try! NSRegularExpression(pattern: #"Input (?:size|bytes):\s*([0-9]+(?:\.[0-9]+)?)\s*(MB|GB)"#)
-    private static let reOutputSize = try! NSRegularExpression(pattern: #"Output (?:size|bytes):\s*([0-9]+(?:\.[0-9]+)?)\s*(MB|GB)"#)
-    private static let reRatio      = try! NSRegularExpression(pattern: #"(?:Ratio|Compression):\s*([0-9]+(?:\.[0-9]+)?)x"#)
-    private static let reForwardEquiv = try! NSRegularExpression(pattern: #"Forward-equiv:.*max_abs=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)(?:.*tol=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?))?"#)
+    static let reInputSize  = try? NSRegularExpression(pattern: #"Input (?:size|bytes):\s*([0-9]+(?:\.[0-9]+)?)\s*(MB|GB)"#)
+    static let reOutputSize = try? NSRegularExpression(pattern: #"Output (?:size|bytes):\s*([0-9]+(?:\.[0-9]+)?)\s*(MB|GB)"#)
+    static let reRatio      = try? NSRegularExpression(pattern: #"(?:Ratio|Compression):\s*([0-9]+(?:\.[0-9]+)?)x"#)
+    static let reForwardEquiv = try? NSRegularExpression(pattern: #"Forward-equiv:.*max_abs=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)(?:.*tol=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?))?"#)
 
     private static func parseQuantSummary(_ line: String) -> LatticeEvent? {
         let ns = NSRange(line.startIndex..., in: line)
 
-        if let m = reInputSize.firstMatch(in: line, range: ns),
+        if let m = reInputSize?.firstMatch(in: line, range: ns),
            let vR = Range(m.range(at: 1), in: line),
            let uR = Range(m.range(at: 2), in: line),
            let v  = Double(line[vR]) {
             let mb = String(line[uR]) == "GB" ? v * 1024.0 : v
             return _quantAccumulator.update(beforeMB: mb)
         }
-        if let m = reOutputSize.firstMatch(in: line, range: ns),
+        if let m = reOutputSize?.firstMatch(in: line, range: ns),
            let vR = Range(m.range(at: 1), in: line),
            let uR = Range(m.range(at: 2), in: line),
            let v  = Double(line[vR]) {
             let mb = String(line[uR]) == "GB" ? v * 1024.0 : v
             return _quantAccumulator.update(afterMB: mb)
         }
-        if let m = reRatio.firstMatch(in: line, range: ns),
+        if let m = reRatio?.firstMatch(in: line, range: ns),
            let vR = Range(m.range(at: 1), in: line),
            let v  = Double(line[vR]) {
             return _quantAccumulator.update(ratio: v)
         }
-        if let m = reForwardEquiv.firstMatch(in: line, range: ns),
+        if let m = reForwardEquiv?.firstMatch(in: line, range: ns),
            let vR = Range(m.range(at: 1), in: line),
            let v  = Double(line[vR]) {
             var derived: String? = nil

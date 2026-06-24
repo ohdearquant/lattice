@@ -64,6 +64,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
@@ -92,6 +94,18 @@ jobs:
       - name: embed — metal-gpu (macOS only)
         if: runner.os == 'macOS'
         run: cargo build -p lattice-embed --features metal-gpu
+      # The required `ci` job runs `cargo clippy --workspace` with DEFAULT
+      # features only, so the entire metal-gpu surface — including the ~18K-line
+      # metal_qwen35.rs — was never linted, and 34 clippy errors accumulated
+      # invisibly (#240). Lint the Metal surface on macOS so it cannot rot.
+      # f16,metal-gpu is the production decode combo; this also reaches the
+      # chat_metal bin target.
+      - name: inference — metal-gpu clippy (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy -p lattice-inference --features f16,metal-gpu -- -D warnings
+      - name: embed — metal-gpu clippy (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
 
   # The benchmark harnesses live behind their own feature flags / target gates
   # and are never built by `cargo test`. A `Qwen35Config` field added to the

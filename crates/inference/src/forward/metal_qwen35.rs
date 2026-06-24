@@ -479,144 +479,122 @@ kernel void per_head_rms_norm(
 // GQA group simultaneously. QK computed once per (query_head, cache_tile), scores stored in
 // threadgroup memory and reused for V accumulation. Q loaded once into threadgroup memory.
 // Grid: [num_kv_heads, 1, 1].  Threads: [256, 1, 1] — one thread per output dimension.
-kernel void decode_attention(
-    device const float* q        [[buffer(0)]],
-    device const float* k_cache  [[buffer(1)]],
-    device const float* v_cache  [[buffer(2)]],
-    device float* out            [[buffer(3)]],
-    constant uint& cache_len     [[buffer(4)]],
-    constant uint& head_dim      [[buffer(5)]],
-    constant uint& num_q_heads   [[buffer(6)]],
-    constant uint& num_kv_heads  [[buffer(7)]],
-    constant uint& q_dim         [[buffer(8)]],
-    constant uint& kv_dim        [[buffer(9)]],
-    constant float& scale        [[buffer(10)]],
-    uint gid  [[threadgroup_position_in_grid]],
-    uint lid  [[thread_position_in_threadgroup]],
-    uint tgs  [[threads_per_threadgroup]])
-{
-    if (cache_len == 0) return;
-    constexpr uint HEAD_DIM    = 256;
-    constexpr uint MAX_GRP     = 8;   // max GQA group size supported
-    constexpr uint TILE_TOKENS = 256; // cache tokens per tile; one thread per token during QK
-
-    if (head_dim != HEAD_DIM || num_kv_heads == 0) return;
-    const uint kvh = gid;
-    if (kvh >= num_kv_heads) return;
-    if ((num_q_heads % num_kv_heads) != 0) return;
-    const uint group_size = num_q_heads / num_kv_heads;
-    if (group_size == 0 || group_size > MAX_GRP) return;
-    const uint qh_base = kvh * group_size;
-
-    // Threadgroup memory (~17 KB total for MAX_GRP=8, HEAD_DIM=256, TILE_TOKENS=256)
-    threadgroup float q_s    [MAX_GRP * HEAD_DIM];      // Q for all heads in this KV group
-    threadgroup float score_s[MAX_GRP * TILE_TOKENS];   // raw QK scores, then unnorm weights
-    threadgroup float reduce_s[TILE_TOKENS];             // reduction scratch
-    threadgroup float m_s    [MAX_GRP];                  // running max per Q head
-    threadgroup float l_s    [MAX_GRP];                  // running denominator per Q head
-    threadgroup float alpha_s[MAX_GRP];                  // exp(m_old - m_new) per Q head
-
-    // Initialize running softmax state
-    if (lid < group_size) {
-        m_s[lid] = -INFINITY;
-        l_s[lid] = 0.0f;
-    }
-
-    // Load Q for all query heads in this GQA group into threadgroup memory (H4)
-    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) {
-        q_s[idx] = q[qh_base * HEAD_DIM + idx];
-    }
-
-    // Per-thread register accumulators: thread lid owns output dimension d=lid (H1)
-    float acc[MAX_GRP];
-    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // === Tiled online-softmax loop (H1 + H2) ===
-    for (uint tile_start = 0; tile_start < cache_len; tile_start += TILE_TOKENS) {
-        const uint tile_count = min(TILE_TOKENS, cache_len - tile_start);
-
-        // QK scoring: thread lid owns one cache token (lid < tile_count).
-        // Loads K once and accumulates dot products for all GQA query heads (H2).
-        if (lid < tile_count) {
-            float dot[MAX_GRP];
-            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f;
-            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM;
-            for (uint d = 0; d < HEAD_DIM; d++) {
-                const float kd = k_cache[k_base + d];
-                for (uint qi = 0; qi < group_size; qi++) {
-                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd;
-                }
-            }
-            for (uint qi = 0; qi < group_size; qi++) {
-                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Online-softmax state update per Q head (H5 — proper barriers, separate arrays)
-        for (uint qi = 0; qi < group_size; qi++) {
-            // Tile max reduction over valid tokens
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float tile_max = reduce_s[0];
-
-            if (lid == 0) {
-                const float m_old = m_s[qi];
-                const float m_new = max(m_old, tile_max);
-                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f;
-                m_s[qi]     = m_new;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Overwrite raw scores with unnormalized softmax weights p = exp(score - m_new)
-            if (lid < tile_count) {
-                score_s[qi * TILE_TOKENS + lid] =
-                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Tile sum reduction of p values
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] += reduce_s[lid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (lid == 0) {
-                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Rescale previous tile's V accumulators before adding new tile (H1)
-        for (uint qi = 0; qi < group_size; qi++) {
-            acc[qi] *= alpha_s[qi];
-        }
-
-        // V accumulation: thread lid owns output dimension d=lid; reuses p from score_s (H1)
-        const uint d = lid;
-        for (uint local_t = 0; local_t < tile_count; local_t++) {
-            const float v = v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d];
-            for (uint qi = 0; qi < group_size; qi++) {
-                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Final normalization and output write
-    for (uint qi = 0; qi < group_size; qi++) {
-        const uint qh  = qh_base + qi;
-        const float dn = l_s[qi];
-        out[qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f;
-    }
+//
+// KVT is the KV cache element type (float for f32 path, half for f16 path).
+// float(...) casts are no-ops for float and widen half→float for the f16 path.
+#define DEFINE_DECODE_ATTENTION(NAME, KVT) \
+kernel void NAME( \
+    device const float* q        [[buffer(0)]], \
+    device const KVT*   k_cache  [[buffer(1)]], \
+    device const KVT*   v_cache  [[buffer(2)]], \
+    device float* out            [[buffer(3)]], \
+    constant uint& cache_len     [[buffer(4)]], \
+    constant uint& head_dim      [[buffer(5)]], \
+    constant uint& num_q_heads   [[buffer(6)]], \
+    constant uint& num_kv_heads  [[buffer(7)]], \
+    constant uint& q_dim         [[buffer(8)]], \
+    constant uint& kv_dim        [[buffer(9)]], \
+    constant float& scale        [[buffer(10)]], \
+    uint gid  [[threadgroup_position_in_grid]], \
+    uint lid  [[thread_position_in_threadgroup]], \
+    uint tgs  [[threads_per_threadgroup]]) \
+{ \
+    if (cache_len == 0) return; \
+    constexpr uint HEAD_DIM    = 256; \
+    constexpr uint MAX_GRP     = 8; \
+    constexpr uint TILE_TOKENS = 256; \
+    if (head_dim != HEAD_DIM || num_kv_heads == 0) return; \
+    const uint kvh = gid; \
+    if (kvh >= num_kv_heads) return; \
+    if ((num_q_heads % num_kv_heads) != 0) return; \
+    const uint group_size = num_q_heads / num_kv_heads; \
+    if (group_size == 0 || group_size > MAX_GRP) return; \
+    const uint qh_base = kvh * group_size; \
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM]; \
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS]; \
+    threadgroup float reduce_s[TILE_TOKENS]; \
+    threadgroup float m_s    [MAX_GRP]; \
+    threadgroup float l_s    [MAX_GRP]; \
+    threadgroup float alpha_s[MAX_GRP]; \
+    if (lid < group_size) { \
+        m_s[lid] = -INFINITY; \
+        l_s[lid] = 0.0f; \
+    } \
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) { \
+        q_s[idx] = q[qh_base * HEAD_DIM + idx]; \
+    } \
+    float acc[MAX_GRP]; \
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint tile_start = 0; tile_start < cache_len; tile_start += TILE_TOKENS) { \
+        const uint tile_count = min(TILE_TOKENS, cache_len - tile_start); \
+        if (lid < tile_count) { \
+            float dot[MAX_GRP]; \
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f; \
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM; \
+            for (uint d = 0; d < HEAD_DIM; d++) { \
+                const float kd = float(k_cache[k_base + d]); \
+                for (uint qi = 0; qi < group_size; qi++) { \
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd; \
+                } \
+            } \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]); \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            const float tile_max = reduce_s[0]; \
+            if (lid == 0) { \
+                const float m_old = m_s[qi]; \
+                const float m_new = max(m_old, tile_max); \
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f; \
+                m_s[qi]     = m_new; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            if (lid < tile_count) { \
+                score_s[qi * TILE_TOKENS + lid] = \
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]); \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s]; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            if (lid == 0) { \
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            acc[qi] *= alpha_s[qi]; \
+        } \
+        const uint d = lid; \
+        for (uint local_t = 0; local_t < tile_count; local_t++) { \
+            const float v = float(v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d]); \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    for (uint qi = 0; qi < group_size; qi++) { \
+        const uint qh  = qh_base + qi; \
+        const float dn = l_s[qi]; \
+        out[qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f; \
+    } \
 }
+
+DEFINE_DECODE_ATTENTION(decode_attention,     float)
+DEFINE_DECODE_ATTENTION(decode_attention_f16, half)
 
 // ===== Partitioned flash decode — partial kernel (H3) =====
 // One threadgroup per (KV head, partition). Runs the same tiled online-softmax as
@@ -625,138 +603,131 @@ kernel void decode_attention(
 // Partials layout: partials[((part * num_q_heads + qh) * (HEAD_DIM+2)) + offset]
 //   offset 0 = running max m, offset 1 = running sum l, offset 2+ = acc[d].
 // Grid: [num_kv_heads, num_partitions, 1].  Threads: [256, 1, 1].
-kernel void decode_attention_flash_partial(
-    device const float* q           [[buffer(0)]],
-    device const float* k_cache     [[buffer(1)]],
-    device const float* v_cache     [[buffer(2)]],
-    device float* attn_partials     [[buffer(3)]],
-    constant uint& cache_len        [[buffer(4)]],
-    constant uint& head_dim         [[buffer(5)]],
-    constant uint& num_q_heads      [[buffer(6)]],
-    constant uint& num_kv_heads     [[buffer(7)]],
-    constant uint& q_dim            [[buffer(8)]],
-    constant uint& kv_dim           [[buffer(9)]],
-    constant float& scale           [[buffer(10)]],
-    constant uint& partition_tokens [[buffer(11)]],
-    uint3 gid3  [[threadgroup_position_in_grid]],
-    uint3 lid3  [[thread_position_in_threadgroup]],
-    uint3 tgs3  [[threads_per_threadgroup]])
-{
-    constexpr uint HEAD_DIM    = 256;
-    constexpr uint MAX_GRP     = 8;
-    constexpr uint TILE_TOKENS = 256;
-    constexpr uint STRIDE      = HEAD_DIM + 2; // m + l + acc[256]
-
-    const uint lid          = lid3.x;
-    const uint tgs          = tgs3.x;
-    const uint kvh          = gid3.x;
-    const uint partition_id = gid3.y;
-    if (head_dim != HEAD_DIM || partition_tokens == 0 || num_kv_heads == 0) return;
-    if (kvh >= num_kv_heads) return;
-    if ((num_q_heads % num_kv_heads) != 0) return;
-
-    const uint part_start = partition_id * partition_tokens;
-    if (part_start >= cache_len) return;
-    const uint part_end = min(cache_len, part_start + partition_tokens);
-
-    const uint group_size = num_q_heads / num_kv_heads;
-    if (group_size == 0 || group_size > MAX_GRP) return;
-    const uint qh_base = kvh * group_size;
-
-    threadgroup float q_s    [MAX_GRP * HEAD_DIM];
-    threadgroup float score_s[MAX_GRP * TILE_TOKENS];
-    threadgroup float reduce_s[TILE_TOKENS];
-    threadgroup float m_s    [MAX_GRP];
-    threadgroup float l_s    [MAX_GRP];
-    threadgroup float alpha_s[MAX_GRP];
-
-    if (lid < group_size) {
-        m_s[lid] = -INFINITY;
-        l_s[lid] = 0.0f;
-    }
-    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) {
-        q_s[idx] = q[qh_base * HEAD_DIM + idx];
-    }
-
-    float acc[MAX_GRP];
-    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint tile_start = part_start; tile_start < part_end; tile_start += TILE_TOKENS) {
-        const uint tile_count = min(TILE_TOKENS, part_end - tile_start);
-
-        if (lid < tile_count) {
-            float dot[MAX_GRP];
-            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f;
-            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM;
-            for (uint d = 0; d < HEAD_DIM; d++) {
-                const float kd = k_cache[k_base + d];
-                for (uint qi = 0; qi < group_size; qi++) {
-                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd;
-                }
-            }
-            for (uint qi = 0; qi < group_size; qi++) {
-                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint qi = 0; qi < group_size; qi++) {
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float tile_max = reduce_s[0];
-            if (lid == 0) {
-                const float m_old = m_s[qi];
-                const float m_new = max(m_old, tile_max);
-                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f;
-                m_s[qi]     = m_new;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < tile_count) {
-                score_s[qi * TILE_TOKENS + lid] =
-                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] += reduce_s[lid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (lid == 0) {
-                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        for (uint qi = 0; qi < group_size; qi++) acc[qi] *= alpha_s[qi];
-
-        const uint d = lid;
-        for (uint local_t = 0; local_t < tile_count; local_t++) {
-            const float v = v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d];
-            for (uint qi = 0; qi < group_size; qi++) {
-                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write partial state to global buffer
-    const uint d = lid;
-    for (uint qi = 0; qi < group_size; qi++) {
-        const uint qh   = qh_base + qi;
-        const uint base = (partition_id * num_q_heads + qh) * STRIDE;
-        if (lid == 0) {
-            attn_partials[base + 0] = m_s[qi];
-            attn_partials[base + 1] = l_s[qi];
-        }
-        attn_partials[base + 2 + d] = acc[qi];
-    }
+//
+// KVT is the KV cache element type (float for f32 path, half for f16 path).
+#define DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(NAME, KVT) \
+kernel void NAME( \
+    device const float* q           [[buffer(0)]], \
+    device const KVT*   k_cache     [[buffer(1)]], \
+    device const KVT*   v_cache     [[buffer(2)]], \
+    device float* attn_partials     [[buffer(3)]], \
+    constant uint& cache_len        [[buffer(4)]], \
+    constant uint& head_dim         [[buffer(5)]], \
+    constant uint& num_q_heads      [[buffer(6)]], \
+    constant uint& num_kv_heads     [[buffer(7)]], \
+    constant uint& q_dim            [[buffer(8)]], \
+    constant uint& kv_dim           [[buffer(9)]], \
+    constant float& scale           [[buffer(10)]], \
+    constant uint& partition_tokens [[buffer(11)]], \
+    uint3 gid3  [[threadgroup_position_in_grid]], \
+    uint3 lid3  [[thread_position_in_threadgroup]], \
+    uint3 tgs3  [[threads_per_threadgroup]]) \
+{ \
+    constexpr uint HEAD_DIM    = 256; \
+    constexpr uint MAX_GRP     = 8; \
+    constexpr uint TILE_TOKENS = 256; \
+    constexpr uint STRIDE      = HEAD_DIM + 2; \
+    const uint lid          = lid3.x; \
+    const uint tgs          = tgs3.x; \
+    const uint kvh          = gid3.x; \
+    const uint partition_id = gid3.y; \
+    if (head_dim != HEAD_DIM || partition_tokens == 0 || num_kv_heads == 0) return; \
+    if (kvh >= num_kv_heads) return; \
+    if ((num_q_heads % num_kv_heads) != 0) return; \
+    const uint part_start = partition_id * partition_tokens; \
+    if (part_start >= cache_len) return; \
+    const uint part_end = min(cache_len, part_start + partition_tokens); \
+    const uint group_size = num_q_heads / num_kv_heads; \
+    if (group_size == 0 || group_size > MAX_GRP) return; \
+    const uint qh_base = kvh * group_size; \
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM]; \
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS]; \
+    threadgroup float reduce_s[TILE_TOKENS]; \
+    threadgroup float m_s    [MAX_GRP]; \
+    threadgroup float l_s    [MAX_GRP]; \
+    threadgroup float alpha_s[MAX_GRP]; \
+    if (lid < group_size) { \
+        m_s[lid] = -INFINITY; \
+        l_s[lid] = 0.0f; \
+    } \
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) { \
+        q_s[idx] = q[qh_base * HEAD_DIM + idx]; \
+    } \
+    float acc[MAX_GRP]; \
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint tile_start = part_start; tile_start < part_end; tile_start += TILE_TOKENS) { \
+        const uint tile_count = min(TILE_TOKENS, part_end - tile_start); \
+        if (lid < tile_count) { \
+            float dot[MAX_GRP]; \
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f; \
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM; \
+            for (uint d = 0; d < HEAD_DIM; d++) { \
+                const float kd = float(k_cache[k_base + d]); \
+                for (uint qi = 0; qi < group_size; qi++) { \
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd; \
+                } \
+            } \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]); \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            const float tile_max = reduce_s[0]; \
+            if (lid == 0) { \
+                const float m_old = m_s[qi]; \
+                const float m_new = max(m_old, tile_max); \
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f; \
+                m_s[qi]     = m_new; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            if (lid < tile_count) { \
+                score_s[qi * TILE_TOKENS + lid] = \
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]); \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s]; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            if (lid == 0) { \
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        for (uint qi = 0; qi < group_size; qi++) acc[qi] *= alpha_s[qi]; \
+        const uint d = lid; \
+        for (uint local_t = 0; local_t < tile_count; local_t++) { \
+            const float v = float(v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d]); \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    const uint d = lid; \
+    for (uint qi = 0; qi < group_size; qi++) { \
+        const uint qh   = qh_base + qi; \
+        const uint base = (partition_id * num_q_heads + qh) * STRIDE; \
+        if (lid == 0) { \
+            attn_partials[base + 0] = m_s[qi]; \
+            attn_partials[base + 1] = l_s[qi]; \
+        } \
+        attn_partials[base + 2 + d] = acc[qi]; \
+    } \
 }
+
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial,     float)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_f16, half)
 
 // ===== Partitioned flash decode — reduce kernel (H3) =====
 // Combines partition partial states into the final attention output.
@@ -953,6 +924,19 @@ kernel void copy_buf_offset(
 {
     if (gid >= count) return;
     dst[dst_offset + gid] = src[gid];
+}
+
+// Variant that narrows f32 src → half dst; used for f16 KV cache writes.
+// Offsets are element-counted (same semantic as copy_buf_offset, different element size).
+kernel void copy_buf_offset_f16(
+    device const float* src    [[buffer(0)]],
+    device half*  dst          [[buffer(1)]],
+    constant uint& count       [[buffer(2)]],
+    constant uint& dst_offset  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[dst_offset + gid] = half(src[gid]);
 }
 
 // ===== Q4_0 GEMV Decode: 4-bit x float32 with simd_sum reduction =====
@@ -2491,157 +2475,159 @@ kernel void copy_kv_cache_batch(
     v_cache[dst] = v_src[src];
 }
 
+// Variant that narrows f32 src → half dst for the f16 KV cache batch-write path.
+kernel void copy_kv_cache_batch_f16(
+    device const float* k_src   [[buffer(0)]],
+    device const float* v_src   [[buffer(1)]],
+    device half* k_cache        [[buffer(2)]],
+    device half* v_cache        [[buffer(3)]],
+    constant uint& num_tokens   [[buffer(4)]],
+    constant uint& kv_dim       [[buffer(5)]],
+    constant uint& base_pos     [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = num_tokens * kv_dim;
+    if (gid >= total) return;
+
+    uint t = gid / kv_dim;
+    uint d = gid % kv_dim;
+    uint src = t * kv_dim + d;
+    uint dst = (base_pos + t) * kv_dim + d;
+    k_cache[dst] = half(k_src[src]);
+    v_cache[dst] = half(v_src[src]);
+}
+
 // ===== Batched causal prefill attention (Win 2) =====
 // Replaces the per-token decode_attention loop for full-attention prefill chunks.
 // Grid: [num_kv_heads, num_tokens, 1]. Threads: [256, 1, 1] — one thread per output dim.
 // One threadgroup per (kv_head, query_token) processes all Q heads in the GQA group.
-kernel void prefill_attention_batched_causal(
-    device const float* q          [[buffer(0)]],
-    device const float* k_cache    [[buffer(1)]],
-    device const float* v_cache    [[buffer(2)]],
-    device float* out              [[buffer(3)]],
-    constant uint& base_pos        [[buffer(4)]],
-    constant uint& num_tokens      [[buffer(5)]],
-    constant uint& cache_len_total [[buffer(6)]],
-    constant uint& head_dim        [[buffer(7)]],
-    constant uint& num_q_heads     [[buffer(8)]],
-    constant uint& num_kv_heads    [[buffer(9)]],
-    constant uint& q_dim           [[buffer(10)]],
-    constant uint& kv_dim          [[buffer(11)]],
-    constant float& scale          [[buffer(12)]],
-    uint3 gid3 [[threadgroup_position_in_grid]],
-    uint3 lid3 [[thread_position_in_threadgroup]],
-    uint3 tgs3 [[threads_per_threadgroup]])
-{
-    constexpr uint HEAD_DIM    = 256;
-    constexpr uint MAX_GRP     = 8;
-    constexpr uint TILE_TOKENS = 256;
-
-    // Extract scalar thread/threadgroup indices from the 3D vectors.
-    const uint lid = lid3.x;
-    const uint tgs = tgs3.x;
-
-    if (head_dim != HEAD_DIM || num_kv_heads == 0) return;
-    const uint kvh = gid3.x;
-    const uint qt  = gid3.y;
-    if (kvh >= num_kv_heads || qt >= num_tokens) return;
-    if ((num_q_heads % num_kv_heads) != 0) return;
-    const uint group_size = num_q_heads / num_kv_heads;
-    if (group_size == 0 || group_size > MAX_GRP) return;
-    const uint qh_base = kvh * group_size;
-
-    // Causal bound: query token qt at absolute position base_pos+qt
-    // sees only cache rows [0 .. base_pos+qt+1] to exclude future tokens.
-    const uint causal_len = min(cache_len_total, base_pos + qt + 1u);
-    if (causal_len == 0) {
-        for (uint qi = 0; qi < group_size; qi++) {
-            out[qt * q_dim + (qh_base + qi) * HEAD_DIM + lid] = 0.0f;
-        }
-        return;
-    }
-
-    // Threadgroup memory — same layout and size as decode_attention (~17 KB).
-    threadgroup float q_s    [MAX_GRP * HEAD_DIM];
-    threadgroup float score_s[MAX_GRP * TILE_TOKENS];
-    threadgroup float reduce_s[TILE_TOKENS];
-    threadgroup float m_s    [MAX_GRP];
-    threadgroup float l_s    [MAX_GRP];
-    threadgroup float alpha_s[MAX_GRP];
-
-    if (lid < group_size) {
-        m_s[lid] = -INFINITY;
-        l_s[lid] = 0.0f;
-    }
-
-    // Load Q for all GQA query heads from this token's row in q_separated[N, q_dim].
-    const uint q_row_base = qt * q_dim + qh_base * HEAD_DIM;
-    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) {
-        q_s[idx] = q[q_row_base + idx];
-    }
-
-    float acc[MAX_GRP];
-    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f;
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tiled online-softmax — same structure as decode_attention.
-    for (uint tile_start = 0; tile_start < causal_len; tile_start += TILE_TOKENS) {
-        const uint tile_count = min(TILE_TOKENS, causal_len - tile_start);
-
-        if (lid < tile_count) {
-            float dot[MAX_GRP];
-            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f;
-            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM;
-            for (uint d = 0; d < HEAD_DIM; d++) {
-                const float kd = k_cache[k_base + d];
-                for (uint qi = 0; qi < group_size; qi++) {
-                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd;
-                }
-            }
-            for (uint qi = 0; qi < group_size; qi++) {
-                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Online-softmax rescale: when a later tile raises the max, rescale the prior
-        // accumulator by alpha=exp(m_old-m_new) to preserve the running weighted sum.
-        for (uint qi = 0; qi < group_size; qi++) {
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            const float tile_max = reduce_s[0];
-
-            if (lid == 0) {
-                const float m_old = m_s[qi];
-                const float m_new = max(m_old, tile_max);
-                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f;
-                m_s[qi]     = m_new;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            if (lid < tile_count) {
-                score_s[qi * TILE_TOKENS + lid] =
-                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint s = tgs >> 1; s > 0; s >>= 1) {
-                if (lid < s) reduce_s[lid] += reduce_s[lid + s];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-            if (lid == 0) {
-                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        for (uint qi = 0; qi < group_size; qi++) {
-            acc[qi] *= alpha_s[qi];
-        }
-
-        const uint d = lid;
-        for (uint local_t = 0; local_t < tile_count; local_t++) {
-            const float v = v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d];
-            for (uint qi = 0; qi < group_size; qi++) {
-                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Write output at the query token's row: out[qt * q_dim + qh * HEAD_DIM + lid].
-    for (uint qi = 0; qi < group_size; qi++) {
-        const uint qh  = qh_base + qi;
-        const float dn = l_s[qi];
-        out[qt * q_dim + qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f;
-    }
+//
+// KVT is the KV cache element type (float for f32 path, half for f16 path).
+#define DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(NAME, KVT) \
+kernel void NAME( \
+    device const float* q          [[buffer(0)]], \
+    device const KVT*   k_cache    [[buffer(1)]], \
+    device const KVT*   v_cache    [[buffer(2)]], \
+    device float* out              [[buffer(3)]], \
+    constant uint& base_pos        [[buffer(4)]], \
+    constant uint& num_tokens      [[buffer(5)]], \
+    constant uint& cache_len_total [[buffer(6)]], \
+    constant uint& head_dim        [[buffer(7)]], \
+    constant uint& num_q_heads     [[buffer(8)]], \
+    constant uint& num_kv_heads    [[buffer(9)]], \
+    constant uint& q_dim           [[buffer(10)]], \
+    constant uint& kv_dim          [[buffer(11)]], \
+    constant float& scale          [[buffer(12)]], \
+    uint3 gid3 [[threadgroup_position_in_grid]], \
+    uint3 lid3 [[thread_position_in_threadgroup]], \
+    uint3 tgs3 [[threads_per_threadgroup]]) \
+{ \
+    constexpr uint HEAD_DIM    = 256; \
+    constexpr uint MAX_GRP     = 8; \
+    constexpr uint TILE_TOKENS = 256; \
+    const uint lid = lid3.x; \
+    const uint tgs = tgs3.x; \
+    if (head_dim != HEAD_DIM || num_kv_heads == 0) return; \
+    const uint kvh = gid3.x; \
+    const uint qt  = gid3.y; \
+    if (kvh >= num_kv_heads || qt >= num_tokens) return; \
+    if ((num_q_heads % num_kv_heads) != 0) return; \
+    const uint group_size = num_q_heads / num_kv_heads; \
+    if (group_size == 0 || group_size > MAX_GRP) return; \
+    const uint qh_base = kvh * group_size; \
+    const uint causal_len = min(cache_len_total, base_pos + qt + 1u); \
+    if (causal_len == 0) { \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            out[qt * q_dim + (qh_base + qi) * HEAD_DIM + lid] = 0.0f; \
+        } \
+        return; \
+    } \
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM]; \
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS]; \
+    threadgroup float reduce_s[TILE_TOKENS]; \
+    threadgroup float m_s    [MAX_GRP]; \
+    threadgroup float l_s    [MAX_GRP]; \
+    threadgroup float alpha_s[MAX_GRP]; \
+    if (lid < group_size) { \
+        m_s[lid] = -INFINITY; \
+        l_s[lid] = 0.0f; \
+    } \
+    const uint q_row_base = qt * q_dim + qh_base * HEAD_DIM; \
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) { \
+        q_s[idx] = q[q_row_base + idx]; \
+    } \
+    float acc[MAX_GRP]; \
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint tile_start = 0; tile_start < causal_len; tile_start += TILE_TOKENS) { \
+        const uint tile_count = min(TILE_TOKENS, causal_len - tile_start); \
+        if (lid < tile_count) { \
+            float dot[MAX_GRP]; \
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f; \
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM; \
+            for (uint d = 0; d < HEAD_DIM; d++) { \
+                const float kd = float(k_cache[k_base + d]); \
+                for (uint qi = 0; qi < group_size; qi++) { \
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd; \
+                } \
+            } \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]); \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            const float tile_max = reduce_s[0]; \
+            if (lid == 0) { \
+                const float m_old = m_s[qi]; \
+                const float m_new = max(m_old, tile_max); \
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f; \
+                m_s[qi]     = m_new; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            if (lid < tile_count) { \
+                score_s[qi * TILE_TOKENS + lid] = \
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]); \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s]; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            if (lid == 0) { \
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            acc[qi] *= alpha_s[qi]; \
+        } \
+        const uint d = lid; \
+        for (uint local_t = 0; local_t < tile_count; local_t++) { \
+            const float v = float(v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d]); \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    for (uint qi = 0; qi < group_size; qi++) { \
+        const uint qh  = qh_base + qi; \
+        const float dn = l_s[qi]; \
+        out[qt * q_dim + qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f; \
+    } \
 }
+
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal,     float)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_f16, half)
 
 // ===== GDN Chunked Prefill Scan (C=32 specialized) =====
 // Implements chunked-parallel WY/UT scan for GatedDeltaNet prefill.
@@ -3822,6 +3808,9 @@ kernel void gdn_chunk_norm_silu_c32(
         // stride dimension stored for CPU-side append_kv; not needed on GPU path
         kv_dim: usize,
         max_cache_len: usize,
+        /// When true the k/v buffers hold half-precision elements (2 bytes each).
+        /// GPU kernels use the `_f16` pipeline variants; CPU append_kv writes u16 bits.
+        kv_f16: bool,
     }
 
     /// Compiled MSL pipeline state objects.
@@ -3891,6 +3880,12 @@ kernel void gdn_chunk_norm_silu_c32(
         copy_kv_cache_batch: ComputePipelineState,
         // Win 2 batched causal prefill attention (ADR-126B)
         prefill_attention_batched: ComputePipelineState,
+        // f16 KV cache variants (#154): used when use_kv_f16 is true
+        copy_offset_f16: ComputePipelineState,
+        copy_kv_cache_batch_f16: ComputePipelineState,
+        decode_attention_f16: ComputePipelineState,
+        decode_attn_partial_f16: ComputePipelineState,
+        prefill_attention_batched_f16: ComputePipelineState,
     }
 
     // -----------------------------------------------------------------------
@@ -3936,16 +3931,11 @@ kernel void gdn_chunk_norm_silu_c32(
         GpuTopkRoute::CpuFallback
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
     pub(crate) enum QuantFormat {
+        #[default]
         Q8_0,
         Q4_0,
-    }
-
-    impl Default for QuantFormat {
-        fn default() -> Self {
-            QuantFormat::Q8_0
-        }
     }
 
     impl QuantFormat {
@@ -4125,6 +4115,15 @@ kernel void gdn_chunk_norm_silu_c32(
         /// field directly in tests to switch paths without touching the process
         /// environment (thread-safe under parallel test execution).
         pub(crate) use_gdn_chunked: bool,
+        /// Per-instance flag: store KV cache in f16 (default OFF, opt-in).
+        ///
+        /// Halves KV memory and bandwidth for the GQA full-attention layers.
+        /// f32 (default) is byte-identical to the pre-#154 path; greedy output and
+        /// perplexity are unchanged when enabled (verified), but no decode speedup
+        /// was measured at 1k context (the model is GatedDeltaNet-dominated, so KV
+        /// reads are a small fraction of decode bandwidth). Set `LATTICE_KV_F16=1`
+        /// or `LATTICE_KV_F16=true` at construction time to enable.
+        pub(crate) use_kv_f16: bool,
     }
 
     // ---------------------------------------------------------------------------
@@ -4145,8 +4144,7 @@ kernel void gdn_chunk_norm_silu_c32(
     ) -> Result<(), String> {
         if head_dim != METAL_FLASH_HEAD_DIM {
             return Err(format!(
-                "Metal FlashAttention decode supports head_dim={} only; got {}",
-                METAL_FLASH_HEAD_DIM, head_dim
+                "Metal FlashAttention decode supports head_dim={METAL_FLASH_HEAD_DIM} only; got {head_dim}"
             ));
         }
         if num_q_heads == 0 || num_kv_heads == 0 {
@@ -4162,8 +4160,7 @@ kernel void gdn_chunk_norm_silu_c32(
         let group_size = num_q_heads / num_kv_heads;
         if group_size == 0 || group_size > METAL_FLASH_MAX_GQA_GROUP {
             return Err(format!(
-                "Metal FlashAttention decode supports GQA group size 1..={}; got {}",
-                METAL_FLASH_MAX_GQA_GROUP, group_size
+                "Metal FlashAttention decode supports GQA group size 1..={METAL_FLASH_MAX_GQA_GROUP}; got {group_size}"
             ));
         }
         let expected_q_dim = num_q_heads
@@ -4271,6 +4268,14 @@ kernel void gdn_chunk_norm_silu_c32(
 
     fn make_zero_buffer(device: &Device, num_floats: usize, label: &str) -> Buffer {
         let byte_len = (num_floats * std::mem::size_of::<f32>()) as u64;
+        let buf = device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+        buf.set_label(label);
+        buf
+    }
+
+    /// Allocate a zero-initialised f16 buffer holding `num_halves` half-precision elements.
+    fn make_zero_buffer_f16(device: &Device, num_halves: usize, label: &str) -> Buffer {
+        let byte_len = (num_halves * std::mem::size_of::<u16>()) as u64;
         let buf = device.new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
         buf.set_label(label);
         buf
@@ -4541,20 +4546,27 @@ kernel void gdn_chunk_norm_silu_c32(
             num_full_layers: usize,
             kv_dim: usize,
             max_cache_len: usize,
+            use_kv_f16: bool,
         ) -> Self {
+            let num_elems = max_cache_len * kv_dim;
             let mut k_bufs = Vec::with_capacity(num_full_layers);
             let mut v_bufs = Vec::with_capacity(num_full_layers);
             for i in 0..num_full_layers {
-                k_bufs.push(make_zero_buffer(
-                    device,
-                    max_cache_len * kv_dim,
-                    &format!("kv_k_{i}"),
-                ));
-                v_bufs.push(make_zero_buffer(
-                    device,
-                    max_cache_len * kv_dim,
-                    &format!("kv_v_{i}"),
-                ));
+                if use_kv_f16 {
+                    k_bufs.push(make_zero_buffer_f16(
+                        device,
+                        num_elems,
+                        &format!("kv_k_{i}"),
+                    ));
+                    v_bufs.push(make_zero_buffer_f16(
+                        device,
+                        num_elems,
+                        &format!("kv_v_{i}"),
+                    ));
+                } else {
+                    k_bufs.push(make_zero_buffer(device, num_elems, &format!("kv_k_{i}")));
+                    v_bufs.push(make_zero_buffer(device, num_elems, &format!("kv_v_{i}")));
+                }
             }
             let cache = Self {
                 k_bufs,
@@ -4562,22 +4574,25 @@ kernel void gdn_chunk_norm_silu_c32(
                 seq_len: 0,
                 kv_dim,
                 max_cache_len,
+                kv_f16: use_kv_f16,
             };
             // ADR-064: runtime KV layout assertion (debug builds only).
-            // Current layout is f32; update this when #154 migrates to f16.
+            // Layout is f16 (2 bytes/elem) when use_kv_f16, f32 (4 bytes/elem) otherwise.
             #[cfg(debug_assertions)]
             if num_full_layers > 0 {
-                let expected_bytes = max_cache_len * kv_dim * std::mem::size_of::<f32>();
+                let element_size = if use_kv_f16 { 2 } else { 4 };
+                let expected_bytes = max_cache_len * kv_dim * element_size;
+                let layout_name = if use_kv_f16 { "f16" } else { "f32" };
                 for (i, (k, v)) in cache.k_bufs.iter().zip(cache.v_bufs.iter()).enumerate() {
                     debug_assert_eq!(
                         k.length() as usize,
                         expected_bytes,
-                        "KV cache K[{i}] size mismatch: expected f32 layout ({expected_bytes} bytes)"
+                        "KV cache K[{i}] size mismatch: expected {layout_name} layout ({expected_bytes} bytes)"
                     );
                     debug_assert_eq!(
                         v.length() as usize,
                         expected_bytes,
-                        "KV cache V[{i}] size mismatch: expected f32 layout ({expected_bytes} bytes)"
+                        "KV cache V[{i}] size mismatch: expected {layout_name} layout ({expected_bytes} bytes)"
                     );
                 }
             }
@@ -4608,11 +4623,25 @@ kernel void gdn_chunk_norm_silu_c32(
             // buffer is in flight during this call); offset + k_vec.len() ==
             // (seq_len + 1) * kv_dim which is ≤ max_cache_len * kv_dim (the
             // allocated buffer size).
-            unsafe {
-                let k_ptr = self.k_bufs[full_layer_idx].contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(k_vec.as_ptr(), k_ptr.add(offset), k_vec.len());
-                let v_ptr = self.v_bufs[full_layer_idx].contents() as *mut f32;
-                std::ptr::copy_nonoverlapping(v_vec.as_ptr(), v_ptr.add(offset), v_vec.len());
+            if self.kv_f16 {
+                // Write as f16 bits into the half-precision buffer.
+                unsafe {
+                    let k_ptr = self.k_bufs[full_layer_idx].contents() as *mut u16;
+                    for (i, &val) in k_vec.iter().enumerate() {
+                        k_ptr.add(offset + i).write(f32_to_f16(val));
+                    }
+                    let v_ptr = self.v_bufs[full_layer_idx].contents() as *mut u16;
+                    for (i, &val) in v_vec.iter().enumerate() {
+                        v_ptr.add(offset + i).write(f32_to_f16(val));
+                    }
+                }
+            } else {
+                unsafe {
+                    let k_ptr = self.k_bufs[full_layer_idx].contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(k_vec.as_ptr(), k_ptr.add(offset), k_vec.len());
+                    let v_ptr = self.v_bufs[full_layer_idx].contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(v_vec.as_ptr(), v_ptr.add(offset), v_vec.len());
+                }
             }
             Ok(())
         }
@@ -4802,6 +4831,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 partial_rope_batch: make_pipeline("partial_rope_batch")?,
                 copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
                 prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
+                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+                decode_attention_f16: make_pipeline("decode_attention_f16")?,
+                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+                prefill_attention_batched_f16: make_pipeline(
+                    "prefill_attention_batched_causal_f16",
+                )?,
             };
 
             // Upload per-layer weights
@@ -5010,7 +5046,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &format!("L{i}.gdn.z.{quant_tag}"),
                             )),
                             in_proj_qkvz: {
-                                let mut combined = gdn_w.in_proj_qkv.to_vec();
+                                let mut combined = gdn_w.in_proj_qkv.clone();
                                 combined.extend_from_slice(&gdn_w.in_proj_z);
                                 Q4WeightBuf::from_buffer(make_buffer_quant(
                                     &device,
@@ -5135,6 +5171,18 @@ kernel void gdn_chunk_norm_silu_c32(
 
         /// Allocate per-session mutable state for a single concurrent request.
         pub fn new_session(&self, max_cache_len: usize) -> Result<InferenceSession, String> {
+            let use_kv_f16 = matches!(
+                std::env::var("LATTICE_KV_F16").as_deref(),
+                Ok("1") | Ok("true")
+            );
+            self.new_session_inner(max_cache_len, use_kv_f16)
+        }
+
+        fn new_session_inner(
+            &self,
+            max_cache_len: usize,
+            use_kv_f16: bool,
+        ) -> Result<InferenceSession, String> {
             if max_cache_len == 0 {
                 return Err("new_session: max_cache_len must be > 0".into());
             }
@@ -5254,7 +5302,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 })
                 .collect();
             let gdn_gpu_conv_out = make_zero_buffer(device, qkv_dim2, "gdn_conv_out");
-            let kv_cache = MetalKvCache::new(device, num_full, kv_dim, max_cache_len);
+            let kv_cache = MetalKvCache::new(device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
             // Allocate MTP session state if engine has MTP weights loaded.
             let mtp = self.mtp_weights.as_ref().map(|_| {
@@ -5348,16 +5396,23 @@ kernel void gdn_chunk_norm_silu_c32(
             max_cache_len: usize,
         ) -> Result<Self, String> {
             let engine = MetalQwen35Engine::new(weights, cfg)?;
-            let session = engine.new_session(max_cache_len)?;
             let use_gdn_chunked = !matches!(
                 std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
                 Ok("0") | Ok("false")
             );
+            let use_kv_f16 = matches!(
+                std::env::var("LATTICE_KV_F16").as_deref(),
+                Ok("1") | Ok("true")
+            );
+            // new_session reads LATTICE_KV_F16 identically, so session.kv_cache
+            // and the use_kv_f16 field below agree by construction.
+            let session = engine.new_session(max_cache_len)?;
             Ok(Self {
                 engine,
                 session,
                 lora: None,
                 use_gdn_chunked,
+                use_kv_f16,
             })
         }
 
@@ -5390,9 +5445,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
                 ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
                 ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
-                    "module '{}' is not yet supported in Metal forward (consumed inside \
-                     fused GDN recurrence kernel); target other GDN modules instead",
-                    module
+                    "module '{module}' is not yet supported in Metal forward (consumed inside \
+                     fused GDN recurrence kernel); target other GDN modules instead"
                 ))),
                 ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
                 // MLP projections (shared across both layer types)
@@ -5402,19 +5456,16 @@ kernel void gdn_chunk_norm_silu_c32(
                 // Wrong layer-type combinations
                 ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
                     Err(InferenceError::Inference(format!(
-                        "module '{}' is a full-attention projection but layer {} is GDN",
-                        module, layer_idx
+                        "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
                     )))
                 }
                 ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
                     Err(InferenceError::Inference(format!(
-                        "module '{}' is a GDN projection but layer {} is full-attention",
-                        module, layer_idx
+                        "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
                     )))
                 }
                 _ => Err(InferenceError::Inference(format!(
-                    "unknown LoRA module '{}'",
-                    module
+                    "unknown LoRA module '{module}'"
                 ))),
             }
         }
@@ -5466,8 +5517,7 @@ kernel void gdn_chunk_norm_silu_c32(
             }
             if !scale.is_finite() {
                 return Err(InferenceError::Inference(format!(
-                    "load_lora_adapter: scale must be finite, got {}",
-                    scale
+                    "load_lora_adapter: scale must be finite, got {scale}"
                 )));
             }
 
@@ -5982,9 +6032,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 if is_linear {
                     // GDN layer: batch projections + sequential recurrence (causal dependency).
                     let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Linear(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Linear(gdn_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -6202,9 +6253,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 } else {
                     // Full-attention layer: batch QKV/O/MLP projections, sequential per-token ops.
                     let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Full(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Full(full_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &full_w.q_proj as *const Q4WeightBuf,
@@ -6347,7 +6399,11 @@ kernel void gdn_chunk_norm_silu_c32(
                         }
 
                         // KV store at absolute position (start_pos + t).
-                        enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
+                        if self.use_kv_f16 {
+                            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset_f16);
+                        } else {
+                            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
+                        }
                         enc.set_buffer(0, Some(&self.session.activations.k), k_off);
                         enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
                         let cnt = kv_dim as u32;
@@ -6366,7 +6422,13 @@ kernel void gdn_chunk_norm_silu_c32(
                         );
 
                         // Causal attention: Q[t] against full cache[0..start_pos+t+1].
-                        enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                        if self.use_kv_f16 {
+                            enc.set_compute_pipeline_state(
+                                &self.engine.pipelines.decode_attention_f16,
+                            );
+                        } else {
+                            enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                        }
                         enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
                         enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
                         enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
@@ -7528,9 +7590,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 if is_linear {
                     // ========= GDN layer: batch projections + sequential recurrence =========
                     let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Linear(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Linear(gdn_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -7797,9 +7860,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 } else {
                     // ========= Full attention layer: batch proj + sequential attention =========
                     let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                            MetalLayerAttnWeights::Full(w) => w,
-                            _ => unreachable!(),
+                        let MetalLayerAttnWeights::Full(full_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
                         };
                         (
                             &full_w.q_proj as *const Q4WeightBuf,
@@ -7958,9 +8022,15 @@ kernel void gdn_chunk_norm_silu_c32(
                             let kvd = kv_dim as u32;
                             // Per-token q/attn_out offsets are within batch activation buffers.
                             {
-                                enc.set_compute_pipeline_state(
-                                    &self.engine.pipelines.decode_attention,
-                                );
+                                if self.use_kv_f16 {
+                                    enc.set_compute_pipeline_state(
+                                        &self.engine.pipelines.decode_attention_f16,
+                                    );
+                                } else {
+                                    enc.set_compute_pipeline_state(
+                                        &self.engine.pipelines.decode_attention,
+                                    );
+                                }
                                 enc.set_buffer(
                                     0,
                                     Some(&self.session.activations.q_separated),
@@ -8300,16 +8370,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 } else {
                     self.verify_tokens_batched(&[pending_token, draft.token_id], pos)
                 };
-                let verify_out = match verify_result {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Fallback: accept pending, advance normally.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = draft.token_id;
-                        continue;
-                    }
+                let Ok(verify_out) = verify_result else {
+                    // Fallback: accept pending, advance normally.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = draft.token_id;
+                    continue;
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
@@ -8321,23 +8388,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 //   draft_logits          = [draft.logits]   (q(·) for draft position)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
-                let rs = match crate::speculative::rejection_sample_draft(
+                let Ok(rs) = crate::speculative::rejection_sample_draft(
                     &[draft.token_id],
                     std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
                     false,
                     None,
-                ) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Fallback: accept pending, advance normally.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = draft.token_id;
-                        continue;
-                    }
+                ) else {
+                    // Fallback: accept pending, advance normally.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = draft.token_id;
+                    continue;
                 };
 
                 if rs.accepted_count == 1 {
@@ -8537,19 +8601,16 @@ kernel void gdn_chunk_norm_silu_c32(
                 self.restore_gdn_slot_blocking(0);
 
                 let t_verify = std::time::Instant::now();
-                let verify_out = match self.verify_tokens_batched(&verify_input, pos) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        // Verification failed: accept pending, use draft as next pending.
-                        self.session.kv_cache.seq_len = pos + 1;
-                        generated_ids.push(pending_token);
-                        metrics.fallback_tokens += 1;
-                        pending_token = argmax_logits(&first_draft_logits);
-                        if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
-                            break;
-                        }
-                        continue 'round;
+                let Ok(verify_out) = self.verify_tokens_batched(&verify_input, pos) else {
+                    // Verification failed: accept pending, use draft as next pending.
+                    self.session.kv_cache.seq_len = pos + 1;
+                    generated_ids.push(pending_token);
+                    metrics.fallback_tokens += 1;
+                    pending_token = argmax_logits(&first_draft_logits);
+                    if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
                     }
+                    continue 'round;
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
@@ -9047,7 +9108,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // Text tokens start at position `visual_tokens`.
             let prompt_len = total_len;
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-            let mut all_ids: Vec<u32> = text_ids.to_vec();
+            let mut all_ids: Vec<u32> = text_ids.clone();
 
             // Process all text tokens sequentially at their offset positions.
             let mut last_logits = Vec::new();
@@ -9194,9 +9255,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 w_norm,
                 w_out_proj,
             ) = {
-                let gdn_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!("gdn_layer_step called on non-linear layer"),
+                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!("gdn_layer_step called on non-linear layer")
                 };
                 (
                     &gdn_w.in_proj_qkv as *const Q4WeightBuf,
@@ -9417,9 +9478,9 @@ kernel void gdn_chunk_norm_silu_c32(
             let kernel_size = cfg.linear_conv_kernel_dim;
 
             let (w_in_proj_b, w_in_proj_a, w_a_log, w_dt_bias, w_conv1d, w_norm) = {
-                let gdn_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &gdn_w.in_proj_b as *const Buffer,
@@ -9583,9 +9644,9 @@ kernel void gdn_chunk_norm_silu_c32(
             // Extract weight buffer pointers to avoid holding borrow on layer_weights.
             // SAFETY: layer_weights is never mutated during forward pass.
             let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let full_w = match &self.engine.layer_weights[layer_idx].0 {
-                    MetalLayerAttnWeights::Full(w) => w,
-                    _ => unreachable!("full_attention_layer_step called on non-full layer"),
+                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[layer_idx].0
+                else {
+                    unreachable!("full_attention_layer_step called on non-full layer")
                 };
                 (
                     &full_w.q_proj as *const Q4WeightBuf,
@@ -9765,9 +9826,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 w_norm,
                 w_out_proj,
             ) = {
-                let gdn_w = match &self.engine.layer_weights[compact_idx].0 {
-                    MetalLayerAttnWeights::Linear(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Linear(gdn_w) =
+                    &self.engine.layer_weights[compact_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &gdn_w.in_proj_qkvz as *const Q4WeightBuf,
@@ -9804,7 +9866,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // H4 fusion: one wider GEMV writes QKV||Z rows to gdn_qkvz (saves 1 dispatch/GDN layer).
             // SAFETY: w_in_proj_qkvz holds contiguous Q4 rows [0..qkv_d) from qkv and
             // [qkv_d..qkv_d+out_d) from z; output gdn_qkvz is (qkv_d+out_d) floats.
-            let proj_t0 = profiling.then(|| std::time::Instant::now());
+            let proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -9866,7 +9928,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // SAFETY: All buffers are StorageModeShared and live for the
             // command buffer; dimensions in GdnRecurParams are derived from
             // the model config used to allocate the GDN state buffers.
-            let gdn_t0 = profiling.then(|| std::time::Instant::now());
+            let gdn_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 #[repr(C)]
                 struct GdnRecurParams {
@@ -9962,7 +10024,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 } else {
                     // Fallback: H2+H4 fused kernel or generic
                     let recur_pipe = use_q36
-                        .then(|| self.engine.pipelines.gdn_recurrence_q36.as_ref())
+                        .then_some(self.engine.pipelines.gdn_recurrence_q36.as_ref())
                         .flatten()
                         .unwrap_or(&self.engine.pipelines.gdn_recurrence);
                     enc.set_compute_pipeline_state(recur_pipe);
@@ -9994,7 +10056,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // Output projection — reads norm output from Z portion of fused buffer.
             // SAFETY: w_out_proj and gdn_qkvz are live for this command buffer;
             // z_byte_off points to out_d norm values written by gdn_recurrence.
-            let out_proj_t0 = profiling.then(|| std::time::Instant::now());
+            let out_proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_gemm(
                     enc,
@@ -10026,7 +10088,7 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // MLP: fused residual+add+norm replaces 4 dispatches with 1
             // residual = residual + attn_out; hidden = norm(residual)
-            let mlp_t0 = profiling.then(|| std::time::Instant::now());
+            let mlp_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_fused_residual_add_norm(
                 enc,
                 &self.session.activations.residual,
@@ -10144,9 +10206,9 @@ kernel void gdn_chunk_norm_silu_c32(
             let inter = cfg.intermediate_size;
             // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
             let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let full_w = match &self.engine.layer_weights[compact_idx].0 {
-                    MetalLayerAttnWeights::Full(w) => w,
-                    _ => unreachable!(),
+                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
+                else {
+                    unreachable!()
                 };
                 (
                     &full_w.q_proj as *const Q4WeightBuf,
@@ -10187,7 +10249,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // SAFETY: Raw layer weight pointers were taken from
             // self.engine.layer_weights and remain valid while self is borrowed;
             // dispatch dimensions match the preallocated activation buffers.
-            let gqa_proj_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_proj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -10287,14 +10349,14 @@ kernel void gdn_chunk_norm_silu_c32(
             );
 
             // GPU KV cache copy
-            self.dispatch_copy_offset(
+            self.dispatch_copy_offset_kv(
                 enc,
                 &self.session.activations.k,
                 &self.session.kv_cache.k_bufs[full_idx],
                 kv_dim as u32,
                 kv_cache_offset,
             );
-            self.dispatch_copy_offset(
+            self.dispatch_copy_offset_kv(
                 enc,
                 &self.session.activations.v,
                 &self.session.kv_cache.v_bufs[full_idx],
@@ -10303,7 +10365,7 @@ kernel void gdn_chunk_norm_silu_c32(
             );
 
             // Decode attention + gating + O projection
-            let gqa_attn_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_attn_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_decode_attention(
                 enc,
                 &self.session.kv_cache.k_bufs[full_idx],
@@ -10322,7 +10384,7 @@ kernel void gdn_chunk_norm_silu_c32(
             }
             // SAFETY: The O-projection buffer pointer is live for the command
             // buffer and dimensions match [hidden, q_dim].
-            let gqa_oproj_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_oproj_t0 = profiling.then(std::time::Instant::now);
             unsafe {
                 self.dispatch_matmul(
                     enc,
@@ -10355,7 +10417,7 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             // MLP: fused residual+add+norm replaces 4 dispatches with 1
-            let gqa_mlp_t0 = profiling.then(|| std::time::Instant::now());
+            let gqa_mlp_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_fused_residual_add_norm(
                 enc,
                 &self.session.activations.residual,
@@ -10798,7 +10860,7 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             // === Final RMS norm + logits (same command buffer) ===
-            let final_t0 = profiling.then(|| std::time::Instant::now());
+            let final_t0 = profiling.then(std::time::Instant::now);
             self.dispatch_rms_norm(
                 enc,
                 &self.session.activations.hidden,
@@ -11379,6 +11441,8 @@ kernel void gdn_chunk_norm_silu_c32(
             )
             .expect("invalid Metal FlashAttention decode shape");
 
+            let kv_f16 = self.use_kv_f16;
+
             // Common buffer setup (same layout for both direct and partial kernels)
             let set_common_bufs = |enc: &ComputeCommandEncoderRef, out_or_partials: &Buffer| {
                 enc.set_buffer(0, Some(&self.session.activations.q_separated), 0);
@@ -11396,7 +11460,11 @@ kernel void gdn_chunk_norm_silu_c32(
 
             if cache_len <= DIRECT_THRESHOLD {
                 // Direct grouped flash decode: one threadgroup per KV head (H1+H2+H4+H5)
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                if kv_f16 {
+                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention_f16);
+                } else {
+                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                }
                 set_common_bufs(enc, &self.session.activations.attn_out);
                 enc.dispatch_thread_groups(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
@@ -11408,7 +11476,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 let num_partitions = cache_len.div_ceil(PARTITION_TOKENS);
 
                 // Partial pass: one TG per (KV head, partition)
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial);
+                if kv_f16 {
+                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial_f16);
+                } else {
+                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial);
+                }
                 set_common_bufs(enc, &self.session.activations.attn_partials);
                 enc.set_bytes(11, 4, &PARTITION_TOKENS as *const u32 as *const _);
                 enc.dispatch_thread_groups(
@@ -11416,7 +11488,8 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(256, 1, 1),
                 );
 
-                // Reduce pass: one TG per KV head, combines all partitions
+                // Reduce pass: one TG per KV head, combines all partitions.
+                // decode_attention_flash_reduce reads f32 attn_partials, not KV — no f16 variant.
                 enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_reduce);
                 enc.set_buffer(0, Some(&self.session.activations.attn_partials), 0);
                 enc.set_buffer(1, Some(&self.session.activations.attn_out), 0);
@@ -11550,7 +11623,11 @@ kernel void gdn_chunk_norm_silu_c32(
             base_pos: u32,
         ) {
             let total = num_tokens * kv_dim;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch);
+            if self.use_kv_f16 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch_f16);
+            } else {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch);
+            }
             enc.set_buffer(0, Some(k_src), 0);
             enc.set_buffer(1, Some(v_src), 0);
             enc.set_buffer(2, Some(k_cache), 0);
@@ -11590,7 +11667,13 @@ kernel void gdn_chunk_norm_silu_c32(
             let cache_len_total = base_pos.checked_add(num_tokens).ok_or_else(|| {
                 "prefill_attention_batched: base_pos + num_tokens overflow".to_string()
             })?;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.prefill_attention_batched);
+            if self.use_kv_f16 {
+                enc.set_compute_pipeline_state(
+                    &self.engine.pipelines.prefill_attention_batched_f16,
+                );
+            } else {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.prefill_attention_batched);
+            }
             enc.set_buffer(0, Some(&self.session.activations.q_separated), 0);
             enc.set_buffer(1, Some(k_cache), 0);
             enc.set_buffer(2, Some(v_cache), 0);
@@ -11810,6 +11893,32 @@ kernel void gdn_chunk_norm_silu_c32(
             dst_offset: u32,
         ) {
             enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_bytes(2, 4, &count as *const u32 as *const _);
+            enc.set_bytes(3, 4, &dst_offset as *const u32 as *const _);
+            let wg = 256u64;
+            enc.dispatch_threads(
+                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
+                MTLSize::new(wg, 1, 1),
+            );
+        }
+
+        /// Copy `count` f32 elements from `src` into the KV cache buffer `dst` at element
+        /// offset `dst_offset`. Selects the f16 narrowing kernel when `use_kv_f16` is set.
+        fn dispatch_copy_offset_kv(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            src: &Buffer,
+            dst: &Buffer,
+            count: u32,
+            dst_offset: u32,
+        ) {
+            if self.use_kv_f16 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset_f16);
+            } else {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
+            }
             enc.set_buffer(0, Some(src), 0);
             enc.set_buffer(1, Some(dst), 0);
             enc.set_bytes(2, 4, &count as *const u32 as *const _);
@@ -12865,7 +12974,7 @@ kernel void gdn_chunk_norm_silu_c32(
             let path = q4_dir.join("quantize_index.json");
             let bytes = std::fs::read(&path).ok()?;
             let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            v.get("quarot_seed").and_then(|s| s.as_u64())
+            v.get("quarot_seed").and_then(serde_json::Value::as_u64)
         }
 
         /// Create a new [`MetalQwen35State`] by loading pre-quantized Q4/F16 files directly
@@ -13078,6 +13187,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 partial_rope_batch: make_pipeline("partial_rope_batch")?,
                 copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
                 prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
+                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+                decode_attention_f16: make_pipeline("decode_attention_f16")?,
+                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+                prefill_attention_batched_f16: make_pipeline(
+                    "prefill_attention_batched_causal_f16",
+                )?,
             };
 
             let hidden = cfg.hidden_size;
@@ -13526,7 +13642,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 .collect();
             let gdn_gpu_conv_out = make_zero_buffer(&device, qkv_dim, "gdn_conv_out");
 
-            let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len);
+            let use_kv_f16 = matches!(
+                std::env::var("LATTICE_KV_F16").as_deref(),
+                Ok("1") | Ok("true")
+            );
+            let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
             let dur_d = t_d.elapsed();
             eprintln!(
@@ -13664,6 +13784,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
                     Ok("0") | Ok("false")
                 ),
+                use_kv_f16,
             })
         }
 
@@ -15131,6 +15252,7 @@ kernel void decode_attention_reference(
                 session,
                 lora: None,
                 use_gdn_chunked: true,
+                use_kv_f16: false,
             }
         }
 
@@ -15328,6 +15450,7 @@ kernel void decode_attention_reference(
                 session: session_a,
                 lora: None,
                 use_gdn_chunked: true,
+                use_kv_f16: false,
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
