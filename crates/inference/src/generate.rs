@@ -198,6 +198,22 @@ fn check_kv_cache_capacity(
     Ok(())
 }
 
+/// Compute the maximum sequence length (prompt + generated) used to size the KV
+/// cache, guarding against `usize` overflow on a pathological `max_new_tokens`.
+///
+/// A caller passing `max_new_tokens` near `usize::MAX` would otherwise wrap the
+/// addition (release builds elide the overflow check), yielding a tiny `max_seq`,
+/// an undersized cache, and a bare panic inside `prefill_layer`'s capacity
+/// assertion. Returning `InvalidInput` turns that latent panic into a clean,
+/// caller-visible error.
+fn compute_max_seq(prompt_len: usize, max_new_tokens: usize) -> Result<usize, InferenceError> {
+    prompt_len.checked_add(max_new_tokens).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "prompt_len ({prompt_len}) + max_new_tokens ({max_new_tokens}) overflows usize"
+        ))
+    })
+}
+
 /// **Unstable**: text generation entry point for Qwen3 models; the full
 /// generation loop (prefill, decode, sampling) is under active design.
 ///
@@ -243,7 +259,7 @@ pub fn generate(
     }
 
     // 2. Initialize KV cache and scratch (allocate once per request)
-    let max_seq = prompt_len + config.max_new_tokens;
+    let max_seq = compute_max_seq(prompt_len, config.max_new_tokens)?;
     // Effective cache capacity: honour the caller's opt-in cap (issue #12).
     // Clamped to [1, max_seq] so over-large caps and zero are both safe.
     let effective_cap = config
@@ -1005,6 +1021,25 @@ mod tests {
         };
         assert_eq!(output.generated_tokens, 3);
         assert!(!output.stopped_by_eos);
+    }
+
+    #[test]
+    fn test_compute_max_seq_normal() {
+        assert_eq!(compute_max_seq(10, 100).unwrap(), 110);
+        assert_eq!(compute_max_seq(0, 0).unwrap(), 0);
+        // Largest sum that still fits exactly.
+        assert_eq!(compute_max_seq(1, usize::MAX - 1).unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn test_compute_max_seq_overflow_is_error_not_panic() {
+        // A pathological max_new_tokens near usize::MAX must surface a clean
+        // InvalidInput error rather than wrapping the addition and panicking
+        // later inside prefill_layer's capacity assertion (codex finding #2).
+        let err = compute_max_seq(10, usize::MAX).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+        let err = compute_max_seq(usize::MAX, 1).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
     #[test]
