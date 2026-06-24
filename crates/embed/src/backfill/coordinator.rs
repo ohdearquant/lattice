@@ -338,14 +338,19 @@ impl BackfillCoordinator {
     /// Compute the next batch size to process.
     ///
     /// Returns `0` if the migration is not in `InProgress` state.
-    /// Otherwise returns the smaller of the configured batch size
-    /// and the remaining items.
+    /// Otherwise returns the smaller of the configured batch size and the
+    /// effective remaining items (total minus processed minus skipped).
+    /// This keeps the batch estimate coherent with `record_progress`, which
+    /// also uses `effective_total = total − skipped` as its completion
+    /// threshold.
     pub fn next_batch_size(&self) -> usize {
         match self.controller.state() {
             MigrationState::InProgress {
-                processed, total, ..
+                processed,
+                total,
+                skipped,
             } => {
-                let remaining = total.saturating_sub(*processed);
+                let remaining = total.saturating_sub(*processed).saturating_sub(*skipped);
                 remaining.min(self.config.batch_size)
             }
             _ => 0,
