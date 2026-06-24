@@ -103,9 +103,11 @@ impl CandidateSet {
         best_id
     }
 
-    /// Scale logits by `1 / temperature`.  No-op when temperature == 1.0.
+    /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
+    /// non-positive, or non-finite (NaN/±inf) — none of those carry a valid
+    /// scaling, and `1.0 / NaN` would poison every logit with NaN.
     pub fn apply_temperature(&mut self, temperature: f32) {
-        if temperature <= 0.0 || temperature == 1.0 {
+        if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
             return;
         }
         let inv = 1.0 / temperature;
@@ -271,7 +273,16 @@ impl Sampler {
         // whenever the raw argmax token is not in recent_tokens. In the common case
         // (recent_tokens empty or raw argmax not recently generated) this avoids the
         // 993 KB extend_from_slice entirely.
-        if self.config.temperature <= 0.0 || self.config.top_k == 1 {
+        //
+        // A non-finite temperature (NaN, ±inf) is also routed here: it carries no
+        // valid scaling. `1.0 / NaN` is NaN, which poisons every scaled logit and
+        // collapses the fused top-k to token 0 (the lowest ID), and `1.0 / inf` is 0,
+        // which flattens all logits. Fall back to the same deterministic argmax as
+        // temperature <= 0.0 rather than sampling from a corrupted distribution.
+        if !self.config.temperature.is_finite()
+            || self.config.temperature <= 0.0
+            || self.config.top_k == 1
+        {
             let raw_best = argmax_f32(logits);
             if self.config.repetition_penalty == 1.0 || !self.recent_tokens.contains(&raw_best) {
                 self.push_token(raw_best);
@@ -665,6 +676,52 @@ mod tests {
         let mut sampler = Sampler::new(config);
         let logits = vec![1.0, 5.0, 2.0];
         assert_eq!(sampler.sample(&logits), 1);
+    }
+
+    #[test]
+    fn test_nonfinite_temperature_falls_back_to_argmax() {
+        // top_k=2 forces the non-greedy fused-top-k path pre-fix, where a NaN/inf
+        // temperature produced `inv_temp = NaN`/`0`, scaling every logit to NaN/0
+        // and collapsing the result to token 0. The guard must instead return the
+        // true argmax (token 1) for any non-finite temperature.
+        let logits = vec![0.0, 100.0, 99.0];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = SamplingConfig {
+                temperature: bad,
+                top_k: 2,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+            };
+            let mut sampler = Sampler::new(config).with_seed(7);
+            assert_eq!(
+                sampler.sample(&logits),
+                1,
+                "temperature {bad} must fall back to argmax, not collapse to token 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_temperature_nonfinite_is_noop() {
+        // A non-finite (or non-positive) temperature must leave logits untouched —
+        // `1.0 / NaN` would poison the whole candidate set, `1.0 / inf` would zero it.
+        for bad in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0_f32,
+            -2.0_f32,
+        ] {
+            let mut cs = CandidateSet::from_full_logits(&[1.0, 5.0, 3.0]);
+            cs.apply_temperature(bad);
+            let logits: Vec<f32> = cs.candidates.iter().map(|c| c.logit).collect();
+            assert_eq!(
+                logits,
+                vec![1.0, 5.0, 3.0],
+                "temperature {bad} must be a no-op, leaving logits finite and unscaled"
+            );
+            assert_eq!(cs.argmax(), 1);
+        }
     }
 
     #[test]
