@@ -95,6 +95,8 @@ struct CompileCtx<'a> {
     /// Name-to-schema mapping for `$defs` / `definitions`.
     defs: HashMap<String, &'a Value>,
     builder: GrammarBuilder,
+    /// Monotonic counter for generating collision-free string-enum rule names.
+    enum_counter: usize,
 }
 
 impl<'a> CompileCtx<'a> {
@@ -115,7 +117,11 @@ impl<'a> CompileCtx<'a> {
         let mut builder = GrammarBuilder::new();
         // Pre-register built-in rules.
         register_builtins(&mut builder);
-        Ok(Self { defs, builder })
+        Ok(Self {
+            defs,
+            builder,
+            enum_counter: 0,
+        })
     }
 
     /// Compile `schema` into a list of alternatives.
@@ -464,18 +470,18 @@ impl<'a> CompileCtx<'a> {
                 //
                 // Grammar: root → '"' enum_choices '"'
                 //          enum_choices → alt0 | alt1 | ...
-                let choices_name = format!("str_enum_{}", str_values.join("_"));
-                let choices_id = if let Some(id) = self.builder.rule_id(&choices_name) {
-                    id
-                } else {
-                    let id = self.builder.reserve(&choices_name);
-                    let choice_alts: Vec<Alt> = str_values
-                        .iter()
-                        .map(|s| s.bytes().map(Symbol::Terminal).collect::<Alt>())
-                        .collect();
-                    self.builder.set_alts(id, choice_alts);
-                    id
-                };
+                //
+                // Each enum occurrence gets a UNIQUE rule name via a monotonic
+                // counter to prevent collisions when distinct enum sets would
+                // otherwise produce the same join("_") name (issue #310 #4).
+                let choices_name = format!("str_enum_{}", self.enum_counter);
+                self.enum_counter += 1;
+                let choices_id = self.builder.reserve(&choices_name);
+                let choice_alts: Vec<Alt> = str_values
+                    .iter()
+                    .map(|s| s.bytes().map(Symbol::Terminal).collect::<Alt>())
+                    .collect();
+                self.builder.set_alts(choices_id, choice_alts);
                 return vec![vec![
                     Symbol::Terminal(b'"'),
                     Symbol::NonTerminal(choices_id),
@@ -620,11 +626,36 @@ fn register_builtins(b: &mut GrammarBuilder) {
         ]],
     );
 
+    // json_nonzero = '1' | '2' | ... | '9'
+    let nonzero_id = b.reserve("json_nonzero");
+    let nonzero_alts: Vec<Alt> = (b'1'..=b'9')
+        .map(|byte| vec![Symbol::Terminal(byte)])
+        .collect();
+    b.set_alts(nonzero_id, nonzero_alts);
+
+    // json_int_part = '0' | nonzero digit_tail
+    // Strict JSON integer part: forbids leading zeros (e.g. "01" rejected).
+    // Alternatives differ on first byte ('0' vs 1-9), so the single-stack
+    // PDA disambiguates them without backtracking (issue #310 finding #6).
+    // json_digits is kept unchanged for fraction/exponent where leading zeros
+    // ARE legal (e.g. "1.05", "1e08").
+    let int_part_id = b.reserve("json_int_part");
+    b.set_alts(
+        int_part_id,
+        vec![
+            vec![Symbol::Terminal(b'0')],
+            vec![
+                Symbol::NonTerminal(nonzero_id),
+                Symbol::NonTerminal(digit_tail_id),
+            ],
+        ],
+    );
+
     // Optional sign
     let opt_sign_id = b.reserve("json_opt_sign");
     b.set_alts(opt_sign_id, vec![vec![Symbol::Terminal(b'-')], vec![]]);
 
-    // Optional fraction: '.' digits
+    // Optional fraction: '.' digits  (leading zeros legal here, e.g. 1.05)
     let opt_frac_id = b.reserve("json_opt_frac");
     b.set_alts(
         opt_frac_id,
@@ -634,7 +665,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
         ],
     );
 
-    // Optional exponent: (e|E) (sign?) digits
+    // Optional exponent: (e|E) (sign?) digits  (leading zeros legal, e.g. 1e08)
     let exp_sign_id = b.reserve("json_exp_sign");
     b.set_alts(
         exp_sign_id,
@@ -662,23 +693,25 @@ fn register_builtins(b: &mut GrammarBuilder) {
         ],
     );
 
+    // json_number = '-'? int_part ('.' digits)? (('e'|'E') sign? digits)?
+    // Uses int_part (not digits) for the integer part to reject leading zeros.
     b.set_alts(
         num_id,
         vec![vec![
             Symbol::NonTerminal(opt_sign_id),
-            Symbol::NonTerminal(digits_id),
+            Symbol::NonTerminal(int_part_id),
             Symbol::NonTerminal(opt_frac_id),
             Symbol::NonTerminal(opt_exp_id),
         ]],
     );
 
-    // json_integer = '-'? digit+
+    // json_integer = '-'? int_part  (rejects leading zeros)
     let int_id = b.reserve("json_integer");
     b.set_alts(
         int_id,
         vec![vec![
             Symbol::NonTerminal(opt_sign_id),
-            Symbol::NonTerminal(digits_id),
+            Symbol::NonTerminal(int_part_id),
         ]],
     );
 
