@@ -3395,6 +3395,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejection_greedy_one_draft_mtp_contract_empty_draft_logits() {
+        // Locks the contract the greedy MTP loop (metal_qwen35::generate_greedy_mtp,
+        // #237) depends on: a single draft token verified with `greedy=true` and an
+        // EMPTY `draft_logits` slice (unused in greedy mode). The downstream loop reads
+        //   accept → bonus = argmax(target_logits[0])  (verify_out.logits[1])
+        //   reject → bonus = argmax(initial_target)     (verify_out.logits[0])
+        // A regression that flips this call back to probabilistic (greedy=false,
+        // clock-seeded) would break determinism and these argmax bonus identities.
+        // `seed=None` with `greedy=true` must stay deterministic (no RNG is built).
+        const VOCAB: usize = 16;
+        let initial_target = peaked_logits(VOCAB, 4, 6.0); // target's pick at draft pos = 4
+        let target_logits = vec![peaked_logits(VOCAB, 11, 6.0)]; // full-accept bonus = 11
+
+        // Accept: draft token == initial_target argmax (4) → accept, bonus = 11.
+        let accept =
+            rejection_sample_draft(&[4u32], &[], &initial_target, &target_logits, true, None)
+                .unwrap();
+        assert_eq!(
+            accept.accepted_count, 1,
+            "draft == initial argmax → accepted"
+        );
+        assert!(!accept.had_rejection);
+        assert_eq!(
+            accept.bonus_token,
+            Some(11),
+            "full-accept bonus is argmax(target_logits[0])"
+        );
+
+        // Reject: draft token (7) != initial_target argmax (4) → reject, bonus = 4.
+        let reject =
+            rejection_sample_draft(&[7u32], &[], &initial_target, &target_logits, true, None)
+                .unwrap();
+        assert_eq!(
+            reject.accepted_count, 0,
+            "draft != initial argmax → rejected"
+        );
+        assert!(reject.had_rejection);
+        assert_eq!(
+            reject.bonus_token,
+            Some(4),
+            "rejection bonus is the target's own pick = argmax(initial_target)"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // MtpVerifier f16 KV cache rollback regression (Defect 4 fix, Option A).
     //
