@@ -1171,6 +1171,14 @@ pub trait MtpTargetVerifier {
 ///
 /// Returns an [`MtpVerifyResult`] with accepted tokens, optional fallback, metrics,
 /// and properly rolled-back caches.
+///
+/// # Errors
+///
+/// On `Err`, the verifier and target caches (and GDN state) are restored to their
+/// pre-call positions on a **best-effort** basis: if a rollback call itself fails, the
+/// original error is still returned and cache coherence is no longer guaranteed. A caller
+/// recovering from an error must therefore treat the speculative context as invalid and
+/// rebuild it rather than assume the caches are at a known position.
 pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     verifier: &mut MtpVerifier<'_>,
     current_token_id: u32,
