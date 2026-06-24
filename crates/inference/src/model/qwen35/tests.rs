@@ -685,6 +685,71 @@ mod lora_serving {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Out-of-vocabulary token_id guard tests (issue #269)
+    // ---------------------------------------------------------------------------
+
+    /// CPU path: a token_id exactly at vocab_size (one past the last valid id)
+    /// must panic with a message that names the offending id and the vocab size.
+    /// "vocab_size is" is our contract — the cryptic slice panic says nothing like that.
+    #[test]
+    #[should_panic(expected = "vocab_size is")]
+    fn cpu_forward_step_rejects_token_at_vocab_size() {
+        let cfg = test_config();
+        let model = build_model(cfg.clone(), 0x1234);
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        // vocab_size is 97; id 97 is one past the end.
+        model.forward_step(cfg.vocab_size as u32, 0, &mut gdn, &mut kv, &mut scratch);
+    }
+
+    /// CPU path: u32::MAX must also panic with the same clear message.
+    #[test]
+    #[should_panic(expected = "vocab_size is")]
+    fn cpu_forward_step_rejects_max_u32() {
+        let cfg = test_config();
+        let model = build_model(cfg.clone(), 0x1234);
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        model.forward_step(u32::MAX, 0, &mut gdn, &mut kv, &mut scratch);
+    }
+
+    /// CPU path: the last valid id (vocab_size − 1) must NOT panic.
+    #[test]
+    fn cpu_forward_step_accepts_last_valid_token() {
+        let cfg = test_config();
+        let model = build_model(cfg.clone(), 0x1234);
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        // token 96 = vocab_size − 1 = eos_token_id. Must not panic.
+        model.forward_step(
+            cfg.vocab_size as u32 - 1,
+            0,
+            &mut gdn,
+            &mut kv,
+            &mut scratch,
+        );
+        // Logits buffer was written — at least some are finite.
+        assert!(
+            scratch.logits[..cfg.vocab_size]
+                .iter()
+                .all(|v| v.is_finite()),
+            "logits must be finite for a valid token"
+        );
+    }
+
+    /// CPU path: token 0 (always valid) produces finite logits.
+    #[test]
+    fn cpu_forward_step_accepts_token_zero() {
+        let cfg = test_config();
+        let model = build_model(cfg.clone(), 0x5678);
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        model.forward_step(0, 0, &mut gdn, &mut kv, &mut scratch);
+        assert!(
+            scratch.logits[..cfg.vocab_size]
+                .iter()
+                .all(|v| v.is_finite()),
+            "logits must be finite for token 0"
+        );
+    }
+
     #[test]
     fn generate_max_new_tokens_zero_returns_empty() {
         // Contract: max_new_tokens == 0 means "generate nothing". The non-streaming
