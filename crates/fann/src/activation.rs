@@ -318,7 +318,12 @@ impl Activation {
     /// and need `f'(x)`. For efficiency, many activation derivatives can be
     /// computed from the output `y` directly.
     ///
-    /// Note: For Softmax, use `derivative_batch` with the full Jacobian.
+    /// For Softmax, both this method and `derivative_batch` return only the
+    /// **diagonal** of the Jacobian: `s_i * (1 − s_i)`.  The full Jacobian
+    /// (`J[i,j] = s_i * (δ_ij − s_j)`) is required for mathematically correct
+    /// Softmax gradients; it is implemented for the output layer in
+    /// `backprop.rs::compute_gradients`.  Hidden-layer Softmax uses only the
+    /// diagonal approximation (tracked as FP-095).
     #[inline]
     pub fn derivative(&self, output: f32) -> f32 {
         match self {

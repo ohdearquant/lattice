@@ -31,6 +31,28 @@ pub struct NetworkBuilder {
     layers: Vec<(usize, Activation)>,
 }
 
+/// Reject Softmax on any hidden (non-final) layer.
+///
+/// Softmax normalises over the simplex — meaningful only at the output.
+/// On hidden layers the gradient degrades to the diagonal approximation
+/// `s_i*(1-s_i)`, producing silently wrong gradients (tracked as FP-095).
+fn validate_no_hidden_softmax(layers: &[(usize, Activation)]) -> FannResult<()> {
+    if layers.len() < 2 {
+        return Ok(());
+    }
+    let last_hidden = layers.len() - 1;
+    for (_, activation) in &layers[..last_hidden] {
+        if activation.is_softmax() {
+            return Err(FannError::InvalidBuilder(
+                "Softmax is only valid as the output-layer activation; \
+                 hidden layers must use a pointwise activation"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl NetworkBuilder {
     /// Create a new network builder
     pub fn new() -> Self {
@@ -70,6 +92,7 @@ impl NetworkBuilder {
     /// - Input size was not specified
     /// - No layers were added
     /// - Any layer has size 0
+    /// - Softmax is used on a hidden (non-output) layer
     pub fn build(self) -> FannResult<Network> {
         let input_size = self
             .input_size
@@ -82,6 +105,8 @@ impl NetworkBuilder {
         if input_size == 0 {
             return Err(FannError::InvalidBuilder("Input size cannot be 0".into()));
         }
+
+        validate_no_hidden_softmax(&self.layers)?;
 
         let mut layers = Vec::with_capacity(self.layers.len());
         let mut prev_size = input_size;
@@ -139,6 +164,8 @@ impl NetworkBuilder {
         if input_size == 0 {
             return Err(FannError::InvalidBuilder("Input size cannot be 0".into()));
         }
+
+        validate_no_hidden_softmax(&self.layers)?;
 
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
         let mut layers = Vec::with_capacity(self.layers.len());
@@ -260,5 +287,54 @@ mod tests {
         let layer1 = network1.layer(0).unwrap();
         let layer2 = network2.layer(0).unwrap();
         assert_ne!(layer1.weights(), layer2.weights());
+    }
+
+    #[test]
+    fn test_builder_rejects_hidden_softmax() {
+        // Softmax on a hidden layer should be rejected.
+        let result = NetworkBuilder::new()
+            .input(2)
+            .hidden(4, Activation::Softmax)
+            .output(1, Activation::Linear)
+            .build();
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "expected InvalidBuilder, got {result:?}"
+        );
+
+        // build_with_seed must enforce the same rule.
+        let result = NetworkBuilder::new()
+            .input(2)
+            .hidden(4, Activation::Softmax)
+            .output(1, Activation::Linear)
+            .build_with_seed(0);
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "expected InvalidBuilder from build_with_seed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_builder_output_softmax_is_allowed() {
+        // Softmax on the output layer must continue to work.
+        let result = NetworkBuilder::new()
+            .input(4)
+            .hidden(8, Activation::ReLU)
+            .output(3, Activation::Softmax)
+            .build();
+        assert!(
+            result.is_ok(),
+            "output Softmax should be allowed, got {result:?}"
+        );
+
+        let result = NetworkBuilder::new()
+            .input(4)
+            .hidden(8, Activation::ReLU)
+            .output(3, Activation::Softmax)
+            .build_with_seed(7);
+        assert!(
+            result.is_ok(),
+            "output Softmax with seed should be allowed, got {result:?}"
+        );
     }
 }
