@@ -1632,6 +1632,17 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
         .unwrap_or(1e-6);
 
     let num_attention_heads = get("num_attention_heads")?;
+    let num_key_value_heads = get("num_key_value_heads")?;
+    // Both head counts are used as divisors (head_dim inference below,
+    // QwenConfig::num_groups, GQA grouping). A zero from a caller-supplied
+    // config.json would otherwise be an integer divide-by-zero panic, so reject
+    // it as InvalidInput here rather than crashing deep in the forward pass.
+    if num_attention_heads == 0 || num_key_value_heads == 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "config.json: num_attention_heads ({num_attention_heads}) and \
+             num_key_value_heads ({num_key_value_heads}) must both be non-zero"
+        )));
+    }
     let hidden_size = get("hidden_size")?;
     // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
     let head_dim =
@@ -1642,7 +1653,7 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
         hidden_size,
         num_hidden_layers: get("num_hidden_layers")?,
         num_attention_heads,
-        num_key_value_heads: get("num_key_value_heads")?,
+        num_key_value_heads,
         head_dim,
         intermediate_size: get("intermediate_size")?,
         max_position_embeddings: get("max_position_embeddings")?,
@@ -1686,6 +1697,54 @@ mod tests {
         assert_eq!(cfg.q_dim(), 2048); // 16 * 128
         assert_eq!(cfg.kv_dim(), 1024); // 8 * 128
         assert_eq!(cfg.num_groups(), 2); // 16 / 8
+    }
+
+    #[test]
+    fn test_parse_config_zero_heads_is_error_not_panic() {
+        let tmp = std::env::temp_dir().join("lattice_test_zero_heads");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // num_attention_heads=0 WITH head_dim present: proves the eager
+        // `unwrap_or(hidden_size / num_attention_heads)` divide-by-zero is
+        // guarded even on the head_dim-explicit path.
+        let cfg_zero_attn = tmp.join("zero_attn_heads.json");
+        std::fs::write(
+            &cfg_zero_attn,
+            r#"{"vocab_size":151669,"hidden_size":1024,"num_hidden_layers":1,"num_attention_heads":0,"num_key_value_heads":8,"head_dim":128,"intermediate_size":3072,"max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        let r = parse_qwen_config(&cfg_zero_attn);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "num_attention_heads=0 must be InvalidInput, not panic; got {r:?}"
+        );
+
+        // num_key_value_heads=0: sibling divisor (num_groups / GQA grouping).
+        let cfg_zero_kv = tmp.join("zero_kv_heads.json");
+        std::fs::write(
+            &cfg_zero_kv,
+            r#"{"vocab_size":151669,"hidden_size":1024,"num_hidden_layers":1,"num_attention_heads":16,"num_key_value_heads":0,"head_dim":128,"intermediate_size":3072,"max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        let r = parse_qwen_config(&cfg_zero_kv);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "num_key_value_heads=0 must be InvalidInput, not panic; got {r:?}"
+        );
+
+        // Sanity: a valid config still parses.
+        let cfg_ok = tmp.join("valid.json");
+        std::fs::write(
+            &cfg_ok,
+            r#"{"vocab_size":151669,"hidden_size":1024,"num_hidden_layers":1,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"intermediate_size":3072,"max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_qwen_config(&cfg_ok).is_ok(),
+            "valid config must still parse"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
