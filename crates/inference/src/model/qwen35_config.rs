@@ -423,6 +423,38 @@ impl Qwen35Config {
         self.num_key_value_heads * self.head_dim
     }
 
+    /// **Unstable**: number of layers that hold a KV cache.
+    ///
+    /// Only full-attention (GQA) layers carry a growing KV cache. The
+    /// GatedDeltaNet linear-attention layers carry fixed-size recurrent state
+    /// that does not grow with sequence length. Therefore KV memory scales with
+    /// `num_full_attention_layers()`, not `num_hidden_layers`.
+    ///
+    /// For qwen3.5-0.8B this is 6 (not 24). A regression to all-24-layer KV
+    /// allocation would 4× decode memory; this method makes the invariant
+    /// testable.
+    pub fn kv_cache_layer_count(&self) -> usize {
+        self.num_full_attention_layers()
+    }
+
+    /// **Unstable**: total KV cache bytes consumed per input token.
+    ///
+    /// Formula: `num_full_attention_layers × 2 (K and V) × full_kv_dim × dtype_bytes`.
+    ///
+    /// Pass `dtype_bytes = 2` for f16, `dtype_bytes = 4` for f32.
+    ///
+    /// For qwen3.5-0.8B with f16:
+    /// `6 × 2 × 512 × 2 = 12_288 B/token ≈ 48 MiB at a 4096-token context`.
+    ///
+    /// Numeric identity (preset-specific, NOT a general formula): at `dtype_bytes = 1`,
+    /// `kv_bytes_per_token(1) = 6 × 2 × 512 = 6_144 = 24 × 256 = num_hidden_layers × head_dim`.
+    /// Since `kv_bytes_per_token(1) = num_full × 2 × num_kv_heads × head_dim`, it equals
+    /// `num_hidden_layers × head_dim` exactly when `num_full × 2 × num_kv_heads == num_hidden_layers`
+    /// — true for 0.8B (`6 × 2 × 2 == 24`) but not in general. Do not rely on it across configs.
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> usize {
+        self.num_full_attention_layers() * 2 * self.full_kv_dim() * dtype_bytes
+    }
+
     /// **Unstable**: number of RoPE dimensions (partial rotary factor applied).
     pub fn rope_dim(&self) -> usize {
         (self.head_dim as f32 * self.partial_rotary_factor) as usize
@@ -1051,5 +1083,77 @@ mod tests {
 
         // tie_word_embeddings is taken from the outer wrapper.
         assert!(cfg.tie_word_embeddings);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // KV-cache layer-count invariant tests (issue #170)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// KV cache layer count is the number of full-attention layers, NOT all layers.
+    ///
+    /// This is the primary regression guard: a silent switch to all-24-layer KV
+    /// allocation would change `kv_cache_layer_count()` from 6 to 24 and cause
+    /// this test to fail.
+    #[test]
+    fn kv_layer_count_excludes_linear_layers() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert_eq!(
+            cfg.kv_cache_layer_count(),
+            6,
+            "must be full-attention count"
+        );
+        assert_ne!(
+            cfg.kv_cache_layer_count(),
+            cfg.num_hidden_layers,
+            "kv_cache_layer_count must not equal num_hidden_layers (would 4× decode memory)"
+        );
+    }
+
+    /// Full + linear layers must sum to total hidden layers for every preset.
+    ///
+    /// `compute_layer_types` produces exactly `num_hidden_layers` entries, each
+    /// either FullAttention or LinearAttention, so this invariant must always hold.
+    /// If any preset fails here it indicates a config bug.
+    #[test]
+    fn full_plus_linear_equals_total() {
+        for (name, cfg) in [
+            ("qwen35_0_8b", Qwen35Config::qwen35_0_8b()),
+            ("qwen35_2b", Qwen35Config::qwen35_2b()),
+            ("qwen36_35b_a3b", Qwen35Config::qwen36_35b_a3b()),
+            ("qwen36_27b", Qwen35Config::qwen36_27b()),
+        ] {
+            assert_eq!(
+                cfg.num_full_attention_layers() + cfg.num_linear_attention_layers(),
+                cfg.num_hidden_layers,
+                "{name}: full + linear must equal num_hidden_layers"
+            );
+        }
+    }
+
+    /// KV bytes per token for f16 matches the expected 12_288 B for qwen3.5-0.8B.
+    ///
+    /// Formula: `num_full(6) × 2(K+V) × full_kv_dim(512) × dtype_bytes(2) = 12_288`.
+    /// At a 4096-token context this is 48 MiB.
+    #[test]
+    fn kv_bytes_per_token_f16() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        // 6 layers × 2 (K+V) × 512 (kv_dim) × 2 (f16) = 12_288 B/token = 48 MiB @ 4096 ctx
+        assert_eq!(cfg.kv_bytes_per_token(2), 12_288);
+    }
+
+    /// Numeric identity: kv_bytes_per_token(1) == num_hidden_layers * head_dim for 0.8B.
+    ///
+    /// `6 × 2 × 512 × 1 = 6_144 = 24 × 256`. This is a coincidence specific to
+    /// the 0.8B parameters (full_attention_interval=4, num_kv_heads=2); it does
+    /// NOT generalise across configs and must not be used as a formula.
+    #[test]
+    fn kv_bytes_per_token_identity() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert_eq!(cfg.kv_bytes_per_token(1), 6_144);
+        // Coincidence: matches num_hidden_layers × head_dim for this specific preset only.
+        assert_eq!(
+            cfg.kv_bytes_per_token(1),
+            cfg.num_hidden_layers * cfg.head_dim
+        );
     }
 }
