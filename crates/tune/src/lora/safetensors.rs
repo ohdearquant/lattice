@@ -400,10 +400,25 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
 
     let rank = rank.unwrap_or(0);
 
+    // Recover the LoRA alpha from the safetensors header metadata that
+    // save_peft_safetensors writes. Without this, every adapter would load with
+    // alpha = rank (scale = 1.0), applying a model trained at alpha != rank at the
+    // wrong magnitude. Fall back to `rank` (scale = 1.0) when the metadata is
+    // absent or unparseable, preserving behavior for adapters that lack it.
+    let alpha = SafeTensors::read_metadata(&data)
+        .ok()
+        .and_then(|(_, meta)| {
+            meta.metadata()
+                .as_ref()
+                .and_then(|m| m.get("alpha").cloned())
+        })
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(rank as f32);
+
     Ok(LoraAdapter {
         config: LoraConfig {
             rank,
-            alpha: rank as f32, // default: alpha = rank => scale = 1.0
+            alpha,
             target_modules: target_modules.into_iter().collect(),
         },
         layers,
@@ -879,7 +894,8 @@ mod tests {
         let d_in = 8;
         let d_out = 16;
 
-        // alpha == rank as f32 so the assertion holds: loader always sets alpha = rank as f32
+        // alpha == rank here, so the round-trip lands back on rank either way;
+        // test_alpha_metadata_round_trips covers the alpha != rank case.
         let config = LoraConfig {
             rank,
             alpha: rank as f32,
@@ -922,7 +938,7 @@ mod tests {
 
         assert_eq!(loaded.layers.len(), adapter.layers.len());
         assert_eq!(loaded.config.rank, adapter.config.rank);
-        assert_eq!(loaded.config.alpha, adapter.config.rank as f32);
+        assert_eq!(loaded.config.alpha, adapter.config.alpha);
 
         for (key, orig) in &adapter.layers {
             let got = loaded
@@ -941,6 +957,77 @@ mod tests {
                 assert!((g - w).abs() < f32::EPSILON, "B mismatch: {g} vs {w}");
             }
         }
+    }
+
+    #[test]
+    fn test_alpha_metadata_round_trips() {
+        // Regression: an adapter trained with alpha != rank must load with its
+        // saved alpha, not alpha = rank. The old loader hardcoded alpha = rank,
+        // so a rank-4 / alpha-16 adapter loaded at scale 1.0 instead of 4.0.
+        use tempfile::NamedTempFile;
+
+        let rank = 4;
+        let d_in = 8;
+        let d_out = 16;
+        let config = LoraConfig {
+            rank,
+            alpha: 16.0,
+            target_modules: vec!["q_proj".to_string()],
+        };
+
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0usize, "q_proj".to_string()),
+            LoraLayer {
+                a: (0..rank * d_in).map(|i| i as f32 * 0.01).collect(),
+                b: (0..d_out * rank).map(|i| i as f32 * 0.1).collect(),
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+
+        let adapter = LoraAdapter::new(config, layers);
+        let temp = NamedTempFile::new().unwrap();
+        save_peft_safetensors(&adapter, temp.path()).unwrap();
+        let loaded = load_peft_safetensors(temp.path()).unwrap();
+
+        assert_eq!(loaded.config.rank, 4);
+        assert_eq!(loaded.config.alpha, 16.0);
+        assert!((loaded.config.alpha - 16.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_alpha_falls_back_to_rank_without_metadata() {
+        // An adapter file with no `alpha` in its header (e.g. a raw PEFT export)
+        // must fall back to alpha = rank (scale = 1.0), not panic or zero out.
+        use safetensors::Dtype;
+        use safetensors::tensor::{TensorView, serialize};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_alpha.safetensors");
+
+        let a_data: Vec<f32> = (0..2 * 8).map(|i| i as f32 * 0.01).collect();
+        let b_data: Vec<f32> = (0..16 * 2).map(|i| i as f32 * 0.1).collect();
+        let a_bytes: Vec<u8> = a_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![2, 8], &a_bytes).unwrap(),
+        );
+        tensors.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![16, 2], &b_bytes).unwrap(),
+        );
+
+        let bytes = serialize(&tensors, &None).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let loaded = load_peft_safetensors(&path).unwrap();
+        assert_eq!(loaded.config.rank, 2);
+        assert_eq!(loaded.config.alpha, 2.0);
     }
 
     #[test]
