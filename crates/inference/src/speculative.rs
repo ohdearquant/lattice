@@ -1210,12 +1210,21 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     let gdn_snap = target.snapshot_gdn_states();
 
     // Generate draft with per-token logits for probabilistic rejection sampling (ADR-050).
-    let mtp_draft = verifier.draft_tokens_with_logits(
+    // #282: if draft generation fails after advancing the verifier cache, restore both
+    // caches to their pre-call positions so the caller can retry or propagate cleanly.
+    let mtp_draft = match verifier.draft_tokens_with_logits(
         current_token_id,
         current_position,
         main_hidden_at_current_position,
         eos_token,
-    )?;
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = verifier.rollback_cache_to(mtp_start);
+            target.restore_gdn_states(&gdn_snap);
+            return Err(e);
+        }
+    };
     let draft = mtp_draft.tokens;
     let draft_logits = mtp_draft.logits;
     let draft_len = draft.len();
@@ -1245,19 +1254,41 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     // called before `rejection_sample_draft` so that implementors that maintain a
     // speculation checkpoint (e.g. the Metal adapter) have an active checkpoint to roll
     // back into when `rollback_cache_to` is called below — even in the full-rejection case.
-    let target_logits = target.verify_tokens(&draft, current_position + 1)?;
+    // #282: verify_tokens advances the target cache; roll back both caches on error so
+    // the caller sees a consistent pre-call state.
+    let target_logits = match target.verify_tokens(&draft, current_position + 1) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = verifier.rollback_cache_to(mtp_start);
+            let _ = target.rollback_cache_to(target_start);
+            target.restore_gdn_states(&gdn_snap);
+            return Err(e);
+        }
+    };
     let target_forwards = 1;
 
     // Probabilistic rejection sampling (ADR-050): pass draft logits and greedy=false so
     // every draft token is accepted with probability min(1, p(x)/q(x)).
-    let rs = rejection_sample_draft(
+    // #282: rejection_sample_draft doesn't touch the caches, but it is fallible (e.g. on a
+    // draft/logits length mismatch). By this point verify_tokens has already advanced the
+    // target cache and draft generation advanced the verifier cache, so an early Err here
+    // must restore both to their pre-call positions.
+    let rs = match rejection_sample_draft(
         &draft,
         &draft_logits,
         initial_target_logits,
         &target_logits,
         false,
         None,
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = verifier.rollback_cache_to(mtp_start);
+            let _ = target.rollback_cache_to(target_start);
+            target.restore_gdn_states(&gdn_snap);
+            return Err(e);
+        }
+    };
     let mut accepted_count = rs.accepted_count;
     let mut fallback_token = if rs.had_rejection {
         rs.bonus_token
@@ -1393,7 +1424,15 @@ fn mtp_verify_precomputed_draft<T: MtpTargetVerifier>(
         });
     }
 
-    let target_logits = target.verify_tokens(&draft, current_position + 1)?;
+    // #282: verify_tokens advances the target cache; roll back to target_start on error
+    // so the caller sees a consistent pre-call state (no partial forward visible).
+    let target_logits = match target.verify_tokens(&draft, current_position + 1) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = target.rollback_cache_to(target_start);
+            return Err(e);
+        }
+    };
     let target_forwards = 1usize;
 
     let mut accepted_count = 1;
@@ -2503,6 +2542,74 @@ mod tests {
         assert_eq!(r1.fallback_token, r2.fallback_token);
     }
 
+    // A verifier whose `verify_tokens` advances `cache_pos` then immediately
+    // returns an error — exercises the #282 error-path rollback in
+    // `mtp_verify_precomputed_draft` (and, by structural analogy, in
+    // `mtp_verify_draft`).  We use the precomputed helper because constructing a
+    // real `MtpVerifier` requires a live model.
+    struct ErroringTargetVerifier {
+        cache_pos: usize,
+    }
+
+    impl MtpTargetVerifier for ErroringTargetVerifier {
+        fn cache_position(&self) -> usize {
+            self.cache_pos
+        }
+        fn rollback_cache_to(
+            &mut self,
+            seq_len: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            self.cache_pos = seq_len;
+            Ok(())
+        }
+        fn verify_tokens(
+            &mut self,
+            tokens: &[u32],
+            _start_pos: usize,
+        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            // Advance the cache before returning the error, mimicking a real
+            // implementation that commits the forward pass then discovers a
+            // shape mismatch in the output.
+            self.cache_pos += tokens.len();
+            Err(crate::error::InferenceError::Inference(
+                "simulated verify_tokens failure".into(),
+            ))
+        }
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            Vec::new()
+        }
+        fn restore_gdn_states(&mut self, _snapshot: &crate::attention::gdn::GdnSnapshot) {}
+    }
+
+    #[test]
+    fn mtp_verify_error_restores_target_cache() {
+        // Guards the #282 footgun: if `verify_tokens` advances the target cache
+        // and then returns an error, the cache must be rolled back to its
+        // pre-call position so subsequent calls see a consistent starting state.
+        //
+        // We use `mtp_verify_precomputed_draft` (the test helper) rather than
+        // `mtp_verify_draft` because the latter requires a real `MtpVerifier`
+        // backed by a model.  The rollback logic for the production path is
+        // structurally identical.
+        let target_start = 42usize;
+        // initial argmax = draft[0] so execution reaches verify_tokens
+        let initial = logits_with_argmax(VOCAB, 5);
+        let draft = vec![5u32, 6, 7]; // draft[0]==5 matches initial argmax; not EOS
+
+        let mut target = ErroringTargetVerifier {
+            cache_pos: target_start,
+        };
+
+        let result =
+            mtp_verify_precomputed_draft(draft, target_start, &initial, None, &mut target, 4);
+
+        assert!(result.is_err(), "expected Err from erroring verifier");
+        assert_eq!(
+            target.cache_pos, target_start,
+            "cache_pos must be restored to pre-call value on error (#282)"
+        );
+    }
+
     // -- generate_with_speculation integration tests --
 
     #[test]
@@ -2744,6 +2851,60 @@ mod tests {
         assert_eq!(
             spec_out, greedy_out,
             "speculative output diverged from greedy: spec={spec_out:?} greedy={greedy_out:?}"
+        );
+    }
+
+    #[test]
+    fn generate_with_speculation_matches_greedy_with_ties() {
+        // Regression guard for #280 (last-wins tie-break divergence).
+        //
+        // The existing `generate_with_speculation_matches_greedy` uses one-hot logits
+        // so the top logit is never tied.  This test places TWO entries at the same
+        // maximum value so `argmax`'s first-wins tie-break is exercised on every step.
+        // Both greedy and speculative paths must resolve the tie identically (lower
+        // token-id wins) and produce the same output sequence.
+        //
+        // forward_fn: tokens 2 and 5 share the peak (first-wins → always 2).
+        // Prompt repeats the cycle twice so the 2-gram speculator fires.
+        let prompt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1];
+        let eos = 50u32;
+        let max_new = 10usize;
+
+        // The tied forward: token 2 and token 5 are both at the peak; argmax returns
+        // the first (lower) index, so greedy always emits 2 regardless of input token.
+        let tied_fwd = |_tok: u32, _pos: usize| -> Vec<f32> {
+            let mut l = vec![0.0f32; 60];
+            l[2] = 1.0; // first tied winner — argmax must return this
+            l[5] = 1.0; // second tied entry at the same value
+            l
+        };
+
+        // Reference greedy: identical logic, independent closure.
+        let greedy_fwd = |_tok: u32, _pos: usize| -> Vec<f32> {
+            let mut l = vec![0.0f32; 60];
+            l[2] = 1.0;
+            l[5] = 1.0;
+            l
+        };
+        let mut ref_tokens = prompt.clone();
+        let mut ref_pos = prompt.len();
+        let mut greedy_out = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let logits = greedy_fwd(*ref_tokens.last().unwrap(), ref_pos);
+            let t = argmax(&logits) as u32;
+            if t == eos {
+                break;
+            }
+            greedy_out.push(t);
+            ref_tokens.push(t);
+            ref_pos += 1;
+        }
+
+        let spec_out = generate_with_speculation(&prompt, max_new, eos, tied_fwd, 5, 4);
+
+        assert_eq!(
+            spec_out, greedy_out,
+            "speculative output diverged from greedy under tie-break: spec={spec_out:?} greedy={greedy_out:?}"
         );
     }
 
