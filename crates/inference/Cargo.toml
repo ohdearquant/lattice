@@ -137,6 +137,10 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_concurrent"
 required-features = ["f16", "metal-gpu"]
 
+[[example]]
+name = "decode_profile"
+required-features = ["f16", "metal-gpu"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 approx = "0.5"
