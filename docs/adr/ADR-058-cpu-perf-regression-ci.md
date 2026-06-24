@@ -1,8 +1,17 @@
 # ADR-058: CPU Performance Regression Tracking in CI
 
-**Status**: Draft
+**Status**: Superseded
 **Date**: 2026-05-24
 **Crate**: workspace (CI infrastructure, touches lattice-inference + lattice-embed bench surfaces)
+
+## Status update (2026-06-24)
+
+The proposed `bench-regression.yml` workflow was never created (confirmed: `ls .github/workflows/`
+shows `app-binaries.yml`, `bench-update.yml`, `ci.yml`, `e2e-parity.yml` — no
+`bench-regression.yml`). The actual regression gate shipped as `.github/workflows/e2e-parity.yml`
+(PR #192), which runs HF transformers vs lattice on the same macOS runner and requires first-3-token
+greedy parity. Criterion micro-benchmarks are collected as trend data by `bench-update.yml` but are
+not a merge gate. This ADR's CPU-bench-as-gate design was superseded by the e2e-parity approach.
 
 ## Context
 

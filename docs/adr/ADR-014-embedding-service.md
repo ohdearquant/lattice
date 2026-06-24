@@ -60,6 +60,16 @@ divergence between current and reference embedding distributions. Used for:
 Not yet wired into production — the algorithms are proven and tested,
 awaiting integration into the embedding pipeline.
 
+## Implementation status (2026-06-24)
+
+The `EmbeddingService` trait, `NativeEmbeddingService`, and `CachedEmbeddingService` are
+implemented at `crates/embed/src/service/` (native.rs, cached.rs). The transport/drift submodule
+shown in §Decision as `embed/src/service/transport/` was not placed there. Optimal transport
+and drift detection shipped as a standalone crate: `crates/transport/src/` (sinkhorn.rs,
+divergence.rs, barycenter.rs, online_drift.rs, etc.). The embedding crate (`crates/embed/`) does
+not import `crates/transport/`; wiring drift detection into the embedding pipeline remains
+a future step.
+
 ## Consequences
 
 - `ml/embed` is the only crate that imports `ml/inference`.

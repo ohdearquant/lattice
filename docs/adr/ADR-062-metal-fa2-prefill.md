@@ -1,11 +1,22 @@
 # ADR-062: Metal FlashAttention-2 Prefill + KV Cache Quantization Chain
 
-**Status**: Proposed
+**Status**: Proposed (partially superseded — see implementation status below)
 **Date**: 2026-05-27
 **Crate**: lattice-inference (Metal shaders, KV cache). Phase 0 proposes extracting shaders into a `crates/lattice-metal/` directory tree. **This introduces a new workspace member** — see Crate Layout below for dependency direction, feature gating, and publish-order consequences. If the team prefers keeping shaders inside `crates/inference/`, the same file structure applies under `crates/inference/src/metal/` without a new crate.
 **Research**: RQ-4 (`workspaces/20260527/04.md`)
 **Issues**: #126 (Metal FA2 prefill), #85 (MLX kernel study), #86 (shader extraction)
 **KG entities**: `Metal FA2 Prefill` (0dfbc841), `Metal Fused Attention` (48ee18b2), `FlashAttention-2` (63602a7f), `Chunked Prefill` (018193b3)
+
+## Implementation status (2026-06-24)
+
+The prefill bottleneck described in §Context was solved by a different mechanism than the FA2
+Metal shader proposed here. The shipped solution is chunked batched prefill:
+`forward_prefill_batched_chunk` at `crates/inference/src/forward/metal_qwen35.rs:7878` (PR #228,
+1.78× TTFT improvement). Tiled Q4 GEMM landing on Apple7+ (PRs #265/#270/#283) further reduced
+prefill time. The full Metal FA2 kernel (new shader extraction into `crates/lattice-metal/`) and
+KV-cache quantization chain described in this ADR were not built; `prefix.rs:60` still stores
+`Arc<[f32]>` pages. The ADR remains as the historical design proposal; its KV-quant chain is an
+open future direction.
 
 ---
 

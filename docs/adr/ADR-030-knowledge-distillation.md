@@ -91,6 +91,15 @@ The method pairs them by index (returns `TuneError::DimensionMismatch` on length
 - `to_training_examples` uses index-aligned slices (results, context_embeddings, message_embeddings). If the caller filters results before passing them, the index alignment breaks. The `DimensionMismatch` error catches length mismatches but not index-misalignment bugs where lengths happen to match after filtering.
 - `MAX_PROMPT_LENGTH = 50_000` is conservative for most teacher APIs but may need adjustment for context-heavy conversations with many messages.
 
+## Implementation status (2026-06-24)
+
+The data contract (`LabelingResult`, `TrainingExample`, `DistillationStats`) and the
+`DistillationPipeline` struct are fully defined and tested. Actual HTTP teacher calls remain
+placeholder: `crates/tune/src/distill/pipeline/distill.rs:65` comments "This is a placeholder
+— actual implementation would call the teacher API." No `reqwest` HTTP requests are made; the
+`label_single` and `label_batch` methods do not hit any external endpoint. The pipeline struct
+and config presets are ready for wiring once a real HTTP client is added.
+
 ## References
 
 - `crates/tune/src/distill/pipeline/distill.rs` — `DistillationPipeline`, `label_single`, `label_batch`, `to_training_examples`

@@ -7,6 +7,18 @@
 **Depends on**: ADR-059 (ModelSpec, ForwardCtx, LayerMetrics schema — **ADR-061 is the authoritative source for LayerMetrics**)
 **Consumed by**: ADR-060 (Structured Pruning uses CheapOnline metrics as scoring substrate)
 
+## Implementation status (2026-06-24)
+
+Phase 1 is partially shipped. `LayerMetrics` and `ForwardMetrics` exist at
+`crates/inference/src/metrics.rs:30` and `56` respectively. `MetricsMode` (Off / CheapOnline /
+AttentionProfile / HeavyDiagnostics) and `OnlineSoftmaxEntropy` accumulator are implemented in the
+same file. `BlockInfluence` and `BlockInfluenceAccumulator` ship at `crates/inference/src/pruning.rs:62`
+and `121`. `AttentionEntropy` as a standalone type was never created; attention entropy is stored as a
+field (`entropy: Option<Vec<f32>>`) on `LayerMetrics`. The `MetricSink` trait, SQLite recorder, JSONL
+event writer, and the experiment runner CLI (Phases 2–5) are not yet built. The `CalibrationObserver`
+trait and `ForwardCtx` hooks are described in the `pruning.rs` module doc as "ADR-060 D1/P0 work
+(future PR)" and are not present in source as of this date.
+
 ## Context
 
 Lattice's current observability surface is PPL (strided sliding-window, ADR-044 step 4) and wall-clock throughput (bench scripts via `scripts/bench-compare.sh`). This is sufficient for "config A has PPL X, config B has PPL Y" but insufficient for _architectural insight_: which layers are doing useful work, which heads are redundant, where the memory bandwidth bottleneck is, and whether a given layer is a candidate for replacement, removal, or compression.

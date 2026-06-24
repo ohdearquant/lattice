@@ -135,6 +135,15 @@ pub trait Teacher {
 provider set. If provider count exceeds 6-8, this alternative should be revisited. The
 `Custom(String)` variant provides escape hatch for unforeseen providers.
 
+## Implementation status (2026-06-24)
+
+`TeacherConfig`, `TeacherProvider`, and `EndpointSecurity` are implemented at
+`crates/tune/src/distill/teacher/config.rs` and `security.rs`. However, actual HTTP API calls
+to teacher providers are placeholders. `crates/tune/src/distill/pipeline/distill.rs:12` states:
+"This is a placeholder implementation. The actual API calls would need to be implemented with a
+proper HTTP client like `reqwest`." No `reqwest` or HTTP client dependency is wired. The
+`DistillationPipeline::label_single` and `label_batch` methods do not make real network calls.
+
 ## References
 
 - TeacherConfig: `crates/tune/src/distill/teacher.rs`

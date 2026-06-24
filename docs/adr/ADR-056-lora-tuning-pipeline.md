@@ -722,3 +722,14 @@ changes require a new ADR.
 - ADR-054 — Rotation-Aware LoRA Training (RoLoRA; depends on this ADR)
 - Hu et al. 2021 — "LoRA: Low-Rank Adaptation of Large Language Models" — https://arxiv.org/abs/2106.09685
 - Dettmers et al. 2023 — "QLoRA: Efficient Finetuning of Quantized LLMs" — https://arxiv.org/abs/2305.14314
+
+## Implementation status (2026-06-24)
+
+The `LoraTrainLoop` struct and the `train/lora/` directory proposed in this ADR were never
+created. Real backward-pass LoRA training shipped via a different code path:
+`crates/tune/src/bin/train_grad_full.rs` is the training binary, and backward pass primitives
+live under `crates/tune/src/` (lora/, train/ sub-directories). The
+`crates/inference/src/backward/` module (attention_gqa.rs, gradcheck.rs, ops.rs, tape.rs)
+holds the autograd tape. Anyone extending LoRA training should start from
+`crates/tune/src/bin/train_grad_full.rs` and `crates/tune/src/lora/online.rs`, not from
+the `LoraTrainLoop` / `train/lora/` paths described in this ADR's architecture section.

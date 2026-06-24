@@ -676,3 +676,14 @@ lattice_pruning.json        # method, sparsity stats
 - Lottery Ticket Hypothesis: `6b08bfba`
 - QuaRot (existing): `e754741e`
 - lattice-inference (existing): `6c0a97df`
+
+## Implementation status (2026-06-24)
+
+Only the D2 ShortGPT block-influence scorer has shipped. `BlockInfluence` and
+`BlockInfluenceAccumulator` are implemented at `crates/inference/src/pruning.rs:62` and `121`.
+The `CalibrationObserver` trait (D1/P0), `Wanda` per-channel activation scorer, and `SliceGPT`
+PCA-rotation infrastructure are not present in source — `pruning.rs` module doc notes that
+`CalibrationObserver` and `ForwardCtx` hooks are "ADR-060 D1/P0 work (future PR)". Grep for
+`Wanda`, `SliceGPT`, and `CalibrationObserver` in `crates/` returns no type definitions. The
+`OrthogonalBasis` trait and `BasisKind` enum referenced in the ADR-044 Amendment are also not
+yet implemented (they are a design proposal).
