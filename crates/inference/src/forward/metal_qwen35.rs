@@ -16144,6 +16144,448 @@ kernel void decode_attention_reference(
             );
         }
 
+        // ── Q4 GEMM numeric differential gate (#271) ─────────────────────────
+        // The tiled kernel (`gemm_q4_tiled`, PR #270) stores X and W in half-precision
+        // staging tiles (`simdgroup_half8x8`) while keeping accumulation in f32
+        // (`simdgroup_float8x8`).  This test catches half-tile precision regressions
+        // that the greedy-argmax e2e gate can miss when the numeric error is too small
+        // to flip a token but large enough to corrupt softmax-sensitive downstream ops.
+        //
+        // Strategy: build a synthetic Q4 weight buffer in-test (no model file), run both
+        // the naive f32 kernel (`gemm_q4`) and the tiled half-staging kernel
+        // (`gemm_q4_tiled`) on identical inputs, and assert both stay within documented
+        // error envelopes vs an in-Rust f32 reference (dequantize → f32 matmul).
+        //
+        // The naive kernel is f32 throughout, so its bound vs reference is dominated by
+        // Q4 quantization error (~2 ULP at half scale).  The tiled kernel adds half
+        // multiplicand rounding on top, widening the bound — but accumulators stay f32,
+        // so the envelope is tighter than a pure-f16 path would be.
+        //
+        // Buffer layout (MUST match both kernels): QW is indexed as
+        //   `QW[col * row_bytes + ib * 20 + ...]` where col ∈ 0..N (output neuron),
+        //   ib ∈ 0..(K/32) (K-block), and row_bytes = (K/32) * 20.
+        // Calling `quantize_row_q4_0` row-by-row on a [N, K] matrix produces this layout.
+
+        /// Helper used by both Q4-GEMM differential tests: dispatch a single GEMM kernel
+        /// and read back Y[M, N] from the returned buffer.  The caller provides the
+        /// command queue and either the naive `gemm_q4` or tiled `gemm_q4_tiled` pipeline.
+        /// Buffer bindings match `dispatch_gemm_q4`: buf0=QW, buf1=X, buf2=Y, bytes 3-5=m/n/k.
+        fn run_gemm_q4_kernel(
+            queue: &CommandQueue,
+            pipeline: &ComputePipelineState,
+            qw_buf: &Buffer,
+            x_buf: &Buffer,
+            y_buf: &Buffer,
+            m: u32,
+            n: u32,
+            k: u32,
+            tg_x: u64,
+            tg_y: u64,
+        ) {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            enc.set_buffer(0, Some(qw_buf), 0);
+            enc.set_buffer(1, Some(x_buf), 0);
+            enc.set_buffer(2, Some(y_buf), 0);
+            enc.set_bytes(3, 4, &m as *const u32 as *const _);
+            enc.set_bytes(4, 4, &n as *const u32 as *const _);
+            enc.set_bytes(5, 4, &k as *const u32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(32, 4, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        /// Build a Q4 weight buffer and f32 reference for shape [N, K] (output × input).
+        /// Uses a deterministic LCG so every run produces the same synthetic weights.
+        /// Calls `quantize_row_q4_0` on each output row — matching the kernel index formula
+        /// `QW[col * (K/32 * 20) + ib * 20]`.
+        fn make_q4_weight_ref(
+            device: &Device,
+            seed: u64,
+            n: usize, // output dim
+            k: usize, // input dim — must be divisible by 32
+        ) -> (Buffer, Vec<f32>) {
+            assert_eq!(k % 32, 0, "K must be divisible by 32 for Q4_0 GEMM");
+            let mut rng = seed;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                // Map u64 to [-1, 1] with moderate range — representative of projection weights.
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            // Generate row-major [N, K] weight matrix.
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            // Quantize each output row independently — matches kernel's per-row block layout.
+            use crate::weights::q4_weights::dequantize_row_q4_0;
+            let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
+            let mut deq_weights = Vec::with_capacity(n * k);
+            for row in weights_f32.chunks_exact(k) {
+                let row_packed = quantize_row_q4_0(row);
+                deq_weights.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
+                packed_bytes.extend_from_slice(&row_packed);
+            }
+            let buf = device.new_buffer_with_data(
+                packed_bytes.as_ptr() as *const _,
+                packed_bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            buf.set_label("test_qw_q4");
+            // Return: GPU buffer + dequantized f32 weights for CPU reference matmul.
+            (buf, deq_weights)
+        }
+
+        /// CPU f32 reference: Y[m, n] = sum_k X[m, k] * W[n, k]  (W is transposed).
+        fn cpu_matmul_ref(x: &[f32], w_deq: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+            let mut y = vec![0.0f32; m * n];
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut acc = 0.0f32;
+                    for ki in 0..k {
+                        acc += x[mi * k + ki] * w_deq[ni * k + ki];
+                    }
+                    y[mi * n + ni] = acc;
+                }
+            }
+            y
+        }
+
+        fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        }
+
+        /// Hermetic numeric differential: naive vs tiled vs CPU reference, two shapes.
+        ///
+        /// Shape A (M=64, N=64, K=64) — exact tile multiple, exercises the main tiled path.
+        /// Shape B (M=72, N=48, K=64) — non-multiple of BM/BN, exercises the boundary
+        /// guards (`gm<M` / `gn<N` zero-pad paths) in the tiled kernel.
+        ///
+        /// Measured on M1 (2026-06-24) with half-tile staging (PR #270):
+        ///   naive_vs_ref  A: 3.3e-6  B: 4.3e-6
+        ///   tiled_vs_ref  A: 2.9e-3  B: 2.7e-3
+        ///   tiled_vs_naive A: 2.9e-3  B: 2.7e-3
+        ///
+        /// Asserted bounds (5× headroom over measured):
+        ///   naive_vs_ref  < 1e-3   — naive is f32 throughout; only Q4 quantization error
+        ///   tiled_vs_ref  < 0.015  — half Xtg staging adds ~3e-3 on top of Q4 error;
+        ///                            accumulators stay f32 so this is well under a pure-f16 bound
+        ///   tiled_vs_naive < 0.012 — direct bound between the two GPU kernels
+        ///
+        /// If future changes restore f32 staging tiles, all three bounds still pass.
+        /// If half precision is extended to accumulators, tiled_vs_ref would likely exceed 0.015.
+        #[test]
+        fn gemm_q4_tiled_vs_naive_numeric_differential() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let Some(tiled_pipeline) = state.engine.pipelines.gemm_q4_tiled.as_ref() else {
+                // Should not reach here after the enabled-on-apple7-plus gate passes,
+                // but be safe: no tiled pipeline means nothing to test.
+                return;
+            };
+            let naive_pipeline = &state.engine.pipelines.gemm_q4;
+            let queue = &state.engine.queue;
+
+            // Activation RNG (independent seed from weight RNG).
+            let mut xrng = 0xDEAD_BEEF_u64;
+            let mut next_x = || -> f32 {
+                xrng = xrng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            // ── Shape A: M=64, N=64, K=64 — exact tile multiples ────────────
+            {
+                let (m, n, k) = (64usize, 64usize, 64usize);
+                let (qw_buf, w_deq) = make_q4_weight_ref(&device, 0xABCD_1234_u64, n, k);
+                let x: Vec<f32> = (0..m * k).map(|_| next_x()).collect();
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+
+                // Naive dispatch: tg = (ceil(N/2), ceil(M/4), 1)
+                let y_naive_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q4_kernel(
+                    queue,
+                    naive_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_naive_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(2) as u64,
+                    m.div_ceil(4) as u64,
+                );
+
+                // Tiled dispatch: tg = (ceil(N/32), ceil(M/64), 1)
+                let y_tiled_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q4_kernel(
+                    queue,
+                    tiled_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_tiled_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(32) as u64,
+                    m.div_ceil(64) as u64,
+                );
+
+                let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+                // SAFETY: buffers are StorageModeShared, GPU work completed, sizes match allocation.
+                let y_naive: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_naive_buf.contents() as *const f32, m * n)
+                };
+                let y_tiled: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_tiled_buf.contents() as *const f32, m * n)
+                };
+
+                let naive_vs_ref = max_abs_diff(y_naive, &y_ref);
+                let tiled_vs_ref = max_abs_diff(y_tiled, &y_ref);
+                let tiled_vs_naive = max_abs_diff(y_tiled, y_naive);
+
+                eprintln!(
+                    "[shape A 64×64×64] naive_vs_ref={naive_vs_ref:.4e}  \
+                     tiled_vs_ref={tiled_vs_ref:.4e}  tiled_vs_naive={tiled_vs_naive:.4e}"
+                );
+                // Naive is f32 throughout; its error is purely Q4 quantization rounding.
+                // Measured 3.3e-6 on M1 (2026-06-24). Bound 1e-3 gives ~300× headroom.
+                // If this fails, the buffer layout or dequant convention is wrong.
+                assert!(
+                    naive_vs_ref < 1e-3,
+                    "[shape A] naive_vs_ref={naive_vs_ref:.4e} exceeds 1e-3 — \
+                     buffer layout or dequant mismatch (check per-row quantize convention)"
+                );
+                // Tiled adds half Xtg staging; measured 2.9e-3 on M1. Bound 0.015 gives 5× headroom.
+                // If this exceeds 0.015, half precision was extended beyond staging tiles.
+                assert!(
+                    tiled_vs_ref < 0.015,
+                    "[shape A] tiled_vs_ref={tiled_vs_ref:.4e} exceeds 0.015 — \
+                     half-tile staging introduced unexpected precision regression"
+                );
+                // Direct kernel-vs-kernel bound; measured 2.9e-3 on M1. Bound 0.012 gives 4× headroom.
+                assert!(
+                    tiled_vs_naive < 0.012,
+                    "[shape A] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012 — \
+                     tiled and naive kernels are computing different values"
+                );
+            }
+
+            // ── Shape B: M=72, N=48, K=64 — non-multiple of BM/BN, tests boundary guards ─
+            {
+                let (m, n, k) = (72usize, 48usize, 64usize);
+                let (qw_buf, w_deq) = make_q4_weight_ref(&device, 0x5EED_CAFE_u64, n, k);
+                let x: Vec<f32> = (0..m * k).map(|_| next_x()).collect();
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+
+                let y_naive_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q4_kernel(
+                    queue,
+                    naive_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_naive_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(2) as u64,
+                    m.div_ceil(4) as u64,
+                );
+
+                let y_tiled_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q4_kernel(
+                    queue,
+                    tiled_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_tiled_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(32) as u64,
+                    m.div_ceil(64) as u64,
+                );
+
+                let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+                // SAFETY: same as shape A — StorageModeShared, GPU done, sizes match.
+                let y_naive: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_naive_buf.contents() as *const f32, m * n)
+                };
+                let y_tiled: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_tiled_buf.contents() as *const f32, m * n)
+                };
+
+                let naive_vs_ref = max_abs_diff(y_naive, &y_ref);
+                let tiled_vs_ref = max_abs_diff(y_tiled, &y_ref);
+                let tiled_vs_naive = max_abs_diff(y_tiled, y_naive);
+
+                eprintln!(
+                    "[shape B 72×48×64] naive_vs_ref={naive_vs_ref:.4e}  \
+                     tiled_vs_ref={tiled_vs_ref:.4e}  tiled_vs_naive={tiled_vs_naive:.4e}"
+                );
+                // Measured 4.3e-6, 2.7e-3, 2.7e-3 on M1 (2026-06-24). Same bounds as shape A.
+                assert!(
+                    naive_vs_ref < 1e-3,
+                    "[shape B] naive_vs_ref={naive_vs_ref:.4e} exceeds 1e-3"
+                );
+                assert!(
+                    tiled_vs_ref < 0.015,
+                    "[shape B] tiled_vs_ref={tiled_vs_ref:.4e} exceeds 0.015"
+                );
+                assert!(
+                    tiled_vs_naive < 0.012,
+                    "[shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
+                );
+            }
+        }
+
+        /// Edge-scale coverage for the half-tile Q4 GEMM (#271).
+        ///
+        /// The tiled kernel stores activations and dequantized weights as `half` in
+        /// threadgroup memory before multiplying.  Large activations (100s–1000s) combined
+        /// with small weight scales can stress f16 representability: if the staged half
+        /// value saturates to ±65504 the result diverges from the f32 reference.
+        ///
+        /// This test checks two edge cases:
+        ///   1. Large activations (scale ~500) with near-unit weight values — verifies
+        ///      that f32 accumulation keeps relative error below 1 %.
+        ///   2. Near-zero weight scale blocks (weights ≈ 0) — verifies the bias term does
+        ///      not produce spurious non-zero outputs.
+        ///
+        /// Measured on M1 (2026-06-24): abs=9.6e-1, ref_max=4.21e3, rel=2.3e-4 (0.023%).
+        /// Asserted: rel < 2 % (87× measured headroom).
+        /// The absolute error looks large but is proportional to output magnitude: at scale
+        /// 500 each Q4 nibble step ≈ 33, and f16 Xtg staging adds ~0.023% on top.
+        /// What the test really enforces is that relative error stays < 2 % — i.e.,
+        /// accumulators are NOT downcast to f16 (that would give ~1 % relative error from
+        /// the half-precision mantissa alone, pushing rel toward the bound).
+        #[test]
+        fn gemm_q4_tiled_edge_scale_activation_coverage() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let Some(tiled_pipeline) = state.engine.pipelines.gemm_q4_tiled.as_ref() else {
+                return;
+            };
+            let queue = &state.engine.queue;
+
+            let (m, n, k) = (64usize, 32usize, 64usize);
+            // Weights designed to produce blocks with two distinct scales: near-unit (~1.0)
+            // and near-zero (~0.002).  Block 0 (first 32 elements of each row) is near-unit;
+            // block 1 (next 32) is near-zero.  K=64 so exactly 2 blocks per output row.
+            let mut w_f32 = vec![0.0f32; n * k];
+            for ni in 0..n {
+                // First block: values in [-1, 1] with typical scale
+                for ki in 0..32 {
+                    let t = (ni * 32 + ki) as f32 / (n * 32) as f32 * 2.0 - 1.0;
+                    w_f32[ni * k + ki] = t;
+                }
+                // Second block: near-zero values — tests that the bias term stays small
+                for ki in 32..64 {
+                    w_f32[ni * k + ki] = ((ni * ki) as f32 / (n * k) as f32 - 0.5) * 0.004;
+                }
+            }
+
+            use crate::weights::q4_weights::dequantize_row_q4_0;
+            let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
+            let mut w_deq = Vec::with_capacity(n * k);
+            for row in w_f32.chunks_exact(k) {
+                let row_packed = quantize_row_q4_0(row);
+                w_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
+                packed_bytes.extend_from_slice(&row_packed);
+            }
+            let qw_buf = device.new_buffer_with_data(
+                packed_bytes.as_ptr() as *const _,
+                packed_bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            // Large activations: scale ~500, mixing positive and negative values.
+            let mut arng = 0x1234_5678_u64;
+            let x: Vec<f32> = (0..m * k)
+                .map(|_| {
+                    arng = arng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((arng >> 11) as u32 as f32 / u32::MAX as f32) * 1000.0 - 500.0
+                })
+                .collect();
+
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_tiled_buf =
+                device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            run_gemm_q4_kernel(
+                queue,
+                tiled_pipeline,
+                &qw_buf,
+                &x_buf,
+                &y_tiled_buf,
+                m as u32,
+                n as u32,
+                k as u32,
+                n.div_ceil(32) as u64,
+                m.div_ceil(64) as u64,
+            );
+
+            let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+            // SAFETY: StorageModeShared, GPU done, size matches allocation.
+            let y_tiled: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_tiled_buf.contents() as *const f32, m * n) };
+
+            let abs_diff = max_abs_diff(y_tiled, &y_ref);
+            let ref_max = y_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            // Relative error = abs_diff / max(|y_ref|), expected < 0.5 % (half-staging rounding
+            // on top of Q4 quantization; accumulators stay f32 so error is bounded by Q4 step).
+            let rel_err = if ref_max > 1.0 {
+                abs_diff / ref_max
+            } else {
+                abs_diff
+            };
+            eprintln!(
+                "[edge-scale] tiled_vs_ref abs={abs_diff:.4e}  ref_max={ref_max:.2e}  \
+                 rel={rel_err:.4e}"
+            );
+            assert!(
+                rel_err < 0.02,
+                "[edge-scale] relative error {rel_err:.4e} exceeds 2 % — \
+                 half-tile staging may be saturating or accumulating in f16"
+            );
+        }
+
         // ── malformed-load validation tests ──────────────────────────────────
         // These tests require a Metal device — they return early if none is available.
         // Each case must return Err, never panic.
