@@ -198,6 +198,66 @@ fn check_kv_cache_capacity(
     Ok(())
 }
 
+/// Compute the maximum sequence length (prompt + generated) used to size the KV
+/// cache, guarding against `usize` overflow on a pathological `max_new_tokens`.
+///
+/// A caller passing `max_new_tokens` near `usize::MAX` would otherwise wrap the
+/// addition (release builds elide the overflow check), yielding a tiny `max_seq`,
+/// an undersized cache, and a bare panic on the first prefill write into the
+/// (now too small) cache buffer. Returning `InvalidInput` turns that latent panic
+/// into a clean, caller-visible error.
+///
+/// This guards only the addition; [`check_alloc_capacity`] guards the subsequent
+/// multiplication into per-buffer byte counts.
+fn compute_max_seq(prompt_len: usize, max_new_tokens: usize) -> Result<usize, InferenceError> {
+    prompt_len.checked_add(max_new_tokens).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "prompt_len ({prompt_len}) + max_new_tokens ({max_new_tokens}) overflows usize"
+        ))
+    })
+}
+
+/// Validate that the KV cache and per-token scratch sized to `effective_cap` will
+/// not overflow `usize` when their element counts are computed.
+///
+/// [`compute_max_seq`] guards the `prompt_len + max_new_tokens` *addition*, but a
+/// huge-yet-non-overflowing result (e.g. `max_new_tokens = usize::MAX / 1024`)
+/// still wraps the downstream `max_seq_len * dim` *multiplications* in cache
+/// sizing ([`FlatKVCacheConfig::layer_capacity`]) and scratch sizing
+/// (`ForwardScratch::ensure_capacity`), yielding undersized buffers and a panic on
+/// the first write. Every length-scaled allocation is linear in `effective_cap`,
+/// so summing their per-position element coefficients and checking the single
+/// product `effective_cap * Σcoeff` bounds them all at once: each individual
+/// product is `≤` the sum, so if the sum is overflow-safe every term is too.
+///
+/// The remaining scratch buffers scale with `prompt_len` (real tokenized input,
+/// not caller-controlled to pathological sizes), so they are not guarded here.
+fn check_alloc_capacity(
+    cfg: &QwenConfig,
+    num_layers: usize,
+    effective_cap: usize,
+) -> Result<(), InferenceError> {
+    let kv_dim = cfg.kv_dim();
+    // Per-position element coefficients that scale with the cache length:
+    //   KV cache (K+V across all layers): 2 * num_layers * kv_dim
+    //   dequant scratch (cached_k_f32 + cached_v_f32): 2 * kv_dim
+    //   attention scores: num_attention_heads
+    let coeff = (|| -> Option<usize> {
+        let cache = 2usize.checked_mul(num_layers)?.checked_mul(kv_dim)?;
+        let dequant = 2usize.checked_mul(kv_dim)?;
+        cache
+            .checked_add(dequant)?
+            .checked_add(cfg.num_attention_heads)
+    })()
+    .ok_or_else(|| InferenceError::InvalidInput("model dimensions overflow usize".into()))?;
+    effective_cap.checked_mul(coeff).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "KV cache + scratch for max_seq ({effective_cap}) overflows usize"
+        ))
+    })?;
+    Ok(())
+}
+
 /// **Unstable**: text generation entry point for Qwen3 models; the full
 /// generation loop (prefill, decode, sampling) is under active design.
 ///
@@ -243,7 +303,7 @@ pub fn generate(
     }
 
     // 2. Initialize KV cache and scratch (allocate once per request)
-    let max_seq = prompt_len + config.max_new_tokens;
+    let max_seq = compute_max_seq(prompt_len, config.max_new_tokens)?;
     // Effective cache capacity: honour the caller's opt-in cap (issue #12).
     // Clamped to [1, max_seq] so over-large caps and zero are both safe.
     let effective_cap = config
@@ -251,6 +311,7 @@ pub fn generate(
         .map(|c| c.max(1).min(max_seq))
         .unwrap_or(max_seq);
     check_kv_cache_capacity(config.kv_cache_capacity, effective_cap, prompt_len)?;
+    check_alloc_capacity(cfg, cfg.num_hidden_layers, effective_cap)?;
     let cache_cfg = FlatKVCacheConfig::for_qwen3(
         cfg.num_hidden_layers,
         cfg.num_key_value_heads,
@@ -286,8 +347,13 @@ pub fn generate(
         engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
     }
 
-    // 6. Sample first token from the last position's logits
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens);
+    // 6. Sample first token from the last position's logits.
+    // Cap the preallocation hint at effective_cap (the real generation ceiling —
+    // decode stops once the cache is full), not the raw max_new_tokens: a caller
+    // with a small kv_cache_capacity and a huge max_new_tokens would otherwise
+    // panic in Vec::with_capacity (capacity * 4 bytes > isize::MAX). effective_cap
+    // is already validated allocation-safe by check_alloc_capacity above.
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens.min(effective_cap));
     let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
     generated_ids.push(first_token);
 
@@ -1005,6 +1071,47 @@ mod tests {
         };
         assert_eq!(output.generated_tokens, 3);
         assert!(!output.stopped_by_eos);
+    }
+
+    #[test]
+    fn test_compute_max_seq_normal() {
+        assert_eq!(compute_max_seq(10, 100).unwrap(), 110);
+        assert_eq!(compute_max_seq(0, 0).unwrap(), 0);
+        // Largest sum that still fits exactly.
+        assert_eq!(compute_max_seq(1, usize::MAX - 1).unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn test_compute_max_seq_overflow_is_error_not_panic() {
+        // A pathological max_new_tokens near usize::MAX must surface a clean
+        // InvalidInput error rather than wrapping the addition and panicking
+        // later inside prefill_layer's capacity assertion (codex finding #2).
+        let err = compute_max_seq(10, usize::MAX).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+        let err = compute_max_seq(usize::MAX, 1).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_check_alloc_capacity_normal() {
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        // A realistic context length must pass.
+        assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 4096).is_ok());
+        assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 262_144).is_ok());
+        assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_alloc_capacity_multiplication_overflow_is_error() {
+        // The codex review of PR #291 found that guarding only compute_max_seq's
+        // addition leaves the downstream `max_seq_len * kv_dim` multiplication
+        // unchecked: a huge-yet-non-overflowing effective_cap (here usize::MAX/1024,
+        // matching the reviewer's kv_dim=8*128 counterexample) wraps the cache/scratch
+        // element count and panics on the first write. The guard must reject it.
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        let effective_cap = usize::MAX / 1024;
+        let err = check_alloc_capacity(&cfg, cfg.num_hidden_layers, effective_cap).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
     #[test]
