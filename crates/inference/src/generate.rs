@@ -347,8 +347,13 @@ pub fn generate(
         engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
     }
 
-    // 6. Sample first token from the last position's logits
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens);
+    // 6. Sample first token from the last position's logits.
+    // Cap the preallocation hint at effective_cap (the real generation ceiling —
+    // decode stops once the cache is full), not the raw max_new_tokens: a caller
+    // with a small kv_cache_capacity and a huge max_new_tokens would otherwise
+    // panic in Vec::with_capacity (capacity * 4 bytes > isize::MAX). effective_cap
+    // is already validated allocation-safe by check_alloc_capacity above.
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens.min(effective_cap));
     let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
     generated_ids.push(first_token);
 
