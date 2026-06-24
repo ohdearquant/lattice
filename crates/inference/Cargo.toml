@@ -122,6 +122,10 @@ name = "bench_q4_prefill"
 required-features = ["f16", "metal-gpu"]
 
 [[example]]
+name = "bench_q8_prefill"
+required-features = ["f16", "metal-gpu"]
+
+[[example]]
 name = "bench_gdn_decode"
 required-features = ["f16", "metal-gpu"]
 

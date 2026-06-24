@@ -3273,6 +3273,123 @@ kernel void gdn_chunk_norm_silu_c32(
         "#endif\n"
     );
 
+    /// MSL source for the Q8_0 simdgroup-matrix tiled GEMM kernel.
+    ///
+    /// Block layout: each Q8_0 block is 34 bytes — 2-byte f16 scale (little-endian)
+    /// followed by 32 int8 values.  The kernel tiles BM=64 rows × BN=32 cols × BK=32
+    /// depth and uses simdgroup_half8x8/float8x8 MMA accumulation, keeping accumulators
+    /// in f32 while staging X and W as f16 in threadgroup memory.
+    ///
+    /// Threadgroup memory breakdown (~9.8 KB):
+    ///   half  Xtg[64][32]  = 4096 bytes
+    ///   char  Qraw[32][32] = 1024 bytes
+    ///   half  Qscale[32]   =   64 bytes
+    ///   half  Wtg[32][40]  = 2560 bytes  (BN_PAD=40 avoids bank conflicts)
+    ///   float Ytg[32][16]  = 2048 bytes
+    ///   float Zero[8][8]   =  256 bytes
+    ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
+    const MSL_Q8_TILED_SOURCE: &str = concat!(
+        "#include <metal_stdlib>\n",
+        "#if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 300)\n",
+        "#include <metal_simdgroup_matrix>\n",
+        "using namespace metal;\n",
+        "kernel void gemm_q8_tiled(\n",
+        "    device const char* QW  [[buffer(0)]],\n",
+        "    device const float* X  [[buffer(1)]],\n",
+        "    device float* Y        [[buffer(2)]],\n",
+        "    constant uint& M       [[buffer(3)]],\n",
+        "    constant uint& N       [[buffer(4)]],\n",
+        "    constant uint& K       [[buffer(5)]],\n",
+        "    uint3 tg               [[threadgroup_position_in_grid]],\n",
+        "    uint tid               [[thread_index_in_threadgroup]],\n",
+        "    uint lane              [[thread_index_in_simdgroup]],\n",
+        "    uint sg                [[simdgroup_index_in_threadgroup]])\n",
+        "{\n",
+        "    constexpr uint BM = 64;\n",
+        "    constexpr uint BN = 32;\n",
+        "    constexpr uint BK = 32;\n",
+        "    constexpr uint BN_PAD = 40;\n",
+        "    constexpr uint THREADS = 128;\n",
+        "    const uint m0 = tg.y * BM;\n",
+        "    const uint n0 = tg.x * BN;\n",
+        "    const uint nb = K / 32;\n",
+        "    const uint row_bytes = nb * 34;\n",
+        "    threadgroup half Xtg[64][32];\n",
+        "    threadgroup char Qraw[32][32];\n",
+        "    threadgroup half Qscale[32];\n",
+        "    threadgroup half Wtg[32][40];\n",
+        "    threadgroup float Ytg[32][16];\n",
+        "    threadgroup float Zero[8][8];\n",
+        "    if (tid < 64) { Zero[tid / 8][tid % 8] = 0.0f; }\n",
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "    const uint sg_m_base = (sg / 2) * 32;\n",
+        "    const uint sg_n_base = (sg % 2) * 16;\n",
+        "    simdgroup_float8x8 acc00,acc01,acc10,acc11,acc20,acc21,acc30,acc31;\n",
+        "    simdgroup_load(acc00,&Zero[0][0],8); simdgroup_load(acc01,&Zero[0][0],8);\n",
+        "    simdgroup_load(acc10,&Zero[0][0],8); simdgroup_load(acc11,&Zero[0][0],8);\n",
+        "    simdgroup_load(acc20,&Zero[0][0],8); simdgroup_load(acc21,&Zero[0][0],8);\n",
+        "    simdgroup_load(acc30,&Zero[0][0],8); simdgroup_load(acc31,&Zero[0][0],8);\n",
+        "    for (uint k0 = 0; k0 < K; k0 += BK) {\n",
+        "        const uint kb = k0 / 32;\n",
+        "        for (uint j = tid; j < BM*(BK/4); j += THREADS) {\n",
+        "            uint mi=j/(BK/4); uint kb4=j%(BK/4); uint gm=m0+mi; uint gk4=k0+kb4*4;\n",
+        "            float4 v=(gm<M)?*((device const float4*)(X+gm*K+gk4)):float4(0.0f);\n",
+        "            Xtg[mi][kb4*4+0]=half(v.x); Xtg[mi][kb4*4+1]=half(v.y);\n",
+        "            Xtg[mi][kb4*4+2]=half(v.z); Xtg[mi][kb4*4+3]=half(v.w); }\n",
+        "        for (uint i = tid; i < BN; i += THREADS) {\n",
+        "            uint gn = n0 + i;\n",
+        "            if (gn < N) {\n",
+        "                ushort sb = ushort(QW[gn*row_bytes+kb*34+0]&0xff) | (ushort(QW[gn*row_bytes+kb*34+1]&0xff)<<8);\n",
+        "                Qscale[i] = as_type<half>(sb);\n",
+        "            } else { Qscale[i] = half(0.0f); }\n",
+        "        }\n",
+        "        for (uint i = tid; i < BN*BK; i += THREADS) {\n",
+        "            uint ni=i/BK; uint ki=i%BK; uint gn=n0+ni;\n",
+        "            Qraw[ni][ki] = (gn<N) ? QW[gn*row_bytes+kb*34+2+ki] : char(0); }\n",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "        for (uint i = tid; i < BN*BK; i += THREADS) {\n",
+        "            uint ni=i/BK; uint ki=i%BK;\n",
+        "            Wtg[ki][ni] = half(float(Qraw[ni][ki]) * float(Qscale[ni])); }\n",
+        "        for (uint i = tid; i < BK*8; i += THREADS) {\n",
+        "            uint kk=i/8; uint pn=BN+(i%8); Wtg[kk][pn]=half(0.0f); }\n",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "        [[unroll]]\n",
+        "        for (uint kk = 0; kk < BK; kk += 8) {\n",
+        "            simdgroup_half8x8 a0,a1,a2,a3,b0,b1;\n",
+        "            simdgroup_load(a0,&Xtg[sg_m_base+ 0][kk],BK);\n",
+        "            simdgroup_load(a1,&Xtg[sg_m_base+ 8][kk],BK);\n",
+        "            simdgroup_load(a2,&Xtg[sg_m_base+16][kk],BK);\n",
+        "            simdgroup_load(a3,&Xtg[sg_m_base+24][kk],BK);\n",
+        "            simdgroup_load(b0,&Wtg[kk][sg_n_base+0],BN_PAD);\n",
+        "            simdgroup_load(b1,&Wtg[kk][sg_n_base+8],BN_PAD);\n",
+        "            simdgroup_multiply_accumulate(acc00,a0,b0,acc00);\n",
+        "            simdgroup_multiply_accumulate(acc01,a0,b1,acc01);\n",
+        "            simdgroup_multiply_accumulate(acc10,a1,b0,acc10);\n",
+        "            simdgroup_multiply_accumulate(acc11,a1,b1,acc11);\n",
+        "            simdgroup_multiply_accumulate(acc20,a2,b0,acc20);\n",
+        "            simdgroup_multiply_accumulate(acc21,a2,b1,acc21);\n",
+        "            simdgroup_multiply_accumulate(acc30,a3,b0,acc30);\n",
+        "            simdgroup_multiply_accumulate(acc31,a3,b1,acc31); }\n",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "    }\n",
+        "    for (uint ssg = 0; ssg < 4; ssg++) {\n",
+        "        if (sg == ssg) {\n",
+        "            simdgroup_store(acc00,&Ytg[ 0][0],16); simdgroup_store(acc01,&Ytg[ 0][8],16);\n",
+        "            simdgroup_store(acc10,&Ytg[ 8][0],16); simdgroup_store(acc11,&Ytg[ 8][8],16);\n",
+        "            simdgroup_store(acc20,&Ytg[16][0],16); simdgroup_store(acc21,&Ytg[16][8],16);\n",
+        "            simdgroup_store(acc30,&Ytg[24][0],16); simdgroup_store(acc31,&Ytg[24][8],16); }\n",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "        uint smb=(ssg/2)*32; uint snb=(ssg%2)*16;\n",
+        "        for (uint i = tid; i < 512; i += THREADS) {\n",
+        "            uint lm=i/16; uint ln=i%16;\n",
+        "            uint gm=m0+smb+lm; uint gn=n0+snb+ln;\n",
+        "            if(gm<M&&gn<N){Y[gm*N+gn]=Ytg[lm][ln];} }\n",
+        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        "    }\n",
+        "}\n",
+        "#endif\n"
+    );
+
     // ---------------------------------------------------------------------------
     // GPU Buffer Structures
     // ---------------------------------------------------------------------------
@@ -3851,6 +3968,7 @@ kernel void gdn_chunk_norm_silu_c32(
         copy_and_rms_norm_batch: ComputePipelineState,
         fused_residual_add_norm_batch: ComputePipelineState,
         gemm_q8: ComputePipelineState,
+        gemm_q8_tiled: Option<ComputePipelineState>,
         topk_first_pass: ComputePipelineState,
         topk_merge_pass: ComputePipelineState,
         argmax_first: ComputePipelineState,
@@ -4767,6 +4885,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 device.new_compute_pipeline_state_with_function(&func).ok()
             };
 
+            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
             let pipelines = MetalQwen35Pipelines {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
@@ -4816,6 +4948,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
+                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
                 topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
@@ -11183,6 +11316,13 @@ kernel void gdn_chunk_norm_silu_c32(
             n: u32,
             k: u32,
         ) {
+            if m == 0 || n == 0 {
+                return;
+            }
+            assert!(
+                k > 0 && k % 32 == 0,
+                "dispatch_gemm_q8 requires K non-zero and divisible by 32, got {k}"
+            );
             if m <= 1 {
                 // GEMV decode path (M=1)
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
@@ -11195,8 +11335,22 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(n.div_ceil(2) as u64, 1, 1),
                     MTLSize::new(32, 4, 1),
                 );
+            } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
+                // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=32).
+                // Buffer bindings: buf(0)=QW, buf(1)=X, buf(2)=Y.
+                enc.set_compute_pipeline_state(tiled);
+                enc.set_buffer(0, Some(&qw.buffer), 0);
+                enc.set_buffer(1, Some(x), x_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
             } else {
-                // Batch GEMM (prefill path): NR=2 cols × NM=4 rows per TG
+                // Naive fallback GEMM. Buffer bindings: buf(0)=X, buf(1)=QW, buf(2)=Y.
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q8);
                 enc.set_buffer(0, Some(x), x_offset);
                 enc.set_buffer(1, Some(&qw.buffer), 0);
@@ -11206,7 +11360,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 enc.set_bytes(5, 4, &k as *const u32 as *const _);
                 enc.dispatch_thread_groups(
                     MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
-                    MTLSize::new(32, 4, 1), // 128 threads: same as GEMV
+                    MTLSize::new(32, 4, 1),
                 );
             }
         }
@@ -11972,6 +12126,13 @@ kernel void gdn_chunk_norm_silu_c32(
             k: u32,
         ) {
             let wq_offset = qw.payload_offset + qw_extra_offset;
+            if m == 0 || n == 0 {
+                return;
+            }
+            assert!(
+                k > 0 && k % 32 == 0,
+                "dispatch_gemm_q8_at requires K non-zero and divisible by 32, got {k}"
+            );
             if m <= 1 {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
                 enc.set_buffer(0, Some(x), x_offset);
@@ -11983,7 +12144,21 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(n.div_ceil(2) as u64, 1, 1),
                     MTLSize::new(32, 4, 1),
                 );
+            } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
+                // Tiled path: buf(0)=QW (with offset), buf(1)=X, buf(2)=Y.
+                enc.set_compute_pipeline_state(tiled);
+                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
+                enc.set_buffer(1, Some(x), x_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
             } else {
+                // Naive fallback. Buffer bindings: buf(0)=X, buf(1)=QW, buf(2)=Y.
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q8);
                 enc.set_buffer(0, Some(x), x_offset);
                 enc.set_buffer(1, Some(&qw.buffer), wq_offset);
@@ -13311,6 +13486,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 device.new_compute_pipeline_state_with_function(&func).ok()
             };
 
+            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
             let pipelines = MetalQwen35Pipelines {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
@@ -13360,6 +13549,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
+                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
                 topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
@@ -16648,6 +16838,323 @@ kernel void decode_attention_reference(
                 assert!(
                     tiled_vs_naive < 0.012,
                     "[shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
+                );
+            }
+        }
+
+        // ── Q8 GEMM numeric differential gate ────────────────────────────────
+        // Mirrors the Q4 differential test above, but for the Q8_0 tiled kernel
+        // (`gemm_q8_tiled`, PR #271 follow-up).  Q8_0 blocks are 34 bytes:
+        // 2-byte f16 scale (LE) + 32 int8 values.  The tiled kernel stores
+        // activations and dequantized weights as half in threadgroup memory while
+        // keeping accumulators in f32.  Q8 quantization error is lower than Q4,
+        // so all bounds are the same (a subtest that Q8 ≤ Q4 on precision).
+
+        /// Helper: decode a Q8_0 scale word (little-endian f16) to f32.
+        fn f16_bits_to_f32(bits: u16) -> f32 {
+            // IEEE 754-2008 half to single conversion.
+            let sign = ((bits >> 15) as u32) << 31;
+            let exp = ((bits >> 10) & 0x1f) as i32;
+            let frac = (bits & 0x3ff) as u32;
+            if exp == 31 {
+                // Inf or NaN
+                return f32::from_bits(sign | 0x7f80_0000 | (frac << 13));
+            }
+            if exp == 0 {
+                // Zero or denormalized half
+                if frac == 0 {
+                    return f32::from_bits(sign);
+                }
+                // Denorm half: value = (-1)^sign * 2^(-14) * (frac / 1024)
+                // Find the leading 1 bit of frac (10-bit mantissa stored in low bits of frac).
+                // frac is nonzero, in range 1..1023 stored in a u32.
+                // leading_zeros counts from bit 31 down; the highest bit of frac is at most bit 9.
+                let lz = frac.leading_zeros(); // ≥ 22 since frac < 1024
+                let shift = lz - 22; // how many extra shifts to normalize (0..9)
+                // After left-shift by (shift+1) the implicit 1 is gone; the remaining bits form
+                // the f32 mantissa (22 bits from 23..1).
+                let frac32 = (frac << (shift + 1)) & 0x007f_ffff;
+                // Unbiased exp for denorm half is -14; further adjusted by normalization shift.
+                // f32 exponent = -14 - shift + 127 (biased).
+                let exp32 = (127i32 - 14 - shift as i32) as u32;
+                return f32::from_bits(sign | (exp32 << 23) | frac32);
+            }
+            // Normal half: exp32 = exp16 - 15 + 127
+            let exp32 = (exp - 15 + 127) as u32;
+            f32::from_bits(sign | (exp32 << 23) | (frac << 13))
+        }
+
+        /// Build a Q8_0 weight buffer and f32 reference for shape [N, K].
+        /// Uses a deterministic LCG; calls `quantize_row_q8_0` row-by-row —
+        /// matching the kernel index formula `QW[col * (K/32 * 34) + ib * 34]`.
+        fn make_q8_weight_ref(
+            device: &Device,
+            seed: u64,
+            n: usize, // output dim
+            k: usize, // input dim — must be divisible by 32
+        ) -> (Buffer, Vec<f32>) {
+            assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_0 GEMM");
+            let mut rng = seed;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 34);
+            let mut deq_weights = Vec::with_capacity(n * k);
+            for row in weights_f32.chunks_exact(k) {
+                let row_packed = quantize_row_q8_0(row);
+                // Dequantize for CPU reference: each 34-byte block has f16 scale + 32 i8 values.
+                for block in row_packed.chunks_exact(34) {
+                    let scale_bits = (block[0] as u16) | ((block[1] as u16) << 8);
+                    let scale = f16_bits_to_f32(scale_bits);
+                    for &byte in &block[2..34] {
+                        deq_weights.push((byte as i8) as f32 * scale);
+                    }
+                }
+                packed_bytes.extend_from_slice(&row_packed);
+            }
+            let buf = device.new_buffer_with_data(
+                packed_bytes.as_ptr() as *const _,
+                packed_bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            buf.set_label("test_qw_q8");
+            (buf, deq_weights)
+        }
+
+        /// Helper used by Q8 differential tests: dispatch a single GEMM kernel.
+        /// `is_tiled` selects buffer binding order:
+        ///   tiled: buf(0)=QW, buf(1)=X, buf(2)=Y
+        ///   naive: buf(0)=X,  buf(1)=QW, buf(2)=Y
+        fn run_gemm_q8_kernel(
+            queue: &CommandQueue,
+            pipeline: &ComputePipelineState,
+            qw_buf: &Buffer,
+            x_buf: &Buffer,
+            y_buf: &Buffer,
+            m: u32,
+            n: u32,
+            k: u32,
+            tg_x: u64,
+            tg_y: u64,
+            is_tiled: bool,
+        ) {
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipeline);
+            if is_tiled {
+                enc.set_buffer(0, Some(qw_buf), 0);
+                enc.set_buffer(1, Some(x_buf), 0);
+            } else {
+                enc.set_buffer(0, Some(x_buf), 0);
+                enc.set_buffer(1, Some(qw_buf), 0);
+            }
+            enc.set_buffer(2, Some(y_buf), 0);
+            enc.set_bytes(3, 4, &m as *const u32 as *const _);
+            enc.set_bytes(4, 4, &n as *const u32 as *const _);
+            enc.set_bytes(5, 4, &k as *const u32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(tg_x, tg_y, 1), MTLSize::new(32, 4, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+
+        #[test]
+        fn gemm_q8_tiled_enabled_on_apple7_plus() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            assert!(
+                state.engine.pipelines.gemm_q8_tiled.is_some(),
+                "gemm_q8_tiled must be enabled on Apple7+ (got None — gate regressed \
+                 or MSL_Q8_TILED_SOURCE failed to compile)"
+            );
+        }
+
+        #[test]
+        fn gemm_q8_tiled_vs_naive_numeric_differential() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let tiled_pipeline = state.engine.pipelines.gemm_q8_tiled.as_ref().expect(
+                "gemm_q8_tiled must be present on Apple7+ (else this gate passes vacuously)",
+            );
+            let naive_pipeline = &state.engine.pipelines.gemm_q8;
+            let queue = &state.engine.queue;
+
+            let mut xrng = 0xBEEF_DEAD_u64;
+            let mut next_x = || -> f32 {
+                xrng = xrng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+
+            // ── Shape A: M=64, N=64, K=64 — exact tile multiples ────────────
+            {
+                let (m, n, k) = (64usize, 64usize, 64usize);
+                let (qw_buf, w_deq) = make_q8_weight_ref(&device, 0xABCD_5678_u64, n, k);
+                let x: Vec<f32> = (0..m * k).map(|_| next_x()).collect();
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+
+                // Naive dispatch: buf(0)=X, buf(1)=QW; tg = (ceil(N/2), ceil(M/4), 1)
+                let y_naive_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q8_kernel(
+                    queue,
+                    naive_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_naive_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(2) as u64,
+                    m.div_ceil(4) as u64,
+                    false,
+                );
+
+                // Tiled dispatch: buf(0)=QW, buf(1)=X; tg = (ceil(N/32), ceil(M/64), 1)
+                let y_tiled_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q8_kernel(
+                    queue,
+                    tiled_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_tiled_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(32) as u64,
+                    m.div_ceil(64) as u64,
+                    true,
+                );
+
+                let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+                // SAFETY: StorageModeShared, GPU work completed, sizes match allocation.
+                let y_naive: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_naive_buf.contents() as *const f32, m * n)
+                };
+                let y_tiled: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_tiled_buf.contents() as *const f32, m * n)
+                };
+
+                let naive_vs_ref = max_abs_diff(y_naive, &y_ref);
+                let tiled_vs_ref = max_abs_diff(y_tiled, &y_ref);
+                let tiled_vs_naive = max_abs_diff(y_tiled, y_naive);
+
+                eprintln!(
+                    "[Q8 shape A 64×64×64] naive_vs_ref={naive_vs_ref:.4e}  \
+                     tiled_vs_ref={tiled_vs_ref:.4e}  tiled_vs_naive={tiled_vs_naive:.4e}"
+                );
+                assert!(
+                    naive_vs_ref < 1e-3,
+                    "[Q8 shape A] naive_vs_ref={naive_vs_ref:.4e} exceeds 1e-3 — \
+                     buffer layout or dequant mismatch"
+                );
+                assert!(
+                    tiled_vs_ref < 0.015,
+                    "[Q8 shape A] tiled_vs_ref={tiled_vs_ref:.4e} exceeds 0.015 — \
+                     half-tile staging introduced unexpected precision regression"
+                );
+                assert!(
+                    tiled_vs_naive < 0.012,
+                    "[Q8 shape A] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012 — \
+                     tiled and naive kernels are computing different values"
+                );
+            }
+
+            // ── Shape B: M=72, N=48, K=64 — non-multiple of BM/BN ───────────
+            {
+                let (m, n, k) = (72usize, 48usize, 64usize);
+                let (qw_buf, w_deq) = make_q8_weight_ref(&device, 0x5EED_1234_u64, n, k);
+                let x: Vec<f32> = (0..m * k).map(|_| next_x()).collect();
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+
+                let y_naive_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q8_kernel(
+                    queue,
+                    naive_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_naive_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(2) as u64,
+                    m.div_ceil(4) as u64,
+                    false,
+                );
+
+                let y_tiled_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                run_gemm_q8_kernel(
+                    queue,
+                    tiled_pipeline,
+                    &qw_buf,
+                    &x_buf,
+                    &y_tiled_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    n.div_ceil(32) as u64,
+                    m.div_ceil(64) as u64,
+                    true,
+                );
+
+                let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+                // SAFETY: same as shape A.
+                let y_naive: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_naive_buf.contents() as *const f32, m * n)
+                };
+                let y_tiled: &[f32] = unsafe {
+                    std::slice::from_raw_parts(y_tiled_buf.contents() as *const f32, m * n)
+                };
+
+                let naive_vs_ref = max_abs_diff(y_naive, &y_ref);
+                let tiled_vs_ref = max_abs_diff(y_tiled, &y_ref);
+                let tiled_vs_naive = max_abs_diff(y_tiled, y_naive);
+
+                eprintln!(
+                    "[Q8 shape B 72×48×64] naive_vs_ref={naive_vs_ref:.4e}  \
+                     tiled_vs_ref={tiled_vs_ref:.4e}  tiled_vs_naive={tiled_vs_naive:.4e}"
+                );
+                assert!(
+                    naive_vs_ref < 1e-3,
+                    "[Q8 shape B] naive_vs_ref={naive_vs_ref:.4e} exceeds 1e-3"
+                );
+                assert!(
+                    tiled_vs_ref < 0.015,
+                    "[Q8 shape B] tiled_vs_ref={tiled_vs_ref:.4e} exceeds 0.015"
+                );
+                assert!(
+                    tiled_vs_naive < 0.012,
+                    "[Q8 shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
                 );
             }
         }
