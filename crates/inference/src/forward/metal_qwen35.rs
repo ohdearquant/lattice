@@ -8708,6 +8708,19 @@ kernel void gdn_chunk_norm_silu_c32(
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
+            // Mirror plain greedy `generate()` (generate.rs:235): max_new_tokens == 0
+            // means "generate nothing".  Return before sampling so we never emit a
+            // token the caller did not ask for — including the case-A prefill-EOS path
+            // below, which would otherwise emit one stop token for a zero budget.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                };
+            }
+
             // Greedy argmax from prefill logits.
             let pending_first = prefill_logits
                 .iter()
@@ -8829,6 +8842,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 //   reject → argmax(verify_out.logits[0])  (target's replacement at pos+1)
                 // Both are encoded in rs.bonus_token by `rejection_sample_draft`.
                 let bonus_token = rs.bonus_token.unwrap_or(0);
+                // The loop guard (`generated_ids.len() < max_new_tokens`) guarantees at
+                // least one slot remains here, but a round can emit up to three tokens
+                // (case B: [pending, draft, bonus]).  Clip every emission to the
+                // remaining budget so greedy MTP never exceeds `max_new_tokens` — plain
+                // greedy `generate()` enters only `max_new_tokens - 1` decode steps, so
+                // it stops at the cap even when the next token would be EOS.
                 match super::mtp_greedy_round(
                     pending_token,
                     draft.token_id,
@@ -8837,11 +8856,13 @@ kernel void gdn_chunk_norm_silu_c32(
                     is_stop,
                 ) {
                     super::MtpRoundOutcome::EmitAndStop(tokens) => {
-                        generated_ids.extend_from_slice(&tokens);
+                        let remaining = gen_cfg.max_new_tokens - generated_ids.len();
+                        generated_ids.extend_from_slice(&tokens[..tokens.len().min(remaining)]);
                         break;
                     }
                     super::MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
-                        generated_ids.extend_from_slice(&emit);
+                        let remaining = gen_cfg.max_new_tokens - generated_ids.len();
+                        generated_ids.extend_from_slice(&emit[..emit.len().min(remaining)]);
                         if generated_ids.len() >= gen_cfg.max_new_tokens {
                             break;
                         }
@@ -19741,11 +19762,15 @@ mod mtp_greedy_round_tests {
 
             match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
                 MtpRoundOutcome::EmitAndStop(tokens) => {
-                    out.extend_from_slice(&tokens);
+                    // Mirror the real call site: clip the emission to the remaining
+                    // budget so MTP never exceeds max_len (plain greedy caps exactly).
+                    let remaining = max_len - out.len();
+                    out.extend_from_slice(&tokens[..tokens.len().min(remaining)]);
                     break;
                 }
                 MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
-                    out.extend_from_slice(&emit);
+                    let remaining = max_len - out.len();
+                    out.extend_from_slice(&emit[..emit.len().min(remaining)]);
                     if out.len() >= max_len {
                         break;
                     }
@@ -20060,6 +20085,67 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
+    // CAP-EDGE REGRESSION (codex finding #1 on PR #287):
+    // A round can emit up to 3 tokens (case B). When max_new_tokens lands
+    // mid-emission, the call site must clip so MTP never exceeds the cap —
+    // plain greedy `generate()` stops at the cap even before an EOS.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_cap_clips_case_b_before_bonus() {
+        // Case B logits: [10, 20, EOS]; uncapped MTP would emit [10, 20, EOS].
+        let logit_rows: Vec<Vec<f32>> =
+            vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![20u32];
+
+        // max_len = 2: cap lands before the bonus EOS.
+        let oracle = plain_greedy_oracle(&logit_rows, 2);
+        assert_eq!(oracle, vec![10, 20], "oracle caps at 2 tokens, no EOS");
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, 2);
+        assert_eq!(
+            mtp,
+            vec![10, 20],
+            "case B must clip to [10, 20] at max_len=2"
+        );
+        assert_eq!(oracle, mtp);
+
+        // max_len = 1: only the pending token fits.
+        let oracle1 = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(oracle1, vec![10]);
+        let mtp1 = simulate_mtp(&logit_rows, &draft_seq, 1);
+        assert_eq!(mtp1, vec![10], "case B must clip to [10] at max_len=1");
+        assert_eq!(oracle1, mtp1);
+    }
+
+    #[test]
+    fn test_cap_clips_case_c_max_len_1() {
+        // Case C: pending=10, draft wrong, target replacement is EOS.
+        let logit_rows: Vec<Vec<f32>> = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![99u32];
+        let oracle = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(oracle, vec![10]);
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, 1);
+        assert_eq!(mtp, vec![10], "case C must clip to [10] at max_len=1");
+        assert_eq!(oracle, mtp);
+    }
+
+    #[test]
+    fn test_cap_clips_continue_emit() {
+        // accept + non-stop bonus → EmitAndContinue([pending, draft]); cap=1 clips to [pending].
+        let logit_rows: Vec<Vec<f32>> =
+            vec![make_logit(10, 5), make_logit(20, 5), make_logit(30, 5)];
+        let draft_seq = vec![20u32, 30];
+        let oracle = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(oracle, vec![10]);
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, 1);
+        assert_eq!(
+            mtp,
+            vec![10],
+            "EmitAndContinue must clip to [10] at max_len=1"
+        );
+        assert_eq!(oracle, mtp);
+    }
+
+    // -----------------------------------------------------------------------
     // Randomised / property-style sweep: seeded RNG, arbitrary draft choices.
     //
     // With all three EOS-faithful fixes (A/B/C), `simulate_mtp` should produce
@@ -20104,6 +20190,51 @@ mod mtp_greedy_round_tests {
                 oracle,
                 mtp,
                 "trial {trial}: oracle != mtp\n  logit_winners={:?}\n  draft_seq={:?}\n  oracle={:?}\n  mtp={:?}",
+                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                draft_seq,
+                oracle,
+                mtp
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Randomised sweep with SMALL caps: stresses the emission-clip path so MTP
+    // never exceeds max_len even when a round wants to emit 2-3 tokens.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_randomised_sweep_small_cap() {
+        let mut rng = Lcg::new(0x0123_4567_89ab_cdef);
+        let vocab_size = 6usize; // EOS=2, frequent stops
+        let trials = 400;
+
+        for trial in 0..trials {
+            let seq_len = (rng.next_u64() % 6 + 2) as usize; // 2..=7
+            let max_len = (rng.next_u64() % 4 + 1) as usize; // 1..=4 — cap often bites mid-round
+
+            let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
+                .map(|_| {
+                    let winner = (rng.next_u64() % vocab_size as u64) as usize;
+                    let mut row = vec![0.0f32; vocab_size];
+                    row[winner] = 10.0;
+                    row
+                })
+                .collect();
+            let draft_seq: Vec<u32> = (0..seq_len)
+                .map(|_| (rng.next_u64() % vocab_size as u64) as u32)
+                .collect();
+
+            let oracle = plain_greedy_oracle(&logit_rows, max_len);
+            let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
+
+            assert!(
+                mtp.len() <= max_len,
+                "trial {trial}: mtp exceeded cap {max_len}: {mtp:?}"
+            );
+            assert_eq!(
+                oracle,
+                mtp,
+                "trial {trial} (max_len={max_len}): oracle != mtp\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  mtp={:?}",
                 logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
