@@ -4749,7 +4749,10 @@ kernel void gdn_chunk_norm_silu_c32(
             };
 
             let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                if !device.supports_family(MTLGPUFamily::Apple9) {
+                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+                // The compile/pipeline `.ok()?` chain below falls back to the
+                // naive gemm_q4 on any device where the V3.0 source fails.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
                     return None;
                 }
                 let tiled_opts = CompileOptions::new();
@@ -13105,7 +13108,10 @@ kernel void gdn_chunk_norm_silu_c32(
             };
 
             let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                if !device.supports_family(MTLGPUFamily::Apple9) {
+                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+                // The compile/pipeline `.ok()?` chain below falls back to the
+                // naive gemm_q4 on any device where the V3.0 source fails.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
                     return None;
                 }
                 let tiled_opts = CompileOptions::new();
@@ -16111,6 +16117,31 @@ kernel void decode_attention_reference(
             // Unload
             state.unload_lora_adapter();
             assert!(!state.has_lora_adapter());
+        }
+
+        #[test]
+        fn gemm_q4_tiled_enabled_on_apple7_plus() {
+            // Regression guard for the M>1 prefill GEMM. The simdgroup-matrix
+            // tiled Q4 kernel (`gemm_q4_tiled`) must be enabled on every Apple7+
+            // GPU (M1 and up). It was previously gated behind Apple9, silently
+            // disabling it on M1/M2 and falling back to the ~1.6x-slower naive
+            // `gemm_q4`. A silent MSL compile failure would re-trigger the same
+            // fallback. Both regress prefill throughput with no visible error,
+            // so assert the real gate path keeps the tiled pipeline live.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            assert!(
+                state.engine.pipelines.gemm_q4_tiled.is_some(),
+                "gemm_q4_tiled must be enabled on Apple7+ (got None — gate regressed \
+                 or MSL_Q4_TILED_SOURCE failed to compile)"
+            );
         }
 
         // ── malformed-load validation tests ──────────────────────────────────
