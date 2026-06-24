@@ -190,3 +190,35 @@ pub(crate) fn resize(buf: &mut Vec<f32>, n: usize) {
         buf.resize(n, 0.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::qwen35_config::Qwen35Config;
+
+    /// KV cache is allocated for exactly the full-attention (GQA) layers, not all layers.
+    ///
+    /// For qwen3.5-0.8B: 6 full-attention layers out of 24 total. Allocating for all
+    /// 24 layers would 4× decode memory; this test fails if that regression occurs.
+    #[test]
+    fn kv_cache_allocates_only_full_attention_layers() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let kv = KvCache::new(cfg.num_full_attention_layers());
+        assert_eq!(
+            kv.k.len(),
+            6,
+            "k cache must have exactly 6 layers (full-attention only)"
+        );
+        assert_eq!(
+            kv.v.len(),
+            6,
+            "v cache must have exactly 6 layers (full-attention only)"
+        );
+        // Regression guard: layer count must NOT equal num_hidden_layers (24).
+        assert_ne!(
+            kv.k.len(),
+            cfg.num_hidden_layers,
+            "KV cache must not be allocated for all hidden layers"
+        );
+    }
+}
