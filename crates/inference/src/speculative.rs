@@ -98,15 +98,22 @@ impl NgramSpeculator {
 ///
 /// Return the index of the maximum element in `logits`.
 ///
-/// When multiple elements share the maximum value, returns the last
-/// occurrence (Rust `max_by` semantics). Returns 0 on empty input.
+/// When multiple elements share the maximum value, returns the **first**
+/// occurrence. Speculative decoding must be token-identical to plain greedy, so
+/// this tie-break must match the engine greedy decode (`forward::metal_qwen35`),
+/// the `sampling` module, and `torch.argmax` — all of which are first-wins (#280).
+/// Non-finite (`NaN`) entries are skipped, matching `sampling::argmax_f32_scalar`.
+/// Returns 0 on empty input.
 pub fn argmax(logits: &[f32]) -> usize {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    let mut best_idx = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,9 +2088,32 @@ mod tests {
     }
 
     #[test]
-    fn argmax_tie_last_wins() {
-        // Rust max_by returns the last element on tie.
-        assert_eq!(argmax(&[1.0, 1.0, 0.5]), 1);
+    fn argmax_tie_first_wins() {
+        // Greedy contract: speculation must be token-identical to plain greedy.
+        // The engine greedy decode (metal_qwen35), the sampling module, and
+        // torch.argmax all break ties toward the FIRST max index, so this helper
+        // must too (see #280).
+        assert_eq!(argmax(&[1.0, 1.0, 0.5]), 0);
+    }
+
+    #[test]
+    fn argmax_tie_matches_engine_first_wins() {
+        // Cross-check against the engine's first-wins loop on a tie-heavy vector:
+        // enabling speculation must not change the token on tied top logits.
+        let tie = [0.0_f32, 0.0, -1.0, 0.0];
+        let engine_first_wins = {
+            let mut best_id = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &v) in tie.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_id = i;
+                }
+            }
+            best_id
+        };
+        assert_eq!(engine_first_wins, 0);
+        assert_eq!(argmax(&tie), engine_first_wins);
     }
 
     #[test]
