@@ -8720,11 +8720,16 @@ kernel void gdn_chunk_norm_silu_c32(
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
             if is_stop(pending_first) {
+                // Plain greedy (`generate()`) pushes the first token before
+                // checking for EOS (generate.rs line 292: generated_ids.push(first_token)
+                // then checks config.eos_token_id == Some(first_token)).  Match that
+                // contract: emit the stop token, return generated_tokens = 1.
+                let text = decode_tokens(tokenizer, &[pending_first]);
                 return GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
+                    text,
+                    token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
-                    generated_tokens: 0,
+                    generated_tokens: 1,
                 };
             }
 
@@ -19432,33 +19437,30 @@ pub enum MtpRoundOutcome {
 ///   choice for the draft position, replaces the rejected draft).
 /// * `is_stop` – Returns `true` for EOS / stop-token IDs.
 ///
-/// # Semantics
+/// # EOS-faithful contract (matches plain greedy `generate()`)
 ///
-/// Matches the greedy-MTP loop's emit/stop/continue contract:
+/// Plain greedy always pushes the stop token to the output before breaking
+/// (generate.rs: `generated_ids.push(token)` precedes the EOS check).
+/// This function honours the same invariant for every terminal case:
 ///
 /// **Accept** (`accepted == true`):
-/// - The target model agrees `draft_token` is correct for pos+1.
 /// - Emit `[pending, draft_token]`.
-/// - If `draft_token` is a stop token: return `EmitAndStop`. Do NOT consume
-///   the bonus — the draft position is the last token and no further
-///   prediction is needed. This is the fix for #237 concern 2: the old
-///   code short-circuited *before* verify, so a wrong draft-EOS silently
-///   truncated generation. Now verify always runs; if the target confirms
-///   EOS we emit it and stop, if not the reject path takes over.
-/// - If the bonus (`argmax(target_logits_1)`) is a stop token: return
-///   `EmitAndStop` without emitting the bonus (the bonus becomes `pending`
-///   next round which would be emitted and then stop — but since the stop
-///   is already known, stopping now is equivalent and avoids an extra round).
-/// - Otherwise: return `EmitAndContinue { emit: [pending, draft], next_pending: bonus }`.
+/// - If `draft_token` is a stop token: `EmitAndStop([pending, draft])`. The
+///   bonus (pos+2 prediction) is irrelevant once generation ends. This is
+///   the fix for #237 concern 2: the old code short-circuited *before* verify,
+///   so a wrong draft-EOS silently truncated generation early.
+/// - If `bonus_token` is a stop token: `EmitAndStop([pending, draft, bonus])`.
+///   The bonus is the target's genuine greedy token at pos+2; plain greedy
+///   would emit it as the next round's `pending` and then stop.
+/// - Otherwise: `EmitAndContinue { emit: [pending, draft], next_pending: bonus }`.
 ///
 /// **Reject** (`accepted == false`):
-/// - The target's argmax at pos+1 differs from `draft_token`.
-/// - `bonus_token` is the target's correct replacement for pos+1.
-/// - Emit `[pending]` (only; the caller rolls back GPU state to pos+1).
-/// - If `bonus_token` is a stop token: return `EmitAndStop` (the replacement
-///   would become the next pending and stop next round; stopping now avoids
-///   the extra round while preserving the same output prefix length).
-/// - Otherwise: return `EmitAndContinue { emit: [pending], next_pending: bonus }`.
+/// - `bonus_token` is the target's own greedy choice at the draft position.
+/// - Emit `[pending]` only (caller rolls back GPU state to pos+1).
+/// - If `bonus_token` is a stop token: `EmitAndStop([pending, bonus])`.
+///   The replacement would become the next pending and stop; plain greedy
+///   would push it then break.
+/// - Otherwise: `EmitAndContinue { emit: [pending], next_pending: bonus }`.
 pub fn mtp_greedy_round(
     pending_token: u32,
     draft_token: u32,
@@ -19468,14 +19470,16 @@ pub fn mtp_greedy_round(
 ) -> MtpRoundOutcome {
     if accepted {
         // Draft accepted: target agrees draft_token belongs at pos+1.
-        // Always emit [pending, draft_token].  If the accepted token is itself
-        // a stop, halt immediately — the bonus (pos+2 prediction) is irrelevant.
+        // Always emit [pending, draft_token].
         if is_stop(draft_token) {
+            // The accepted token is itself a stop — emit and halt.
+            // Bonus is the pos+2 prediction; irrelevant once EOS is emitted.
             return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token]);
         }
-        // Accepted non-stop draft.  Bonus becomes next pending.
         if is_stop(bonus_token) {
-            return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token]);
+            // Accepted non-stop draft, but target's next greedy token is a stop.
+            // Plain greedy would emit the bonus as the next token then break.
+            return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token, bonus_token]);
         }
         MtpRoundOutcome::EmitAndContinue {
             emit: vec![pending_token, draft_token],
@@ -19483,9 +19487,11 @@ pub fn mtp_greedy_round(
         }
     } else {
         // Draft rejected.  Emit pending only; caller rolls back GPU state.
-        // bonus_token is the target's replacement for the draft position.
+        // bonus_token is the target's replacement greedy token at the draft position.
         if is_stop(bonus_token) {
-            return MtpRoundOutcome::EmitAndStop(vec![pending_token]);
+            // Target's own replacement is a stop.  Plain greedy would push it
+            // as the next token then break.
+            return MtpRoundOutcome::EmitAndStop(vec![pending_token, bonus_token]);
         }
         MtpRoundOutcome::EmitAndContinue {
             emit: vec![pending_token],
@@ -19614,6 +19620,13 @@ impl MetalQwen35State {
 // They compare the output of a tiny plain-greedy oracle against the sequence
 // produced by driving `mtp_greedy_round` with the same synthetic target
 // logits, across hand-constructed cases and a seeded randomised sweep.
+//
+// EOS-faithful contract (all three terminal cases A/B/C must match oracle):
+//   A: prefill argmax is EOS → oracle emits [EOS]; simulation must also emit [EOS].
+//   B: accept + bonus is stop → oracle emits [..., pending, draft, bonus];
+//      simulation must emit the same (bonus emitted as trailing stop token).
+//   C: reject + replacement is stop → oracle emits [..., pending, replacement];
+//      simulation must emit the same.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod mtp_greedy_round_tests {
@@ -19629,6 +19642,9 @@ mod mtp_greedy_round_tests {
     // Plain-greedy oracle: given a sequence of per-position logit vectors,
     // greedily pick argmax at each position, push to output, stop when
     // argmax is a stop token (including that stop token), or at max_len.
+    //
+    // Matches generate.rs: generated_ids.push(token) precedes the EOS check,
+    // so the stop token is always present in the output.
     // -----------------------------------------------------------------------
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
@@ -19656,30 +19672,21 @@ mod mtp_greedy_round_tests {
     // MTP simulation: drives `mtp_greedy_round` with the same synthetic
     // target logits used by the oracle.
     //
-    // `target_logits[i]` is the target's logit vector predicting the token at
-    // position i+1 (position 0 is the first pending token, already decided by
-    // prefill).
+    // Alignment with the oracle:
+    //   logit_rows[i] = target's logit vector for position i.
+    //   argmax(logit_rows[0]) = first pending token (prefill argmax).
+    //   argmax(logit_rows[i+1]) = target's prediction for pos+1 from pos i.
     //
-    // `draft_seq[i]` is the draft's proposal for position i+1.
+    // Each MTP round at pos i:
+    //   pending          = argmax(logit_rows[i])
+    //   draft            = draft_seq[i]
+    //   target_logits_0  = logit_rows[i+1]   (verify pos i+1)
+    //   accepted         = draft == argmax(target_logits_0)
+    //   bonus            = accepted ? argmax(logit_rows[i+2])
+    //                               : argmax(logit_rows[i+1])
     //
-    // The function mirrors the Metal loop structure:
-    //   - `pending_token` starts as `argmax(target_logits[0])` ... but wait,
-    //     the first pending comes from prefill, not from target_logits[0].
-    //
-    // To align with the oracle: the oracle's first output token is
-    // `argmax(logit_rows[0])`, which is `pending_token` in MTP parlance.
-    // MTP's verify_out.logits[0] corresponds to the target's prediction for
-    // pos+1, which is `target_logits[1]` in the simulation.
-    //
-    // Simpler alignment: treat `first_pending = argmax(logit_rows[0])`.
-    // Each MTP round i (0-indexed):
-    //   - pending = argmax(logit_rows[i])
-    //   - draft   = draft_seq[i]
-    //   - target_logits_0 = logit_rows[i+1]  (predict pos i+1)
-    //   - target_logits_1 = logit_rows[i+2]  (predict pos i+2, for bonus)
-    //   - accepted = draft == argmax(logit_rows[i+1])
-    //   - bonus    = if accepted { argmax(logit_rows[i+2]) }
-    //                else        { argmax(logit_rows[i+1]) }
+    // Case A (pending is stop): emit [pending], stop — mirrors the FIXED
+    // Metal loop (generate.rs: first_token is pushed before EOS check).
     // -----------------------------------------------------------------------
     fn simulate_mtp(logit_rows: &[Vec<f32>], draft_seq: &[u32], max_len: usize) -> Vec<u32> {
         assert!(
@@ -19688,6 +19695,7 @@ mod mtp_greedy_round_tests {
         );
         let mut out: Vec<u32> = Vec::new();
         let mut pos = 0usize; // index into logit_rows for the current pending
+        let mut draft_idx = 0usize; // sequential index into draft_seq
 
         loop {
             if out.len() >= max_len {
@@ -19695,11 +19703,12 @@ mod mtp_greedy_round_tests {
             }
             let pending_token = argmax(&logit_rows[pos]);
 
-            // Mirror the Metal loop's `pending_first` early return: if the pending
-            // token is a stop, the loop exits without emitting it (MTP yields empty
-            // when prefill argmax is EOS, and the loop invariant guarantees pending
-            // is non-stop at round start for all subsequent rounds).
+            // Case A: pending is a stop token.  The fixed Metal loop emits it
+            // (matches generate.rs: push first_token then check EOS).  For
+            // subsequent rounds, mtp_greedy_round guarantees EmitAndContinue only
+            // returns non-stop next_pending, so this branch fires only at pos=0.
             if is_stop(pending_token) {
+                out.push(pending_token);
                 break;
             }
 
@@ -19709,13 +19718,14 @@ mod mtp_greedy_round_tests {
                 break;
             }
 
-            let draft_token = if pos < draft_seq.len() {
-                draft_seq[pos]
+            let draft_token = if draft_idx < draft_seq.len() {
+                draft_seq[draft_idx]
             } else {
                 // No more drafts: fall back to pushing pending and stopping.
                 out.push(pending_token);
                 break;
             };
+            draft_idx += 1;
 
             let target_logits_0 = &logit_rows[pos + 1];
             let accepted = draft_token == argmax(target_logits_0);
@@ -19739,13 +19749,9 @@ mod mtp_greedy_round_tests {
                     if out.len() >= max_len {
                         break;
                     }
-                    // Advance pos to wherever next_pending lives in logit_rows.
-                    // On accept the next pending is from pos+2; on reject from pos+1.
-                    // We derive it from next_pending's identity: find the next pos
-                    // such that argmax(logit_rows[next_pos]) == next_pending.
-                    // Simpler: accepted advances by 2, reject by 1.
+                    // Advance pos: accept advances by 2, reject by 1.
                     pos = if accepted { pos + 2 } else { pos + 1 };
-                    let _ = next_pending; // used by caller only for continuation check
+                    let _ = next_pending; // value verified via logit_rows[pos]
                 }
             }
         }
@@ -19753,19 +19759,130 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hand-constructed case 1: All non-stop tokens, draft always accepted.
+    // Case A: prefill argmax is a stop token.
+    // Oracle: [EOS].  MTP (FIXED): [EOS].
+    // Old MTP code returned token_ids: vec![] (generated_tokens: 0) — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_case_a_prefill_eos() {
+        // logit_rows[0] argmax is EOS — the very first pending is a stop.
+        let logit_rows: Vec<Vec<f32>> = vec![
+            make_logit(EOS, 5), // pos0 → EOS
+            make_logit(10, 5),  // pos1 → 10 (never reached)
+        ];
+        let draft_seq = vec![10u32]; // draft never consulted
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        // Oracle: push EOS, then stop → [EOS].
+        assert_eq!(oracle, vec![EOS], "oracle sanity: prefill EOS yields [EOS]");
+
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
+        // Fixed MTP: pending_first = EOS → emit [EOS], return.
+        assert_eq!(mtp, vec![EOS], "case A: mtp must emit [EOS] not []");
+        assert_eq!(
+            oracle, mtp,
+            "case A: full oracle==mtp equality required; mtp={mtp:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case B: accept + bonus is stop.
+    // Oracle: [pending, draft, EOS].  MTP (FIXED): [pending, draft, EOS].
+    // Old mtp_greedy_round returned EmitAndStop([pending, draft]) — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_case_b_accept_bonus_stop() {
+        // pending=10, draft=20 (accepted), bonus=EOS.
+        // accept: target[1]=20, target[2]=EOS.
+        let logit_rows: Vec<Vec<f32>> = vec![
+            make_logit(10, 5),  // pos0 → 10 (pending)
+            make_logit(20, 5),  // pos1 → 20 (target agrees with draft)
+            make_logit(EOS, 5), // pos2 → EOS (bonus)
+        ];
+        let draft_seq = vec![20u32];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        // Oracle: push 10, push 20, push EOS, stop → [10, 20, EOS].
+        assert_eq!(oracle, vec![10, 20, EOS], "case B oracle sanity");
+
+        // Verify the pure function directly.
+        let outcome = mtp_greedy_round(
+            10,   // pending
+            20,   // draft (accepted)
+            true, // accepted
+            EOS,  // bonus is stop
+            is_stop,
+        );
+        assert_eq!(
+            outcome,
+            MtpRoundOutcome::EmitAndStop(vec![10, 20, EOS]),
+            "case B: accept+bonus-stop must emit [pending, draft, bonus]"
+        );
+
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
+        assert_eq!(mtp, vec![10, 20, EOS], "case B: mtp must match oracle");
+        assert_eq!(
+            oracle, mtp,
+            "case B: full oracle==mtp equality required; mtp={mtp:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case C: reject + replacement is stop.
+    // Oracle: [pending, EOS].  MTP (FIXED): [pending, EOS].
+    // Old mtp_greedy_round returned EmitAndStop([pending]) — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_case_c_reject_bonus_stop() {
+        // pending=10, draft=99 (wrong), target says EOS at pos1.
+        // reject: target[1]=EOS, bonus=EOS.
+        let logit_rows: Vec<Vec<f32>> = vec![
+            make_logit(10, 5),  // pos0 → 10 (pending)
+            make_logit(EOS, 5), // pos1 → EOS (target's own choice = EOS)
+        ];
+        let draft_seq = vec![99u32]; // wrong draft
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        // Oracle: push 10, push EOS, stop → [10, EOS].
+        assert_eq!(oracle, vec![10, EOS], "case C oracle sanity");
+
+        // Verify the pure function directly.
+        let outcome = mtp_greedy_round(
+            10,    // pending
+            99,    // draft (rejected)
+            false, // not accepted
+            EOS,   // bonus = target's replacement = EOS
+            is_stop,
+        );
+        assert_eq!(
+            outcome,
+            MtpRoundOutcome::EmitAndStop(vec![10, EOS]),
+            "case C: reject+bonus-stop must emit [pending, bonus]"
+        );
+
+        let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
+        assert_eq!(mtp, vec![10, EOS], "case C: mtp must match oracle");
+        assert_eq!(
+            oracle, mtp,
+            "case C: full oracle==mtp equality required; mtp={mtp:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hand-constructed: All non-stop tokens, draft always accepted.
     // Oracle and MTP should agree on the first `max_len` tokens.
     // -----------------------------------------------------------------------
     #[test]
     fn test_all_accepted_no_stop() {
-        // Tokens: 10=A, 20=B, 30=C, 40=D (none are EOS=2)
         let logit_rows: Vec<Vec<f32>> = vec![
-            make_logit(10, 5), // pos0 → token 10
-            make_logit(20, 5), // pos1 → token 20
-            make_logit(30, 5), // pos2 → token 30
-            make_logit(40, 5), // pos3 → token 40
+            make_logit(10, 5), // pos0 → 10
+            make_logit(20, 5), // pos1 → 20
+            make_logit(30, 5), // pos2 → 30
+            make_logit(40, 5), // pos3 → 40
         ];
-        // Draft always proposes the correct next token.
         let draft_seq = vec![20u32, 30, 40];
         let max_len = 4;
 
@@ -19778,8 +19895,8 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hand-constructed case 2: Draft always rejected.
-    // Oracle and MTP output must still agree.
+    // Hand-constructed: Draft always rejected, no stop tokens.
+    // Oracle and MTP output must agree.
     // -----------------------------------------------------------------------
     #[test]
     fn test_all_rejected_no_stop() {
@@ -19789,7 +19906,6 @@ mod mtp_greedy_round_tests {
             make_logit(30, 5),
             make_logit(40, 5),
         ];
-        // Draft always wrong (proposes 99, target says 20/30/40).
         let draft_seq = vec![99u32, 99, 99];
         let max_len = 4;
 
@@ -19802,38 +19918,32 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hand-constructed case 3: Target emits EOS naturally (not via draft).
-    // Both oracle and MTP should stop at the same token including EOS.
+    // Hand-constructed: target emits EOS via the accept+bonus-stop path.
+    // After fix B, oracle and MTP both emit [10, 20, EOS].
     // -----------------------------------------------------------------------
     #[test]
-    fn test_target_eos_naturally() {
+    fn test_target_eos_via_bonus() {
         let logit_rows: Vec<Vec<f32>> = vec![
             make_logit(10, 5),  // pos0 → 10
-            make_logit(20, 5),  // pos1 → 20
-            make_logit(EOS, 5), // pos2 → EOS
+            make_logit(20, 5),  // pos1 → 20 (draft correct → accepted)
+            make_logit(EOS, 5), // pos2 → EOS (bonus)
         ];
-        let draft_seq = vec![20u32, 99]; // draft wrong at pos1
+        let draft_seq = vec![20u32, 99];
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: push 10, push 20, push EOS, break → [10, 20, EOS]
-        assert_eq!(oracle, vec![10, 20, EOS]);
+        assert_eq!(oracle, vec![10, 20, EOS], "oracle: [10, 20, EOS]");
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        // MTP round 0: pending=10, draft=20, accepted (target[1]=20), bonus=argmax(logit[2])=EOS
-        //   → mtp_greedy_round(10, 20, true, EOS, is_stop) → EmitAndStop([10, 20])
-        // So MTP output = [10, 20].
-        // Note: MTP does not emit the bonus stop token when accept+bonus-is-stop;
-        // this matches the pre-existing loop behaviour (bonus not pushed, break).
+        // Round 0: pending=10, draft=20, accepted, bonus=EOS
+        //   → mtp_greedy_round(10, 20, true, EOS, is_stop)
+        //   → EmitAndStop([10, 20, EOS])   (case B fix)
         assert_eq!(
             mtp,
-            vec![10, 20],
-            "mtp: accept+bonus-eos stops without emitting bonus"
+            vec![10, 20, EOS],
+            "after case B fix, mtp must equal oracle"
         );
-        // The oracle emits [10, 20, EOS] while MTP emits [10, 20]. This is a
-        // pre-existing discrepancy in the bonus-stop path; not the concern of this PR.
-        // What we assert: both stop before any non-EOS token 99 appears.
-        assert!(!mtp.contains(&99), "no spurious token 99 in output");
+        assert_eq!(oracle, mtp);
     }
 
     // -----------------------------------------------------------------------
@@ -19851,43 +19961,27 @@ mod mtp_greedy_round_tests {
             make_logit(30, 5),  // pos2 → 30
             make_logit(EOS, 5), // pos3 → EOS
         ];
-        // Draft proposes EOS at pos1 (wrong), then 99 (also wrong), then 99.
         let draft_seq = vec![EOS, 99u32, 99];
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: 10, 20, 30, EOS.
         assert_eq!(oracle, vec![10, 20, 30, EOS], "oracle sanity check");
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
         // Round 0: pending=10, draft=EOS, target[1]=20 (non-stop) → rejected.
-        //   bonus = argmax(logit[1]) = 20.
-        //   mtp_greedy_round(10, EOS, false, 20, is_stop) → EmitAndContinue([10], 20)
-        //   pos advances to 1.
-        // Round 1: pending=20, draft=99, target[2]=30 (non-stop) → rejected.
-        //   bonus = argmax(logit[2]) = 30.
-        //   mtp_greedy_round(20, 99, false, 30, is_stop) → EmitAndContinue([20], 30)
-        //   pos advances to 2.
+        //   bonus = 20.  EmitAndContinue([10], 20).  pos→1.
+        // Round 1: pending=20, draft=99, target[2]=30 → rejected.
+        //   bonus = 30.  EmitAndContinue([20], 30).  pos→2.
         // Round 2: pending=30, draft=99, target[3]=EOS → rejected.
-        //   bonus = argmax(logit[3]) = EOS (is_stop).
-        //   mtp_greedy_round(30, 99, false, EOS, is_stop) → EmitAndStop([30])
-        // Final output = [10, 20, 30].
-        // (EOS not pushed in reject-stop path — pre-existing behaviour.)
-        assert!(
-            mtp.len() >= 3,
-            "draft-EOS-but-target-non-stop: generation must NOT truncate early; got {mtp:?}"
-        );
-        assert_eq!(mtp[0], 10, "first token must be 10, got {mtp:?}");
+        //   bonus = EOS.  EmitAndStop([30, EOS])   ← case C fix.
+        // MTP output = [10, 20, 30, EOS].
         assert_eq!(
-            mtp[1], 20,
-            "second token must be 20 (draft EOS rejected), got {mtp:?}"
+            mtp,
+            vec![10, 20, 30, EOS],
+            "draft-EOS-but-target-non-stop: must match oracle; got {mtp:?}"
         );
-        assert_eq!(mtp[2], 30, "third token must be 30, got {mtp:?}");
-        assert!(
-            !mtp.contains(&99),
-            "spurious token 99 must not appear, got {mtp:?}"
-        );
-        // Confirm it does NOT equal [10] which the old short-circuit produced.
+        assert_eq!(oracle, mtp);
+        // Confirm it does NOT equal [10] (old short-circuit regression).
         assert_ne!(
             mtp,
             vec![10],
@@ -19896,8 +19990,8 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Hand-constructed case: Draft proposes EOS and target AGREES.
-    // MTP should emit [pending, EOS] and stop.
+    // Hand-constructed: Draft proposes EOS and target AGREES.
+    // MTP must emit [pending, EOS] and stop (accept+draft-is-stop path).
     // -----------------------------------------------------------------------
     #[test]
     fn test_draft_eos_accepted() {
@@ -19909,11 +20003,14 @@ mod mtp_greedy_round_tests {
         let draft_seq = vec![EOS];
         let max_len = 10;
 
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![10, EOS]);
+
         let outcome = mtp_greedy_round(
             10,   // pending
-            EOS,  // draft
-            true, // accepted: target also says EOS
-            30,   // bonus (irrelevant)
+            EOS,  // draft (accepted: target[1]=EOS)
+            true, // accepted
+            30,   // bonus (irrelevant — draft is the stop)
             is_stop,
         );
         assert_eq!(
@@ -19923,104 +20020,77 @@ mod mtp_greedy_round_tests {
         );
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        // Round 0: pending=10, draft=EOS, target[1]=EOS → accepted.
-        //   is_stop(EOS) → EmitAndStop([10, EOS])
         assert_eq!(mtp, vec![10, EOS], "accepted draft-EOS: mtp={mtp:?}");
+        assert_eq!(oracle, mtp);
     }
 
     // -----------------------------------------------------------------------
-    // Mixed case: some accepted, some rejected, with EOS at the natural end.
+    // Mixed: some accepted, some rejected, EOS at the end via case C.
+    // After fixes, oracle and MTP agree fully including EOS.
     // -----------------------------------------------------------------------
     #[test]
     fn test_mixed_accept_reject_then_eos() {
         let logit_rows: Vec<Vec<f32>> = vec![
             make_logit(10, 5),  // pos0 → 10
-            make_logit(20, 5),  // pos1 → 20
-            make_logit(30, 5),  // pos2 → 30
-            make_logit(40, 5),  // pos3 → 40
+            make_logit(20, 5),  // pos1 → 20 (draft correct)
+            make_logit(30, 5),  // pos2 → 30 (draft wrong)
+            make_logit(40, 5),  // pos3 → 40 (draft wrong)
             make_logit(EOS, 5), // pos4 → EOS
         ];
-        // Round 0: draft=20 (correct, accepted), Round 1: draft=99 (wrong, rejected).
         let draft_seq = vec![20u32, 99, 99];
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: 10, 20, 30, 40, EOS.
         assert_eq!(oracle, vec![10, 20, 30, 40, EOS]);
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        // Round 0: pending=10, draft=20, accepted, bonus=argmax(logit[2])=30 (non-stop)
+        // Round 0: pending=10, draft=20, accepted, bonus=30 (non-stop)
         //   → EmitAndContinue([10, 20], 30), pos=2
-        // Round 1: pending=30, draft=99, rejected, bonus=argmax(logit[3])=40 (non-stop)
+        // Round 1: pending=30, draft=99, rejected, bonus=40 (non-stop)
         //   → EmitAndContinue([30], 40), pos=3
-        // Round 2: pending=40, draft=99, rejected, bonus=argmax(logit[4])=EOS (stop)
-        //   → EmitAndStop([40])
-        // MTP output = [10, 20, 30, 40].
-        assert_eq!(mtp, vec![10, 20, 30, 40]);
-        // Prefix must match oracle (up to the pre-existing bonus-stop difference).
+        // Round 2: pending=40, draft=99, rejected, bonus=EOS (stop)
+        //   → EmitAndStop([40, EOS])   ← case C fix
+        // MTP output = [10, 20, 30, 40, EOS].
         assert_eq!(
-            &mtp[..],
-            &oracle[..oracle.len().saturating_sub(1)],
-            "mtp prefix must match oracle minus trailing EOS"
+            mtp,
+            vec![10, 20, 30, 40, EOS],
+            "mixed: mtp must fully match oracle"
         );
+        assert_eq!(oracle, mtp);
     }
 
     // -----------------------------------------------------------------------
     // Randomised / property-style sweep: seeded RNG, arbitrary draft choices.
     //
-    // Properties checked per trial:
-    // 1. MTP output length does not exceed max_len.
-    // 2. If EOS appears in MTP output, it is the final token (no generation
-    //    past EOS).
-    // 3. All non-stop tokens in the MTP output appear in the oracle output in
-    //    the same order (MTP produces a valid prefix of the oracle sequence).
-    // 4. MTP never produces a non-stop token at a position where the oracle
-    //    produced a stop token (no generation past oracle's EOS boundary).
+    // With all three EOS-faithful fixes (A/B/C), `simulate_mtp` should produce
+    // token-for-token identical output to `plain_greedy_oracle` across all
+    // trials, including those where stop tokens appear at any position.
     //
-    // Note on MTP-vs-oracle length differences: MTP can stop one token earlier
-    // than the oracle when the oracle's last token is EOS but MTP hits the
-    // bonus-stop path (pre-existing behaviour, not concern #2). The assertions
-    // below tolerate this and only flag definite correctness violations.
-    //
-    // Trials where logit_rows[0] argmax is EOS are skipped: the Metal loop
-    // returns empty output in that case (prefill-EOS early return), which is
-    // trivially correct and not exercised by the loop logic under test.
+    // The sweep also includes trials where logit_rows[0] is EOS (case A).
+    // max_len is set large (20) so that natural EOS-stop is reached before
+    // the cap, keeping EOS-faithfulness under test rather than cap behavior.
     // -----------------------------------------------------------------------
     #[test]
     fn test_randomised_sweep() {
-        // Minimal LCG for deterministic seeding — no external RNG dep needed.
         let mut rng = Lcg::new(0xdeadbeef_cafebabe);
 
         let vocab_size = 8usize; // tiny vocab; EOS=2
-        let trials_target = 200;
-        let mut trials_run = 0;
-        let mut attempts = 0;
+        let trials = 400;
 
-        while trials_run < trials_target {
-            attempts += 1;
-            assert!(
-                attempts < 5000,
-                "LCG exhausted before reaching {trials_target} trials"
-            );
-
+        for trial in 0..trials {
             let seq_len = (rng.next_u64() % 6 + 2) as usize; // 2..=7
-            let max_len = (rng.next_u64() % 8 + 2) as usize; // 2..=9
+            // Large max_len so EOS-stop is reached before cap in most trials.
+            let max_len = 20;
 
-            // Generate random logit rows (one per position).
+            // Random logit rows — stop tokens may appear at any position.
             let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
                 .map(|_| {
                     let winner = (rng.next_u64() % vocab_size as u64) as usize;
                     let mut row = vec![0.0f32; vocab_size];
-                    row[winner] = 10.0; // strong argmax
+                    row[winner] = 10.0;
                     row
                 })
                 .collect();
-
-            // Skip trials where the first pending token is EOS: the Metal loop
-            // returns empty for prefill-EOS, which is trivially correct.
-            if is_stop(argmax(&logit_rows[0])) {
-                continue;
-            }
 
             // Random draft sequence (may propose EOS at any position).
             let draft_seq: Vec<u32> = (0..seq_len)
@@ -20029,41 +20099,15 @@ mod mtp_greedy_round_tests {
 
             let oracle = plain_greedy_oracle(&logit_rows, max_len);
             let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-            trials_run += 1;
 
-            // 1. MTP must not exceed max_len.
-            assert!(
-                mtp.len() <= max_len,
-                "trial {trials_run}: mtp output exceeds max_len={max_len}: mtp={mtp:?}"
-            );
-
-            // 2. MTP must not produce EOS and then continue (stop-then-continue).
-            let eos_pos = mtp.iter().position(|&t| is_stop(t));
-            if let Some(ep) = eos_pos {
-                assert_eq!(
-                    ep + 1,
-                    mtp.len(),
-                    "trial {trials_run}: EOS at pos {ep} but output continues: mtp={mtp:?}"
-                );
-            }
-
-            // 3. Non-stop tokens in MTP must be a prefix of the oracle's
-            //    non-stop sequence (no fabricated tokens).
-            let oracle_non_stop: Vec<u32> =
-                oracle.iter().copied().filter(|&t| !is_stop(t)).collect();
-            let mtp_non_stop: Vec<u32> = mtp.iter().copied().filter(|&t| !is_stop(t)).collect();
-            assert!(
-                oracle_non_stop.starts_with(&mtp_non_stop),
-                "trial {trials_run}: mtp non-stop tokens not a prefix of oracle:\n  oracle_non_stop={oracle_non_stop:?}\n  mtp_non_stop={mtp_non_stop:?}"
-            );
-
-            // 4. MTP must not generate tokens past the oracle's EOS boundary.
-            //    oracle_eos_prefix_len = number of non-stop tokens before EOS.
-            let oracle_eos_prefix = oracle_non_stop.len();
-            assert!(
-                mtp_non_stop.len() <= oracle_eos_prefix,
-                "trial {trials_run}: mtp generated {len} non-stop tokens but oracle has only {oracle_eos_prefix} before EOS:\n  oracle={oracle:?}\n  mtp={mtp:?}",
-                len = mtp_non_stop.len()
+            assert_eq!(
+                oracle,
+                mtp,
+                "trial {trial}: oracle != mtp\n  logit_winners={:?}\n  draft_seq={:?}\n  oracle={:?}\n  mtp={:?}",
+                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                draft_seq,
+                oracle,
+                mtp
             );
         }
     }
@@ -20072,8 +20116,7 @@ mod mtp_greedy_round_tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Build a logit vector of `size` elements where position `winner` has
-    /// value `high` and everything else is 0.
+    /// Build a logit vector of size 100 with `winner` at logit 10.0.
     fn make_logit(winner: u32, _high: u32) -> Vec<f32> {
         let size = 100usize;
         let mut v = vec![0.0f32; size];
