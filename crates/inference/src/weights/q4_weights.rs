@@ -311,15 +311,15 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
 
 /// Dequantize Q4_0 blocks (raw bytes) back to f32 values.
 ///
-/// `data` must be a multiple of 20 bytes (one block per 20 bytes).
-/// Returns exactly `n_weights` values; the caller is responsible for ensuring
-/// `n_weights <= (data.len() / 20) * 32`.
+/// Trailing bytes beyond the last complete 20-byte block are silently ignored;
+/// the function returns `min(n_weights, (data.len() / 20) * 32)` values.
+/// It never panics regardless of input length — inputs shorter than 20 bytes
+/// return an empty `Vec`.
+///
+/// The caller is responsible for sizing `n_weights` appropriately:
+/// if `n_weights > (data.len() / 20) * 32` the output is truncated to the
+/// number of values that complete blocks can produce.
 pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
-    assert_eq!(
-        data.len() % 20,
-        0,
-        "data length must be a multiple of 20 (Q4Block size with bias)"
-    );
     let mut out = Vec::with_capacity(n_weights);
     for chunk in data.chunks_exact(20) {
         let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
@@ -1429,5 +1429,78 @@ mod tests {
             std::slice::from_raw_parts(q.blocks.as_ptr().cast::<u8>(), q.blocks.len() * 20)
         };
         assert_eq!(q_bytes, row_bytes.as_slice());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for dequantize_row_q4_0 robustness (issue #263)
+    //
+    // These tests verify that dequantize_row_q4_0 does NOT panic on
+    // misaligned or undersized inputs. The function uses chunks_exact(20)
+    // which silently ignores trailing bytes, so removing the assert_eq!
+    // alignment check makes the behaviour well-defined on any input.
+    // -----------------------------------------------------------------------
+
+    /// Misaligned input (25 bytes = 1 complete block + 5 remainder bytes) must not panic.
+    /// The 5 trailing bytes are ignored; only the 1 complete block (32 values) is returned.
+    #[test]
+    fn dequantize_row_q4_0_misaligned_does_not_panic() {
+        // Build a valid 1-block (20-byte) buffer by quantizing 32 known values.
+        let src: Vec<f32> = (0..32).map(|i| (i as f32 / 31.0) * 14.0 - 7.0).collect();
+        let mut buf = quantize_row_q4_0(&src); // exactly 20 bytes
+        assert_eq!(buf.len(), 20);
+        // Append 5 garbage bytes — total 25, which is NOT a multiple of 20.
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xFF]);
+        assert_eq!(buf.len(), 25);
+
+        // Must not panic; chunks_exact(20) stops after the first complete block.
+        let out = dequantize_row_q4_0(&buf, 32);
+
+        // Should return exactly 32 values (one block worth).
+        assert_eq!(out.len(), 32);
+
+        // Round-trip tolerance: same threshold used by test_quantize_single_block.
+        // With scale ≈ 1.0 (range = 14.0, 15 steps) the max error is ≤ 0.51.
+        let max_err = src
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err <= 0.51,
+            "max abs error {max_err:.4} > 0.51 for single-block misaligned input"
+        );
+    }
+
+    /// Input shorter than one block (10 bytes < 20) must return an empty Vec.
+    #[test]
+    fn dequantize_row_q4_0_truncated_below_one_block() {
+        let buf = vec![0xABu8; 10]; // 10 bytes — not even one complete block
+        // Must not panic; chunks_exact(20) produces zero chunks → empty output.
+        let out = dequantize_row_q4_0(&buf, 32);
+        assert!(
+            out.is_empty(),
+            "expected empty Vec for sub-block input, got {} values",
+            out.len()
+        );
+    }
+
+    /// Clean 2-block (40-byte) input with n_weights=64 still returns 64 correct values.
+    /// This is a regression guard: removing the assert must not break the happy path.
+    #[test]
+    fn dequantize_row_q4_0_exact_blocks_unchanged() {
+        let src: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
+        let data = quantize_row_q4_0(&src);
+        assert_eq!(data.len(), 40, "2-block input must be 40 bytes");
+        let out = dequantize_row_q4_0(&data, 64);
+        assert_eq!(out.len(), 64);
+        let max_err = src
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.5,
+            "max abs error {max_err:.4} >= 0.5 for exact 2-block input"
+        );
     }
 }
