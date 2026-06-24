@@ -43,9 +43,14 @@ fn run() {
         .expect("from_q4_dir failed — MSL compile or weight load error");
     eprintln!("[bench] Model loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // 512 synthetic token IDs cycling through mid-vocabulary (stable, repeatable)
-    let prompt_ids: Vec<u32> = (0u32..512).map(|i| 100 + (i % 1000)).collect();
-    let seq_len = prompt_ids.len();
+    // Synthetic token IDs cycling through mid-vocabulary (stable, repeatable).
+    // Sequence length is configurable via LATTICE_SEQ_LEN (default 512) to
+    // characterize the prefill throughput curve across context lengths.
+    let seq_len: usize = std::env::var("LATTICE_SEQ_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let prompt_ids: Vec<u32> = (0u32..seq_len as u32).map(|i| 100 + (i % 1000)).collect();
 
     let n_warmup = 1usize;
     let n_measure = 3usize;
