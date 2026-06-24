@@ -8925,6 +8925,20 @@ kernel void gdn_chunk_norm_silu_c32(
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
+            // Mirror plain greedy `generate()` (generate.rs:293) and the sibling
+            // `generate_greedy_mtp`: max_new_tokens == 0 means "generate nothing".
+            // Return before sampling so we never emit a token the caller did not ask
+            // for — including the case-A prefill-EOS path below, which would otherwise
+            // emit one stop token for a zero budget.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                };
+            }
+
             let argmax_logits = |logits: &[f32]| -> u32 {
                 logits
                     .iter()
