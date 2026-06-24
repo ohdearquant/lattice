@@ -1823,16 +1823,27 @@ pub fn rejection_sample_draft(
 ///
 /// Verify draft tokens against the model's greedy predictions.
 ///
-/// Runs `forward_fn(token_id, position)` for each draft token in sequence.
-/// Accepts tokens as long as the model's greedy choice agrees with the next
-/// draft token. Returns after the first disagreement.
+/// Starting from `current_token` (the last committed token sitting at `position_start - 1`
+/// with the KV cache holding positions `0..position_start`), runs one forward pass per
+/// candidate position until either a draft token is rejected or all drafts are confirmed.
 ///
-/// Returns `(accepted_count, collected_logits)` where:
-/// - `accepted_count`: number of draft tokens whose forward passes were
-///   executed (always >= 1 if `draft_tokens` is non-empty).
-/// - `collected_logits`: the logits from each forward call, useful for
-///   recovering the correct next token after a rejection.
+/// # Contract
+///
+/// Returns `(accepted, all_logits)` where:
+/// - `accepted` ∈ `0..=draft_tokens.len()`: number of draft tokens that matched greedy.
+/// - `all_logits.len() == accepted + 1`: exactly one logit vector per committed position
+///   plus one for the next-step distribution.
+/// - For `i in 0..accepted`: `argmax(all_logits[i]) == draft_tokens[i]` (greedy agreement).
+/// - `argmax(all_logits[accepted])` is the greedy-correct continuation after the accepted
+///   prefix: a rejection-correction when `accepted < draft_tokens.len()`, or the bonus
+///   token when all drafts matched.
+///
+/// This helper is greedy-equivalent: with a stateless `forward_fn` the sequence it commits
+/// is byte-for-byte identical to plain greedy decoding. The real latency benefit only appears
+/// when the *target* forward pass is batched (as in the `mtp_verify_draft` path); this
+/// single-token variant does `accepted + 1` sequential calls for `accepted + 1` tokens.
 pub fn verify_draft<F>(
+    current_token: u32,
     draft_tokens: &[u32],
     position_start: usize,
     mut forward_fn: F,
@@ -1840,20 +1851,22 @@ pub fn verify_draft<F>(
 where
     F: FnMut(u32, usize) -> Vec<f32>,
 {
-    let mut accepted = 0;
-    let mut all_logits = Vec::with_capacity(draft_tokens.len());
+    let mut input = current_token;
+    let mut accepted = 0usize;
+    let mut all_logits = Vec::with_capacity(draft_tokens.len() + 1);
 
-    for (i, &draft_token) in draft_tokens.iter().enumerate() {
-        let logits = forward_fn(draft_token, position_start + i);
+    loop {
+        let logits = forward_fn(input, position_start + accepted);
         let model_choice = argmax(&logits);
         all_logits.push(logits);
 
-        // Always count this token as accepted (we ran the forward pass for it).
-        accepted += 1;
-
-        // If there are more draft tokens, check whether the model agrees
-        // with the next one. If not, stop here.
-        if i + 1 < draft_tokens.len() && model_choice != draft_tokens[i + 1] as usize {
+        if accepted < draft_tokens.len() && model_choice == draft_tokens[accepted] as usize {
+            // Model agrees with the next draft token; advance and keep verifying.
+            input = draft_tokens[accepted];
+            accepted += 1;
+        } else {
+            // Either a mismatch (rejection) or all drafts verified — the final logits
+            // in all_logits[accepted] are the greedy-correct next-step distribution.
             break;
         }
     }
@@ -1905,56 +1918,39 @@ where
     let mut pos = prompt_tokens.len();
 
     while generated.len() < max_new_tokens {
-        // Attempt speculative draft from prompt n-grams
         let draft = speculator.speculate(&all_tokens);
+        let current = *all_tokens
+            .last()
+            .expect("invariant: prompt_tokens must seed speculation history");
 
-        if draft.is_empty() {
-            // No speculation possible -- normal single-token decode
-            let logits = forward_fn(
-                *all_tokens
-                    .last()
-                    .expect("invariant: prompt_tokens must seed speculation history"),
-                pos,
-            );
-            let next_token = argmax(&logits) as u32;
+        // verify_draft feeds `current` first, then accepted draft tokens.
+        // When draft is empty this reduces to a single forward pass — the
+        // "bonus" logits[0] give the greedy-correct next token.
+        let (accepted, logits_vec) = verify_draft(current, &draft, pos, &mut forward_fn);
+
+        // Commit the accepted draft tokens (each == greedy by verify_draft's contract).
+        for &t in &draft[..accepted] {
+            if generated.len() == max_new_tokens {
+                return generated;
+            }
+            if t == eos_token {
+                return generated;
+            }
+            generated.push(t);
+            all_tokens.push(t);
+            pos += 1;
+        }
+
+        // logits_vec[accepted] is the greedy-correct next-step distribution regardless
+        // of whether we rejected or exhausted the draft (bonus token path).
+        if generated.len() < max_new_tokens {
+            let next_token = argmax(&logits_vec[accepted]) as u32;
             if next_token == eos_token {
                 break;
             }
             generated.push(next_token);
             all_tokens.push(next_token);
             pos += 1;
-        } else {
-            // Verify the draft tokens
-            let (accepted, logits_vec) = verify_draft(&draft, pos, &mut forward_fn);
-
-            // Accept verified tokens, but never past the caller's budget: a
-            // multi-token draft can exceed `max_new_tokens` in a single step,
-            // so clamp the commit to the remaining budget (#242).
-            let remaining = max_new_tokens - generated.len();
-            let commit = accepted.min(remaining);
-            for &t in &draft[..commit] {
-                if t == eos_token {
-                    return generated;
-                }
-                generated.push(t);
-                all_tokens.push(t);
-                pos += 1;
-            }
-
-            // If we rejected some draft tokens, the last set of logits
-            // gives us the model's actual prediction for the next token.
-            // Skip it once the budget is full so the fallback cannot overrun.
-            if accepted < draft.len() && generated.len() < max_new_tokens {
-                let rejection_logits =
-                    &logits_vec[accepted.min(logits_vec.len().saturating_sub(1))];
-                let next_token = argmax(rejection_logits) as u32;
-                if next_token == eos_token {
-                    break;
-                }
-                generated.push(next_token);
-                all_tokens.push(next_token);
-                pos += 1;
-            }
         }
     }
 
@@ -2099,94 +2095,133 @@ mod tests {
 
     #[test]
     fn verify_draft_all_accepted() {
+        // current=0, draft=[1,2,3].
+        // Call 0: fwd(0, 10) → predicts draft[0]=1  → accepted=1, input=1
+        // Call 1: fwd(1, 11) → predicts draft[1]=2  → accepted=2, input=2
+        // Call 2: fwd(2, 12) → predicts draft[2]=3  → accepted=3, input=3
+        // Call 3: fwd(3, 13) → accepted=3 == len=3  → break (bonus logits)
+        // Result: accepted=3, logits.len()=4 (3 verification calls + 1 bonus call)
         let draft = vec![1u32, 2, 3];
-        // Forward function: for draft[i], model predicts draft[i+1]
         let mut call = 0usize;
-        let (accepted, logits) = verify_draft(&draft, 10, |_tok, _pos| {
+        let (accepted, logits) = verify_draft(0, &draft, 10, |_tok, _pos| {
             let mut l = vec![0.0f32; 10];
-            call += 1;
-            // After processing draft[i], model should predict draft[i+1]
-            if call < draft.len() {
-                l[draft[call] as usize] = 1.0;
-            } else {
-                l[0] = 1.0; // last token -- prediction doesn't matter for acceptance
+            match call {
+                0 => l[1] = 1.0, // predicts draft[0]=1
+                1 => l[2] = 1.0, // predicts draft[1]=2
+                2 => l[3] = 1.0, // predicts draft[2]=3
+                _ => l[0] = 1.0, // bonus call — prediction is the next greedy token
             }
+            call += 1;
             l
         });
         assert_eq!(accepted, 3);
-        assert_eq!(logits.len(), 3);
+        assert_eq!(logits.len(), 4);
     }
 
     #[test]
     fn verify_draft_first_rejected() {
+        // current=5, draft=[1,2,3].
+        // Call 0: fwd(5, 0) → predicts 99 != draft[0]=1 → accepted=0, break
+        // Result: accepted=0, logits.len()=1 (the rejection-correction call)
         let draft = vec![1u32, 2, 3];
-        // Model always predicts token 99 -- disagrees with draft[1]=2
-        let (accepted, logits) = verify_draft(&draft, 0, |_tok, _pos| {
+        let (accepted, logits) = verify_draft(5, &draft, 0, |_tok, _pos| {
             let mut l = vec![0.0f32; 100];
             l[99] = 1.0;
             l
         });
-        // First forward call processes draft[0]=1, predicts 99 != draft[1]=2 => stop after 1
-        assert_eq!(accepted, 1);
+        assert_eq!(accepted, 0);
         assert_eq!(logits.len(), 1);
+        // The correction token is 99, not draft[0]=1
+        assert_eq!(argmax(&logits[0]), 99);
     }
 
     #[test]
     fn verify_draft_partial_acceptance() {
+        // current=0, draft=[10,20,30,40].
+        // Call 0: fwd(0,  0) → predicts 10  → accepted=1, input=10
+        // Call 1: fwd(10, 1) → predicts 20  → accepted=2, input=20
+        // Call 2: fwd(20, 2) → predicts 30  → accepted=3, input=30
+        // Call 3: fwd(30, 3) → predicts  0 != draft[3]=40 → break
+        // Result: accepted=3, logits.len()=4
         let draft = vec![10u32, 20, 30, 40];
         let mut call = 0usize;
-        let (accepted, logits) = verify_draft(&draft, 0, |_tok, _pos| {
-            call += 1;
+        let (accepted, logits) = verify_draft(0, &draft, 0, |_tok, _pos| {
             let mut l = vec![0.0f32; 50];
             match call {
+                0 => l[10] = 1.0, // agrees with draft[0]
                 1 => l[20] = 1.0, // agrees with draft[1]
                 2 => l[30] = 1.0, // agrees with draft[2]
-                3 => l[0] = 1.0,  // disagrees with draft[3]=40
-                _ => l[0] = 1.0,
+                _ => l[0] = 1.0,  // disagrees with draft[3]=40
             }
+            call += 1;
             l
         });
-        // Accepted: draft[0] (model ok with draft[1]), draft[1] (ok with draft[2]),
-        // draft[2] (disagrees with draft[3]) => 3 accepted
         assert_eq!(accepted, 3);
-        assert_eq!(logits.len(), 3);
+        assert_eq!(logits.len(), 4);
     }
 
     #[test]
     fn verify_draft_single_token() {
+        // current=7, draft=[42].
+        // Call 0: fwd(7, 5) → predicts 42 == draft[0] → accepted=1, input=42
+        // Call 1: fwd(42, 6) → accepted=1 == len=1 → break (bonus)
+        // Result: accepted=1, logits.len()=2
         let draft = vec![42u32];
-        let (accepted, logits) = verify_draft(&draft, 5, |_tok, _pos| vec![0.0; 10]);
+        let mut call = 0usize;
+        let (accepted, logits) = verify_draft(7, &draft, 5, |_tok, _pos| {
+            let mut l = vec![0.0f32; 100];
+            if call == 0 {
+                l[42] = 1.0; // predicts draft[0]=42
+            } else {
+                l[0] = 1.0; // bonus call
+            }
+            call += 1;
+            l
+        });
         assert_eq!(accepted, 1);
-        assert_eq!(logits.len(), 1);
+        assert_eq!(logits.len(), 2);
     }
 
     #[test]
     fn verify_draft_empty() {
-        let (accepted, logits) = verify_draft(&[], 0, |_tok, _pos| vec![0.0; 10]);
+        // current=3, draft=[].
+        // Call 0: fwd(3, 0) → accepted=0 == len=0 → break immediately (bonus logits)
+        // Result: accepted=0, logits.len()=1
+        let (accepted, logits) = verify_draft(3, &[], 0, |_tok, _pos| {
+            let mut l = vec![0.0f32; 10];
+            l[7] = 1.0;
+            l
+        });
         assert_eq!(accepted, 0);
-        assert_eq!(logits.len(), 0);
+        assert_eq!(logits.len(), 1);
+        // The single logits entry is the greedy-correct next token distribution
+        assert_eq!(argmax(&logits[0]), 7);
     }
 
     #[test]
     fn verify_draft_positions_are_correct() {
+        // current=9, draft=[1,2,3], position_start=100.
+        // Call 0: fwd(9,   100) → predicts 1  → accepted=1
+        // Call 1: fwd(1,   101) → predicts 2  → accepted=2
+        // Call 2: fwd(2,   102) → predicts 3  → accepted=3
+        // Call 3: fwd(3,   103) → bonus call  → break
+        // Positions seen: [100, 101, 102, 103]
         let draft = vec![1u32, 2, 3];
         let mut positions = Vec::new();
         let mut call = 0usize;
-        let _ = verify_draft(&draft, 100, |_tok, pos| {
+        let _ = verify_draft(9, &draft, 100, |_tok, pos| {
             positions.push(pos);
-            call += 1;
             let mut l = vec![0.0f32; 10];
-            // Each call must predict the *next* draft token for verification
-            // to continue.
             match call {
+                0 => l[1] = 1.0, // predicts draft[0]=1
                 1 => l[2] = 1.0, // predicts draft[1]=2
                 2 => l[3] = 1.0, // predicts draft[2]=3
-                _ => l[0] = 1.0, // last token, prediction doesn't matter
+                _ => l[0] = 1.0, // bonus
             }
+            call += 1;
             l
         });
-        // Should be called with consecutive positions starting at 100
-        assert_eq!(positions, vec![100, 101, 102]);
+        assert_eq!(positions, vec![100, 101, 102, 103]);
     }
 
     // -- MTP verification tests --
@@ -2561,19 +2596,19 @@ mod tests {
 
     #[test]
     fn generate_eos_in_draft_stops_early() {
-        // Prompt: [1, 2, 3, EOS, 5]
-        // If speculation drafts [3, EOS, 5], generation should stop at EOS.
+        // Prompt: [1, 2, 3, 99, 5] where eos=99.
+        //
+        // Iter 1: draft=[] (no 2-gram match from tail [..,5]); verify_draft(5,[],5,fwd).
+        //   call 1: fwd(5, 5) → 2.  Emit 2.  all_tokens=[1,2,3,99,5,2], pos=6.
+        // Iter 2: draft=[] ([5,2] not in prompt); verify_draft(2,[],6,fwd).
+        //   call 2: fwd(2, 6) → 3.  Emit 3.  all_tokens=[...,2,3], pos=7.
+        // Iter 3: 2-gram [2,3] matches prompt[1..3] → draft=[99,5].
+        //   verify_draft(3, [99,5], 7, fwd):
+        //     call 3: fwd(3, 7) → 99 == draft[0] → accepted=1, input=99
+        //     call 4: fwd(99, 8) → 0  != draft[1]=5 → break
+        //   Commit draft[..1]=[99]: 99==eos → return [2,3].
         let prompt = vec![1u32, 2, 3, 99, 5];
         let eos = 99;
-
-        // We need to construct a scenario where speculation fires with EOS in draft.
-        // After first normal decode, if model produces token 2, all_tokens = [1,2,3,99,5,2].
-        // Then [5, 2] doesn't match prompt. Next, model produces 3, all_tokens=[...,2,3].
-        // [2, 3] matches prompt[1..3], draft = [99, 5] (draft[0] = EOS).
-        // verify_draft runs forward for draft[0]=99, which is EOS.
-        // But EOS check is done AFTER verify, in the acceptance loop.
-        // draft[0]=99=EOS => generation should return.
-
         let mut call = 0;
         let result = generate_with_speculation(
             &prompt,
@@ -2583,12 +2618,10 @@ mod tests {
                 call += 1;
                 let mut l = vec![0.0f32; 100];
                 match call {
-                    1 => l[2] = 1.0, // first normal: predict 2
-                    2 => l[3] = 1.0, // second normal: predict 3
-                    // Now speculation kicks in: [2,3] matches, drafts [99,5]
-                    // verify_draft calls forward for draft token 99
-                    3 => l[5] = 1.0, // model predicts 5 (agrees with draft[1])
-                    4 => l[0] = 1.0, // model prediction for token 5
+                    1 => l[2] = 1.0,  // verify_draft(5,[],5): bonus → emit 2
+                    2 => l[3] = 1.0,  // verify_draft(2,[],6): bonus → emit 3
+                    3 => l[99] = 1.0, // verify_draft(3,[99,5],7): fwd(3,7)→99 matches draft[0]
+                    4 => l[0] = 1.0,  // verify_draft cont: fwd(99,8)→0 != draft[1]=5 → reject
                     _ => l[42] = 1.0,
                 }
                 l
@@ -2597,8 +2630,80 @@ mod tests {
             4,
         );
 
-        // Generated: [2, 3] from normal decode, then EOS hit from draft
-        assert_eq!(result.len(), 2);
+        // [2, 3] emitted normally, then draft[0]=99=EOS terminates generation
+        assert_eq!(result, vec![2, 3]);
+    }
+
+    #[test]
+    fn generate_with_speculation_issue_243_regression() {
+        // Regression: prompt=[1,1,1], greedy always picks 0 from input 1.
+        // Speculation drafts [1,...] from 2-gram [1,1], but the model rejects
+        // draft[0]=1 on the very first call (greedy choice is 0). The fix
+        // ensures verify_draft feeds current_token first, so draft[0] is gated
+        // by an actual forward pass rather than admitted unconditionally.
+        let prompt = vec![1u32, 1, 1];
+        let eos = 99;
+        let result = generate_with_speculation(
+            &prompt,
+            1,
+            eos,
+            |_tok, _pos| {
+                // Greedy choice is always 0 regardless of input.
+                let mut l = vec![0.0f32; 10];
+                l[0] = 1.0;
+                l
+            },
+            5,
+            4,
+        );
+        // Greedy emits [0]; the old buggy code emitted [1] (draft committed unverified).
+        assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn generate_with_speculation_matches_greedy() {
+        // Verifies speculative decoding is token-identical to plain greedy.
+        //
+        // forward_fn: next token = (input_token + 1) % 10 (pure, position-independent).
+        // Prompt repeats the cycle twice to guarantee 2-gram matches fire during
+        // generation, exercising the speculation path on every iteration after
+        // the first few tokens.
+        let prompt: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1];
+        let eos = 50u32; // unreachable in a 10-token cycle
+        let max_new = 10usize;
+
+        // Reference greedy: feed last token, argmax, repeat.
+        let greedy_fwd = |tok: u32, _pos: usize| -> Vec<f32> {
+            let mut l = vec![0.0f32; 60];
+            l[((tok + 1) % 10) as usize] = 1.0;
+            l
+        };
+        let mut ref_tokens = prompt.clone();
+        let mut ref_pos = prompt.len();
+        let mut greedy_out = Vec::with_capacity(max_new);
+        for _ in 0..max_new {
+            let logits = greedy_fwd(*ref_tokens.last().unwrap(), ref_pos);
+            let t = argmax(&logits) as u32;
+            if t == eos {
+                break;
+            }
+            greedy_out.push(t);
+            ref_tokens.push(t);
+            ref_pos += 1;
+        }
+
+        // Speculative path — identical forward logic, independent closure.
+        let spec_fwd = |tok: u32, _pos: usize| -> Vec<f32> {
+            let mut l = vec![0.0f32; 60];
+            l[((tok + 1) % 10) as usize] = 1.0;
+            l
+        };
+        let spec_out = generate_with_speculation(&prompt, max_new, eos, spec_fwd, 5, 4);
+
+        assert_eq!(
+            spec_out, greedy_out,
+            "speculative output diverged from greedy: spec={spec_out:?} greedy={greedy_out:?}"
+        );
     }
 
     // ── rejection_sample_draft tests ─────────────────────────────────────────
