@@ -8778,15 +8778,17 @@ kernel void gdn_chunk_norm_silu_c32(
                 // `greedy=true`: argmax-only acceptance that is deterministic and
                 // token-for-token equivalent to plain greedy `generate()`. Passing
                 // `greedy=false` here drove a clock-seeded RNG, making greedy MTP output
-                // non-deterministic and not argmax-equivalent (#237). In greedy mode
-                // `draft_logits` is unused, so pass `&[]` per the function contract.
+                // non-deterministic and not argmax-equivalent (#237). In greedy mode the
+                // verifier never reads `draft_logits` (it may even be `&[]` per the
+                // contract), but we still hand it the draft's own logits: the value is
+                // ignored on the greedy path and this keeps `draft.logits` a live read.
                 //   draft_tokens          = [draft.token_id]
-                //   draft_logits          = &[]                   (unused in greedy mode)
+                //   draft_logits          = [draft.logits]        (ignored in greedy mode)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
                 let Ok(rs) = crate::speculative::rejection_sample_draft(
                     &[draft.token_id],
-                    &[],
+                    std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
                     true,
