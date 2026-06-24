@@ -4,6 +4,25 @@
 **Date**: 2026-05-13\
 **Crate**: `lattice-inference`
 
+## Amendment (2026-06-24)
+
+The original ADR (Decision point 6 and the Consequences section) documented that
+`MtpVerifier` uses **interleaved pairs `(2i, 2i+1)`** for partial RoPE. This was
+**incorrect as of the v0.2.3 RoPE-convention fix**. The MTP partial RoPE path
+(`speculative.rs:mtp_apply_partial_rope`) now uses **split-half `(i, half+i)`**,
+matching the main-model convention. The code comment on that function reads:
+"Stride-half partial RoPE: rotate pairs (i, half+i) for i in 0..rope_dim/2 —
+matches HF rotate_half / MLX traditional=False."
+
+**Do not reintroduce interleaved pairing to `mtp_apply_partial_rope`.** The v0.2.3
+bug was the interleaved `(2i, 2i+1)` variant; the fix is split-half `(i, half+i)`.
+Cross-reference: the "Differential Test First" section of `CLAUDE.md` in this repo
+documents the v0.2.3 RoPE-convention fix and the diagnostic method used to identify
+the pairing mismatch.
+
+The original Decision and Context text is preserved below as a historical record.
+Inline corrections to the false statements are marked with `[CORRECTED]`.
+
 ---
 
 ## Context
@@ -46,7 +65,10 @@ Tests in `src/rope.rs` verify:
 - Norm preservation (rotation is an isometry)
 - Precision to 1e-6 vs f64 reference up to position 262,143
 
-The MtpVerifier in `src/speculative.rs` uses a separate partial RoPE application (`mtp_apply_partial_rope()`) that applies rotation only to the first `rope_dim` dimensions (25% of `head_dim`) using interleaved pairs `(2i, 2i+1)`.
+The MtpVerifier in `src/speculative.rs` uses a separate partial RoPE application
+(`mtp_apply_partial_rope()`) that applies rotation only to the first `rope_dim`
+dimensions (25% of `head_dim`). [CORRECTED: uses split-half pairs `(i, half+i)`,
+not interleaved `(2i, 2i+1)` — see Amendment above.]
 
 ---
 
@@ -63,7 +85,12 @@ Precompute RoPE frequency tables at model initialization in **f64 precision, sto
 3. **Precomputed table**: The table for Qwen3-0.6B is `32,768 × 64 (half_dim)` f32 entries × 2 (cos+sin) × 4 bytes = 16 MB. This is modest and avoids computing `cos(pos * freq[i])` in the hot path (transcendentals are expensive: ~20–80 cycles vs ~1 cycle for a table lookup).
 4. **θ=1,000,000 for Qwen3**: YaRN and similar extended-context RoPE variants use higher theta values to reduce the rotation speed of high-frequency dimensions, extending the effective context window beyond the training length. Qwen3 is trained with θ=1,000,000 and `max_position_embeddings=32,768`.
 5. **Immutable after construction**: `RopeTable` is constructed once and shared as `&RopeTable`. No locking. The apply method takes `&mut [f32]` (the head buffer) and `&self`, making parallelism straightforward.
-6. **MtpVerifier uses interleaved pairs for partial RoPE**: This is an exception to the split-half convention, dictated by the MTP architecture spec. It applies to only 25% of dimensions (`rope_dim = partial_rotary_factor * head_dim`). The interleaved and split-half conventions produce different outputs; mixing them would produce wrong attention.
+6. **MtpVerifier partial RoPE uses split-half `(i, half+i)`** [CORRECTED: the
+   original ADR stated "interleaved pairs `(2i, 2i+1)` — an exception to the
+   split-half convention." This was wrong. After the v0.2.3 fix, `mtp_apply_partial_rope`
+   uses split-half `(i, half+i)`, identical in pairing style to the main-model
+   `RopeTable::apply`. It applies to only 25% of dimensions (`rope_dim = partial_rotary_factor * head_dim`).
+   There is no longer a pairing-convention exception for the MTP path.]
 
 ---
 
@@ -92,18 +119,25 @@ Precompute RoPE frequency tables at model initialization in **f64 precision, sto
 **Negative**:
 
 - 16 MB table per model in steady state. For a system running five concurrent models, this is 80 MB of RoPE tables alone.
-- Two RoPE conventions in the codebase (split-half for main path, interleaved for MTP partial RoPE) require careful documentation to avoid future bugs.
+- [CORRECTED: as of v0.2.3, there is only one pairing convention in the codebase:
+  split-half `(i, half+i)` for both the main-model path and the MTP partial RoPE path.
+  The original concern about two conflicting conventions no longer applies.]
 
 **Risks**:
 
 - If a future model uses a non-standard theta schedule (e.g., NTK-aware interpolation with frequency-dependent theta), the current `RopeTable::new()` API accepts only a single scalar theta. The API must be extended.
-- The MTP interleaved partial RoPE is distinct from the main split-half RoPE. A refactor that "unifies" the RoPE code without checking the MTP path could silently break speculative decoding.
+- [CORRECTED: MTP partial RoPE is now split-half, not interleaved. The residual risk
+  is the inverse: a future refactor that "unifies" MTP with the main RoPE path could
+  accidentally reintroduce the interleaved bug. The function `mtp_apply_partial_rope`
+  is intentionally separate to apply RoPE to only `rope_dim` (25%) of dimensions;
+  do not merge it with `RopeTable::apply` without verifying the partial-dimension
+  contract is preserved.]
 
 ---
 
 ## References
 
 - `src/rope.rs` — `RopeTable`, `new()`, `apply()`, test suite
-- `src/speculative.rs` — `mtp_apply_partial_rope()`, interleaved-pair convention, `partial_rotary_factor=0.25`
+- `src/speculative.rs` — `mtp_apply_partial_rope()`, split-half convention `(i, half+i)`, `partial_rotary_factor=0.25` [CORRECTED from "interleaved-pair convention"]
 - Su et al. 2021 — "RoFormer: Enhanced Transformer with Rotary Position Embedding" — https://arxiv.org/abs/2104.09864
 - Qwen3 technical report — theta=1,000,000, max_position_embeddings=32,768

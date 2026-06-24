@@ -4,6 +4,14 @@
 **Date**: 2026-05-13\
 **Crate**: `lattice-inference`
 
+## Amendment (2026-06-24)
+
+The Risks section originally stated that `mtp_apply_partial_rope()` uses
+**interleaved pairs `(2i, 2i+1)`**. This was incorrect as of the v0.2.3
+RoPE-convention fix. The function now uses **split-half `(i, half+i)`**, matching
+the main-model convention. See ADR-007 Amendment for full context. The inline
+correction is marked with `[CORRECTED]` in the Risks section below.
+
 ---
 
 ## Context
@@ -93,7 +101,11 @@ Implement **two-tier speculative decoding**: `NgramSpeculator` (zero training, p
 
 **Risks**:
 
-- The MTP layer's partial RoPE implementation (`mtp_apply_partial_rope()`) uses interleaved pairs `(2i, 2i+1)` — distinct from the target model's split-half RoPE. A bug that applies the wrong RoPE pattern to MTP will produce quietly wrong draft tokens with high rejection rates, not a crash.
+- [CORRECTED: `mtp_apply_partial_rope()` now uses split-half `(i, half+i)`, matching
+  the target model's convention — not interleaved `(2i, 2i+1)` as the original ADR
+  stated. The residual risk is unchanged in character: applying the wrong pairing
+  convention to MTP produces quietly wrong draft tokens with high rejection rates, not
+  a crash. As of v0.2.3, the correct convention is split-half.]
 
 ---
 
