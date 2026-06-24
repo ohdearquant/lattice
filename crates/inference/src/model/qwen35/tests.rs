@@ -63,6 +63,30 @@ fn test_sample_repetition_penalty() {
 }
 
 #[test]
+fn test_sample_nonfinite_temperature_is_greedy() {
+    // The live Qwen3.5 decode sampler must treat a non-finite temperature as
+    // greedy (deterministic argmax = token 1), not sample from an unscaled
+    // distribution (NaN) or a flattened uniform one (+inf → inv_temp 0). top_k=2
+    // forces the categorical path that would otherwise mis-sample.
+    let logits = vec![0.0, 100.0, 99.0];
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let cfg = crate::model::qwen35_config::GenerateConfig {
+            temperature: bad,
+            top_k: 2,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg, &[], &mut rng);
+        assert_eq!(
+            token, 1,
+            "temperature {bad} must fall back to greedy argmax, not corrupt sampling"
+        );
+    }
+}
+
+#[test]
 fn test_decode_tokens_roundtrip() {
     // Test the byte_encoder/decoder roundtrip
     let encoder = bytes_to_unicode();
