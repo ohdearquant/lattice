@@ -5392,6 +5392,12 @@ kernel void gdn_chunk_norm_silu_c32(
         gqa_attention_us: u128,
         mlp_us: u128,
         final_us: u128,
+        // GPU-time fields populated by LATTICE_DECODE_PROFILE per-group command-buffer split.
+        // True GPU execution time measured as Instant::now() around commit()+wait_until_completed()
+        // for serialized per-group command buffers. Zero when LATTICE_DECODE_PROFILE is not set.
+        gpu_gdn_us: u128,
+        gpu_gqa_us: u128,
+        gpu_lm_head_us: u128,
     }
 
     impl MetalQwen35State {
@@ -7112,6 +7118,7 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // --- Per-phase timing (enabled by env LATTICE_PROFILE=1) ---
             let profiling = std::env::var_os("LATTICE_PROFILE").is_some();
+            let decode_profiling = std::env::var_os("LATTICE_DECODE_PROFILE").is_some();
 
             if std::env::var_os("LATTICE_GDN_CPU").is_some() {
                 #[cfg(not(debug_assertions))]
@@ -7151,6 +7158,169 @@ kernel void gdn_chunk_norm_silu_c32(
 
             let kv_dim = cfg.full_kv_dim();
 
+            if decode_profiling {
+                // Per-group command-buffer split path (LATTICE_DECODE_PROFILE=1).
+                // Each layer gets its own command buffer committed and waited before the next.
+                // GPU time = Instant::now() wraps commit()+wait_until_completed() per layer.
+                // This serializes cross-kernel GPU pipelining; absolute throughput is lower
+                // than the fused path.
+                for layer_i in 0..cfg.num_hidden_layers {
+                    if !cfg.is_layer_active(layer_i) {
+                        continue;
+                    }
+                    let compact_idx = active_layer_idx;
+                    active_layer_idx += 1;
+                    let is_linear = matches!(
+                        &self.engine.layer_weights[compact_idx].0,
+                        MetalLayerAttnWeights::Linear(_)
+                    );
+                    // SAFETY: same raw-pointer idiom as the fused path below.
+                    // cmd is ref-counted by Metal and outlives the queue borrow.
+                    // encode_* methods need &mut self but don't touch engine.queue.
+                    let layer_cmd = unsafe {
+                        &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+                    };
+                    let layer_enc = layer_cmd.new_compute_command_encoder();
+                    if is_linear {
+                        gdn_gpu_dispatches += self.encode_gdn_layer(
+                            layer_enc,
+                            compact_idx,
+                            linear_idx,
+                            position,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        linear_idx += 1;
+                        layer_enc.end_encoding();
+                        let t_gpu = std::time::Instant::now();
+                        layer_cmd.commit();
+                        layer_cmd.wait_until_completed();
+                        prof.gpu_gdn_us += t_gpu.elapsed().as_micros();
+                    } else {
+                        self.encode_gqa_layer(
+                            layer_enc,
+                            compact_idx,
+                            full_idx,
+                            position,
+                            kv_dim,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        full_idx += 1;
+                        layer_enc.end_encoding();
+                        let t_gpu = std::time::Instant::now();
+                        layer_cmd.commit();
+                        layer_cmd.wait_until_completed();
+                        prof.gpu_gqa_us += t_gpu.elapsed().as_micros();
+                    }
+                }
+
+                let head_cmd = unsafe {
+                    &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+                };
+                let head_enc = head_cmd.new_compute_command_encoder();
+                let topk_which_inner =
+                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
+                head_enc.end_encoding();
+                let t_gpu = std::time::Instant::now();
+                head_cmd.commit();
+                head_cmd.wait_until_completed();
+                prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
+
+                let total_gpu_us = prof.gpu_gdn_us + prof.gpu_gqa_us + prof.gpu_lm_head_us;
+                let pct = |v: u128| -> f64 {
+                    if total_gpu_us == 0 {
+                        0.0
+                    } else {
+                        v as f64 / total_gpu_us as f64 * 100.0
+                    }
+                };
+                eprintln!("[DECODE_PROFILE] step {position}: total_gpu_us={total_gpu_us}");
+                eprintln!(
+                    "  gdn_layer:   {:>8} µs  ({:5.1}%)  [18 GDN layers: norm+in_proj+conv1d+recurrence+out_proj+mlp]",
+                    prof.gpu_gdn_us,
+                    pct(prof.gpu_gdn_us)
+                );
+                eprintln!(
+                    "  gqa_layer:   {:>8} µs  ({:5.1}%)  [6 GQA layers: norm+qkv_proj+attention+o_proj+mlp]",
+                    prof.gpu_gqa_us,
+                    pct(prof.gpu_gqa_us)
+                );
+                eprintln!(
+                    "  lm_head:     {:>8} µs  ({:5.1}%)  [final norm + lm_head GEMV]",
+                    prof.gpu_lm_head_us,
+                    pct(prof.gpu_lm_head_us)
+                );
+                eprintln!("  unaccounted: {:>8} µs  ({:5.1}%)", 0u128, 0.0f64);
+                eprintln!(
+                    "  NOTE: GPU time under serialized per-group command buffers; absolute throughput is lower than the fused path because per-group commit/wait disables cross-kernel GPU pipelining."
+                );
+
+                debug_assert_eq!(
+                    gdn_gpu_dispatches, expected_gdn_dispatches,
+                    "GDN GPU recurrence dispatch count mismatch"
+                );
+
+                if profiling {
+                    let total_us = step_start.elapsed().as_micros();
+                    let accounted_us = prof.embedding_us
+                        + prof.projection_us
+                        + prof.gdn_recurrence_us
+                        + prof.gqa_attention_us
+                        + prof.mlp_us
+                        + prof.final_us;
+                    let other_us = total_us.saturating_sub(accounted_us);
+                    eprintln!(
+                        "[PROFILE] step {position}: total_us={total_us} \
+                         embedding_us={} projection_us={} gdn_recurrence_us={} \
+                         gqa_attention_us={} mlp_us={} final_us={} other_us={} \
+                         gdn_gpu_dispatches={} expected_gdn_dispatches={} gdn_cpu_dispatches={}",
+                        prof.embedding_us,
+                        prof.projection_us,
+                        prof.gdn_recurrence_us,
+                        prof.gqa_attention_us,
+                        prof.mlp_us,
+                        prof.final_us,
+                        other_us,
+                        gdn_gpu_dispatches,
+                        expected_gdn_dispatches,
+                        gdn_cpu_dispatches,
+                    );
+                }
+
+                // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
+                let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                    let h =
+                        unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
+                    self.session.last_pre_final_hidden = h.clone();
+                    h
+                } else {
+                    Vec::new()
+                };
+
+                let logits = if skip_logits_readback {
+                    vec![]
+                } else if let Some(which) = topk_which_inner {
+                    let k = self.session.compact_topk;
+                    let candidates = unsafe { self.read_topk_candidates(which, k) };
+                    self.session.compact_result = candidates;
+                    vec![]
+                } else {
+                    unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
+                };
+                self.session.kv_cache.seq_len += 1;
+
+                return MetalStepOutput {
+                    logits,
+                    pre_final_hidden,
+                };
+            }
+
+            // Fused single-command-buffer path (default, zero-cost when LATTICE_DECODE_PROFILE is off).
             // Single command buffer for ALL 24 layers — no intermediate waits.
             // Raw pointer breaks the borrow chain: cmd is ref-counted by Metal
             // and outlives the queue borrow. The encode_* methods need &mut self
