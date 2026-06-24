@@ -115,13 +115,13 @@ and can be used standalone.
 
 ## Crates
 
-| Crate                                    | Description                                                                                                                                                                    | LOC    |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
-| [`lattice-embed`](crates/embed/)         | Embedding service — `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill, migration                               | ~14 k  |
-| [`lattice-inference`](crates/inference/) | Transformer kernel — safetensors loading, BERT/BGE/Qwen3 forward pass, WordPiece/SentencePiece/BPE tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding | ~69 k  |
-| [`lattice-fann`](crates/fann/)           | Fast neural network primitives — `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer, FANN binary format                                         | ~7.5 k |
-| [`lattice-tune`](crates/tune/)           | Training infrastructure — knowledge distillation pipeline, dataset management, LoRA adapter management, model registry with semver lineage                                     | ~13 k  |
-| [`lattice-transport`](crates/transport/) | Optimal transport math — Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection, log-domain throughout                                     | ~5.3 k |
+| Crate                                    | Description                                                                                                                                                                    | LOC     |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| [`lattice-embed`](crates/embed/)         | Embedding service — `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill, migration                               | ~12 k   |
+| [`lattice-inference`](crates/inference/) | Transformer kernel — safetensors loading, BERT/BGE/Qwen3 forward pass, WordPiece/SentencePiece/BPE tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding | ~104 k  |
+| [`lattice-fann`](crates/fann/)           | Fast neural network primitives — `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer, FANN binary format                                         | ~6.5 k  |
+| [`lattice-tune`](crates/tune/)           | Training infrastructure — knowledge distillation pipeline, dataset management, LoRA adapter management, model registry with semver lineage                                     | ~15.6 k |
+| [`lattice-transport`](crates/transport/) | Optimal transport math — Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection, log-domain throughout                                     | ~5.4 k  |
 
 ---
 
@@ -199,10 +199,10 @@ let config = ModelConfig::try_new(EmbeddingModel::Qwen3Embedding4B, Some(512))?;
 
 ```toml
 # GPU acceleration on macOS
-lattice-embed = { version = "0.1", features = ["metal-gpu"] }
+lattice-embed = { version = "0.3", features = ["metal-gpu"] }
 
 # Cross-platform GPU
-lattice-embed = { version = "0.1", features = ["wgpu-gpu"] }
+lattice-embed = { version = "0.3", features = ["wgpu-gpu"] }
 ```
 
 ---
@@ -287,10 +287,10 @@ prompt, so prompt prefill, model load, and per-call overhead cancel and every en
 the _same_ way (greedy, median of 5 runs).
 
 | Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
-| ------- | ---------------------- | ------------- | ------------------ | ----------------- |
-| 64 tok  | **187**                | 93            | 265                | **2.0×**          |
-| 128 tok | **171**                | 92            | 263                | **1.9×**          |
-| 256 tok | **146**                | 88            | 260                | **1.6×**          |
+| ------- | ---------------------- | ------------- | ----------------- | ----------------- |
+| 64 tok  | **187**                | 93            | 265               | **2.0×**          |
+| 128 tok | **171**                | 92            | 263               | **1.9×**          |
+| 256 tok | **146**                | 88            | 260               | **1.6×**          |
 
 MLX uses Apple's private MPS/AMX matrix engines — a different category than public-Metal-compute
 engines (Lattice, Ollama). **MLX decodes faster than Lattice.** Lattice's value is portability

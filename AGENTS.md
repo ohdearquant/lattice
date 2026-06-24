@@ -92,9 +92,9 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-inference (57K)  fann (7.5K)  transport (5.3K)   ← leaf, zero internal deps
-    |               |
-  embed (14K)    tune (13K)                       ← depend on leaves only
+inference (104K)  fann (6.5K)  transport (5.4K)   ← leaf, zero internal deps
+    |                |
+  embed (12K)    tune (15.6K)                     ← depend on leaves only
 ```
 
 ### lattice-inference — Transformer kernel
@@ -182,7 +182,7 @@ E5 models need `"query: "` / `"passage: "` prefixes. Qwen3 needs instruction pre
 
 ## Rust Conventions
 
-**Toolchain**: Edition 2024, MSRV 1.85.0, resolver 2. CI pinned to rustc 1.94.1.
+**Toolchain**: Edition 2024, no MSRV declared; CI pins Rust 1.94.1, resolver 2.
 
 **Lints**: Zero clippy warnings. All crates inherit `[lints] workspace = true`. Correctness lints are `deny`. `unsafe_op_in_unsafe_fn = "allow"` for SIMD. `inference` allows `too_many_arguments` and `needless_range_loop` crate-wide. AVX-512 code gets `#[allow(clippy::incompatible_msrv)]`.
 
@@ -217,7 +217,7 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 tokens must match (GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 
@@ -243,7 +243,7 @@ make bench-gate                          # compare against perf-baselines branch
 
 ## ADRs
 
-58 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
+63 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
 
 Write when: new model, SIMD dispatch change, weight format change, new backend, public API change.
 
