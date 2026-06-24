@@ -5398,6 +5398,10 @@ kernel void gdn_chunk_norm_silu_c32(
         gpu_gdn_us: u128,
         gpu_gqa_us: u128,
         gpu_lm_head_us: u128,
+        // 4-category de-confounded fields: separates shared MLP from layer-specific mixer/attn.
+        gpu_gdn_mixer_us: u128,
+        gpu_gqa_attn_us: u128,
+        gpu_mlp_us: u128,
     }
 
     impl MetalQwen35State {
@@ -7182,6 +7186,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     };
                     let layer_enc = layer_cmd.new_compute_command_encoder();
                     if is_linear {
+                        // Mixer-only (no MLP): measures pure GDN recurrence cost.
                         gdn_gpu_dispatches += self.encode_gdn_layer(
                             layer_enc,
                             compact_idx,
@@ -7191,14 +7196,35 @@ kernel void gdn_chunk_norm_silu_c32(
                             &cfg,
                             &mut prof,
                             profiling,
+                            false,
                         );
                         linear_idx += 1;
                         layer_enc.end_encoding();
-                        let t_gpu = std::time::Instant::now();
+                        let t_mixer = std::time::Instant::now();
                         layer_cmd.commit();
                         layer_cmd.wait_until_completed();
-                        prof.gpu_gdn_us += t_gpu.elapsed().as_micros();
+                        prof.gpu_gdn_mixer_us += t_mixer.elapsed().as_micros();
+                        // MLP-only command buffer for this GDN layer.
+                        let mlp_cmd = unsafe {
+                            &*(self.engine.queue.new_command_buffer()
+                                as *const metal::CommandBufferRef)
+                        };
+                        let mlp_enc = mlp_cmd.new_compute_command_encoder();
+                        self.encode_mlp_block(
+                            mlp_enc,
+                            compact_idx,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            false,
+                        );
+                        mlp_enc.end_encoding();
+                        let t_mlp = std::time::Instant::now();
+                        mlp_cmd.commit();
+                        mlp_cmd.wait_until_completed();
+                        prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     } else {
+                        // Attn-only (no MLP): measures pure GQA attention cost.
                         self.encode_gqa_layer(
                             layer_enc,
                             compact_idx,
@@ -7209,14 +7235,37 @@ kernel void gdn_chunk_norm_silu_c32(
                             &cfg,
                             &mut prof,
                             profiling,
+                            false,
                         );
                         full_idx += 1;
                         layer_enc.end_encoding();
-                        let t_gpu = std::time::Instant::now();
+                        let t_attn = std::time::Instant::now();
                         layer_cmd.commit();
                         layer_cmd.wait_until_completed();
-                        prof.gpu_gqa_us += t_gpu.elapsed().as_micros();
+                        prof.gpu_gqa_attn_us += t_attn.elapsed().as_micros();
+                        // MLP-only command buffer for this GQA layer.
+                        let mlp_cmd = unsafe {
+                            &*(self.engine.queue.new_command_buffer()
+                                as *const metal::CommandBufferRef)
+                        };
+                        let mlp_enc = mlp_cmd.new_compute_command_encoder();
+                        self.encode_mlp_block(
+                            mlp_enc,
+                            compact_idx,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            false,
+                        );
+                        mlp_enc.end_encoding();
+                        let t_mlp = std::time::Instant::now();
+                        mlp_cmd.commit();
+                        mlp_cmd.wait_until_completed();
+                        prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     }
+                    // Keep legacy aggregates for backward compat with existing tooling.
+                    prof.gpu_gdn_us = prof.gpu_gdn_mixer_us;
+                    prof.gpu_gqa_us = prof.gpu_gqa_attn_us;
                 }
 
                 let head_cmd = unsafe {
@@ -7231,7 +7280,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 head_cmd.wait_until_completed();
                 prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
 
-                let total_gpu_us = prof.gpu_gdn_us + prof.gpu_gqa_us + prof.gpu_lm_head_us;
+                let total_gpu_us = prof.gpu_gdn_mixer_us
+                    + prof.gpu_gqa_attn_us
+                    + prof.gpu_mlp_us
+                    + prof.gpu_lm_head_us;
                 let pct = |v: u128| -> f64 {
                     if total_gpu_us == 0 {
                         0.0
@@ -7241,23 +7293,27 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
                 eprintln!("[DECODE_PROFILE] step {position}: total_gpu_us={total_gpu_us}");
                 eprintln!(
-                    "  gdn_layer:   {:>8} µs  ({:5.1}%)  [18 GDN layers: norm+in_proj+conv1d+recurrence+out_proj+mlp]",
-                    prof.gpu_gdn_us,
-                    pct(prof.gpu_gdn_us)
+                    "  gdn_mixer:   {:>8} µs  ({:5.1}%)  [18 GDN layers: norm+in_proj+conv1d+recurrence+out_proj (no MLP)]",
+                    prof.gpu_gdn_mixer_us,
+                    pct(prof.gpu_gdn_mixer_us)
                 );
                 eprintln!(
-                    "  gqa_layer:   {:>8} µs  ({:5.1}%)  [6 GQA layers: norm+qkv_proj+attention+o_proj+mlp]",
-                    prof.gpu_gqa_us,
-                    pct(prof.gpu_gqa_us)
+                    "  gqa_attn:    {:>8} µs  ({:5.1}%)  [6 GQA layers: norm+qkv_proj+attention+o_proj (no MLP)]",
+                    prof.gpu_gqa_attn_us,
+                    pct(prof.gpu_gqa_attn_us)
+                );
+                eprintln!(
+                    "  mlp:         {:>8} µs  ({:5.1}%)  [all 24 layers: post_attn_norm+gate_up_proj+silu_mul+down_proj]",
+                    prof.gpu_mlp_us,
+                    pct(prof.gpu_mlp_us)
                 );
                 eprintln!(
                     "  lm_head:     {:>8} µs  ({:5.1}%)  [final norm + lm_head GEMV]",
                     prof.gpu_lm_head_us,
                     pct(prof.gpu_lm_head_us)
                 );
-                eprintln!("  unaccounted: {:>8} µs  ({:5.1}%)", 0u128, 0.0f64);
                 eprintln!(
-                    "  NOTE: GPU time under serialized per-group command buffers; absolute throughput is lower than the fused path because per-group commit/wait disables cross-kernel GPU pipelining."
+                    "  NOTE: GPU time under serialized per-group command buffers (2 cmd bufs/layer + 1 for lm_head). Absolute throughput is lower than the fused path."
                 );
 
                 debug_assert_eq!(
@@ -7350,6 +7406,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         &cfg,
                         &mut prof,
                         profiling,
+                        true,
                     );
                     linear_idx += 1;
                 } else {
@@ -7363,6 +7420,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         &cfg,
                         &mut prof,
                         profiling,
+                        true,
                     );
                     full_idx += 1;
                 }
@@ -7552,6 +7610,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         &cfg,
                         &mut prof,
                         false,
+                        true,
                     );
                     linear_idx += 1;
                 }
@@ -9996,6 +10055,123 @@ kernel void gdn_chunk_norm_silu_c32(
         // Layer-encoding helpers (called from forward_step_inner)
         // ===================================================================
 
+        /// Encode the MLP tail shared by every layer (both GDN and GQA).
+        ///
+        /// Dispatches: fused residual-add-norm → gate_up_proj GEMV → LoRA(gate/up) →
+        /// silu_mul → down_proj GEMV → LoRA(down) → residual-add-copy.
+        ///
+        /// Pure extraction from `encode_gdn_layer` / `encode_gqa_layer`; the fused
+        /// path is byte-for-byte identical to inlining.
+        ///
+        /// # Preconditions
+        /// - `self.session.activations.residual` holds the post-attention residual.
+        /// - `self.session.activations.attn_out` holds the attention output.
+        /// - `self.session.activations.hidden` is scratch space.
+        ///
+        /// # Postconditions
+        /// - `self.session.activations.residual` and `.hidden` hold the post-FFN state.
+        fn encode_mlp_block(
+            &mut self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            layer_idx: usize,
+            cfg: &Qwen35Config,
+            prof: &mut StepProfile,
+            profiling: bool,
+        ) {
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let (_, common_w) = &self.engine.layer_weights[compact_idx];
+            let mlp_t0 = profiling.then(std::time::Instant::now);
+            self.dispatch_fused_residual_add_norm(
+                enc,
+                &self.session.activations.residual,
+                &self.session.activations.attn_out,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                &common_w.post_attention_layernorm,
+                hidden as u32,
+                cfg.rms_norm_eps,
+            );
+            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
+            match &common_w.ffn {
+                MetalFfnWeights::Dense {
+                    gate_up_proj,
+                    down_proj,
+                } => {
+                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
+                    let w_down = down_proj as *const Q4WeightBuf;
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_gate_up,
+                            &self.session.activations.gate,
+                            1,
+                            (2 * inter) as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        0,
+                        layer_idx,
+                        "gate_proj",
+                    );
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        (inter * std::mem::size_of::<f32>()) as u64,
+                        layer_idx,
+                        "up_proj",
+                    );
+                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
+                    unsafe {
+                        self.dispatch_matmul(
+                            enc,
+                            &self.session.activations.gate,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            1,
+                            hidden as u32,
+                            inter as u32,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.gate,
+                        0,
+                        &self.session.activations.ffn_out,
+                        0,
+                        layer_idx,
+                        "down_proj",
+                    );
+                }
+                MetalFfnWeights::Moe(moe_bufs) => {
+                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
+                    // SAFETY: moe_bufs is owned by layer_weights which is live.
+                    unsafe {
+                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
+                    }
+                }
+            }
+            self.dispatch_add_and_copy(
+                enc,
+                &self.session.activations.ffn_out,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                hidden as u32,
+            );
+            if let Some(t0) = mlp_t0 {
+                prof.mlp_us += t0.elapsed().as_micros();
+            }
+        }
+
         /// Encode all Metal commands for a single GDN (linear-attention) layer.
         ///
         /// All commands are appended to the already-open encoder `enc`; no new
@@ -10011,9 +10187,9 @@ kernel void gdn_chunk_norm_silu_c32(
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
             profiling: bool,
+            with_mlp: bool,
         ) -> usize {
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
             let (
                 w_in_proj_qkvz,
                 w_in_proj_b,
@@ -10284,100 +10460,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 "out_proj",
             );
 
-            // MLP: fused residual+add+norm replaces 4 dispatches with 1
-            // residual = residual + attn_out; hidden = norm(residual)
-            let mlp_t0 = profiling.then(std::time::Instant::now);
-            self.dispatch_fused_residual_add_norm(
-                enc,
-                &self.session.activations.residual,
-                &self.session.activations.attn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                &common_w.post_attention_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-            // Dispatch FFN (Dense SwiGLU or MoE).
-            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
-            match &common_w.ffn {
-                MetalFfnWeights::Dense {
-                    gate_up_proj,
-                    down_proj,
-                } => {
-                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
-                    let w_down = down_proj as *const Q4WeightBuf;
-                    // Single fused GEMV: hidden × gate_up_proj[2*inter, hidden] → gate[0..2*inter]
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.hidden,
-                            &*w_gate_up,
-                            &self.session.activations.gate,
-                            1,
-                            (2 * inter) as u32,
-                            hidden as u32,
-                        );
-                    }
-                    // LoRA: gate half at offset 0, up half at offset inter*sizeof(f32)
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        0,
-                        layer_idx,
-                        "gate_proj",
-                    );
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        (inter * std::mem::size_of::<f32>()) as u64,
-                        layer_idx,
-                        "up_proj",
-                    );
-                    // silu_mul_fused: gate[0..inter] = silu(gate[0..inter]) * gate[inter..2*inter]
-                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.gate,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            1,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.gate,
-                        0,
-                        &self.session.activations.ffn_out,
-                        0,
-                        layer_idx,
-                        "down_proj",
-                    );
-                }
-                MetalFfnWeights::Moe(moe_bufs) => {
-                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
-                    // SAFETY: moe_bufs is owned by layer_weights which is live.
-                    unsafe {
-                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
-                    }
-                }
-            }
-            // End of layer: residual += ffn_out, hidden = residual (fused)
-            self.dispatch_add_and_copy(
-                enc,
-                &self.session.activations.ffn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                hidden as u32,
-            );
-            if let Some(t0) = mlp_t0 {
-                prof.mlp_us += t0.elapsed().as_micros();
+            if with_mlp {
+                self.encode_mlp_block(enc, compact_idx, layer_idx, cfg, prof, profiling);
             }
 
             1 // one GDN GPU dispatch per layer
@@ -10399,9 +10483,9 @@ kernel void gdn_chunk_norm_silu_c32(
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
             profiling: bool,
+            with_mlp: bool,
         ) {
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
             // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
             let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
                 let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
@@ -10614,99 +10698,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 prof.projection_us += t0.elapsed().as_micros();
             }
 
-            // MLP: fused residual+add+norm replaces 4 dispatches with 1
-            let gqa_mlp_t0 = profiling.then(std::time::Instant::now);
-            self.dispatch_fused_residual_add_norm(
-                enc,
-                &self.session.activations.residual,
-                &self.session.activations.attn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                &common_w.post_attention_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-            // Dispatch FFN (Dense SwiGLU or MoE).
-            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
-            match &common_w.ffn {
-                MetalFfnWeights::Dense {
-                    gate_up_proj,
-                    down_proj,
-                } => {
-                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
-                    let w_down = down_proj as *const Q4WeightBuf;
-                    // Single fused GEMV: hidden × gate_up_proj[2*inter, hidden] → gate[0..2*inter]
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.hidden,
-                            &*w_gate_up,
-                            &self.session.activations.gate,
-                            1,
-                            (2 * inter) as u32,
-                            hidden as u32,
-                        );
-                    }
-                    // LoRA: gate half at offset 0, up half at offset inter*sizeof(f32)
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        0,
-                        layer_idx,
-                        "gate_proj",
-                    );
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        (inter * std::mem::size_of::<f32>()) as u64,
-                        layer_idx,
-                        "up_proj",
-                    );
-                    // silu_mul_fused: gate[0..inter] = silu(gate[0..inter]) * gate[inter..2*inter]
-                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.gate,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            1,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.gate,
-                        0,
-                        &self.session.activations.ffn_out,
-                        0,
-                        layer_idx,
-                        "down_proj",
-                    );
-                }
-                MetalFfnWeights::Moe(moe_bufs) => {
-                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
-                    // SAFETY: moe_bufs is owned by layer_weights which is live.
-                    unsafe {
-                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
-                    }
-                }
-            }
-            // End of layer: residual += ffn_out, hidden = residual (fused)
-            self.dispatch_add_and_copy(
-                enc,
-                &self.session.activations.ffn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                hidden as u32,
-            );
-            if let Some(t0) = gqa_mlp_t0 {
-                prof.mlp_us += t0.elapsed().as_micros();
+            if with_mlp {
+                self.encode_mlp_block(enc, compact_idx, layer_idx, cfg, prof, profiling);
             }
         }
 
