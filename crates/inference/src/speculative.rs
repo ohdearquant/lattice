@@ -2117,6 +2117,17 @@ mod tests {
     }
 
     #[test]
+    fn argmax_skips_nan_and_never_panics() {
+        // NaN loses to finite values; among finite ties the first index wins.
+        // Matches sampling::argmax_f32_scalar and the engine greedy decode.
+        assert_eq!(argmax(&[f32::NAN, 1.0, 1.0]), 1);
+        assert_eq!(argmax(&[1.0, f32::NAN, 1.0]), 0);
+        // All-NaN and all-(-inf) fall back to index 0 — must never panic.
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+        assert_eq!(argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]), 0);
+    }
+
+    #[test]
     fn argmax_negative_values() {
         assert_eq!(argmax(&[-3.0, -1.0, -2.0]), 1);
     }
