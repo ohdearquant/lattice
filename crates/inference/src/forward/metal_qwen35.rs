@@ -16289,11 +16289,12 @@ kernel void decode_attention_reference(
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let state =
                 MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
-            let Some(tiled_pipeline) = state.engine.pipelines.gemm_q4_tiled.as_ref() else {
-                // Should not reach here after the enabled-on-apple7-plus gate passes,
-                // but be safe: no tiled pipeline means nothing to test.
-                return;
-            };
+            // On Apple7+ the tiled pipeline MUST exist (see gemm_q4_tiled_enabled_on_apple7_plus).
+            // A missing pipeline here is the exact regression this gate guards against, so fail
+            // loudly rather than `return` — a skipped numeric test passes vacuously.
+            let tiled_pipeline = state.engine.pipelines.gemm_q4_tiled.as_ref().expect(
+                "gemm_q4_tiled must be present on Apple7+ (else this gate passes vacuously)",
+            );
             let naive_pipeline = &state.engine.pipelines.gemm_q4;
             let queue = &state.engine.queue;
 
@@ -16470,19 +16471,19 @@ kernel void decode_attention_reference(
         /// with small weight scales can stress f16 representability: if the staged half
         /// value saturates to ±65504 the result diverges from the f32 reference.
         ///
-        /// This test checks two edge cases:
-        ///   1. Large activations (scale ~500) with near-unit weight values — verifies
-        ///      that f32 accumulation keeps relative error below 1 %.
-        ///   2. Near-zero weight scale blocks (weights ≈ 0) — verifies the bias term does
-        ///      not produce spurious non-zero outputs.
+        /// Two properties are checked:
+        ///   1. Large activations (±500) with near-unit weights — relative error must stay
+        ///      well under 2 %.  This is the f32-accumulation guard: if the accumulators were
+        ///      silently downcast to f16, the half mantissa alone would push relative error
+        ///      toward ~1 % and shrink the margin.  (Half *staging* of a ±500 input loses
+        ///      ≤0.25 abs/elem, which is why the absolute diff is ~1 at output magnitude
+        ///      ~4e3 — a 0.02 % relative error, not an accumulation error.)
+        ///   2. A near-zero weight block in isolation (second sub-test below) — proves the
+        ///      small-scale dequant path neither amplifies (|y| stays on the order of tens,
+        ///      not thousands) nor diverges from the f32 reference.  The mixed-block global
+        ///      relative error in (1) cannot isolate this, so (2) zeroes the near-unit block.
         ///
-        /// Measured on M1 (2026-06-24): abs=9.6e-1, ref_max=4.21e3, rel=2.3e-4 (0.023%).
-        /// Asserted: rel < 2 % (87× measured headroom).
-        /// The absolute error looks large but is proportional to output magnitude: at scale
-        /// 500 each Q4 nibble step ≈ 33, and f16 Xtg staging adds ~0.023% on top.
-        /// What the test really enforces is that relative error stays < 2 % — i.e.,
-        /// accumulators are NOT downcast to f16 (that would give ~1 % relative error from
-        /// the half-precision mantissa alone, pushing rel toward the bound).
+        /// Measured on M1 (2026-06-24): mixed abs=9.6e-1, ref_max=4.21e3, rel=2.3e-4 (bound 2 %).
         #[test]
         fn gemm_q4_tiled_edge_scale_activation_coverage() {
             let Some(device) = Device::system_default() else {
@@ -16494,9 +16495,11 @@ kernel void decode_attention_reference(
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let state =
                 MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
-            let Some(tiled_pipeline) = state.engine.pipelines.gemm_q4_tiled.as_ref() else {
-                return;
-            };
+            // Fail loudly (not skip) if the pipeline is missing on Apple7+ — see the numeric
+            // differential test above for why a `return` here would pass vacuously.
+            let tiled_pipeline = state.engine.pipelines.gemm_q4_tiled.as_ref().expect(
+                "gemm_q4_tiled must be present on Apple7+ (else this gate passes vacuously)",
+            );
             let queue = &state.engine.queue;
 
             let (m, n, k) = (64usize, 32usize, 64usize);
@@ -16583,6 +16586,65 @@ kernel void decode_attention_reference(
                 rel_err < 0.02,
                 "[edge-scale] relative error {rel_err:.4e} exceeds 2 % — \
                  half-tile staging may be saturating or accumulating in f16"
+            );
+
+            // ── Isolated near-zero block (codex #272 review) ────────────────
+            // The mixed-block assertion above is dominated by the near-unit block, so it
+            // cannot isolate the near-zero claim. Zero the near-unit block and keep only the
+            // near-zero one, so the output magnitude IS the near-zero block's contribution.
+            // Proves the small-scale dequant path does not amplify and tracks the f32 ref.
+            let mut w_nz = w_f32.clone();
+            for ni in 0..n {
+                for ki in 0..32 {
+                    w_nz[ni * k + ki] = 0.0;
+                }
+            }
+            let mut nz_packed = Vec::with_capacity(n * (k / 32) * 20);
+            let mut nz_deq = Vec::with_capacity(n * k);
+            for row in w_nz.chunks_exact(k) {
+                let row_packed = quantize_row_q4_0(row);
+                nz_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
+                nz_packed.extend_from_slice(&row_packed);
+            }
+            let nz_qw_buf = device.new_buffer_with_data(
+                nz_packed.as_ptr() as *const _,
+                nz_packed.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_nz_buf =
+                device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            run_gemm_q4_kernel(
+                queue,
+                tiled_pipeline,
+                &nz_qw_buf,
+                &x_buf,
+                &y_nz_buf,
+                m as u32,
+                n as u32,
+                k as u32,
+                n.div_ceil(32) as u64,
+                m.div_ceil(64) as u64,
+            );
+            let y_nz_ref = cpu_matmul_ref(&x, &nz_deq, m, n, k);
+            // SAFETY: StorageModeShared, GPU done, size matches allocation.
+            let y_nz: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_nz_buf.contents() as *const f32, m * n) };
+            let nz_abs = max_abs_diff(y_nz, &y_nz_ref);
+            let nz_ref_max = y_nz_ref.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!(
+                "[edge-scale near-zero] tiled_vs_ref abs={nz_abs:.4e}  ref_max={nz_ref_max:.2e}"
+            );
+            // |w|≲0.002 × |x|≲500 × 32 terms ⇒ |y| on the order of tens, never thousands.
+            assert!(
+                nz_ref_max < 200.0,
+                "[edge-scale near-zero] near-zero weights produced |y_ref|={nz_ref_max:.2e} \
+                 (expected ≲ tens) — a near-zero Q4 block is being amplified"
+            );
+            // Tiled must track the f32 reference: half staging of ±500 × |w|≲0.002 ⇒ ~1e-3 abs.
+            assert!(
+                nz_abs < 1.0,
+                "[edge-scale near-zero] tiled_vs_ref abs={nz_abs:.4e} exceeds 1.0 — \
+                 near-zero block path diverges from the f32 reference"
             );
         }
 
