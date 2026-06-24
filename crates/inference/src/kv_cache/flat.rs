@@ -238,18 +238,23 @@ impl FlatKVCache {
         num_tokens: usize,
     ) -> Result<(), InferenceError> {
         let kv_dim = self.config.kv_dim();
-        if k_tokens.len() != num_tokens * kv_dim {
+        // Use checked arithmetic so a malformed `num_tokens` returns a clean
+        // error rather than overflow-panicking in debug builds (matches `advance_by`).
+        let total = num_tokens.checked_mul(kv_dim).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "prefill_layer: num_tokens ({num_tokens}) * kv_dim ({kv_dim}) overflows usize"
+            ))
+        })?;
+        if k_tokens.len() != total {
             return Err(InferenceError::InvalidInput(format!(
-                "k_tokens length {} does not equal num_tokens * kv_dim ({})",
+                "k_tokens length {} does not equal num_tokens * kv_dim ({total})",
                 k_tokens.len(),
-                num_tokens * kv_dim
             )));
         }
-        if v_tokens.len() != num_tokens * kv_dim {
+        if v_tokens.len() != total {
             return Err(InferenceError::InvalidInput(format!(
-                "v_tokens length {} does not equal num_tokens * kv_dim ({})",
+                "v_tokens length {} does not equal num_tokens * kv_dim ({total})",
                 v_tokens.len(),
-                num_tokens * kv_dim
             )));
         }
         if layer >= self.config.num_layers {
@@ -257,14 +262,19 @@ impl FlatKVCache {
                 "layer index out of bounds".to_string(),
             ));
         }
-        if self.seq_len + num_tokens > self.config.max_seq_len {
+        let new_len = self.seq_len.checked_add(num_tokens).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "prefill_layer: seq_len ({}) + num_tokens ({num_tokens}) overflows usize",
+                self.seq_len
+            ))
+        })?;
+        if new_len > self.config.max_seq_len {
             return Err(InferenceError::InvalidInput(
                 "prefill would exceed max_seq_len".to_string(),
             ));
         }
 
         let offset = self.seq_len * kv_dim;
-        let total = num_tokens * kv_dim;
         for (i, &val) in k_tokens[..total].iter().enumerate() {
             self.k[layer][offset + i] = f16::from_f32(val);
         }
@@ -1430,6 +1440,20 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput error, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn prefill_layer_overflow_returns_err() {
+        // A pathological num_tokens whose `num_tokens * kv_dim` overflows usize must
+        // return Err (not arithmetic-overflow-panic in debug builds) before the
+        // length comparison. Empty slices so we never allocate the absurd length.
+        let config = make_config(1, 4);
+        let mut cache = FlatKVCache::new(config);
+        let r = cache.prefill_layer(0, &[], &[], usize::MAX);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error for overflowing num_tokens, got {r:?}"
         );
     }
 
