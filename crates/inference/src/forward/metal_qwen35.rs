@@ -7106,6 +7106,8 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // --- Per-phase timing (enabled by env LATTICE_PROFILE=1) ---
             let profiling = std::env::var_os("LATTICE_PROFILE").is_some();
+            // Per-layer command buffers: isolate each layer's GPU wall for #241 attribution.
+            let profiling_gpu = std::env::var_os("LATTICE_PROFILE_GPU").is_some();
 
             if std::env::var_os("LATTICE_GDN_CPU").is_some() {
                 #[cfg(not(debug_assertions))]
@@ -7149,56 +7151,145 @@ kernel void gdn_chunk_norm_silu_c32(
             // Raw pointer breaks the borrow chain: cmd is ref-counted by Metal
             // and outlives the queue borrow. The encode_* methods need &mut self
             // (for session state) but don't touch engine.queue.
-            let cmd = unsafe {
-                &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
-            };
-            let enc = cmd.new_compute_command_encoder();
+            let topk_which = if !profiling_gpu {
+                let cmd = unsafe {
+                    &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+                };
+                let enc = cmd.new_compute_command_encoder();
 
-            for layer_i in 0..cfg.num_hidden_layers {
-                if !cfg.is_layer_active(layer_i) {
-                    continue;
-                }
-                let compact_idx = active_layer_idx;
-                active_layer_idx += 1;
-                let is_linear = matches!(
-                    &self.engine.layer_weights[compact_idx].0,
-                    MetalLayerAttnWeights::Linear(_)
-                );
-                if is_linear {
-                    gdn_gpu_dispatches += self.encode_gdn_layer(
-                        enc,
-                        compact_idx,
-                        linear_idx,
-                        position,
-                        layer_i,
-                        &cfg,
-                        &mut prof,
-                        profiling,
+                for layer_i in 0..cfg.num_hidden_layers {
+                    if !cfg.is_layer_active(layer_i) {
+                        continue;
+                    }
+                    let compact_idx = active_layer_idx;
+                    active_layer_idx += 1;
+                    let is_linear = matches!(
+                        &self.engine.layer_weights[compact_idx].0,
+                        MetalLayerAttnWeights::Linear(_)
                     );
-                    linear_idx += 1;
+                    if is_linear {
+                        gdn_gpu_dispatches += self.encode_gdn_layer(
+                            enc,
+                            compact_idx,
+                            linear_idx,
+                            position,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        linear_idx += 1;
+                    } else {
+                        self.encode_gqa_layer(
+                            enc,
+                            compact_idx,
+                            full_idx,
+                            position,
+                            kv_dim,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        full_idx += 1;
+                    }
+                } // end layer loop
+
+                let topk = self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling);
+
+                // Single submit for entire forward pass + optional top-k.
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                topk
+            } else {
+                // Per-layer command buffers: isolate each layer's GPU wall for #241 attribution.
+                let mut layer_walls: Vec<(usize, bool, u128)> = Vec::new();
+
+                for layer_i in 0..cfg.num_hidden_layers {
+                    if !cfg.is_layer_active(layer_i) {
+                        continue;
+                    }
+                    let compact_idx = active_layer_idx;
+                    active_layer_idx += 1;
+                    let is_linear = matches!(
+                        &self.engine.layer_weights[compact_idx].0,
+                        MetalLayerAttnWeights::Linear(_)
+                    );
+                    let cmd_i = unsafe {
+                        &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+                    };
+                    let enc_i = cmd_i.new_compute_command_encoder();
+                    if is_linear {
+                        gdn_gpu_dispatches += self.encode_gdn_layer(
+                            enc_i,
+                            compact_idx,
+                            linear_idx,
+                            position,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        linear_idx += 1;
+                    } else {
+                        self.encode_gqa_layer(
+                            enc_i,
+                            compact_idx,
+                            full_idx,
+                            position,
+                            kv_dim,
+                            layer_i,
+                            &cfg,
+                            &mut prof,
+                            profiling,
+                        );
+                        full_idx += 1;
+                    }
+                    enc_i.end_encoding();
+                    let t = std::time::Instant::now();
+                    cmd_i.commit();
+                    cmd_i.wait_until_completed();
+                    let wall = t.elapsed().as_micros();
+                    layer_walls.push((layer_i, is_linear, wall));
+                } // end per-layer loop
+
+                let cmd_head = unsafe {
+                    &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
+                };
+                let enc_head = cmd_head.new_compute_command_encoder();
+                let topk =
+                    self.encode_final_head(enc_head, &cfg, capture_hidden, &mut prof, profiling);
+                enc_head.end_encoding();
+                let t_head = std::time::Instant::now();
+                cmd_head.commit();
+                cmd_head.wait_until_completed();
+                let head_wall = t_head.elapsed().as_micros();
+
+                let n_gdn = layer_walls.iter().filter(|e| e.1).count();
+                let n_gqa = layer_walls.iter().filter(|e| !e.1).count();
+                let gdn_sum: u128 = layer_walls.iter().filter(|e| e.1).map(|e| e.2).sum();
+                let gqa_sum: u128 = layer_walls.iter().filter(|e| !e.1).map(|e| e.2).sum();
+                let sum_all = gdn_sum + gqa_sum + head_wall;
+                let gdn_mean = if n_gdn > 0 {
+                    gdn_sum / n_gdn as u128
                 } else {
-                    self.encode_gqa_layer(
-                        enc,
-                        compact_idx,
-                        full_idx,
-                        position,
-                        kv_dim,
-                        layer_i,
-                        &cfg,
-                        &mut prof,
-                        profiling,
-                    );
-                    full_idx += 1;
-                }
-            } // end layer loop
+                    0
+                };
+                let gqa_mean = if n_gqa > 0 {
+                    gqa_sum / n_gqa as u128
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[GPU-PROFILE] step {position}: total_us={sum_all} \
+                     gdn_sum_us={gdn_sum} gqa_sum_us={gqa_sum} final_head_us={head_wall} \
+                     n_gdn={n_gdn} n_gqa={n_gqa} gdn_mean_us={gdn_mean} gqa_mean_us={gqa_mean}"
+                );
 
-            let topk_which =
-                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling);
-
-            // Single submit for entire forward pass + optional top-k.
-            enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+                topk
+            };
 
             // Diagnostic: dump post-final-norm hidden state magnitudes for
             // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
