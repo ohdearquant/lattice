@@ -3,6 +3,13 @@
 **Status**: Proposed
 **Date**: 2026-05-27
 **Crate**: lattice-inference (new `serve` module + unified binary)
+
+## Implementation status (2026-06-24)
+
+Phase 1 batch scheduling infrastructure is implemented. `crates/inference/src/batch/` exists with
+`config.rs`, `mod.rs`, `scheduler.rs`, `sequence.rs`, and `worker.rs`. Phase 2 (HTTP server,
+OpenAI/Anthropic API compatibility, GPU worker pool) has not been built. There is no `serve` binary
+or HTTP listener in the codebase as of this date.
 **Research**: RQ-5 (`workspaces/20260527/05.md`, 1583 lines)
 **Issues**: #91 (CLI), #92 (daemon), #93 (OpenAI API), #94 (Anthropic API)
 **Depends on**: ADR-048 (Continuous Batching), ADR-046 (XGrammar Structured Output), ADR-047 (Paged KV Cache)

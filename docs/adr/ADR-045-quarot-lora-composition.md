@@ -20,7 +20,7 @@ The next step is **LoRA adapter injection on top of the QuaRot Q4 base**. This c
 | `LoraConfig` (rank, alpha, targets) | `crates/tune/src/lora/mod.rs` | Active |
 | CPU forward LoRA injection | `crates/inference/src/model/qwen35/model.rs:17` | Active — `Qwen35Model.lora` field, called per projection |
 | Metal Q4 forward path | `crates/inference/src/forward/metal_qwen35.rs` | Active — LoRA dispatch after each projection (PR #37) |
-| QuaRot seed in artifact | `config.json` in quantize_quarot output | **NOT YET PERSISTED** — caller must supply seed explicitly (see §Prerequisites) |
+| QuaRot seed in artifact | `config.json` in quantize_quarot output | Shipped — `inject_quarot_seed` at `crates/inference/src/quant/quarot/convert.rs:136` writes the seed into the output `config.json` under both `text_config` and top-level keys |
 | `RandomizedHadamard` reconstruction | `crates/inference/src/quant/quarot/` | Active — deterministic from seed |
 
 ### Gaps (remaining)
@@ -230,7 +230,7 @@ When `quarot_seed` is `None` (unrotated Q4 base): skip rotation correction, uplo
 | 3 | `MetalQwen35State::load_lora_adapter` API: orchestrates rotation + buffer upload + Rust dispatch wrapper | **Done** (PR #36) |
 | 4 | Forward path integration: dispatch LoRA kernel after each adapted Q4 GEMV | **Done** (PR #37) |
 | 5 | End-to-end validation: PPL with adapter vs CPU reference path | Pending |
-| 6 | `bin/chat_metal` adapter flag: `--lora-dir <PATH>` for interactive use | Pending |
+| 6 | `bin/chat_metal` adapter flag: `--lora-dir <PATH>` for interactive use | Done — `--lora` flag implemented at `crates/inference/src/bin/chat_metal.rs:405` |
 
 Steps 1-4 complete. Prefill falls back to sequential when adapter active (no batch LoRA kernel).
 `in_proj_b`/`in_proj_a` rejected at load time (consumed inside fused kernels).

@@ -27,7 +27,7 @@ JIT here means "triggered at inference time" — not LLVM JIT or kernel JIT. The
 | `LastNLayers(n)` (default: 2) | Last N layers trainable, earlier frozen                           | Standard adaptation with stability                          |
 | `HeadOnly`                    | Only the classification head (last layer)                         | Fastest, minimum parameter update                           |
 | `GradualUnfreeze`             | All layers, LR scales linearly from `frozen_lr_multiplier` to 1.0 | When earlier layers also need adaptation                    |
-| `LowRank { rank }`            | All base weights frozen; low-rank delta matrices                  | LoRA-style adaptation (in-memory, not saved as safetensors) |
+| `LowRank { rank }`            | All base weights frozen; low-rank delta matrices (not yet implemented — see §Consequences/Negative) | LoRA-style adaptation (in-memory, not saved as safetensors) |
 | `Full`                        | All parameters                                                    | Maximum adaptation, slowest                                 |
 
 `freeze::get_frozen_layers(strategy, total_layers) -> Vec<bool>` returns a per-layer freeze mask. `freeze::get_lr_multipliers(strategy, total_layers, frozen_mult) -> Vec<f32>` returns per-layer learning rate scale factors. For `GradualUnfreeze`, multipliers are linearly interpolated from `frozen_lr_multiplier` at layer 0 to `1.0` at the last layer.

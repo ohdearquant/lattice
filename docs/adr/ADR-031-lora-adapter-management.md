@@ -20,7 +20,7 @@ Three-layer design: `LoraConfig` (global config), `LoraLayer` (per-projection we
 
 #### LoraConfig and Scaling
 
-`LoraConfig` holds `rank: usize`, `alpha: f32`, and `target_modules: Vec<String>`. The effective scaling factor is `alpha / rank`. When loading from PEFT safetensors, `alpha` defaults to `rank` (so `scale = 1.0`), matching PEFT's default behavior. Callers can override `alpha` post-load for explicit scaling.
+`LoraConfig` holds `rank: usize`, `alpha: f32`, and `target_modules: Vec<String>`. The effective scaling factor is `alpha / rank`. [CORRECTED: as of commit a91a7c05] When loading from PEFT safetensors, `alpha` is now read from the safetensors header metadata (`crates/tune/src/lora/safetensors.rs:403`). If the header contains no `alpha` key (e.g. raw PEFT exports), the loader falls back to `alpha = rank` so `scale = 1.0`, matching PEFT's default behavior. Callers can still override `alpha` post-load for explicit scaling.
 
 `LoraConfig::scale()` guards against `rank == 0` by returning `0.0` rather than dividing by zero.
 

@@ -231,3 +231,13 @@ receives `Vec<f32>` values. Enforcement: `crates/transport/Cargo.toml` must neve
 - Genevay, Peyré, Cuturi, "Learning Generative Models with Sinkhorn Divergences", AISTATS 2018
 - Feydy et al., "Interpolating between Optimal Transport and MMD using Sinkhorn Divergences",
   AISTATS 2019 — positive semi-definiteness proof used to justify divergence thresholding
+
+## Implementation status (2026-06-24)
+
+`OnlineDriftDetector` is fully implemented at `crates/transport/src/online_drift.rs:109` and
+re-exported from `crates/transport/src/lib.rs:119`. The `DriftSampler` bridge trait described
+in §"Layer 1: `lattice-inference`" was not built. Searching `crates/inference/src/` for
+`DriftSampler` returns no results. The inference forward pass has no `Arc<dyn DriftSampler>`
+hook. The end-to-end drift sampling path (inference → transport → reaction) described in this
+ADR's architecture exists only in `lattice-transport`; the inference-side callback boundary
+and application-level wiring remain unimplemented.

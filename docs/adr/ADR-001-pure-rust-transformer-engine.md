@@ -13,7 +13,7 @@ Python, no external runtime.
 
 ## Decision
 
-### Pure Rust, 57.5K LOC
+### Pure Rust, ~104K LOC [CORRECTED: was 57.5K at initial commit; `find crates/inference/src -name '*.rs' | xargs wc -l` as of 2026-06-24 yields ~103,775 lines]
 
 The engine implements the full transformer forward pass:
 

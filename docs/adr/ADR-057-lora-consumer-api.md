@@ -1,8 +1,16 @@
 # ADR-057: LoRA Full-Lifecycle Consumer API
 
-**Status**: Draft
+**Status**: Accepted
 **Date**: 2026-05-23
 **Crate**: lattice-tune, lattice-inference
+
+## Status update (2026-06-24)
+
+All five lifecycle gaps described in §Context were closed. `save_peft_safetensors` is
+public at `crates/tune/src/lora/safetensors.rs:439`. `adapt_step` (online gradient step)
+ships at `crates/tune/src/lora/online.rs:38`. The BERT hook, consumer docs, and
+inference-hook feature gate shipped across D1–D5 (see KG entity `LoraConsumerAPI`).
+Status promoted from Draft to Accepted.
 
 ## Context
 

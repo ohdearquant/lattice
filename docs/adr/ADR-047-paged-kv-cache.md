@@ -3,7 +3,9 @@
 **Status**: Accepted (KV element format superseded by ADR-062 for f16/int8/int4)
 **Date**: 2026-05-19
 **Crate**: `lattice-inference`
-**Amendment (2026-05-27)**: ADR-062 replaces `Arc<[f32]>` page storage with format-parameterized `KvFormat` (f16/int8/int4). The page adapter namespacing, LRU ownership, restore/promote semantics, and 256-token multi-sequence page design remain unchanged. `PrefixPageCache` `prefix_page_size` (default 64 tokens, `prefix.rs:111`) is the authoritative prefix matching granularity.
+**Amendment (2026-05-27)**: ADR-062 proposes replacing `Arc<[f32]>` page storage with format-parameterized `KvFormat` (f16/int8/int4). The page adapter namespacing, LRU ownership, restore/promote semantics, and 256-token multi-sequence page design remain unchanged. `PrefixPageCache` `prefix_page_size` (default 64 tokens, `prefix.rs:111`) is the authoritative prefix matching granularity.
+
+**Implementation note (2026-06-24)**: The KvFormat amendment is a forward plan. As of this date, `crates/inference/src/kv_cache/prefix.rs:60` still stores `Arc<[f32]>` pages. ADR-062 itself was not built (see ADR-062 §Implementation status).
 
 ---
 
