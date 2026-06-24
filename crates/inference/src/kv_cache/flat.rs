@@ -232,9 +232,13 @@ impl FlatKVCache {
     ///
     /// `buf` must have length >= `seq_len * kv_dim`. Converts f16→f32.
     pub fn read_k_into(&self, layer: usize, buf: &mut [f32]) {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
-        debug_assert!(buf.len() >= end);
+        assert!(
+            buf.len() >= end,
+            "output buffer too small: need {end}, got {}",
+            buf.len()
+        );
         for (i, &h) in self.k[layer][..end].iter().enumerate() {
             buf[i] = h.to_f32();
         }
@@ -244,9 +248,13 @@ impl FlatKVCache {
     ///
     /// `buf` must have length >= `seq_len * kv_dim`. Converts f16→f32.
     pub fn read_v_into(&self, layer: usize, buf: &mut [f32]) {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
-        debug_assert!(buf.len() >= end);
+        assert!(
+            buf.len() >= end,
+            "output buffer too small: need {end}, got {}",
+            buf.len()
+        );
         for (i, &h) in self.v[layer][..end].iter().enumerate() {
             buf[i] = h.to_f32();
         }
@@ -257,7 +265,7 @@ impl FlatKVCache {
     /// Use `read_k_into` for f32 dequantized access.
     #[inline]
     pub fn get_k_f16(&self, layer: usize) -> &[f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         &self.k[layer][..end]
     }
@@ -267,7 +275,7 @@ impl FlatKVCache {
     /// Use `read_v_into` for f32 dequantized access.
     #[inline]
     pub fn get_v_f16(&self, layer: usize) -> &[f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         &self.v[layer][..end]
     }
@@ -277,7 +285,7 @@ impl FlatKVCache {
     /// Allocates a Vec; prefer `read_k_into` when a pre-allocated buffer is available.
     #[inline]
     pub fn get_k(&self, layer: usize) -> Vec<f32> {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         self.k[layer][..end].iter().map(|h| h.to_f32()).collect()
     }
@@ -287,7 +295,7 @@ impl FlatKVCache {
     /// Allocates a Vec; prefer `read_v_into` when a pre-allocated buffer is available.
     #[inline]
     pub fn get_v(&self, layer: usize) -> Vec<f32> {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         self.v[layer][..end].iter().map(|h| h.to_f32()).collect()
     }
@@ -295,7 +303,7 @@ impl FlatKVCache {
     /// **Unstable**: mutable K slice for in-place f16 operations (e.g. RoPE applied in f16).
     #[inline]
     pub fn get_k_mut(&mut self, layer: usize) -> &mut [f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         &mut self.k[layer][..end]
     }
@@ -303,7 +311,7 @@ impl FlatKVCache {
     /// **Unstable**: mutable V slice for in-place f16 operations.
     #[inline]
     pub fn get_v_mut(&mut self, layer: usize) -> &mut [f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         let end = self.seq_len * self.config.kv_dim();
         &mut self.v[layer][..end]
     }
@@ -311,28 +319,28 @@ impl FlatKVCache {
     /// **Unstable**: full K buffer including unwritten positions (f16); used by prefill.
     #[inline]
     pub fn k_buffer_mut(&mut self, layer: usize) -> &mut [f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         &mut self.k[layer]
     }
 
     /// **Unstable**: immutable full K buffer (f16).
     #[inline]
     pub fn k_buffer(&self, layer: usize) -> &[f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         &self.k[layer]
     }
 
     /// **Unstable**: full V buffer including unwritten positions (f16).
     #[inline]
     pub fn v_buffer_mut(&mut self, layer: usize) -> &mut [f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         &mut self.v[layer]
     }
 
     /// **Unstable**: immutable full V buffer (f16).
     #[inline]
     pub fn v_buffer(&self, layer: usize) -> &[f16] {
-        debug_assert!(layer < self.config.num_layers);
+        assert!(layer < self.config.num_layers, "layer index out of bounds");
         &self.v[layer]
     }
 
@@ -662,6 +670,38 @@ mod tests {
                 "read_k_into[{i}]: expected {orig}, got {got}"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "layer index out of bounds")]
+    fn read_k_into_out_of_range_layer_panics_clearly() {
+        // Regression for #244: read accessors guarded `layer` with `debug_assert!`,
+        // which compiled out in release and degraded to a bare `index out of bounds`
+        // panic. Now a runtime `assert!` gives the same descriptive message in both
+        // profiles, matching the write path (`append_kv` / `prefill_layer`).
+        let config = make_config(2, 8);
+        let kv_dim = config.kv_dim();
+        let cache = FlatKVCache::new(config);
+        let mut buf = vec![0.0f32; kv_dim];
+        cache.read_k_into(2, &mut buf); // valid layers are 0..2
+    }
+
+    #[test]
+    #[should_panic(expected = "output buffer too small")]
+    fn read_k_into_undersized_buffer_panics_clearly() {
+        // Regression for #244: the `buf.len() >= end` precondition was a
+        // `debug_assert!` and so unchecked in release. It is now a runtime
+        // `assert!` with a descriptive message.
+        let config = make_config(1, 8);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![0.0f32; kv_dim];
+        cache.append_kv(0, &k, &v);
+        cache.advance();
+
+        let mut too_small = vec![0.0f32; kv_dim - 1];
+        cache.read_k_into(0, &mut too_small);
     }
 
     #[test]
