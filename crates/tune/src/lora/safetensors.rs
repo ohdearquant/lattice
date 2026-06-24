@@ -441,6 +441,13 @@ pub fn save_peft_safetensors(adapter: &LoraAdapter, path: &Path) -> Result<(), T
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
     for ((layer_idx, module), layer) in &adapter.layers {
+        // A LoRA layer with an empty factor buffer means "this module was not trained"
+        // (e.g. GDN-attention slots leave q_proj/v_proj empty). Skip it rather than
+        // emit an InvalidTensorView for a zero-byte tensor with non-zero shape.
+        if layer.a.is_empty() || layer.b.is_empty() {
+            continue;
+        }
+
         let block = match module.as_str() {
             "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
             "gate_proj" | "up_proj" | "down_proj" => "mlp",
@@ -1094,5 +1101,80 @@ mod tests {
         // Mimic the guard: data.len() != expected => would return Err
         let guard_fires = data_len != expected;
         assert!(guard_fires, "guard must detect the mismatch");
+    }
+
+    /// Regression test: saving an adapter that contains a GDN-slot layer with empty A/B
+    /// buffers must succeed (pre-fix it returned `Err(InvalidTensorView)`). The empty layer
+    /// must be silently dropped from the saved file; the real layer must round-trip intact.
+    #[test]
+    fn test_save_skips_empty_buffer_layers() {
+        use tempfile::NamedTempFile;
+
+        let rank: usize = 8;
+        let config = LoraConfig {
+            rank,
+            alpha: rank as f32,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        };
+
+        let mut layers = HashMap::new();
+
+        // Real GQA layer — should survive the round-trip.
+        layers.insert(
+            (19usize, "q_proj".to_string()),
+            LoraLayer {
+                a: vec![0.1f32; rank * 1024],
+                b: vec![0.2f32; 4096 * rank],
+                d_in: 1024,
+                d_out: 4096,
+                rank,
+            },
+        );
+
+        // Empty GDN-slot layer — must be skipped, not serialized.
+        layers.insert(
+            (20usize, "v_proj".to_string()),
+            LoraLayer {
+                a: Vec::new(),
+                b: Vec::new(),
+                d_in: 1024,
+                d_out: 512,
+                rank,
+            },
+        );
+
+        let adapter = LoraAdapter::new(config, layers);
+
+        let temp = NamedTempFile::new().unwrap();
+        // This was the regression: pre-fix this call returned Err(InvalidTensorView).
+        save_peft_safetensors(&adapter, temp.path())
+            .expect("save must succeed even with an empty-buffer GDN slot");
+
+        let loaded = load_peft_safetensors(temp.path()).unwrap();
+
+        // The real layer is present.
+        let real_key = (19usize, "q_proj".to_string());
+        assert!(
+            loaded.layers.contains_key(&real_key),
+            "real GQA layer (19, q_proj) must be present after round-trip"
+        );
+
+        // The empty layer was dropped — it must NOT appear in the saved file.
+        let empty_key = (20usize, "v_proj".to_string());
+        assert!(
+            !loaded.layers.contains_key(&empty_key),
+            "empty GDN-slot layer (20, v_proj) must be absent from saved adapter"
+        );
+
+        // The A buffer of the real layer must be bit-exact.
+        let got = &loaded.layers[&real_key];
+        let expected_a = vec![0.1f32; rank * 1024];
+        assert_eq!(got.a.len(), expected_a.len());
+        for (g, w) in got.a.iter().zip(&expected_a) {
+            assert!(
+                (g - w).abs() < f32::EPSILON,
+                "A buffer mismatch: {g} vs {w}"
+            );
+        }
     }
 }
