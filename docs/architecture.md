@@ -145,3 +145,159 @@ lattice-tune             ← training pipeline (depends on fann + inference)
 | Build a training loop with distillation  | `lattice-tune`                 |
 | Measure embedding distribution drift     | `lattice-transport`            |
 | Write a new model architecture or kernel | `lattice-inference` (internal) |
+
+## Forward Pass Pipeline
+
+This section traces the decoder (Qwen3) generate path end to end. All references are to
+`crates/inference/src/` unless a full path is given. The encoder (BERT/BGE) path is
+structurally similar but uses bidirectional attention and skips the KV cache and decode loop.
+
+### 1. Model Load
+
+`QwenModel::load` (`model/qwen.rs`) opens the model directory and calls
+`SafetensorsFile::open` (`weights/f32_weights.rs`) to memory-map `model.safetensors`. Tensors
+are accessed as zero-copy `Tensor2D<'a>` slices backed by the mmap. Sharded checkpoints go
+through `ShardedQwenBacking`, which owns heap-allocated copies of each shard. The model also
+constructs a `RopeTable` (`rope.rs`) at load time by precomputing sin/cos tables up to
+`max_position_embeddings`.
+
+### 2. Entry Point
+
+```
+generate(model, prompt, config)   // generate.rs:276
+```
+
+`generate` is the single public entry point for text generation. It accepts a `&QwenModel`, a
+prompt string, and a `GenerateConfig` (`generate.rs:27`), then orchestrates the five steps
+below. `GenerateConfig` carries `max_new_tokens`, `SamplingConfig`, an optional EOS token ID,
+an optional `GrammarEngine`, and an optional `kv_cache_capacity` cap.
+
+### 3. Tokenize
+
+```
+tokenizer.tokenize(prompt)   // tokenizer/common.rs:37
+```
+
+`QwenModel::tokenizer()` returns a `Box<dyn Tokenizer>`. For Qwen3 this is a `BpeTokenizer`
+(`tokenizer/bpe.rs`) doing GPT-2-style byte-level BPE encoding. `tokenize` returns a
+`TokenizedInput` with `input_ids` (a `Vec<u32>`) and `real_length` (number of non-padding
+tokens). The generate loop uses `tokenized.real_length` as `prompt_len`.
+
+### 4. Allocate KV Cache and Scratch
+
+`generate.rs` allocates a `FlatKVCache` (`kv_cache/flat.rs`) sized to
+`prompt_len + max_new_tokens` (or the caller's `kv_cache_capacity` cap). The cache stores K
+and V tensors in f16 (2 bytes per element) across all layers in two contiguous per-layer
+buffers, totalling `2 * num_layers * capacity * kv_dim * 2` bytes.
+
+A `ForwardScratch` struct (`generate.rs:103`) holds pre-allocated f32 buffers for all
+intermediate activations: `hidden`, `residual`, `qkv_buf`, `q_buf`, `k_buf`, `v_buf`,
+`attn_out`, `gate_up_buf`, `gate_buf`, `up_buf`, `ffn_out`, `scores`, `logits`, and two
+dequantization buffers (`cached_k_f32`, `cached_v_f32`). `ensure_capacity` grows these
+buffers on the first call (prefill size) and never shrinks them, so decode steps reuse the
+same allocation.
+
+### 5. Prefill
+
+```
+forward_with_cache(model, &prompt_ids[..prompt_len], &mut cache, 0, &mut scratch, max_seq)
+```
+
+`forward_with_cache` (`generate.rs:451`) runs the full prompt through the transformer in a
+single pass (`start_pos = 0`, `seq_len = prompt_len`). Inside:
+
+1. **Embedding lookup** (`generate.rs:475`). Each token ID indexes into
+   `weights.embed_tokens.data` (the `[vocab_size, hidden_size]` embedding matrix) and copies
+   one row into `scratch.hidden`.
+
+2. **Transformer layers** (`generate.rs:494`). For each of `num_hidden_layers` layers:
+
+   a. **Pre-attention RMS norm** (`forward/cpu.rs: rms_norm`). Normalizes
+   `scratch.hidden` in place using the layer's `input_layernorm_weight`.
+
+   b. **Fused QKV projection** (`matmul_bt`). A single `[seq_len, hidden_size] ×
+      [qkv_dim, hidden_size]^T` matmul produces `[seq_len, qkv_dim]` in `scratch.qkv_buf`.
+   The output is then scattered into separate `scratch.q_buf`, `scratch.k_buf`,
+   `scratch.v_buf` slices.
+
+   c. **Per-head QK RMS norm**. Each Q head and each KV head is independently RMS-normed
+   using `lw.q_norm_weight` and `lw.k_norm_weight`.
+
+   d. **RoPE** (`rope.rs: RopeTable::apply`). `RopeTable::apply` rotates each Q and K head
+   in place using the precomputed sin/cos table at position `start_pos + token_index`.
+
+   e. **KV cache write** (`generate.rs:563`). K and V are converted f32→f16 and appended to
+   `cache.k_buffer_mut(layer_idx)` and `cache.v_buffer_mut(layer_idx)`.
+
+   f. **Attention** (`generate.rs:620, compute_attention`). The cached K and V buffers are
+   dequantized f16→f32 into `scratch.cached_k_f32` / `scratch.cached_v_f32`. Then
+   `compute_attention` (`generate.rs:875`) runs GQA with causal masking: Q @ K^T scaled
+   by `1/sqrt(head_dim)`, softmax, weighted sum of V. During prefill (`q_seq_len > 1`)
+   the generic path applies a causal mask (`ki > start_pos + qi → NEG_INFINITY`). During
+   decode (`q_seq_len == 1`) a faster path loads each KV row once and dots it against all
+   Q heads in its GQA group, then uses an online safe-softmax (running `(m, l)`
+   accumulation) before accumulating V via NEON on AArch64 for `head_dim = 128`.
+
+   g. **Output projection** (`matmul_bt`). `[seq_len, q_dim] × [hidden_size, q_dim]^T →
+      [seq_len, hidden_size]` writes the attention output back to `scratch.hidden`.
+
+   h. **Residual add**. `scratch.hidden[i] += scratch.residual[i]` for each element.
+
+   i. **Post-attention RMS norm** using `lw.post_attention_layernorm_weight`.
+
+   j. **SwiGLU FFN**. A fused gate+up projection (`[seq_len, hidden] × [2*inter, hidden]^T`)
+   fills `scratch.gate_up_buf`. Gate and up halves are scattered, then `silu_inplace` is
+   applied to the gate half, followed by `elementwise_mul(gate, up)` to produce the
+   activated hidden state. The down projection (`[seq_len, inter] × [hidden_size, inter]^T`)
+   writes the FFN output. A second residual add completes the layer.
+
+3. **KV cache advance** (`cache.advance_by(seq_len)`, `generate.rs:702`). Increments the
+   logical sequence length by the number of tokens just processed.
+
+4. **Final RMS norm** (`generate.rs:706`). Applied to the last token's hidden state only
+   (`hidden[last_start..]`).
+
+5. **Logits projection** (`generate.rs:716`). Qwen3 ties `lm_head` with `embed_tokens`:
+   `logits = hidden_last @ embed_tokens^T`. This is a single `matmul_bt` call producing a
+   `[1, vocab_size]` vector written into `scratch.logits`.
+
+### 6. Sample First Token
+
+```
+sampler.sample(&scratch.logits[..cfg.vocab_size])   // sampling.rs
+```
+
+`Sampler::sample` applies temperature scaling, top-k filtering, top-p nucleus filtering, and
+repetition penalty, then draws a token ID. If a `GrammarEngine` is active, `mask_logits` is
+called on `scratch.logits` before sampling and `advance` is called after (`grammar/mod.rs`).
+
+### 7. Decode Loop
+
+```
+for step in 0..max_new_tokens.saturating_sub(1) {
+    forward_with_cache(model, &[last_token], &mut cache, pos-1, &mut scratch, max_seq)?;
+    token = sampler.sample(&scratch.logits[..vocab_size]);
+    generated_ids.push(token);
+}
+```
+
+Each decode step calls `forward_with_cache` with a single-token input. The KV cache grows by
+one position per step. The loop stops on EOS, when the cache is full (optional
+`kv_cache_capacity` cap), or when `max_new_tokens` is exhausted.
+
+### 8. Detokenize
+
+```
+tokenizer.decode(&generated_ids)   // tokenizer/common.rs:44
+```
+
+`BpeTokenizer::decode` converts generated token IDs back to a UTF-8 string using GPT-2
+byte-level decoding. If `GenerateConfig::include_prompt` is set, the prompt string is
+prepended to the result.
+
+### Setting a Breakpoint
+
+To inspect the forward pass at runtime, set a breakpoint on `forward_with_cache`
+(`generate.rs:451`). The prefill call has `seq_len = prompt_len`; each decode call has
+`seq_len = 1`. The logits for the sampled token are always in `scratch.logits[0..vocab_size]`
+after the function returns.
