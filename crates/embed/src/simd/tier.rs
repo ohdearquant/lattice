@@ -544,7 +544,19 @@ pub fn approximate_int4_batch_prepared_into(
 /// The query is always f32; the stored data may be at any tier.
 ///
 /// Returns a value in [0, 2] where 0 = identical, 2 = opposite.
+///
+/// # Precondition
+///
+/// `query_f32.len()` must equal the stored vector's dimensionality. Violating
+/// this is a caller bug; correct HNSW usage never triggers it.
 pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) -> f32 {
+    debug_assert_eq!(
+        query_f32.len(),
+        stored.dims(),
+        "approximate_cosine_distance: query length {} != stored dims {}",
+        query_f32.len(),
+        stored.dims(),
+    );
     match stored {
         QuantizedData::Full(v) => {
             // Exact cosine distance

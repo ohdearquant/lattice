@@ -644,8 +644,12 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
 /// # Invariant
 ///
 /// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption in AVX2 and AVX-512 VNNI SIMD paths. This function
-/// enforces the invariant with a release-mode `assert!` at the public boundary.
+/// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
+/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). The invariant is enforced with a
+/// **`debug_assert!`** (debug builds only); callers MUST guarantee it. The
+/// `QuantizedVector::from_f32` constructor satisfies it by clamping to `[-127, 127]`.
+/// Promoting this to a release `assert!` would add an O(n) scan to a documented hot
+/// path and is intentionally avoided.
 ///
 /// # Performance
 ///
