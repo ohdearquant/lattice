@@ -14,15 +14,20 @@ pub(crate) fn sample_token(
         apply_repetition_penalty(&mut adjusted, previous_ids, cfg.repetition_penalty);
     }
 
-    if cfg.temperature > 0.0 && cfg.temperature != 1.0 {
+    // A non-finite (NaN/±inf) or non-positive temperature carries no valid
+    // scaling: `1.0 / NaN` is NaN and `1.0 / inf` is 0, either of which corrupts
+    // the distribution (NaN logits, or all logits flattened to a uniform draw).
+    // Route them all to deterministic greedy argmax before any scaling, matching
+    // Sampler::sample and the documented "0.0 = greedy" contract.
+    if !cfg.temperature.is_finite() || cfg.temperature <= 0.0 {
+        return greedy_token(&adjusted);
+    }
+
+    if cfg.temperature != 1.0 {
         let inv_temp = 1.0 / cfg.temperature;
         for v in &mut adjusted {
             *v *= inv_temp;
         }
-    }
-
-    if cfg.temperature <= 0.0 {
-        return greedy_token(&adjusted);
     }
 
     let mut indices: Vec<usize> = (0..vocab_size).collect();
