@@ -1927,8 +1927,12 @@ where
             // Verify the draft tokens
             let (accepted, logits_vec) = verify_draft(&draft, pos, &mut forward_fn);
 
-            // Accept verified tokens
-            for &t in &draft[..accepted] {
+            // Accept verified tokens, but never past the caller's budget: a
+            // multi-token draft can exceed `max_new_tokens` in a single step,
+            // so clamp the commit to the remaining budget (#242).
+            let remaining = max_new_tokens - generated.len();
+            let commit = accepted.min(remaining);
+            for &t in &draft[..commit] {
                 if t == eos_token {
                     return generated;
                 }
@@ -1939,7 +1943,8 @@ where
 
             // If we rejected some draft tokens, the last set of logits
             // gives us the model's actual prediction for the next token.
-            if accepted < draft.len() {
+            // Skip it once the budget is full so the fallback cannot overrun.
+            if accepted < draft.len() && generated.len() < max_new_tokens {
                 let rejection_logits =
                     &logits_vec[accepted.min(logits_vec.len().saturating_sub(1))];
                 let next_token = argmax(rejection_logits) as u32;
@@ -2516,6 +2521,42 @@ mod tests {
             4,
         );
         assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn generate_does_not_overrun_budget_on_multi_token_draft() {
+        // Regression for #242: the speculative branch committed every accepted
+        // draft token (plus a rejection-fallback token) without re-checking the
+        // budget, so a multi-token draft could return more than `max_new_tokens`.
+        //
+        // The suffix [7,8,9] recurs at pos 0, so `speculate(&prompt)` drafts
+        // prompt[3..7] = [0,7,8,9] on the very first step. The forward_fn below
+        // makes the target agree with all four (accepted == 4), so a budget of 1
+        // would have returned 4 tokens before the fix.
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+        let eos = 999u32;
+        for max_new in 1..=3 {
+            let out = generate_with_speculation(
+                &prompt,
+                max_new,
+                eos,
+                |tok: u32, _pos: usize| match tok {
+                    0 => logits_with_argmax(1000, 7),
+                    7 => logits_with_argmax(1000, 8),
+                    8 => logits_with_argmax(1000, 9),
+                    _ => logits_with_argmax(1000, 5),
+                },
+                5,
+                4,
+            );
+            assert!(
+                out.len() <= max_new,
+                "budget {max_new} overrun: produced {} tokens {:?}",
+                out.len(),
+                out
+            );
+            assert_eq!(out.len(), max_new, "should fill the budget exactly");
+        }
     }
 
     #[test]
