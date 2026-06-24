@@ -5,7 +5,7 @@ similarity matching.
 
 ## Features
 
-- **Local Embeddings**: Generate embeddings locally using BGE models via fastembed
+- **Native Embeddings**: Generate embeddings locally using pure Rust inference (no ONNX, no Python)
 - **SIMD Acceleration**: AVX2/AVX-512/NEON optimized vector operations (7x speedup)
 - **LRU Cache**: Blake3-based caching to avoid recomputation
 - **Async API**: Full async/await support with tokio
@@ -22,15 +22,15 @@ All models have a 512 token input limit.
 
 ## Services
 
-### LocalEmbeddingService
+### NativeEmbeddingService
 
 Single-model service with lazy initialization. Inference is serialized (one call at a
-time).
+time). Concurrency is handled internally.
 
 ```rust
-use lattice_embed::{EmbeddingService, EmbeddingModel, LocalEmbeddingService};
+use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
 
-let service = LocalEmbeddingService::new();
+let service = NativeEmbeddingService::default();
 let embedding = service.embed_one("Hello, world!", EmbeddingModel::default()).await?;
 assert_eq!(embedding.len(), 384);
 ```
@@ -40,25 +40,14 @@ assert_eq!(embedding.len(), 384);
 Wraps any `EmbeddingService` with LRU caching. Identical texts return cached embeddings.
 
 ```rust
-use lattice_embed::{CachedEmbeddingService, LocalEmbeddingService, EmbeddingService};
+use lattice_embed::{CachedEmbeddingService, NativeEmbeddingService, EmbeddingService};
 use std::sync::Arc;
 
-let inner = Arc::new(LocalEmbeddingService::new());
+let inner = Arc::new(NativeEmbeddingService::new());
 let cached = CachedEmbeddingService::new(inner, 1000); // 1000 entry cache
 
 let emb1 = cached.embed_one("Hello", EmbeddingModel::default()).await?;
 let emb2 = cached.embed_one("Hello", EmbeddingModel::default()).await?; // cache hit
-```
-
-### PooledEmbeddingService
-
-Maintains N model instances for parallel inference. Memory scales linearly (~100-300MB
-per instance).
-
-```rust
-use lattice_embed::{PooledEmbeddingService, EmbeddingService};
-
-let service = PooledEmbeddingService::new(4); // 4 concurrent inference slots
 ```
 
 ## SIMD Vector Operations
@@ -129,14 +118,14 @@ println!("Hit rate: {:.1}%", stats.hit_rate() * 100.0);
 
 ## Feature Flags
 
-| Feature | Default | Description                          |
-| ------- | ------- | ------------------------------------ |
-| `local` | Yes     | Enable local embedding via fastembed |
+| Feature  | Default | Description                                    |
+| -------- | ------- | ---------------------------------------------- |
+| `native` | Yes     | Enable local embedding via pure Rust inference |
 
 ```toml
 [dependencies]
-lattice-embed = { version = "0.1", default-features = false }  # SIMD only
-lattice-embed = { version = "0.1" }  # Full (local + SIMD)
+lattice-embed = { version = "0.3", default-features = false }  # SIMD only
+lattice-embed = { version = "0.3" }  # Full (native + SIMD)
 ```
 
 ## Batch Processing
