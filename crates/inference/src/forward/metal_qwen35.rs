@@ -8773,9 +8773,17 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 // Route the accept/reject decision through `rejection_sample_draft` so
                 // the live MTP loop and the trait-level `mtp_verify_draft` share the
-                // same verifier implementation (ADR-050). For probabilistic 1-draft MTP:
+                // same verifier implementation (ADR-050). This is the GREEDY MTP loop
+                // (entered only when top_k<=1 && temperature<=0.0), so verification uses
+                // `greedy=true`: argmax-only acceptance that is deterministic and
+                // token-for-token equivalent to plain greedy `generate()`. Passing
+                // `greedy=false` here drove a clock-seeded RNG, making greedy MTP output
+                // non-deterministic and not argmax-equivalent (#237). In greedy mode the
+                // verifier never reads `draft_logits` (it may even be `&[]` per the
+                // contract), but we still hand it the draft's own logits: the value is
+                // ignored on the greedy path and this keeps `draft.logits` a live read.
                 //   draft_tokens          = [draft.token_id]
-                //   draft_logits          = [draft.logits]   (q(·) for draft position)
+                //   draft_logits          = [draft.logits]        (ignored in greedy mode)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
                 let Ok(rs) = crate::speculative::rejection_sample_draft(
@@ -8783,7 +8791,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
-                    false,
+                    true,
                     None,
                 ) else {
                     // Fallback: accept pending, advance normally.
