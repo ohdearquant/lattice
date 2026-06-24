@@ -699,7 +699,7 @@ fn forward_with_cache<'a>(
     }
 
     // Advance KV cache position after all layers processed
-    cache.advance_by(seq_len);
+    cache.advance_by(seq_len)?;
 
     // Final RMS norm on last token's hidden state
     let last_start = (seq_len - 1) * hidden_size;

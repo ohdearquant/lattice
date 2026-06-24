@@ -12,6 +12,8 @@
 
 use half::f16;
 
+use crate::error::InferenceError;
+
 /// **Unstable**: flat KV cache configuration; fields may change as the
 /// generation infrastructure evolves.
 #[derive(Debug, Clone)]
@@ -128,25 +130,43 @@ impl FlatKVCache {
         self.seq_len >= self.config.max_seq_len
     }
 
-    /// **Unstable**: append K/V for a single token; panics on overflow.
+    /// **Unstable**: append K/V for a single token.
     ///
     /// `k_token` and `v_token` must each have length `kv_dim`.
     /// Returns the position index where the token was stored.
     /// Converts f32→f16 on write.
     ///
-    /// # Panics
-    /// Panics if the cache is full or if slice lengths are wrong.
-    pub fn append_kv(&mut self, layer: usize, k_token: &[f32], v_token: &[f32]) -> usize {
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if the cache is full, the layer index
+    /// is out of bounds, or either slice length does not equal `kv_dim`.
+    pub fn append_kv(
+        &mut self,
+        layer: usize,
+        k_token: &[f32],
+        v_token: &[f32],
+    ) -> Result<usize, InferenceError> {
         let kv_dim = self.config.kv_dim();
-        assert_eq!(k_token.len(), kv_dim, "k_token length must equal kv_dim");
-        assert_eq!(v_token.len(), kv_dim, "v_token length must equal kv_dim");
-        assert!(layer < self.config.num_layers, "layer index out of bounds");
-        assert!(
-            self.seq_len < self.config.max_seq_len,
-            "KV cache is full (seq_len={}, max={})",
-            self.seq_len,
-            self.config.max_seq_len
-        );
+        if k_token.len() != kv_dim {
+            return Err(InferenceError::InvalidInput(
+                "k_token length must equal kv_dim".to_string(),
+            ));
+        }
+        if v_token.len() != kv_dim {
+            return Err(InferenceError::InvalidInput(
+                "v_token length must equal kv_dim".to_string(),
+            ));
+        }
+        if layer >= self.config.num_layers {
+            return Err(InferenceError::InvalidInput(
+                "layer index out of bounds".to_string(),
+            ));
+        }
+        if self.seq_len >= self.config.max_seq_len {
+            return Err(InferenceError::InvalidInput(format!(
+                "KV cache is full (seq_len={}, max={})",
+                self.seq_len, self.config.max_seq_len
+            )));
+        }
 
         let offset = self.seq_len * kv_dim;
         for (i, &val) in k_token.iter().enumerate() {
@@ -156,45 +176,92 @@ impl FlatKVCache {
             self.v[layer][offset + i] = f16::from_f32(val);
         }
 
-        self.seq_len
+        Ok(self.seq_len)
     }
 
     /// **Unstable**: advance position counter after all layers are appended.
-    pub fn advance(&mut self) {
-        assert!(
-            self.seq_len < self.config.max_seq_len,
-            "cannot advance: cache is full"
-        );
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if the cache is already full.
+    pub fn advance(&mut self) -> Result<(), InferenceError> {
+        if self.seq_len >= self.config.max_seq_len {
+            return Err(InferenceError::InvalidInput(
+                "cannot advance: cache is full".to_string(),
+            ));
+        }
         self.seq_len += 1;
+        Ok(())
     }
 
     /// **Unstable**: append K/V for all layers in one call and advance.
-    pub fn append_kv_all_layers(&mut self, k_all: &[&[f32]], v_all: &[&[f32]]) {
-        assert_eq!(k_all.len(), self.config.num_layers);
-        assert_eq!(v_all.len(), self.config.num_layers);
-        for layer in 0..self.config.num_layers {
-            self.append_kv(layer, k_all[layer], v_all[layer]);
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if `k_all` or `v_all` length does not
+    /// equal the number of layers, or if any per-layer `append_kv` or `advance` fails.
+    pub fn append_kv_all_layers(
+        &mut self,
+        k_all: &[&[f32]],
+        v_all: &[&[f32]],
+    ) -> Result<(), InferenceError> {
+        if k_all.len() != self.config.num_layers {
+            return Err(InferenceError::InvalidInput(format!(
+                "k_all length {} does not match num_layers {}",
+                k_all.len(),
+                self.config.num_layers
+            )));
         }
-        self.advance();
+        if v_all.len() != self.config.num_layers {
+            return Err(InferenceError::InvalidInput(format!(
+                "v_all length {} does not match num_layers {}",
+                v_all.len(),
+                self.config.num_layers
+            )));
+        }
+        for layer in 0..self.config.num_layers {
+            self.append_kv(layer, k_all[layer], v_all[layer])?;
+        }
+        self.advance()?;
+        Ok(())
     }
 
     /// **Unstable**: batch-append tokens for one layer during prefill.
     /// Converts f32→f16 on write.
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if slice lengths are wrong, the layer
+    /// index is out of bounds, or the tokens would overflow the cache capacity.
     pub fn prefill_layer(
         &mut self,
         layer: usize,
         k_tokens: &[f32],
         v_tokens: &[f32],
         num_tokens: usize,
-    ) {
+    ) -> Result<(), InferenceError> {
         let kv_dim = self.config.kv_dim();
-        assert_eq!(k_tokens.len(), num_tokens * kv_dim);
-        assert_eq!(v_tokens.len(), num_tokens * kv_dim);
-        assert!(layer < self.config.num_layers);
-        assert!(
-            self.seq_len + num_tokens <= self.config.max_seq_len,
-            "prefill would exceed max_seq_len"
-        );
+        if k_tokens.len() != num_tokens * kv_dim {
+            return Err(InferenceError::InvalidInput(format!(
+                "k_tokens length {} does not equal num_tokens * kv_dim ({})",
+                k_tokens.len(),
+                num_tokens * kv_dim
+            )));
+        }
+        if v_tokens.len() != num_tokens * kv_dim {
+            return Err(InferenceError::InvalidInput(format!(
+                "v_tokens length {} does not equal num_tokens * kv_dim ({})",
+                v_tokens.len(),
+                num_tokens * kv_dim
+            )));
+        }
+        if layer >= self.config.num_layers {
+            return Err(InferenceError::InvalidInput(
+                "layer index out of bounds".to_string(),
+            ));
+        }
+        if self.seq_len + num_tokens > self.config.max_seq_len {
+            return Err(InferenceError::InvalidInput(
+                "prefill would exceed max_seq_len".to_string(),
+            ));
+        }
 
         let offset = self.seq_len * kv_dim;
         let total = num_tokens * kv_dim;
@@ -204,15 +271,28 @@ impl FlatKVCache {
         for (i, &val) in v_tokens[..total].iter().enumerate() {
             self.v[layer][offset + i] = f16::from_f32(val);
         }
+        Ok(())
     }
 
     /// **Unstable**: advance position counter by n after prefilling all layers.
-    pub fn advance_by(&mut self, n: usize) {
-        assert!(
-            self.seq_len + n <= self.config.max_seq_len,
-            "advance_by would exceed max_seq_len"
-        );
-        self.seq_len += n;
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if `seq_len + n` would overflow
+    /// `usize` or exceed `max_seq_len`.
+    pub fn advance_by(&mut self, n: usize) -> Result<(), InferenceError> {
+        let new_len = self.seq_len.checked_add(n).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "advance_by({n}) would overflow usize (seq_len={})",
+                self.seq_len
+            ))
+        })?;
+        if new_len > self.config.max_seq_len {
+            return Err(InferenceError::InvalidInput(
+                "advance_by would exceed max_seq_len".to_string(),
+            ));
+        }
+        self.seq_len = new_len;
+        Ok(())
     }
 
     /// **Unstable**: roll back the cache to a shorter sequence without deallocating buffers.
@@ -398,14 +478,14 @@ mod tests {
         // Use small values well within f16 range to avoid precision loss.
         let k: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.01).collect();
         let v: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.02 + 1.0).collect();
-        cache.append_kv(0, &k, &v);
+        cache.append_kv(0, &k, &v).unwrap();
 
         // Also append to layer 1.
         let k1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.03).collect();
         let v1: Vec<f32> = (0..kv_dim).map(|i| (i as f32) * 0.04 + 2.0).collect();
-        cache.append_kv(1, &k1, &v1);
+        cache.append_kv(1, &k1, &v1).unwrap();
 
-        cache.advance();
+        cache.advance().unwrap();
         assert_eq!(cache.seq_len(), 1);
 
         // Verify roundtrip with f16 tolerance.
@@ -446,9 +526,9 @@ mod tests {
             let marker = (layer + 1) as f32;
             let k = vec![marker; kv_dim];
             let v = vec![marker + 0.5; kv_dim];
-            cache.append_kv(layer, &k, &v);
+            cache.append_kv(layer, &k, &v).unwrap();
         }
-        cache.advance();
+        cache.advance().unwrap();
 
         // Each layer should have its own data (with f16 tolerance).
         for layer in 0..4 {
@@ -474,9 +554,9 @@ mod tests {
 
         let k = vec![1.0f32; kv_dim];
         let v = vec![2.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.append_kv(1, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.append_kv(1, &k, &v).unwrap();
+        cache.advance().unwrap();
         assert_eq!(cache.seq_len(), 1);
 
         cache.reset();
@@ -497,28 +577,31 @@ mod tests {
 
         // Fill to capacity.
         for _ in 0..4 {
-            cache.append_kv(0, &k, &v);
-            cache.advance();
+            cache.append_kv(0, &k, &v).unwrap();
+            cache.advance().unwrap();
         }
         assert!(cache.is_full());
         assert_eq!(cache.seq_len(), 4);
     }
 
     #[test]
-    #[should_panic(expected = "KV cache is full")]
-    fn append_beyond_capacity_panics() {
+    fn append_beyond_capacity_returns_err() {
         let config = make_config(1, 2);
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
         let k = vec![1.0f32; kv_dim];
         let v = vec![2.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.advance();
-        cache.append_kv(0, &k, &v);
-        cache.advance();
-        // This should panic.
-        cache.append_kv(0, &k, &v);
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
+        // Cache is now full; next append must return Err.
+        let r = cache.append_kv(0, &k, &v);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error, got {r:?}"
+        );
     }
 
     #[test]
@@ -538,9 +621,11 @@ mod tests {
             let v_prefill: Vec<f32> = (0..prompt_len * kv_dim)
                 .map(|i| marker + 0.5 + (i as f32) * 0.001)
                 .collect();
-            cache.prefill_layer(layer, &k_prefill, &v_prefill, prompt_len);
+            cache
+                .prefill_layer(layer, &k_prefill, &v_prefill, prompt_len)
+                .unwrap();
         }
-        cache.advance_by(prompt_len);
+        cache.advance_by(prompt_len).unwrap();
         assert_eq!(cache.seq_len(), prompt_len);
 
         // Decode: append 5 more tokens one at a time.
@@ -549,9 +634,9 @@ mod tests {
                 let marker = 100.0 + step as f32;
                 let k = vec![marker; kv_dim];
                 let v = vec![marker + 0.5; kv_dim];
-                cache.append_kv(layer, &k, &v);
+                cache.append_kv(layer, &k, &v).unwrap();
             }
-            cache.advance();
+            cache.advance().unwrap();
         }
         assert_eq!(cache.seq_len(), 15);
 
@@ -601,7 +686,7 @@ mod tests {
         let kv_dim = config.kv_dim();
         let mut cache = FlatKVCache::new(config);
 
-        cache.advance_by(5);
+        cache.advance_by(5).unwrap();
         let k_len_before = cache.k_buffer(0).len();
         let v_len_before = cache.v_buffer(0).len();
 
@@ -622,8 +707,8 @@ mod tests {
 
         let k = vec![42.0f32; kv_dim];
         let v = vec![43.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
 
         cache.reset_fast();
         assert_eq!(cache.seq_len(), 0);
@@ -639,8 +724,8 @@ mod tests {
 
         let k = vec![1.0f32; kv_dim];
         let v = vec![2.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
 
         // Modify K in-place via f16 mutation.
         let k_mut = cache.get_k_mut(0);
@@ -658,8 +743,8 @@ mod tests {
 
         let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.5).collect();
         let v = vec![0.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
 
         let mut buf = vec![0.0f32; kv_dim];
         cache.read_k_into(0, &mut buf);
@@ -697,8 +782,8 @@ mod tests {
         let mut cache = FlatKVCache::new(config);
         let k = vec![1.0f32; kv_dim];
         let v = vec![0.0f32; kv_dim];
-        cache.append_kv(0, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
 
         let mut too_small = vec![0.0f32; kv_dim - 1];
         cache.read_k_into(0, &mut too_small);
@@ -745,8 +830,8 @@ mod tests {
             max_seq_len: 4,
         };
         let mut cache = FlatKVCache::new(config);
-        cache.append_kv(0, &[val], &[0.0f32]);
-        cache.advance();
+        cache.append_kv(0, &[val], &[0.0f32]).unwrap();
+        cache.advance().unwrap();
         cache.get_k(0)[0]
     }
 
@@ -1172,7 +1257,7 @@ mod tests {
                         v_layer[i] = f16::from_f32(val);
                     }
                 }
-                cache.advance_by(seq_len);
+                cache.advance_by(seq_len).unwrap();
 
                 // Dequantize via the same scratch-loop pattern as generate.rs:463-466.
                 let k_end = seq_len * KV_DIM;
@@ -1291,5 +1376,76 @@ mod tests {
         let sum: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
         let log_sum = sum.ln();
         (logits[target] - max_l) - log_sum
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for Result-returning mutators (issue #290).
+    // Each asserts Err(InferenceError::InvalidInput(_)) on the boundary case.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn advance_past_capacity_returns_err() {
+        let config = make_config(1, 2);
+        let mut cache = FlatKVCache::new(config);
+        cache.advance_by(2).unwrap();
+        // Cache is now full; advance must return Err.
+        let r = cache.advance();
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn advance_by_overflow_returns_err() {
+        let config = make_config(1, 4);
+        let mut cache = FlatKVCache::new(config);
+        // Requesting n that exceeds max_seq_len.
+        let r = cache.advance_by(5);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error for over-capacity advance_by, got {r:?}"
+        );
+        // Also verify the usize overflow path: seq_len + usize::MAX overflows.
+        cache.advance_by(2).unwrap();
+        let r2 = cache.advance_by(usize::MAX);
+        assert!(
+            matches!(r2, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error for usize::MAX advance_by, got {r2:?}"
+        );
+    }
+
+    #[test]
+    fn prefill_layer_over_capacity_returns_err() {
+        let config = make_config(1, 4);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+        // Prefill 3 tokens first.
+        let data = vec![0.0f32; 3 * kv_dim];
+        cache.prefill_layer(0, &data, &data, 3).unwrap();
+        cache.advance_by(3).unwrap();
+        // Now try to prefill 2 more tokens (only 1 slot left).
+        let data2 = vec![0.0f32; 2 * kv_dim];
+        let r = cache.prefill_layer(0, &data2, &data2, 2);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn append_kv_all_layers_wrong_layer_count_returns_err() {
+        let config = make_config(3, 8);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+        let tok = vec![0.0f32; kv_dim];
+        // Pass only 2 layers' worth of data when num_layers == 3.
+        let k_all: Vec<&[f32]> = vec![tok.as_slice(), tok.as_slice()];
+        let v_all: Vec<&[f32]> = vec![tok.as_slice(), tok.as_slice()];
+        let r = cache.append_kv_all_layers(&k_all, &v_all);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput error, got {r:?}"
+        );
     }
 }

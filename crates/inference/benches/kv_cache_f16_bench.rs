@@ -42,7 +42,9 @@ fn bench_append_kv(c: &mut Criterion) {
         b.iter_batched_ref(
             || FlatKVCache::new(config.clone()),
             |cache| {
-                cache.append_kv(0, black_box(&k_token), black_box(&v_token));
+                cache
+                    .append_kv(0, black_box(&k_token), black_box(&v_token))
+                    .unwrap();
             },
             BatchSize::SmallInput,
         );
@@ -61,8 +63,8 @@ fn bench_read_k_into(c: &mut Criterion) {
     let k: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.001).collect();
     let v: Vec<f32> = (0..kv_dim).map(|i| i as f32 * 0.002).collect();
     for _ in 0..seq_len {
-        cache.append_kv(0, &k, &v);
-        cache.advance();
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.advance().unwrap();
     }
 
     let mut buf = vec![0.0f32; seq_len * kv_dim];

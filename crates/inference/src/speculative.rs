@@ -862,7 +862,7 @@ impl<'a> MtpVerifier<'a> {
         }
 
         // Advance KV cache after layer completes
-        self.cache.advance_by(1);
+        self.cache.advance_by(1)?;
 
         // Post-attention layernorm (plain RMSNorm), save residual for FFN
         self.scratch.residual.copy_from_slice(&self.scratch.hidden);

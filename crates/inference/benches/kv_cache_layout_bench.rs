@@ -38,8 +38,10 @@ impl CurrentFixture {
 
         let cfg = FlatKVCacheConfig::for_qwen3(1, N_KV_HEADS, HEAD_DIM, kv_seq_len);
         let mut cache = FlatKVCache::new(cfg);
-        cache.prefill_layer(0, &sequence_major_k, &sequence_major_v, kv_seq_len);
-        cache.advance_by(kv_seq_len);
+        cache
+            .prefill_layer(0, &sequence_major_k, &sequence_major_v, kv_seq_len)
+            .unwrap();
+        cache.advance_by(kv_seq_len).unwrap();
 
         let k = cache.get_k(0);
         let v = cache.get_v(0);
