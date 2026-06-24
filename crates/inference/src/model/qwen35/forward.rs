@@ -13,6 +13,12 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 
 impl Qwen35Model {
     /// Single-token forward pass. Writes logits into scratch.logits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `token_id >= vocab_size`. The tokenizer-bounded generate path
+    /// never triggers this; it can only be reached by a library consumer calling
+    /// the raw entry point with an out-of-vocabulary id.
     pub(crate) fn forward_step(
         &self,
         token_id: u32,
@@ -23,6 +29,12 @@ impl Qwen35Model {
     ) {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
+
+        assert!(
+            (token_id as usize) < cfg.vocab_size,
+            "token_id {token_id} out of range: vocab_size is {}",
+            cfg.vocab_size,
+        );
 
         scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
 

@@ -7293,6 +7293,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
+        ///
+        /// # Panics
+        ///
+        /// Panics if `token_id >= vocab_size`. The check is O(1) and runs before any
+        /// GPU dispatch. The tokenizer-bounded generate path never triggers this; it
+        /// can only be reached by a library consumer calling the raw entry point with
+        /// an out-of-vocabulary id.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.forward_step_inner(token_id, position, false).logits
         }
@@ -7404,6 +7411,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Prompts longer than max_prefill without active LoRA are processed in
         /// max_prefill-sized batched chunks; LoRA-active prompts remain on the
         /// per-token forward_step fallback.
+        ///
+        /// # Panics
+        ///
+        /// Panics if any `token_ids[i] >= vocab_size`. The check is O(seq_len) and
+        /// runs once at the entry point before any GPU work. The tokenizer-bounded
+        /// generate path never triggers this; it can only be reached by a library
+        /// consumer passing raw ids with an out-of-vocabulary value.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
             self.forward_prefill_impl(token_ids, false)
         }
@@ -7415,6 +7429,10 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Used by perplexity evaluation. Allocates a per-call buffer of size
         /// `n * vocab_size * 4` bytes — for `vocab_size=248K` and `n=128` that's
         /// ~127MB. Callers should cap `n` accordingly (typical PPL window: 128).
+        ///
+        /// # Panics
+        ///
+        /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
             self.forward_prefill_impl(token_ids, true)
         }
@@ -7422,6 +7440,15 @@ kernel void gdn_chunk_norm_silu_c32(
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
             let n = token_ids.len();
             let vocab = self.engine.config.vocab_size;
+            // Validate all ids once at the entry point (O(seq_len)) before any GPU work.
+            // Do NOT duplicate this inside the hot embedding loop; the inner chunk code
+            // relies on this pre-scan and omits the per-token guard.
+            for (t, &id) in token_ids.iter().enumerate() {
+                assert!(
+                    (id as usize) < vocab,
+                    "forward_prefill: token_ids[{t}]={id} out of range: vocab_size is {vocab}",
+                );
+            }
             if n == 0 {
                 return if all_positions {
                     vec![]
@@ -7516,16 +7543,11 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // Batch embedding: f16 → f32 for all N tokens
             // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // each id is validated < vocab_size before computing the offset.
+            // all ids validated < vocab_size at the forward_prefill_impl entry point.
             unsafe {
                 let src_base = self.engine.embed_tokens.contents() as *const u16;
                 let dst_base = self.session.activations.hidden.contents() as *mut f32;
                 for (t, &id) in token_ids.iter().enumerate() {
-                    assert!(
-                        (id as usize) < cfg.vocab_size,
-                        "forward_prefill: token_ids[{t}]={id} >= vocab_size {}",
-                        cfg.vocab_size
-                    );
                     let src = src_base.add(id as usize * hidden);
                     let dst = dst_base.add(t * hidden);
                     // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
