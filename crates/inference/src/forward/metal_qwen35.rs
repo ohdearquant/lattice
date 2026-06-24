@@ -8939,11 +8939,15 @@ kernel void gdn_chunk_norm_silu_c32(
 
             let pending_first = argmax_logits(prefill_logits);
             if is_stop(pending_first) {
+                // Plain greedy (generate.rs) pushes the first token before the EOS
+                // check — so the stop token is always the last element of the output.
+                // Mirror that contract: emit [pending_first], generated_tokens = 1.
+                let text = decode_tokens(tokenizer, &[pending_first]);
                 return GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
+                    text,
+                    token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
-                    generated_tokens: 0,
+                    generated_tokens: 1,
                 };
             }
 
@@ -8975,7 +8979,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
-                    if is_stop(next) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                    // Plain greedy pushes the terminating stop token before breaking.
+                    // If next is a stop and there is still budget, emit it before halting.
+                    if is_stop(next) {
+                        if generated_ids.len() < gen_cfg.max_new_tokens {
+                            generated_ids.push(next);
+                        }
+                        break;
+                    }
+                    if generated_ids.len() >= gen_cfg.max_new_tokens {
                         break;
                     }
                     pending_token = next;
@@ -8991,7 +9003,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
-                    if is_stop(next) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                    // Plain greedy pushes the terminating stop token before breaking.
+                    // If next is a stop and there is still budget, emit it before halting.
+                    if is_stop(next) {
+                        if generated_ids.len() < gen_cfg.max_new_tokens {
+                            generated_ids.push(next);
+                        }
+                        break;
+                    }
+                    if generated_ids.len() >= gen_cfg.max_new_tokens {
                         break;
                     }
                     pending_token = next;
@@ -9039,10 +9059,19 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.kv_cache.seq_len = pos + 1;
                     generated_ids.push(pending_token);
                     metrics.fallback_tokens += 1;
-                    pending_token = argmax_logits(&first_draft_logits);
-                    if is_stop(pending_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                    let next = argmax_logits(&first_draft_logits);
+                    // Plain greedy pushes the terminating stop token before breaking.
+                    // If next is a stop and there is still budget, emit it before halting.
+                    if is_stop(next) {
+                        if generated_ids.len() < gen_cfg.max_new_tokens {
+                            generated_ids.push(next);
+                        }
                         break;
                     }
+                    if generated_ids.len() >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                    pending_token = next;
                     continue 'round;
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
@@ -9081,7 +9110,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     let t_rb = std::time::Instant::now();
                     let _ = self.rollback_speculative_state_to(pos + accepted_drafts + 1);
                     metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
-                    if is_stop(next_token) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                    // Plain greedy pushes the terminating stop token before breaking.
+                    // If next_token is a stop and there is still budget, emit it before halting.
+                    if is_stop(next_token) {
+                        if generated_ids.len() < gen_cfg.max_new_tokens {
+                            generated_ids.push(next_token);
+                        }
+                        break;
+                    }
+                    if generated_ids.len() >= gen_cfg.max_new_tokens {
                         break;
                     }
                     pending_token = next_token;
@@ -9098,7 +9135,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     .min(verify_out.logits.len().saturating_sub(1));
                 let next_pending = argmax_logits(&verify_out.logits[last_idx]);
                 metrics.rounds += 1;
-                if is_stop(next_pending) || generated_ids.len() >= gen_cfg.max_new_tokens {
+                // Plain greedy pushes the terminating stop token before breaking.
+                // If next_pending is a stop and there is still budget, emit it before halting.
+                if is_stop(next_pending) {
+                    if generated_ids.len() < gen_cfg.max_new_tokens {
+                        generated_ids.push(next_pending);
+                    }
+                    break;
+                }
+                if generated_ids.len() >= gen_cfg.max_new_tokens {
                     break;
                 }
                 pending_token = next_pending;
@@ -20258,6 +20303,513 @@ mod mtp_greedy_round_tests {
     }
 
     /// Minimal deterministic LCG — no external crate needed.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Differential unit tests for `generate_greedy_self_spec` EOS-emission contract.
+//
+// Strategy: mirror `mtp_greedy_round_tests` — write an independent plain-greedy
+// oracle (push token, then check is_stop, bounded by max_new_tokens) and a pure
+// simulation of the self-spec round logic. The simulation encodes exactly the
+// post-fix decision logic for each termination path WITHOUT re-deriving it from
+// the buggy pre-fix code, so it acts as an independent reference.
+//
+// EOS-faithful contract (matches generate.rs):
+//   A:  prefill argmax is EOS → emit [EOS], generated_tokens = 1.
+//   R:  rejection: target replacement is stop → emit [pending, stop] before halting.
+//   FA: full-accept: next_pending is stop → emit [next_pending] before halting.
+//   FB: fallback (no-checkpoint, checkpoint-failure, verify-failure): target's next
+//       is stop → emit that stop before halting (budget-clipped).
+//
+// These tests run on every platform (no cfg gate — no GPU required).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod self_spec_eos_tests {
+    const EOS: u32 = 2;
+
+    fn is_stop(id: u32) -> bool {
+        id == EOS
+    }
+
+    fn argmax(logits: &[f32]) -> u32 {
+        logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Plain-greedy oracle: push token then check stop, bounded by max_len.
+    // Matches generate.rs invariant exactly — stop token is always in output.
+    // Independent reference: do NOT derive from self-spec logic.
+    // -----------------------------------------------------------------------
+    fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        for row in logit_rows.iter().take(max_len) {
+            let token = argmax(row);
+            out.push(token);
+            if is_stop(token) {
+                break;
+            }
+        }
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-spec simulation: encodes the fixed per-round decision logic of
+    // `generate_greedy_self_spec` as pure token operations, no GPU.
+    //
+    // Alignment with the real loop and the oracle:
+    //   logit_rows[i] = target's logit vector for position i.
+    //   argmax(logit_rows[0])   = prefill argmax (first pending).
+    //   argmax(logit_rows[i+1]) = target's prediction at pos i+1, used both as
+    //                             verify target and as next_pending on full accept.
+    //
+    // `draft_seq[i]` = the draft proposal at round i.
+    //
+    // Each round:
+    //   - pending_token = logit_rows[pos] argmax
+    //   - verify: target agrees if draft_seq[round] == argmax(logit_rows[pos+1])
+    //   - on accept: push pending + all agreeing drafts, next_pending = logit_rows[last+1]
+    //   - on reject: push pending, target's replacement = argmax(logit_rows[pos+1])
+    //   - fallback paths behave like the plain-greedy single-step decode
+    //
+    // Termination for all paths: push the stop token if budget allows, then break.
+    // -----------------------------------------------------------------------
+    fn simulate_self_spec(
+        logit_rows: &[Vec<f32>],
+        // draft_seq[i]: what the draft proposes at round i
+        draft_seq: &[u32],
+        // simulate_fallback: if true, bypass the normal verify path and use the
+        // fallback (single-step decode) path, so we can exercise cases FB.
+        simulate_fallback: bool,
+        max_len: usize,
+    ) -> Vec<u32> {
+        assert!(!logit_rows.is_empty(), "need at least one logit row");
+        let mut out: Vec<u32> = Vec::new();
+        let mut pos = 0usize; // logit_rows index for current pending
+
+        // Case A: prefill argmax is stop → emit it (budget-clipped), return.
+        let pending_first = argmax(&logit_rows[pos]);
+        if is_stop(pending_first) {
+            if max_len > 0 {
+                out.push(pending_first);
+            }
+            return out;
+        }
+
+        let mut pending_token = pending_first;
+        let mut round = 0usize;
+
+        'round: loop {
+            if out.len() >= max_len {
+                break;
+            }
+
+            if simulate_fallback || pos + 1 >= logit_rows.len() || round >= draft_seq.len() {
+                // Fallback path (single-step decode): push pending, check next.
+                // Mirrors no-checkpoint / checkpoint-failure / verify-failure sites.
+                out.push(pending_token);
+                if out.len() >= max_len || pos + 1 >= logit_rows.len() {
+                    break;
+                }
+                let next = argmax(&logit_rows[pos + 1]);
+                // Push the terminating stop token before halting (EOS-faithful fix).
+                if is_stop(next) {
+                    if out.len() < max_len {
+                        out.push(next);
+                    }
+                    break;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                pending_token = next;
+                pos += 1;
+                round += 1;
+                continue 'round;
+            }
+
+            let draft = draft_seq[round];
+            round += 1;
+
+            // Verify: target agrees with draft if argmax(logit_rows[pos+1]) == draft.
+            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let accepted = target_at_pos1 == draft;
+
+            if accepted {
+                // pending_token is always pushed first.
+                out.push(pending_token);
+                if is_stop(draft) || out.len() >= max_len {
+                    // accept+draft-is-stop: push draft (already correct in original).
+                    if !is_stop(draft) {
+                        // cap hit — don't push draft
+                    } else if out.len() < max_len {
+                        out.push(draft);
+                    }
+                    break;
+                }
+                out.push(draft);
+                if out.len() >= max_len {
+                    break;
+                }
+                // next_pending = target prediction after the last accepted token.
+                let next_pending_pos = pos + 2;
+                if next_pending_pos >= logit_rows.len() {
+                    break;
+                }
+                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                // Full-accept EOS fix: push before halting.
+                if is_stop(next_pending) {
+                    if out.len() < max_len {
+                        out.push(next_pending);
+                    }
+                    break;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                pending_token = next_pending;
+                pos += 2;
+            } else {
+                // Rejection: push pending, target's replacement is argmax(logit_rows[pos+1]).
+                out.push(pending_token);
+                let replacement = target_at_pos1;
+                // Rejection-EOS fix: push before halting.
+                if is_stop(replacement) {
+                    if out.len() < max_len {
+                        out.push(replacement);
+                    }
+                    break;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                pending_token = replacement;
+                pos += 1;
+            }
+        }
+        out
+    }
+
+    fn make_logit(winner: u32) -> Vec<f32> {
+        let size = 100usize;
+        let mut v = vec![0.0f32; size];
+        if (winner as usize) < size {
+            v[winner as usize] = 10.0;
+        }
+        v
+    }
+
+    // -----------------------------------------------------------------------
+    // Case A: prefill argmax is stop → oracle emits [EOS]; sim must also emit [EOS].
+    // Pre-fix: self-spec returned token_ids: vec![], generated_tokens: 0 — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_case_a_prefill_eos() {
+        let logit_rows = vec![make_logit(EOS), make_logit(10)];
+        let draft_seq = vec![10u32];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![EOS], "oracle sanity: prefill EOS yields [EOS]");
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(sim, vec![EOS], "case A: sim must emit [EOS] not []");
+        assert_eq!(oracle, sim, "case A: oracle == sim required");
+    }
+
+    // -----------------------------------------------------------------------
+    // Case A with max_len = 0: no budget → emit nothing (mirrors MTP max_new_tokens=0 guard).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_case_a_prefill_eos_zero_budget() {
+        let logit_rows = vec![make_logit(EOS), make_logit(10)];
+        let draft_seq = vec![10u32];
+        let oracle = plain_greedy_oracle(&logit_rows, 0);
+        assert_eq!(oracle, Vec::<u32>::new(), "oracle: zero budget → empty");
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, 0);
+        assert_eq!(sim, Vec::<u32>::new(), "case A zero budget: must be empty");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rejection path: target replacement is stop → oracle/sim both emit [pending, EOS].
+    // Pre-fix: self-spec broke WITHOUT pushing next_token — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_rejection_eos() {
+        // pos0→10 (pending), pos1→EOS (target; draft proposes 99 = wrong).
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let draft_seq = vec![99u32];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![10, EOS], "rejection-EOS oracle: [10, EOS]");
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(sim, vec![10, EOS], "rejection-EOS: sim must match oracle");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rejection path: budget clips the stop token (max_len = 1).
+    // Oracle stops at 1 token; sim must also stop at 1 (do not exceed budget).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_rejection_eos_budget_clips_stop() {
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let draft_seq = vec![99u32];
+        let oracle = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(oracle, vec![10], "budget-1: oracle emits only pending");
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, 1);
+        assert_eq!(sim, vec![10], "budget-1: sim must not emit stop beyond cap");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-accept path: next_pending is stop → oracle/sim both emit [..., EOS].
+    // Pre-fix: self-spec broke WITHOUT pushing next_pending — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_full_accept_next_pending_eos() {
+        // pos0→10 (pending), pos1→20 (draft=20 accepted), pos2→EOS (next_pending).
+        let logit_rows = vec![make_logit(10), make_logit(20), make_logit(EOS)];
+        let draft_seq = vec![20u32];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(
+            oracle,
+            vec![10, 20, EOS],
+            "full-accept-EOS oracle: [10, 20, EOS]"
+        );
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(
+            sim,
+            vec![10, 20, EOS],
+            "full-accept-EOS: sim must match oracle"
+        );
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-accept path: budget clips EOS (max_len = 2).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_full_accept_next_pending_eos_budget_clips() {
+        let logit_rows = vec![make_logit(10), make_logit(20), make_logit(EOS)];
+        let draft_seq = vec![20u32];
+        let oracle = plain_greedy_oracle(&logit_rows, 2);
+        assert_eq!(oracle, vec![10, 20], "budget-2: oracle stops before EOS");
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, 2);
+        assert_eq!(sim, vec![10, 20], "budget-2: sim must not exceed cap");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback path (case FB): next token from single-step decode is stop.
+    // Pre-fix: all three fallback sites broke WITHOUT pushing next — WRONG.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_fallback_path_eos() {
+        // pos0→10 (pending), pos1→EOS (single-step decode result).
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let draft_seq = vec![]; // unused in fallback mode
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![10, EOS], "fallback-EOS oracle: [10, EOS]");
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, true, max_len);
+        assert_eq!(sim, vec![10, EOS], "fallback-EOS: sim must match oracle");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback path: budget clips the stop token (max_len = 1).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_fallback_path_eos_budget_clips() {
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let draft_seq = vec![];
+        let oracle = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(oracle, vec![10]);
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, true, 1);
+        assert_eq!(sim, vec![10], "fallback-EOS budget-1: must not exceed cap");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Accept+draft-is-stop: already correct in original — verify it stays correct.
+    // Oracle: [pending, EOS].  Sim: [pending, EOS].
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_accept_draft_is_stop_already_correct() {
+        // pos0→10 (pending), pos1→EOS (draft=EOS accepted by target).
+        let logit_rows = vec![make_logit(10), make_logit(EOS), make_logit(30)];
+        let draft_seq = vec![EOS];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![10, EOS], "accept+draft-stop oracle: [10, EOS]");
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(sim, vec![10, EOS], "accept+draft-stop: already correct");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // No-stop normal sequence: all accepted, no EOS.  Oracle and sim agree.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_all_accepted_no_stop() {
+        let logit_rows = vec![
+            make_logit(10),
+            make_logit(20),
+            make_logit(30),
+            make_logit(40),
+        ];
+        let draft_seq = vec![20u32, 30, 40];
+        let max_len = 4;
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(
+            oracle, sim,
+            "all-accept non-stop: oracle={oracle:?} sim={sim:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mixed: some accepted, some rejected, EOS at the end via rejection path.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_mixed_accept_reject_then_rejection_eos() {
+        // target: 10 → 20 → 30 → EOS
+        let logit_rows = vec![
+            make_logit(10),
+            make_logit(20),
+            make_logit(30),
+            make_logit(EOS),
+        ];
+        // draft: accept 20 at round0, reject 99 at round1 (target says 30).
+        // Then target says EOS at pos2 → reject-EOS path.
+        let draft_seq = vec![20u32, 99];
+        let max_len = 10;
+
+        let oracle = plain_greedy_oracle(&logit_rows, max_len);
+        assert_eq!(oracle, vec![10, 20, 30, EOS]);
+
+        let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
+        assert_eq!(sim, vec![10, 20, 30, EOS], "mixed reject-EOS: got {sim:?}");
+        assert_eq!(oracle, sim);
+    }
+
+    // -----------------------------------------------------------------------
+    // Seeded randomised sweep: oracle vs sim must agree across all EOS positions.
+    // Covers all termination paths probabilistically.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_randomised_sweep() {
+        let mut rng = Lcg::new(0xfeedface_deadbeef);
+        let vocab_size = 8usize; // EOS=2
+        let trials = 400;
+
+        for trial in 0..trials {
+            let seq_len = (rng.next_u64() % 6 + 2) as usize;
+            let max_len = 20;
+            let fallback = rng.next_u64() % 4 == 0; // 25% fallback
+
+            let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
+                .map(|_| {
+                    let winner = (rng.next_u64() % vocab_size as u64) as usize;
+                    let mut row = vec![0.0f32; vocab_size];
+                    row[winner] = 10.0;
+                    row
+                })
+                .collect();
+            let draft_seq: Vec<u32> = (0..seq_len)
+                .map(|_| (rng.next_u64() % vocab_size as u64) as u32)
+                .collect();
+
+            let oracle = plain_greedy_oracle(&logit_rows, max_len);
+            let sim = simulate_self_spec(&logit_rows, &draft_seq, fallback, max_len);
+
+            assert_eq!(
+                oracle,
+                sim,
+                "trial {trial} (fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
+                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                draft_seq,
+                oracle,
+                sim,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Seeded randomised sweep with small caps: stresses the budget-clip paths.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_randomised_sweep_small_cap() {
+        let mut rng = Lcg::new(0xabcd_1234_5678_ef01);
+        let vocab_size = 6usize; // EOS=2, frequent stops
+        let trials = 400;
+
+        for trial in 0..trials {
+            let seq_len = (rng.next_u64() % 6 + 2) as usize;
+            let max_len = (rng.next_u64() % 4 + 1) as usize; // 1..=4
+            let fallback = rng.next_u64() % 4 == 0;
+
+            let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
+                .map(|_| {
+                    let winner = (rng.next_u64() % vocab_size as u64) as usize;
+                    let mut row = vec![0.0f32; vocab_size];
+                    row[winner] = 10.0;
+                    row
+                })
+                .collect();
+            let draft_seq: Vec<u32> = (0..seq_len)
+                .map(|_| (rng.next_u64() % vocab_size as u64) as u32)
+                .collect();
+
+            let oracle = plain_greedy_oracle(&logit_rows, max_len);
+            let sim = simulate_self_spec(&logit_rows, &draft_seq, fallback, max_len);
+
+            assert!(
+                sim.len() <= max_len,
+                "trial {trial}: sim exceeded cap {max_len}: {sim:?}"
+            );
+            assert_eq!(
+                oracle,
+                sim,
+                "trial {trial} (max_len={max_len}, fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
+                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                draft_seq,
+                oracle,
+                sim,
+            );
+        }
+    }
+
+    /// Minimal deterministic LCG — shared with `mtp_greedy_round_tests`.
     struct Lcg(u64);
     impl Lcg {
         fn new(seed: u64) -> Self {
