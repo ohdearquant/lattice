@@ -1653,9 +1653,11 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         let make_warmed_cache = || {
             let mut cache = FlatKVCache::new(cache_cfg.clone());
             for layer in 0..FWD_LAYERS {
-                cache.prefill_layer(layer, &warm_kv_seq, &warm_kv_seq, FWD_WARM_KV);
+                cache
+                    .prefill_layer(layer, &warm_kv_seq, &warm_kv_seq, FWD_WARM_KV)
+                    .unwrap();
             }
-            cache.advance_by(FWD_WARM_KV);
+            cache.advance_by(FWD_WARM_KV).unwrap();
             cache
         };
 
@@ -1791,9 +1793,11 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             let make_ctx_cache = || {
                 let mut cache = FlatKVCache::new(cache_cfg_ctx.clone());
                 for layer in 0..FWD_LAYERS {
-                    cache.prefill_layer(layer, &warm_kv_seq_ctx, &warm_kv_seq_ctx, warm_kv);
+                    cache
+                        .prefill_layer(layer, &warm_kv_seq_ctx, &warm_kv_seq_ctx, warm_kv)
+                        .unwrap();
                 }
-                cache.advance_by(warm_kv);
+                cache.advance_by(warm_kv).unwrap();
                 cache
             };
 
