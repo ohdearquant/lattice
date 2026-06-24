@@ -88,9 +88,15 @@ jobs:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
           key: hf-qwen35-0.8b-v1
 
-      # Step 1: install reference framework (HF transformers + torch CPU)
+      # Step 1: install reference framework (HF transformers + torch CPU).
+      # Pinned to the known-green reference set — the exact versions that
+      # produced the current passing parity baseline (extracted from a green
+      # `e2e parity` run). An unpinned `pip install` lets a new transformers
+      # release silently change greedy-generation behavior and flip the parity
+      # verdict on borderline prompts (issue #236). To bump: change a pin, let
+      # this gate re-run, and re-baseline the committed goldens if it moves.
       - name: Install Python deps
-        run: pip install torch transformers tokenizers huggingface_hub
+        run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
 
       # Step 2: download model if not cached
       - name: Download Qwen3.5-0.8B weights
