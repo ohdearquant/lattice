@@ -154,8 +154,11 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
 ///
 /// Delegates to `crate::sampling::xorshift64_next` (shifts 13/7/17, full period
 /// over nonzero state) and `crate::sampling::uniform_f32_from_u64` (top-24-bit
-/// conversion, provably strictly < 1.0). Both CPU sampling paths now share these
-/// primitives, producing identical seeded token streams from the same seed.
+/// conversion, provably strictly < 1.0). Both CPU sampling paths now share this
+/// canonical RNG primitive, so a fixed seed yields the same uniform draw stream.
+/// This does NOT guarantee identical token streams: the two paths still diverge
+/// below the RNG layer (top-k tie-break and the candidate-exhaustion fallback
+/// pick in opposite directions), so equal draws can still select different tokens.
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
     let x = crate::sampling::xorshift64_next(state);
     crate::sampling::uniform_f32_from_u64(x)
