@@ -410,7 +410,7 @@ pub(crate) fn temperature_degenerate(temperature: f32) -> bool {
 /// or non-positive value, is treated as "no penalty" so an invalid config can
 /// never flip a logit's sign or produce an infinity.
 #[inline(always)]
-fn penalized_logit(logit: f32, penalty: f32) -> f32 {
+pub(crate) fn penalized_logit(logit: f32, penalty: f32) -> f32 {
     if penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0 {
         return logit;
     }
