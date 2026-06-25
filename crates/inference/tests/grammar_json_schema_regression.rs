@@ -91,3 +91,47 @@ fn enum_helper_does_not_clobber_user_defs_rule() {
         "a must reject a quoted string (still the integer def, not the enum)"
     );
 }
+
+// Finding #4 (reverse $defs sub-case, raised by codex re-review): when an enum
+// property compiles BEFORE a `$ref` to a def of a colliding name, the `$ref`
+// must resolve to the DEF, not alias to the enum helper. Here `a` (enum, first)
+// would claim `str_enum_0`; `b` then references a def named `str_enum_0` that is
+// an integer. `b` must stay integer-constrained.
+#[test]
+fn enum_then_ref_does_not_alias_to_enum_helper() {
+    let g = compile_json_schema(&serde_json::json!({
+        "$defs": {"str_enum_0": {"type":"integer"}},
+        "type":"object",
+        "properties":{
+            "a":{"type":"string","enum":["0"]},
+            "b":{"$ref":"#/$defs/str_enum_0"}
+        },
+        "required":["a","b"]
+    }))
+    .unwrap();
+    assert!(
+        full_accept(&g, br#"{"a":"0","b":7}"#),
+        "b must resolve to the integer def, not alias to a's enum helper"
+    );
+    assert!(
+        !full_accept(&g, br#"{"a":"0","b":"0"}"#),
+        "b must reject a quoted string (it is the integer def, not the enum)"
+    );
+}
+
+// A user `$defs` rule must not collide with a builtin rule name either: a def
+// named `ws` (whitespace builtin) must keep its own integer constraint.
+#[test]
+fn user_defs_does_not_clobber_builtin_rule() {
+    let g = compile_json_schema(&serde_json::json!({
+        "$defs": {"ws": {"type":"integer"}},
+        "type":"object",
+        "properties":{"a":{"$ref":"#/$defs/ws"}},
+        "required":["a"]
+    }))
+    .unwrap();
+    assert!(
+        full_accept(&g, br#"{"a":7}"#),
+        "def named 'ws' must stay an integer, not alias the whitespace builtin"
+    );
+}

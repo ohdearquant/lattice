@@ -218,13 +218,20 @@ impl<'a> CompileCtx<'a> {
             .copied()
             .ok_or_else(|| SchemaError(format!("$ref not found: {ref_str}")))?;
 
-        // If we already have a rule for this name, emit a NonTerminal.
-        if let Some(id) = self.builder.rule_id(name) {
+        // Namespace `$defs` rules under a `def_` prefix so they share the rule
+        // table with neither built-in rules (`ws`, `json_*`) nor generated
+        // helpers (`str_enum_*`). A user definition named `ws` or `str_enum_0`
+        // thus becomes `def_ws` / `def_str_enum_0` and can neither clobber nor
+        // be aliased to those rules in any compile order (issue #310 #4).
+        let rule_name = format!("def_{name}");
+
+        // If we already have a rule for this def, emit a NonTerminal.
+        if let Some(id) = self.builder.rule_id(&rule_name) {
             return Ok(vec![vec![Symbol::NonTerminal(id)]]);
         }
 
         // Reserve the rule (handles recursive references).
-        let id = self.builder.reserve(name);
+        let id = self.builder.reserve(&rule_name);
         // Compile the target and set alts.
         let alts = self.compile_schema(target, &[])?;
         self.builder.set_alts(id, alts);
@@ -472,17 +479,12 @@ impl<'a> CompileCtx<'a> {
                 //          enum_choices → alt0 | alt1 | ...
                 //
                 // Each enum occurrence gets a UNIQUE rule name via a monotonic
-                // counter to prevent collisions when distinct enum sets would
-                // otherwise produce the same join("_") name (issue #310 #4).
-                // Bump the counter past any name already taken (e.g. a user
-                // `$defs` rule literally named `str_enum_3`) so the enum helper
-                // never overwrites a pre-existing rule (#310 #4 $defs sub-case).
-                let mut choices_name = format!("str_enum_{}", self.enum_counter);
+                // counter, so distinct enum sets never share alternatives
+                // (issue #310 #4). User `$defs` rules live in a separate `def_*`
+                // namespace (see `compile_ref`), so a user-named definition can
+                // never collide with these `str_enum_*` helpers in either order.
+                let choices_name = format!("str_enum_{}", self.enum_counter);
                 self.enum_counter += 1;
-                while self.builder.rule_id(&choices_name).is_some() {
-                    choices_name = format!("str_enum_{}", self.enum_counter);
-                    self.enum_counter += 1;
-                }
                 let choices_id = self.builder.reserve(&choices_name);
                 let choice_alts: Vec<Alt> = str_values
                     .iter()
