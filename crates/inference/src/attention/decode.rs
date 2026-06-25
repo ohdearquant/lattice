@@ -362,7 +362,17 @@ unsafe fn softmax_decode_neon(
         let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
         let mut max_val = vmaxvq_f32(vmax);
         for i in (chunks * 16)..kv_seq_len {
-            max_val = max_val.max(*ptr.add(i));
+            let s = *ptr.add(i);
+            // `f32::max` returns the finite operand when the other is NaN, so a
+            // tail NaN would be silently dropped and leave `max_val` finite. The
+            // NEON chunk reduction propagates NaN (ARM `FMAX`), so we must mirror
+            // that here to drive the non-finite row into the fail-closed branch
+            // below, matching the scalar `softmax_decode_scores` path.
+            if s.is_nan() {
+                max_val = f32::NAN;
+                break;
+            }
+            max_val = max_val.max(s);
         }
 
         // Fail closed on a non-finite row max (e.g. a `+inf` score). The fast-exp
@@ -800,6 +810,37 @@ mod tests {
         assert!(
             out.iter().all(|&x| x == 0.0),
             "expected fail-closed zero row, got {out:?}"
+        );
+    }
+
+    /// A `NaN` score in the scalar tail (`kv_seq_len % 16 != 0`) must fail closed
+    /// like the scalar path. Rust `f32::max` ignores NaN, so the NEON tail max
+    /// scan must detect it explicitly; otherwise the finite chunk lanes normalize
+    /// against a finite max and diverge from `softmax_decode_scores`. Driven at
+    /// the softmax level (the NaN row is not reachable from a single q·k product).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_decode_softmax_neon_nan_tail_fails_closed() {
+        let kv_seq_len = 17usize; // one 16-wide chunk + a 1-lane scalar tail
+        let stride = kv_seq_len;
+        let mut row_neon = vec![0.5f32; kv_seq_len];
+        row_neon[16] = f32::NAN; // NaN in the scalar tail, finite chunk
+        let mut row_scalar = row_neon.clone();
+        unsafe {
+            softmax_decode_neon(&mut row_neon, 1, kv_seq_len, stride);
+        }
+        softmax_decode_scores(&mut row_scalar, 1, kv_seq_len, stride);
+        assert!(
+            row_neon.iter().all(|x| x.is_finite()),
+            "neon row non-finite: {row_neon:?}"
+        );
+        assert!(
+            row_neon.iter().all(|&x| x == 0.0),
+            "neon tail-NaN row should fail closed, got {row_neon:?}"
+        );
+        assert!(
+            row_scalar.iter().all(|&x| x == 0.0),
+            "scalar tail-NaN row should fail closed, got {row_scalar:?}"
         );
     }
 
