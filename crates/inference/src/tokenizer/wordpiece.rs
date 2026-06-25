@@ -378,8 +378,21 @@ impl WordPieceTokenizer {
         let mut continuation_builder = PlainTrieBuilder::new();
         for (token, &id) in &vocab {
             if let Some(stripped) = token.strip_prefix("##") {
+                // A "##"-only vocab entry strips to "" — see the empty-subword note below.
+                if stripped.is_empty() {
+                    continue;
+                }
                 continuation_builder.insert(stripped, id as i32);
             } else {
+                // An empty subword sets the trie *root* value, so longest_match_chars
+                // returns a zero-length match (idx == start) at every position and
+                // wordpiece_tokenize_word_into's `start = end` never advances — a
+                // non-advancing-match hang, the same class the added-token retain
+                // above guards. A raw "" vocab key here (and a "##"-only key above)
+                // both yield an empty subword; an empty subword is never a real token.
+                if token.is_empty() {
+                    continue;
+                }
                 whole_builder.insert(token, id as i32);
             }
         }
@@ -559,12 +572,19 @@ impl WordPieceTokenizer {
                 &self.inner.continuation_trie
             };
 
-            if let Some((id, end)) = trie.longest_match_chars(&chars, start) {
-                out.push(id);
-                start = end;
-            } else {
-                out.push(self.inner.unk_id);
-                start += 1;
+            match trie.longest_match_chars(&chars, start) {
+                // `end > start` guards against a zero-length match wedging the loop:
+                // an empty subword in the trie (dropped at construction, guarded here
+                // too) yields a root match at idx == start, and `start = end` would
+                // never advance. Treat any non-advancing match as no match.
+                Some((id, end)) if end > start => {
+                    out.push(id);
+                    start = end;
+                }
+                _ => {
+                    out.push(self.inner.unk_id);
+                    start += 1;
+                }
             }
         }
     }
@@ -1136,6 +1156,55 @@ mod tests {
             ),
             Err(_) => {
                 panic!("tokenize() hung on a zero-length added token (infinite-loop regression)")
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_content_vocab_token_does_not_hang() {
+        // Regression (companion to the added-token guard): a malformed
+        // tokenizer.json `model.vocab` can carry an empty key (`{"": id}`) or a
+        // "##"-only key (which strip_prefix("##") reduces to ""). Either inserts
+        // the empty string into a trie, which sets the trie *root* value;
+        // longest_match_chars then returns a zero-length match (idx == start) at
+        // every position and wordpiece_tokenize_word_into's `start = end` never
+        // advances — an infinite loop with unbounded output. Construction must drop
+        // empty subwords and the loop must reject non-advancing matches. Run on a
+        // worker thread with a 5s timeout so a re-introduced hang fails fast.
+        let mut vocab = HashMap::new();
+        for (s, i) in [
+            ("[PAD]", 0u32),
+            ("[UNK]", 1),
+            ("[CLS]", 2),
+            ("[SEP]", 3),
+            ("[MASK]", 4),
+            ("a", 5),
+            ("b", 6),
+            ("c", 7),
+            ("", 8),   // raw empty vocab key
+            ("##", 9), // "##"-only key strips to ""
+        ] {
+            vocab.insert(s.to_string(), i);
+        }
+        let tokenizer = WordPieceTokenizer::from_vocab_map_with_added(
+            vocab,
+            HashMap::new(),
+            DEFAULT_WORDPIECE_CACHE_CAPACITY,
+            DEFAULT_MAX_SEQ_LEN,
+        )
+        .expect("construct wordpiece tokenizer with empty vocab token");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(tokenizer.tokenize("abc").real_length);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(len) => assert!(
+                len < 1000,
+                "empty vocab token produced runaway output ({len}); empty subwords must be dropped"
+            ),
+            Err(_) => {
+                panic!("tokenize() hung on a zero-length vocab token (infinite-loop regression)")
             }
         }
     }
