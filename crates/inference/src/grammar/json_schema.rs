@@ -474,8 +474,15 @@ impl<'a> CompileCtx<'a> {
                 // Each enum occurrence gets a UNIQUE rule name via a monotonic
                 // counter to prevent collisions when distinct enum sets would
                 // otherwise produce the same join("_") name (issue #310 #4).
-                let choices_name = format!("str_enum_{}", self.enum_counter);
+                // Bump the counter past any name already taken (e.g. a user
+                // `$defs` rule literally named `str_enum_3`) so the enum helper
+                // never overwrites a pre-existing rule (#310 #4 $defs sub-case).
+                let mut choices_name = format!("str_enum_{}", self.enum_counter);
                 self.enum_counter += 1;
+                while self.builder.rule_id(&choices_name).is_some() {
+                    choices_name = format!("str_enum_{}", self.enum_counter);
+                    self.enum_counter += 1;
+                }
                 let choices_id = self.builder.reserve(&choices_name);
                 let choice_alts: Vec<Alt> = str_values
                     .iter()

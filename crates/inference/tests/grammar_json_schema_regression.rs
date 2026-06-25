@@ -64,3 +64,30 @@ fn enum_helper_names_do_not_collide() {
         "x=c_d, y=ab_c must be accepted"
     );
 }
+
+// Finding #4 ($defs sub-case, raised by codex review): a generated
+// `str_enum_N` helper rule must not overwrite a user `$defs` rule that
+// happens to share the same name. Here `a` references a def literally named
+// `str_enum_0` (an integer), and `b`'s enum helper would otherwise reserve
+// `str_enum_0` and clobber the def's alternatives.
+#[test]
+fn enum_helper_does_not_clobber_user_defs_rule() {
+    let g = compile_json_schema(&serde_json::json!({
+        "$defs": {"str_enum_0": {"type":"integer"}},
+        "type":"object",
+        "properties":{
+            "a":{"$ref":"#/$defs/str_enum_0"},
+            "b":{"type":"string","enum":["0"]}
+        },
+        "required":["a","b"]
+    }))
+    .unwrap();
+    assert!(
+        full_accept(&g, br#"{"a":7,"b":"0"}"#),
+        "a must stay integer-constrained (def rule not clobbered by enum helper)"
+    );
+    assert!(
+        !full_accept(&g, br#"{"a":"0","b":"0"}"#),
+        "a must reject a quoted string (still the integer def, not the enum)"
+    );
+}
