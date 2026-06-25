@@ -544,6 +544,50 @@ impl<'a> MtpVerifier<'a> {
             ));
         }
 
+        // Guard structural scalars: zero values cause divide-by-zero or OOB on
+        // first forward_one; partial_rotary_factor outside [0,1] produces a
+        // rope_dim > head_dim which overreads the per-head slice in
+        // mtp_apply_partial_rope.
+        if config.hidden_size == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig hidden_size must be > 0".into(),
+            ));
+        }
+        if config.vocab_size == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig vocab_size must be > 0".into(),
+            ));
+        }
+        if config.head_dim == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig head_dim must be > 0".into(),
+            ));
+        }
+        if config.num_attention_heads == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig num_attention_heads must be > 0".into(),
+            ));
+        }
+        if config.num_key_value_heads == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig num_key_value_heads must be > 0".into(),
+            ));
+        }
+        if config.num_attention_heads % config.num_key_value_heads != 0 {
+            return Err(InferenceError::Inference(format!(
+                "MtpConfig num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            )));
+        }
+        if !config.partial_rotary_factor.is_finite()
+            || !(0.0..=1.0).contains(&config.partial_rotary_factor)
+        {
+            return Err(InferenceError::Inference(format!(
+                "MtpConfig partial_rotary_factor {} is not in [0.0, 1.0]",
+                config.partial_rotary_factor
+            )));
+        }
+
         let rope_dim = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
         // RopeTable built with head_dim=rope_dim so half_dim = rope_dim/2
         let rope = crate::rope::RopeTable::new(rope_dim, max_seq_len.max(1), config.rope_theta);
@@ -606,6 +650,18 @@ impl<'a> MtpVerifier<'a> {
             return Err(InferenceError::InvalidInput(format!(
                 "MTP KV cache is full ({} tokens); call rollback_cache_to or reset_cache before forward_one",
                 self.cache.seq_len()
+            )));
+        }
+
+        // Guard RoPE table bounds: `position` is an independent parameter and
+        // can exceed `max_seq_len` even when the cache is not full.
+        // mtp_apply_partial_rope indexes at `position * half_dim + i`; if
+        // position >= rope.max_positions() that index is past the end of the
+        // precomputed table and panics.  Fail closed instead.
+        if position >= self.rope.max_positions() {
+            return Err(InferenceError::InvalidInput(format!(
+                "MTP forward_one position {position} out of range for RoPE table of {} positions",
+                self.rope.max_positions()
             )));
         }
 
@@ -3655,6 +3711,78 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidInput for full cache, got {other:?}"),
         }
+    }
+
+    /// forward_one returns Err (not a panic) when `position` equals max_seq_len even
+    /// though the KV cache is not yet full.  This guards the RoPE table OOB path in
+    /// mtp_apply_partial_rope (independent `position` param, distinct from the #290
+    /// is_full guard).
+    #[test]
+    fn mtp_verifier_forward_one_out_of_range_position_returns_err() {
+        let cfg = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&cfg);
+
+        let embed: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+
+        let h = cfg.hidden_size;
+        let max_seq = 4usize;
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        // Cache starts empty (seq_len == 0); pass position == max_seq so the
+        // cache is not full but the position is past the RoPE table.
+        let mut v = MtpVerifier::new(cfg, &weights, &embed, &lm_head, max_seq).unwrap();
+        assert_eq!(v.cache.seq_len(), 0, "cache must start empty");
+        assert!(!v.cache.is_full(), "cache must not be full yet");
+
+        match v.forward_one(1, max_seq, &prev_hidden) {
+            Ok(_) => panic!(
+                "forward_one with out-of-range position must return Err, not panic or succeed"
+            ),
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("position"),
+                    "error message should mention position, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput for out-of-range position, got {other:?}"),
+        }
+    }
+
+    /// MtpVerifier::new rejects a config whose partial_rotary_factor is outside [0,1].
+    /// Factor 2.0 would produce rope_dim = 2 * head_dim, making mtp_apply_partial_rope
+    /// index head_vec[head_dim] on a head_dim-length slice (Bug 2 / scalar validation).
+    #[test]
+    fn mtp_new_rejects_partial_rotary_factor_above_one() {
+        let mut cfg = tiny_mtp_config();
+        cfg.partial_rotary_factor = 2.0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        assert!(
+            MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8).is_err(),
+            "partial_rotary_factor > 1 must be rejected"
+        );
+    }
+
+    /// MtpVerifier::new rejects a config with num_key_value_heads == 0.
+    /// Zero kv heads causes divide-by-zero at `groups = num_q_heads / num_kv_heads`
+    /// on the first forward_one (Bug 2 / scalar validation).
+    #[test]
+    fn mtp_new_rejects_zero_kv_heads() {
+        let mut cfg = tiny_mtp_config();
+        cfg.num_key_value_heads = 0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        assert!(
+            MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8).is_err(),
+            "num_key_value_heads == 0 must be rejected"
+        );
     }
 
     #[test]
