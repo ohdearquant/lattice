@@ -695,7 +695,13 @@ pub(crate) fn json_object_to_vocab(
         let id = id_value.as_u64().ok_or_else(|| {
             InferenceError::Tokenizer(format!("invalid non-integer token id for {token:?}"))
         })?;
-        vocab.insert(token.clone(), id as u32);
+        // Token ids are stored as u32 everywhere downstream. A JSON value past u32::MAX
+        // would silently wrap under `as u32` (e.g. 2^32 -> 0) and alias an unrelated
+        // token; reject it instead of corrupting the vocabulary.
+        let id = u32::try_from(id).map_err(|_| {
+            InferenceError::Tokenizer(format!("token id {id} for {token:?} exceeds u32 range"))
+        })?;
+        vocab.insert(token.clone(), id);
     }
     Ok(vocab)
 }
@@ -713,6 +719,18 @@ pub(crate) fn vocab_txt_to_map(vocab_text: &str) -> HashMap<String, u32> {
 /// Convert a token->id vocabulary map into an ID-indexed token table.
 pub(crate) fn invert_vocab(vocab: &HashMap<String, u32>) -> Result<Vec<String>, InferenceError> {
     let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+    // `id_to_token` is a dense table sized to the largest id. Real tokenizer vocabs are
+    // dense (ids 0..len), so gaps are small and tolerated. A malformed tokenizer.json with
+    // a single sparse huge id (e.g. 4_294_967_295) would otherwise force a ~100 GB
+    // allocation here and abort the process at load. Cap the table at 16x the entry count:
+    // generous headroom for any real gap, a hard ceiling on the malformed-input blast radius.
+    let max_slots = vocab.len().saturating_mul(16);
+    if max_id >= max_slots {
+        return Err(InferenceError::Tokenizer(format!(
+            "vocabulary id {max_id} out of range for {} entries (sparse or malformed)",
+            vocab.len()
+        )));
+    }
     let mut id_to_token = vec![String::new(); max_id + 1];
     for (token, &id) in vocab {
         let slot = &mut id_to_token[id as usize];
@@ -740,10 +758,16 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
         let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
             continue;
         };
-        let Some(id) = object.get("id").and_then(JsonValue::as_u64) else {
+        // Skip an id past u32::MAX rather than wrap it under `as u32` into a colliding
+        // id (parse_added_tokens is lenient by contract and already skips malformed entries).
+        let Some(id) = object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
             continue;
         };
-        tokens.insert(content.to_string(), id as u32);
+        tokens.insert(content.to_string(), id);
     }
 
     tokens
@@ -830,7 +854,8 @@ fn find_template_processing(pp: &JsonValue) -> Option<&JsonValue> {
 
 fn resolve_template_token_id(special_tokens: Option<&JsonValue>, name: &str) -> Option<u32> {
     let ids = special_tokens?.get(name)?.get("ids")?.as_array()?;
-    ids.first()?.as_u64().map(|v| v as u32)
+    // An id past u32::MAX is treated as absent rather than wrapped into a wrong id.
+    ids.first()?.as_u64().and_then(|v| u32::try_from(v).ok())
 }
 
 /// **Unstable**: internal LRU cache used by tokenizer implementations;
@@ -1010,6 +1035,52 @@ mod tests {
         let inverse = invert_vocab(&vocab).unwrap();
         assert_eq!(inverse[0], "[PAD]");
         assert_eq!(inverse[3], "hello");
+    }
+
+    #[test]
+    fn test_vocab_id_overflowing_u32_rejected() {
+        // A token id past u32::MAX would wrap under `as u32` (2^32 -> 0) and alias another
+        // token. json_object_to_vocab must reject it at parse time, not corrupt the vocab.
+        let json = parse_json(r#"{"[PAD]": 4294967296}"#).unwrap();
+        assert!(
+            json_object_to_vocab(&json).is_err(),
+            "a vocab id past u32::MAX must be rejected, not wrapped"
+        );
+    }
+
+    #[test]
+    fn test_invert_vocab_rejects_disproportionate_sparse_id() {
+        // A vocabulary whose largest id vastly exceeds its entry count would force a giant
+        // dense-table allocation (a single id of 4_294_967_295 -> ~100 GB) and abort the
+        // process at load. invert_vocab caps the table at 16x the entry count and rejects.
+        // Here: 1 entry, id 50 -> 51 slots, well past the 16x cap.
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 50u32);
+        assert!(
+            invert_vocab(&vocab).is_err(),
+            "a single sparse id far past the entry count must be rejected"
+        );
+        // A normal gapped vocab (within the cap) still inverts fine — no regression.
+        let mut dense = HashMap::new();
+        dense.insert("a".to_string(), 0u32);
+        dense.insert("b".to_string(), 3u32);
+        assert!(invert_vocab(&dense).is_ok());
+    }
+
+    #[test]
+    fn test_added_token_id_overflowing_u32_skipped() {
+        // parse_added_tokens is lenient: an id past u32::MAX is skipped, not wrapped into a
+        // colliding id. A well-formed sibling entry is still parsed.
+        let root = parse_json(
+            r#"{"added_tokens":[{"content":"<bad>","id":4294967296},{"content":"<ok>","id":7}]}"#,
+        )
+        .unwrap();
+        let tokens = parse_added_tokens(&root);
+        assert_eq!(tokens.get("<ok>"), Some(&7));
+        assert!(
+            !tokens.contains_key("<bad>"),
+            "an added-token id past u32::MAX must be skipped, not wrapped to a colliding id"
+        );
     }
 
     #[test]
