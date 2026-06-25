@@ -41,7 +41,9 @@ pub(crate) fn sample_token(
         indices.truncate(k);
     }
 
-    let mut probs = build_softmax_probs(&adjusted, &indices);
+    let Some(mut probs) = build_softmax_probs(&adjusted, &indices) else {
+        return greedy_token(&adjusted);
+    };
 
     probs.sort_unstable_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -63,11 +65,7 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
     for &id in previous_ids {
         let idx = id as usize;
         if idx < vocab_size && seen.insert(id) {
-            if adjusted[idx] > 0.0 {
-                adjusted[idx] /= penalty;
-            } else {
-                adjusted[idx] *= penalty;
-            }
+            adjusted[idx] = crate::sampling::penalized_logit(adjusted[idx], penalty);
         }
     }
 }
@@ -76,25 +74,42 @@ fn greedy_token(adjusted: &[f32]) -> u32 {
     adjusted
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|(_, a), (_, b)| match (a.is_nan(), b.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        })
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
 }
 
-fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Vec<(usize, f32)> {
+fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize, f32)>> {
     let max_logit = indices
         .iter()
         .map(|&i| adjusted[i])
         .fold(f32::NEG_INFINITY, f32::max);
+    // A non-finite max (+INF token, or an empty/all-NaN/-INF index set whose
+    // fold stays NEG_INFINITY) makes every `(logit - max).exp()` NaN; the
+    // weighted draw then never selects a token and falls through to a wrong
+    // one. Signal "degenerate" so the caller returns the argmax instead.
+    if !max_logit.is_finite() {
+        return None;
+    }
     let mut probs: Vec<(usize, f32)> = indices
         .iter()
         .map(|&i| (i, (adjusted[i] - max_logit).exp()))
         .collect();
     let sum: f32 = probs.iter().map(|(_, p)| p).sum();
+    // A finite max does not guarantee a finite sum: a NaN logit in a non-max
+    // position (NaN never becomes `max_logit`) poisons the sum. Same fallback.
+    if !sum.is_finite() || sum <= 0.0 {
+        return None;
+    }
     for (_, p) in &mut probs {
         *p /= sum;
     }
-    probs
+    Some(probs)
 }
 
 fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
@@ -184,5 +199,64 @@ mod tests {
         let mut rng = 7u64;
         let token = sample_token(&logits, &cfg(0.7, 0), &[], &mut rng);
         assert!(token < 3, "valid temperature must return an in-range token");
+    }
+
+    #[test]
+    fn test_inf_logit_routes_to_argmax_not_nan_draw() {
+        // +INF logit with the full sampling path (non-degenerate temp, top_k=0)
+        // must return the +INF token (index 2), not an arbitrary NaN-softmax draw.
+        let logits = [0.0_f32, 1.0, f32::INFINITY];
+        let mut rng = 42u64;
+        let token = sample_token(&logits, &cfg(1.0, 0), &[], &mut rng);
+        assert_eq!(
+            token, 2,
+            "infinite-logit token must win via argmax fallback"
+        );
+    }
+
+    #[test]
+    fn test_nan_in_nonmax_position_routes_to_argmax() {
+        // Finite max but a NaN in a non-max slot poisons the softmax sum; the
+        // guard must fall back to the finite argmax (index 0), not the NaN slot.
+        let logits = [5.0_f32, f32::NAN, 1.0];
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg(1.0, 0), &[], &mut rng);
+        assert_eq!(
+            token, 0,
+            "finite argmax must win when a non-max logit is NaN"
+        );
+    }
+
+    #[test]
+    fn test_empty_logits_returns_zero_without_panic() {
+        let logits: [f32; 0] = [];
+        let mut rng = 1u64;
+        let token = sample_token(&logits, &cfg(1.0, 0), &[], &mut rng);
+        assert_eq!(token, 0, "empty logits must return 0, never panic");
+    }
+
+    #[test]
+    fn test_invalid_repetition_penalty_is_noop_not_signflip() {
+        // A negative penalty must NOT flip the sign of a seen positive logit.
+        // With penalty treated as no-op, the raw argmax (index 0) wins.
+        let logits = [5.0_f32, 1.0, 0.5];
+        let mut cfg_rp = cfg(0.0, 0); // temp 0 -> greedy, isolates the penalty effect
+        cfg_rp.repetition_penalty = -1.0;
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg_rp, &[0], &mut rng);
+        assert_eq!(
+            token, 0,
+            "invalid penalty must be a no-op, argmax stays index 0"
+        );
+    }
+
+    #[test]
+    fn test_nan_repetition_penalty_is_noop() {
+        let logits = [5.0_f32, 1.0, 0.5];
+        let mut cfg_rp = cfg(0.0, 0);
+        cfg_rp.repetition_penalty = f32::NAN;
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg_rp, &[0], &mut rng);
+        assert_eq!(token, 0, "NaN penalty must be a no-op");
     }
 }
