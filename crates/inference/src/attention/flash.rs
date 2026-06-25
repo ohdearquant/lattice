@@ -188,6 +188,8 @@ impl TiledAttentionBuffers {
         let d = config.head_dim.max(1);
         let seq = max_seq_len.max(1);
 
+        assert_tiled_scratch_no_overflow(br, bc, d, seq);
+
         resize_zeroed(&mut self.q_tile, br * d);
         resize_zeroed(&mut self.k_tile, bc * d);
         resize_zeroed(&mut self.v_tile, bc * d);
@@ -230,6 +232,75 @@ fn resize_zeroed(buffer: &mut Vec<f32>, len: usize) {
     if buffer.len() < len {
         buffer.resize(len, 0.0);
     }
+}
+
+/// Reject tile/sequence shape products that wrap `usize` before scratch allocation.
+///
+/// `TiledAttentionConfig::{tile_size_q, tile_size_kv, head_dim}` are public, caller-controlled
+/// fields, so an arbitrary tile size can wrap a scratch-length product (`tile_q * tile_kv`,
+/// `tile_kv * head_dim`, ...) to a small value. `resize_zeroed` would then allocate an undersized
+/// buffer that the core kernel later slices as if the unwrapped tile were present, panicking from
+/// an internal bound instead of rejecting the impossible config. This is the non-causal sibling of
+/// the `flash_causal.rs` tile-scratch overflow guard (#366). Release-active: the wrap is invisible
+/// to a debug-only check.
+#[inline]
+fn assert_tiled_scratch_no_overflow(br: usize, bc: usize, head_dim: usize, seq: usize) {
+    assert!(
+        br.checked_mul(bc).is_some(),
+        "tiled scratch overflow: tile_q * tile_kv"
+    );
+    assert!(
+        br.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: tile_q * head_dim"
+    );
+    assert!(
+        bc.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: tile_kv * head_dim"
+    );
+    assert!(
+        seq.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: max_seq_len * head_dim"
+    );
+}
+
+/// Reject multi-head projection shape products that wrap `usize` before the release length asserts.
+///
+/// The release-active `assert_eq!(hidden_size, num_q_heads * head_dim)` and the derived
+/// `seq_len * q_proj_dim` / `seq_len * kv_proj_dim` slice lengths in
+/// `tiled_multi_head_attention_in_place` are computed with plain `*`. A wrapping
+/// `num_q_heads * head_dim` makes the `hidden_size` assert *accept* an impossible head layout, then
+/// per-head extraction (`head_index * head_dim`, `src[start..start + head_dim]`) indexes a buffer
+/// sized for the wrapped (tiny) shape and reads out of bounds. Mirrors
+/// `flash_causal.rs::assert_flash_no_overflow` (#366). Caller guarantees `num_kv_heads != 0` and
+/// `num_q_heads % num_kv_heads == 0` (asserted at the call site).
+#[inline]
+fn assert_flash_tiled_no_overflow(
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) {
+    assert!(
+        num_q_heads.checked_mul(head_dim).is_some(),
+        "tiled shape overflow: num_q_heads * head_dim"
+    );
+    assert!(
+        num_kv_heads.checked_mul(head_dim).is_some(),
+        "tiled shape overflow: num_kv_heads * head_dim"
+    );
+    assert!(
+        seq_len.checked_mul(hidden_size).is_some(),
+        "tiled shape overflow: seq_len * hidden_size"
+    );
+    assert!(
+        seq_len.checked_mul(num_q_heads * head_dim).is_some(),
+        "tiled shape overflow: seq_len * q_proj_dim"
+    );
+    assert!(
+        seq_len.checked_mul(num_kv_heads * head_dim).is_some(),
+        "tiled shape overflow: seq_len * kv_proj_dim"
+    );
 }
 
 #[inline]
@@ -617,6 +688,8 @@ pub(crate) fn tiled_multi_head_attention_in_place(
         "config.num_kv_heads must match"
     );
     assert_eq!(config.head_dim, head_dim, "config.head_dim must match");
+    assert_ne!(num_kv_heads, 0, "num_kv_heads must be > 0");
+    assert_flash_tiled_no_overflow(num_q_heads, num_kv_heads, head_dim, seq_len, hidden_size);
     assert_eq!(hidden_states.len(), seq_len * hidden_size);
     assert_eq!(attention_mask.len(), seq_len);
     assert_eq!(hidden_size, num_q_heads * head_dim);
@@ -1411,5 +1484,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "tiled scratch overflow")]
+    fn tile_config_scratch_overflow_is_rejected() {
+        // Public `TiledAttentionConfig` fields let a caller pick a tile size that wraps
+        // `tile_kv * head_dim` to 0; the guard must reject it before `ensure_capacity` allocates
+        // an undersized scratch buffer. External head shapes are valid.
+        let config = TiledAttentionConfig {
+            tile_size_q: 2,
+            tile_size_kv: 1usize << 63,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+        };
+        let _buffers = TiledAttentionBuffers::new(2, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "tiled shape overflow")]
+    fn entry_shape_overflow_is_rejected_not_silently_accepted() {
+        // `num_q_heads * head_dim` wraps to a small value; without the guard the
+        // `hidden_size == num_q_heads * head_dim` release assert would accept an impossible head
+        // layout and per-head extraction would index out of bounds. Exercised directly because the
+        // only call site (`tiled_multi_head_attention_in_place`) needs a fully-populated
+        // 16-tensor `TransformerLayerWeights`; the guard placement before the products is verified
+        // by inspection/review.
+        assert_flash_tiled_no_overflow((1usize << 63) + 1, 1, 2, 2, 2);
     }
 }
