@@ -519,18 +519,28 @@ impl<'a> MtpVerifier<'a> {
                 config.num_hidden_layers
             )));
         }
-        if embed_tokens.len() != config.vocab_size * config.hidden_size {
+        // Checked product so a pathological public config returns a typed error
+        // instead of overflow-panicking (debug) or wrapping (release) before the
+        // shape comparison. Matches the FlatKVCache checked-arithmetic precedent.
+        let embed_numel = config
+            .vocab_size
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "MtpConfig vocab_size ({}) * hidden_size ({}) overflows usize",
+                    config.vocab_size, config.hidden_size
+                ))
+            })?;
+        if embed_tokens.len() != embed_numel {
             return Err(InferenceError::Inference(format!(
-                "embed_tokens length {} != vocab_size * hidden_size = {}",
+                "embed_tokens length {} != vocab_size * hidden_size = {embed_numel}",
                 embed_tokens.len(),
-                config.vocab_size * config.hidden_size
             )));
         }
-        if lm_head_weight.len() != config.vocab_size * config.hidden_size {
+        if lm_head_weight.len() != embed_numel {
             return Err(InferenceError::Inference(format!(
-                "lm_head_weight length {} != vocab_size * hidden_size = {}",
+                "lm_head_weight length {} != vocab_size * hidden_size = {embed_numel}",
                 lm_head_weight.len(),
-                config.vocab_size * config.hidden_size
             )));
         }
         if config.draft_length > 8 {
@@ -589,6 +599,18 @@ impl<'a> MtpVerifier<'a> {
         }
 
         let rope_dim = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        // Reject zero-width RoPE: rope_dim < 2 gives half_dim == 0, so
+        // RopeTable::max_positions() == 0 and the forward_one position bound
+        // would reject every position. A no-RoPE MTP is unsupported (Qwen3.5
+        // always uses partial RoPE); fail closed rather than run without
+        // positional encoding.
+        if rope_dim < 2 {
+            return Err(InferenceError::UnsupportedModel(format!(
+                "MTP requires a non-zero RoPE width: head_dim ({}) * partial_rotary_factor ({}) \
+                 yields rope_dim {rope_dim}, need >= 2",
+                config.head_dim, config.partial_rotary_factor
+            )));
+        }
         // RopeTable built with head_dim=rope_dim so half_dim = rope_dim/2
         let rope = crate::rope::RopeTable::new(rope_dim, max_seq_len.max(1), config.rope_theta);
 
@@ -3763,9 +3785,12 @@ mod tests {
         let weights = tiny_mtp_weights(&cfg);
         let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
         let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("partial_rotary_factor > 1 must be rejected");
+        };
         assert!(
-            MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8).is_err(),
-            "partial_rotary_factor > 1 must be rejected"
+            format!("{err:?}").contains("partial_rotary_factor"),
+            "expected partial_rotary_factor rejection, got: {err:?}"
         );
     }
 
@@ -3779,9 +3804,54 @@ mod tests {
         let weights = tiny_mtp_weights(&cfg);
         let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
         let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("num_key_value_heads == 0 must be rejected");
+        };
         assert!(
-            MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8).is_err(),
-            "num_key_value_heads == 0 must be rejected"
+            format!("{err:?}").contains("num_key_value_heads"),
+            "expected num_key_value_heads rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new rejects zero-width RoPE (partial_rotary_factor == 0.0,
+    /// which the [0,1] scalar check accepts) before constructing a degenerate
+    /// RopeTable whose max_positions() == 0 would reject every forward_one
+    /// position (codex #362 Major: position-bound exactness for zero-width RoPE).
+    #[test]
+    fn mtp_new_rejects_zero_partial_rotary_factor() {
+        let mut cfg = tiny_mtp_config();
+        cfg.partial_rotary_factor = 0.0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("zero-width RoPE (partial_rotary_factor == 0) must be rejected");
+        };
+        assert!(
+            format!("{err:?}").contains("RoPE width"),
+            "expected zero-width RoPE rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new returns Err (not a debug overflow-panic / release wrap)
+    /// when vocab_size * hidden_size overflows usize. Weights/embeds are tiny;
+    /// the checked product fires before any tensor-shape comparison
+    /// (codex #362 Medium: unchecked dimension products).
+    #[test]
+    fn mtp_new_rejects_dimension_product_overflow() {
+        let base = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&base);
+        let embed: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let mut cfg = tiny_mtp_config();
+        cfg.hidden_size = usize::MAX / 2 + 1;
+        cfg.vocab_size = 2;
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("overflowing vocab_size * hidden_size must return Err, not panic");
+        };
+        assert!(
+            format!("{err:?}").contains("overflows usize"),
+            "expected overflow rejection, got: {err:?}"
         );
     }
 
