@@ -12865,7 +12865,11 @@ kernel void gdn_chunk_norm_silu_c32(
         cs.apply_temperature(cfg.temperature);
 
         let raw = xorshift64(rng_state);
-        let r = (raw as f64 / u64::MAX as f64) as f32;
+        // #351: `(raw as f64 / u64::MAX as f64) as f32` rounds up to exactly 1.0
+        // when raw == u64::MAX, and sample_top_p with r == 1.0 can select the
+        // worst-probability token. Route through the canonical [0, 1) helper
+        // (provably < 1.0), matching the CPU sampling path.
+        let r = crate::sampling::uniform_f32_from_u64(raw);
         cs.sample_top_p(cfg.top_p, r)
     }
 
@@ -12902,7 +12906,9 @@ kernel void gdn_chunk_norm_silu_c32(
         }
         cs.apply_temperature(cfg.temperature);
         cs.retain_top_k(cfg.top_k);
-        let r = (xorshift64(rng_state) as f64 / u64::MAX as f64) as f32;
+        // #351: see sample_from_candidates — avoid the r == 1.0 worst-token bug
+        // by routing through the canonical [0, 1) helper (provably < 1.0).
+        let r = crate::sampling::uniform_f32_from_u64(xorshift64(rng_state));
         cs.sample_top_p(cfg.top_p, r)
     }
 
