@@ -63,6 +63,28 @@ fn test_sample_repetition_penalty() {
 }
 
 #[test]
+fn test_repetition_penalty_applied_once_per_repeated_id() {
+    // `previous_ids` is the full token history (prompt + generated), so it routinely
+    // contains the same id multiple times. The penalty must apply ONCE per id —
+    // matching HF and the Metal `CandidateSet` path — not once per occurrence
+    // (which compounds to penalty^N and over-suppresses as the sequence grows).
+    let logits = vec![0.0, 10.0, 3.0];
+    let cfg = crate::model::qwen35_config::GenerateConfig {
+        temperature: 0.0,
+        repetition_penalty: 2.0,
+        ..Default::default()
+    };
+    let mut rng = 1u64;
+    // Token 1 appears TWICE in the history. Penalized once: 10/2 = 5 (beats token 2's 3).
+    // Per-occurrence bug: 10/2/2 = 2.5 (token 2 wrongly wins).
+    let token = sample_token(&logits, &cfg, &[1, 1], &mut rng);
+    assert_eq!(
+        token, 1,
+        "repeated history id must be penalized once (10/2=5), not per occurrence (2.5)"
+    );
+}
+
+#[test]
 fn test_sample_nonfinite_temperature_is_greedy() {
     // The live Qwen3.5 decode sampler must treat a non-finite temperature as
     // greedy (deterministic argmax = token 1), not sample from an unscaled

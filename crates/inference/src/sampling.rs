@@ -292,7 +292,13 @@ impl Sampler {
             self.logit_scratch.clear();
             self.logit_scratch.extend_from_slice(logits);
             let penalty = self.config.repetition_penalty;
-            for &tok in &self.recent_tokens {
+            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
+                // Penalize each id once (recent_tokens may repeat). recent_tokens is
+                // capped at max_recent (64), so this O(n²) scan stays well under the
+                // full-vocab argmax cost and avoids a per-call allocation.
+                if self.recent_tokens[..pos].contains(&tok) {
+                    continue;
+                }
                 let idx = tok as usize;
                 if idx < self.logit_scratch.len() {
                     self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
@@ -309,7 +315,13 @@ impl Sampler {
         let adj = &mut self.logit_scratch;
 
         if self.config.repetition_penalty != 1.0 {
-            for &tok in &self.recent_tokens {
+            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
+                // Penalize each id once (recent_tokens may repeat); applying it per
+                // occurrence compounds to penalty^N. Capped at max_recent (64), so the
+                // O(n²) dedup scan is negligible against the fused top-k over the vocab.
+                if self.recent_tokens[..pos].contains(&tok) {
+                    continue;
+                }
                 let idx = tok as usize;
                 if idx < adj.len() {
                     adj[idx] = penalized_logit(adj[idx], self.config.repetition_penalty);
@@ -1192,6 +1204,33 @@ mod tests {
         assert!(
             (penalized_logit(-2.0, 2.0) - -4.0).abs() < 1e-6,
             "-2.0*2.0 == -4.0"
+        );
+    }
+
+    #[test]
+    fn test_repetition_penalty_applied_once_per_token() {
+        // `recent_tokens` accumulates duplicates (`push_token` never dedups), so a
+        // token repeated within the window must be penalized exactly ONCE — matching
+        // HF's gather-once semantics and the Metal `CandidateSet` path. Applying the
+        // penalty per occurrence compounds it (penalty^N) and silently over-suppresses
+        // common tokens as a sequence grows.
+        let mut s = Sampler::new(SamplingConfig {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        })
+        .with_seed(1);
+        // Step 1: token 1 is the clear argmax; recent_tokens -> [1].
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
+        // Step 2: token 1 penalized once (10/2 = 5) still wins; recent_tokens -> [1, 1].
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
+        // Step 3: token 1 penalized ONCE (10/2 = 5) must beat token 2 (logit 3).
+        // The per-occurrence bug penalizes twice (10/2/2 = 2.5) and wrongly picks token 2.
+        assert_eq!(
+            s.sample(&[0.0, 10.0, 3.0]),
+            1,
+            "duplicate history id must be penalized once, not per occurrence"
         );
     }
 }
