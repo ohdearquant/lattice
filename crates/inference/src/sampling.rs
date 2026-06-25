@@ -308,24 +308,39 @@ impl Sampler {
     /// shape `[vocab_size]`.
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         // Greedy fast path: skip the full-vocab clone when argmax is not penalized.
-        // Repetition penalty only lowers penalized tokens, so argmax(raw) == argmax(penalized)
-        // whenever the raw argmax token is not in recent_tokens. In the common case
-        // (recent_tokens empty or raw argmax not recently generated) this avoids the
-        // 993 KB extend_from_slice entirely.
+        // A repetition penalty >= 1.0 only lowers penalized tokens, so argmax(raw) ==
+        // argmax(penalized) whenever the raw argmax token is not in recent_tokens. In the
+        // common case (recent_tokens empty or raw argmax not recently generated) this
+        // avoids the 993 KB extend_from_slice entirely. A penalty in (0, 1) BOOSTS recent
+        // tokens, so it must fall through to the re-scan even when raw_best is not recent.
         //
         // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so that its
         // reciprocal overflows) carries no valid scaling and is routed here to the same
         // deterministic argmax as the t -> 0+ limit. See `temperature_degenerate`.
         if temperature_degenerate(self.config.temperature) || self.config.top_k == 1 {
             let raw_best = argmax_f32(logits);
-            if self.config.repetition_penalty == 1.0 || !self.recent_tokens.contains(&raw_best) {
+            // Conservative sufficient gate (not maximal): take the shortcut when the
+            // penalty cannot promote a non-argmax token above raw_best. That holds when
+            // the penalty is inactive (a no-op in `penalized_logit`), or it only demotes
+            // (> 1.0) AND raw_best is not itself penalized. A penalty in (0, 1) divides a
+            // positive logit by < 1, boosting recent tokens, so a non-recent raw_best can
+            // be overtaken by a boosted recent token — that case must re-scan.
+            //
+            // One always-safe case is intentionally left to the re-scan for simplicity:
+            // (0, 1) penalty where raw_best is ITSELF recent. `penalized_logit` is monotone,
+            // so boosting raw_best keeps it >= every non-recent logit and preserves order
+            // against other recent logits, leaving it the argmax. Shortcutting it would
+            // need an extra `contains` probe on the hot path to save a rare clone, so we
+            // fall through instead — correct, just not maximal.
+            let penalty = self.config.repetition_penalty;
+            let penalty_inactive = penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0;
+            if penalty_inactive || (penalty > 1.0 && !self.recent_tokens.contains(&raw_best)) {
                 self.push_token(raw_best);
                 return raw_best;
             }
-            // Rare: raw argmax is a recently penalized token — clone + re-scan.
+            // raw argmax would change once the penalty is applied — clone + re-scan.
             self.logit_scratch.clear();
             self.logit_scratch.extend_from_slice(logits);
-            let penalty = self.config.repetition_penalty;
             for (pos, &tok) in self.recent_tokens.iter().enumerate() {
                 // Penalize each id once (recent_tokens may repeat). recent_tokens is
                 // capped at max_recent (64), so this O(n²) scan stays well under the
@@ -939,6 +954,51 @@ mod tests {
         // Second sample: token 1 is penalized, should pick 2
         let second = sampler.sample(&logits);
         assert_eq!(second, 2);
+    }
+
+    /// A repetition penalty in (0, 1) BOOSTS recent tokens. The greedy fast path
+    /// must not shortcut to the raw argmax when a boosted recent token would
+    /// overtake it, even though the raw argmax itself is not recent (codex
+    /// sampling discovery: the fast-path invariant only holds for penalty >= 1.0).
+    #[test]
+    fn test_greedy_sub_one_penalty_boosts_recent_token() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy fast path
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 0.5, // < 1.0 boosts recent tokens
+        };
+        let mut sampler = Sampler::new(config);
+
+        // Step 1: token 1 is the clear argmax; becomes a recent token.
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+
+        // Step 2: raw argmax is token 0 (5.0) and is NOT recent, but recent token
+        // 1 is boosted to 4.0 / 0.5 = 8.0 > 5.0, so the penalized argmax is token
+        // 1. Before the fix the fast path returned the raw argmax token 0.
+        assert_eq!(sampler.sample(&[5.0, 4.0]), 1);
+    }
+
+    /// The documented always-safe case the conservative gate leaves to the re-scan:
+    /// a (0, 1) penalty where the raw argmax is ITSELF recent. `penalized_logit` is
+    /// monotone, so boosting raw_best keeps it the argmax — the fall-through must
+    /// still return it. Regression guard for the comment at the gate.
+    #[test]
+    fn test_greedy_sub_one_penalty_recent_argmax_unchanged() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy fast path
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 0.5, // < 1.0 boosts recent tokens
+        };
+        let mut sampler = Sampler::new(config);
+
+        // Step 1: token 1 is the clear argmax; becomes a recent token.
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+
+        // Step 2: raw argmax is token 1 (6.0) and IS recent. Boosting it to
+        // 6.0 / 0.5 = 12.0 keeps it above token 0's 5.0, so it stays the argmax.
+        assert_eq!(sampler.sample(&[5.0, 6.0]), 1);
     }
 
     #[test]
