@@ -174,6 +174,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         enable_thinking: false,
         enable_mtp: None,
         grammar: None,
+        stop_strings: vec![],
     };
 
     eprintln!(

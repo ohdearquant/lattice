@@ -18168,6 +18168,7 @@ kernel void decode_attention_reference(
                 enable_thinking: false,
                 enable_mtp: Some(false),
                 grammar: None,
+                stop_strings: vec![],
             };
 
             let out = with_self_spec_env(|| {
@@ -18263,6 +18264,7 @@ kernel void decode_attention_reference(
                 enable_thinking: false,
                 enable_mtp: Some(false),
                 grammar: None,
+                stop_strings: vec![],
             };
 
             let mut state = with_self_spec_env(|| {
