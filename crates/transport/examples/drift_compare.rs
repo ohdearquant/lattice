@@ -28,6 +28,7 @@ fn load_dump(path: &str) -> HashMap<String, Vec<Vec<f32>>> {
 /// Returns the dot product divided by the product of L2 norms.  Returns 1.0
 /// when both vectors are zero (identical degenerate case).
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

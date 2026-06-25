@@ -112,11 +112,27 @@ fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
 
 #[tokio::test]
 async fn bge_small_drift_vs_frozen_baseline() {
-    // --- Skip guard: no weights → skip gracefully, do not fail. -------
-    let model_dir = PathBuf::from(std::env::var("HOME").expect("HOME env var not set"))
-        .join(".lattice/models/bge-small-en-v1.5");
+    // --- Skip guard: no weights → skip locally, but FAIL CLOSED in CI. ---
+    // Resolve the model cache the same way the engine does (`LATTICE_MODEL_CACHE`
+    // overrides `$HOME/.lattice/models`); otherwise a CI runner that sets the env
+    // would download to one path while this guard checks another and silently skip.
+    let cache_root = match std::env::var("LATTICE_MODEL_CACHE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => PathBuf::from(std::env::var("HOME").expect("HOME env var not set"))
+            .join(".lattice/models"),
+    };
+    let model_dir = cache_root.join("bge-small-en-v1.5");
 
     if !model_dir.join("model.safetensors").exists() {
+        // In CI the provisioning step MUST have populated the weights. A silent
+        // skip there would make this drift gate pure theater (green without ever
+        // exercising the forward path), so fail loudly instead.
+        if std::env::var("CI").is_ok() {
+            panic!(
+                "drift gate weights missing in CI — provisioning did not populate {}",
+                model_dir.display()
+            );
+        }
         eprintln!(
             "LATTICE_DRIFT_GATE_SKIPPED test=bge_small_drift_vs_frozen_baseline \
              reason=missing_weights path={}",

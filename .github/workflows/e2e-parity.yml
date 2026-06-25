@@ -201,7 +201,7 @@ jobs:
   # did. Fails closed if change-detection itself errored.
   parity-gate:
     name: parity-gate
-    needs: [changes, parity]
+    needs: [changes, parity, embed-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -210,7 +210,8 @@ jobs:
           CHANGES_RESULT="${{ needs.changes.result }}"
           ENGINE="${{ needs.changes.outputs.engine }}"
           PARITY_RESULT="${{ needs.parity.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT"
+          DRIFT_RESULT="${{ needs.embed-drift.result }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -219,9 +220,13 @@ jobs:
             echo "No engine change — parity not required. PASS."
             exit 0
           fi
-          if [ "$PARITY_RESULT" = "success" ]; then
-            echo "Engine changed and parity PASSED."
-            exit 0
+          if [ "$PARITY_RESULT" != "success" ]; then
+            echo "::error::Engine changed and parity did not succeed (result=$PARITY_RESULT)."
+            exit 1
           fi
-          echo "::error::Engine changed and parity did not succeed (result=$PARITY_RESULT)."
-          exit 1
+          if [ "$DRIFT_RESULT" != "success" ]; then
+            echo "::error::Engine changed and embed-drift gate did not succeed (result=$DRIFT_RESULT)."
+            exit 1
+          fi
+          echo "Engine changed; parity and embed-drift both PASSED."
+          exit 0
