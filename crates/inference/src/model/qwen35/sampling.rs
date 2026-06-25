@@ -130,25 +130,38 @@ fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
 }
 
 fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
-    let r = xorshift64(rng_state);
+    draw_index(probs, xorshift64(rng_state))
+}
+
+/// Inverse-CDF draw: return the first token whose cumulative probability exceeds
+/// `r`. The boundary is strict `r < cumsum`: the canonical uniform draw gives
+/// `r` in `[0, 1)`, so `r < cumsum` is the textbook-correct inverse-CDF and never
+/// double-counts a bucket boundary (`r <= cumsum` would, and is also unsafe for an
+/// `r` that reached exactly 1.0). Falls back to the first (highest-probability)
+/// token only if float error leaves the final cumsum just under `r`.
+fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
     let mut cumsum = 0.0f32;
     for &(idx, p) in probs {
         cumsum += p;
-        if r <= cumsum {
+        if r < cumsum {
             return idx as u32;
         }
     }
     probs[0].0 as u32
 }
 
-/// Xorshift64 PRNG. Returns a value in [0, 1).
+/// Canonical uniform f32 in [0, 1) via the shared xorshift64 primitive.
+///
+/// Delegates to `crate::sampling::xorshift64_next` (shifts 13/7/17, full period
+/// over nonzero state) and `crate::sampling::uniform_f32_from_u64` (top-24-bit
+/// conversion, provably strictly < 1.0). Both CPU sampling paths now share this
+/// canonical RNG primitive, so a fixed seed yields the same uniform draw stream.
+/// This does NOT guarantee identical token streams: the two paths still diverge
+/// below the RNG layer (top-k tie-break and the candidate-exhaustion fallback
+/// pick in opposite directions), so equal draws can still select different tokens.
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
-    let mut s = *state;
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    *state = s;
-    (s >> 11) as f32 / (1u64 << 53) as f32
+    let x = crate::sampling::xorshift64_next(state);
+    crate::sampling::uniform_f32_from_u64(x)
 }
 
 #[cfg(test)]
@@ -258,5 +271,65 @@ mod tests {
         let mut rng = 7u64;
         let token = sample_token(&logits, &cfg_rp, &[0], &mut rng);
         assert_eq!(token, 0, "NaN penalty must be a no-op");
+    }
+
+    #[test]
+    fn canonical_rng_streams_match_across_sampling_paths() {
+        // Both CPU sampling paths must produce the same seeded float stream once
+        // they share xorshift64_next + uniform_f32_from_u64.
+        // Note: crate::model::qwen35::sampling is private, so this test lives here
+        // where both xorshift64 (local) and the canonical primitives are reachable.
+        let seed = 0x1234_5678_9abc_def0u64;
+        let n = 32usize;
+
+        // Path 1: this module's xorshift64 (now delegates to the canonical primitives).
+        let mut state_q = seed;
+        let q35: Vec<f32> = (0..n).map(|_| xorshift64(&mut state_q)).collect();
+
+        // Path 2: direct use of xorshift64_next + uniform_f32_from_u64 from crate::sampling.
+        let mut state_c = seed;
+        let canonical: Vec<f32> = (0..n)
+            .map(|_| {
+                let x = crate::sampling::xorshift64_next(&mut state_c);
+                crate::sampling::uniform_f32_from_u64(x)
+            })
+            .collect();
+
+        assert_eq!(
+            q35, canonical,
+            "xorshift64 and canonical primitives must produce identical streams"
+        );
+    }
+
+    #[test]
+    fn draw_index_uses_strict_less_than_at_exact_boundary() {
+        // Lock the draw boundary as `r < cumsum`, NOT `r <= cumsum`. The two
+        // operators differ ONLY when `r` exactly equals a partial cumsum. Use
+        // values that are exact in f32 (0.5) so there is no rounding ambiguity and
+        // no dependence on the RNG reproducing a bit-identical float: r == 0.5,
+        // first token prob == 0.5, so cumsum after token 0 is `0.0 + 0.5 == 0.5`.
+        //   `r < cumsum`  -> `0.5 < 0.5`  == false -> skip token 0, select token 1
+        //   `r <= cumsum` -> `0.5 <= 0.5` == true  -> select token 0
+        // A regression back to `<=` flips this and fails the test.
+        let probs: Vec<(usize, f32)> = vec![(0, 0.5), (1, 0.5)];
+        assert_eq!(
+            draw_index(&probs, 0.5),
+            1,
+            "at the exact boundary (cumsum == r), strict `r < cumsum` must skip \
+             token 0 and select token 1 (a `r <= cumsum` regression selects token 0)"
+        );
+
+        // Sanity: r below the first bucket selects token 0; r at/above the last
+        // bucket's cumsum (only reachable via float error) falls back to token 0.
+        assert_eq!(
+            draw_index(&probs, 0.25),
+            0,
+            "r below first cumsum picks token 0"
+        );
+        assert_eq!(
+            draw_index(&probs, 0.75),
+            1,
+            "r between the two bucket boundaries picks token 1"
+        );
     }
 }

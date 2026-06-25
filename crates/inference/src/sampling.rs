@@ -202,6 +202,25 @@ impl CandidateSet {
     }
 }
 
+/// Canonical xorshift64 state advance shared by every CPU sampling path.
+/// Shifts 13/7/17 give a full period over nonzero state.
+pub(crate) fn xorshift64_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Canonical uniform f32 in [0, 1) from a 64-bit random word. Uses the top 24
+/// bits (the f32 mantissa width) so the result is a uniform over representable
+/// f32 values in [0, 1) and is provably strictly < 1.0 — unlike a 53-bit
+/// integer cast to f32, which rounds up to exactly 1.0 at the top of the range.
+pub(crate) fn uniform_f32_from_u64(x: u64) -> f32 {
+    (x >> 40) as f32 / (1u64 << 24) as f32
+}
+
 /// Xorshift64 PRNG for sampling (no external dependency).
 struct Rng {
     state: u64,
@@ -215,17 +234,12 @@ impl Rng {
     }
 
     fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+        xorshift64_next(&mut self.state)
     }
 
     /// Returns a uniform f32 in [0, 1).
     fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+        uniform_f32_from_u64(self.next_u64())
     }
 }
 
@@ -1439,5 +1453,29 @@ mod tests {
             1,
             "duplicate history id must be penalized once, not per occurrence"
         );
+    }
+
+    // ── canonical RNG primitive tests ────────────────────────────────────────
+
+    #[test]
+    fn uniform_f32_from_u64_is_always_in_unit_interval() {
+        // The canonical 24-bit conversion must be in [0, 1) for all u64 values —
+        // in particular u64::MAX must NOT round up to exactly 1.0 (the latent bug
+        // in the 53-bit `(s >> 11) as f32 / 2^53` path).
+        for x in [
+            0u64,
+            1,
+            u64::MAX,
+            0xFFFF_FFFF_FFFF_FFFF,
+            1u64 << 40,
+            (1u64 << 40) - 1,
+            0x8000_0000_0000_0000,
+        ] {
+            let f = uniform_f32_from_u64(x);
+            assert!(
+                (0.0..1.0).contains(&f),
+                "uniform_f32_from_u64({x:#018x}) = {f} is not in [0, 1)"
+            );
+        }
     }
 }
