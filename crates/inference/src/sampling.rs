@@ -274,15 +274,10 @@ impl Sampler {
         // (recent_tokens empty or raw argmax not recently generated) this avoids the
         // 993 KB extend_from_slice entirely.
         //
-        // A non-finite temperature (NaN, ±inf) is also routed here: it carries no
-        // valid scaling. `1.0 / NaN` is NaN, which poisons every scaled logit and
-        // collapses the fused top-k to token 0 (the lowest ID), and `1.0 / inf` is 0,
-        // which flattens all logits. Fall back to the same deterministic argmax as
-        // temperature <= 0.0 rather than sampling from a corrupted distribution.
-        if !self.config.temperature.is_finite()
-            || self.config.temperature <= 0.0
-            || self.config.top_k == 1
-        {
+        // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so that its
+        // reciprocal overflows) carries no valid scaling and is routed here to the same
+        // deterministic argmax as the t -> 0+ limit. See `temperature_degenerate`.
+        if temperature_degenerate(self.config.temperature) || self.config.top_k == 1 {
             let raw_best = argmax_f32(logits);
             if self.config.repetition_penalty == 1.0 || !self.recent_tokens.contains(&raw_best) {
                 self.push_token(raw_best);
@@ -364,6 +359,24 @@ impl Sampler {
     pub fn reset(&mut self) {
         self.recent_tokens.clear();
     }
+}
+
+/// True when `temperature` cannot produce a valid finite logit scaling, so sampling
+/// must fall back to greedy argmax (the `t -> 0+` limit, `softmax(logits / t) ->
+/// argmax(logits)`). Covers three cases:
+/// - non-finite temperature (NaN, ±inf): `1.0 / NaN` is NaN and `1.0 / inf` is 0, both
+///   of which corrupt the scaled distribution;
+/// - `t <= 0`: no valid scaling;
+/// - finite but tiny positive `t`: `1.0 / t` overflows f32 to +inf for `t < ~2.94e-39`
+///   (since `f32::MAX ≈ 3.4e38`), so the scaling multiplies every logit by inf and
+///   loses their ordering, collapsing the distribution to the wrong token.
+///
+/// Shared by every sampling entry point (CPU `Sampler::sample` and the Metal
+/// `sample_from_candidates` / `sample_token` paths) so the degeneracy check stays
+/// identical across backends.
+#[inline]
+pub(crate) fn temperature_degenerate(temperature: f32) -> bool {
+    !temperature.is_finite() || temperature <= 0.0 || !(1.0 / temperature).is_finite()
 }
 
 /// Apply repetition penalty to one logit. A penalty of 1.0, or any non-finite
@@ -709,6 +722,58 @@ mod tests {
                 sampler.sample(&logits),
                 1,
                 "temperature {bad} must fall back to argmax, not collapse to token 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tiny_temperature_falls_back_to_argmax() {
+        // A finite, positive, but tiny temperature whose reciprocal overflows f32 to
+        // +inf (t < ~2.94e-39). Pre-fix `inv_temp = 1.0 / t = inf` scaled every logit
+        // to +inf, destroying their ordering, and the fused top-k collapsed to token 0.
+        // The t -> 0+ limit of softmax(logits / t) is argmax, so the highest-logit
+        // token (1) must win. top_k=2 forces the non-greedy fused-top-k path.
+        let logits = vec![10.0, 11.0, 9.0];
+        for tiny in [1e-45_f32, 1e-40, 1e-39] {
+            let config = SamplingConfig {
+                temperature: tiny,
+                top_k: 2,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+            };
+            let mut sampler = Sampler::new(config).with_seed(7);
+            assert_eq!(
+                sampler.sample(&logits),
+                1,
+                "tiny temperature {tiny} must fall back to argmax, not collapse to token 0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_temperature_degenerate_predicate() {
+        // Degenerate: non-finite, non-positive, and finite-but-tiny (reciprocal overflows).
+        for bad in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -1.0,
+            1e-45,
+            1e-40,
+            1e-39,
+        ] {
+            assert!(
+                temperature_degenerate(bad),
+                "temperature {bad} should be degenerate"
+            );
+        }
+        // Valid: normal temperatures whose reciprocal stays finite (incl. small-but-safe,
+        // e.g. f32::MIN_POSITIVE whose reciprocal 8.5e37 is below f32::MAX).
+        for ok in [1.0, 0.5, 2.0, 0.1, 1e-30, 1e-3, f32::MIN_POSITIVE] {
+            assert!(
+                !temperature_degenerate(ok),
+                "temperature {ok} should be valid (reciprocal finite)"
             );
         }
     }
