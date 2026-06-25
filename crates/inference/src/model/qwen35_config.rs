@@ -381,6 +381,76 @@ impl Qwen35Config {
         }
         cfg.normalize_layer_mask();
 
+        // Structural invariants. A parseable-but-malformed config.json can set these to zero
+        // or inconsistent values that survive serde yet cause a downstream divide-by-zero,
+        // out-of-bounds index, or unsigned underflow at model construction / forward (e.g.
+        // `num_q_heads / num_kv_heads` in the GQA path, `head_vec[rope_dim / 2 + i]` in
+        // partial RoPE, `linear_conv_kernel_dim - 1` in the GatedDeltaNet conv buffer).
+        // Surface them as typed errors at this single load-time choke point rather than as a
+        // panic deep in the forward pass. Presets satisfy all of these by construction.
+        if cfg.num_attention_heads == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: num_attention_heads must be > 0".to_string(),
+            ));
+        }
+        if cfg.num_key_value_heads == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: num_key_value_heads must be > 0".to_string(),
+            ));
+        }
+        if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: num_attention_heads ({}) must be divisible by \
+                 num_key_value_heads ({})",
+                cfg.num_attention_heads, cfg.num_key_value_heads
+            )));
+        }
+        if cfg.head_dim == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: head_dim must be > 0".to_string(),
+            ));
+        }
+        if cfg.num_hidden_layers == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: num_hidden_layers must be > 0".to_string(),
+            ));
+        }
+        if cfg.linear_conv_kernel_dim == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: linear_conv_kernel_dim must be > 0".to_string(),
+            ));
+        }
+        // `rope_dim = (head_dim * partial_rotary_factor) as usize` is rotated in place over a
+        // `head_dim`-length head slice; a factor > 1.0 makes `rope_dim` exceed `head_dim` and
+        // indexes `head_vec[rope_dim / 2 + i]` out of bounds. Require a finite fraction.
+        if !(cfg.partial_rotary_factor.is_finite()
+            && cfg.partial_rotary_factor >= 0.0
+            && cfg.partial_rotary_factor <= 1.0)
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: partial_rotary_factor ({}) must be in [0.0, 1.0]",
+                cfg.partial_rotary_factor
+            )));
+        }
+        // The GatedDeltaNet fused path divides by these head counts: `value_heads / key_heads`
+        // (gdn_fused.rs ratio) and `h / ratio` per value head. A parseable config with
+        // `linear_num_key_heads == 0`, `linear_num_value_heads == 0`, or value-heads not a
+        // positive multiple of key-heads (ratio == 0) is an integer divide-by-zero panic deep in
+        // the recurrence. Real GDN configs are key=16/value=32 (ratio 2); reject the rest here.
+        let key_heads = cfg.linear_num_key_heads;
+        let value_heads = cfg.linear_num_value_heads();
+        if key_heads == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: linear_num_key_heads must be > 0".to_string(),
+            ));
+        }
+        if value_heads == 0 || value_heads % key_heads != 0 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: linear_num_value_heads ({value_heads}) must be a \
+                 positive multiple of linear_num_key_heads ({key_heads})"
+            )));
+        }
+
         Ok(cfg)
     }
 
@@ -960,6 +1030,134 @@ mod tests {
         assert!(
             result.is_err(),
             "full_attention_interval: 0 must yield an InferenceError, not panic"
+        );
+    }
+
+    #[test]
+    fn test_zero_num_key_value_heads_errors_not_panics() {
+        // An explicit num_key_value_heads: 0 survives serde but reaches a divide-by-zero
+        // (`num_q_heads / num_kv_heads`) and a hard `assert!(num_kv_heads > 0)` in the GQA
+        // forward path. Reject at parse time. Omitted fields fall back to the valid preset.
+        // The substring assert proves THIS guard fired (not an unrelated default-zero field):
+        // `#[serde(default)]` + `Default = qwen36_35b_a3b()` means every omitted field carries a
+        // valid preset value, so the one explicit bad field is the only one that can trip.
+        let json = r#"{"text_config": {"num_key_value_heads": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_key_value_heads: 0 must yield an InferenceError, not a panic")
+            .to_string();
+        assert!(
+            err.contains("num_key_value_heads"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_indivisible_head_counts_error_not_panics() {
+        // num_attention_heads not divisible by num_key_value_heads truncates the GQA group
+        // count and over-runs the KV row (OOB read) on the unasserted release path.
+        let json = r#"{"text_config": {"num_attention_heads": 3, "num_key_value_heads": 2}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("indivisible head counts must yield an InferenceError, not OOB/panic")
+            .to_string();
+        assert!(err.contains("divisible"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_zero_head_dim_errors() {
+        let json = r#"{"text_config": {"head_dim": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("head_dim: 0 must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("head_dim"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_zero_num_hidden_layers_errors() {
+        let json = r#"{"text_config": {"num_hidden_layers": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_hidden_layers: 0 must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_hidden_layers"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_zero_linear_conv_kernel_dim_errors() {
+        // `linear_conv_kernel_dim - 1` underflows usize (panics in debug, wraps to a ~16 EiB
+        // allocation in release) in the GatedDeltaNet conv-buffer sizing.
+        let json = r#"{"text_config": {"linear_conv_kernel_dim": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("linear_conv_kernel_dim: 0 must yield an InferenceError, not underflow")
+            .to_string();
+        assert!(
+            err.contains("linear_conv_kernel_dim"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_zero_linear_num_key_heads_errors() {
+        // gdn_fused divides `value_heads / linear_num_key_heads`; a parseable 0 is a hard
+        // integer divide-by-zero panic deep in the GatedDeltaNet recurrence (codex #342 finding).
+        let json = r#"{"text_config": {"linear_num_key_heads": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("linear_num_key_heads: 0 must yield an InferenceError, not divide-by-zero")
+            .to_string();
+        assert!(
+            err.contains("linear_num_key_heads"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_value_heads_below_key_heads_errors() {
+        // value_heads < key_heads makes the integer `ratio = value_heads / key_heads == 0`, then
+        // `h / ratio` is a divide-by-zero panic. value=1/key=16 (preset) hits ratio 0.
+        let json = r#"{"text_config": {"linear_num_value_heads": 1}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("value_heads < key_heads must yield an InferenceError, not divide-by-zero")
+            .to_string();
+        assert!(
+            err.contains("linear_num_value_heads"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_value_heads_multiple_of_key_heads_accepted() {
+        // Boundary: the real GDN shape (key 16, value 32 → ratio 2) must pass the divisibility
+        // guard. Guards against the new check wrongly rejecting legitimate asymmetric heads.
+        let json = r#"{"text_config": {"linear_num_key_heads": 16, "linear_num_value_heads": 32}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "key 16 / value 32 (ratio 2) is a real GDN config and must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_partial_rotary_factor_above_one_errors() {
+        // rope_dim = (head_dim * factor); factor > 1 makes rope_dim exceed head_dim and
+        // indexes head_vec[rope_dim/2 + i] out of bounds in apply_partial_rope.
+        let json = r#"{"text_config": {"partial_rotary_factor": 3.0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("partial_rotary_factor > 1.0 must yield an InferenceError, not OOB")
+            .to_string();
+        assert!(
+            err.contains("partial_rotary_factor"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_partial_rotary_factor_one_accepted() {
+        // Boundary: factor == 1.0 makes rope_dim == head_dim (full rotary), which is in range.
+        // Guards against an off-by-one in the [0.0, 1.0] range check.
+        let json = r#"{"text_config": {"partial_rotary_factor": 1.0}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "partial_rotary_factor == 1.0 (full rotary) must be accepted"
         );
     }
 
