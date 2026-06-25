@@ -135,6 +135,8 @@ pub fn flash_attention_causal_with_config(
         "num_heads must be divisible by num_kv_heads"
     );
 
+    assert_flash_no_overflow(num_heads, num_kv_heads, head_dim, seq_len);
+
     let q_dim = num_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
     assert_eq!(q_buf.len(), seq_len * q_dim, "bad q_buf shape");
@@ -161,6 +163,8 @@ pub fn flash_attention_causal_with_config(
         );
         return;
     }
+
+    assert_flash_scratch_no_overflow(br, bc, head_dim);
 
     let mut scratch = FlashAttentionScratch::new(br, bc, head_dim);
     let mut group_m = vec![f32::NEG_INFINITY; groups * seq_len];
@@ -277,6 +281,65 @@ pub fn flash_attention_causal_with_config(
 fn ceil_div(n: usize, d: usize) -> usize {
     debug_assert!(d > 0);
     n / d + usize::from(n % d != 0)
+}
+
+/// Release-active precondition guard: reject head/sequence shapes whose `usize`
+/// products would wrap before they reach the length `assert_eq!`s. A wrapping
+/// product would otherwise make those length checks accept an impossible buffer,
+/// then trap later from a confusing derived slice offset. Mirrors the decode-path
+/// `assert_decode_no_overflow` guard. Callers (`num_kv_heads != 0` and
+/// `num_heads % num_kv_heads == 0` already validated) guarantee `groups` is exact.
+#[inline]
+fn assert_flash_no_overflow(
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+) {
+    assert!(
+        num_heads.checked_mul(head_dim).is_some(),
+        "flash shape overflow: num_heads * head_dim"
+    );
+    assert!(
+        num_kv_heads.checked_mul(head_dim).is_some(),
+        "flash shape overflow: num_kv_heads * head_dim"
+    );
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    assert!(
+        seq_len.checked_mul(q_dim).is_some(),
+        "flash shape overflow: seq_len * q_dim"
+    );
+    assert!(
+        seq_len.checked_mul(kv_dim).is_some(),
+        "flash shape overflow: seq_len * kv_dim"
+    );
+    assert!(
+        (num_heads / num_kv_heads).checked_mul(seq_len).is_some(),
+        "flash shape overflow: groups * seq_len"
+    );
+}
+
+/// Release-active precondition guard for the tile scratch products. A
+/// caller-supplied [`FlashAttentionConfig`] with a huge `br`/`bc` could wrap
+/// `br * bc` / `bc * head_dim` to a small value, allocating an undersized scratch
+/// buffer that then traps on an internal `bc_cur * head_dim` slice. The
+/// `br_cur <= br` and `bc_cur <= bc` invariants dominate the later block products
+/// once these base products are checked.
+#[inline]
+fn assert_flash_scratch_no_overflow(br: usize, bc: usize, head_dim: usize) {
+    assert!(
+        br.checked_mul(bc).is_some(),
+        "flash scratch overflow: br * bc"
+    );
+    assert!(
+        br.checked_mul(head_dim).is_some(),
+        "flash scratch overflow: br * head_dim"
+    );
+    assert!(
+        bc.checked_mul(head_dim).is_some(),
+        "flash scratch overflow: bc * head_dim"
+    );
 }
 
 fn extract_head_block(
@@ -788,5 +851,64 @@ mod tests {
         );
 
         approx_eq(&out, &expected, 1e-4);
+    }
+
+    #[test]
+    #[should_panic(expected = "flash shape overflow")]
+    fn entry_shape_overflow_is_rejected_not_silently_accepted() {
+        // num_heads * head_dim wraps in release: (2^63 + 1) * 2 == 2 (mod 2^64),
+        // which without the guard makes the length asserts accept 4-element buffers
+        // and then traps later from a derived offset. The guard rejects it up front.
+        let seq_len = 2;
+        let num_heads = (1usize << 63) + 1;
+        let num_kv_heads = 1;
+        let head_dim = 2;
+        let q_buf = vec![0.0; 4];
+        let k_buf = vec![0.0; 4];
+        let v_buf = vec![0.0; 4];
+        let mut attn_out = vec![0.0; 4];
+
+        flash_attention_causal(
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut attn_out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "flash scratch overflow")]
+    fn tile_config_scratch_overflow_is_rejected() {
+        // External shapes are valid, but a caller-supplied huge `bc` wraps the
+        // scratch products (br * bc) to 0, allocating undersized scratch buffers
+        // that would trap on an internal slice. The scratch guard rejects it.
+        let seq_len = 2;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 2;
+        let q_buf = vec![0.0; 4];
+        let k_buf = vec![0.0; 4];
+        let v_buf = vec![0.0; 4];
+        let mut attn_out = vec![0.0; 4];
+
+        flash_attention_causal_with_config(
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut attn_out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            FlashAttentionConfig {
+                br: 2,
+                bc: 1usize << 63,
+                fallback_below: 0,
+            },
+        );
     }
 }
