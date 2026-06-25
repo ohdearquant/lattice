@@ -366,6 +366,77 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Regression (issue #343): a left-recursive GBNF grammar (`root ::= root`)
+    /// must not hang. Before the PDA depth cap, `enumerate_grammar_states` grew
+    /// the PDA stack without bound inside a single `simulate_token` call. The
+    /// depth cap turns it into a bounded dead grammar; construction returns.
+    #[test]
+    fn cyclic_gbnf_does_not_hang() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::Gbnf("root ::= root\n".to_string());
+        let result = GrammarEngine::new(&spec, vocab);
+        // Bounded construction (Ok with a dead grammar) is the contract — the
+        // point is that it terminates rather than hanging or OOMing.
+        assert!(result.is_ok(), "cyclic GBNF should construct, not hang");
+    }
+
+    /// Regression (issue #343): a JSON-Schema `$ref` cycle compiles to a cyclic
+    /// grammar and previously hung at construction via the same PDA mechanism.
+    #[test]
+    fn cyclic_ref_schema_does_not_hang() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "$ref": "#/$defs/Node",
+            "$defs": { "Node": { "$ref": "#/$defs/Node" } }
+        }));
+        let result = GrammarEngine::new(&spec, vocab);
+        assert!(
+            result.is_ok(),
+            "cyclic $ref schema should construct, not hang"
+        );
+    }
+
+    /// Regression (issue #343): an array schema with an absurd `maxItems`
+    /// (near `u64::MAX`) previously overflowed the stack in `build_bounded_tail`.
+    /// It must now be rejected with a typed error at the parse boundary.
+    #[test]
+    fn array_maxitems_overflow_rejected() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array",
+            "items": { "type": "boolean" },
+            "maxItems": 18446744073709551615u64
+        }));
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("absurd maxItems must be rejected, not overflow the stack"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("maxItems"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Regression (issue #343): the `minItems` sibling — a near-`u64::MAX`
+    /// `minItems` drives the required-item loop ~1.8e19 times. Reject it too.
+    #[test]
+    fn array_minitems_overflow_rejected() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array",
+            "items": { "type": "boolean" },
+            "minItems": 18446744073709551615u64
+        }));
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("absurd minItems must be rejected, not hang"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("minItems"),
+            "error should name the offending field: {err}"
+        );
+    }
+
     #[test]
     fn mask_logits_blocks_disallowed() {
         // Boolean grammar: only "true" or "false" tokens allowed.

@@ -33,6 +33,19 @@ use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
+/// materialize.
+///
+/// `build_cardinality_array_alt` emits one grammar rule (or symbol) per
+/// required/optional item, and `build_bounded_tail` recurses once per unit of
+/// `maxItems - minItems` slack. A parseable schema with `maxItems` or
+/// `minItems` near `u64::MAX` (e.g. `18446744073709551615`) therefore overflows
+/// the stack or exhausts memory at compile time — reachable from untrusted
+/// schema input at `GrammarEngine::new` (issue #343). Constrained decoding has
+/// no real use for arrays anywhere near this many items; reject beyond the cap
+/// at the parse boundary with a typed error.
+const MAX_ARRAY_CARDINALITY: usize = 4096;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -344,6 +357,24 @@ impl<'a> CompileCtx<'a> {
             .get("maxItems")
             .and_then(Value::as_u64)
             .map(|v| v as usize);
+
+        // issue #343: cap cardinality before materializing per-item rules.
+        // `build_bounded_tail` recurses once per unit of slack and the required-
+        // item loop emits one symbol group per `minItems`, so an absurd
+        // `minItems`/`maxItems` (e.g. u64::MAX) overflows the stack / exhausts
+        // memory at compile time. Reject at the parse boundary.
+        if min_items > MAX_ARRAY_CARDINALITY {
+            return Err(SchemaError(format!(
+                "array schema minItems ({min_items}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
+            )));
+        }
+        if let Some(max) = max_items {
+            if max > MAX_ARRAY_CARDINALITY {
+                return Err(SchemaError(format!(
+                    "array schema maxItems ({max}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
+                )));
+            }
+        }
 
         // issue #310 finding #2: validate cardinality constraints up front.
         if let Some(max) = max_items {

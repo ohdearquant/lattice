@@ -62,6 +62,19 @@ pub enum Symbol {
     NonTerminal(usize),
 }
 
+/// Maximum PDA stack depth before an advance is rejected.
+///
+/// A left-recursive or cyclic grammar (`root ::= root`, or a JSON-Schema `$ref`
+/// cycle) makes `try_advance_stack` push non-terminal frames without ever
+/// consuming a byte, growing the stack without bound — a hang reachable from
+/// untrusted grammar input at `GrammarEngine::new` (issue #343). Capping the
+/// depth turns that into a bounded rejection (the grammar becomes a dead
+/// grammar that accepts nothing) instead of an OOM. The bound is far above any
+/// real nesting: `serde_json` itself caps recursion at 128, and each JSON level
+/// expands to only a handful of PDA frames, so 8192 frames is unreachable by a
+/// well-formed grammar on well-formed output.
+pub(crate) const MAX_PDA_DEPTH: usize = 8192;
+
 /// A compiled grammar rule: a name and a set of alternatives.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -207,6 +220,11 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
     loop {
         if stack.is_empty() {
             // Stack empty and we still have a byte to consume → reject.
+            return false;
+        }
+        if stack.len() > MAX_PDA_DEPTH {
+            // Cyclic / left-recursive grammar pushing frames without progress
+            // (issue #343). Reject rather than grow the stack unbounded.
             return false;
         }
 
