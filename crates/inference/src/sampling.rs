@@ -361,22 +361,39 @@ impl Sampler {
     }
 }
 
+/// A generous upper bound on the magnitude of a transformer lm_head logit. Real
+/// logits are O(10) (rarely past ~50); this 1e4 ceiling carries ~100-1000x of
+/// headroom. It defines the boundary below which a temperature is treated as
+/// greedy: if scaling a logit of this magnitude by `1.0 / t` would overflow f32,
+/// the temperature cannot produce a valid ordering for any realistic logit.
+const MAX_PLAUSIBLE_ABS_LOGIT: f32 = 1.0e4;
+
 /// True when `temperature` cannot produce a valid finite logit scaling, so sampling
 /// must fall back to greedy argmax (the `t -> 0+` limit, `softmax(logits / t) ->
-/// argmax(logits)`). Covers three cases:
+/// argmax(logits)`). Covers four cases:
 /// - non-finite temperature (NaN, ±inf): `1.0 / NaN` is NaN and `1.0 / inf` is 0, both
 ///   of which corrupt the scaled distribution;
 /// - `t <= 0`: no valid scaling;
-/// - finite but tiny positive `t`: `1.0 / t` overflows f32 to +inf for `t < ~2.94e-39`
-///   (since `f32::MAX ≈ 3.4e38`), so the scaling multiplies every logit by inf and
-///   loses their ordering, collapsing the distribution to the wrong token.
+/// - finite but tiny positive `t` where `1.0 / t` itself overflows f32 to +inf
+///   (`t < ~2.94e-39`, since `f32::MAX ≈ 3.4e38`): the scaling multiplies every logit
+///   by inf and loses their ordering;
+/// - finite `t` where `1.0 / t` stays finite but `logit * (1.0 / t)` overflows for a
+///   plausible logit (`t` roughly below `MAX_PLAUSIBLE_ABS_LOGIT / f32::MAX ≈ 2.94e-35`).
+///   The scaled logits saturate to +inf, the softmax's non-finite-max guard then
+///   returns an arbitrary candidate instead of the true argmax. Both overflow bands
+///   are well below any valid sampling temperature, and the `t -> 0+` limit is argmax
+///   for all of them, so routing them to greedy is exact, not a behavior change.
 ///
-/// Shared by every sampling entry point (CPU `Sampler::sample` and the Metal
-/// `sample_from_candidates` / `sample_token` paths) so the degeneracy check stays
-/// identical across backends.
+/// Shared by every sampling entry point (CPU `Sampler::sample`, the CPU
+/// `model/qwen35::sample_token`, and the Metal `sample_from_candidates` /
+/// `sample_token` paths) so the degeneracy check stays identical across backends.
 #[inline]
 pub(crate) fn temperature_degenerate(temperature: f32) -> bool {
-    !temperature.is_finite() || temperature <= 0.0 || !(1.0 / temperature).is_finite()
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return true;
+    }
+    let inv_temp = 1.0 / temperature;
+    !inv_temp.is_finite() || inv_temp > f32::MAX / MAX_PLAUSIBLE_ABS_LOGIT
 }
 
 /// Apply repetition penalty to one logit. A penalty of 1.0, or any non-finite
@@ -752,7 +769,10 @@ mod tests {
 
     #[test]
     fn test_temperature_degenerate_predicate() {
-        // Degenerate: non-finite, non-positive, and finite-but-tiny (reciprocal overflows).
+        // Degenerate: non-finite, non-positive, finite-but-tiny where the reciprocal
+        // overflows (1e-45..1e-39), and the residual band where the reciprocal is finite
+        // but `logit * inv_temp` would overflow for a plausible logit (1e-38..1e-35,
+        // including f32::MIN_POSITIVE whose reciprocal 8.5e37 exceeds f32::MAX / 1e4).
         for bad in [
             f32::NAN,
             f32::INFINITY,
@@ -762,18 +782,46 @@ mod tests {
             1e-45,
             1e-40,
             1e-39,
+            f32::MIN_POSITIVE,
+            1e-37,
+            1e-35,
         ] {
             assert!(
                 temperature_degenerate(bad),
                 "temperature {bad} should be degenerate"
             );
         }
-        // Valid: normal temperatures whose reciprocal stays finite (incl. small-but-safe,
-        // e.g. f32::MIN_POSITIVE whose reciprocal 8.5e37 is below f32::MAX).
-        for ok in [1.0, 0.5, 2.0, 0.1, 1e-30, 1e-3, f32::MIN_POSITIVE] {
+        // Valid: normal temperatures, plus small-but-safe values whose reciprocal stays
+        // far enough below f32::MAX that scaling a plausible logit cannot overflow
+        // (1e-30 -> inv 1e30, well under the f32::MAX / 1e4 ≈ 3.4e34 threshold).
+        for ok in [1.0, 0.5, 2.0, 0.1, 1e-3, 1e-30] {
             assert!(
                 !temperature_degenerate(ok),
-                "temperature {ok} should be valid (reciprocal finite)"
+                "temperature {ok} should be valid (no scaling overflow)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_band_temperature_falls_back_to_argmax() {
+        // The residual band: a finite, positive temperature whose reciprocal stays finite
+        // (so the pre-fix `!(1.0 / t).is_finite()` check missed it) yet is large enough
+        // that `logit * inv_temp` overflows for ordinary logits. Pre-fix this saturated
+        // every scaled logit to +inf and the softmax non-finite-max guard returned an
+        // arbitrary candidate. argmax (token 1) is the correct t -> 0+ limit.
+        let logits = vec![10.0, 11.0, 9.0];
+        for band in [f32::MIN_POSITIVE, 1e-37_f32, 1e-36] {
+            let config = SamplingConfig {
+                temperature: band,
+                top_k: 2,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+            };
+            let mut sampler = Sampler::new(config).with_seed(7);
+            assert_eq!(
+                sampler.sample(&logits),
+                1,
+                "residual-band temperature {band} must fall back to argmax, not collapse"
             );
         }
     }

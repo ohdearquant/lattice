@@ -14,12 +14,12 @@ pub(crate) fn sample_token(
         apply_repetition_penalty(&mut adjusted, previous_ids, cfg.repetition_penalty);
     }
 
-    // A non-finite (NaN/±inf) or non-positive temperature carries no valid
-    // scaling: `1.0 / NaN` is NaN and `1.0 / inf` is 0, either of which corrupts
-    // the distribution (NaN logits, or all logits flattened to a uniform draw).
-    // Route them all to deterministic greedy argmax before any scaling, matching
-    // Sampler::sample and the documented "0.0 = greedy" contract.
-    if !cfg.temperature.is_finite() || cfg.temperature <= 0.0 {
+    // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
+    // reciprocal overflows or scales a logit past f32::MAX) carries no valid
+    // scaling and is routed to deterministic greedy argmax before any scaling,
+    // matching Sampler::sample, the Metal paths, and the documented "0.0 = greedy"
+    // contract. See `crate::sampling::temperature_degenerate`.
+    if crate::sampling::temperature_degenerate(cfg.temperature) {
         return greedy_token(&adjusted);
     }
 
@@ -134,4 +134,55 @@ pub(crate) fn xorshift64(state: &mut u64) -> f32 {
     s ^= s << 17;
     *state = s;
     (s >> 11) as f32 / (1u64 << 53) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(temperature: f32, top_k: usize) -> GenerateConfig {
+        GenerateConfig {
+            temperature,
+            top_k,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_sample_token_degenerate_temperature_falls_back_to_argmax() {
+        // A degenerate temperature (non-finite, <= 0, reciprocal-overflow, or residual
+        // post-multiply-overflow band) must route to greedy argmax rather than scaling
+        // every logit to inf and collapsing the softmax draw to token 0. The highest
+        // logit is index 1, so every degenerate temperature must return 1.
+        let logits = [10.0_f32, 11.0, 9.0];
+        for bad in [
+            f32::NAN,
+            f32::INFINITY,
+            -1.0,
+            0.0,
+            1e-45,
+            1e-39,
+            f32::MIN_POSITIVE,
+            1e-37,
+        ] {
+            let mut rng = 7u64;
+            let token = sample_token(&logits, &cfg(bad, 0), &[], &mut rng);
+            assert_eq!(
+                token, 1,
+                "degenerate temperature {bad} must fall back to argmax (token 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sample_token_valid_temperature_unchanged() {
+        // A normal temperature must still take the scaling + softmax draw path
+        // (byte-identical to before the degeneracy guard) and produce a valid token.
+        let logits = [10.0_f32, 11.0, 9.0];
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg(0.7, 0), &[], &mut rng);
+        assert!(token < 3, "valid temperature must return an in-range token");
+    }
 }
