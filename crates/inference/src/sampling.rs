@@ -156,6 +156,16 @@ impl CandidateSet {
         probs.clear();
         probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
         let sum: f32 = probs.iter().sum();
+        // A finite max does not guarantee a finite sum: a NaN logit in a
+        // non-max position (NaN sorts last, so it does not become `max_logit`)
+        // makes its `exp()` NaN, poisoning `sum` and every normalised prob, and
+        // the weighted-sample loop below — `r < cumsum` is always false for a
+        // NaN cumsum — would fall through to the worst candidate. Fall back to
+        // the argmax (candidates[0] after the descending sort) instead, matching
+        // the non-finite-max guard above.
+        if !sum.is_finite() || sum <= 0.0 {
+            return self.candidates[0].token_id;
+        }
         for p in probs.iter_mut() {
             *p /= sum;
         }
@@ -683,13 +693,22 @@ unsafe fn select_top_k_neon(logits: &[f32], k: usize, inv_temp: f32, out: &mut V
 
 /// Descending-logit ordering with NaN-last and ascending token_id tie-breaking.
 /// Matches Metal `topk_better` semantics: higher logit wins; equal logits → lower token_id wins.
+///
+/// Two NaN logits compare *equal on the logit* and fall back to the token_id
+/// tie-break. The earlier `(true, _) => Greater` form returned `Greater` for
+/// both `(a, b)` and `(b, a)` when both were NaN, which is not antisymmetric —
+/// `sort_by`/`select_nth_unstable_by` require a total strict-weak order, so a
+/// NaN-heavy candidate set could sort nondeterministically. Resolving the
+/// NaN/NaN case by token_id restores a total order and keeps the tie-break
+/// deterministic (lowest id wins, as for finite ties).
 #[inline(always)]
 fn candidate_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a.logit.is_nan(), b.logit.is_nan()) {
-        (true, _) => Ordering::Greater,
-        (_, true) => Ordering::Less,
-        _ => b
+        (true, true) => a.token_id.cmp(&b.token_id),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => b
             .logit
             .partial_cmp(&a.logit)
             .unwrap_or(Ordering::Equal)
@@ -1078,6 +1097,81 @@ mod tests {
         cs.candidates.sort_by(candidate_order);
         assert_eq!(cs.candidates[0].token_id, 2);
         assert_eq!(cs.candidates[1].token_id, 5);
+    }
+
+    #[test]
+    fn test_candidate_order_nan_nan_antisymmetric() {
+        use std::cmp::Ordering;
+        // Two NaN-logit candidates must produce a valid total order: the
+        // comparator has to be antisymmetric (a<b ⇒ b>a) and break the tie
+        // deterministically by token_id. The old `(true, _) => Greater` form
+        // returned Greater for both (a,b) and (b,a), violating the strict-weak
+        // order contract of sort_by/select_nth_unstable_by.
+        let a = Candidate {
+            token_id: 3,
+            logit: f32::NAN,
+        };
+        let b = Candidate {
+            token_id: 7,
+            logit: f32::NAN,
+        };
+        assert_eq!(candidate_order(&a, &b), Ordering::Less);
+        assert_eq!(candidate_order(&b, &a), Ordering::Greater);
+        assert_eq!(candidate_order(&a, &a), Ordering::Equal);
+
+        // A multi-NaN set sorts deterministically by token_id.
+        let mut nans = [
+            Candidate {
+                token_id: 9,
+                logit: f32::NAN,
+            },
+            Candidate {
+                token_id: 1,
+                logit: f32::NAN,
+            },
+            Candidate {
+                token_id: 4,
+                logit: f32::NAN,
+            },
+        ];
+        nans.sort_by(candidate_order);
+        assert_eq!(
+            nans.iter().map(|c| c.token_id).collect::<Vec<_>>(),
+            vec![1, 4, 9],
+            "all-NaN set must sort by ascending token_id"
+        );
+    }
+
+    #[test]
+    fn test_sample_top_p_tail_nan_returns_argmax() {
+        // A NaN logit in a non-max position sorts last (so the finite max guard
+        // does not catch it), but its exp() poisons the softmax sum to NaN. The
+        // weighted-sample loop then never matches `r < cumsum` and would fall
+        // through to candidates.last() — the NaN-sorted-last token (id 1) — a
+        // garbage selection. The sum-finite guard must instead return the argmax
+        // (token 0, the highest finite logit). select_top_k sanitises NaN→-inf in
+        // the Sampler path, so this state is reachable via the public CandidateSet
+        // API; constructing one directly exercises the residual hole.
+        let mut cs = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 0,
+                logit: 100.0,
+            },
+            Candidate {
+                token_id: 1,
+                logit: f32::NAN,
+            },
+            Candidate {
+                token_id: 2,
+                logit: 50.0,
+            },
+        ]);
+        // r in the middle of the distribution; pre-fix this returns last() = 1.
+        let token = cs.sample_top_p(1.0, 0.5);
+        assert_eq!(
+            token, 0,
+            "tail-NaN poisons the softmax sum; must fall back to argmax (token 0), not last()"
+        );
     }
 
     // ── H1: select_top_k correctness tests ──────────────────────────────────
