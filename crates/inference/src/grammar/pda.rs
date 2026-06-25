@@ -268,13 +268,12 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                     if frame.sym_pos == 0 {
                         return try_next_alt(stack, grammar, b, frame_idx);
                     } else {
-                        // Mid-alternative mismatch: propagate to parent.
-                        if frame_idx == 0 {
-                            return false;
-                        }
-                        stack.truncate(frame_idx);
-                        let parent_idx = stack.len() - 1;
-                        return try_next_alt(stack, grammar, b, parent_idx);
+                        // Mid-alternative mismatch: bytes have already been
+                        // consumed under this alternative.  A byte-level matcher
+                        // without input rewind cannot un-consume them, so no
+                        // sibling or ancestor alternative can validly
+                        // reinterpret the current byte.  Reject.
+                        return false;
                     }
                 }
             }
@@ -318,6 +317,18 @@ fn try_next_alt(
     if next_alt >= num_alts {
         // No more alternatives at this level.
         // Try backtracking to the parent.
+        //
+        // KNOWN LIMITATION (not fixed here): this path can over-accept. If the
+        // parent has already consumed input bytes under its current alternative,
+        // switching the parent to a sibling alternative re-interprets the
+        // current byte as if those bytes were never consumed — this byte-level
+        // matcher has no input rewind. A correct guard needs per-frame
+        // byte-consumption tracking; a position (`sym_pos`) check is insufficient
+        // because a frame's `sym_pos` can advance past nullable nonterminals
+        // without consuming any byte (e.g. an optional numeric sign), so a naive
+        // guard over-rejects valid input like `[]`. The shared-prefix `anyOf`
+        // over-rejection is the dual of this. Tracked as a grammar-PDA soundness
+        // issue.
         if frame_idx == 0 {
             return false;
         }
@@ -685,6 +696,65 @@ mod tests {
         let g = or_grammar();
         let mut s = GrammarState::initial();
         assert_eq!(advance_byte(&mut s, &g, b'c'), StepResult::Rejected);
+    }
+
+    /// Grammar: root = "a" nonterm | "x" ; nonterm = "cd"
+    /// Root reserved first so it lands at index 0.
+    fn leading_terminal_then_nt_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let nt_id = b.reserve("nonterm");
+        b.set_alts(
+            nt_id,
+            vec![vec![Symbol::Terminal(b'c'), Symbol::Terminal(b'd')]],
+        );
+        b.set_alts(
+            root_id,
+            vec![
+                vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(nt_id)],
+                vec![Symbol::Terminal(b'x')],
+            ],
+        );
+        b.build()
+    }
+
+    #[test]
+    fn mid_alt_mismatch_does_not_rewind_consumed_bytes() {
+        // Regression for the mid-alternative backtrack hole.
+        // "acd" and "x" are the only strings this grammar accepts. Feeding
+        // "acx": 'a' commits root alt-0, 'c' commits nonterm's first byte, then
+        // 'x' mismatches nonterm's 'd'. The consumed 'a'/'c' bytes cannot be
+        // undone, so 'x' must be rejected at the byte level (it does NOT get to
+        // retry root alt-1 "x"). simulate_token therefore reports the token as
+        // ContextDependent (bytes consumed up to a boundary), never a full
+        // Accept. Before the fix, the parent backtrack wrongly accepted "acx".
+        let g = leading_terminal_then_nt_grammar();
+
+        let state = GrammarState::initial();
+        let (result, _) = simulate_token(&state, &g, b"acx");
+        assert_ne!(
+            result,
+            SimResult::Accept,
+            "mid-alternative mismatch must not rewind already-consumed bytes"
+        );
+
+        // Byte-level: after consuming "ac", the 'x' is rejected outright.
+        let mut s = GrammarState::initial();
+        assert_eq!(advance_byte(&mut s, &g, b'a'), StepResult::Accepted);
+        assert_eq!(advance_byte(&mut s, &g, b'c'), StepResult::Accepted);
+        assert_eq!(advance_byte(&mut s, &g, b'x'), StepResult::Rejected);
+    }
+
+    #[test]
+    fn leading_terminal_then_nt_accepts_valid() {
+        let g = leading_terminal_then_nt_grammar();
+        // "acd" via alt-0, "x" via alt-1 must both still be accepted.
+        let s0 = GrammarState::initial();
+        let (r_acd, _) = simulate_token(&s0, &g, b"acd");
+        assert_eq!(r_acd, SimResult::Accept);
+        let s1 = GrammarState::initial();
+        let (r_x, _) = simulate_token(&s1, &g, b"x");
+        assert_eq!(r_x, SimResult::Accept);
     }
 
     #[test]
