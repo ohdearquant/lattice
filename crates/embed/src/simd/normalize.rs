@@ -125,7 +125,11 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
     }
 
     let norm = norm_sq.sqrt();
-    if norm == 0.0 {
+    // Match `normalize_scalar`, which only scales when `norm > 0.0`. Rejecting
+    // NaN here too (a NaN element makes `norm` NaN) leaves the vector
+    // byte-identical to the scalar path instead of scaling by a NaN inv_norm.
+    // `is_nan() || <= 0.0` is the lint-clean equivalent of `!(norm > 0.0)`.
+    if norm.is_nan() || norm <= 0.0 {
         return;
     }
 
@@ -228,7 +232,10 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
     }
 
     let norm = norm_sq.sqrt();
-    if norm == 0.0 {
+    // Match `normalize_scalar`: reject 0.0 and NaN alike so a NaN-containing
+    // vector is left unchanged rather than scaled by NaN. `is_nan() || <= 0.0`
+    // is the lint-clean equivalent of `!(norm > 0.0)`.
+    if norm.is_nan() || norm <= 0.0 {
         return;
     }
 
@@ -325,7 +332,12 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
         norm_sq += val * val;
     }
 
-    if norm_sq == 0.0 {
+    // Match `normalize_scalar`: reject 0.0 and NaN alike. A subnormal-but-positive
+    // norm_sq still passes here and is handled by the finite-fallback below; only
+    // zero/NaN short-circuit to leave the vector unchanged, keeping NEON
+    // byte-consistent with the scalar path. `is_nan() || <= 0.0` is the lint-clean
+    // equivalent of `!(norm_sq > 0.0)`.
+    if norm_sq.is_nan() || norm_sq <= 0.0 {
         return;
     }
 
