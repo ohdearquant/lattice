@@ -366,6 +366,141 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Regression (issue #343): a left-recursive GBNF grammar (`root ::= root`)
+    /// must not hang. Before the PDA depth cap, `enumerate_grammar_states` grew
+    /// the PDA stack without bound inside a single `simulate_token` call. The
+    /// depth cap turns it into a bounded dead grammar; construction returns.
+    #[test]
+    fn cyclic_gbnf_does_not_hang() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::Gbnf("root ::= root\n".to_string());
+        let result = GrammarEngine::new(&spec, vocab);
+        // Bounded construction (Ok with a dead grammar) is the contract — the
+        // point is that it terminates rather than hanging or OOMing.
+        assert!(result.is_ok(), "cyclic GBNF should construct, not hang");
+    }
+
+    /// Regression (issue #343): a JSON-Schema `$ref` cycle compiles to a cyclic
+    /// grammar and previously hung at construction via the same PDA mechanism.
+    #[test]
+    fn cyclic_ref_schema_does_not_hang() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "$ref": "#/$defs/Node",
+            "$defs": { "Node": { "$ref": "#/$defs/Node" } }
+        }));
+        let result = GrammarEngine::new(&spec, vocab);
+        assert!(
+            result.is_ok(),
+            "cyclic $ref schema should construct, not hang"
+        );
+    }
+
+    /// Regression (issue #343): an array schema with an absurd `maxItems`
+    /// (near `u64::MAX`) previously overflowed the stack in `build_bounded_tail`.
+    /// It must now be rejected with a typed error at the parse boundary.
+    #[test]
+    fn array_maxitems_overflow_rejected() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array",
+            "items": { "type": "boolean" },
+            "maxItems": 18446744073709551615u64
+        }));
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("absurd maxItems must be rejected, not overflow the stack"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("maxItems"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Regression (issue #343): the `minItems` sibling — a near-`u64::MAX`
+    /// `minItems` drives the required-item loop ~1.8e19 times. Reject it too.
+    #[test]
+    fn array_minitems_overflow_rejected() {
+        let vocab = tiny_vocab();
+        let spec = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array",
+            "items": { "type": "boolean" },
+            "minItems": 18446744073709551615u64
+        }));
+        let err = match GrammarEngine::new(&spec, vocab) {
+            Ok(_) => panic!("absurd minItems must be rejected, not hang"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("minItems"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Regression (issue #343, codex finding B): a long *acyclic* `$defs`
+    /// reference chain (`N0→N1→…→Nk`, each a distinct unseen ref) recurses
+    /// `compile_schema` once per link. Without the depth cap this overflowed the
+    /// stack at compile time, independent of the PDA cycle fix. A 2000-link
+    /// chain (well past MAX_SCHEMA_DEPTH=512) must reject cleanly.
+    #[test]
+    fn deep_ref_chain_rejected() {
+        let n = 2000usize;
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            let target = if i + 1 < n {
+                serde_json::json!({ "$ref": format!("#/$defs/N{}", i + 1) })
+            } else {
+                serde_json::json!({ "type": "boolean" })
+            };
+            defs.insert(format!("N{i}"), target);
+        }
+        let schema = serde_json::json!({ "$ref": "#/$defs/N0", "$defs": defs });
+        let spec = GrammarSpec::JsonSchema(schema);
+        let err = match GrammarEngine::new(&spec, tiny_vocab()) {
+            Ok(_) => panic!("deep $ref chain must be rejected, not overflow the stack"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("depth"), "error should mention depth: {err}");
+    }
+
+    /// A short acyclic `$ref` chain (well under the cap) must still compile.
+    #[test]
+    fn shallow_ref_chain_accepted() {
+        let n = 64usize;
+        let mut defs = serde_json::Map::new();
+        for i in 0..n {
+            let target = if i + 1 < n {
+                serde_json::json!({ "$ref": format!("#/$defs/N{}", i + 1) })
+            } else {
+                serde_json::json!({ "type": "boolean" })
+            };
+            defs.insert(format!("N{i}"), target);
+        }
+        let schema = serde_json::json!({ "$ref": "#/$defs/N0", "$defs": defs });
+        let result = GrammarEngine::new(&GrammarSpec::JsonSchema(schema), tiny_vocab());
+        assert!(result.is_ok(), "a 64-link $ref chain should compile");
+    }
+
+    /// Boundary (issue #343, codex finding D): `maxItems` one past the cap is
+    /// rejected; a small in-range `maxItems` still compiles.
+    #[test]
+    fn array_maxitems_boundary() {
+        let over = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array", "items": { "type": "boolean" }, "maxItems": 4097
+        }));
+        assert!(
+            GrammarEngine::new(&over, tiny_vocab()).is_err(),
+            "maxItems just past the cap must be rejected"
+        );
+        let ok = GrammarSpec::JsonSchema(serde_json::json!({
+            "type": "array", "items": { "type": "boolean" }, "maxItems": 8
+        }));
+        assert!(
+            GrammarEngine::new(&ok, tiny_vocab()).is_ok(),
+            "a small in-range maxItems must still compile"
+        );
+    }
+
     #[test]
     fn mask_logits_blocks_disallowed() {
         // Boolean grammar: only "true" or "false" tokens allowed.

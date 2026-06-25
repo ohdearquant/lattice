@@ -33,6 +33,31 @@ use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
+/// materialize.
+///
+/// `build_cardinality_array_alt` emits one grammar rule (or symbol) per
+/// required/optional item, and `build_bounded_tail` recurses once per unit of
+/// `maxItems - minItems` slack. A parseable schema with `maxItems` or
+/// `minItems` near `u64::MAX` (e.g. `18446744073709551615`) therefore overflows
+/// the stack or exhausts memory at compile time — reachable from untrusted
+/// schema input at `GrammarEngine::new` (issue #343). Constrained decoding has
+/// no real use for arrays anywhere near this many items; reject beyond the cap
+/// at the parse boundary with a typed error.
+const MAX_ARRAY_CARDINALITY: usize = 4096;
+
+/// Maximum schema recursion depth the compiler will descend.
+///
+/// `compile_schema` is the single recursion hub: `$ref` targets, object
+/// properties, array items, and `anyOf`/`oneOf` branches all recurse back into
+/// it. A parseable schema with a long `$defs` reference chain
+/// (`A→B→C→…`, each a distinct unseen ref) or deeply nested objects therefore
+/// recurses once per link with no natural bound — a compile-time stack overflow
+/// reachable from untrusted schema input (issue #343, codex finding B). Cap the
+/// depth: `serde_json` itself rejects JSON nested beyond 128, and no legitimate
+/// schema chains references or nests anywhere near 512 levels.
+const MAX_SCHEMA_DEPTH: usize = 512;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -101,6 +126,9 @@ struct CompileCtx<'a> {
     /// (issue #310 finding #2: each array node gets a unique suffix to prevent
     /// rule sharing across distinct array schemas in the same document).
     array_counter: usize,
+    /// Current `compile_schema` recursion depth (issue #343: bound compile-time
+    /// recursion through `$ref` chains and deep nesting).
+    depth: usize,
 }
 
 impl<'a> CompileCtx<'a> {
@@ -126,11 +154,33 @@ impl<'a> CompileCtx<'a> {
             builder,
             enum_counter: 0,
             array_counter: 0,
+            depth: 0,
         })
     }
 
     /// Compile `schema` into a list of alternatives.
+    ///
+    /// Thin recursion-depth wrapper around [`Self::compile_schema_inner`]: every
+    /// recursive descent (refs, properties, items, `anyOf`) re-enters here, so a
+    /// single depth cap bounds all compile-time recursion (issue #343).
     fn compile_schema(
+        &mut self,
+        schema: &'a Value,
+        path: &[&str],
+    ) -> Result<Vec<Alt>, SchemaError> {
+        self.depth += 1;
+        if self.depth > MAX_SCHEMA_DEPTH {
+            self.depth -= 1;
+            return Err(SchemaError(format!(
+                "schema nesting / $ref chain exceeds the supported depth ({MAX_SCHEMA_DEPTH})"
+            )));
+        }
+        let result = self.compile_schema_inner(schema, path);
+        self.depth -= 1;
+        result
+    }
+
+    fn compile_schema_inner(
         &mut self,
         schema: &'a Value,
         _path: &[&str],
@@ -344,6 +394,24 @@ impl<'a> CompileCtx<'a> {
             .get("maxItems")
             .and_then(Value::as_u64)
             .map(|v| v as usize);
+
+        // issue #343: cap cardinality before materializing per-item rules.
+        // `build_bounded_tail` recurses once per unit of slack and the required-
+        // item loop emits one symbol group per `minItems`, so an absurd
+        // `minItems`/`maxItems` (e.g. u64::MAX) overflows the stack / exhausts
+        // memory at compile time. Reject at the parse boundary.
+        if min_items > MAX_ARRAY_CARDINALITY {
+            return Err(SchemaError(format!(
+                "array schema minItems ({min_items}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
+            )));
+        }
+        if let Some(max) = max_items {
+            if max > MAX_ARRAY_CARDINALITY {
+                return Err(SchemaError(format!(
+                    "array schema maxItems ({max}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
+                )));
+            }
+        }
 
         // issue #310 finding #2: validate cardinality constraints up front.
         if let Some(max) = max_items {
