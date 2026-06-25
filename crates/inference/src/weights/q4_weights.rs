@@ -595,6 +595,34 @@ pub struct Q4FileHeader {
     pub payload_offset: u64,
 }
 
+/// Validate a header-declared element count before allocating a buffer for it.
+///
+/// Custom `.q4`/`.f16` files carry untrusted `ndim`/`original_len`/`numel` fields
+/// straight from disk. Without this guard, a crafted header can (a) overflow the
+/// `count * elem_size` multiply (silently producing a wrong-sized buffer in release)
+/// or (b) request an allocation far larger than the file, aborting the process with
+/// an OOM. Both are denial-of-service / silent-corruption vectors on the
+/// untrusted-checkpoint boundary (weight-loading sweep over #341/#342). A legitimate
+/// payload is physically present in the file, so its byte length can never exceed
+/// `file_len`; bounding by `file_len` therefore rejects only adversarial over-claims.
+fn checked_alloc_bytes(
+    count: usize,
+    elem_size: usize,
+    file_len: u64,
+    what: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let bytes = count
+        .checked_mul(elem_size)
+        .ok_or_else(|| format!("{what}: element count {count} × {elem_size} overflows usize"))?;
+    if bytes as u64 > file_len {
+        return Err(format!(
+            "{what}: header claims {bytes} bytes but file is only {file_len} bytes"
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 /// Parse the header of a `.q4` file without reading the block payload.
 ///
 /// On return the file cursor is positioned at the start of the block data.
@@ -604,6 +632,7 @@ pub struct Q4FileHeader {
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
     use std::io::Read;
+    let file_len = file.metadata()?.len();
     let mut f = std::io::BufReader::new(file);
 
     let mut magic = [0u8; 4];
@@ -624,6 +653,7 @@ pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std:
 
     f.read_exact(&mut b4)?;
     let ndim = u32::from_le_bytes(b4) as usize;
+    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
     let mut shape = Vec::with_capacity(ndim);
     let mut b8 = [0u8; 8];
     for _ in 0..ndim {
@@ -652,6 +682,7 @@ pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std:
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -671,6 +702,7 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 
     f.read_exact(&mut b4)?;
     let ndim = u32::from_le_bytes(b4) as usize;
+    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
     let mut shape = Vec::with_capacity(ndim);
     let mut b8 = [0u8; 8];
     for _ in 0..ndim {
@@ -682,7 +714,8 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
     let original_len = u64::from_le_bytes(b8) as usize;
     let n_blocks = original_len.div_ceil(32);
 
-    let mut raw = vec![0u8; n_blocks * 20];
+    let raw_len = checked_alloc_bytes(n_blocks, 20, file_len, "block payload")?;
+    let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
 
     let blocks: Vec<Q4Block> = raw
@@ -721,6 +754,7 @@ pub fn load_f16_tensor_file(
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -741,6 +775,7 @@ pub fn load_f16_tensor_file(
 
     f.read_exact(&mut b4)?;
     let ndim = u32::from_le_bytes(b4) as usize;
+    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
     let mut shape = Vec::with_capacity(ndim);
     let mut b8 = [0u8; 8];
     for _ in 0..ndim {
@@ -751,7 +786,8 @@ pub fn load_f16_tensor_file(
     f.read_exact(&mut b8)?;
     let numel = u64::from_le_bytes(b8) as usize;
 
-    let mut raw = vec![0u8; numel * 2];
+    let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
+    let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
 
     let values: Vec<f32> = raw
@@ -1501,6 +1537,101 @@ mod tests {
         assert!(
             max_err < 0.5,
             "max abs error {max_err:.4} >= 0.5 for exact 2-block input"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Adversarial header guards (weight-loading sweep): a crafted .q4/.f16
+    // header must yield a clean Err, never an integer-overflow buffer or a
+    // process-aborting OOM allocation.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_q4_rejects_huge_ndim() {
+        // ndim = u32::MAX → unguarded Vec::with_capacity(ndim) is a ~34 GB OOM.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let path = std::path::PathBuf::from("/tmp/test_q4_huge_ndim.q4");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_q4_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "u32::MAX ndim must be rejected, not OOM-aborted"
+        );
+    }
+
+    #[test]
+    fn test_read_q4_header_rejects_huge_ndim() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let path = std::path::PathBuf::from("/tmp/test_q4_header_huge_ndim.q4");
+        std::fs::write(&path, &buf).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let r = read_q4_header(&file);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "u32::MAX ndim in read_q4_header must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_q4_rejects_huge_original_len() {
+        // original_len = 2^62 → unguarded n_blocks*20 is a ~2.9 EB OOM.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(1u64 << 62).to_le_bytes()); // original_len
+        let path = std::path::PathBuf::from("/tmp/test_q4_huge_len.q4");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_q4_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "2^62 original_len must be rejected, not OOM-aborted"
+        );
+    }
+
+    #[test]
+    fn test_f16_rejects_huge_numel() {
+        // numel = 2^63 → unguarded numel*2 overflows usize to 0, silently
+        // returning ([], [shape]) — wrong data with no error. Must be Err now.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(1u64 << 63).to_le_bytes()); // numel
+        let path = std::path::PathBuf::from("/tmp/test_f16_huge_numel.f16");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_f16_tensor_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "2^63 numel must be rejected, not silently truncated to empty"
+        );
+    }
+
+    #[test]
+    fn test_f16_rejects_huge_ndim() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let path = std::path::PathBuf::from("/tmp/test_f16_huge_ndim.f16");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_f16_tensor_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "u32::MAX ndim in .f16 must be rejected, not OOM-aborted"
         );
     }
 }
