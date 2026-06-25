@@ -365,6 +365,17 @@ impl Qwen35Config {
             }
         }
         if cfg.layer_types.len() != cfg.num_hidden_layers {
+            // compute_layer_types uses `(i + 1) % interval`; a zero interval (from an
+            // explicit `"full_attention_interval": 0`, or the container `#[serde(default)]`
+            // fallback when a preset's interval is zero) would panic with a remainder
+            // divide-by-zero. Malformed input must surface as a typed error, not a panic.
+            if cfg.full_attention_interval == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid Qwen config.json: full_attention_interval must be > 0 when \
+                     layer_types is absent or its length differs from num_hidden_layers"
+                        .to_string(),
+                ));
+            }
             cfg.layer_types =
                 compute_layer_types(cfg.num_hidden_layers, cfg.full_attention_interval);
         }
@@ -926,6 +937,29 @@ mod tests {
         assert!(
             cfg.layer_mask.iter().all(|&v| v),
             "normalized mask must be all-true"
+        );
+    }
+
+    #[test]
+    fn test_zero_full_attention_interval_errors_not_panics() {
+        // A config.json with full_attention_interval: 0 must return a clean
+        // InferenceError, never panic. layer_types is omitted, so the container
+        // #[serde(default)] fills it from the preset (whose length differs from
+        // num_hidden_layers: 4), forcing the recompute branch that calls
+        // compute_layer_types(4, 0) -> (i + 1) % 0 -> divide-by-zero panic
+        // without the guard.
+        let json = r#"{
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 4,
+                "full_attention_interval": 0,
+                "eos_token_id": 1
+            }
+        }"#;
+        let result = Qwen35Config::from_config_json_str(json);
+        assert!(
+            result.is_err(),
+            "full_attention_interval: 0 must yield an InferenceError, not panic"
         );
     }
 
