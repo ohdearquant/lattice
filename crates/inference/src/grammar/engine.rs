@@ -495,6 +495,15 @@ mod tests {
             assert!(engine.advance(&mut state, 1), "mid-chain 'a' accepted");
         }
 
+        // The deep state must NOT be in the enumerated partition — otherwise
+        // this test exercises the precomputed fast path, not the simulation
+        // fallback it is meant to cover.
+        assert!(
+            engine.find_state_id(&state).is_none(),
+            "deep state must be unknown to the capped partition (else the \
+             simulation fallback is not the path under test)"
+        );
+
         let mut logits = vec![1.0f32, 1.0f32];
         engine.mask_logits(&mut state, &mut logits);
 
