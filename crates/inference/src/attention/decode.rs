@@ -7,6 +7,34 @@ use crate::attention::gqa::GqaConfig;
 #[cfg(target_arch = "aarch64")]
 use crate::forward::cpu::simd_config;
 
+/// Release-active overflow guard for the decode shape products.
+///
+/// Every product below feeds either a length assertion or an unsafe NEON
+/// pointer offset in the decode kernels. A wrapping `usize` product (e.g. an
+/// absurd `num_heads` near `usize::MAX / head_dim`) would make the length
+/// checks accept impossible buffers and let the SIMD path read out of bounds.
+/// Reject overflow before any unsafe dispatch, matching the FlatKVCache
+/// checked-arithmetic precedent.
+#[inline]
+fn assert_decode_no_overflow(cfg: GqaConfig, kv_seq_len: usize, score_stride: usize) {
+    assert!(
+        cfg.num_heads.checked_mul(cfg.head_dim).is_some(),
+        "decode shape overflow: num_heads * head_dim"
+    );
+    assert!(
+        cfg.num_kv_heads.checked_mul(cfg.head_dim).is_some(),
+        "decode shape overflow: num_kv_heads * head_dim"
+    );
+    assert!(
+        cfg.num_heads.checked_mul(score_stride).is_some(),
+        "decode shape overflow: num_heads * score_stride"
+    );
+    assert!(
+        kv_seq_len.checked_mul(cfg.kv_dim()).is_some(),
+        "decode shape overflow: kv_seq_len * kv_dim"
+    );
+}
+
 /// **Unstable**: compute decode-time attention scores for one query token.
 ///
 /// Layouts:
@@ -31,6 +59,7 @@ pub fn decode_attention_scores(
         0,
         "num_heads must be divisible by num_kv_heads"
     );
+    assert_decode_no_overflow(cfg, kv_seq_len, score_stride);
     assert_eq!(q_buf.len(), cfg.q_dim(), "q_buf length mismatch");
     assert_eq!(
         k_buf.len(),
@@ -85,6 +114,7 @@ pub fn decode_attention(
         0,
         "num_heads must be divisible by num_kv_heads"
     );
+    assert_decode_no_overflow(cfg, kv_seq_len, score_stride);
     assert_eq!(q_buf.len(), cfg.q_dim(), "q_buf length mismatch");
     assert_eq!(attn_out.len(), cfg.q_dim(), "attn_out length mismatch");
     assert!(
@@ -335,6 +365,19 @@ unsafe fn softmax_decode_neon(
             max_val = max_val.max(*ptr.add(i));
         }
 
+        // Fail closed on a non-finite row max (e.g. a `+inf` score). The fast-exp
+        // path turns `finite - inf = -inf` into a tiny positive value and
+        // `inf - inf = NaN` into 0, so `sum` stays small-but-finite-positive and
+        // the normalizer would hand all probability mass to finite losers. Emit a
+        // zero row instead, matching the scalar `softmax_decode_scores` behavior
+        // (`l > 0.0` is false for a non-finite normalizer → `row.fill(0.0)`).
+        if !max_val.is_finite() {
+            for i in 0..kv_seq_len {
+                *ptr.add(i) = 0.0;
+            }
+            continue;
+        }
+
         // Pass 2: exp(x - max) + accumulate sum
         let vmax_bcast = vdupq_n_f32(max_val);
         let mut s0 = vdupq_n_f32(0.0);
@@ -375,8 +418,10 @@ unsafe fn softmax_decode_neon(
             sum += e;
         }
 
-        // Pass 3: normalize
-        if sum > 0.0 {
+        // Pass 3: normalize. Require a finite positive sum so a finite row max
+        // with a `NaN` score (sum becomes `NaN`) also fails closed, matching the
+        // scalar path rather than normalizing against `NaN`.
+        if sum.is_finite() && sum > 0.0 {
             let vinv = vdupq_n_f32(1.0 / sum);
             for c in 0..chunks {
                 let base = c * 16;
@@ -719,5 +764,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `+inf` score must fail closed (zero row), matching the scalar path,
+    /// rather than letting finite-loser fast-exp mass win the softmax. Uses
+    /// `kv_seq_len=16` so the NEON path exercises its chunked max-reduction.
+    #[test]
+    fn test_decode_softmax_pos_inf_score_fails_closed() {
+        let cfg = GqaConfig {
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+        };
+        let kv_seq_len = 16;
+        let q = vec![1.0e20f32];
+        let mut k = vec![0.0f32; kv_seq_len * cfg.kv_dim()];
+        k[5] = 1.0e20; // q·k overflows f32 -> +inf score at position 5
+        let v: Vec<f32> = (0..kv_seq_len).map(|i| (i as f32 + 1.0) * 10.0).collect();
+        let mut out = vec![0.0f32; cfg.q_dim()];
+        let mut scores = vec![0.0f32; cfg.num_heads * kv_seq_len];
+        decode_attention(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mut scores,
+            kv_seq_len,
+            cfg,
+            kv_seq_len,
+        );
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "non-finite output: {out:?}"
+        );
+        assert!(
+            out.iter().all(|&x| x == 0.0),
+            "expected fail-closed zero row, got {out:?}"
+        );
+    }
+
+    /// An absurd `num_heads` makes `num_heads * head_dim` wrap `usize`; the
+    /// release-active overflow guard must reject it before any length check or
+    /// unsafe NEON dispatch can act on the wrapped (too-small) product.
+    #[test]
+    #[should_panic(expected = "decode shape overflow")]
+    fn test_decode_overflow_guard_panics() {
+        let cfg = GqaConfig {
+            num_heads: usize::MAX / 8 + 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+        };
+        let mut scores: Vec<f32> = Vec::new();
+        decode_attention_scores(&[], &[], &mut scores, 1, cfg, 8);
     }
 }
