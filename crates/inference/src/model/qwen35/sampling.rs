@@ -296,49 +296,29 @@ mod tests {
 
     #[test]
     fn draw_from_distribution_uses_strict_less_than() {
-        // Verify the draw boundary is `r < cumsum`, not `r <= cumsum`.
-        //
-        // Two-token distribution: prob 0.6 for token 0, prob 0.4 for token 1.
-        // We use two hardcoded seeds with known xorshift64 outputs:
-        //   seed 0x1234_5678_9abc_def0 -> r ≈ 0.9941  (> 0.6): must select token 1
-        //   seed 0xdead_beef_cafe_1234 -> r ≈ 0.1557  (< 0.6): must select token 0
-        //
-        // These were verified against the canonical xorshift64_next + uniform_f32_from_u64
-        // implementation at the time this test was written.
-        let probs: Vec<(usize, f32)> = vec![(0, 0.6), (1, 0.4)];
+        // Lock the draw boundary as `r < cumsum`, NOT `r <= cumsum`. The two
+        // operators only differ when `r` exactly equals a partial cumsum, so we
+        // construct precisely that case: make the first token's probability equal
+        // the drawn `r`. Then cumsum-after-token-0 == r exactly, and
+        //   `r < cumsum`  -> `r < r`  == false -> skip token 0, select token 1
+        //   `r <= cumsum` -> `r <= r` == true  -> select token 0
+        // so a regression back to `<=` flips this assertion and fails the test.
+        let seed = 0x1234_5678_9abc_def0u64;
 
-        // Verify the expected r values hold (catches any future primitive change).
-        let seed_high = 0x1234_5678_9abc_def0u64;
-        let mut s = seed_high;
-        let r_high = xorshift64(&mut s);
-        assert!(
-            r_high > 0.6 && r_high < 1.0,
-            "seed {seed_high:#018x} must produce r > 0.6, got {r_high}"
-        );
+        // Draw r the same way draw_from_distribution will (advance a copy).
+        let mut probe = seed;
+        let r = xorshift64(&mut probe);
+        assert!((0.0..1.0).contains(&r), "r must be in [0, 1), got {r}");
 
-        let seed_low = 0xdead_beef_cafe_1234u64;
-        let mut s = seed_low;
-        let r_low = xorshift64(&mut s);
-        assert!(
-            r_low < 0.6,
-            "seed {seed_low:#018x} must produce r < 0.6, got {r_low}"
-        );
+        // First token's prob == r exactly; cumsum after it is `0.0 + r == r` (exact in f32).
+        let probs: Vec<(usize, f32)> = vec![(0, r), (1, 1.0 - r)];
 
-        // With r > 0.6: cumsum after token 0 is 0.6, which is NOT > r, so strict `r < cumsum`
-        // is false → skip token 0.  Cumsum after token 1 is 1.0 > r → select token 1.
-        // Under the old `r <= cumsum` boundary this would also select token 1 here, but
-        // the canonical `<` is what the spec requires and what this test locks in.
-        let mut rng_high = seed_high;
-        let token_high = draw_from_distribution(&probs, &mut rng_high);
+        let mut rng = seed;
+        let token = draw_from_distribution(&probs, &mut rng);
         assert_eq!(
-            token_high, 1,
-            "r={r_high} > 0.6 must skip the first token (cumsum=0.6) and select token 1"
+            token, 1,
+            "with cumsum==r at the boundary, strict `r < cumsum` must skip token 0 \
+             and select token 1 (a `r <= cumsum` regression would select token 0)"
         );
-
-        // With r < 0.6: cumsum after token 0 is 0.6 > r → strict `r < cumsum` is true
-        // → select token 0 immediately.
-        let mut rng_low = seed_low;
-        let token_low = draw_from_distribution(&probs, &mut rng_low);
-        assert_eq!(token_low, 0, "r={r_low} < 0.6 must select token 0");
     }
 }
