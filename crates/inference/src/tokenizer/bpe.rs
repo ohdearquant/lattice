@@ -216,6 +216,13 @@ impl BpeTokenizer {
         }
 
         let mut special_tokens = added_tokens;
+        // A zero-length special token would match at every position
+        // (`"".starts_with(_)` is always true), so match_special returns the
+        // same `pos` and tokenize() never advances — an infinite loop with
+        // unbounded output. A malformed tokenizer.json (an added_token whose
+        // "content" is empty) must not be able to wedge the engine: drop
+        // zero-length specials at construction.
+        special_tokens.retain(|name, _| !name.is_empty());
         for name in [
             "<|endoftext|>",
             "<|im_start|>",
@@ -1158,6 +1165,45 @@ mod tests {
         let tokenizer = synthetic_bpe();
         let ids = tokenizer.tokenize_to_ids("hello world");
         assert_eq!(ids, vec![11, 16]);
+    }
+
+    #[test]
+    fn test_empty_content_special_token_does_not_hang() {
+        // Regression: a malformed tokenizer.json with a zero-length added-token
+        // `content` injects "" into special_tokens. `"".starts_with(_)` is
+        // always true, so match_special returns the same `pos` and
+        // tokenize_to_ids_into never advances — an infinite loop with unbounded
+        // output on the first tokenize() call. The constructor must drop
+        // zero-length special tokens. Run in a worker thread so a re-introduced
+        // hang fails fast via timeout instead of stalling the test binary.
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2)] {
+            vocab.insert(s.to_string(), i);
+        }
+        let mut added = HashMap::new();
+        added.insert(String::new(), 0u32);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            added,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct tokenizer with empty special token");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(tokenizer.tokenize("abc").real_length);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(len) => assert!(
+                len < 1000,
+                "empty special token produced runaway output ({len}); zero-length specials must be dropped"
+            ),
+            Err(_) => {
+                panic!("tokenize() hung on a zero-length special token (infinite-loop regression)")
+            }
+        }
     }
 
     #[test]
