@@ -301,6 +301,31 @@ impl SentencePieceTokenizer {
             InferenceError::Tokenizer("SentencePiece model missing unk_id".into())
         })?;
         let pad_id = model.pad_id.unwrap_or(unk_id);
+
+        // A malformed tokenizer.json (`model.unk_id`) or native `.model` trainer_spec
+        // (unk/bos/eos/pad fields) can declare a special-token id past the end of the
+        // vocabulary — the value is cast `as u32` with no bounds check at parse time.
+        // viterbi_encode emits `unk_id` directly for unmatched input, and bos/eos are
+        // prepended/appended, so an out-of-range id flows straight into the model's
+        // embedding gather (out-of-bounds read) or `id_to_piece` lookup. Reject the
+        // malformed model at construction rather than emit an invalid token id (mirrors
+        // the BPE/WordPiece malformed-tokenizer guards).
+        let vocab_len = model.pieces.len() as u32;
+        for (name, id) in [
+            ("unk_id", Some(unk_id)),
+            ("pad_id", Some(pad_id)),
+            ("bos_id", model.bos_id),
+            ("eos_id", model.eos_id),
+        ] {
+            if let Some(id) = id {
+                if id >= vocab_len {
+                    return Err(InferenceError::Tokenizer(format!(
+                        "SentencePiece {name} ({id}) out of range for vocab size {vocab_len}"
+                    )));
+                }
+            }
+        }
+
         let min_score = model
             .pieces
             .iter()
@@ -907,6 +932,53 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_out_of_range_special_id_rejected_at_construction() {
+        // A malformed tokenizer.json / .model can declare unk_id (or bos/eos/pad) past
+        // the end of the vocab; the value is cast `as u32` with no bounds check at parse
+        // time. Without the construction guard, from_parsed_model would build a tokenizer
+        // that emits that out-of-range id from viterbi_encode's unmatched-char fallback,
+        // which then indexes the model's embedding table out of bounds. Construction must
+        // reject it. Here vocab has 3 pieces (ids 0..3) and unk_id = 5.
+        let pieces = vec![
+            SentencePieceEntry {
+                piece: "<unk>".to_string(),
+                score: -10.0,
+                kind: SentencePieceType::Unknown,
+            },
+            SentencePieceEntry {
+                piece: "▁a".to_string(),
+                score: 1.0,
+                kind: SentencePieceType::Normal,
+            },
+            SentencePieceEntry {
+                piece: "▁b".to_string(),
+                score: 1.0,
+                kind: SentencePieceType::Normal,
+            },
+        ];
+        let result = SentencePieceTokenizer::from_pieces_for_test(pieces, 5);
+        assert!(
+            result.is_err(),
+            "an out-of-range unk_id must be rejected at construction, not emitted at tokenize time"
+        );
+    }
+
+    #[test]
+    fn test_out_of_range_unk_id_rejected_from_json() {
+        // The tokenizer.json loader path (from_tokenizer_json_str -> from_parsed_model)
+        // casts `model.unk_id` `as u32` with no bounds check. A malformed file declaring
+        // unk_id past the vocab end must be rejected at construction, mirroring the
+        // .model path covered by from_pieces_for_test above. Vocab has 2 pieces (ids 0,1)
+        // and unk_id = 4.
+        let json = r#"{"model":{"type":"Unigram","unk_id":4,"vocab":[["<unk>",0.0],["▁a",-1.0]]}}"#;
+        let result = SentencePieceTokenizer::from_tokenizer_json_str(json);
+        assert!(
+            result.is_err(),
+            "an out-of-range unk_id from tokenizer.json must be rejected at construction"
+        );
     }
 
     #[test]
