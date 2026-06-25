@@ -179,3 +179,69 @@ fn f2_multi_array_no_collision() {
         "a must reject booleans (its own item schema is integer)"
     );
 }
+
+#[test]
+fn f2_no_items_cardinality() {
+    // codex #1: cardinality must be enforced even without an `items` schema.
+    let g0 = compile_json_schema(&serde_json::json!({"type":"array","maxItems":0})).unwrap();
+    assert!(
+        full_accept(&g0, b"[]"),
+        "[] accepted (maxItems:0, no items)"
+    );
+    assert!(
+        !full_accept(&g0, b"[1]"),
+        "[1] rejected (maxItems:0, no items)"
+    );
+    let g2 = compile_json_schema(&serde_json::json!({"type":"array","minItems":2,"maxItems":2}))
+        .unwrap();
+    assert!(
+        full_accept(&g2, b"[1,2]"),
+        "[1,2] accepted (2<=2<=2, no items)"
+    );
+    assert!(!full_accept(&g2, b"[1]"), "[1] rejected (minItems:2)");
+    assert!(
+        !full_accept(&g2, b"[1,2,3]"),
+        "[1,2,3] rejected (maxItems:2)"
+    );
+}
+
+#[test]
+fn f3_prefix_items_maxitems() {
+    // critic F1 / codex #2: prefixItems + items must honor maxItems.
+    let g = compile_json_schema(&serde_json::json!(
+        {"type":"array","prefixItems":[{"type":"integer"}],"items":{"type":"integer"},"maxItems":2}
+    ))
+    .unwrap();
+    assert!(full_accept(&g, b"[1]"), "[1] accepted (1<=2)");
+    assert!(full_accept(&g, b"[1,2]"), "[1,2] accepted (2<=2)");
+    assert!(
+        !full_accept(&g, b"[1,2,3]"),
+        "[1,2,3] rejected (maxItems:2)"
+    );
+}
+
+#[test]
+fn f3_prefix_maxitems_lt_prefixlen_error() {
+    // maxItems below the fixed prefix length is unsatisfiable -> compile error.
+    let r = compile_json_schema(&serde_json::json!(
+        {"type":"array","prefixItems":[{"const":1},{"const":2}],"maxItems":1}
+    ));
+    assert!(
+        r.is_err(),
+        "maxItems(1) < prefixItems len(2) must be a compile error"
+    );
+}
+
+#[test]
+fn f3_empty_prefix_items_applies_items() {
+    // codex #3: empty prefixItems == no prefixItems; `items` must apply.
+    let g = compile_json_schema(&serde_json::json!(
+        {"type":"array","prefixItems":[],"items":{"type":"integer"}}
+    ))
+    .unwrap();
+    assert!(
+        full_accept(&g, b"[1]"),
+        "[1] accepted (empty prefixItems, items=integer)"
+    );
+    assert!(full_accept(&g, b"[]"), "[] accepted");
+}

@@ -362,13 +362,33 @@ impl<'a> CompileCtx<'a> {
             .map(Vec::as_slice);
 
         if let Some(prefix_schemas) = prefix_items {
-            // Assign a unique counter for this array node.
-            let n = self.array_counter;
-            self.array_counter += 1;
-
+            // Only process non-empty prefixItems here; empty prefixItems falls
+            // through to the items / no-items handling below (JSON-Schema 2020-12:
+            // empty prefixItems ≡ no prefixItems).
             if !prefix_schemas.is_empty() {
+                // Assign a unique counter for this array node (only when we will
+                // actually emit array helper rules).
+                let n = self.array_counter;
+                self.array_counter += 1;
+
+                let p = prefix_schemas.len();
+
+                // Cardinality validation against the fixed prefix length.
+                if let Some(m) = max_items {
+                    if m < p {
+                        return Err(SchemaError(format!(
+                            "array maxItems ({m}) < prefixItems length ({p})"
+                        )));
+                    }
+                }
+                if min_items > p {
+                    return Err(SchemaError(format!(
+                        "array minItems ({min_items}) > prefixItems length ({p}) is not supported with prefixItems"
+                    )));
+                }
+
                 // Compile each positional item schema into a named rule.
-                let mut pos_ids: Vec<usize> = Vec::with_capacity(prefix_schemas.len());
+                let mut pos_ids: Vec<usize> = Vec::with_capacity(p);
                 for (i, pos_schema) in prefix_schemas.iter().enumerate() {
                     let pos_rule = format!("arr_{n}_prefix_{i}");
                     let pos_id = self.builder.reserve(&pos_rule);
@@ -377,7 +397,7 @@ impl<'a> CompileCtx<'a> {
                     pos_ids.push(pos_id);
                 }
 
-                // Build: `[` ws p0 ws `,` ws p1 ws `,` ... ws `]`
+                // Build: `[` ws p0 ws `,` ws p1 ws `,` ... ws
                 let mut alt: Alt = vec![Symbol::Terminal(b'[')];
                 alt.push(Symbol::NonTerminal(ws_id));
                 for (i, &pid) in pos_ids.iter().enumerate() {
@@ -389,40 +409,25 @@ impl<'a> CompileCtx<'a> {
                     alt.push(Symbol::NonTerminal(ws_id));
                 }
 
-                // If `items` is also present, append an unbounded uniform tail.
+                // If `items` is also present, append a bounded uniform tail.
+                // p prefix items already emitted; max >= p validated above.
+                // slack = None → unbounded; slack = Some(0) → epsilon (no extra items).
                 if let Some(items_schema) = schema.get("items") {
                     let item_rule = format!("arr_{n}_item");
                     let item_id = self.builder.reserve(&item_rule);
                     let item_alts = self.compile_schema(items_schema, &[])?;
                     self.builder.set_alts(item_id, item_alts);
 
-                    // tail: (ws `,` ws item)*  right-recursive
-                    let tail_rule = format!("arr_{n}_tail");
-                    let tail_id = self.builder.reserve(&tail_rule);
-                    let tail_alts = vec![
-                        vec![
-                            Symbol::Terminal(b','),
-                            Symbol::NonTerminal(ws_id),
-                            Symbol::NonTerminal(item_id),
-                            Symbol::NonTerminal(ws_id),
-                            Symbol::NonTerminal(tail_id),
-                        ],
-                        vec![], // epsilon
-                    ];
-                    self.builder.set_alts(tail_id, tail_alts);
+                    // depth=1: leading-comma continuation after the fixed prefix.
+                    let slack = max_items.map(|m| m - p);
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
                     alt.push(Symbol::NonTerminal(tail_id));
                 }
 
                 alt.push(Symbol::Terminal(b']'));
                 return Ok(vec![alt]);
-            } else {
-                // Empty prefixItems: closed empty tuple; only `[]` valid.
-                return Ok(vec![vec![
-                    Symbol::Terminal(b'['),
-                    Symbol::NonTerminal(ws_id),
-                    Symbol::Terminal(b']'),
-                ]]);
             }
+            // else: empty prefixItems — fall through to items / no-items handling.
         }
 
         if let Some(items_schema) = schema.get("items") {
@@ -437,58 +442,7 @@ impl<'a> CompileCtx<'a> {
             let item_alts = self.compile_schema(items_schema, &[])?;
             self.builder.set_alts(item_id, item_alts);
 
-            // Build the array body based on [min_items, max_items] cardinality.
-            // issue #310 finding #2: bounded array cardinality.
-            //
-            // Grammar shape:
-            //   - Required head: `item (ws , ws item){min_items - 1}` when min_items >= 1
-            //   - Optional tail:
-            //       * max_items = None:     unbounded right-recursive tail
-            //       * max_items = Some(m):  nested-optional structure allowing
-            //                               at most (m - min_items) further items
-            let mut alt: Alt = vec![Symbol::Terminal(b'[')];
-            alt.push(Symbol::NonTerminal(ws_id));
-
-            let slack = max_items.map(|m| m - min_items); // None = unbounded
-
-            match (min_items, max_items) {
-                (0, Some(0)) => {
-                    // Only `[]` is valid; no items at all.
-                }
-                (0, _) => {
-                    // All items are optional.  Build an optional head + optional tail.
-                    if slack == Some(0) {
-                        // max_items == 0 handled above; this branch unreachable,
-                        // but be explicit: zero slack with zero required = empty.
-                    } else {
-                        // Build optional body: first item is optional, subsequent
-                        // items each carry a leading comma.
-                        // opt_body_{n} = item ws opt_tail_{n,k}  |  ε
-                        let body_id = self.build_bounded_tail(n, 0, slack, item_id, ws_id);
-                        alt.push(Symbol::NonTerminal(body_id));
-                    }
-                }
-                (min, _) => {
-                    // Emit exactly `min` required items (first without leading comma,
-                    // remaining with leading comma).
-                    alt.push(Symbol::NonTerminal(item_id));
-                    alt.push(Symbol::NonTerminal(ws_id));
-                    for _ in 1..min {
-                        alt.push(Symbol::Terminal(b','));
-                        alt.push(Symbol::NonTerminal(ws_id));
-                        alt.push(Symbol::NonTerminal(item_id));
-                        alt.push(Symbol::NonTerminal(ws_id));
-                    }
-
-                    // Append optional tail for additional items (up to slack more).
-                    if slack != Some(0) {
-                        let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
-                        alt.push(Symbol::NonTerminal(tail_id));
-                    }
-                }
-            }
-
-            alt.push(Symbol::Terminal(b']'));
+            let alt = self.build_cardinality_array_alt(n, item_id, ws_id, min_items, max_items);
             return Ok(vec![alt]);
         }
 
@@ -503,6 +457,15 @@ impl<'a> CompileCtx<'a> {
             id
         };
 
+        // issue #310 #2 (codex review): honor cardinality even with no `items` schema.
+        if min_items > 0 || max_items.is_some() {
+            let n = self.array_counter;
+            self.array_counter += 1;
+            let alt = self.build_cardinality_array_alt(n, any_id, ws_id, min_items, max_items);
+            return Ok(vec![alt]);
+        }
+
+        // Unconstrained any-array: cache the shared rules.
         let tail_name = "any_arr_tail";
         let tail_id = if let Some(id) = self.builder.rule_id(tail_name) {
             id
@@ -543,6 +506,62 @@ impl<'a> CompileCtx<'a> {
         alt.push(Symbol::NonTerminal(ws_id));
         alt.push(Symbol::Terminal(b']'));
         Ok(vec![alt])
+    }
+
+    /// Build the full `[ ... ]` alternative for an array whose items all use
+    /// `item_id`, honoring [min_items, max_items] cardinality.
+    ///
+    /// Precondition: max_items >= min_items (validated by the caller / global guard).
+    fn build_cardinality_array_alt(
+        &mut self,
+        n: usize,
+        item_id: usize,
+        ws_id: usize,
+        min_items: usize,
+        max_items: Option<usize>,
+    ) -> Alt {
+        let mut alt: Alt = vec![Symbol::Terminal(b'[')];
+        alt.push(Symbol::NonTerminal(ws_id));
+
+        let slack = max_items.map(|m| m - min_items); // None = unbounded
+
+        match (min_items, max_items) {
+            (0, Some(0)) => {
+                // Only `[]` is valid; no items at all.
+            }
+            (0, _) => {
+                // All items are optional.  Build an optional head + optional tail.
+                // slack == Some(0) means max == 0 which is handled above;
+                // this arm is only reached when slack > 0 or slack is None.
+                if slack != Some(0) {
+                    // Build optional body: first item is optional, subsequent
+                    // items each carry a leading comma.
+                    let body_id = self.build_bounded_tail(n, 0, slack, item_id, ws_id);
+                    alt.push(Symbol::NonTerminal(body_id));
+                }
+            }
+            (min, _) => {
+                // Emit exactly `min` required items (first without leading comma,
+                // remaining with leading comma).
+                alt.push(Symbol::NonTerminal(item_id));
+                alt.push(Symbol::NonTerminal(ws_id));
+                for _ in 1..min {
+                    alt.push(Symbol::Terminal(b','));
+                    alt.push(Symbol::NonTerminal(ws_id));
+                    alt.push(Symbol::NonTerminal(item_id));
+                    alt.push(Symbol::NonTerminal(ws_id));
+                }
+
+                // Append optional tail for additional items (up to slack more).
+                if slack != Some(0) {
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
+                    alt.push(Symbol::NonTerminal(tail_id));
+                }
+            }
+        }
+
+        alt.push(Symbol::Terminal(b']'));
+        alt
     }
 
     /// Build a rule representing "zero or more additional items (with leading commas),
