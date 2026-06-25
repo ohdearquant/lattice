@@ -141,6 +141,21 @@ impl CandidateSet {
             return 0;
         }
 
+        // #328: normalise top_p into a defined regime before the `top_p < 1.0`
+        // gate below. The raw argument is otherwise interpreted by undefined
+        // behaviour: NaN makes `top_p < 1.0` false and silently disables nucleus
+        // truncation (full distribution sampled); a negative top_p passes the
+        // gate and the `cumsum >= top_p` cutoff matches on the first (largest)
+        // token, collapsing to greedy. Mapping NaN/+Inf/>1 → 1.0 (no truncation)
+        // and clamping the rest into [0, 1] preserves today's behaviour exactly
+        // while making it explicit and refactor-safe. `f32::clamp` returns NaN
+        // for a NaN input, so NaN is handled before the clamp.
+        let top_p = if top_p.is_nan() {
+            1.0
+        } else {
+            top_p.clamp(0.0, 1.0)
+        };
+
         // Sort descending for deterministic top-p traversal.
         self.candidates.sort_by(candidate_order);
 
@@ -1186,6 +1201,59 @@ mod tests {
             token, 0,
             "tail-NaN poisons the softmax sum; must fall back to argmax (token 0), not last()"
         );
+    }
+
+    #[test]
+    fn test_sample_top_p_invalid_top_p_normalized() {
+        // #328: an out-of-range top_p must resolve to defined behaviour, not the
+        // accidental fall-through of the raw `top_p < 1.0` gate. NaN / +Inf / >1
+        // map to 1.0 (no nucleus truncation, identical to top_p == 1.0); a
+        // negative top_p collapses to greedy (argmax only). A fresh candidate set
+        // is built per call because sample_top_p truncates its buffers in place.
+        let make = || {
+            CandidateSet::from_candidates(vec![
+                Candidate {
+                    token_id: 0,
+                    logit: 3.0,
+                },
+                Candidate {
+                    token_id: 1,
+                    logit: 2.0,
+                },
+                Candidate {
+                    token_id: 2,
+                    logit: 1.0,
+                },
+                Candidate {
+                    token_id: 3,
+                    logit: 0.0,
+                },
+            ])
+        };
+
+        for &r in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
+            let baseline = make().sample_top_p(1.0, r);
+            assert_eq!(
+                make().sample_top_p(f32::NAN, r),
+                baseline,
+                "NaN top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(1.5, r),
+                baseline,
+                ">1 top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(f32::INFINITY, r),
+                baseline,
+                "+Inf top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(-0.5, r),
+                0,
+                "negative top_p must collapse to greedy argmax at r={r}"
+            );
+        }
     }
 
     // ── H1: select_top_k correctness tests ──────────────────────────────────
