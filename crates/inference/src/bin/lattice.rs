@@ -760,10 +760,15 @@ mod serve {
             // on the blocking thread pool and feed incremental deltas into an
             // unbounded MPSC channel.  The async SSE handler drains the channel
             // and converts each message to an OpenAI `chat.completion.chunk` event.
-            // An unbounded channel is safe here because the model produces tokens
-            // at most as fast as the GPU/CPU can generate them and the SSE write
-            // loop is the bottleneck, so back-pressure from the network naturally
-            // limits the channel depth in practice.
+            // An unbounded channel is acceptable here because the channel depth is
+            // bounded by `max_tokens` (capped at `max_tokens_cap`): the producer
+            // sends at most one `Delta` per generated token and generation halts at
+            // the cap, so the worst-case buffer is a few thousand short strings —
+            // the same order the non-streaming path already holds as one buffered
+            // string. There is no true backpressure (an unbounded send never
+            // blocks); if the client disconnects mid-stream the producer keeps
+            // generating to the cap and the ignored send errors drain harmlessly.
+            // Per-token backpressure / disconnect-cancellation is a future refinement.
             let (tx, rx) = futures::channel::mpsc::unbounded::<StreamMsg>();
 
             let stream_id = response_id.clone();
