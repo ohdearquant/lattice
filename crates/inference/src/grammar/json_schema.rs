@@ -126,6 +126,12 @@ struct CompileCtx<'a> {
     /// (issue #310 finding #2: each array node gets a unique suffix to prevent
     /// rule sharing across distinct array schemas in the same document).
     array_counter: usize,
+    /// Monotonic counter for generating collision-free object helper rule names.
+    /// Same hazard as `array_counter`: two distinct object schemas that share a
+    /// property key (e.g. the two branches of an `anyOf`) must not share the
+    /// per-key value/pair rules, or the first branch's value type silently wins
+    /// for both. Each object node gets a unique suffix.
+    object_counter: usize,
     /// Current `compile_schema` recursion depth (issue #343: bound compile-time
     /// recursion through `$ref` chains and deep nesting).
     depth: usize,
@@ -154,6 +160,7 @@ impl<'a> CompileCtx<'a> {
             builder,
             enum_counter: 0,
             array_counter: 0,
+            object_counter: 0,
             depth: 0,
         })
     }
@@ -305,19 +312,22 @@ impl<'a> CompileCtx<'a> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
+        let ws_id = self.builder.rule_id("ws").unwrap();
         match properties {
             None => {
-                // No properties: any JSON object `{}` or `{"k":v,...}`.
-                Ok(vec![empty_object_alt()])
+                // No properties: empty object `{}`, tolerating interior ws (`{ }`).
+                Ok(vec![empty_object_as_alt_with_ws(ws_id)])
             }
             Some(props) => {
                 // Generate grammar: `{` ws property_list ws `}`
                 // For v0 we emit a single alt with all properties in declaration order.
                 // Required properties are mandated; optional properties are wrapped in an
                 // "optional item" rule.
+                // Unique per-object suffix so distinct object schemas sharing a
+                // property key don't alias each other's value/pair rules.
+                let obj_idx = self.object_counter;
+                self.object_counter += 1;
                 let mut main_alt: Alt = vec![Symbol::Terminal(b'{')];
-                // ws
-                let ws_id = self.builder.rule_id("ws").unwrap();
                 main_alt.push(Symbol::NonTerminal(ws_id));
 
                 let mut first = true;
@@ -326,7 +336,7 @@ impl<'a> CompileCtx<'a> {
                     let is_req = required.contains(&key_str);
 
                     // Compile the value schema into a named rule.
-                    let val_rule_name = format!("prop_val_{key_str}");
+                    let val_rule_name = format!("prop_val_{obj_idx}_{key_str}");
                     let val_id = if let Some(id) = self.builder.rule_id(&val_rule_name) {
                         id
                     } else {
@@ -337,7 +347,7 @@ impl<'a> CompileCtx<'a> {
                     };
 
                     // Build: `"key" ws ":" ws value`
-                    let pair_rule_name = format!("pair_{key_str}");
+                    let pair_rule_name = format!("pair_{obj_idx}_{key_str}");
                     let pair_id = if let Some(id) = self.builder.rule_id(&pair_rule_name) {
                         id
                     } else {
@@ -1013,10 +1023,6 @@ fn bytes_to_alt(bytes: &[u8]) -> Alt {
     bytes.iter().map(|&b| Symbol::Terminal(b)).collect()
 }
 
-fn empty_object_alt() -> Alt {
-    vec![Symbol::Terminal(b'{'), Symbol::Terminal(b'}')]
-}
-
 fn empty_object_as_alt_with_ws(ws_id: usize) -> Alt {
     vec![
         Symbol::Terminal(b'{'),
@@ -1194,9 +1200,58 @@ mod tests {
     }
 
     #[test]
+    fn empty_object_accepts_interior_whitespace() {
+        // A no-properties object schema must accept `{ }` (interior ws), not
+        // only the byte-exact `{}`. The None arm previously emitted `{` `}`
+        // with no ws rule between the braces.
+        let g = compile_ok(r#"{"type":"object"}"#);
+        assert!(accepts(&g, b"{}"));
+        assert!(
+            accepts(&g, b"{ }"),
+            "empty no-properties object should accept interior whitespace"
+        );
+    }
+
+    #[test]
+    fn distinct_objects_sharing_a_key_do_not_alias() {
+        // Two distinct object schemas (`a` and `b`) each declare a property
+        // named `x` with a DIFFERENT value type. Without per-object rule-name
+        // namespacing they would share a single `prop_val_x` rule and the first
+        // compiled type (string) would silently win for both, rejecting `b.x`
+        // as an integer. `a` and `b` are distinct keys, so there is no
+        // shared-prefix ambiguity here — the PDA handles it cleanly.
+        let g = compile_ok(
+            r#"{
+              "type":"object",
+              "properties":{
+                "a":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]},
+                "b":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
+              },
+              "required":["a","b"]
+            }"#,
+        );
+        assert!(
+            accepts(&g, b"{\"a\":{\"x\":\"s\"},\"b\":{\"x\":42}}"),
+            "b.x must accept an integer; the string rule for a.x must not alias it"
+        );
+        assert!(
+            rejects(&g, b"{\"a\":{\"x\":42},\"b\":{\"x\":42}}"),
+            "a.x must still reject an integer (string-typed)"
+        );
+    }
+
+    #[test]
     fn compile_array_any() {
         let g = compile_ok(r#"{"type":"array"}"#);
         assert!(accepts(&g, b"[]"));
+        // Non-empty untyped arrays must accept too: the any-array tail rule
+        // `tail ::= ws ',' ws value tail | ε` reaches the `| ε` alternative
+        // after each element so the closing `]` can match.  Regression guard
+        // for a mid-alternative-backtrack over-rejection (refs #353).
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(accepts(&g, br#"[{}]"#));
+        assert!(accepts(&g, b"[true]"));
     }
 
     #[test]

@@ -318,6 +318,17 @@ fn try_next_alt(
     if next_alt >= num_alts {
         // No more alternatives at this level.
         // Try backtracking to the parent.
+        //
+        // KNOWN LIMITATION (not fixed here): this path can over-accept. If the
+        // parent has already consumed input bytes under its current alternative,
+        // switching the parent to a sibling alternative re-interprets the
+        // current byte as if those bytes were never consumed — this byte-level
+        // matcher has no input rewind. A correct guard needs per-frame
+        // byte-consumption tracking; a position (`sym_pos`) check is insufficient
+        // because a frame's `sym_pos` can advance past nullable nonterminals
+        // without consuming any byte (e.g. an optional numeric sign), so a naive
+        // guard over-rejects valid input like `[]`. The shared-prefix `anyOf`
+        // over-rejection is the dual of this. Tracked in #353.
         if frame_idx == 0 {
             return false;
         }
@@ -685,6 +696,38 @@ mod tests {
         let g = or_grammar();
         let mut s = GrammarState::initial();
         assert_eq!(advance_byte(&mut s, &g, b'c'), StepResult::Rejected);
+    }
+
+    /// Grammar: root = "a" nonterm | "x" ; nonterm = "cd"
+    /// Root reserved first so it lands at index 0.
+    fn leading_terminal_then_nt_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let nt_id = b.reserve("nonterm");
+        b.set_alts(
+            nt_id,
+            vec![vec![Symbol::Terminal(b'c'), Symbol::Terminal(b'd')]],
+        );
+        b.set_alts(
+            root_id,
+            vec![
+                vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(nt_id)],
+                vec![Symbol::Terminal(b'x')],
+            ],
+        );
+        b.build()
+    }
+
+    #[test]
+    fn leading_terminal_then_nt_accepts_valid() {
+        let g = leading_terminal_then_nt_grammar();
+        // "acd" via alt-0, "x" via alt-1 must both still be accepted.
+        let s0 = GrammarState::initial();
+        let (r_acd, _) = simulate_token(&s0, &g, b"acd");
+        assert_eq!(r_acd, SimResult::Accept);
+        let s1 = GrammarState::initial();
+        let (r_x, _) = simulate_token(&s1, &g, b"x");
+        assert_eq!(r_x, SimResult::Accept);
     }
 
     #[test]
