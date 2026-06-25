@@ -212,45 +212,76 @@ impl GrammarEngine {
         );
 
         // Find the state id in the partition.
-        let state_id = self.find_state_id(state);
+        match self.find_state_id(state) {
+            Some(state_id) => {
+                // Apply the precomputed bitmask.
+                self.partition.apply_mask(state_id, logits);
 
-        // Apply the precomputed bitmask.
-        self.partition.apply_mask(state_id, logits);
-
-        // Re-check context-dependent tokens at runtime.
-        for &token_id in self.partition.context_dependent_ids() {
-            if token_id >= self.vocab_size {
-                continue;
+                // Re-check context-dependent tokens at runtime.
+                for &token_id in self.partition.context_dependent_ids() {
+                    if token_id >= self.vocab_size {
+                        continue;
+                    }
+                    // If the bitmask already blocked this token, nothing to do.
+                    if logits[token_id] == f32::NEG_INFINITY {
+                        continue;
+                    }
+                    // Simulate advancing the grammar with this token's bytes.
+                    let token_bytes = &self.vocab_bytes[token_id];
+                    if token_bytes.is_empty() {
+                        logits[token_id] = f32::NEG_INFINITY;
+                        continue;
+                    }
+                    let (result, _) = simulate_token(state, &self.grammar, token_bytes);
+                    match result {
+                        // Byte-level rejection, or partial consumption (the token
+                        // straddles a grammar boundary and cannot be generated as a
+                        // complete unit): block.
+                        SimResult::Reject | SimResult::ContextDependent => {
+                            logits[token_id] = f32::NEG_INFINITY;
+                        }
+                        // All bytes consumed with no rejection: the token is legal.
+                        SimResult::Accept => {}
+                    }
+                }
             }
-            // If the bitmask already blocked this token, nothing to do.
+            None => {
+                // The grammar exceeded `MAX_GRAMMAR_STATES`, so the BFS state
+                // enumeration was truncated and this runtime state has no
+                // precomputed mask. Falling back to the initial-state mask would
+                // be unsound: tokens valid only at position 0 (e.g. an opening
+                // quote) would be left allowed at a deep state, and single-byte
+                // tokens are not in the context-dependent recheck set, so nothing
+                // would correct them. Compute the exact mask by simulating every
+                // token against the actual state instead. This is the universal
+                // algorithm the precomputed table caches; it is sound and live
+                // (a fully fail-closed "block everything" fallback would be sound
+                // but would stall generation by leaving no legal token).
+                self.mask_by_simulation(state, logits);
+            }
+        }
+    }
+
+    /// Compute the grammar mask for `state` directly by simulating every token.
+    ///
+    /// Used as the exact fallback for runtime states that are not present in the
+    /// precomputed partition (grammars exceeding `MAX_GRAMMAR_STATES`). Blocks
+    /// every token whose byte sequence does not fully advance the PDA from
+    /// `state`. Cost: O(vocab_size × token_len); only invoked on the unknown-state
+    /// path, never for grammars within the state cap.
+    fn mask_by_simulation(&self, state: &GrammarState, logits: &mut [f32]) {
+        for token_id in 0..self.vocab_size {
             if logits[token_id] == f32::NEG_INFINITY {
                 continue;
             }
-            // Simulate advancing the grammar with this token's bytes.
             let token_bytes = &self.vocab_bytes[token_id];
             if token_bytes.is_empty() {
                 logits[token_id] = f32::NEG_INFINITY;
                 continue;
             }
-            let (result, next_state) = simulate_token(state, &self.grammar, token_bytes);
-            match result {
-                SimResult::Reject => {
-                    // Byte-level rejection: token is definitively invalid.
-                    logits[token_id] = f32::NEG_INFINITY;
-                }
-                SimResult::ContextDependent => {
-                    // Partial consumption: the token straddles a grammar
-                    // boundary and cannot be generated as a complete unit.
-                    logits[token_id] = f32::NEG_INFINITY;
-                }
-                SimResult::Accept => {
-                    // All bytes consumed; check that the resulting state is
-                    // either mid-grammar (not complete but still valid) or
-                    // fully complete.  We allow both — the token is legal.
-                    // next_state validity is implicit: simulate_token only
-                    // returns Accept when no byte was rejected.
-                    let _ = next_state; // used above for Accept branch
-                }
+            let (result, _) = simulate_token(state, &self.grammar, token_bytes);
+            if result != SimResult::Accept {
+                logits[token_id] = f32::NEG_INFINITY;
             }
         }
     }
@@ -281,22 +312,23 @@ impl GrammarEngine {
 
     /// Find the partition state id for `state` by matching stack configuration.
     ///
-    /// If no matching precomputed state is found, returns 0 (initial state).
-    /// This is safe (conservative) because unknown states fall through to the
-    /// initial-state bitmask, which may over-allow some tokens — context-dependent
-    /// re-checks will catch incorrect allowances.
+    /// Returns `None` when no matching precomputed state exists. This happens
+    /// only for grammars that exceed `MAX_GRAMMAR_STATES`, where the BFS state
+    /// enumeration was truncated. Callers must handle `None` by computing the
+    /// mask directly (see `mask_by_simulation`) rather than assuming the
+    /// initial state, which would be unsound.
     ///
     /// For v0 this is a linear scan.  For large grammars a hash map would be
     /// appropriate.
-    fn find_state_id(&self, state: &GrammarState) -> usize {
+    fn find_state_id(&self, state: &GrammarState) -> Option<usize> {
         for sid in 0..self.partition.num_states() {
             if let Some(ps) = self.partition.grammar_state(sid) {
                 if ps.stack == state.stack && ps.complete == state.complete {
-                    return sid;
+                    return Some(sid);
                 }
             }
         }
-        0 // fallback to initial state
+        None
     }
 }
 
@@ -411,6 +443,80 @@ mod tests {
             engine.mask_logits(&mut state, &mut logits);
         }));
         assert!(result.is_err(), "should panic when logits too short");
+    }
+
+    #[test]
+    fn unknown_state_fallback_is_sound() {
+        // Soundness regression: when a grammar exceeds MAX_GRAMMAR_STATES the
+        // BFS enumeration is truncated, so a deep runtime state is not in the
+        // partition. `find_state_id` must NOT silently fall back to the
+        // initial-state mask (which over-allows tokens that are valid only at
+        // position 0). It must compute the exact mask by simulation.
+        //
+        // Grammar: a literal chain `"` + 300×`a` + `"` (>256 PDA states).
+        // Vocab: token 0 = b"\"" (quote), token 1 = b"a".
+        // At a deep mid-chain state the only valid next token is `a`; the
+        // closing quote `"` is invalid there but IS valid at state 0.
+        use crate::grammar::pda::{CompiledGrammar, Rule, Symbol};
+
+        let mut chain = vec![Symbol::Terminal(b'"')];
+        chain.extend(std::iter::repeat_n(Symbol::Terminal(b'a'), 300));
+        chain.push(Symbol::Terminal(b'"'));
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![chain],
+            }],
+        };
+        let vocab = vec![b"\"".to_vec(), b"a".to_vec()];
+
+        let spec = GrammarSpec::Gbnf("root ::= \"placeholder\"\n".to_string());
+        // Build engine then swap in the hand-built grammar + partition so the
+        // test does not depend on json_schema const-compilation internals.
+        let mut engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+        let states = enumerate_grammar_states(
+            &grammar,
+            &vocab,
+            crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+        );
+        // Enumeration must have hit the cap, otherwise the test is vacuous.
+        assert_eq!(
+            states.len(),
+            crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+            "grammar must exceed the state cap for this regression to bite"
+        );
+        engine.partition = VocabPartition::build(&grammar, states, &vocab);
+        engine.grammar = grammar;
+
+        // Drive into a deep state beyond the enumerated cap: quote + 270 a's.
+        let mut state = engine.initial_state();
+        assert!(engine.advance(&mut state, 0), "opening quote accepted");
+        for _ in 0..270 {
+            assert!(engine.advance(&mut state, 1), "mid-chain 'a' accepted");
+        }
+
+        // The deep state must NOT be in the enumerated partition — otherwise
+        // this test exercises the precomputed fast path, not the simulation
+        // fallback it is meant to cover.
+        assert!(
+            engine.find_state_id(&state).is_none(),
+            "deep state must be unknown to the capped partition (else the \
+             simulation fallback is not the path under test)"
+        );
+
+        let mut logits = vec![1.0f32, 1.0f32];
+        engine.mask_logits(&mut state, &mut logits);
+
+        assert!(
+            logits[1] > f32::NEG_INFINITY,
+            "valid mid-chain token 'a' must remain allowed at the deep state"
+        );
+        assert_eq!(
+            logits[0],
+            f32::NEG_INFINITY,
+            "invalid closing-quote token must be blocked at the deep state \
+             (state-0 fallback would wrongly allow it)"
+        );
     }
 
     #[test]
