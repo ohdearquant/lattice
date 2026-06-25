@@ -210,6 +210,16 @@ impl SentencePieceTokenizer {
                 InferenceError::Tokenizer("tokenizer.json missing model.vocab".into())
             })?;
 
+        // SentencePiece serializes a model-level `byte_fallback` flag in
+        // tokenizer.json. Shape-inference of `<0xNN>` pieces is the recovery
+        // signal when the flag is true or absent (HF byte-fallback models set
+        // it true; some recovery paths omit it). Only an explicit `false`
+        // suppresses inference — so a model that genuinely declares no byte
+        // fallback keeps a literal `<0xNN>` text token as Normal (#255 review).
+        let byte_fallback_enabled = json_path(&root, &["model", "byte_fallback"])
+            .and_then(JsonValue::as_bool)
+            != Some(false);
+
         let mut pieces = Vec::with_capacity(vocab_entries.len());
         for entry in vocab_entries {
             let values = entry.as_array().ok_or_else(|| {
@@ -232,7 +242,7 @@ impl SentencePieceTokenizer {
             // inserted into the trie as literal text — leaving byte_fallback_ids
             // empty and breaking OOV byte fallback in viterbi_encode. Recover the
             // Byte type from the `<0xNN>` shape, mirroring the .model loader (#255).
-            let kind = if parse_byte_piece(piece).is_some() {
+            let kind = if byte_fallback_enabled && parse_byte_piece(piece).is_some() {
                 SentencePieceType::Byte
             } else {
                 SentencePieceType::Normal
@@ -941,6 +951,16 @@ mod tests {
         assert_eq!(tok.inner.byte_fallback_ids[0xE2], Some(3));
         // Normal pieces are unaffected by the inference.
         assert_eq!(tok.tokenize_to_ids("hello"), vec![1]);
+    }
+
+    #[test]
+    fn test_json_loader_respects_explicit_byte_fallback_false() {
+        // When the model explicitly declares no byte fallback, a literal
+        // `<0xNN>`-shaped piece must stay Normal (trie-resolvable), not be
+        // misrouted to byte_fallback_ids by shape inference (#255 review edge).
+        let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0.0],["<0x41>",-5.0]]}}"#;
+        let tok = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tok.inner.byte_fallback_ids[0x41], None);
     }
 
     // HF Metaspace semantics: trailing whitespace in input must not produce a
