@@ -711,7 +711,13 @@ pub(crate) fn vocab_txt_to_map(vocab_text: &str) -> HashMap<String, u32> {
     let mut vocab = HashMap::new();
     for (idx, line) in vocab_text.lines().enumerate() {
         let token = line.trim_end_matches('\r').to_string();
-        vocab.insert(token, idx as u32);
+        // The line index is the token id. Stop rather than wrap if it would exceed u32
+        // range (a vocab.txt past 2^32 lines is malformed); enumerate is monotonic, so no
+        // later line could fit either.
+        let Ok(id) = u32::try_from(idx) else {
+            break;
+        };
+        vocab.insert(token, id);
     }
     vocab
 }
@@ -1049,6 +1055,15 @@ mod tests {
     }
 
     #[test]
+    fn test_vocab_id_at_u32_max_accepted() {
+        // u32::MAX itself is in range and must be accepted (not rejected) — locks the
+        // try_from boundary against an off-by-one that would reject the largest valid id.
+        let json = parse_json(r#"{"x": 4294967295}"#).unwrap();
+        let vocab = json_object_to_vocab(&json).expect("u32::MAX is a valid id");
+        assert_eq!(vocab.get("x"), Some(&u32::MAX));
+    }
+
+    #[test]
     fn test_invert_vocab_rejects_disproportionate_sparse_id() {
         // A vocabulary whose largest id vastly exceeds its entry count would force a giant
         // dense-table allocation (a single id of 4_294_967_295 -> ~100 GB) and abort the
@@ -1065,6 +1080,21 @@ mod tests {
         dense.insert("a".to_string(), 0u32);
         dense.insert("b".to_string(), 3u32);
         assert!(invert_vocab(&dense).is_ok());
+    }
+
+    #[test]
+    fn test_invert_vocab_cap_boundary() {
+        // The cap is `max_id >= len*16`. For a single entry (len 1, cap 16): id 15 -> 16
+        // slots is the largest accepted table; id 16 trips the cap. Locks the off-by-one.
+        let mut at_limit = HashMap::new();
+        at_limit.insert("a".to_string(), 15u32);
+        assert!(invert_vocab(&at_limit).is_ok(), "max_id == len*16 - 1 fits");
+        let mut over_limit = HashMap::new();
+        over_limit.insert("a".to_string(), 16u32);
+        assert!(
+            invert_vocab(&over_limit).is_err(),
+            "max_id == len*16 must trip the cap"
+        );
     }
 
     #[test]
