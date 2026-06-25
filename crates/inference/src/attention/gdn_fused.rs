@@ -135,7 +135,10 @@ fn scalar_gated_rms_norm(x: &[f32], z: &[f32], gamma: &[f32], out: &mut [f32], e
 
 #[inline]
 fn compute_decay_gate(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
-    let a = a_log.exp();
+    // Clamp the decay rate to finite: `a_log.exp()` overflows to +inf for a_log > ~88, and
+    // `inf * softplus(very_negative)=0.0` is NaN that poisons the recurrent state. Mirrors
+    // the scalar `gdn::compute_decay_gate` guard (kept in lockstep for scalar/fused parity).
+    let a = a_log.exp().min(f32::MAX);
     let sp = softplus(alpha + dt_bias);
     (-a * sp).exp()
 }
@@ -1499,5 +1502,26 @@ mod tests {
             let energy: f32 = head_slice.iter().map(|x| x * x).sum();
             assert!(energy > 0.0, "head {h} output is zero in symmetric config");
         }
+    }
+
+    #[test]
+    fn test_fused_decay_gate_finite_on_exp_overflow() {
+        // Mirror of gdn::test_decay_gate_finite_on_exp_overflow for the fused path's
+        // own compute_decay_gate. `a_log.exp()` overflows f32 to +inf for a_log > ~88;
+        // paired with softplus(very_negative) = 0.0 the product was `inf * 0.0` = NaN,
+        // which poisons the recurrent state and every subsequent token.
+        let g = compute_decay_gate(100.0, -200.0, 0.0);
+        assert!(
+            g.is_finite() && (0.0..=1.0).contains(&g),
+            "fused decay gate must stay finite in [0,1] under exp overflow, got {g}"
+        );
+        assert!((g - 1.0).abs() < 1e-6, "expected g≈1 for dt≈0, got {g}");
+
+        let g0 = compute_decay_gate(100.0, 5.0, 0.0);
+        assert!(
+            g0.is_finite() && g0 >= 0.0,
+            "fused decay gate must stay finite, got {g0}"
+        );
+        assert!(g0 < 1e-6, "expected g≈0 for huge decay rate, got {g0}");
     }
 }

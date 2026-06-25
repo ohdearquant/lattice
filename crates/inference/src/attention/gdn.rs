@@ -410,7 +410,13 @@ pub fn l2_normalize_vec(x: &mut [f32]) {
 /// Compute decay gate: g = exp(-exp(a_log) * softplus(alpha + dt_bias))
 #[inline]
 fn compute_decay_gate(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
-    let a = a_log.exp();
+    // `a_log.exp()` overflows f32 to +inf for a_log > ~88. Paired with a very negative
+    // `alpha + dt_bias` (softplus hard-returns 0.0), the product is `inf * 0.0` = NaN and
+    // `exp(NaN)` = NaN — which then propagates through the recurrent state S and poisons
+    // every subsequent token. Clamp the decay rate to finite so the product stays finite:
+    // `huge * 0 = 0` → g = 1 (the dt≈0 "no decay" limit), `huge * positive` → -inf → g = 0
+    // (full decay). No effect for valid checkpoints, where a_log stays O(1).
+    let a = a_log.exp().min(f32::MAX);
     let sp = softplus(alpha + dt_bias);
     (-a * sp).exp()
 }
@@ -588,6 +594,30 @@ mod tests {
                 "decay gate should be in (0, 1], got {g} for a_log={a_log}, alpha={alpha}, dt_bias={dt_bias}"
             );
         }
+    }
+
+    #[test]
+    fn test_decay_gate_finite_on_exp_overflow() {
+        // a_log large enough that exp(a_log) overflows f32 to +inf, paired with a very
+        // negative (alpha + dt_bias) where softplus hard-returns 0.0. Pre-guard this was
+        // `inf * 0.0` = NaN → `exp(NaN)` = NaN, which then poisons the entire recurrent
+        // state S and every subsequent token.
+        let g = compute_decay_gate(100.0, -200.0, 0.0);
+        assert!(
+            g.is_finite() && (0.0..=1.0).contains(&g),
+            "decay gate must stay finite in [0,1] under exp overflow, got {g}"
+        );
+        // softplus(very_negative) ≈ 0 ⇒ dt ≈ 0 ⇒ no time step ⇒ no decay ⇒ g = 1.
+        assert!((g - 1.0).abs() < 1e-6, "expected g≈1 for dt≈0, got {g}");
+
+        // The full-decay limit also stays finite: overflowing a_log with a positive dt
+        // drives the exponent to -inf, so g → 0 (not NaN).
+        let g0 = compute_decay_gate(100.0, 5.0, 0.0);
+        assert!(
+            g0.is_finite() && g0 >= 0.0,
+            "decay gate must stay finite, got {g0}"
+        );
+        assert!(g0 < 1e-6, "expected g≈0 for huge decay rate, got {g0}");
     }
 
     #[test]
