@@ -130,15 +130,19 @@ fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
 }
 
 fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
-    let r = xorshift64(rng_state);
+    draw_index(probs, xorshift64(rng_state))
+}
+
+/// Inverse-CDF draw: return the first token whose cumulative probability exceeds
+/// `r`. The boundary is strict `r < cumsum`: the canonical uniform draw gives
+/// `r` in `[0, 1)`, so `r < cumsum` is the textbook-correct inverse-CDF and never
+/// double-counts a bucket boundary (`r <= cumsum` would, and is also unsafe for an
+/// `r` that reached exactly 1.0). Falls back to the first (highest-probability)
+/// token only if float error leaves the final cumsum just under `r`.
+fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
     let mut cumsum = 0.0f32;
     for &(idx, p) in probs {
         cumsum += p;
-        // Canonical strict-less-than boundary: r is in [0, 1) and cumsum grows
-        // toward 1.0, so `r < cumsum` is the textbook-correct inverse-CDF draw.
-        // `r <= cumsum` could double-count the boundary probability and — before
-        // the 53-bit fix — could be reached with r == 1.0 (rounding artifact),
-        // mishandling that edge case.
         if r < cumsum {
             return idx as u32;
         }
@@ -295,30 +299,34 @@ mod tests {
     }
 
     #[test]
-    fn draw_from_distribution_uses_strict_less_than() {
+    fn draw_index_uses_strict_less_than_at_exact_boundary() {
         // Lock the draw boundary as `r < cumsum`, NOT `r <= cumsum`. The two
-        // operators only differ when `r` exactly equals a partial cumsum, so we
-        // construct precisely that case: make the first token's probability equal
-        // the drawn `r`. Then cumsum-after-token-0 == r exactly, and
-        //   `r < cumsum`  -> `r < r`  == false -> skip token 0, select token 1
-        //   `r <= cumsum` -> `r <= r` == true  -> select token 0
-        // so a regression back to `<=` flips this assertion and fails the test.
-        let seed = 0x1234_5678_9abc_def0u64;
-
-        // Draw r the same way draw_from_distribution will (advance a copy).
-        let mut probe = seed;
-        let r = xorshift64(&mut probe);
-        assert!((0.0..1.0).contains(&r), "r must be in [0, 1), got {r}");
-
-        // First token's prob == r exactly; cumsum after it is `0.0 + r == r` (exact in f32).
-        let probs: Vec<(usize, f32)> = vec![(0, r), (1, 1.0 - r)];
-
-        let mut rng = seed;
-        let token = draw_from_distribution(&probs, &mut rng);
+        // operators differ ONLY when `r` exactly equals a partial cumsum. Use
+        // values that are exact in f32 (0.5) so there is no rounding ambiguity and
+        // no dependence on the RNG reproducing a bit-identical float: r == 0.5,
+        // first token prob == 0.5, so cumsum after token 0 is `0.0 + 0.5 == 0.5`.
+        //   `r < cumsum`  -> `0.5 < 0.5`  == false -> skip token 0, select token 1
+        //   `r <= cumsum` -> `0.5 <= 0.5` == true  -> select token 0
+        // A regression back to `<=` flips this and fails the test.
+        let probs: Vec<(usize, f32)> = vec![(0, 0.5), (1, 0.5)];
         assert_eq!(
-            token, 1,
-            "with cumsum==r at the boundary, strict `r < cumsum` must skip token 0 \
-             and select token 1 (a `r <= cumsum` regression would select token 0)"
+            draw_index(&probs, 0.5),
+            1,
+            "at the exact boundary (cumsum == r), strict `r < cumsum` must skip \
+             token 0 and select token 1 (a `r <= cumsum` regression selects token 0)"
+        );
+
+        // Sanity: r below the first bucket selects token 0; r at/above the last
+        // bucket's cumsum (only reachable via float error) falls back to token 0.
+        assert_eq!(
+            draw_index(&probs, 0.25),
+            0,
+            "r below first cumsum picks token 0"
+        );
+        assert_eq!(
+            draw_index(&probs, 0.75),
+            1,
+            "r between the two bucket boundaries picks token 1"
         );
     }
 }
