@@ -81,6 +81,55 @@ pub fn multi_head_attention(
 }
 
 /// Internal in-place attention kernel.
+/// Release-active precondition guard for the bidirectional MHA shape products.
+///
+/// `multi_head_attention_in_place` previously checked the entry shapes only with
+/// `debug_assert!`, so a release build silently accepted a malformed shape. Two
+/// hazards follow from that: (1) `hidden_size != num_heads * head_dim` produces a
+/// stale concat layout (the per-head copy loops write only `num_heads * head_dim`
+/// lanes of each `hidden_size`-wide row, leaving the rest stale before the output
+/// projection consumes them); (2) the local products `seq_len * hidden_size`,
+/// `num_heads * seq_len * seq_len`, and `num_heads * seq_len * head_dim` are not
+/// dominated by the `matmul_bt` boundary guards and could wrap a 64-bit `usize`
+/// for an absurd shape, yielding an undersized scratch slice. This asserts the
+/// head-layout invariant and that every product is computed before it wraps.
+#[inline]
+fn assert_standard_no_overflow(
+    seq_len: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+) {
+    assert!(num_heads > 0, "standard: num_heads must be non-zero");
+    assert!(head_dim > 0, "standard: head_dim must be non-zero");
+    assert!(
+        num_heads.checked_mul(head_dim).is_some(),
+        "standard shape overflow: num_heads * head_dim"
+    );
+    assert_eq!(
+        hidden_size,
+        num_heads * head_dim,
+        "standard: hidden_size must equal num_heads * head_dim"
+    );
+    assert!(
+        seq_len.checked_mul(hidden_size).is_some(),
+        "standard shape overflow: seq_len * hidden_size"
+    );
+    assert!(
+        num_heads.checked_mul(seq_len).is_some(),
+        "standard shape overflow: num_heads * seq_len"
+    );
+    let nh_sl = num_heads * seq_len;
+    assert!(
+        nh_sl.checked_mul(seq_len).is_some(),
+        "standard shape overflow: num_heads * seq_len * seq_len"
+    );
+    assert!(
+        nh_sl.checked_mul(head_dim).is_some(),
+        "standard shape overflow: num_heads * seq_len * head_dim"
+    );
+}
+
 pub(crate) fn multi_head_attention_in_place(
     hidden_states: &[f32],
     layer_weights: &TransformerLayerWeights<'_>,
@@ -93,9 +142,17 @@ pub(crate) fn multi_head_attention_in_place(
     lora: &dyn LoraHook,
     layer_idx: usize,
 ) {
-    debug_assert_eq!(hidden_states.len(), seq_len * hidden_size);
-    debug_assert_eq!(attention_mask.len(), seq_len);
-    debug_assert_eq!(hidden_size, num_heads * head_dim);
+    assert_standard_no_overflow(seq_len, hidden_size, num_heads, head_dim);
+    assert_eq!(
+        hidden_states.len(),
+        seq_len * hidden_size,
+        "standard: hidden_states length must equal seq_len * hidden_size"
+    );
+    assert_eq!(
+        attention_mask.len(),
+        seq_len,
+        "standard: attention_mask length must equal seq_len"
+    );
 
     let used_hidden = seq_len * hidden_size;
     let used_scores = num_heads * seq_len * seq_len;
@@ -567,5 +624,28 @@ mod tests {
         for &v in result_all.iter().chain(result_masked.iter()) {
             assert!(v.is_finite());
         }
+    }
+
+    #[test]
+    fn standard_no_overflow_accepts_valid_shape() {
+        // hidden_size == num_heads * head_dim, no product wraps.
+        assert_standard_no_overflow(8, 64, 8, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "hidden_size must equal num_heads * head_dim")]
+    fn standard_no_overflow_rejects_layout_mismatch() {
+        // hidden_size=4 but num_heads * head_dim = 2: the concat layout would
+        // leave lanes 2..4 of every row stale before the output projection.
+        assert_standard_no_overflow(1, 4, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_heads * seq_len * seq_len")]
+    fn standard_no_overflow_rejects_wrapping_product() {
+        // seq_len=2^32, num_heads=2, head_dim=1, hidden_size=2: every earlier
+        // product fits, but num_heads * seq_len * seq_len = 2^65 wraps a 64-bit
+        // usize to a small value that would feed an undersized scores slice.
+        assert_standard_no_overflow(1usize << 32, 2, 2, 1);
     }
 }
