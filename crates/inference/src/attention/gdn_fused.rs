@@ -228,9 +228,14 @@ pub fn simd_matvec_transpose(
     key_dim: usize,
     value_dim: usize,
 ) {
-    debug_assert!(s.len() >= key_dim * value_dim);
-    debug_assert!(k.len() >= key_dim);
-    debug_assert!(kv_mem.len() >= value_dim);
+    // Release-active: these are the soundness preconditions for the unsafe SIMD
+    // kernels below (which load `key_dim`/`value_dim` lanes via raw pointers).
+    // `debug_assert!` is compiled out in release, so a malformed-slice call from
+    // this safe `pub fn` would reach an out-of-bounds SIMD load (UB). Promote to
+    // real checks so the contract violation panics deterministically instead.
+    assert!(s.len() >= key_dim * value_dim);
+    assert!(k.len() >= key_dim);
+    assert!(kv_mem.len() >= value_dim);
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -267,9 +272,12 @@ pub fn simd_decay_and_rank1_update(
     key_dim: usize,
     value_dim: usize,
 ) {
-    debug_assert!(s.len() >= key_dim * value_dim);
-    debug_assert!(k.len() >= key_dim);
-    debug_assert!(delta.len() >= value_dim);
+    // Release-active: soundness preconditions for the unsafe SIMD kernels below.
+    // See `simd_matvec_transpose` for the rationale (debug_assert is removed in
+    // release, leaving the safe wrapper able to drive an OOB SIMD load).
+    assert!(s.len() >= key_dim * value_dim);
+    assert!(k.len() >= key_dim);
+    assert!(delta.len() >= value_dim);
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -299,9 +307,12 @@ pub fn simd_decay_and_rank1_update(
 /// **Unstable**: SIMD-dispatched gated RMSNorm (AVX2/NEON/scalar fallback).
 #[inline]
 pub fn simd_gated_rms_norm(x: &[f32], z: &[f32], gamma: &[f32], out: &mut [f32], eps: f32) {
-    debug_assert_eq!(z.len(), x.len());
-    debug_assert_eq!(gamma.len(), x.len());
-    debug_assert!(out.len() >= x.len());
+    // Release-active: soundness preconditions for the unsafe SIMD kernels below.
+    // See `simd_matvec_transpose` for the rationale (debug_assert is removed in
+    // release, leaving the safe wrapper able to drive an OOB SIMD load).
+    assert_eq!(z.len(), x.len());
+    assert_eq!(gamma.len(), x.len());
+    assert!(out.len() >= x.len());
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -1523,5 +1534,39 @@ mod tests {
             "fused decay gate must stay finite, got {g0}"
         );
         assert!(g0 < 1e-6, "expected g≈0 for huge decay rate, got {g0}");
+    }
+
+    // The safe public SIMD wrappers below dispatch to unsafe AVX2/NEON kernels
+    // that load `key_dim`/`value_dim`/`x.len()` lanes via raw pointers. A
+    // length-mismatched call must fail closed (panic) rather than read OOB. The
+    // guards are release-active `assert!`s, so these `#[should_panic]` tests hold
+    // in both debug and release builds.
+
+    #[test]
+    #[should_panic]
+    fn simd_matvec_transpose_rejects_short_k() {
+        let s = [0.0f32; 8];
+        let k = [0.0f32; 1]; // key_dim = 2 but only 1 element
+        let mut kv_mem = [0.0f32; 4];
+        simd_matvec_transpose(&s, &k, &mut kv_mem, 2, 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn simd_decay_and_rank1_update_rejects_short_delta() {
+        let mut s = [0.0f32; 8];
+        let k = [0.0f32; 2];
+        let delta = [0.0f32; 1]; // value_dim = 4 but only 1 element
+        simd_decay_and_rank1_update(&mut s, &k, &delta, 0.5, 2, 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn simd_gated_rms_norm_rejects_short_gamma() {
+        let x = [1.0f32; 8];
+        let z = [0.0f32; 8];
+        let gamma: [f32; 0] = []; // must equal x.len()
+        let mut out = [0.0f32; 8];
+        simd_gated_rms_norm(&x, &z, &gamma, &mut out, 1e-6);
     }
 }
