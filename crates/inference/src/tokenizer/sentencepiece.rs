@@ -967,6 +967,21 @@ mod tests {
     }
 
     #[test]
+    fn test_out_of_range_unk_id_rejected_from_json() {
+        // The tokenizer.json loader path (from_tokenizer_json_str -> from_parsed_model)
+        // casts `model.unk_id` `as u32` with no bounds check. A malformed file declaring
+        // unk_id past the vocab end must be rejected at construction, mirroring the
+        // .model path covered by from_pieces_for_test above. Vocab has 2 pieces (ids 0,1)
+        // and unk_id = 4.
+        let json = r#"{"model":{"type":"Unigram","unk_id":4,"vocab":[["<unk>",0.0],["▁a",-1.0]]}}"#;
+        let result = SentencePieceTokenizer::from_tokenizer_json_str(json);
+        assert!(
+            result.is_err(),
+            "an out-of-range unk_id from tokenizer.json must be rejected at construction"
+        );
+    }
+
+    #[test]
     fn test_normalize_adds_metaspace() {
         let tokenizer = synthetic_tokenizer();
         assert_eq!(tokenizer.normalize("hello world"), "▁hello▁world");
