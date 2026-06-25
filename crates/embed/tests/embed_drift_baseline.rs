@@ -26,9 +26,11 @@
 //!   because the entropic-regularisation floor on small identical point-sets (n=5)
 //!   produces a non-zero baseline even when all vectors are identical.
 //!
-//! **Skip guard**: when model weights are absent (local dev without `~/.lattice/`)
-//!   the test prints a SKIP line and returns without failing.  CI provisions weights
-//!   explicitly.
+//! **Skip guard**: when model weights are absent (local dev without `~/.lattice/`,
+//!   or the workspace-wide `cargo test` job that does not provision weights) the
+//!   test prints a SKIP line and returns without failing.  The dedicated CI gate
+//!   job provisions weights AND sets `LATTICE_DRIFT_GATE_ENFORCE=1`; there a missing
+//!   model fails loudly instead of skipping (provisioning regression guard).
 //!
 //! **Run**:
 //!   ```bash
@@ -124,12 +126,20 @@ async fn bge_small_drift_vs_frozen_baseline() {
     let model_dir = cache_root.join("bge-small-en-v1.5");
 
     if !model_dir.join("model.safetensors").exists() {
-        // In CI the provisioning step MUST have populated the weights. A silent
-        // skip there would make this drift gate pure theater (green without ever
-        // exercising the forward path), so fail loudly instead.
-        if std::env::var("CI").is_ok() {
+        // The dedicated `embed-drift` CI job provisions the weights and sets
+        // LATTICE_DRIFT_GATE_ENFORCE=1 before running this test; there a missing
+        // model means provisioning failed and a silent skip would be pure theater
+        // (green without exercising the forward path), so fail loudly.
+        //
+        // The generic `CI` env var is NOT used as the trigger: the workspace-wide
+        // `cargo test` job also sets `CI=true` but deliberately does not provision
+        // model weights (only the dedicated gate job does). Gating on a dedicated
+        // var keeps that job a clean skip while the dedicated job — which feeds the
+        // required `parity-gate` — enforces the gate for real.
+        if std::env::var("LATTICE_DRIFT_GATE_ENFORCE").is_ok() {
             panic!(
-                "drift gate weights missing in CI — provisioning did not populate {}",
+                "drift gate weights missing despite LATTICE_DRIFT_GATE_ENFORCE=1 — \
+                 provisioning did not populate {}",
                 model_dir.display()
             );
         }

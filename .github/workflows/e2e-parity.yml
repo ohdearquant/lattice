@@ -192,6 +192,12 @@ jobs:
             -- --model bge-small-en-v1.5 --download-only
 
       - name: Run embedding-drift gate
+        # LATTICE_DRIFT_GATE_ENFORCE=1 makes the test fail-closed if the weights
+        # are missing here (provisioning regression). The workspace-wide `cargo
+        # test` CI job does NOT set this, so it cleanly skips when weights are
+        # absent instead of panicking.
+        env:
+          LATTICE_DRIFT_GATE_ENFORCE: '1'
         run: |
           cargo test --release -p lattice-embed --test embed_drift_baseline \
             -- --nocapture
