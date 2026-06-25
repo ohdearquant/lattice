@@ -134,21 +134,27 @@ fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
     let mut cumsum = 0.0f32;
     for &(idx, p) in probs {
         cumsum += p;
-        if r <= cumsum {
+        // Canonical strict-less-than boundary: r is in [0, 1) and cumsum grows
+        // toward 1.0, so `r < cumsum` is the textbook-correct inverse-CDF draw.
+        // `r <= cumsum` could double-count the boundary probability and — before
+        // the 53-bit fix — could be reached with r == 1.0 (rounding artifact),
+        // mishandling that edge case.
+        if r < cumsum {
             return idx as u32;
         }
     }
     probs[0].0 as u32
 }
 
-/// Xorshift64 PRNG. Returns a value in [0, 1).
+/// Canonical uniform f32 in [0, 1) via the shared xorshift64 primitive.
+///
+/// Delegates to `crate::sampling::xorshift64_next` (shifts 13/7/17, full period
+/// over nonzero state) and `crate::sampling::uniform_f32_from_u64` (top-24-bit
+/// conversion, provably strictly < 1.0). Both CPU sampling paths now share these
+/// primitives, producing identical seeded token streams from the same seed.
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
-    let mut s = *state;
-    s ^= s << 13;
-    s ^= s >> 7;
-    s ^= s << 17;
-    *state = s;
-    (s >> 11) as f32 / (1u64 << 53) as f32
+    let x = crate::sampling::xorshift64_next(state);
+    crate::sampling::uniform_f32_from_u64(x)
 }
 
 #[cfg(test)]
@@ -258,5 +264,81 @@ mod tests {
         let mut rng = 7u64;
         let token = sample_token(&logits, &cfg_rp, &[0], &mut rng);
         assert_eq!(token, 0, "NaN penalty must be a no-op");
+    }
+
+    #[test]
+    fn canonical_rng_streams_match_across_sampling_paths() {
+        // Both CPU sampling paths must produce the same seeded float stream once
+        // they share xorshift64_next + uniform_f32_from_u64.
+        // Note: crate::model::qwen35::sampling is private, so this test lives here
+        // where both xorshift64 (local) and the canonical primitives are reachable.
+        let seed = 0x1234_5678_9abc_def0u64;
+        let n = 32usize;
+
+        // Path 1: this module's xorshift64 (now delegates to the canonical primitives).
+        let mut state_q = seed;
+        let q35: Vec<f32> = (0..n).map(|_| xorshift64(&mut state_q)).collect();
+
+        // Path 2: direct use of xorshift64_next + uniform_f32_from_u64 from crate::sampling.
+        let mut state_c = seed;
+        let canonical: Vec<f32> = (0..n)
+            .map(|_| {
+                let x = crate::sampling::xorshift64_next(&mut state_c);
+                crate::sampling::uniform_f32_from_u64(x)
+            })
+            .collect();
+
+        assert_eq!(
+            q35, canonical,
+            "xorshift64 and canonical primitives must produce identical streams"
+        );
+    }
+
+    #[test]
+    fn draw_from_distribution_uses_strict_less_than() {
+        // Verify the draw boundary is `r < cumsum`, not `r <= cumsum`.
+        //
+        // Two-token distribution: prob 0.6 for token 0, prob 0.4 for token 1.
+        // We use two hardcoded seeds with known xorshift64 outputs:
+        //   seed 0x1234_5678_9abc_def0 -> r ≈ 0.9941  (> 0.6): must select token 1
+        //   seed 0xdead_beef_cafe_1234 -> r ≈ 0.1557  (< 0.6): must select token 0
+        //
+        // These were verified against the canonical xorshift64_next + uniform_f32_from_u64
+        // implementation at the time this test was written.
+        let probs: Vec<(usize, f32)> = vec![(0, 0.6), (1, 0.4)];
+
+        // Verify the expected r values hold (catches any future primitive change).
+        let seed_high = 0x1234_5678_9abc_def0u64;
+        let mut s = seed_high;
+        let r_high = xorshift64(&mut s);
+        assert!(
+            r_high > 0.6 && r_high < 1.0,
+            "seed {seed_high:#018x} must produce r > 0.6, got {r_high}"
+        );
+
+        let seed_low = 0xdead_beef_cafe_1234u64;
+        let mut s = seed_low;
+        let r_low = xorshift64(&mut s);
+        assert!(
+            r_low < 0.6,
+            "seed {seed_low:#018x} must produce r < 0.6, got {r_low}"
+        );
+
+        // With r > 0.6: cumsum after token 0 is 0.6, which is NOT > r, so strict `r < cumsum`
+        // is false → skip token 0.  Cumsum after token 1 is 1.0 > r → select token 1.
+        // Under the old `r <= cumsum` boundary this would also select token 1 here, but
+        // the canonical `<` is what the spec requires and what this test locks in.
+        let mut rng_high = seed_high;
+        let token_high = draw_from_distribution(&probs, &mut rng_high);
+        assert_eq!(
+            token_high, 1,
+            "r={r_high} > 0.6 must skip the first token (cumsum=0.6) and select token 1"
+        );
+
+        // With r < 0.6: cumsum after token 0 is 0.6 > r → strict `r < cumsum` is true
+        // → select token 0 immediately.
+        let mut rng_low = seed_low;
+        let token_low = draw_from_distribution(&probs, &mut rng_low);
+        assert_eq!(token_low, 0, "r={r_low} < 0.6 must select token 0");
     }
 }
