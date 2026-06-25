@@ -36,9 +36,12 @@ pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
     assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
     assert!(k.checked_mul(n).is_some(), "matmul shape overflow: k*n");
     assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
-    // Lower-bound (>=): some callers pass reused scratch buffers longer than the exact
-    // footprint — that is sound because the kernels only read/write [0, m*k), [0, k*n),
-    // and [0, m*n). Using assert_eq! here would false-panic on those callers.
+    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
+    // shape footprint (a: [0, m*k), b: [0, k*n)) and the output requires c.len() >= m*n.
+    // Some callers pass reused scratch buffers longer than the exact footprint; that is
+    // sound, and assert_eq! would false-panic on them. Note the output suffix beyond m*n
+    // is NOT part of the result and may be clobbered (matmul_scalar zeroes the full c
+    // slice) — callers needing suffix preservation must pass &mut c[..m*n].
     assert!(a.len() >= m * k, "matmul: a too short for m*k");
     assert!(b.len() >= k * n, "matmul: b too short for k*n");
     assert!(c.len() >= m * n, "matmul: c too short for m*n");
@@ -66,9 +69,13 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
     assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
     assert!(n.checked_mul(k).is_some(), "matmul shape overflow: n*k");
     assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
-    // Lower-bound (>=): some callers pass reused scratch buffers longer than the exact
-    // footprint — that is sound because the kernels only read/write [0, m*k), [0, n*k),
-    // and [0, m*n). Using assert_eq! here would false-panic on those callers.
+    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
+    // shape footprint (a: [0, m*k), b: [0, n*k) since B is transposed) and the output
+    // requires c.len() >= m*n. Some callers pass reused scratch buffers longer than the
+    // exact footprint; that is sound, and assert_eq! would false-panic on them. Note the
+    // output suffix beyond m*n is NOT part of the result and may be clobbered
+    // (matmul_bt_tiled zeroes the full c slice) — callers needing suffix preservation
+    // must pass &mut c[..m*n].
     assert!(a.len() >= m * k, "matmul: a too short for m*k");
     assert!(b.len() >= n * k, "matmul_bt: b too short for n*k");
     assert!(c.len() >= m * n, "matmul: c too short for m*n");
