@@ -596,6 +596,19 @@ impl<'a> MtpVerifier<'a> {
         use crate::error::InferenceError;
         use crate::forward::cpu::{matmul_bt, rms_norm};
 
+        // At capacity (`seq_len == max_seq_len`) this step indexes per-position
+        // buffers (RoPE position tables, then the raw `k_buffer_mut(0)` K/V write at
+        // `seq_len * kv_dim`) out of bounds, bypassing the bounds-checked
+        // `FlatKVCache` append API hardened in #290, and panics. Fail closed with a
+        // typed error instead, matching the no-panic-in-library contract and
+        // `advance_by`'s overflow behaviour.
+        if self.cache.is_full() {
+            return Err(InferenceError::InvalidInput(format!(
+                "MTP KV cache is full ({} tokens); call rollback_cache_to or reset_cache before forward_one",
+                self.cache.seq_len()
+            )));
+        }
+
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
@@ -3593,6 +3606,54 @@ mod tests {
                 "logits[{i}] differ after rollback (replay={r}, fresh={f}): \
                  stale f16 dequant scratch is contaminating attention output"
             );
+        }
+    }
+
+    #[test]
+    fn mtp_verifier_forward_one_at_capacity_returns_err_not_panic() {
+        let cfg = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&cfg);
+
+        let embed: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+
+        let h = cfg.hidden_size;
+        let max_seq = 4usize;
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        let mut v = MtpVerifier::new(cfg, &weights, &embed, &lm_head, max_seq).unwrap();
+
+        // Fill the cache to exactly capacity: each forward_one appends one token.
+        for pos in 0..max_seq {
+            v.forward_one((pos % 2) as u32 + 1, pos, &prev_hidden)
+                .unwrap_or_else(|e| {
+                    panic!("forward_one at pos {pos} (below capacity) should succeed: {e:?}")
+                });
+        }
+        assert_eq!(
+            v.cache.seq_len(),
+            max_seq,
+            "cache must be full after filling"
+        );
+        assert!(v.cache.is_full(), "cache must report full at capacity");
+
+        // The next forward_one would index the raw K/V buffer out of bounds
+        // (it writes at seq_len * kv_dim before advance_by). It must fail closed
+        // with a typed error, never panic — matches the no-panic library contract
+        // and the #290 FlatKVCache hardening.
+        match v.forward_one(1, max_seq, &prev_hidden) {
+            Ok(_) => panic!("forward_one at capacity must return Err, not overwrite or panic"),
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("full"),
+                    "error message should explain the cache is full, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput for full cache, got {other:?}"),
         }
     }
 
