@@ -97,6 +97,10 @@ struct CompileCtx<'a> {
     builder: GrammarBuilder,
     /// Monotonic counter for generating collision-free string-enum rule names.
     enum_counter: usize,
+    /// Monotonic counter for generating collision-free array helper rule names
+    /// (issue #310 finding #2: each array node gets a unique suffix to prevent
+    /// rule sharing across distinct array schemas in the same document).
+    array_counter: usize,
 }
 
 impl<'a> CompileCtx<'a> {
@@ -121,6 +125,7 @@ impl<'a> CompileCtx<'a> {
             defs,
             builder,
             enum_counter: 0,
+            array_counter: 0,
         })
     }
 
@@ -143,7 +148,7 @@ impl<'a> CompileCtx<'a> {
             let type_is_string = schema.get("type").and_then(Value::as_str) == Some("string");
             let all_strings = values.iter().all(Value::is_string);
             if type_is_string || all_strings {
-                return Ok(self.compile_string_type(schema));
+                return self.compile_string_type(schema);
             }
             return compile_enum(values);
         }
@@ -171,7 +176,7 @@ impl<'a> CompileCtx<'a> {
         match schema.get("type").and_then(Value::as_str) {
             Some("object") => self.compile_object(schema),
             Some("array") => self.compile_array(schema),
-            Some("string") => Ok(self.compile_string_type(schema)),
+            Some("string") => self.compile_string_type(schema),
             Some("number") => {
                 let id = self
                     .builder
@@ -287,7 +292,7 @@ impl<'a> CompileCtx<'a> {
                         id
                     } else {
                         let id = self.builder.reserve(&pair_rule_name);
-                        let mut pair_alt = json_string_literal(key_str);
+                        let mut pair_alt = json_string_literal(key_str)?;
                         pair_alt.push(Symbol::NonTerminal(ws_id));
                         pair_alt.push(Symbol::Terminal(b':'));
                         pair_alt.push(Symbol::NonTerminal(ws_id));
@@ -340,80 +345,108 @@ impl<'a> CompileCtx<'a> {
             .and_then(Value::as_u64)
             .map(|v| v as usize);
 
+        // issue #310 finding #2: validate cardinality constraints up front.
+        if let Some(max) = max_items {
+            if max < min_items {
+                return Err(SchemaError(format!(
+                    "array schema maxItems ({max}) < minItems ({min_items})"
+                )));
+            }
+        }
+
+        // issue #310 finding #3: handle prefixItems (tuple arrays).
+        // prefixItems is a JSON array of per-position schemas.
+        let prefix_items = schema
+            .get("prefixItems")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice);
+
+        if let Some(prefix_schemas) = prefix_items {
+            // Only process non-empty prefixItems here; empty prefixItems falls
+            // through to the items / no-items handling below (JSON-Schema 2020-12:
+            // empty prefixItems ≡ no prefixItems).
+            if !prefix_schemas.is_empty() {
+                // Assign a unique counter for this array node (only when we will
+                // actually emit array helper rules).
+                let n = self.array_counter;
+                self.array_counter += 1;
+
+                let p = prefix_schemas.len();
+
+                // Cardinality validation against the fixed prefix length.
+                if let Some(m) = max_items {
+                    if m < p {
+                        return Err(SchemaError(format!(
+                            "array maxItems ({m}) < prefixItems length ({p})"
+                        )));
+                    }
+                }
+                if min_items > p {
+                    return Err(SchemaError(format!(
+                        "array minItems ({min_items}) > prefixItems length ({p}) is not supported with prefixItems"
+                    )));
+                }
+
+                // Compile each positional item schema into a named rule.
+                let mut pos_ids: Vec<usize> = Vec::with_capacity(p);
+                for (i, pos_schema) in prefix_schemas.iter().enumerate() {
+                    let pos_rule = format!("arr_{n}_prefix_{i}");
+                    let pos_id = self.builder.reserve(&pos_rule);
+                    let pos_alts = self.compile_schema(pos_schema, &[])?;
+                    self.builder.set_alts(pos_id, pos_alts);
+                    pos_ids.push(pos_id);
+                }
+
+                // Build: `[` ws p0 ws `,` ws p1 ws `,` ... ws
+                let mut alt: Alt = vec![Symbol::Terminal(b'[')];
+                alt.push(Symbol::NonTerminal(ws_id));
+                for (i, &pid) in pos_ids.iter().enumerate() {
+                    if i > 0 {
+                        alt.push(Symbol::Terminal(b','));
+                        alt.push(Symbol::NonTerminal(ws_id));
+                    }
+                    alt.push(Symbol::NonTerminal(pid));
+                    alt.push(Symbol::NonTerminal(ws_id));
+                }
+
+                // If `items` is also present, append a bounded uniform tail.
+                // p prefix items already emitted; max >= p validated above.
+                // slack = None → unbounded; slack = Some(0) → epsilon (no extra items).
+                if let Some(items_schema) = schema.get("items") {
+                    let item_rule = format!("arr_{n}_item");
+                    let item_id = self.builder.reserve(&item_rule);
+                    let item_alts = self.compile_schema(items_schema, &[])?;
+                    self.builder.set_alts(item_id, item_alts);
+
+                    // depth=1: leading-comma continuation after the fixed prefix.
+                    let slack = max_items.map(|m| m - p);
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
+                    alt.push(Symbol::NonTerminal(tail_id));
+                }
+
+                alt.push(Symbol::Terminal(b']'));
+                return Ok(vec![alt]);
+            }
+            // else: empty prefixItems — fall through to items / no-items handling.
+        }
+
         if let Some(items_schema) = schema.get("items") {
             // Uniform array: all items share the same schema.
-            let item_rule = "arr_item";
-            let item_id = if let Some(id) = self.builder.rule_id(item_rule) {
-                id
-            } else {
-                let id = self.builder.reserve(item_rule);
-                let item_alts = self.compile_schema(items_schema, &[])?;
-                self.builder.set_alts(id, item_alts);
-                id
-            };
+            // issue #310 finding #2: use per-array unique rule names to prevent
+            // collision when multiple array schemas appear in one document.
+            let n = self.array_counter;
+            self.array_counter += 1;
 
-            // Build the array as: `[` ws  (item (ws , ws item)*)? ws `]`
-            let mut alt: Alt = vec![Symbol::Terminal(b'[')];
-            alt.push(Symbol::NonTerminal(ws_id));
+            let item_rule = format!("arr_{n}_item");
+            let item_id = self.builder.reserve(&item_rule);
+            let item_alts = self.compile_schema(items_schema, &[])?;
+            self.builder.set_alts(item_id, item_alts);
 
-            if min_items == 0 && max_items.is_none_or(|m| m > 0) {
-                // Optional content: build arr_body rule.
-                let body_name = "arr_body";
-                let body_id = if let Some(id) = self.builder.rule_id(body_name) {
-                    id
-                } else {
-                    let id = self.builder.reserve(body_name);
-                    // arr_body = item (ws , ws item)*
-                    // We approximate repetition with a left-recursive rule.
-                    // Since our PDA doesn't handle true left-recursion well,
-                    // we use right-recursion: arr_body = item arr_tail
-                    // arr_tail = (ws , ws item arr_tail) | ε
-                    let tail_name = "arr_tail";
-                    let tail_id = self.builder.reserve(tail_name);
-                    let tail_alts = vec![
-                        vec![
-                            Symbol::NonTerminal(ws_id),
-                            Symbol::Terminal(b','),
-                            Symbol::NonTerminal(ws_id),
-                            Symbol::NonTerminal(item_id),
-                            Symbol::NonTerminal(tail_id),
-                        ],
-                        vec![], // epsilon
-                    ];
-                    self.builder.set_alts(tail_id, tail_alts);
-
-                    let body_alt = vec![vec![
-                        Symbol::NonTerminal(item_id),
-                        Symbol::NonTerminal(tail_id),
-                    ]];
-                    self.builder.set_alts(id, body_alt);
-                    id
-                };
-
-                // opt_arr_body = arr_body | ε
-                let opt_name = "opt_arr_body";
-                let opt_id = if let Some(id) = self.builder.rule_id(opt_name) {
-                    id
-                } else {
-                    let id = self.builder.reserve(opt_name);
-                    self.builder
-                        .set_alts(id, vec![vec![Symbol::NonTerminal(body_id)], vec![]]);
-                    id
-                };
-                alt.push(Symbol::NonTerminal(opt_id));
-            } else {
-                // min_items required items — unroll exactly.
-                for _ in 0..min_items {
-                    alt.push(Symbol::NonTerminal(item_id));
-                }
-            }
-
-            alt.push(Symbol::NonTerminal(ws_id));
-            alt.push(Symbol::Terminal(b']'));
+            let alt = self.build_cardinality_array_alt(n, item_id, ws_id, min_items, max_items);
             return Ok(vec![alt]);
         }
 
-        // No items schema: any array `[]` or `[v, ...]`.
+        // No items schema and no prefixItems: any array `[]` or `[v, ...]`.
         let any_val_rule = "any_json_value";
         let any_id = if let Some(id) = self.builder.rule_id(any_val_rule) {
             id
@@ -424,6 +457,15 @@ impl<'a> CompileCtx<'a> {
             id
         };
 
+        // issue #310 #2 (codex review): honor cardinality even with no `items` schema.
+        if min_items > 0 || max_items.is_some() {
+            let n = self.array_counter;
+            self.array_counter += 1;
+            let alt = self.build_cardinality_array_alt(n, any_id, ws_id, min_items, max_items);
+            return Ok(vec![alt]);
+        }
+
+        // Unconstrained any-array: cache the shared rules.
         let tail_name = "any_arr_tail";
         let tail_id = if let Some(id) = self.builder.rule_id(tail_name) {
             id
@@ -466,8 +508,165 @@ impl<'a> CompileCtx<'a> {
         Ok(vec![alt])
     }
 
+    /// Build the full `[ ... ]` alternative for an array whose items all use
+    /// `item_id`, honoring [min_items, max_items] cardinality.
+    ///
+    /// Precondition: max_items >= min_items (validated by the caller / global guard).
+    fn build_cardinality_array_alt(
+        &mut self,
+        n: usize,
+        item_id: usize,
+        ws_id: usize,
+        min_items: usize,
+        max_items: Option<usize>,
+    ) -> Alt {
+        let mut alt: Alt = vec![Symbol::Terminal(b'[')];
+        alt.push(Symbol::NonTerminal(ws_id));
+
+        let slack = max_items.map(|m| m - min_items); // None = unbounded
+
+        match (min_items, max_items) {
+            (0, Some(0)) => {
+                // Only `[]` is valid; no items at all.
+            }
+            (0, _) => {
+                // All items are optional.  Build an optional head + optional tail.
+                // slack == Some(0) means max == 0 which is handled above;
+                // this arm is only reached when slack > 0 or slack is None.
+                if slack != Some(0) {
+                    // Build optional body: first item is optional, subsequent
+                    // items each carry a leading comma.
+                    let body_id = self.build_bounded_tail(n, 0, slack, item_id, ws_id);
+                    alt.push(Symbol::NonTerminal(body_id));
+                }
+            }
+            (min, _) => {
+                // Emit exactly `min` required items (first without leading comma,
+                // remaining with leading comma).
+                alt.push(Symbol::NonTerminal(item_id));
+                alt.push(Symbol::NonTerminal(ws_id));
+                for _ in 1..min {
+                    alt.push(Symbol::Terminal(b','));
+                    alt.push(Symbol::NonTerminal(ws_id));
+                    alt.push(Symbol::NonTerminal(item_id));
+                    alt.push(Symbol::NonTerminal(ws_id));
+                }
+
+                // Append optional tail for additional items (up to slack more).
+                if slack != Some(0) {
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
+                    alt.push(Symbol::NonTerminal(tail_id));
+                }
+            }
+        }
+
+        alt.push(Symbol::Terminal(b']'));
+        alt
+    }
+
+    /// Build a rule representing "zero or more additional items (with leading commas),
+    /// bounded to at most `slack` items (None = unbounded)".
+    ///
+    /// `depth` tracks whether this is the first item in an all-optional body (depth=0,
+    /// no leading comma on the first item) or a continuation tail (depth>=1, leading
+    /// comma required per item).
+    ///
+    /// Returns the rule id of the outermost optional rule.
+    ///
+    /// For unbounded tails (slack=None): right-recursive rule.
+    /// For bounded tails (slack=Some(k)): nested-optional chain of depth k.
+    fn build_bounded_tail(
+        &mut self,
+        arr_n: usize,
+        depth: usize,
+        slack: Option<usize>,
+        item_id: usize,
+        ws_id: usize,
+    ) -> usize {
+        match slack {
+            None => {
+                // Unbounded tail: arr_{n}_tail_{depth} = (,? ws item ws arr_{n}_tail_{depth}) | ε
+                // When depth==0 (optional body), first item has no leading comma.
+                // When depth>=1 (continuation), every item has a leading comma.
+                let rule_name = format!("arr_{arr_n}_tail_{depth}");
+                let id = self.builder.reserve(&rule_name);
+                let recurse_id = id; // right-recursive reference to self
+                let body_alt = if depth == 0 {
+                    // First item: no leading comma; tail continues with depth=1.
+                    // We build: item ws tail_{depth+1}
+                    // But since we need the recursive rule to reference itself,
+                    // build the continuation tail as a separate rule.
+                    let cont_name = format!("arr_{arr_n}_tail_{}", depth + 1);
+                    let cont_id = self.builder.reserve(&cont_name);
+                    let cont_alt = vec![
+                        Symbol::Terminal(b','),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(item_id),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(cont_id),
+                    ];
+                    self.builder
+                        .set_alts(cont_id, vec![cont_alt, vec![] /* epsilon */]);
+                    vec![
+                        Symbol::NonTerminal(item_id),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(cont_id),
+                    ]
+                } else {
+                    // Continuation: leading comma + item + recurse.
+                    vec![
+                        Symbol::Terminal(b','),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(item_id),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(recurse_id),
+                    ]
+                };
+                self.builder
+                    .set_alts(id, vec![body_alt, vec![] /* epsilon */]);
+                id
+            }
+            Some(0) => {
+                // No slack: epsilon rule (no additional items allowed).
+                let rule_name = format!("arr_{arr_n}_opt_{depth}_0");
+                let id = self.builder.reserve(&rule_name);
+                self.builder.set_alts(id, vec![vec![] /* epsilon */]);
+                id
+            }
+            Some(k) => {
+                // Bounded tail: nested-optional chain of depth k.
+                // opt_{depth}_{k} = (leading_comma? item ws opt_{depth+1}_{k-1}) | ε
+                let rule_name = format!("arr_{arr_n}_opt_{depth}_{k}");
+                let id = self.builder.reserve(&rule_name);
+                // Recursively build the inner optional (one fewer slot).
+                let inner_id =
+                    self.build_bounded_tail(arr_n, depth + 1, Some(k - 1), item_id, ws_id);
+                let body_alt: Alt = if depth == 0 {
+                    // Optional head: no leading comma on first item.
+                    vec![
+                        Symbol::NonTerminal(item_id),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(inner_id),
+                    ]
+                } else {
+                    // Continuation: leading comma before each additional item.
+                    vec![
+                        Symbol::Terminal(b','),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(item_id),
+                        Symbol::NonTerminal(ws_id),
+                        Symbol::NonTerminal(inner_id),
+                    ]
+                };
+                self.builder
+                    .set_alts(id, vec![body_alt, vec![] /* epsilon */]);
+                id
+            }
+        }
+    }
+
     /// Compile `"type": "string"` potentially with an `enum` constraint.
-    fn compile_string_type(&mut self, schema: &Value) -> Vec<Alt> {
+    fn compile_string_type(&mut self, schema: &Value) -> Result<Vec<Alt>, SchemaError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
             let str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
             if !str_values.is_empty() {
@@ -486,24 +685,33 @@ impl<'a> CompileCtx<'a> {
                 let choices_name = format!("str_enum_{}", self.enum_counter);
                 self.enum_counter += 1;
                 let choices_id = self.builder.reserve(&choices_name);
-                let choice_alts: Vec<Alt> = str_values
-                    .iter()
-                    .map(|s| s.bytes().map(Symbol::Terminal).collect::<Alt>())
-                    .collect();
+                // issue #310 finding #7: JSON-encode each string value so that
+                // special characters (e.g. `"`, `\`) are properly escaped in the
+                // grammar, matching what valid JSON actually contains.
+                // serde_json::to_string produces `"value"` with surrounding quotes;
+                // strip them and emit the inner escaped bytes.
+                let mut choice_alts: Vec<Alt> = Vec::with_capacity(str_values.len());
+                for s in &str_values {
+                    let json_repr = serde_json::to_string(s)
+                        .map_err(|e| SchemaError(format!("cannot JSON-encode enum value: {e}")))?;
+                    // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
+                    let inner = &json_repr[1..json_repr.len() - 1];
+                    choice_alts.push(inner.bytes().map(Symbol::Terminal).collect());
+                }
                 self.builder.set_alts(choices_id, choice_alts);
-                return vec![vec![
+                return Ok(vec![vec![
                     Symbol::Terminal(b'"'),
                     Symbol::NonTerminal(choices_id),
                     Symbol::Terminal(b'"'),
-                ]];
+                ]]);
             }
         }
         // Default: any JSON string via built-in rule.
         if let Some(id) = self.builder.rule_id("json_string") {
-            vec![vec![Symbol::NonTerminal(id)]]
+            Ok(vec![vec![Symbol::NonTerminal(id)]])
         } else {
             // Fallback: inline minimal string rule (should not happen).
-            vec![vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]]
+            Ok(vec![vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]])
         }
     }
 
@@ -782,11 +990,14 @@ fn json_value_to_alt(v: &Value) -> Result<Alt, SchemaError> {
 }
 
 /// Build a grammar alternative for the JSON literal string `key` (with quotes).
-fn json_string_literal(key: &str) -> Alt {
-    let mut alt = vec![Symbol::Terminal(b'"')];
-    alt.extend(key.bytes().map(Symbol::Terminal));
-    alt.push(Symbol::Terminal(b'"'));
-    alt
+///
+/// issue #310 finding #7: JSON-encode the key so that characters like `"` and
+/// `\` are properly escaped in the grammar, matching valid JSON output.
+fn json_string_literal(key: &str) -> Result<Alt, SchemaError> {
+    let json_repr = serde_json::to_string(key)
+        .map_err(|e| SchemaError(format!("cannot JSON-encode property key: {e}")))?;
+    // json_repr includes surrounding `"` quotes; emit them as terminals directly.
+    Ok(json_repr.bytes().map(Symbol::Terminal).collect())
 }
 
 /// Extract the definition name from a `$ref` string like `#/$defs/Foo`.
