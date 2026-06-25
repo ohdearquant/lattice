@@ -141,6 +141,61 @@ jobs:
           header: e2e-parity
           path: parity-report.md
 
+  # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
+  # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
+  #
+  # Runs on macos-latest (arm64) to exercise the NEON normalise path that
+  # crates/embed/src/simd/ dispatches on aarch64.  A geometry regression on
+  # AVX2/x86_64 would also be caught here on the runner's scalar fallback, but
+  # the primary reason for macOS is to match the NEON path that production
+  # lattice deployments use.
+  #
+  # Model provisioning: the bge-small-en-v1.5 weights (~130 MB) are downloaded
+  # via `cargo run ... --bin embed -- --download-only`, then cached per-run by
+  # key "bge-small-en-v1.5-v1".  The key never changes because the weights are
+  # immutable; if the model revision is bumped the cache key must be bumped too.
+  #
+  # Re-baseline procedure: when an intentional forward-path change lands, run
+  #   cargo run --release -p lattice-embed --example dump_parity_embeddings
+  # to regenerate, commit the new fixture, and rename _v1 → _v2 in both the
+  # fixture directory and the test file.
+  #
+  # NOTE: once this job has gone green on CI once, add "embed-drift" to the
+  # repository's required status checks (Settings → Branches → main protection
+  # rule).  That governance step is done by the founder; it is intentionally
+  # not automated here.
+  embed-drift:
+    name: embed drift gate
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embed-drift
+
+      - name: Cache BGE-small weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-v1
+
+      # Download weights into ~/.lattice/models/bge-small-en-v1.5 if not cached.
+      - name: Provision bge-small-en-v1.5 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model bge-small-en-v1.5 --download-only
+
+      - name: Run embedding-drift gate
+        run: |
+          cargo test --release -p lattice-embed --test embed_drift_baseline \
+            -- --nocapture
+
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity job's verdict when it
   # did. Fails closed if change-detection itself errored.

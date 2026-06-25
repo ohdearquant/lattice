@@ -38,6 +38,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
 proptest = "1"
+lattice-transport = { path = "../transport" }
+serde_json = { workspace = true }
 
 [features]
 default = ["native"]
@@ -53,6 +55,10 @@ required-features = ["native"]
 
 [[example]]
 name = "basic_embed"
+required-features = ["native"]
+
+[[example]]
+name = "dump_parity_embeddings"
 required-features = ["native"]
 
 [[example]]
