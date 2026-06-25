@@ -54,9 +54,15 @@ pub(crate) fn sample_token(
 
 fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty: f32) {
     let vocab_size = adjusted.len();
+    // previous_ids is the full token history and routinely repeats ids. Penalize each
+    // id exactly once (HF gather-once semantics; matches the Metal CandidateSet path).
+    // Applying per occurrence would compound to penalty^N and over-suppress common
+    // tokens as the sequence grows. O(n) dedup via a set — negligible beside the
+    // full-vocab `adjusted` clone the caller already pays each step.
+    let mut seen = std::collections::HashSet::with_capacity(previous_ids.len());
     for &id in previous_ids {
         let idx = id as usize;
-        if idx < vocab_size {
+        if idx < vocab_size && seen.insert(id) {
             if adjusted[idx] > 0.0 {
                 adjusted[idx] /= penalty;
             } else {
