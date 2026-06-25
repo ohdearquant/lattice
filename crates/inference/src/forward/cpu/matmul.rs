@@ -14,6 +14,13 @@ use super::tiled::matmul_bt_tiled;
 ///
 /// General matrix multiplication: C = A * B.
 pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    // Guard the allocation itself: an overflowed m*n would silently allocate a tiny Vec
+    // whose length would then pass matmul_into's c.len() >= m*n check (same wrapped value).
+    // Checked here so the vec! and all downstream guards use the same trustworthy product.
+    assert!(
+        m.checked_mul(n).is_some(),
+        "matmul output shape overflow: m*n"
+    );
     let mut c = vec![0.0f32; m * n];
     matmul_into(a, b, &mut c, m, k, n);
     c
@@ -23,9 +30,21 @@ pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 ///
 /// Matrix multiply into a pre-allocated output buffer.
 pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), k * n);
-    debug_assert_eq!(c.len(), m * n);
+    // Release-active bounds guards — see #368 (#218/#224 precedent).
+    // Overflow checks first: a wrapped shape product can make a length check pass spuriously
+    // (the #367 lesson). The unchecked multiplies below are safe only after these pass.
+    assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
+    assert!(k.checked_mul(n).is_some(), "matmul shape overflow: k*n");
+    assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
+    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
+    // shape footprint (a: [0, m*k), b: [0, k*n)) and the output requires c.len() >= m*n.
+    // Some callers pass reused scratch buffers longer than the exact footprint; that is
+    // sound, and assert_eq! would false-panic on them. Note the output suffix beyond m*n
+    // is NOT part of the result and may be clobbered (matmul_scalar zeroes the full c
+    // slice) — callers needing suffix preservation must pass &mut c[..m*n].
+    assert!(a.len() >= m * k, "matmul: a too short for m*k");
+    assert!(b.len() >= k * n, "matmul: b too short for k*n");
+    assert!(c.len() >= m * n, "matmul: c too short for m*n");
 
     // GPU dispatch is NOT in this hot path — per-call buffer creation is too slow.
     // GPU acceleration requires the full forward pass to run on-device.
@@ -44,9 +63,22 @@ pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
 ///
 /// Matrix multiply with transposed B: C = A @ B^T.
 pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    debug_assert_eq!(a.len(), m * k);
-    debug_assert_eq!(b.len(), n * k);
-    debug_assert_eq!(c.len(), m * n);
+    // Release-active bounds guards — see #368 (#218/#224 precedent).
+    // Overflow checks first: a wrapped shape product can make a length check pass spuriously
+    // (the #367 lesson). Note: B is stored transposed, so its footprint is n*k, not k*n.
+    assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
+    assert!(n.checked_mul(k).is_some(), "matmul shape overflow: n*k");
+    assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
+    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
+    // shape footprint (a: [0, m*k), b: [0, n*k) since B is transposed) and the output
+    // requires c.len() >= m*n. Some callers pass reused scratch buffers longer than the
+    // exact footprint; that is sound, and assert_eq! would false-panic on them. Note the
+    // output suffix beyond m*n is NOT part of the result and may be clobbered
+    // (matmul_bt_tiled zeroes the full c slice) — callers needing suffix preservation
+    // must pass &mut c[..m*n].
+    assert!(a.len() >= m * k, "matmul: a too short for m*k");
+    assert!(b.len() >= n * k, "matmul_bt: b too short for n*k");
+    assert!(c.len() >= m * n, "matmul: c too short for m*n");
 
     // CPU path only — Accelerate AMX on macOS, SIMD/scalar elsewhere.
     #[cfg(target_os = "macos")]
@@ -184,5 +216,61 @@ fn matmul_bt_scalar_m1(a: &[f32], b: &[f32], c: &mut [f32], k: usize, n: usize) 
             s0 += a_row[p] * b_row[p];
         }
         c[j] = ((s0 + s1) + (s2 + s3)) + ((s4 + s5) + (s6 + s7));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- release-active bounds guards (#368) ---
+
+    /// A too-short `b` must panic in both debug AND release builds (release-active assert).
+    /// m=1, k=2, n=2: b must have n*k=4 elements; passing [] triggers the guard.
+    #[test]
+    #[should_panic(expected = "too short for n*k")]
+    fn matmul_bt_short_b_panics_in_release() {
+        let a = [0.0f32; 2]; // a.len() = m*k = 1*2 = 2 ✓
+        let b: [f32; 0] = []; // b.len() = 0 < n*k = 4  ✗
+        let mut c = [0.0f32; 2];
+        matmul_bt(&a, &b, &mut c, 1, 2, 2);
+    }
+
+    /// A shape product that would overflow usize must panic before any memory access.
+    /// m=2, k=usize::MAX, n=2: m*k overflows on the first overflow check.
+    #[test]
+    #[should_panic(expected = "shape overflow")]
+    fn matmul_shape_overflow_panics() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 1];
+        matmul_bt(&a, &b, &mut c, 2, usize::MAX, 2);
+    }
+
+    /// Callers may pass reused scratch buffers whose length EXCEEDS the exact footprint.
+    /// `>=` is the correct check: this must NOT panic and must produce correct results
+    /// in c[0..m*n]. The content of extra slots is unspecified across platforms.
+    #[test]
+    fn matmul_bt_oversized_c_does_not_panic() {
+        // m=1, k=2, n=2: result c is m*n=2 elements. Pass c of length 3 (one extra).
+        // a = [1, 2], b = [[1, 0], [0, 1]] stored row-major (transposed B).
+        // c[0] = dot(a, b_row0) = 1*1 + 2*0 = 1
+        // c[1] = dot(a, b_row1) = 1*0 + 2*1 = 2
+        let a = [1.0f32, 2.0];
+        let b = [1.0f32, 0.0, 0.0, 1.0]; // n=2 rows of k=2
+        let mut c = [0.0f32; 3]; // intentionally oversized (3 > m*n=2)
+        matmul_bt(&a, &b, &mut c, 1, 2, 2);
+        assert!(
+            (c[0] - 1.0).abs() < 1e-6,
+            "c[0] should be 1.0, got {}",
+            c[0]
+        );
+        assert!(
+            (c[1] - 2.0).abs() < 1e-6,
+            "c[1] should be 2.0, got {}",
+            c[1]
+        );
+        // Extra slot c[2]: content is platform-defined, we only guarantee no panic and
+        // correct values in c[0..m*n]. This test proves the >= bound is correct.
     }
 }
