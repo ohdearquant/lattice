@@ -160,6 +160,45 @@ fn test_normalize_384_dim() {
     }
 }
 
+/// NaN-norm guard: a vector containing a NaN element has a NaN L2 norm. The
+/// scalar path leaves it unchanged (`norm > 0.0` is false for NaN), and every
+/// SIMD path must agree byte-for-byte rather than scaling by a NaN inv_norm.
+///
+/// The dims (129, 145, 200) are deliberately NOT multiples of the unrolled
+/// chunk sizes (NEON 16, AVX2 32, AVX-512 64), so each leaves a nonzero scalar
+/// tail. A NaN is placed once in the SIMD main body (index 5) and once in the
+/// scalar tail (index `dim - 1`), confirming the early-return guard fires no
+/// matter which accumulation loop the NaN flows through.
+#[test]
+fn test_normalize_nan_norm_matches_scalar() {
+    for dim in [129usize, 145, 200] {
+        for nan_at in [5usize, dim - 1] {
+            let mut original = generate_random_vector_seeded(dim, 0x_4e_61_4e ^ dim as u64);
+            original[nan_at] = f32::NAN;
+
+            let mut simd_v = original.clone();
+            let mut scalar_v = original.clone();
+
+            normalize(&mut simd_v); // dispatches to the platform SIMD path
+            normalize::normalize_scalar(&mut scalar_v);
+
+            for (i, (s, sc)) in simd_v.iter().zip(scalar_v.iter()).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    sc.to_bits(),
+                    "NaN-norm SIMD vs scalar mismatch at [{i}] (dim={dim}, nan_at={nan_at}): {s} vs {sc}"
+                );
+                assert_eq!(
+                    s.to_bits(),
+                    original[i].to_bits(),
+                    "NaN-norm vector must be left unchanged at [{i}] (dim={dim}, nan_at={nan_at}): {s} vs {}",
+                    original[i]
+                );
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn test_neon_normalize_matches_scalar_multiple_dims() {
