@@ -93,6 +93,17 @@ pub fn apply_gqa_attention(
     cfg: GqaConfig,
     scratch: &mut GqaScratch,
 ) {
+    // Hard divisibility guard, matching `decode_attention_scores` and the flash
+    // paths. `GqaConfig::groups()` only `debug_assert`s this invariant, which is
+    // stripped in release; a non-divisible config would then truncate `groups`,
+    // skip the high query heads, and leave them stale in `attn_out` (never zeroed)
+    // while the unsafe strided-BLAS path below assumes a validated head layout.
+    assert!(cfg.num_kv_heads > 0, "num_kv_heads must be > 0");
+    assert_eq!(
+        cfg.num_heads % cfg.num_kv_heads,
+        0,
+        "num_heads must be divisible by num_kv_heads"
+    );
     let groups = cfg.groups();
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -536,5 +547,29 @@ mod tests {
         }
 
         bit_eq(&fused, &ref_scores);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_heads must be divisible by num_kv_heads")]
+    fn non_divisible_head_config_panics() {
+        // A non-divisible head topology (num_heads % num_kv_heads != 0) must fail
+        // fast at the kernel entry rather than silently process only the first
+        // `num_kv_heads * floor(groups)` query heads and leave the remainder stale.
+        // The hard assert fires in release too (unlike the prior `debug_assert` in
+        // `groups()`), matching `decode_attention_scores`. RED before the entry
+        // guard: `groups()`'s debug_assert panics with the default message, which
+        // does not contain this expected substring.
+        let cfg = GqaConfig {
+            num_heads: 3,
+            num_kv_heads: 2,
+            head_dim: 4,
+        };
+        let seq_len = 4usize;
+        let q = vec![0.0f32; seq_len * cfg.q_dim()];
+        let k = vec![0.0f32; seq_len * cfg.kv_dim()];
+        let v = vec![0.0f32; seq_len * cfg.kv_dim()];
+        let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
+        let mut scratch = GqaScratch::default();
+        apply_gqa_attention(&q, &k, &v, &mut out, seq_len, cfg, &mut scratch);
     }
 }
