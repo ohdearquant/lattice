@@ -12857,7 +12857,9 @@ kernel void gdn_chunk_norm_silu_c32(
         if cfg.repetition_penalty != 1.0 {
             cs.apply_repetition_penalty(previous_ids, cfg.repetition_penalty);
         }
-        if cfg.temperature <= 0.0 {
+        // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so 1/t
+        // overflows) has no valid scaling; the t -> 0+ limit is argmax.
+        if crate::sampling::temperature_degenerate(cfg.temperature) {
             return cs.argmax();
         }
         cs.apply_temperature(cfg.temperature);
@@ -12893,7 +12895,9 @@ kernel void gdn_chunk_norm_silu_c32(
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_full_logits(logits);
         cs.apply_repetition_penalty(previous_ids, cfg.repetition_penalty);
-        if cfg.temperature <= 0.0 {
+        // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so 1/t
+        // overflows) has no valid scaling; the t -> 0+ limit is argmax.
+        if crate::sampling::temperature_degenerate(cfg.temperature) {
             return cs.argmax();
         }
         cs.apply_temperature(cfg.temperature);
