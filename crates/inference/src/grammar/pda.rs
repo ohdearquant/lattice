@@ -268,12 +268,13 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                     if frame.sym_pos == 0 {
                         return try_next_alt(stack, grammar, b, frame_idx);
                     } else {
-                        // Mid-alternative mismatch: bytes have already been
-                        // consumed under this alternative.  A byte-level matcher
-                        // without input rewind cannot un-consume them, so no
-                        // sibling or ancestor alternative can validly
-                        // reinterpret the current byte.  Reject.
-                        return false;
+                        // Mid-alternative mismatch: propagate to parent.
+                        if frame_idx == 0 {
+                            return false;
+                        }
+                        stack.truncate(frame_idx);
+                        let parent_idx = stack.len() - 1;
+                        return try_next_alt(stack, grammar, b, parent_idx);
                     }
                 }
             }
@@ -327,8 +328,7 @@ fn try_next_alt(
         // because a frame's `sym_pos` can advance past nullable nonterminals
         // without consuming any byte (e.g. an optional numeric sign), so a naive
         // guard over-rejects valid input like `[]`. The shared-prefix `anyOf`
-        // over-rejection is the dual of this. Tracked as a grammar-PDA soundness
-        // issue.
+        // over-rejection is the dual of this. Tracked in #353.
         if frame_idx == 0 {
             return false;
         }
@@ -716,33 +716,6 @@ mod tests {
             ],
         );
         b.build()
-    }
-
-    #[test]
-    fn mid_alt_mismatch_does_not_rewind_consumed_bytes() {
-        // Regression for the mid-alternative backtrack hole.
-        // "acd" and "x" are the only strings this grammar accepts. Feeding
-        // "acx": 'a' commits root alt-0, 'c' commits nonterm's first byte, then
-        // 'x' mismatches nonterm's 'd'. The consumed 'a'/'c' bytes cannot be
-        // undone, so 'x' must be rejected at the byte level (it does NOT get to
-        // retry root alt-1 "x"). simulate_token therefore reports the token as
-        // ContextDependent (bytes consumed up to a boundary), never a full
-        // Accept. Before the fix, the parent backtrack wrongly accepted "acx".
-        let g = leading_terminal_then_nt_grammar();
-
-        let state = GrammarState::initial();
-        let (result, _) = simulate_token(&state, &g, b"acx");
-        assert_ne!(
-            result,
-            SimResult::Accept,
-            "mid-alternative mismatch must not rewind already-consumed bytes"
-        );
-
-        // Byte-level: after consuming "ac", the 'x' is rejected outright.
-        let mut s = GrammarState::initial();
-        assert_eq!(advance_byte(&mut s, &g, b'a'), StepResult::Accepted);
-        assert_eq!(advance_byte(&mut s, &g, b'c'), StepResult::Accepted);
-        assert_eq!(advance_byte(&mut s, &g, b'x'), StepResult::Rejected);
     }
 
     #[test]

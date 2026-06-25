@@ -1244,6 +1244,14 @@ mod tests {
     fn compile_array_any() {
         let g = compile_ok(r#"{"type":"array"}"#);
         assert!(accepts(&g, b"[]"));
+        // Non-empty untyped arrays must accept too: the any-array tail rule
+        // `tail ::= ws ',' ws value tail | ε` reaches the `| ε` alternative
+        // after each element so the closing `]` can match.  Regression guard
+        // for a mid-alternative-backtrack over-rejection (refs #353).
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(accepts(&g, br#"[{}]"#));
+        assert!(accepts(&g, b"[true]"));
     }
 
     #[test]
