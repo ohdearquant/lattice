@@ -344,10 +344,18 @@ impl WordPieceTokenizer {
 
     fn from_vocab_map_with_added(
         vocab: HashMap<String, u32>,
-        added_tokens: HashMap<String, u32>,
+        mut added_tokens: HashMap<String, u32>,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
+        // A zero-length added token would match at every position
+        // (`"".starts_with(_)` is always true), so match_added_token returns the
+        // same `pos` and tokenize_to_ids_into never advances — an infinite loop
+        // with unbounded output. A malformed tokenizer.json (an added_token whose
+        // "content" is empty) must not be able to wedge the engine: drop
+        // zero-length added tokens at construction (mirrors the BPE guard).
+        added_tokens.retain(|name, _| !name.is_empty());
+
         let id_to_token = invert_vocab(&vocab)?;
 
         let cls_id = *vocab
@@ -1082,6 +1090,54 @@ mod tests {
         let trie = builder.build();
         let chars: Vec<char> = "embedding".chars().collect();
         assert_eq!(trie.longest_match_chars(&chars, 0), Some((3, 9)));
+    }
+
+    #[test]
+    fn test_empty_content_added_token_does_not_hang() {
+        // Regression (mirrors the BPE guard): a malformed tokenizer.json with a
+        // zero-length added-token `content` injects "" into added_tokens.
+        // `"".starts_with(_)` is always true, so match_added_token returns the
+        // same `pos` and tokenize_to_ids_into never advances — an infinite loop
+        // with unbounded output on the first tokenize() call. The constructor
+        // must drop zero-length added tokens. Run on a worker thread with a 5s
+        // timeout so a re-introduced hang fails fast instead of stalling the
+        // test binary.
+        let mut vocab = HashMap::new();
+        for (s, i) in [
+            ("[PAD]", 0u32),
+            ("[UNK]", 1),
+            ("[CLS]", 2),
+            ("[SEP]", 3),
+            ("[MASK]", 4),
+            ("a", 5),
+            ("b", 6),
+            ("c", 7),
+        ] {
+            vocab.insert(s.to_string(), i);
+        }
+        let mut added = HashMap::new();
+        added.insert(String::new(), 1u32);
+        let tokenizer = WordPieceTokenizer::from_vocab_map_with_added(
+            vocab,
+            added,
+            DEFAULT_WORDPIECE_CACHE_CAPACITY,
+            DEFAULT_MAX_SEQ_LEN,
+        )
+        .expect("construct wordpiece tokenizer with empty added token");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(tokenizer.tokenize("abc").real_length);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(len) => assert!(
+                len < 1000,
+                "empty added token produced runaway output ({len}); zero-length tokens must be dropped"
+            ),
+            Err(_) => {
+                panic!("tokenize() hung on a zero-length added token (infinite-loop regression)")
+            }
+        }
     }
 
     #[test]
