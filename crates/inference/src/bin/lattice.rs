@@ -232,9 +232,10 @@ mod serve {
     /// OpenAI-compatible chat completions request.
     ///
     /// Known-but-unsupported fields (`stream=true`, `tools`, `tool_choice`,
-    /// `logprobs=true`, `n > 1`, `stop`, `response_format` other than `"text"`)
-    /// are parsed and explicitly rejected with HTTP 400 rather than silently
-    /// dropped.  Unknown fields are ignored by default (serde default).
+    /// `logprobs=true`, `n > 1`, `response_format` other than `"text"`) are
+    /// parsed and explicitly rejected with HTTP 400 rather than silently dropped.
+    /// `stop` is accepted and parsed into string-level stop sequences.
+    /// Unknown fields are ignored by default (serde default).
     #[derive(Deserialize)]
     pub struct ChatCompletionRequest {
         /// Required: must match the served model identifier.
@@ -250,7 +251,8 @@ mod serve {
         pub top_p: Option<f32>,
         /// SSE streaming — not yet supported; rejected with 400.
         pub stream: Option<bool>,
-        /// Stop sequences — not yet supported; rejected with 400.
+        /// Stop sequences — a JSON string or array of strings (up to 4, non-empty).
+        /// Parsed by `parse_stop_strings`; null/absent → empty vec (no stops).
         pub stop: Option<Value>,
         /// Deterministic sampling seed.  Mapped into `GenerateConfig`.
         pub seed: Option<u64>,
@@ -393,6 +395,73 @@ mod serve {
         Ok(top_p)
     }
 
+    /// Parse the OpenAI `stop` field into a `Vec<String>`.
+    ///
+    /// Accepted forms:
+    /// - `null` / absent → empty vec (no string-level stops)
+    /// - a JSON string → `vec![s]`
+    /// - a JSON array of 1–4 non-empty strings → that vec
+    ///
+    /// Returns `Err(BadRequest)` for:
+    /// - an empty array
+    /// - an array with more than 4 elements
+    /// - any array element that is not a string
+    /// - any stop string that is empty
+    fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError> {
+        match stop {
+            None => Ok(vec![]),
+            Some(Value::Null) => Ok(vec![]),
+            Some(Value::String(s)) => {
+                if s.is_empty() {
+                    return Err(ApiError::BadRequest {
+                        message: "stop string must not be empty".to_string(),
+                        code: "invalid_stop",
+                    });
+                }
+                Ok(vec![s.clone()])
+            }
+            Some(Value::Array(arr)) => {
+                if arr.is_empty() {
+                    return Err(ApiError::BadRequest {
+                        message: "stop array must not be empty".to_string(),
+                        code: "invalid_stop",
+                    });
+                }
+                if arr.len() > 4 {
+                    return Err(ApiError::BadRequest {
+                        message: format!("stop array has {} elements; maximum is 4", arr.len()),
+                        code: "invalid_stop",
+                    });
+                }
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    match item {
+                        Value::String(s) => {
+                            if s.is_empty() {
+                                return Err(ApiError::BadRequest {
+                                    message: "stop string must not be empty".to_string(),
+                                    code: "invalid_stop",
+                                });
+                            }
+                            out.push(s.clone());
+                        }
+                        _ => {
+                            return Err(ApiError::BadRequest {
+                                message: "each element of stop must be a string".to_string(),
+                                code: "invalid_stop",
+                            });
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Some(_) => Err(ApiError::BadRequest {
+                message: "stop must be a string or array of strings".to_string(),
+                code: "invalid_stop",
+            }),
+        }
+    }
+
     /// Reject OpenAI fields that are parsed but not yet implemented.
     fn reject_unsupported(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         if req.stream.unwrap_or(false) {
@@ -416,12 +485,6 @@ mod serve {
         if req.n.unwrap_or(1) > 1 {
             return Err(ApiError::BadRequest {
                 message: "n > 1 is not supported".to_string(),
-                code: "unsupported_feature",
-            });
-        }
-        if req.stop.is_some() {
-            return Err(ApiError::BadRequest {
-                message: "stop sequences are not supported by this server".to_string(),
                 code: "unsupported_feature",
             });
         }
@@ -602,11 +665,14 @@ mod serve {
             });
         }
 
+        let stop_strings = parse_stop_strings(&req.stop)?;
+
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
             max_new_tokens: max_tokens,
             temperature,
             top_p,
             seed: req.seed,
+            stop_strings,
             ..Default::default()
         };
 
@@ -1045,19 +1111,105 @@ mod serve {
         }
 
         #[test]
-        fn reject_unsupported_stop_rejected() {
+        fn reject_unsupported_stop_now_accepted() {
+            // stop is no longer rejected by reject_unsupported; it is parsed separately.
             let req = ChatCompletionRequest {
                 stop: Some(serde_json::json!("</s>")),
                 ..bare_req()
             };
-            let err = reject_unsupported(&req).unwrap_err();
+            assert!(reject_unsupported(&req).is_ok());
+        }
+
+        // -----------------------------------------------------------------------
+        // parse_stop_strings
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn parse_stop_strings_null_gives_empty() {
+            assert_eq!(parse_stop_strings(&None).unwrap(), Vec::<String>::new());
+            assert_eq!(
+                parse_stop_strings(&Some(serde_json::Value::Null)).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+
+        #[test]
+        fn parse_stop_strings_single_string_gives_vec_of_one() {
+            let v = parse_stop_strings(&Some(serde_json::json!("</s>"))).unwrap();
+            assert_eq!(v, vec!["</s>".to_string()]);
+        }
+
+        #[test]
+        fn parse_stop_strings_array_of_two_accepted() {
+            let v = parse_stop_strings(&Some(serde_json::json!(["</s>", "\nUser:"]))).unwrap();
+            assert_eq!(v, vec!["</s>".to_string(), "\nUser:".to_string()]);
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_array_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!([]))).unwrap_err();
             assert!(matches!(
                 err,
                 ApiError::BadRequest {
-                    code: "unsupported_feature",
+                    code: "invalid_stop",
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_over_four_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["a", "b", "c", "d", "e"])))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_with_number_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["ok", 42]))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_string_element_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["ok", ""]))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_string_scalar_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(""))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_exactly_four_accepted() {
+            let v = parse_stop_strings(&Some(serde_json::json!(["a", "b", "c", "d"]))).unwrap();
+            assert_eq!(v.len(), 4);
         }
 
         #[test]
