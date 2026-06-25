@@ -109,10 +109,16 @@ pub fn apply_gqa_attention(
     let kv_dim = cfg.kv_dim();
     let head_dim = cfg.head_dim;
 
-    debug_assert_eq!(q_buf.len(), seq_len * q_dim);
-    debug_assert_eq!(k_buf.len(), seq_len * kv_dim);
-    debug_assert_eq!(v_buf.len(), seq_len * kv_dim);
-    debug_assert_eq!(attn_out.len(), seq_len * q_dim);
+    // Release-active length guards, matching the divisibility asserts above and
+    // `decode_attention_scores`. These must hold before the macOS unsafe strided-BLAS
+    // path below dereferences `k_buf`/`q_buf` pointers; a too-short buffer would
+    // otherwise read out of bounds inside Accelerate FFI in release builds, where
+    // `debug_assert_eq!` is stripped. This is a safe public API, so the precondition
+    // is enforced here rather than left to the caller.
+    assert_eq!(q_buf.len(), seq_len * q_dim, "q_buf length mismatch");
+    assert_eq!(k_buf.len(), seq_len * kv_dim, "k_buf length mismatch");
+    assert_eq!(v_buf.len(), seq_len * kv_dim, "v_buf length mismatch");
+    assert_eq!(attn_out.len(), seq_len * q_dim, "attn_out length mismatch");
 
     if seq_len == 0 {
         return;
@@ -140,11 +146,12 @@ pub fn apply_gqa_attention(
         #[cfg(target_os = "macos")]
         {
             // On macOS: use strided BLAS to read K directly from k_buf without copy.
-            // SAFETY: kv_h < num_kv_heads and head_dim/kv_dim were validated by
-            // config, so this offset lands within the first K row of k_buf.
+            // SAFETY: kv_h < num_kv_heads and head_dim/kv_dim come from the validated
+            // config, and `k_buf.len() == seq_len * kv_dim` is asserted (release-active)
+            // above, so this offset lands within the first K row of k_buf.
             let k_ptr = unsafe { k_buf.as_ptr().add(kv_h * head_dim) };
-            // SAFETY: pointers derive from valid slices with strides matching
-            // q_batch, k_buf, and scores_batch dimensions checked above.
+            // SAFETY: pointers derive from valid slices whose lengths were asserted
+            // above, with strides matching q_batch, k_buf, and scores_batch dimensions.
             unsafe {
                 sgemm_bt_strided(
                     scratch.q_batch.as_ptr(),
@@ -341,11 +348,18 @@ fn apply_scaled_causal_softmax_fused(
             sum += *v;
         }
 
-        if sum > 0.0 {
+        if sum > 0.0 && sum.is_finite() {
             let inv = 1.0 / sum;
             for v in &mut row[..valid] {
                 *v *= inv;
             }
+        } else {
+            // Degenerate row: every valid score was masked or non-finite, so `max_val`
+            // is non-finite and `exp` produced NaN/Inf (e.g. all -inf, or any +inf).
+            // Emit a zero-probability row instead of propagating NaN into the context,
+            // matching `decode.rs` (`row.fill(0.0)` when the normalizer is not positive)
+            // and the flash-causal non-finite handling.
+            row[..valid].fill(0.0);
         }
 
         row[valid..].fill(0.0);
@@ -571,5 +585,66 @@ mod tests {
         let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
         let mut scratch = GqaScratch::default();
         apply_gqa_attention(&q, &k, &v, &mut out, seq_len, cfg, &mut scratch);
+    }
+
+    #[test]
+    #[should_panic(expected = "k_buf length mismatch")]
+    fn short_buffer_panics_before_unsafe_blas() {
+        // A too-short K buffer must fail fast at the release-active length assert at
+        // the kernel entry, BEFORE the macOS unsafe strided-BLAS path derives a
+        // pointer into k_buf. The guard is OS-independent (it precedes the
+        // `cfg(macos)` block), so a panic here proves the macOS unsafe FFI cannot be
+        // reached with an out-of-bounds K pointer in release. RED before the fix:
+        // the length check was `debug_assert_eq!`, a no-op in release.
+        let cfg = GqaConfig {
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+        };
+        let seq_len = 1usize;
+        let q = vec![0.0f32; seq_len * cfg.q_dim()];
+        let k: Vec<f32> = Vec::new(); // too short: expected seq_len * kv_dim == 1
+        let v = vec![0.0f32; seq_len * cfg.kv_dim()];
+        let mut out = vec![0.0f32; seq_len * cfg.q_dim()];
+        let mut scratch = GqaScratch::default();
+        apply_gqa_attention(&q, &k, &v, &mut out, seq_len, cfg, &mut scratch);
+    }
+
+    #[test]
+    fn fused_softmax_all_neg_inf_row_is_zero_not_nan() {
+        // A query row whose every valid score is -inf (fully masked / non-finite)
+        // must not propagate NaN: `max_val` stays -inf, `exp(-inf - -inf)` is NaN,
+        // and the row must fall back to a zero-probability distribution, matching
+        // decode.rs and flash-causal. RED before the fix: the row stayed NaN.
+        let seq_len = 2usize;
+        let batch_rows = 2usize; // groups = 1
+        let mut scores = vec![f32::NEG_INFINITY; batch_rows * seq_len];
+        apply_scaled_causal_softmax_fused(&mut scores, batch_rows, seq_len, 0.125);
+        assert!(
+            scores.iter().all(|v| v.is_finite()),
+            "row contains non-finite"
+        );
+        assert!(
+            scores.iter().all(|&v| v == 0.0),
+            "degenerate row must be zero"
+        );
+    }
+
+    #[test]
+    fn fused_softmax_pos_inf_row_is_zero_not_nan() {
+        // A +inf score also yields NaN through `exp(+inf - +inf)`; the degenerate
+        // fallback (sum not positive-finite) must zero the row rather than emit NaN.
+        let seq_len = 3usize;
+        let batch_rows = 3usize;
+        let mut scores = vec![f32::INFINITY; batch_rows * seq_len];
+        apply_scaled_causal_softmax_fused(&mut scores, batch_rows, seq_len, 0.125);
+        assert!(
+            scores.iter().all(|v| v.is_finite()),
+            "row contains non-finite"
+        );
+        assert!(
+            scores.iter().all(|&v| v == 0.0),
+            "degenerate row must be zero"
+        );
     }
 }
