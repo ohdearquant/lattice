@@ -611,6 +611,40 @@ impl<'a> MtpVerifier<'a> {
                 config.head_dim, config.partial_rotary_factor
             )));
         }
+        // Checked derived-dimension products. MtpScratch::new and FlatKVCache
+        // allocate from these, and num_attention_heads/head_dim can be oversized
+        // in a public config even with tiny weights (only weights.layers.len()
+        // is checked above), so a pathological config could overflow-panic
+        // (debug) or wrap (release) before construction. Validate the products
+        // here — the private MtpScratch::new and the cache config are only
+        // reached through this constructor, so upstream checking is sufficient.
+        let checked_dim = |a: usize, b: usize, what: &str| -> Result<usize, InferenceError> {
+            a.checked_mul(b).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "MtpConfig dimension product {what} ({a} * {b}) overflows usize"
+                ))
+            })
+        };
+        let q_dim = checked_dim(
+            config.num_attention_heads,
+            config.head_dim,
+            "num_attention_heads * head_dim",
+        )?;
+        let kv_dim = checked_dim(
+            config.num_key_value_heads,
+            config.head_dim,
+            "num_key_value_heads * head_dim",
+        )?;
+        checked_dim(2, config.hidden_size, "2 * hidden_size")?;
+        checked_dim(2, q_dim, "2 * q_dim")?;
+        checked_dim(2, config.moe_intermediate_size, "2 * moe_intermediate_size")?;
+        checked_dim(
+            config.num_attention_heads,
+            max_seq_len,
+            "num_attention_heads * max_seq_len",
+        )?;
+        checked_dim(kv_dim, max_seq_len, "kv_dim * max_seq_len")?;
+
         // RopeTable built with head_dim=rope_dim so half_dim = rope_dim/2
         let rope = crate::rope::RopeTable::new(rope_dim, max_seq_len.max(1), config.rope_theta);
 
@@ -3852,6 +3886,29 @@ mod tests {
         assert!(
             format!("{err:?}").contains("overflows usize"),
             "expected overflow rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new returns Err (not a panic) when num_attention_heads *
+    /// head_dim overflows. Reachable with TINY weights — only weights.layers.len()
+    /// is checked before MtpScratch/cache construction, so an oversized
+    /// num_attention_heads passes the scalar/divisibility checks (kv_heads=1)
+    /// yet overflows q_dim (codex #362 round-2 Medium: derived-dimension products).
+    #[test]
+    fn mtp_new_rejects_head_dim_product_overflow() {
+        let base = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&base);
+        let embed: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let mut cfg = tiny_mtp_config();
+        cfg.num_key_value_heads = 1;
+        cfg.num_attention_heads = usize::MAX / 4 + 1; // * head_dim (4) overflows
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("overflowing num_attention_heads * head_dim must return Err, not panic");
+        };
+        assert!(
+            format!("{err:?}").contains("overflows usize"),
+            "expected dimension-product overflow rejection, got: {err:?}"
         );
     }
 
