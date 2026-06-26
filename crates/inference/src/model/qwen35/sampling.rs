@@ -55,15 +55,17 @@ pub(crate) fn sample_token(
             .then_with(|| a.cmp(&b))
     });
 
+    // `indices` is already in (descending adjusted-logit, ascending token-id)
+    // order from the pre-sort above. softmax is monotonic in the logit, so the
+    // probabilities build_softmax_probs returns inherit exactly that order
+    // (descending probability, ties broken by ascending token-id) without any
+    // further sorting. Re-sorting here would double the sort cost — and for the
+    // supported `top_k == 0` (no top-k filtering) that means sorting the full
+    // vocabulary twice per decode step. apply_top_p and draw_index both rely only
+    // on this descending order, which the pre-sort already guarantees.
     let Some(mut probs) = build_softmax_probs(&adjusted, &indices) else {
         return greedy_token(&adjusted);
     };
-
-    probs.sort_unstable_by(|(ia, a), (ib, b)| {
-        b.partial_cmp(a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| ia.cmp(ib))
-    });
 
     if cfg.top_p < 1.0 {
         apply_top_p(&mut probs, cfg.top_p);
@@ -302,8 +304,18 @@ mod tests {
         assert_eq!(token, 0, "NaN penalty must be a no-op");
     }
 
-    /// Parity proof: `Sampler::sample` (Path A) and `sample_token` (Path B)
-    /// must produce IDENTICAL token sequences for the same logits, config, and seed.
+    /// Realistic-input parity regression guard: `Sampler::sample` (Path A) and
+    /// `sample_token` (Path B) must produce IDENTICAL token sequences for the same
+    /// logits, config, and seed on a typical no-tie logit vector.
+    ///
+    /// This guards against future drift but does NOT by itself isolate the three
+    /// consolidation alignments — its input has no exact ties (so the tie-break
+    /// never engages) and never forces the CDF fallback (it fires only on rare
+    /// float-rounding events). The mutation-sensitive per-fix proofs live in
+    /// `draw_index_fallback_returns_last_bucket_not_first` (fallback) and
+    /// `cross_path_parity_with_logit_ties` (tie-break + summation order). What this
+    /// test does prove: with the pre-sort in place, the two paths' softmax sums are
+    /// bit-identical, so they agree on a full 200-draw realistic stream.
     ///
     /// Seed alignment: `Sampler::with_seed(S)` calls `Rng::new(S)` which sets
     /// `state = S` (for S ≠ 0). `sample_token` takes `rng_state: &mut u64`; when
@@ -410,8 +422,9 @@ mod tests {
              token 0 and select token 1 (a `r <= cumsum` regression selects token 0)"
         );
 
-        // Sanity: r below the first bucket selects token 0; r at/above the last
-        // bucket's cumsum (only reachable via float error) falls back to token 0.
+        // Sanity: r below the first bucket selects token 0; r between the two
+        // bucket boundaries selects token 1 (these probs sum to exactly 1.0, so
+        // the fallback branch is never reached here — see the dedicated test below).
         assert_eq!(
             draw_index(&probs, 0.25),
             0,
@@ -424,52 +437,71 @@ mod tests {
         );
     }
 
-    /// Parity proof with exact logit ties: both sampling paths must produce
-    /// IDENTICAL token sequences even when the logit set contains exact f32 ties.
+    #[test]
+    fn draw_index_fallback_returns_last_bucket_not_first() {
+        // Directly force the float-error fallback branch: probs that sum to LESS
+        // than r so `r < cumsum` never fires and the loop runs to completion. The
+        // correct fallback is the LAST bucket — on a descending-prob, sum≈1.0 CDF
+        // the final bucket owns [c_{n-2}, 1.0), so an r that floats past the last
+        // threshold belongs to the LAST token. This matches Path A's
+        // `CandidateSet::sample_top_p_with_scratch`, which returns `candidates.last()`.
+        //
+        // This test is the mutation-sensitive proof of the fallback alignment:
+        // reverting `draw_index` to the old `probs[probs.len()-1]` → `probs[0]`
+        // returns idx 7 and fails this assertion. The full-stream parity tests do
+        // NOT exercise this branch (it fires only on ~1e-7 float-rounding events),
+        // which is exactly why this direct unit test exists.
+        let probs: Vec<(usize, f32)> = vec![(7, 0.3), (8, 0.3), (9, 0.3)]; // sum 0.9 < r
+        assert_eq!(
+            draw_index(&probs, 0.95),
+            9,
+            "when cumsum never reaches r (float error), the draw belongs to the \
+             LAST bucket (idx 9); the old `probs[0]` behaviour returns idx 7"
+        );
+    }
+
+    /// Mutation-sensitive tie-break parity proof: both sampling paths must produce
+    /// IDENTICAL token sequences when the logit set contains exact f32 ties, AND
+    /// this test must FAIL if Path B breaks ties towards the higher token-id.
     ///
-    /// Two tie scenarios are exercised simultaneously:
+    /// The earlier version of this test was vacuous (codex round-1 finding): it put
+    /// the ties at low-probability positions (logit 25 of 64) and used top_p=0.95,
+    /// so the nucleus truncated the tied tokens before they could affect a draw —
+    /// a reversed tie-break still passed. The fix is to give the tied tokens real
+    /// probability mass and disable nucleus truncation so the tie-break is observable:
     ///
-    /// 1. **Within-top-40 tie** (indices 5 and 6 share logit 59.0):
-    ///    Both are selected by top-k. Correct sort order places index 5 before
-    ///    index 6 (ascending token-id tie-break). A reversed tie-break reorders
-    ///    the softmax iteration → different accumulated sums → different cumsum
-    ///    thresholds → different tokens drawn.
+    /// - **top_p = 1.0** — no truncation; every kept token participates in draws.
+    /// - **Tie at the maximum** (indices 0 & 1 both = 10.0): they carry ~0.38 of the
+    ///   mass EACH. A reversed sort-order tie-break swaps which of the two owns the
+    ///   first CDF bucket [0, 0.38), so ~77 of 200 draws flip.
+    /// - **Tie at the top-k=3 boundary** (indices 2 & 3 both = 9.5): rank 3 is
+    ///   contested. The correct selection tie-break retains index 2 (lower id, prob
+    ///   ~0.23); a reversed one retains index 3 instead → a different ~0.23-mass token
+    ///   appears in ~46 of 200 draws.
     ///
-    /// 2. **Boundary tie** (indices 39 and 40 share logit 25.0):
-    ///    Exactly 39 tokens rank above this pair, so rank 40 is contested.
-    ///    Correct tie-break retains index 39 (lower id) and evicts index 40.
-    ///    A reversed tie-break swaps them → different token pool → divergent
-    ///    sequences.
-    ///
-    /// This test will FAIL if either path breaks ties towards the higher
-    /// token-id, because the resulting candidate sets and/or sort orders diverge.
+    /// Both ties carry enough probability that a reversed tie-break in EITHER the
+    /// `select_nth_unstable_by` selection OR the pre-softmax sort diverges the stream
+    /// well within 200 draws. Empirically verified mutation-sensitive: reverting
+    /// either Path-B tie-break comparator to descending token-id fails this assertion.
     #[test]
     fn cross_path_parity_with_logit_ties() {
         use crate::model::qwen35_config::GenerateConfig;
         use crate::sampling::{Sampler, SamplingConfig};
 
-        // Base logits: index i gets value (64 − i) so the natural sorted order
-        // is strictly descending, all distinct.
-        let mut logits: Vec<f32> = (0..64).map(|i| 64.0_f32 - i as f32).collect();
+        // 8 tokens. Two ties, both at HIGH-probability positions:
+        //   idx 0 & 1 tie at the maximum (10.0)        -> sort-order tie-break
+        //   idx 2 & 3 tie at the top_k=3 boundary (9.5) -> selection tie-break
+        // Remaining tokens descend so the rest of the order is unambiguous.
+        let logits: Vec<f32> = vec![10.0, 10.0, 9.5, 9.5, 9.0, 8.0, 7.0, 6.0];
 
-        // Tie 1 (within top-40): indices 5 and 6 both receive logit 59.0.
-        // Index 5 originally had 59.0; set index 6 to match.
-        // Both survive top-k selection. Correct sort: 5 before 6.
-        logits[6] = logits[5]; // 59.0
-
-        // Tie 2 (boundary): indices 39 and 40 both receive logit 25.0.
-        // Index 39 originally had 25.0; set index 40 to match.
-        // The 39 tokens above this pair fill ranks 1–39, leaving rank 40
-        // contested. Correct tie-break: index 39 wins; index 40 is evicted.
-        logits[40] = logits[39]; // 25.0
-
-        let temperature = 0.8f32;
-        let top_k = 40usize;
-        let top_p = 0.95f32;
+        let temperature = 1.0f32;
+        let top_k = 3usize; // rank 3 contested between idx 2 and idx 3
+        let top_p = 1.0f32; // NO nucleus truncation — tied tokens stay in play
         let seed = 0xdead_beef_cafe_babe_u64;
         let n = 200usize;
 
-        // Path A: Sampler (CandidateSet::sample_top_p_with_scratch)
+        // Path A: Sampler (CandidateSet::sample_top_p_with_scratch). Keeps {0,1,2}
+        // (idx 2 wins the rank-3 tie by lower id), ordered [0,1,2] (lower id first).
         let config_a = SamplingConfig {
             temperature,
             top_k,
@@ -479,7 +511,9 @@ mod tests {
         let mut sampler = Sampler::new(config_a).with_seed(seed);
         let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
 
-        // Path B: sample_token (this module's pipeline)
+        // Path B: sample_token (this module's pipeline). With matching tie-breaks it
+        // also keeps {0,1,2} ordered [0,1,2]; a reversed tie-break keeps {0,1,3}
+        // and/or orders the max tie [1,0], diverging the stream.
         let config_b = GenerateConfig {
             temperature,
             top_k,
@@ -495,10 +529,11 @@ mod tests {
         assert_eq!(
             tokens_a, tokens_b,
             "Sampler::sample and sample_token must produce identical token streams \
-             even when logits contain exact f32 ties — within top-k (indices 5 & 6) \
-             and at the k=40 boundary (indices 39 & 40). A backwards tie-break \
-             diverges the candidate set or softmax iteration order, which changes \
-             the probability distribution and fails this assertion."
+             with high-probability ties at the max (idx 0 & 1) and the top_k=3 \
+             boundary (idx 2 & 3). A backwards tie-break in either the selection or \
+             the pre-softmax sort changes which token wins the contested rank or the \
+             order of the two max-probability buckets, flipping dozens of the 200 \
+             draws and failing this assertion."
         );
     }
 }
