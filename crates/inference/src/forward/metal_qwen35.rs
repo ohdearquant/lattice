@@ -17045,10 +17045,24 @@ kernel void decode_attention_reference(
         /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
         #[test]
         fn dispatch_matmul_q4_writes_all_rows() {
+            // Fail closed under enforce: a CI runner that provisions a Metal GPU but
+            // silently skips here would make this regression gate verify nothing —
+            // the same silent-skip class as the embed parity gate (#383). The
+            // dedicated macOS test step sets LATTICE_METAL_TEST_ENFORCE=1.
+            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
             let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
             if !device.supports_family(MTLGPUFamily::Apple7) {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but Metal device lacks Apple7 — \
+                     Q4 decode dispatch regression cannot be exercised"
+                );
                 return;
             }
             let (cfg, weights) = tiny_metal_qwen35_fixture();
