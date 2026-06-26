@@ -255,7 +255,13 @@ pub(crate) fn multi_head_attention_in_place(
                 let row = &mut scores[(h * seq_len + i) * seq_len..(h * seq_len + i + 1) * seq_len];
                 for j in 0..seq_len {
                     if attention_mask[j] == 0 {
-                        row[j] = -10_000.0;
+                        // Mask structurally with -inf, not a finite sentinel. A finite
+                        // sentinel can be *exceeded* by a valid logit that sits below it,
+                        // which would make the masked key the softmax row max and hand it
+                        // dominant probability (the #361 leakage mode, fixed in flash.rs;
+                        // standard.rs is the live materialized CPU path). softmax_attention
+                        // zeros an all-masked row via its max-finiteness guard.
+                        row[j] = f32::NEG_INFINITY;
                     }
                 }
             }
@@ -624,6 +630,134 @@ mod tests {
         for &v in result_all.iter().chain(result_masked.iter()) {
             assert!(v.is_finite());
         }
+    }
+
+    #[test]
+    fn masked_token_value_does_not_leak_when_valid_score_below_sentinel() {
+        // #361 live-path (standard.rs) regression. A masked key is excluded with -inf,
+        // not a finite sentinel. Construct a row whose only VALID score sits below where
+        // the old -10_000 sentinel lived: with the finite sentinel the masked key becomes
+        // the softmax row max and its (large) value leaks into the output; with -inf the
+        // valid key dominates and the masked value is suppressed. Reverting line 258 to
+        // `-10_000.0` makes this fail (row-0 output jumps to the masked token's value).
+        let seq_len = 2;
+        let num_heads = 1;
+        let head_dim = 2;
+        let hidden_size = num_heads * head_dim; // 2
+
+        // Token 0 carries a small value; token 1 (which we mask) carries a large value so
+        // any leak is unmistakable.
+        let hidden_states = vec![1.0, 0.0, 500.0, 500.0];
+
+        // Distinct Q/K projections drive score[0][0] = Q_0·K_0·scale below -10_000:
+        // Q_0 = [200,0], K_0 = [-100,0] -> -20000 * (1/sqrt(2)) ≈ -14142.
+        let query_w: Vec<f32> = vec![200.0, 0.0, 0.0, 0.0];
+        let key_w: Vec<f32> = vec![-100.0, 0.0, 0.0, 0.0];
+        let identity_2x2: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+        let zero_bias_2: Vec<f32> = vec![0.0; 2];
+        let ones_2: Vec<f32> = vec![1.0; 2];
+        let intermediate_size = hidden_size;
+
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &query_w,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &key_w,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &identity_2x2,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity_2x2,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones_2,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity_2x2,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: intermediate_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity_2x2,
+                rows: hidden_size,
+                cols: intermediate_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones_2,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_2,
+                len: hidden_size,
+            },
+        };
+
+        // Mask token 1 (the large-value token) for every query row.
+        let mask = vec![1u32, 0];
+        let mut buf = AttentionBuffers::new(seq_len, hidden_size, num_heads, intermediate_size);
+        let out = multi_head_attention(
+            &hidden_states,
+            &layer,
+            &mask,
+            seq_len,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut buf,
+            &NoopLoraHook,
+            0,
+        );
+
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "output must be finite: {out:?}"
+        );
+        // Row 0 must reflect the VALID token's value (V_0 = [1,0]), not the masked
+        // token's value (V_1 = [500,500]).
+        assert!(
+            out[0].abs() < 50.0 && out[1].abs() < 50.0,
+            "masked token value leaked into row 0 output: {:?} (expected ~[1,0])",
+            &out[0..2]
+        );
     }
 
     #[test]
