@@ -279,21 +279,54 @@ class PerfGovernor:
 
     # ------------------------------------------------------------------
     def _kill_pg(self, proc: subprocess.Popen, reason: str) -> None:
-        """Send SIGTERM then SIGKILL to the process group. Logs the reason."""
+        """Terminate the child (SIGTERM then SIGKILL), confirm it is dead.
+
+        The child is spawned with ``start_new_session=True`` so its pgid equals
+        its pid; the group signal reaches the whole subtree. But ``killpg`` can
+        raise ``PermissionError`` (EPERM) on macOS — e.g. when the group leader
+        has exited but the group still holds a zombie, or a GPU-helper member
+        runs under a security context the sender cannot signal. A bare
+        ``except ProcessLookupError`` lets that EPERM escape and crash the poller
+        thread, leaving the SIGKILL undelivered. Since this governor IS the
+        bounded-window safety guarantee, the kill path must never depend on the
+        group signal landing: on ANY failure, fall back to a direct ``proc.kill``
+        (the child is one we definitely own) and reap to CONFIRM death.
+        """
         _log(f"KILL [{reason}]: pid={proc.pid}")
-        try:
-            pgid = os.getpgid(proc.pid)
+
+        def _group_signal(sig: int) -> None:
+            # Best-effort group signal. ProcessLookupError = already gone (fine).
+            # PermissionError = EPERM on the group; swallow and let the direct
+            # proc.kill() fallback below carry the guarantee.
             try:
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            time.sleep(0.25)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except (ProcessLookupError, PermissionError):
                 pass
+
+        if proc.poll() is not None:
+            return  # already dead — nothing to do
+
+        _group_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=2.0)
+            return  # SIGTERM was enough
+        except subprocess.TimeoutExpired:
+            pass
+
+        _group_signal(signal.SIGKILL)
+        # Direct kill of the child we own — independent of the group signal,
+        # so an EPERM on killpg cannot leave the process running.
+        try:
+            proc.kill()
         except ProcessLookupError:
             pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            _log(
+                f"KILL [{reason}]: pid={proc.pid} STILL ALIVE after SIGKILL — "
+                "manual intervention required"
+            )
 
     # ------------------------------------------------------------------
     def run_guarded(self, label: str, argv: List[str]) -> int:
@@ -585,6 +618,56 @@ def _cmd_selftest(gov: PerfGovernor) -> int:
             print(f"  GovernorAbort raised as expected: {e.reason}")
 
     demo("(c) BOUNDED cap kills long process", demo_c)
+
+    # (c2) killpg EPERM: when the process-group signal is denied (the real macOS
+    # failure observed on a GPU bench at the bounded cap), the child must STILL
+    # die via the direct proc.kill() fallback. Regression lock — reverting
+    # _kill_pg to a bare `except ProcessLookupError` lets the EPERM escape, the
+    # SIGKILL never lands, and `sleep 999` survives this assertion.
+    def demo_c2() -> None:
+        g = PerfGovernor(max_window_s=2, cooldown_s=0, afk_only=False,
+                         poll_interval_s=0.4)
+        g._thermal_reader = lambda: {"speed_limit": 100, "nominal": True}
+        g._ac_reader = lambda: True
+        g._idle_reader = lambda: 999.0
+
+        captured: dict = {}
+        real_popen = subprocess.Popen
+        orig_killpg = os.killpg
+
+        def capturing_popen(*a, **k):
+            p = real_popen(*a, **k)
+            captured["proc"] = p
+            return p
+
+        def eperm_killpg(_pgid, _sig):
+            # Simulate the denied group signal. proc.kill() uses os.kill on the
+            # single owned child, not killpg, so the fallback remains effective.
+            raise PermissionError(1, "Operation not permitted")
+
+        subprocess.Popen = capturing_popen  # type: ignore[assignment]
+        os.killpg = eperm_killpg  # type: ignore[assignment]
+        try:
+            try:
+                g.run_guarded("demo_c2", ["sleep", "999"])
+                raise AssertionError("expected GovernorAbort under killpg-EPERM")
+            except GovernorAbort as e:
+                print(f"  GovernorAbort raised under killpg-EPERM: {e.reason}")
+        finally:
+            subprocess.Popen = real_popen  # type: ignore[assignment]
+            os.killpg = orig_killpg  # type: ignore[assignment]
+
+        proc = captured["proc"]
+        for _ in range(30):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert proc.poll() is not None, (
+            "child survived killpg-EPERM — direct proc.kill() fallback failed"
+        )
+        print(f"  child pid={proc.pid} killed via direct fallback (rc={proc.returncode})")
+
+    demo("(c2) killpg-EPERM falls back to direct child kill", demo_c2)
 
     # (d) KILL-SWITCH: create sentinel → preflight aborts → remove → passes
     def demo_d() -> None:

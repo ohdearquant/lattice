@@ -104,6 +104,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     grid.sort_unstable();
     grid.dedup();
 
+    // KV cache must hold the longest requested context plus the decode horizon.
+    // A too-small cache silently corrupts the deepest grid points: prefill fills
+    // the cache, decode immediately hits the cap, and the line reports tokens=1
+    // (a prefill cost masquerading as a decode rate, not a real per-token time).
+    // The previous hard-coded 4096 made every point at/above ctx=4096 — i.e. the
+    // entire SLOPEFIT_FULL {4096,8192,16384} tail this binary advertises — return
+    // tokens=1 instead of a measurement. Size from the grid so the tail is real.
+    let max_ctx = grid.iter().copied().max().unwrap_or(512);
+    let cache_len = max_ctx + warmup_tokens.max(measure_tokens) + 16;
+
     // Detect Q4 dir (same heuristic as bench_decode_ab).
     let is_q4_dir = !dir.join("model.safetensors").exists()
         && std::fs::read_dir(dir)
@@ -138,14 +148,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Qwen35Config::qwen35_0_8b()
         };
-        metal =
-            MetalQwen35State::from_q4_dir(dir, &tokenizer_dir.join("tokenizer.json"), &cfg, 4096)
-                .map_err(|e| format!("Metal Q4 init: {e}"))?;
+        metal = MetalQwen35State::from_q4_dir(
+            dir,
+            &tokenizer_dir.join("tokenizer.json"),
+            &cfg,
+            cache_len,
+        )
+        .map_err(|e| format!("Metal Q4 init: {e}"))?;
         tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
     } else {
         let model = Qwen35Model::from_safetensors(dir).expect("load model");
         let cfg = model.config().clone();
-        metal = MetalQwen35State::new(model.weights(), &cfg, 4096).expect("init metal");
+        metal = MetalQwen35State::new(model.weights(), &cfg, cache_len).expect("init metal");
         tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
     }
 
@@ -179,6 +193,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "[slopefit] grid={grid:?} warmup={warmup_tokens} measure={measure_tokens} repeats={repeats}"
+    );
+    eprintln!(
+        "[slopefit] kv_cache_len={cache_len} (max_ctx={max_ctx} + decode_horizon {})",
+        warmup_tokens.max(measure_tokens)
     );
 
     for &ctx in &grid {
