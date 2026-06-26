@@ -186,10 +186,12 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
 /// conversion, provably strictly < 1.0). Both CPU sampling paths share this
 /// primitive so a fixed seed yields the same uniform draw stream. After the
 /// fallback unification (`draw_index` now returns the LAST element, matching
-/// `CandidateSet::sample_top_p_with_scratch`) and the tie-break alignment (top-k
-/// selection, the probability sort, and the softmax summation order all now match
-/// Path A), a fixed seed produces token-identical streams for inputs without exact
-/// logit ties at the top-k boundary (a rare event for realistic model outputs).
+/// `CandidateSet::sample_top_p_with_scratch`) and the tie-break alignment (the
+/// top-k selection and the single pre-softmax index sort fix both the tie order
+/// and the softmax summation order to match Path A), a fixed seed produces
+/// token-identical streams for the same (logits, config, seed) — including inputs
+/// with exact logit ties at the top-k boundary, which the matched ascending
+/// token-id tie-break now resolves identically in both paths.
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
     let x = crate::sampling::xorshift64_next(state);
     crate::sampling::uniform_f32_from_u64(x)
