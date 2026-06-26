@@ -1,5 +1,5 @@
-/// Metal GPU benchmark — proper throughput measurement with multiple prompts.
-/// Usage: cargo run --release -p lattice-inference --bin profile_metal --features "f16,metal-gpu"
+//! Metal GPU benchmark — proper throughput measurement with multiple prompts.
+//! Usage: cargo run --release -p lattice-inference --bin profile_metal --features "f16,metal-gpu"
 
 fn main() {
     let home = std::env::var("HOME").unwrap();
@@ -34,7 +34,7 @@ fn main() {
         use lattice_inference::tokenizer::bpe::byte_decode_token;
         ids.iter()
             .filter_map(|id| tokenizer.token_for_id(*id))
-            .map(|s| byte_decode_token(s))
+            .map(byte_decode_token)
             .collect()
     };
 
@@ -119,7 +119,11 @@ fn main() {
     // === Throughput vs sequence position ===
     eprintln!("--- Throughput vs Sequence Position (50 tokens) ---");
     metal.reset_state();
-    std::env::set_var("LATTICE_PROFILE", "1");
+    // SAFETY: single-threaded example; no other thread reads the environment
+    // concurrently at this point (set before the generation call below).
+    unsafe {
+        std::env::set_var("LATTICE_PROFILE", "1");
+    }
     let gen_cfg_50 = GenerateConfig {
         max_new_tokens: 50,
         temperature: 0.0,

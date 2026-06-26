@@ -1,6 +1,11 @@
 //! Benchmark MPSMatrixMultiplication (Apple's optimized GEMM) vs hand-written matmul_bt.
 //! Uses raw objc messaging to call MPS APIs since metal 0.33 doesn't expose them.
 
+// The `objc` crate's `msg_send!` macro expands to a legacy `cfg(feature = "cargo-clippy")`
+// gate that predates check-cfg; it is not a feature this crate declares, so the
+// `unexpected_cfgs` warnings here originate entirely from that third-party macro expansion.
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 fn main() {
     eprintln!("need metal-gpu");
@@ -103,7 +108,7 @@ fn main() {
         // Warmup
         for _ in 0..5 {
             let cmd = queue.new_command_buffer();
-            let cmd_ptr = &*cmd as *const CommandBufferRef as *const Object as *mut Object;
+            let cmd_ptr = cmd as *const CommandBufferRef as *const Object as *mut Object;
             let _: () = msg_send![mm, encodeToCommandBuffer:cmd_ptr
                 leftMatrix:a_mat rightMatrix:b_mat resultMatrix:c_mat];
             cmd.commit();
@@ -115,7 +120,7 @@ fn main() {
         let t = Instant::now();
         for _ in 0..rounds {
             let cmd = queue.new_command_buffer();
-            let cmd_ptr = &*cmd as *const CommandBufferRef as *const Object as *mut Object;
+            let cmd_ptr = cmd as *const CommandBufferRef as *const Object as *mut Object;
             let _: () = msg_send![mm, encodeToCommandBuffer:cmd_ptr
                 leftMatrix:a_mat rightMatrix:b_mat resultMatrix:c_mat];
             cmd.commit();
@@ -129,7 +134,7 @@ fn main() {
         let t = Instant::now();
         for _ in 0..20 {
             let cmd = queue.new_command_buffer();
-            let cmd_ptr = &*cmd as *const CommandBufferRef as *const Object as *mut Object;
+            let cmd_ptr = cmd as *const CommandBufferRef as *const Object as *mut Object;
             for _ in 0..batch {
                 let _: () = msg_send![mm, encodeToCommandBuffer:cmd_ptr
                     leftMatrix:a_mat rightMatrix:b_mat resultMatrix:c_mat];
@@ -207,7 +212,7 @@ fn main() {
             enc.set_bytes(4, 4, &n32 as *const u32 as *const _);
             enc.set_bytes(5, 4, &k32 as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new((n + 15) / 16, (m + 15) / 16, 1),
+                MTLSize::new(n.div_ceil(16), m.div_ceil(16), 1),
                 MTLSize::new(16, 16, 1),
             );
         }

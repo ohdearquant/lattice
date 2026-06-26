@@ -118,6 +118,7 @@ fn bench_baseline(c: &mut Criterion) {
             stop_token_ids: vec![],
             enable_thinking: false,
             enable_mtp: Some(false),
+            ..Default::default()
         };
 
         let history = vec![ChatMessage::user(BENCH_PROMPT)];
@@ -216,6 +217,7 @@ fn bench_mtp(c: &mut Criterion) {
             stop_token_ids: vec![],
             enable_thinking: false,
             enable_mtp: Some(true),
+            ..Default::default()
         };
 
         let history = vec![ChatMessage::user(BENCH_PROMPT)];

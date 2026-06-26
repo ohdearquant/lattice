@@ -185,10 +185,7 @@ fn run() {
     drop(state);
 
     // ---- PRUNED-8 ----
-    eprintln!(
-        "\n[bench_quality] Loading pruned-8 model (layers {:?} removed)...",
-        pruned_8_layers
-    );
+    eprintln!("\n[bench_quality] Loading pruned-8 model (layers {pruned_8_layers:?} removed)...");
     let mut cfg8 = base_cfg.clone();
     cfg8.apply_layer_mask(make_mask(&pruned_8_layers));
     let active8 = cfg8.num_active_layers();
@@ -219,10 +216,7 @@ fn run() {
     drop(state8);
 
     // ---- PRUNED-12 ----
-    eprintln!(
-        "\n[bench_quality] Loading pruned-12 model (layers {:?} removed)...",
-        pruned_12_layers
-    );
+    eprintln!("\n[bench_quality] Loading pruned-12 model (layers {pruned_12_layers:?} removed)...");
     let mut cfg12 = base_cfg.clone();
     cfg12.apply_layer_mask(make_mask(&pruned_12_layers));
     let active12 = cfg12.num_active_layers();
@@ -255,13 +249,13 @@ fn run() {
     // ---- SUMMARISE ----
     let n = prompts.len() as f32;
     let mean8 = cos_8.iter().sum::<f32>() / n;
-    let min8 = cos_8.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max8 = cos_8.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min8 = cos_8.iter().copied().fold(f32::INFINITY, f32::min);
+    let max8 = cos_8.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let match_rate8 = match_8.iter().filter(|&&x| x).count() as f32 / n;
 
     let mean12 = cos_12.iter().sum::<f32>() / n;
-    let min12 = cos_12.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max12 = cos_12.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min12 = cos_12.iter().copied().fold(f32::INFINITY, f32::min);
+    let max12 = cos_12.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let match_rate12 = match_12.iter().filter(|&&x| x).count() as f32 / n;
 
     let gate8 = mean8 >= 0.95 && min8 >= 0.85;
@@ -271,12 +265,10 @@ fn run() {
         "BENCH_QUALITY_HEADER config,active_layers,mean_cos,min_cos,max_cos,tok_match_rate,gate_pass"
     );
     println!(
-        "BENCH_QUALITY_RESULT pruned-8,{active8},{mean8:.6},{min8:.6},{max8:.6},{match_rate8:.3},{}",
-        gate8
+        "BENCH_QUALITY_RESULT pruned-8,{active8},{mean8:.6},{min8:.6},{max8:.6},{match_rate8:.3},{gate8}"
     );
     println!(
-        "BENCH_QUALITY_RESULT pruned-12,{active12},{mean12:.6},{min12:.6},{max12:.6},{match_rate12:.3},{}",
-        gate12
+        "BENCH_QUALITY_RESULT pruned-12,{active12},{mean12:.6},{min12:.6},{max12:.6},{match_rate12:.3},{gate12}"
     );
 
     eprintln!("\n=== QUALITY SUMMARY ===");
@@ -313,17 +305,17 @@ fn run() {
         let scored_prune_idxs: Vec<usize> = (0..num_layers)
             .filter(|&i| !plan.recommended_mask[i])
             .collect();
-        let h8: std::collections::HashSet<usize> = pruned_8_layers.iter().cloned().collect();
-        let h12: std::collections::HashSet<usize> = pruned_12_layers.iter().cloned().collect();
+        let h8: std::collections::HashSet<usize> = pruned_8_layers.iter().copied().collect();
+        let h12: std::collections::HashSet<usize> = pruned_12_layers.iter().copied().collect();
         let scored_set: std::collections::HashSet<usize> =
-            scored_prune_idxs.iter().cloned().collect();
+            scored_prune_idxs.iter().copied().collect();
         let overlap8 = h8.intersection(&scored_set).count();
         let overlap12 = h12.intersection(&scored_set).count();
 
         eprintln!("\n=== SCORED vs HEURISTIC ===");
         eprintln!("  Scored top-12 prune indices: {scored_prune_idxs:?}");
-        eprintln!("  Heuristic pruned-8 indices:  {:?}", pruned_8_layers);
-        eprintln!("  Heuristic pruned-12 indices: {:?}", pruned_12_layers);
+        eprintln!("  Heuristic pruned-8 indices:  {pruned_8_layers:?}");
+        eprintln!("  Heuristic pruned-12 indices: {pruned_12_layers:?}");
         eprintln!("  Overlap (heuristic-8 ∩ scored-12):  {overlap8}/8");
         eprintln!("  Overlap (heuristic-12 ∩ scored-12): {overlap12}/12");
     }
