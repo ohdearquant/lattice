@@ -1071,8 +1071,16 @@ mod tests {
             k_proj_f32[j * hidden + j] = 1.0;
         }
 
+        // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
+        // Row j selects input[j] exactly so scratch.q_buf is non-trivial and Q-loop mutation
+        // changes the assertion result.
+        let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
+        for j in 0..q_dim {
+            q_proj_f32[j * hidden + j] = 1.0;
+        }
+
         let weights = F16FullAttentionLayerWeights {
-            q_proj: to_f16(&vec![0.0f32; 2 * q_dim * hidden]),
+            q_proj: to_f16(&q_proj_f32),
             k_proj: to_f16(&k_proj_f32),
             v_proj: to_f16(&vec![0.0f32; kv_dim * hidden]),
             o_proj: to_f16(&vec![0.0f32; hidden * q_dim]),
@@ -1102,6 +1110,8 @@ mod tests {
         // Reference: reproduce the same matmul + QK-norm + stride-half RoPE.
         // Using the same production matmul and norm keeps f16 rounding error identical on
         // both sides, so the only source of divergence under mutation is the RoPE pairing.
+
+        // --- K reference ---
         let mut k_ref = vec![0.0f32; kv_dim];
         matmul_bt_f16(&input, &weights.k_proj, &mut k_ref, 1, hidden, kv_dim);
         qwen35_rms_norm(&mut k_ref, &weights.k_norm, head_dim, cfg.rms_norm_eps);
@@ -1118,15 +1128,51 @@ mod tests {
         }
 
         let k_cached = &kv_cache.k[0][..kv_dim];
-        let max_diff = k_cached
+        let max_k_diff = k_cached
             .iter()
             .zip(k_ref.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
         assert!(
-            max_diff < 1e-4,
-            "cpu F16 stride-half RoPE diverges from reference: max_diff = {max_diff:.6}. \
+            max_k_diff < 1e-4,
+            "cpu F16 K-loop stride-half RoPE diverges from reference: max_k_diff = {max_k_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+
+        // --- Q reference (guards the Q loop mutation) ---
+        // The production scatter copies q_and_gate[0..q_dim] → scratch.q_buf[0..q_dim]
+        // for head 0 (num_q_heads=1).
+        let mut q_and_gate_ref = vec![0.0f32; 2 * q_dim];
+        matmul_bt_f16(
+            &input,
+            &weights.q_proj,
+            &mut q_and_gate_ref,
+            1,
+            hidden,
+            2 * q_dim,
+        );
+        let mut q_ref = q_and_gate_ref[..q_dim].to_vec();
+        qwen35_rms_norm(&mut q_ref, &weights.q_norm, head_dim, cfg.rms_norm_eps);
+
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = q_ref[i];
+            let x1 = q_ref[half + i];
+            q_ref[i] = x0 * cos_val - x1 * sin_val;
+            q_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let max_q_diff = scratch.q_buf[..q_dim]
+            .iter()
+            .zip(q_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_q_diff < 1e-4,
+            "cpu F16 Q-loop stride-half RoPE diverges from reference: max_q_diff = {max_q_diff:.6}. \
              With interleaved pairing the diff is O(0.1-1). Bug: #392."
         );
     }

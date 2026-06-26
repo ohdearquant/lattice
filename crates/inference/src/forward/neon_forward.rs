@@ -1773,8 +1773,19 @@ mod tests {
             pack_weights_q8(&mat, kv_dim, hidden)
         };
 
+        // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
+        // Row j selects input[j] exactly so scratch.q_buf is non-trivial and Q-loop mutation
+        // changes the assertion result.
+        let q_identity_packed = {
+            let mut mat = vec![0.0f32; 2 * q_dim * hidden];
+            for j in 0..q_dim {
+                mat[j * hidden + j] = 1.0;
+            }
+            pack_weights_q8(&mat, 2 * q_dim, hidden)
+        };
+
         let weights = Q8NeonFullAttnWeights {
-            q_proj_packed: zero_packed(2 * q_dim, hidden),
+            q_proj_packed: q_identity_packed,
             q_proj_rows: 2 * q_dim,
             q_proj_cols: hidden,
             k_proj_packed: identity_packed,
@@ -1809,6 +1820,8 @@ mod tests {
         );
 
         // Reference: same matmul + QK-norm + stride-half RoPE as the production path.
+
+        // --- K reference ---
         let mut k_ref = vec![0.0f32; kv_dim];
         matmul_q8_neon_into(
             &input,
@@ -1831,15 +1844,52 @@ mod tests {
         }
 
         let k_cached = &kv_cache.k[0][..kv_dim];
-        let max_diff = k_cached
+        let max_k_diff = k_cached
             .iter()
             .zip(k_ref.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
 
         assert!(
-            max_diff < 1e-4,
-            "NEON Q8 stride-half RoPE diverges from reference: max_diff = {max_diff:.6}. \
+            max_k_diff < 1e-4,
+            "NEON Q8 K-loop stride-half RoPE diverges from reference: max_k_diff = {max_k_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+
+        // --- Q reference (guards the Q loop mutation) ---
+        // The production scatter copies q_and_gate[0..q_dim] → scratch.q_buf[0..q_dim]
+        // for head 0 (num_q_heads=1).
+        let q_proj_dim = 2 * q_dim;
+        let mut q_and_gate_ref = vec![0.0f32; q_proj_dim];
+        matmul_q8_neon_into(
+            &input,
+            &weights.q_proj_packed,
+            q_proj_dim,
+            hidden,
+            &mut q_and_gate_ref,
+            &mut scratch.x_q_scratch,
+        );
+        let mut q_ref = q_and_gate_ref[..q_dim].to_vec();
+        qwen35_rms_norm(&mut q_ref, &weights.q_norm, head_dim, cfg.rms_norm_eps);
+
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = q_ref[i];
+            let x1 = q_ref[half + i];
+            q_ref[i] = x0 * cos_val - x1 * sin_val;
+            q_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let max_q_diff = scratch.q_buf[..q_dim]
+            .iter()
+            .zip(q_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_q_diff < 1e-4,
+            "NEON Q8 Q-loop stride-half RoPE diverges from reference: max_q_diff = {max_q_diff:.6}. \
              With interleaved pairing the diff is O(0.1-1). Bug: #392."
         );
     }
