@@ -11,7 +11,6 @@ use core::mem::size_of;
 /// We leave headroom for non-tile data (stack, loop variables, etc.) by
 /// targeting 75% of the minimum common L1d size (64 KiB * 0.75 = 48 KiB).
 const L1_BUDGET_BYTES: usize = 48 * 1024;
-const MASK_VALUE: f32 = -10_000.0;
 
 /// Threshold below which the full materialized scores matrix fits in L1 cache,
 /// making tiling overhead not worthwhile. At 32KB L1, sqrt(32768/4) ~ 90 tokens.
@@ -443,10 +442,16 @@ fn run_tiled_attention_head(
                 let row = &mut s_tile_used[r * kv_rows..(r + 1) * kv_rows];
                 let mut local_max = f32::NEG_INFINITY;
                 for c in 0..kv_rows {
-                    let mut value = row[c] * scale;
-                    if attention_mask[kv_start + c] == 0 {
-                        value = MASK_VALUE;
-                    }
+                    // Masked keys are excluded structurally with a -inf score so their
+                    // softmax weight is exactly zero no matter how low a valid score sits.
+                    // A finite sentinel can be *exceeded* by a valid logit below it, which
+                    // would make the masked key the row max and hand it dominant
+                    // probability (#361).
+                    let value = if attention_mask[kv_start + c] == 0 {
+                        f32::NEG_INFINITY
+                    } else {
+                        row[c] * scale
+                    };
                     row[c] = value;
                     local_max = local_max.max(value);
                 }
@@ -461,9 +466,19 @@ fn run_tiled_attention_head(
                 };
 
                 let mut tile_sum = 0.0f32;
-                for value in row.iter_mut() {
-                    *value = (*value - new_max).exp();
-                    tile_sum += *value;
+                if new_max.is_finite() {
+                    for value in row.iter_mut() {
+                        // exp(-inf - finite) = 0 for masked columns; never NaN here
+                        // because new_max is finite.
+                        *value = (*value - new_max).exp();
+                        tile_sum += *value;
+                    }
+                } else {
+                    // Every key seen so far in this row is masked (new_max == -inf), so
+                    // `*value - new_max` would be `-inf - -inf = NaN`. Define the masked
+                    // probabilities as zero; an all-masked row then carries a zero
+                    // row_sum and the final normalization emits a zero output, not NaN.
+                    row.fill(0.0);
                 }
                 row_sum_new[r] = row_sum[r] * row_scale[r] + tile_sum;
             }
@@ -822,6 +837,12 @@ mod tests {
     use crate::forward::cpu::{matmul_bt, softmax_attention};
     use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+
+    /// Legacy finite mask sentinel, retained only as the reference path's masking
+    /// convention. The kernel itself now masks with `-inf` (see #361); for the
+    /// in-distribution inputs these reference tests use, the two agree to within
+    /// the SIMD-softmax tolerance.
+    const MASK_VALUE: f32 = -10_000.0;
 
     #[derive(Clone)]
     struct Lcg {
@@ -1364,6 +1385,83 @@ mod tests {
             max_diff <= 0.05,
             "max_abs_diff={max_diff} (tolerance 5e-2: tiled online-softmax vs materialized two-pass softmax have different FP ordering)"
         );
+    }
+
+    #[test]
+    fn masked_key_below_finite_sentinel_does_not_dominate() {
+        // #361 trigger. A valid score below the old finite sentinel (-10000) must not
+        // let a masked key win the softmax.
+        //   seq_len=2, head_dim=1, scale=1
+        //   q=[-20000, 0], k=[1, 0], v=[1, 100], mask=[1, 0]  (key 1 masked)
+        // Row 0: valid key-0 score = -20000, key 1 masked. The masked key's weight
+        // must be exactly 0, so output[0] = v[0] = 1.0. The old finite sentinel made
+        // -10000 the row max and output[0] = v[1] = 100.0 (the masked value wins).
+        let head_dim = 1usize;
+        let seq_len = 2usize;
+        let scale = 1.0f32;
+        let q = vec![-20000.0f32, 0.0];
+        let k = vec![1.0f32, 0.0];
+        let v = vec![1.0f32, 100.0];
+        let mask = vec![1u32, 0u32];
+        let config = TiledAttentionConfig::new(1, 1, head_dim);
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "row 0 output={} expected 1.0 (masked key must not dominate; old sentinel gives 100.0)",
+            out[0]
+        );
+        // Row 1 (query 0): key-0 score = 0 (valid), key 1 masked → output = v[0] = 1.0.
+        assert!(
+            (out[1] - 1.0).abs() < 1e-6,
+            "row 1 output={} expected 1.0",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn all_masked_row_yields_zero_output_not_nan() {
+        // Degenerate guard: if every key is masked, the row max stays -inf. The kernel
+        // must define a zero output (zero row_sum → zero-fill), never NaN from
+        // exp(-inf - -inf).
+        let head_dim = 2usize;
+        let seq_len = 2usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q = vec![0.5f32, -0.5, 1.0, 2.0];
+        let k = vec![0.3f32, 0.7, -0.2, 0.1];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mask = vec![0u32, 0u32];
+        let config = TiledAttentionConfig::new(1, 1, head_dim);
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        for (i, &o) in out.iter().enumerate() {
+            assert!(o.is_finite(), "output[{i}]={o} must be finite (no NaN)");
+            assert_eq!(o, 0.0, "output[{i}]={o} expected 0.0 for an all-masked row");
+        }
     }
 
     #[test]
