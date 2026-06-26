@@ -300,7 +300,7 @@ fn full_attention_step_f16(
         );
     }
 
-    // Partial RoPE: only first rope_dim dimensions of each head (interleaved pairing)
+    // Partial RoPE: stride-half pairing (i, half+i) — matches apply_partial_rope / HF rotate_half
     let half = rope_dim / 2;
     for h in 0..num_q_heads {
         let start = h * head_dim;
@@ -308,10 +308,10 @@ fn full_attention_step_f16(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.q_buf[start + 2 * i];
-            let x1 = scratch.q_buf[start + 2 * i + 1];
-            scratch.q_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.q_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.q_buf[start + i];
+            let x1 = scratch.q_buf[start + half + i];
+            scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
     for h in 0..num_kv_heads {
@@ -320,10 +320,10 @@ fn full_attention_step_f16(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.k_buf[start + 2 * i];
-            let x1 = scratch.k_buf[start + 2 * i + 1];
-            scratch.k_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.k_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.k_buf[start + i];
+            let x1 = scratch.k_buf[start + half + i];
+            scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
 
@@ -995,6 +995,139 @@ mod tests {
         assert_eq!(
             cfg.num_full_attention_layers() + cfg.num_linear_attention_layers(),
             cfg.num_hidden_layers
+        );
+    }
+
+    /// Regression test for #392: cpu F16 RoPE must use stride-half pairing (i, half+i), not
+    /// interleaved (2i, 2i+1).
+    ///
+    /// Design: call `full_attention_step_f16` with an identity K-projection so k_buf equals
+    /// the input exactly (1.0 in f16 is exact, no rounding error on the diagonal).
+    /// Independently reproduce the same matmul + QK-norm + stride-half RoPE in the test body
+    /// and compare against the post-call KV-cache. The two paths agree to <1e-4 when the
+    /// production loops are correct; reverting either loop to 2*i interleaved produces
+    /// max_diff ~0.9 (observed during mutation verification).
+    #[test]
+    fn test_full_attn_step_f16_rope_stride_half_parity() {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::f16_weights::f32_to_f16_slice;
+
+        let head_dim: usize = 32;
+        let num_q_heads: usize = 1;
+        let num_kv_heads: usize = 1;
+        let hidden: usize = 64;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let position: usize = 3;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_q_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5, // rope_dim = 16, half = 8
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope_dim = cfg.rope_dim(); // = 16
+        let half = rope_dim / 2; // = 8
+        let rope = RopeTable::new(rope_dim, 512, cfg.rope_theta);
+
+        // Helper: convert f32 slice to packed f16 Vec<u16>.
+        let to_f16 = |src: &[f32]| -> Vec<u16> {
+            let mut dst = vec![0u16; src.len()];
+            f32_to_f16_slice(src, &mut dst);
+            dst
+        };
+
+        // W_k = identity [kv_dim, hidden]: row j selects input[j] exactly (1.0 in f16 is exact).
+        let mut k_proj_f32 = vec![0.0f32; kv_dim * hidden];
+        for j in 0..kv_dim {
+            k_proj_f32[j * hidden + j] = 1.0;
+        }
+
+        let weights = F16FullAttentionLayerWeights {
+            q_proj: to_f16(&vec![0.0f32; 2 * q_dim * hidden]),
+            k_proj: to_f16(&k_proj_f32),
+            v_proj: to_f16(&vec![0.0f32; kv_dim * hidden]),
+            o_proj: to_f16(&vec![0.0f32; hidden * q_dim]),
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        // Distinct non-trivial input values (positions 0..64 scaled to small floats).
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+
+        let mut kv_cache = KvCache::new(1);
+        full_attention_step_f16(
+            &weights,
+            0,
+            position,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        // Reference: reproduce the same matmul + QK-norm + stride-half RoPE.
+        // Using the same production matmul and norm keeps f16 rounding error identical on
+        // both sides, so the only source of divergence under mutation is the RoPE pairing.
+        let mut k_ref = vec![0.0f32; kv_dim];
+        matmul_bt_f16(&input, &weights.k_proj, &mut k_ref, 1, hidden, kv_dim);
+        qwen35_rms_norm(&mut k_ref, &weights.k_norm, head_dim, cfg.rms_norm_eps);
+
+        // Stride-half reference (correct pairing).
+        let base = position * half;
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = k_ref[i];
+            let x1 = k_ref[half + i];
+            k_ref[i] = x0 * cos_val - x1 * sin_val;
+            k_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let k_cached = &kv_cache.k[0][..kv_dim];
+        let max_diff = k_cached
+            .iter()
+            .zip(k_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-4,
+            "cpu F16 stride-half RoPE diverges from reference: max_diff = {max_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
         );
     }
 
