@@ -8718,6 +8718,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -8743,12 +8744,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
+                    stopped: true,
                 };
             }
 
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut pending_token = pending_first;
             let mut metrics = MetalMtpDecodeMetrics::default();
+            let mut stopped = false;
 
             while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
@@ -8858,6 +8861,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     super::MtpRoundOutcome::EmitAndStop(tokens) => {
                         let remaining = gen_cfg.max_new_tokens - generated_ids.len();
                         generated_ids.extend_from_slice(&tokens[..tokens.len().min(remaining)]);
+                        stopped = true;
                         break;
                     }
                     super::MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
@@ -8905,6 +8909,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -8936,6 +8941,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -8962,12 +8968,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
+                    stopped: true,
                 };
             }
 
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut pending_token = pending_first;
             let mut metrics = SelfSpecMetrics::default();
+            let mut stopped = false;
 
             'round: while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
@@ -8999,6 +9007,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                         }
+                        stopped = true;
                         break;
                     }
                     if generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -9023,6 +9032,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                         }
+                        stopped = true;
                         break;
                     }
                     if generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -9080,6 +9090,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                         }
+                        stopped = true;
                         break;
                     }
                     if generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -9130,6 +9141,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next_token);
                         }
+                        stopped = true;
                         break;
                     }
                     if generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -9155,6 +9167,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if generated_ids.len() < gen_cfg.max_new_tokens {
                         generated_ids.push(next_pending);
                     }
+                    stopped = true;
                     break;
                 }
                 if generated_ids.len() >= gen_cfg.max_new_tokens {
@@ -9183,6 +9196,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -9227,6 +9241,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -9321,6 +9336,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
+                        stopped: false,
                     };
                 }
             }
@@ -9339,6 +9355,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: true,
                 };
             }
 
@@ -9353,6 +9370,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !use_compact;
 
             // Autoregressive decode
+            let mut stopped = false;
             for _ in 1..gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
@@ -9392,6 +9410,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
 
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -9415,6 +9434,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -9468,6 +9488,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 });
             }
 
@@ -9615,32 +9636,38 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: visual_tokens,
                     generated_tokens: 0,
+                    stopped: false,
                 });
             }
 
             // Sample the first token from last logits.
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
+            let mut stopped = false;
             let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
-            if !is_stop(first_id) {
+            if is_stop(first_id) {
+                stopped = true;
+            } else {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
             }
 
             // Autoregressive decode loop.
             let mut pos = visual_tokens + text_ids.len();
-            while generated_ids.len() < gen_cfg.max_new_tokens {
+            while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
                 }
                 let last_token = *all_ids.last().unwrap_or(&cfg.eos_token_id);
                 if is_stop(last_token) {
+                    stopped = true;
                     break;
                 }
                 let step_logits = self.forward_step(last_token, pos);
                 pos += 1;
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
                 generated_ids.push(next_id);
@@ -9653,6 +9680,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         }
 
@@ -13078,6 +13106,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -13133,6 +13162,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
+                        stopped: false, // grammar constraint, not an OpenAI stop condition
                     };
                 }
             }
@@ -13151,6 +13181,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: true, // EOS/stop-token hit immediately after prefill
                 };
             }
 
@@ -13173,8 +13204,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
                 };
             }
+            let mut stopped = false;
             let mut stopped_by_caller = false;
 
             // Autoregressive decode with streaming
@@ -13212,6 +13245,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
 
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -13248,6 +13282,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
