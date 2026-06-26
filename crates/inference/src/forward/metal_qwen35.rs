@@ -17049,6 +17049,12 @@ kernel void decode_attention_reference(
             // silently skips here would make this regression gate verify nothing —
             // the same silent-skip class as the embed parity gate (#383). The
             // dedicated macOS test step sets LATTICE_METAL_TEST_ENFORCE=1.
+            //
+            // Note: NO Apple7 family gate. `gemv_q4_decode` uses only `simd_sum` +
+            // threadgroup memory, not the Apple7-gated `simdgroup_matrix` MMA path,
+            // so it runs on GitHub's paravirtual macOS GPU (which reports a Metal
+            // device but NOT Apple7). The tiled-GEMM tests below DO need Apple7 and
+            // skip on CI; this decode-geometry test genuinely runs there.
             let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
             let Some(device) = Device::system_default() else {
                 assert!(
@@ -17057,14 +17063,6 @@ kernel void decode_attention_reference(
                 );
                 return;
             };
-            if !device.supports_family(MTLGPUFamily::Apple7) {
-                assert!(
-                    !enforce,
-                    "LATTICE_METAL_TEST_ENFORCE=1 but Metal device lacks Apple7 — \
-                     Q4 decode dispatch regression cannot be exercised"
-                );
-                return;
-            }
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let state =
                 MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
