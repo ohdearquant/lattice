@@ -564,7 +564,7 @@ fn full_attention_step_q8_neon(
         );
     }
 
-    // Partial RoPE: interleaved pairing, first rope_dim dimensions
+    // Partial RoPE: stride-half pairing (i, half+i) — matches apply_partial_rope / HF rotate_half
     let half = rope_dim / 2;
     for h in 0..num_q_heads {
         let start = h * head_dim;
@@ -572,10 +572,10 @@ fn full_attention_step_q8_neon(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.q_buf[start + 2 * i];
-            let x1 = scratch.q_buf[start + 2 * i + 1];
-            scratch.q_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.q_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.q_buf[start + i];
+            let x1 = scratch.q_buf[start + half + i];
+            scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
     for h in 0..num_kv_heads {
@@ -584,10 +584,10 @@ fn full_attention_step_q8_neon(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.k_buf[start + 2 * i];
-            let x1 = scratch.k_buf[start + 2 * i + 1];
-            scratch.k_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.k_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.k_buf[start + i];
+            let x1 = scratch.k_buf[start + half + i];
+            scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
 
@@ -1707,6 +1707,143 @@ mod tests {
         }
     }
 
+    /// Regression test for #392: NEON Q8 RoPE must use stride-half pairing (i, half+i), not
+    /// interleaved (2i, 2i+1).
+    ///
+    /// Mirror of `test_full_attn_step_q8_rope_stride_half_parity` in cpu_q8.rs, using the
+    /// NEON packed weight format and `full_attention_step_q8_neon`.  The identity K-projection
+    /// propagates quantised input into k_buf with no W_k quantisation error.  A stride-half
+    /// reference reproduces the expected k_cache; max_diff < 1e-4 with the fix, ~0.9 with the
+    /// interleaved bug (verified by mutation testing).
+    #[test]
+    fn test_full_attn_step_q8_neon_rope_stride_half_parity() {
+        let head_dim: usize = 32;
+        let num_q_heads: usize = 1;
+        let num_kv_heads: usize = 1;
+        let hidden: usize = 64;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let position: usize = 3;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_q_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5, // rope_dim = 16, half = 8
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope_dim = cfg.rope_dim(); // = 16
+        let half = rope_dim / 2; // = 8
+        let rope = RopeTable::new(rope_dim, 512, cfg.rope_theta);
+
+        // W_k packed identity [kv_dim=32, hidden=64]: row j = e_j → k_buf[j] = x[j].
+        // Q8_0 block packs scale=1/127 and one i8=127; dequant gives exact 1.0 × x[j].
+        let identity_packed = {
+            let mut mat = vec![0.0f32; kv_dim * hidden];
+            for j in 0..kv_dim {
+                mat[j * hidden + j] = 1.0;
+            }
+            pack_weights_q8(&mat, kv_dim, hidden)
+        };
+
+        let weights = Q8NeonFullAttnWeights {
+            q_proj_packed: zero_packed(2 * q_dim, hidden),
+            q_proj_rows: 2 * q_dim,
+            q_proj_cols: hidden,
+            k_proj_packed: identity_packed,
+            k_proj_rows: kv_dim,
+            k_proj_cols: hidden,
+            v_proj_packed: zero_packed(kv_dim, hidden),
+            v_proj_rows: kv_dim,
+            v_proj_cols: hidden,
+            o_proj_packed: zero_packed(hidden, q_dim),
+            o_proj_rows: hidden,
+            o_proj_cols: q_dim,
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+
+        let mut kv_cache = KvCache::new(1);
+        full_attention_step_q8_neon(
+            &weights,
+            0,
+            position,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        // Reference: same matmul + QK-norm + stride-half RoPE as the production path.
+        let mut k_ref = vec![0.0f32; kv_dim];
+        matmul_q8_neon_into(
+            &input,
+            &weights.k_proj_packed,
+            kv_dim,
+            hidden,
+            &mut k_ref,
+            &mut scratch.x_q_scratch,
+        );
+        qwen35_rms_norm(&mut k_ref, &weights.k_norm, head_dim, cfg.rms_norm_eps);
+
+        let base = position * half;
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = k_ref[i];
+            let x1 = k_ref[half + i];
+            k_ref[i] = x0 * cos_val - x1 * sin_val;
+            k_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let k_cached = &kv_cache.k[0][..kv_dim];
+        let max_diff = k_cached
+            .iter()
+            .zip(k_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-4,
+            "NEON Q8 stride-half RoPE diverges from reference: max_diff = {max_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Nonzero parity test: captures current allocating NEON logits as baseline.
     // After GDN/full-attention buffer migration (i2), re-run and verify the
@@ -1936,22 +2073,22 @@ mod tests {
         // To recapture: add `eprintln!("{:?}", &logits_a[..16]);` before this block, run test,
         // then update the array below.
         let expected: [f32; 16] = [
-            -0.03680095,
-            0.04277617,
-            0.002856411,
-            0.0072362088,
-            -0.07445018,
-            0.001189895,
-            0.07319608,
-            0.027846893,
-            -0.02805086,
-            -0.10936779,
-            0.041943453,
-            0.08327203,
-            0.007971644,
-            -0.079894274,
-            0.01471648,
-            0.028457977,
+            -0.036519982,
+            0.04271806,
+            0.0027702842,
+            0.007089529,
+            -0.074217916,
+            0.001136966,
+            0.07316325,
+            0.027880985,
+            -0.027898913,
+            -0.10935478,
+            0.04180234,
+            0.08315472,
+            0.008195344,
+            -0.07999688,
+            0.014749594,
+            0.028362377,
         ];
         for (i, (&actual, &exp)) in logits_a.iter().zip(expected.iter()).enumerate() {
             assert!(
