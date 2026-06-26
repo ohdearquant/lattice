@@ -319,21 +319,35 @@ impl<'a> CompileCtx<'a> {
                 Ok(vec![empty_object_as_alt_with_ws(ws_id)])
             }
             Some(props) => {
-                // Generate grammar: `{` ws property_list ws `}`
-                // For v0 we emit a single alt with all properties in declaration order.
-                // Required properties are mandated; optional properties are wrapped in an
-                // "optional item" rule.
                 // Unique per-object suffix so distinct object schemas sharing a
                 // property key don't alias each other's value/pair rules.
                 let obj_idx = self.object_counter;
                 self.object_counter += 1;
-                let mut main_alt: Alt = vec![Symbol::Terminal(b'{')];
-                main_alt.push(Symbol::NonTerminal(ws_id));
 
-                let mut first = true;
+                // Compile value and pair rules for each property.
+                //
+                // props_info entries: (pair_id, val_id, key_bytes, is_required)
+                //   pair_id   — rule for the full `"key" ws ":" ws value` pair
+                //   val_id    — rule for the value schema alone
+                //   key_bytes — raw bytes of the JSON-encoded key, e.g. b"\"r\""
+                //               (includes surrounding quotes, needed for inlining
+                //               in the started=true optional emit alternative)
+                //   is_req    — whether this property appears in `required`
+                let mut props_info: Vec<(usize, usize, Vec<u8>, bool)> =
+                    Vec::with_capacity(props.len());
                 for (key, val_schema) in &props {
                     let key_str: &str = key.as_str();
                     let is_req = required.contains(&key_str);
+
+                    // key_bytes: raw bytes of the JSON-encoded key string.
+                    // Used to inline the key as terminals in started=true tail
+                    // rules so trailing-comma over-acceptance is prevented for a
+                    // single trailing optional (the common case); ≥2 trailing
+                    // optionals remain over-accepted as a pre-existing #353 PDA
+                    // limitation. See build_object_tail for the exact boundary.
+                    let key_bytes = serde_json::to_string(key_str)
+                        .map_err(|e| SchemaError(format!("cannot JSON-encode property key: {e}")))?
+                        .into_bytes();
 
                     // Compile the value schema into a named rule.
                     let val_rule_name = format!("prop_val_{obj_idx}_{key_str}");
@@ -361,39 +375,220 @@ impl<'a> CompileCtx<'a> {
                         id
                     };
 
-                    if !first {
-                        // Separator: ws "," ws
-                        main_alt.push(Symbol::NonTerminal(ws_id));
-                        main_alt.push(Symbol::Terminal(b','));
-                        main_alt.push(Symbol::NonTerminal(ws_id));
-                    }
-
-                    if is_req {
-                        main_alt.push(Symbol::NonTerminal(pair_id));
-                    } else {
-                        // Optional pair: wrap in opt_pair rule.
-                        let opt_name = format!("opt_{pair_rule_name}");
-                        let opt_id = if let Some(id) = self.builder.rule_id(&opt_name) {
-                            id
-                        } else {
-                            let id = self.builder.reserve(&opt_name);
-                            let opt_alts = vec![
-                                vec![Symbol::NonTerminal(pair_id)],
-                                vec![], // epsilon: property absent
-                            ];
-                            self.builder.set_alts(id, opt_alts);
-                            id
-                        };
-                        main_alt.push(Symbol::NonTerminal(opt_id));
-                    }
-                    first = false;
+                    props_info.push((pair_id, val_id, key_bytes, is_req));
                 }
 
-                main_alt.push(Symbol::NonTerminal(ws_id));
-                main_alt.push(Symbol::Terminal(b'}'));
+                // Reorder: required properties first, optional properties after.
+                //
+                // Within each group the original declaration order (alphabetical
+                // from the BTreeMap-backed serde_json Value::as_object) is
+                // preserved.  The sort is stable.
+                //
+                // Why this matters for PDA safety:
+                //   In the `started=false` phase, every property alternative in
+                //   the tail chain starts with the opening `"` of the property
+                //   key.  If an OPTIONAL property P_i appears before a required
+                //   property P_j, the PDA commits to P_i's `"` and then fails
+                //   when the key character doesn't match (mid-alt mismatch), but
+                //   by that point `"` has been consumed and cannot be replayed for
+                //   P_j's opening `"` → input `{"pj_key":...}` is over-rejected.
+                //
+                //   By placing ALL required properties first, the started=false
+                //   phase is a single-alternative chain (one `pair_i` per required
+                //   prop, no branching) — the PDA cannot take a wrong turn.  Only
+                //   after all required properties have been emitted do optional
+                //   ones appear (in started=true mode), where the leading `","`
+                //   separator provides clean first-byte discrimination.
+                //
+                //   This reordering changes the GENERATED PROPERTY ORDER (required
+                //   fields precede optional ones in the output JSON) but is
+                //   semantically valid: JSON objects are unordered by specification.
+                props_info.sort_by_key(|&(_, _, _, is_req)| if is_req { 0usize } else { 1 });
+
+                // Build right-nested tail-chain rules (issue #355).
+                // tail(0, false) is the entry point: no property emitted yet.
+                let tail_id = self.build_object_tail(obj_idx, &props_info, 0, false, ws_id);
+
+                // Object rule: `{` ws tail(0, false) ws `}`
+                let main_alt = vec![
+                    Symbol::Terminal(b'{'),
+                    Symbol::NonTerminal(ws_id),
+                    Symbol::NonTerminal(tail_id),
+                    Symbol::NonTerminal(ws_id),
+                    Symbol::Terminal(b'}'),
+                ];
                 Ok(vec![main_alt])
             }
         }
+    }
+
+    /// Build a right-nested tail rule for object properties (issue #355).
+    ///
+    /// Constructs a grammar rule for "the remaining properties starting at index
+    /// `i`" in `props` (each entry is `(pair_rule_id, is_required)`).
+    ///
+    /// `started`: whether any property has already been emitted — a compile-time
+    /// boolean.  Distinct rules are generated for the two reachable variants.
+    ///
+    /// # Grammar shape
+    ///
+    /// - Base case (`i == props.len()`): epsilon
+    /// - P_i REQUIRED, started=false: `pair_i  tail(i+1, true)`
+    /// - P_i REQUIRED, started=true:  `","  ws  pair_i  tail(i+1, true)`
+    /// - P_i OPTIONAL, started=false: `(pair_i  tail(i+1, true)) | tail(i+1, false)`
+    /// - P_i OPTIONAL, started=true:  `("," ws pair_i tail(i+1, true)) | tail(i+1, true)`
+    ///
+    /// The `","` separator is placed as the **first** terminal in the started=true
+    /// alternatives — there is no leading `ws` before the comma.  This is
+    /// intentional: the PDA switches alternatives only when `sym_pos == 0` (no
+    /// bytes consumed yet in the current alternative).  A leading nullable `ws`
+    /// would advance `sym_pos` past 0 without consuming bytes, making it
+    /// impossible to fall back to the skip alternative.  Compact JSON (no
+    /// whitespace before commas) is the only constrained-decoding target that
+    /// matters in practice, and the llama.cpp `json-schema-to-grammar` reference
+    /// has the same property.
+    ///
+    /// # PDA safety boundary (issue #353)
+    ///
+    /// **Single trailing optional** (P_i is optional and all properties after it
+    /// are also optional, AND P_i is the last optional before the base-ε):
+    /// The inlined key bytes prevent trailing-comma over-acceptance in the common
+    /// one-remaining-optional case.  When `}` arrives after `","`, the mismatch
+    /// fires at sym_pos≥2 (past the comma and into the inlined key) → propagates
+    /// to THIS RULE'S parent, not to the skip alt of THIS rule.  If the parent is
+    /// a single-alternative required chain, there is no further alt → correctly
+    /// rejects.  This is what fixes the #355 bug reproducer (`{r:req, o:opt}`).
+    ///
+    /// **Two or more trailing optionals** (an optional P_i followed by another
+    /// optional P_j): When `}` arrives after `","` in P_i's emit alt, the mismatch
+    /// propagates to THIS rule's parent.  If the parent itself is an optional-tail
+    /// rule with a skip alt (`tail(i-1, false)`), that skip alt is tried next.  The
+    /// skip alt delegates to `tail(i, false)`, which takes its ε path and collapses
+    /// cleanly, allowing `}` to match the outer brace.  Result: `{"a":1,}` is
+    /// over-accepted for `{a:opt, b:opt}`.  This is a pre-existing consequence of
+    /// the #353 PDA limitation (the old flat-sequence grammar had the same
+    /// over-acceptance via mandatory-comma + ε opt_b).  Tracked in issue #353;
+    /// fixing it requires PDA-level changes, not grammar restructuring.
+    ///
+    /// **Interleaved optional** (an optional P_i followed by a required P_j):
+    /// Both the emit path (`"," ...`) and the skip path (`tail(i+1, true)` which
+    /// itself starts with `","` for the required P_j) share the `","` prefix.
+    /// The PDA commits to alt-0 and cannot backtrack → over-rejects inputs that
+    /// skip P_i.  Tracked in issue #353; the emitted CFG is correct, only the
+    /// runtime PDA is limited.
+    fn build_object_tail(
+        &mut self,
+        obj_idx: usize,
+        props: &[(usize, usize, Vec<u8>, bool)], // (pair_id, val_id, key_bytes, is_required)
+        i: usize,
+        started: bool,
+        ws_id: usize,
+    ) -> usize {
+        let started_char = if started { 's' } else { 'f' };
+        let rule_name = format!("obj_{obj_idx}_tail_{i}_{started_char}");
+
+        // Memoization: if this (obj_idx, i, started) variant was already built,
+        // return its id without rebuilding.
+        if let Some(id) = self.builder.rule_id(&rule_name) {
+            return id;
+        }
+
+        // Base case: all properties processed → epsilon.
+        if i == props.len() {
+            let id = self.builder.reserve(&rule_name);
+            self.builder.set_alts(id, vec![vec![]]); // epsilon alternative
+            return id;
+        }
+
+        // Reserve first so that any recursive call that would reference *this*
+        // rule (none in practice — the recursion always increments i — but
+        // reserve-before-set is the established pattern in this file).
+        let id = self.builder.reserve(&rule_name);
+
+        let (pair_id, val_id, ref key_bytes, is_required) = props[i];
+
+        let alts: Vec<Alt> = if is_required {
+            // Required: one alternative (no choice).
+            let next_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id);
+            if started {
+                // "," ws pair_i tail(i+1, true)
+                // Leading "," is a terminal at sym_pos==0 of this alternative.
+                vec![vec![
+                    Symbol::Terminal(b','),
+                    Symbol::NonTerminal(ws_id),
+                    Symbol::NonTerminal(pair_id),
+                    Symbol::NonTerminal(next_id),
+                ]]
+            } else {
+                // pair_i tail(i+1, true)
+                vec![vec![
+                    Symbol::NonTerminal(pair_id),
+                    Symbol::NonTerminal(next_id),
+                ]]
+            }
+        } else {
+            // Optional: emit alt | skip alt.
+            // next_started_id: tail after emitting P_i (started=true regardless).
+            // next_same_id:    tail after skipping P_i (started unchanged).
+            let next_started_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id);
+            let next_same_id = self.build_object_tail(obj_idx, props, i + 1, started, ws_id);
+
+            let emit_alt: Alt = if started {
+                // INLINED key for started=true optionals: instead of using
+                // NonTerminal(pair_id), we inline the key bytes as terminals.
+                //
+                // Why inlining shifts where trailing-comma errors surface:
+                //   With NonTerminal(pair_id): pair_id fails at its own
+                //   sym_pos=0 (e.g. `}` vs expected `"`).  try_next_alt
+                //   propagates to THIS tail rule and switches it from the emit
+                //   alternative to the skip alternative (ε), even though ","
+                //   was already consumed in a previous advance_byte call.
+                //   Result: `{"r":1,}` is over-accepted.
+                //
+                //   With inlined key terminals: after "," (sym_pos 0→1) and ws
+                //   (nullable, advances sym_pos without consuming bytes), the
+                //   opening `"` of the key is a terminal at sym_pos≥2 IN THIS
+                //   RULE.  When `}` arrives instead, sym_pos≥2 ≠ 0 →
+                //   mid-alt mismatch → propagates to THIS RULE'S PARENT.
+                //
+                //   If the parent is a single-alternative required-chain tail
+                //   (no skip alt), trailing-comma correctly rejects.  This is
+                //   the #355 fix for `{r:req, o:opt}`.
+                //
+                //   If the parent is itself an optional-tail rule with a skip
+                //   alt (≥2 trailing optionals), the parent's skip alt is tried,
+                //   which can reach ε → over-accepts trailing comma.  This is
+                //   a pre-existing #353 consequence; see doc comment above.
+                //
+                // "," ws "<key>" ws ":" ws val_i tail(i+1, true)
+                let mut alt: Alt = vec![Symbol::Terminal(b','), Symbol::NonTerminal(ws_id)];
+                for &byte in key_bytes.iter() {
+                    alt.push(Symbol::Terminal(byte));
+                }
+                alt.push(Symbol::NonTerminal(ws_id));
+                alt.push(Symbol::Terminal(b':'));
+                alt.push(Symbol::NonTerminal(ws_id));
+                alt.push(Symbol::NonTerminal(val_id));
+                alt.push(Symbol::NonTerminal(next_started_id));
+                alt
+            } else {
+                // pair_i tail(i+1, true)
+                // For started=false the first byte of pair_id is `"` at
+                // sym_pos=0 of this alternative.  If no key matches (absent
+                // optional property), try_next_alt correctly switches to the
+                // skip alternative.
+                vec![
+                    Symbol::NonTerminal(pair_id),
+                    Symbol::NonTerminal(next_started_id),
+                ]
+            };
+            // Skip: proceed without emitting P_i, maintaining the same started flag.
+            let skip_alt: Alt = vec![Symbol::NonTerminal(next_same_id)];
+            vec![emit_alt, skip_alt]
+        };
+
+        self.builder.set_alts(id, alts);
+        id
     }
 
     /// Compile an `array` schema.
@@ -1334,5 +1529,315 @@ mod tests {
         let g = compile(&schema).unwrap();
         assert!(accepts(&g, b"{\"status\":\"ok\"}"));
         assert!(accepts(&g, b"{\"status\":\"err\"}"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #355 — mixed required / optional object properties
+    // -----------------------------------------------------------------------
+    //
+    // The old flat-sequence grammar pushed the "," separator unconditionally
+    // before every non-first property and then wrapped optional properties in
+    // an `opt_pair` rule that could collapse to ε.  When the optional collapsed,
+    // the mandatory comma was already committed → the closing `}` was rejected.
+    //
+    // The new tail-chain construction mirrors `build_bounded_tail` for arrays:
+    // each optional property *owns* its leading comma so that the comma is only
+    // emitted when the property is present.  The PDA can distinguish the emit
+    // path (starts with `","`) from the skip path (reaches ε / `}`) at the
+    // first byte — no backtracking needed.
+
+    /// Both properties required — baseline sanity check.
+    #[test]
+    fn object_both_required() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{"r":{"type":"integer"},"s":{"type":"integer"}},
+                "required":["r","s"]
+            }"#,
+        );
+        assert!(
+            accepts(&g, b"{\"r\":1,\"s\":2}"),
+            "fully-present object must be accepted"
+        );
+        assert!(
+            rejects(&g, b"{\"r\":1}"),
+            "missing required s must be rejected"
+        );
+        assert!(
+            rejects(&g, b"{}"),
+            "empty object must be rejected when both required"
+        );
+    }
+
+    /// Single optional property only — object may be empty or have the property.
+    #[test]
+    fn object_single_optional_only() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{"o":{"type":"integer"}}
+            }"#,
+        );
+        assert!(
+            accepts(&g, b"{}"),
+            "empty object must be accepted when property is optional"
+        );
+        assert!(
+            accepts(&g, b"{\"o\":1}"),
+            "object with optional property must be accepted"
+        );
+        // Trailing comma is invalid JSON — must reject.
+        assert!(
+            rejects(&g, b"{\"o\":1,}"),
+            "trailing comma must be rejected"
+        );
+    }
+
+    /// Reproducer from issue #355: one required + one trailing optional.
+    /// Both `{"r":1}` and `{"r":1,"o":2}` were wrongly rejected before the fix.
+    #[test]
+    fn object_required_plus_trailing_optional_issue_355() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{"r":{"type":"integer"},"o":{"type":"integer"}},
+                "required":["r"]
+            }"#,
+        );
+        // These two must now be accepted (were both rejected before the fix).
+        assert!(
+            accepts(&g, b"{\"r\":1}"),
+            "required-only object must be accepted (issue #355)"
+        );
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o\":2}"),
+            "fully-present object must be accepted (issue #355)"
+        );
+        // Invalid inputs must remain rejected.
+        assert!(rejects(&g, b"{}"), "missing required r must be rejected");
+        assert!(
+            rejects(&g, b"{\"o\":2}"),
+            "object with only optional and no required must be rejected"
+        );
+        assert!(
+            rejects(&g, b"{\"r\":1,}"),
+            "trailing comma must be rejected"
+        );
+        assert!(
+            rejects(&g, b"{\"r\":\"bad\"}"),
+            "wrong value type for r must be rejected"
+        );
+    }
+
+    /// Two trailing optionals after a required property.
+    #[test]
+    fn object_two_trailing_optionals() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{
+                    "r":{"type":"integer"},
+                    "o1":{"type":"integer"},
+                    "o2":{"type":"integer"}
+                },
+                "required":["r"]
+            }"#,
+        );
+        // Required only.
+        assert!(accepts(&g, b"{\"r\":1}"), "required-only must be accepted");
+        // Required + first optional.
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2}"),
+            "r + o1 must be accepted"
+        );
+        // All three present.
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2,\"o2\":3}"),
+            "all three properties must be accepted"
+        );
+        // Missing required.
+        assert!(rejects(&g, b"{}"), "empty object must be rejected");
+        assert!(rejects(&g, b"{\"o1\":2}"), "missing r must be rejected");
+
+        // r + o2 only (skip o1): this is the INTERLEAVED optional case.
+        // The CFG is correct, but the runtime PDA commits to the emit-o1
+        // alternative when it sees "," and cannot backtrack past the o1 key
+        // mismatch.  Assert the actual current behaviour so the test is
+        // mutation-sensitive and clearly documents the #353 boundary.
+        // #353: interleaved optional — PDA over-rejects; CFG is correct.
+        assert!(
+            rejects(&g, b"{\"r\":1,\"o2\":3}"),
+            "#353: PDA over-rejects r+o2 (interleaved optional, skip o1)"
+        );
+        // Trailing comma boundary (see object_three_props_trailing_comma_boundary
+        // for the full explanation):
+        // - r only with trailing comma: correctly rejects (inline-key fix).
+        // - r+o1 with trailing comma: over-accepts because o2 skip alt is reachable.
+        // - r+o1+o2 with trailing comma: correctly rejects (no optional remaining).
+        assert!(
+            rejects(&g, b"{\"r\":1,}"),
+            "trailing comma after r-only must reject"
+        );
+        // #353 pre-existing: trailing comma over-accepted when o2 skip alt remains.
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2,}"),
+            "#353 pre-existing: r+o1 trailing comma over-accepted"
+        );
+        assert!(
+            rejects(&g, b"{\"r\":1,\"o1\":2,\"o2\":3,}"),
+            "trailing comma after all three must reject"
+        );
+    }
+
+    /// No over-acceptance: invalid JSON must still be rejected after the fix.
+    #[test]
+    fn object_no_over_acceptance() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{"r":{"type":"integer"},"o":{"type":"integer"}},
+                "required":["r"]
+            }"#,
+        );
+        assert!(
+            rejects(&g, b"{\"r\":1,\"o\":\"bad\"}"),
+            "wrong type for optional must be rejected"
+        );
+        assert!(
+            rejects(&g, b"{\"r\":1,,\"o\":2}"),
+            "double comma must be rejected"
+        );
+        assert!(rejects(&g, b"{,\"r\":1}"), "leading comma must be rejected");
+        assert!(rejects(&g, b"\"r\":1"), "missing braces must be rejected");
+        assert!(
+            rejects(&g, b"{\"r\":1,\"o\":2,}"),
+            "trailing comma after optional must be rejected"
+        );
+    }
+
+    /// Regression: the fully-present case (`{"r":1,"o":2}`) must be accepted.
+    /// This was also broken before the fix — the flat grammar made the comma
+    /// mandatory before the optional wrapper, so `{"r":1,"o":2}` was accepted
+    /// BUT `{"r":1}` was not.  Verify both directions are now correct.
+    #[test]
+    fn object_fully_present_and_absent_both_correct() {
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{"a":{"type":"string"},"b":{"type":"boolean"}},
+                "required":["a"]
+            }"#,
+        );
+        assert!(
+            accepts(&g, b"{\"a\":\"x\"}"),
+            "required-only string must be accepted"
+        );
+        assert!(
+            accepts(&g, b"{\"a\":\"x\",\"b\":true}"),
+            "both present must be accepted"
+        );
+        assert!(
+            accepts(&g, b"{\"a\":\"x\",\"b\":false}"),
+            "both present (false) must be accepted"
+        );
+        assert!(
+            rejects(&g, b"{\"b\":true}"),
+            "missing required a must be rejected"
+        );
+        assert!(rejects(&g, b"{}"), "empty must be rejected");
+    }
+
+    /// Two fully-optional properties — PDA boundary for trailing-comma and
+    /// skip-first (#353) behaviours.
+    ///
+    /// Trailing comma after the first optional (`{"a":1,}`) is a pre-existing
+    /// #353 consequence: the old flat-sequence grammar also accepted it via the
+    /// mandatory-comma + ε-opt_b path.  Fixing it requires PDA changes, not
+    /// grammar restructuring.  The assertion documents actual current behaviour
+    /// so that any inadvertent change is caught.
+    #[test]
+    fn object_two_optional_only_pda_boundary() {
+        let g = compile_ok(
+            r#"{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}"#,
+        );
+        assert!(
+            accepts(&g, b"{}"),
+            "empty object must be accepted when all optional"
+        );
+        assert!(
+            accepts(&g, b"{\"a\":1}"),
+            "first optional alone must be accepted"
+        );
+        assert!(
+            accepts(&g, b"{\"a\":1,\"b\":2}"),
+            "both present must be accepted"
+        );
+        // #353: PDA over-rejects skip-first ({"b":2} without a).
+        assert!(
+            rejects(&g, b"{\"b\":2}"),
+            "#353: PDA over-rejects skip-first optional"
+        );
+        // #353 trailing comma: {"a":1,} over-accepts because the skip alt of
+        // tail(0,false) provides an escape after tail(1,true) consumes ",".
+        // This is a pre-existing limitation from the old grammar and requires
+        // a PDA fix (#353), not a grammar change.
+        assert!(
+            accepts(&g, b"{\"a\":1,}"),
+            "#353 pre-existing: trailing comma over-accepted when second optional follows"
+        );
+        // When both properties are present the trailing comma correctly rejects
+        // (no further optional to provide an escape route).
+        assert!(
+            rejects(&g, b"{\"a\":1,\"b\":2,}"),
+            "trailing comma after last property must be rejected"
+        );
+    }
+
+    /// Three-property schema (1 required + 2 trailing optionals) — documents
+    /// trailing-comma boundary for the intermediate optional case.
+    ///
+    /// `{"r":1,"o1":2,}` over-accepts because the o2 skip alt provides an
+    /// escape route after tail(o1, true) consumes the comma.  This is the same
+    /// #353 mechanism as `object_two_optional_only_pda_boundary` above.
+    /// `{"r":1,}` correctly rejects because the inline fix makes the o1 key
+    /// mismatch fire at sym_pos≥2 → propagates to the required chain (no alt)
+    /// → rejects.  And `{"r":1,"o1":2,"o2":3,}` correctly rejects because no
+    /// optional remains to provide an escape.
+    #[test]
+    fn object_three_props_trailing_comma_boundary() {
+        let g = compile_ok(
+            r#"{
+            "type":"object",
+            "properties":{
+                "r":{"type":"integer"},
+                "o1":{"type":"integer"},
+                "o2":{"type":"integer"}
+            },
+            "required":["r"]
+        }"#,
+        );
+        // Correct accepts.
+        assert!(accepts(&g, b"{\"r\":1}"), "required-only must be accepted");
+        assert!(accepts(&g, b"{\"r\":1,\"o1\":2}"), "r+o1 must be accepted");
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2,\"o2\":3}"),
+            "all three must be accepted"
+        );
+        // Inline fix: trailing comma after required-only correctly rejects.
+        assert!(
+            rejects(&g, b"{\"r\":1,}"),
+            "trailing comma after required-only must be rejected (inline-key fix)"
+        );
+        // #353 pre-existing: trailing comma after intermediate optional over-accepts.
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2,}"),
+            "#353 pre-existing: trailing comma over-accepted when further optional (o2) follows"
+        );
+        // Trailing comma after last property correctly rejects.
+        assert!(
+            rejects(&g, b"{\"r\":1,\"o1\":2,\"o2\":3,}"),
+            "trailing comma after last property must be rejected"
+        );
     }
 }
