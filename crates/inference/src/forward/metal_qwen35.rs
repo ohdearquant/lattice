@@ -19660,6 +19660,7 @@ impl MetalQwen35State {
             token_ids: vec![],
             prompt_tokens: 0,
             generated_tokens: 0,
+            stopped: false,
         }
     }
 

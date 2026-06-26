@@ -698,6 +698,10 @@ pub struct GenerateOutput {
     pub prompt_tokens: usize,
     /// Total tokens generated (excluding prompt).
     pub generated_tokens: usize,
+    /// True when generation ended via a stop condition (EOS, a stop token, or a
+    /// stop string); false when it ended by reaching `max_new_tokens`. Serve maps
+    /// this to the OpenAI `finish_reason` ("stop" vs "length").
+    pub stopped: bool,
 }
 
 /// Compute the layer type pattern: every `interval`-th layer (1-indexed) is full attention.

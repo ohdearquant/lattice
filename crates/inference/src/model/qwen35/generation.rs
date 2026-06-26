@@ -35,6 +35,7 @@ impl Qwen35Model {
                 token_ids: vec![],
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
+                stopped: false,
             });
         }
 
@@ -71,6 +72,7 @@ impl Qwen35Model {
                 token_ids: vec![],
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
+                stopped: true,
             });
         }
 
@@ -80,7 +82,7 @@ impl Qwen35Model {
         if gen_cfg.stop_strings.is_empty() {
             // Fast path: no string-level stops. Behaviour byte-for-byte identical
             // to before this feature was added; the e2e-parity CI gate pins this.
-            decode_loop(
+            let stopped = decode_loop(
                 self,
                 gen_cfg,
                 &mut all_ids,
@@ -89,7 +91,7 @@ impl Qwen35Model {
                 &mut gdn_states,
                 &mut kv_cache,
                 &mut scratch,
-            );
+            )?;
 
             let text = decode_tokens(&self.tokenizer, &generated_ids);
 
@@ -98,6 +100,7 @@ impl Qwen35Model {
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         } else {
             // String-stop path: accumulate decoded text and check after every token.
@@ -115,10 +118,11 @@ impl Qwen35Model {
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
+                    stopped: true,
                 });
             }
 
-            decode_loop_with_stops(
+            let stopped = decode_loop_with_stops(
                 self,
                 gen_cfg,
                 &mut all_ids,
@@ -129,13 +133,14 @@ impl Qwen35Model {
                 &mut scratch,
                 &mut detok,
                 &mut full,
-            );
+            )?;
 
             Ok(GenerateOutput {
                 text: full,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         }
     }
@@ -175,6 +180,7 @@ impl Qwen35Model {
                 token_ids: vec![],
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
+                stopped: false,
             });
         }
 
@@ -211,6 +217,7 @@ impl Qwen35Model {
                 token_ids: vec![],
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
+                stopped: true,
             });
         }
 
@@ -230,6 +237,7 @@ impl Qwen35Model {
                 on_token(&delta);
             }
 
+            let mut stopped = false;
             // Decode loop (mirrors decode_loop free function exactly).
             for _ in 1..gen_cfg.max_new_tokens {
                 let pos = kv_cache.seq_len;
@@ -254,6 +262,7 @@ impl Qwen35Model {
                 );
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -278,6 +287,7 @@ impl Qwen35Model {
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         } else {
             // String-stop path: use StopStreamer to hold back (max_stop - 1) bytes and
@@ -293,9 +303,11 @@ impl Qwen35Model {
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
+                    stopped: true,
                 });
             }
 
+            let mut stopped = false;
             // Decode loop for the string-stop path.
             for _ in 1..gen_cfg.max_new_tokens {
                 let pos = kv_cache.seq_len;
@@ -320,6 +332,7 @@ impl Qwen35Model {
                 );
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -328,18 +341,22 @@ impl Qwen35Model {
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if streamer.push(&delta, &mut on_token) {
+                    stopped = true;
                     break;
                 }
             }
 
             // Natural-end flush (no-op if a stop was already hit inside the loop).
             streamer.finish(&detok.finish(), &mut on_token);
+            // finish() may itself complete a stop in the tail bytes.
+            stopped |= streamer.stopped;
 
             Ok(GenerateOutput {
                 text: streamer.into_text(),
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         }
     }
@@ -496,13 +513,13 @@ fn decode_loop(
     gdn_states: &mut [GatedDeltaNetState],
     kv_cache: &mut KvCache,
     scratch: &mut ForwardScratch,
-) {
+) -> Result<bool, InferenceError> {
     let cfg = &model.config;
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
-        let last_token = *all_ids
-            .last()
-            .expect("invariant: prompt or prior generation seeded all_ids");
+        let Some(&last_token) = all_ids.last() else {
+            return Err(InferenceError::Inference("empty generation state".into()));
+        };
 
         model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
         kv_cache.seq_len += 1;
@@ -515,12 +532,13 @@ fn decode_loop(
         );
 
         if should_stop_token(cfg, gen_cfg, next_id) {
-            break;
+            return Ok(true);
         }
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
     }
+    Ok(false)
 }
 
 /// String-stop variant of `decode_loop`. Called only when `gen_cfg.stop_strings` is non-empty.
@@ -544,14 +562,14 @@ fn decode_loop_with_stops(
     scratch: &mut ForwardScratch,
     detok: &mut IncrementalDetokenizer,
     full: &mut String,
-) {
+) -> Result<bool, InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
-        let last_token = *all_ids
-            .last()
-            .expect("invariant: prompt or prior generation seeded all_ids");
+        let Some(&last_token) = all_ids.last() else {
+            return Err(InferenceError::Inference("empty generation state".into()));
+        };
 
         model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
         kv_cache.seq_len += 1;
@@ -564,6 +582,7 @@ fn decode_loop_with_stops(
         );
 
         if should_stop_token(cfg, gen_cfg, next_id) {
+            stopped = true;
             break;
         }
 
@@ -591,9 +610,12 @@ fn decode_loop_with_stops(
             // The tail itself might complete a stop string.
             if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
                 full.truncate(hit);
+                return Ok(true);
             }
         }
+        return Ok(false);
     }
+    Ok(true)
 }
 
 /// Returns the smallest byte index in `haystack` at which any stop string begins,

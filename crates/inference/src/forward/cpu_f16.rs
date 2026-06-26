@@ -887,12 +887,14 @@ pub fn generate_f16(
             token_ids: vec![],
             prompt_tokens: prompt_len,
             generated_tokens: 0,
+            stopped: true,
         });
     }
 
     generated_ids.push(next_id);
     all_ids.push(next_id);
 
+    let mut stopped = false;
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
@@ -920,6 +922,7 @@ pub fn generate_f16(
         );
 
         if next_id == cfg.eos_token_id {
+            stopped = true;
             break;
         }
 
@@ -935,6 +938,7 @@ pub fn generate_f16(
         token_ids: generated_ids.clone(),
         prompt_tokens: prompt_len,
         generated_tokens: generated_ids.len(),
+        stopped,
     })
 }
 
