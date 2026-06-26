@@ -331,6 +331,47 @@ fn test_softmax_all_masked_row_is_zero_across_backends() {
     assert_relative_eq!(row1_sum, 1.0, epsilon = 1e-3);
 }
 
+// Contract for a row with at least one finite valid score and a -inf-masked key
+// (the common #361 case, distinct from the all-masked row above). The masked
+// weight is NOT mathematically exact zero: `softmax_attention` routes through
+// `fast_exp`, which clamps its input to the [-87, 88] floor, so `fast_exp(-inf)`
+// is `fast_exp(-87)` ~= 1.746e-38, not 0.0. This is deliberate and byte-identical
+// to the prior `-10_000.0` sentinel for valid-keys-present rows (both clamp to the
+// same floor), which is why e2e-parity greedy generation is unaffected. The
+// guarantee #361 needs is weaker than exact zero: the masked weight is negligible
+// and never the row max / never dominant. Asserting the clamped magnitude (rather
+// than 0.0) locks that contract so a future `-inf`->0.0 special-case can't silently
+// change parity/perf behaviour without updating this expectation.
+#[test]
+fn test_softmax_finite_valid_row_masked_weight_is_clamped_nonzero_not_dominant() {
+    let num_heads = 1;
+    let seq_len = 2;
+    // Row 0: valid key 0 scores 0.0, masked key 1 is -inf.
+    let mut x = vec![0.0f32, f32::NEG_INFINITY, 0.0, 0.0];
+    softmax_attention(&mut x, seq_len, num_heads);
+
+    let valid = x[0];
+    let masked = x[1];
+    assert!(
+        valid.is_finite() && masked.is_finite(),
+        "row must be finite"
+    );
+    // The masked weight is a tiny clamped nonzero, not exact zero.
+    assert!(
+        masked > 0.0,
+        "fast_exp clamp makes the masked weight strictly > 0"
+    );
+    assert!(
+        masked < 1e-30,
+        "masked weight {masked} must be negligible (clamped fast_exp(-87) ~= 1.7e-38)"
+    );
+    // The valid key carries essentially all the probability mass: never dominated.
+    assert!(
+        valid > 1.0 - 1e-6,
+        "valid key weight {valid} must dominate (~1.0)"
+    );
+}
+
 #[test]
 fn test_fast_exp_accuracy() {
     // Verify fast_exp matches std exp within acceptable tolerance for softmax.
