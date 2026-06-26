@@ -666,6 +666,22 @@ fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// The key difference is zero allocation overhead: no `Vec<i8>`, no
 /// `QuantizedVector`, no `QuantizationParams`. Just raw slices in, f32 out.
+///
+/// # Invariant (caller-guaranteed)
+///
+/// Every element of `a` and `b` must lie in `[-127, 127]`, i.e. the value
+/// `-128` (`i8::MIN`) must not appear. `-128` causes silent corruption in the
+/// AVX2 (`_mm256_sign_epi8` saturation) and AVX-512 VNNI (`_mm512_dpbusd_epi32`
+/// after `vpabsb`) kernels — the dispatch returns a wrong distance with no
+/// panic. The precondition is checked only by `debug_assert!`, which is
+/// compiled out in release builds, so a release caller gets no diagnostic.
+/// `-128` is memory-safe (no UB), only numerically out-of-contract.
+///
+/// Vectors produced by [`QuantizedVector::from_f32`] satisfy this automatically
+/// (it clamps to `[-127, 127]`). Callers feeding slices from an external or
+/// differently-configured quantizer must clamp `i8::MIN` up to `-127` first.
+/// The invariant is a `debug_assert!` rather than a release `assert!` on
+/// purpose: a release-time scan would add O(n) work to this documented hot path.
 #[inline]
 pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {

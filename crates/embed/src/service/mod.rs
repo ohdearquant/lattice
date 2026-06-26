@@ -93,7 +93,8 @@ pub trait EmbeddingService: Send + Sync {
     ///
     /// Returns a vector of embeddings, one for each input text, in the same order.
     /// Applies no role-specific prompt prefix (equivalent to `Generic` role).
-    /// Use [`embed_query`] / [`embed_passage`] for asymmetric retrieval models.
+    /// Use [`EmbeddingService::embed_query`] / [`EmbeddingService::embed_passage`]
+    /// for asymmetric retrieval models.
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>>;
 
     /// **Stable**: generate an embedding for a single text.
