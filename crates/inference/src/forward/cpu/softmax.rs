@@ -45,6 +45,16 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
             let start = (h * seq_len + s) * seq_len;
             let row = &mut x[start..start + seq_len];
             let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max_val.is_finite() {
+                // Every score in this row is masked (-inf): there is no valid key to
+                // attend to. Emit a zero distribution instead of computing
+                // `fast_exp(-inf - -inf) = fast_exp(NaN)`, whose value is path-dependent
+                // (0.0 on scalar/NEON, but a tiny nonzero on AVX2 where MAXPS returns
+                // the finite operand on a NaN input) and would otherwise diverge across
+                // SIMD backends. Zeroing keeps every backend fail-closed and identical.
+                row.fill(0.0);
+                continue;
+            }
             let mut sum = 0.0f32;
             for val in row.iter_mut() {
                 *val = fast_exp(*val - max_val);
@@ -147,6 +157,13 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
                 max_val = max_val.max(*ptr.add(i));
             }
 
+            // All-masked row (max stayed -inf): zero it and skip, matching the scalar
+            // reference. Avoids `neon_exp(-inf - -inf)` and keeps every backend identical.
+            if !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
+            }
+
             // --- Step 2: Subtract max + fast exp + accumulate sum ---
             let vmax_val = vdupq_n_f32(max_val);
             let mut s0 = vdupq_n_f32(0.0);
@@ -242,6 +259,15 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
             let mut max_val = _mm_cvtss_f32(max32);
             for i in (chunks * 8)..n {
                 max_val = max_val.max(*ptr.add(i));
+            }
+
+            // All-masked row (max stayed -inf): zero it and skip, matching the scalar
+            // reference. Without this, the SIMD lanes compute `fast_exp_avx2(-inf - -inf)`
+            // where MAXPS returns the finite clamp on a NaN input, yielding a tiny nonzero
+            // weight and a uniform row — diverging from scalar/NEON which produce zeros.
+            if !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
             }
 
             // --- Step 2: Subtract max + fast exp + accumulate sum (all SIMD) ---
