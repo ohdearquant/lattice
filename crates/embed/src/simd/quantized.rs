@@ -176,8 +176,10 @@ impl QuantizedVector {
 /// # Invariant
 ///
 /// Both vectors must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
-/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). The `data` field is private, so
+/// causes silent corruption on the AVX2 and AVX-512-VNNI paths, which apply an
+/// operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b` emulation):
+/// negating `-128` wraps back to `-128` in two's complement instead of `+128`,
+/// so the kernel accumulates the wrong sign. The `data` field is private, so
 /// only `from_f32` (which clamps) can populate it — `debug_assert!` is sufficient.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
@@ -644,8 +646,10 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
 /// # Invariant
 ///
 /// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption in AVX2 (`_mm256_sign_epi8` saturation) and AVX-512
-/// VNNI (`_mm512_dpbusd_epi32` after `vpabsb`). The invariant is enforced with a
+/// causes silent corruption on the AVX2 and AVX-512-VNNI paths, which apply an
+/// operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b` emulation):
+/// negating `-128` wraps back to `-128` in two's complement instead of `+128`,
+/// so the kernel accumulates the wrong sign. The invariant is enforced with a
 /// **`debug_assert!`** (debug builds only); callers MUST guarantee it. The
 /// `QuantizedVector::from_f32` constructor satisfies it by clamping to `[-127, 127]`.
 /// Promoting this to a release `assert!` would add an O(n) scan to a documented hot
@@ -670,12 +674,14 @@ fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
 /// # Invariant (caller-guaranteed)
 ///
 /// Every element of `a` and `b` must lie in `[-127, 127]`, i.e. the value
-/// `-128` (`i8::MIN`) must not appear. `-128` causes silent corruption in the
-/// AVX2 (`_mm256_sign_epi8` saturation) and AVX-512 VNNI (`_mm512_dpbusd_epi32`
-/// after `vpabsb`) kernels — the dispatch returns a wrong distance with no
-/// panic. The precondition is checked only by `debug_assert!`, which is
-/// compiled out in release builds, so a release caller gets no diagnostic.
-/// `-128` is memory-safe (no UB), only numerically out-of-contract.
+/// `-128` (`i8::MIN`) must not appear. The AVX2 and AVX-512-VNNI kernels apply
+/// an operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b`
+/// emulation); negating `-128` wraps back to `-128` in two's complement instead
+/// of `+128`, so the kernel silently accumulates the wrong sign and the dispatch
+/// returns a wrong distance with no panic. The precondition is checked only by
+/// `debug_assert!`, which is compiled out in release builds, so a release caller
+/// gets no diagnostic. `-128` is memory-safe (no UB), only numerically
+/// out-of-contract.
 ///
 /// Vectors produced by [`QuantizedVector::from_f32`] satisfy this automatically
 /// (it clamps to `[-127, 127]`). Callers feeding slices from an external or
