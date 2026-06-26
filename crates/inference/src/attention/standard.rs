@@ -80,7 +80,6 @@ pub fn multi_head_attention(
     buffers.temp[..seq_len * hidden_size].to_vec()
 }
 
-/// Internal in-place attention kernel.
 /// Release-active precondition guard for the bidirectional MHA shape products.
 ///
 /// `multi_head_attention_in_place` previously checked the entry shapes only with
@@ -130,6 +129,7 @@ fn assert_standard_no_overflow(
     );
 }
 
+/// Internal in-place attention kernel.
 pub(crate) fn multi_head_attention_in_place(
     hidden_states: &[f32],
     layer_weights: &TransformerLayerWeights<'_>,
