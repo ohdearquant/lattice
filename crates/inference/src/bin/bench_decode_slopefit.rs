@@ -104,15 +104,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     grid.sort_unstable();
     grid.dedup();
 
-    // KV cache must hold the longest requested context plus the decode horizon.
-    // A too-small cache silently corrupts the deepest grid points: prefill fills
-    // the cache, decode immediately hits the cap, and the line reports tokens=1
-    // (a prefill cost masquerading as a decode rate, not a real per-token time).
-    // The previous hard-coded 4096 made every point at/above ctx=4096 — i.e. the
-    // entire SLOPEFIT_FULL {4096,8192,16384} tail this binary advertises — return
-    // tokens=1 instead of a measurement. Size from the grid so the tail is real.
     let max_ctx = grid.iter().copied().max().unwrap_or(512);
-    let cache_len = max_ctx + warmup_tokens.max(measure_tokens) + 16;
 
     // Detect Q4 dir (same heuristic as bench_decode_ab).
     let is_q4_dir = !dir.join("model.safetensors").exists()
@@ -137,9 +129,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if is_q4_dir { "Q4" } else { "safetensors" }
     );
 
+    // Tokenizer first — the KV cache must hold the *padded* prompt, and the pad
+    // loop below overshoots `ctx` by up to one `base` block. Sizing from `max_ctx`
+    // alone leaves the deepest grid point short by that overshoot and silently
+    // truncates its decode (a milder echo of the tokens=1 corruption the previous
+    // hard-coded 4096 cache produced at every point >= 4096). Build the deepest
+    // prompt exactly as the measurement loop does and size from its real length.
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
+
+    // Raw continuation prompt — no chat template — so the model sees a partial
+    // sentence and produces a continuation rather than a completed conversation.
+    // This avoids the early EOS that chat_completion triggers via im_end.
+    // The base text is intentionally left incomplete (no closing punctuation)
+    // so greedy continuation runs as a prose generation, not a Q&A exchange.
+    let base = "The quick brown fox jumps over the lazy dog and then continues \
+                running through the meadow past the old stone wall while the sun \
+                sets slowly over the distant mountains painting the sky in shades \
+                of orange and gold as the evening breeze stirs the tall grass and \
+                the river flows gently southward toward the ancient city where ";
+
+    let mut deepest_prompt = String::new();
+    while tokenizer.tokenize(&deepest_prompt).real_length < max_ctx {
+        deepest_prompt.push_str(base);
+    }
+    let deepest_prompt_tokens = tokenizer.tokenize(&deepest_prompt).real_length;
+    // Peak occupancy is prompt + the larger decode phase: warmup and measure each
+    // run after their own reset_state(), so the cache never holds both at once.
+    let cache_len = deepest_prompt_tokens + warmup_tokens.max(measure_tokens) + 16;
+
     // Load model — same dual ownership pattern as bench_decode_ab.
     let mut metal: MetalQwen35State;
-    let tokenizer: BpeTokenizer;
 
     if is_q4_dir {
         let cfg = if dir.join("config.json").exists() {
@@ -155,24 +174,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cache_len,
         )
         .map_err(|e| format!("Metal Q4 init: {e}"))?;
-        tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
     } else {
         let model = Qwen35Model::from_safetensors(dir).expect("load model");
         let cfg = model.config().clone();
         metal = MetalQwen35State::new(model.weights(), &cfg, cache_len).expect("init metal");
-        tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
     }
-
-    // Raw continuation prompt — no chat template — so the model sees a partial
-    // sentence and produces a continuation rather than a completed conversation.
-    // This avoids the early EOS that chat_completion triggers via im_end.
-    // The base text is intentionally left incomplete (no closing punctuation)
-    // so greedy continuation runs as a prose generation, not a Q&A exchange.
-    let base = "The quick brown fox jumps over the lazy dog and then continues \
-                running through the meadow past the old stone wall while the sun \
-                sets slowly over the distant mountains painting the sky in shades \
-                of orange and gold as the evening breeze stirs the tall grass and \
-                the river flows gently southward toward the ancient city where ";
 
     // Greedy, stop_token_ids empty — EOS token (248044) still stops generation
     // via the hard-coded path in generate().  The prompt design above avoids
@@ -195,7 +201,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "[slopefit] grid={grid:?} warmup={warmup_tokens} measure={measure_tokens} repeats={repeats}"
     );
     eprintln!(
-        "[slopefit] kv_cache_len={cache_len} (max_ctx={max_ctx} + decode_horizon {})",
+        "[slopefit] kv_cache_len={cache_len} \
+         (deepest_prompt={deepest_prompt_tokens} for max_ctx={max_ctx} + decode_horizon {})",
         warmup_tokens.max(measure_tokens)
     );
 

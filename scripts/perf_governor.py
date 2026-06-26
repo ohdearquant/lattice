@@ -308,7 +308,10 @@ class PerfGovernor:
 
         _group_signal(signal.SIGTERM)
         try:
-            proc.wait(timeout=2.0)
+            # Short grace, not a generous one: this is a bounded-window / thermal
+            # safety kill, and a GPU bench mid-command-buffer won't service SIGTERM
+            # promptly, so dwelling here only adds load at the cap. Escalate fast.
+            proc.wait(timeout=0.3)
             return  # SIGTERM was enough
         except subprocess.TimeoutExpired:
             pass
@@ -392,10 +395,12 @@ class PerfGovernor:
                             f"{self.max_thermal_cooldowns} cooldown cycles — hard abort"
                         )
                         abort_msgs.append(msg)
-                        # SIGCONT first so SIGTERM is receivable, then SIGKILL
+                        # SIGCONT first so SIGTERM is receivable, then SIGKILL.
+                        # Swallow EPERM too — _kill_pg's direct fallback carries
+                        # the kill even if this group signal is denied.
                         try:
                             os.killpg(os.getpgid(proc.pid), signal.SIGCONT)
-                        except ProcessLookupError:
+                        except (ProcessLookupError, PermissionError):
                             pass
                         self._kill_pg(proc, msg)
                         return
@@ -410,6 +415,14 @@ class PerfGovernor:
                                 "waiting for thermal to clear"
                             )
                         except ProcessLookupError:
+                            return  # child already gone — nothing to throttle
+                        except PermissionError:
+                            # SIGSTOP denied on a still-live, thermally-hot process.
+                            # Abandoning the poller would also drop BOUNDED watch and
+                            # leave it running hot, so escalate to a hard abort.
+                            msg = "THERMAL: SIGSTOP denied (EPERM) — hard abort"
+                            abort_msgs.append(msg)
+                            self._kill_pg(proc, msg)
                             return
                 else:
                     # Thermal cleared — resume if paused
@@ -422,6 +435,10 @@ class PerfGovernor:
                             _log(f"THERMAL: cleared; sent SIGCONT to pgid={pgid}")
                         except ProcessLookupError:
                             return
+                        except PermissionError:
+                            # Resume denied; the next poll re-evaluates thermal and
+                            # will hard-abort if pressure persists. Don't crash here.
+                            pass
 
         poller = threading.Thread(target=_poller, daemon=True)
         poller.start()
