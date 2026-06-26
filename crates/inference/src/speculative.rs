@@ -1658,6 +1658,38 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Validate that a logit row is usable for probabilistic softmax sampling.
+///
+/// The probabilistic path turns every logit row into a probability distribution
+/// via [`softmax_into`]. A `NaN` or `+inf` logit poisons that softmax: the sum
+/// becomes `NaN`, the `sum > 0.0` normalization guard is skipped, and `out` is
+/// left holding un-normalized / `NaN` mass, which silently corrupts the
+/// acceptance test `min(1, p/q)` and breaks ADR-050's distribution-preservation
+/// guarantee. `-inf` is a legitimate zero-probability sentinel, but only when at
+/// least one finite logit remains so the softmax is well defined. Fail closed on
+/// everything else (same bug class as the #327 / #335 / #361 sampling hardening).
+fn validate_probabilistic_logits(
+    label: &str,
+    logits: &[f32],
+) -> Result<(), crate::error::InferenceError> {
+    use crate::error::InferenceError;
+    let mut has_finite = false;
+    for (i, &l) in logits.iter().enumerate() {
+        if l.is_nan() || (l.is_infinite() && l.is_sign_positive()) {
+            return Err(InferenceError::InvalidInput(format!(
+                "{label}[{i}] must be finite or -inf for probabilistic rejection sampling, got {l}"
+            )));
+        }
+        has_finite |= l.is_finite();
+    }
+    if !has_finite {
+        return Err(InferenceError::InvalidInput(format!(
+            "{label} has no finite logit; probabilistic rejection sampling needs a well-defined softmax"
+        )));
+    }
+    Ok(())
+}
+
 /// Xorshift64 PRNG local to this module — used only in rejection sampling.
 /// Mirrors the implementation in `sampling.rs` so callers do not need to
 /// expose or import that module's private `Rng`.
@@ -1867,6 +1899,17 @@ pub fn rejection_sample_draft(
                     dl.len()
                 )));
             }
+        }
+        // Value finiteness: the probabilistic path softmaxes every row, so a
+        // NaN/+inf logit would silently poison the distribution and corrupt the
+        // accept/reject decision. The greedy path is robust (argmax skips NaN),
+        // so this guard is probabilistic-only.
+        validate_probabilistic_logits("initial_target_logits", initial_target_logits)?;
+        for (i, tl) in target_logits.iter().enumerate() {
+            validate_probabilistic_logits(&format!("target_logits[{i}]"), tl)?;
+        }
+        for (i, dl) in draft_logits.iter().enumerate() {
+            validate_probabilistic_logits(&format!("draft_logits[{i}]"), dl)?;
         }
     }
 
@@ -3072,6 +3115,96 @@ mod tests {
         let initial = uniform_logits(10);
         let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, Some(1));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn rejection_probabilistic_rejects_nonfinite_logits() {
+        // The probabilistic path turns every logit row into a softmax. A NaN or
+        // +inf logit poisons softmax_into (sum=NaN -> the `sum > 0.0` guard skips
+        // normalization -> un-normalized/NaN mass corrupts the accept test), so
+        // the verifier must fail closed with InvalidInput rather than silently
+        // accepting an invalid distribution. (#327/#335/#361 bug class.)
+        // Each case mutates exactly ONE logit row; reverting the guard makes the
+        // call return Ok(...) instead of Err, so this is mutation-sensitive.
+        const VOCAB: usize = 4;
+
+        let mut nan_target = uniform_logits(VOCAB);
+        nan_target[1] = f32::NAN;
+        let mut pos_inf_target = uniform_logits(VOCAB);
+        pos_inf_target[2] = f32::INFINITY;
+        let all_neg_inf = vec![f32::NEG_INFINITY; VOCAB];
+
+        // (label, initial_target, draft_logits[0])
+        let cases: [(&str, Vec<f32>, Vec<f32>); 4] = [
+            ("nan_initial_target", nan_target, uniform_logits(VOCAB)),
+            (
+                "pos_inf_initial_target",
+                pos_inf_target,
+                uniform_logits(VOCAB),
+            ),
+            ("nan_draft", uniform_logits(VOCAB), {
+                let mut d = uniform_logits(VOCAB);
+                d[0] = f32::NAN;
+                d
+            }),
+            (
+                "all_neg_inf_initial_target",
+                all_neg_inf,
+                uniform_logits(VOCAB),
+            ),
+        ];
+
+        for (label, initial_target, draft) in cases {
+            let err = rejection_sample_draft(
+                &[1u32],
+                &[draft],
+                &initial_target,
+                &[peaked_logits(VOCAB, 2, 5.0)],
+                false,
+                Some(7),
+            )
+            .expect_err(&format!(
+                "{label}: probabilistic verifier must reject non-finite logits"
+            ));
+            assert!(
+                matches!(err, crate::error::InferenceError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+        }
+
+        // The same non-finite inputs are tolerated by the GREEDY path (argmax is
+        // NaN-robust): the guard must NOT regress greedy callers.
+        let mut nan_target = uniform_logits(VOCAB);
+        nan_target[1] = f32::NAN;
+        let greedy_ok = rejection_sample_draft(
+            &[2u32],
+            &[],
+            &nan_target,
+            &[peaked_logits(VOCAB, 2, 5.0)],
+            true,
+            Some(7),
+        );
+        assert!(
+            greedy_ok.is_ok(),
+            "greedy path must remain robust to non-finite logits, got {greedy_ok:?}"
+        );
+
+        // A legitimate -inf zero-probability sentinel WITH a finite peak must
+        // still be accepted (this is how the other rejection tests build rows).
+        let mut peaked_with_neg_inf = vec![f32::NEG_INFINITY; VOCAB];
+        peaked_with_neg_inf[2] = 5.0;
+        let valid = rejection_sample_draft(
+            &[2u32],
+            &[peaked_with_neg_inf.clone()],
+            &peaked_with_neg_inf,
+            &[peaked_with_neg_inf.clone()],
+            false,
+            Some(7),
+        );
+        assert!(
+            valid.is_ok(),
+            "-inf with a finite peak is a valid distribution, got {valid:?}"
+        );
     }
 
     #[test]
