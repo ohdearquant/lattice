@@ -1465,6 +1465,46 @@ mod tests {
     }
 
     #[test]
+    fn all_masked_multi_tile_row_yields_zero_output_not_nan() {
+        // Single-tile coverage above does not exercise the cross-tile case where the
+        // running `new_max` stays -inf across SEVERAL KV tiles. Force tile_size_kv=1
+        // over a 3-key all-masked row so the `if new_max.is_finite()` guard is hit on
+        // every tile; without it `exp(-inf - -inf)` poisons row_sum to NaN.
+        let head_dim = 2usize;
+        let seq_len = 3usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q = vec![0.5f32, -0.5, 1.0, 2.0, -1.0, 0.25];
+        let k = vec![0.3f32, 0.7, -0.2, 0.1, 0.9, -0.4];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mask = vec![0u32, 0u32, 0u32];
+        let config = TiledAttentionConfig {
+            tile_size_q: 1,
+            tile_size_kv: 1,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim,
+        };
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        for (i, &o) in out.iter().enumerate() {
+            assert!(o.is_finite(), "output[{i}]={o} must be finite (no NaN)");
+            assert_eq!(o, 0.0, "output[{i}]={o} expected 0.0 for an all-masked row");
+        }
+    }
+
+    #[test]
     fn test_should_use_tiled_threshold() {
         let config = TiledAttentionConfig::new(12, 12, 32);
         assert!(!config.should_use_tiled(32));
