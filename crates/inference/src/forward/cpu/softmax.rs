@@ -121,19 +121,28 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
             let chunks = n / CHUNK;
 
             // --- Step 1: Find row max with 4x unrolling ---
+            // Use the maxNum intrinsics (FMAXNM: vmaxnmq/vmaxnmvq) rather than FMAX
+            // (vmaxq/vmaxvq). FMAX PROPAGATES a NaN operand; Rust `f32::max` in the
+            // scalar reference (and the scalar tail below) follows IEEE maxNum and
+            // DROPS a single NaN. With FMAX, a NaN anywhere in the row makes the whole
+            // reduced max NaN, every `neon_exp(x - NaN)` underflows to 0.0, the sum is
+            // 0.0, and the row is left all-zeros — diverging from the scalar path,
+            // which ignores the NaN and normalizes the finite logits. FMAXNM matches
+            // the scalar reference exactly and is byte-identical on all-finite rows
+            // (the only case that occurs in healthy inference), at no extra cost.
             let mut m0 = vdupq_n_f32(f32::NEG_INFINITY);
             let mut m1 = m0;
             let mut m2 = m0;
             let mut m3 = m0;
             for c in 0..chunks {
                 let base = c * CHUNK;
-                m0 = vmaxq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
-                m1 = vmaxq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
-                m2 = vmaxq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
-                m3 = vmaxq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
+                m0 = vmaxnmq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
+                m1 = vmaxnmq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
+                m2 = vmaxnmq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
+                m3 = vmaxnmq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
             }
-            let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
-            let mut max_val = vmaxvq_f32(vmax);
+            let vmax = vmaxnmq_f32(vmaxnmq_f32(m0, m1), vmaxnmq_f32(m2, m3));
+            let mut max_val = vmaxnmvq_f32(vmax);
             for i in (chunks * CHUNK)..n {
                 max_val = max_val.max(*ptr.add(i));
             }
