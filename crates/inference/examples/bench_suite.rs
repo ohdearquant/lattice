@@ -527,7 +527,7 @@ fn bench_llm_metal() -> Vec<Metric> {
 
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");

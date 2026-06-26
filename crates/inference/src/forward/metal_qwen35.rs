@@ -14463,6 +14463,86 @@ kernel void gdn_chunk_norm_silu_c32(
         }
     }
 
+    impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
+        fn cache_position(&self) -> usize {
+            self.session.kv_cache.seq_len
+        }
+
+        fn rollback_cache_to(
+            &mut self,
+            seq_len: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            self.rollback_speculative_state_to(seq_len)
+        }
+
+        fn verify_tokens(
+            &mut self,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            let out = self.verify_tokens_batched(tokens, start_pos)?;
+            Ok(out.logits)
+        }
+
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let mut snap = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                // SAFETY: GPU buffers are StorageModeShared (allocated with
+                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
+                // `contents()` points to host-readable memory. `length()` is the
+                // exact allocated byte length and is divisible by 4 (we always
+                // allocate f32 buffers). Callers of `snapshot_gdn_states` invoke it
+                // outside any in-flight command buffer (in `mtp_verify_draft` before
+                // `target.verify_tokens`), so no GPU write can race with this read.
+                let conv = unsafe {
+                    let ptr = conv_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, conv_floats).to_vec()
+                };
+                let s = unsafe {
+                    let ptr = s_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, s_floats).to_vec()
+                };
+                snap.push((s, conv));
+            }
+            snap
+        }
+
+        fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            if snapshot.is_empty() {
+                return;
+            }
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            debug_assert_eq!(snapshot.len(), num_layers);
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_bytes = conv_snap.len() * 4;
+                let s_bytes = s_snap.len() * 4;
+                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
+                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
+                // the buffer directly; callers invoke this outside any in-flight command
+                // buffer (rejection branch in `mtp_verify_draft`).
+                unsafe {
+                    let dst = conv_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
+                }
+                unsafe {
+                    let dst = s_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(s_snap.as_ptr(), dst, s_snap.len());
+                }
+                if i < self.session.gdn_states.len() {
+                    self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -14603,9 +14683,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_read_buffer_f16_conversion() {
             // Verify read_buffer_f16 produces correct f32 values
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return, // skip on non-Metal systems
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let test_f32 = vec![1.0f32, -0.5, 0.25, 0.0, 100.0];
@@ -14630,9 +14709,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_gemv_decode_kernel_compiles() {
             // Verify the MSL source compiles and GEMV pipeline is creatable.
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let opts = CompileOptions::new();
@@ -14660,9 +14738,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_gemv_decode_numerical() {
             // Run a small GEMM through both f32 and f16 paths, compare results.
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let opts = CompileOptions::new();
@@ -14722,11 +14799,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 enc.set_bytes(4, 4, &n as *const u32 as *const _);
                 enc.set_bytes(5, 4, &k as *const u32 as *const _);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        (n as u64 + tile - 1) / tile,
-                        (m as u64 + tile - 1) / tile,
-                        1,
-                    ),
+                    MTLSize::new((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1),
                     MTLSize::new(tile, tile, 1),
                 );
                 enc.end_encoding();
@@ -14790,9 +14863,8 @@ kernel void gdn_chunk_norm_silu_c32(
 
         #[test]
         fn test_make_buffer_f16_halves_size() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let data = vec![1.0f32; 1024];
@@ -15154,14 +15226,12 @@ kernel void decode_attention_reference(
         /// Strict parity gate: required matrix {128,512,2048} × {8Q/2KV,16Q/2KV}, tolerance 1e-4.
         #[test]
         fn test_decode_attention_parity_required_matrix() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let pipes = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some(pipes) = build_parity_pipelines(&device) else {
+                return;
             };
 
             for &(num_q_heads, num_kv_heads) in &[(8u32, 2u32), (16u32, 2u32)] {
@@ -15182,14 +15252,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_8q2kv_512() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 512);
@@ -15202,14 +15270,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_8q2kv_4096() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 4096);
@@ -15223,14 +15289,12 @@ kernel void decode_attention_reference(
         #[test]
         #[ignore = "slow: reference kernel ~721ms at cache_len=32768; run with --include-ignored"]
         fn test_decode_attention_parity_8q2kv_32768() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 32768);
@@ -15243,14 +15307,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_16q2kv_512() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 512);
@@ -15263,14 +15325,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_16q2kv_4096() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 4096);
@@ -15284,14 +15344,12 @@ kernel void decode_attention_reference(
         #[test]
         #[ignore = "slow: reference kernel ~723ms at cache_len=32768; run with --include-ignored"]
         fn test_decode_attention_parity_16q2kv_32768() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 32768);
@@ -15308,14 +15366,12 @@ kernel void decode_attention_reference(
         /// so flash output must equal the old reference exactly (same f32 arithmetic).
         #[test]
         fn test_decode_attention_edge_cache_len_1() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             // Use 8Q/2KV; first token is on the direct path (cache_len=1 <= 512)
             let (max_d, mean_d, nans) = parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 1);
@@ -15334,14 +15390,12 @@ kernel void decode_attention_reference(
         /// cache_len=257: crosses the 256-token TILE_TOKENS boundary (direct path).
         #[test]
         fn test_decode_attention_edge_cache_len_257() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 257);
@@ -15355,14 +15409,12 @@ kernel void decode_attention_reference(
         /// cache_len=513: just above DIRECT_THRESHOLD — forces partitioned path.
         #[test]
         fn test_decode_attention_edge_cache_len_513() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 513);
@@ -15376,14 +15428,12 @@ kernel void decode_attention_reference(
         /// cache_len=1025: crosses PARTITION_TOKENS boundary in the partitioned path.
         #[test]
         fn test_decode_attention_edge_cache_len_1025() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 1025);
@@ -15465,9 +15515,8 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_gpu_argmax_parity_k1() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
             let opts = CompileOptions::new();
@@ -15578,7 +15627,7 @@ kernel void decode_attention_reference(
                 },
                 Case {
                     name: "all same values (tie → lowest id = 0)",
-                    logits: vec![3.14f32; 4096],
+                    logits: vec![1.5f32; 4096],
                     expect_gpu_eq_cpu: true,
                 },
                 Case {
@@ -16290,14 +16339,10 @@ kernel void decode_attention_reference(
                 std::env::temp_dir().join(format!("lattice-q4-test-mpe-{}", std::process::id()));
             // The validator runs before any file I/O so an empty / non-
             // existent dir is fine for this regression.
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                1024,
-            ) {
-                Ok(_) => panic!("max_cache_len > max_position_embeddings must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 1024)
+            else {
+                panic!("max_cache_len > max_position_embeddings must error")
             };
             assert!(
                 err.contains("max_cache_len") && err.contains("max_position_embeddings"),
@@ -16313,14 +16358,10 @@ kernel void decode_attention_reference(
             let (cfg, _weights) = tiny_metal_qwen35_fixture();
             let tmp =
                 std::env::temp_dir().join(format!("lattice-q4-test-zero-{}", std::process::id()));
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                0,
-            ) {
-                Ok(_) => panic!("max_cache_len = 0 must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 0)
+            else {
+                panic!("max_cache_len = 0 must error")
             };
             assert!(
                 err.contains("max_cache_len"),
@@ -16357,14 +16398,10 @@ kernel void decode_attention_reference(
             let lm_head_file = tmp.join("lm_head_weight.q4");
             std::fs::write(&lm_head_file, b"placeholder").expect("write lm_head placeholder");
 
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                16,
-            ) {
-                Ok(_) => panic!("tied config with stray lm_head.q4 must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("tied config with stray lm_head.q4 must error")
             };
             assert!(
                 err.contains("lm_head") && err.contains("tie_word_embeddings"),
@@ -16393,14 +16430,10 @@ kernel void decode_attention_reference(
                 std::env::temp_dir().join(format!("lattice-q4-test-untied-{}", std::process::id()));
             std::fs::create_dir_all(&tmp).expect("tempdir create");
             // Empty dir → lm_head.weight.q4 does not exist.
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                16,
-            ) {
-                Ok(_) => panic!("untied config without lm_head artifact must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("untied config without lm_head artifact must error")
             };
             assert!(
                 err.contains("lm_head") && err.contains("tie_word_embeddings"),
@@ -16587,7 +16620,7 @@ kernel void decode_attention_reference(
 
             let cmd = state.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc, &x_buf, 0, &y_buf, 0, 0, "o_proj");
+            state.dispatch_lora_if_active(enc, &x_buf, 0, &y_buf, 0, 0, "o_proj");
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -16632,7 +16665,7 @@ kernel void decode_attention_reference(
             );
             let cmd2 = state.engine.queue.new_command_buffer();
             let enc2 = cmd2.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc2, &x_buf, 0, &y_buf2, 0, 0, "v_proj");
+            state.dispatch_lora_if_active(enc2, &x_buf, 0, &y_buf2, 0, 0, "v_proj");
             enc2.end_encoding();
             cmd2.commit();
             cmd2.wait_until_completed();
@@ -18129,7 +18162,9 @@ kernel void decode_attention_reference(
         fn with_self_spec_env<R>(f: impl FnOnce() -> R) -> R {
             use std::sync::Mutex;
             static ENV_LOCK: Mutex<()> = Mutex::new(());
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: only this serialized closure mutates LATTICE_SELF_SPEC. The lock
             // forbids concurrent test threads from reading or writing it.
             unsafe {
@@ -18153,7 +18188,9 @@ kernel void decode_attention_reference(
         fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
             use std::sync::Mutex;
             static GPU_LOCK: Mutex<()> = Mutex::new(());
-            GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+            GPU_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
@@ -18347,7 +18384,7 @@ kernel void decode_attention_reference(
                 "tiny hybrid fixture must have GDN layers"
             );
 
-            let real_prefill = state.forward_prefill(&vec![0u32]);
+            let real_prefill = state.forward_prefill(&[0u32]);
             // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
             // exact state the self-spec round will see at `pos = kv.seq_len`.
             let snap_pre_round = state.snapshot_gdn_states();
@@ -19453,86 +19490,6 @@ kernel void decode_attention_reference(
                 "RACE-LOCALIZATION: chunked-vs-serial state max_abs_diff = {:.6}",
                 max_diff(&chunked_a, &serial_a)
             );
-        }
-    }
-
-    impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
-        fn cache_position(&self) -> usize {
-            self.session.kv_cache.seq_len
-        }
-
-        fn rollback_cache_to(
-            &mut self,
-            seq_len: usize,
-        ) -> Result<(), crate::error::InferenceError> {
-            self.rollback_speculative_state_to(seq_len)
-        }
-
-        fn verify_tokens(
-            &mut self,
-            tokens: &[u32],
-            start_pos: usize,
-        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
-            let out = self.verify_tokens_batched(tokens, start_pos)?;
-            Ok(out.logits)
-        }
-
-        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            let mut snap = Vec::with_capacity(num_layers);
-            for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_floats = (conv_buf.length() / 4) as usize;
-                let s_floats = (s_buf.length() / 4) as usize;
-                // SAFETY: GPU buffers are StorageModeShared (allocated with
-                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
-                // `contents()` points to host-readable memory. `length()` is the
-                // exact allocated byte length and is divisible by 4 (we always
-                // allocate f32 buffers). Callers of `snapshot_gdn_states` invoke it
-                // outside any in-flight command buffer (in `mtp_verify_draft` before
-                // `target.verify_tokens`), so no GPU write can race with this read.
-                let conv = unsafe {
-                    let ptr = conv_buf.contents() as *const f32;
-                    std::slice::from_raw_parts(ptr, conv_floats).to_vec()
-                };
-                let s = unsafe {
-                    let ptr = s_buf.contents() as *const f32;
-                    std::slice::from_raw_parts(ptr, s_floats).to_vec()
-                };
-                snap.push((s, conv));
-            }
-            snap
-        }
-
-        fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
-            if snapshot.is_empty() {
-                return;
-            }
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            debug_assert_eq!(snapshot.len(), num_layers);
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_bytes = conv_snap.len() * 4;
-                let s_bytes = s_snap.len() * 4;
-                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
-                debug_assert_eq!(s_bytes as u64, s_buf.length());
-                // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
-                // the buffer directly; callers invoke this outside any in-flight command
-                // buffer (rejection branch in `mtp_verify_draft`).
-                unsafe {
-                    let dst = conv_buf.contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
-                }
-                unsafe {
-                    let dst = s_buf.contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(s_snap.as_ptr(), dst, s_snap.len());
-                }
-                if i < self.session.gdn_states.len() {
-                    self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
-                }
-            }
         }
     }
 }

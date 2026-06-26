@@ -75,6 +75,7 @@ fn run() {
         seed: Some(1),
         stop_token_ids: vec![im_end_id],
         enable_thinking: false,
+        ..Default::default()
     };
     let system_msg = ChatMessage::system("You are a helpful assistant. Be concise.");
 

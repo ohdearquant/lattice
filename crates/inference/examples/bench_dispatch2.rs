@@ -63,15 +63,15 @@ fn main() {
     let n: u32 = 2048;
     let k: u32 = 1024;
     let a_buf = device.new_buffer(
-        (m as u64 * k as u64 * 4),
+        m as u64 * k as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
     let b_buf = device.new_buffer(
-        (n as u64 * k as u64 * 4),
+        n as u64 * k as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
     let c_buf = device.new_buffer(
-        (m as u64 * n as u64 * 4),
+        m as u64 * n as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
 

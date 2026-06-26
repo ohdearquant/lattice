@@ -722,12 +722,9 @@ fn bench_full_logit_readback_metal(c: &mut Criterion) {
     {
         use metal::{Device, MTLResourceOptions};
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[topk_readback] No Metal device — skipping Metal readback bench");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_readback] No Metal device — skipping Metal readback bench");
+            return;
         };
 
         let src_data = rand_f32_vec(QWEN35_VOCAB_SIZE, 0xCAFE_BABE);
@@ -776,14 +773,9 @@ fn bench_compact_readback_metal(c: &mut Criterion) {
     {
         use metal::{Device, MTLResourceOptions};
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!(
-                    "[topk_readback] No Metal device — skipping compact Metal readback bench"
-                );
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_readback] No Metal device — skipping compact Metal readback bench");
+            return;
         };
 
         let mut group = c.benchmark_group("compact_readback_metal");
@@ -841,12 +833,9 @@ fn bench_noop_command_buffer(c: &mut Criterion) {
     {
         use metal::Device;
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[topk_readback] No Metal device — skipping noop command buffer bench");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_readback] No Metal device — skipping noop command buffer bench");
+            return;
         };
 
         let queue = device.new_command_queue();
@@ -887,12 +876,9 @@ fn bench_metal_topk_dispatch_only(c: &mut Criterion) {
     {
         use metal::{CompileOptions, Device, MTLResourceOptions};
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[topk_readback] No Metal device — skipping top-k dispatch bench");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_readback] No Metal device — skipping top-k dispatch bench");
+            return;
         };
 
         let opts = CompileOptions::new();
@@ -908,61 +894,37 @@ fn bench_metal_topk_dispatch_only(c: &mut Criterion) {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f))
                 .ok()
         };
-        let argmax_first_pipe = match make_pipe("logits_argmax_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] argmax_first pipeline failed");
-                return;
-            }
+        let Some(argmax_first_pipe) = make_pipe("logits_argmax_first") else {
+            eprintln!("[topk_readback] argmax_first pipeline failed");
+            return;
         };
-        let argmax_merge_pipe = match make_pipe("logits_argmax_merge") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] argmax_merge pipeline failed");
-                return;
-            }
+        let Some(argmax_merge_pipe) = make_pipe("logits_argmax_merge") else {
+            eprintln!("[topk_readback] argmax_merge pipeline failed");
+            return;
         };
-        let fast_first_pipe = match make_pipe("logits_topk_fast_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] topk_fast_first pipeline failed");
-                return;
-            }
+        let Some(fast_first_pipe) = make_pipe("logits_topk_fast_first") else {
+            eprintln!("[topk_readback] topk_fast_first pipeline failed");
+            return;
         };
-        let merge_pass_pipe = match make_pipe("logits_topk_merge_pass") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] topk_merge_pass pipeline failed");
-                return;
-            }
+        let Some(merge_pass_pipe) = make_pipe("logits_topk_merge_pass") else {
+            eprintln!("[topk_readback] topk_merge_pass pipeline failed");
+            return;
         };
-        let sel64_first_pipe = match make_pipe("logits_topk_select64_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] select64_first pipeline failed");
-                return;
-            }
+        let Some(sel64_first_pipe) = make_pipe("logits_topk_select64_first") else {
+            eprintln!("[topk_readback] select64_first pipeline failed");
+            return;
         };
-        let sel64_merge_pipe = match make_pipe("logits_topk_select64_merge") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] select64_merge pipeline failed");
-                return;
-            }
+        let Some(sel64_merge_pipe) = make_pipe("logits_topk_select64_merge") else {
+            eprintln!("[topk_readback] select64_merge pipeline failed");
+            return;
         };
-        let sel50_first_pipe = match make_pipe("logits_topk_select50_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] select50_first pipeline failed");
-                return;
-            }
+        let Some(sel50_first_pipe) = make_pipe("logits_topk_select50_first") else {
+            eprintln!("[topk_readback] select50_first pipeline failed");
+            return;
         };
-        let sel50_merge_pipe = match make_pipe("logits_topk_select50_merge") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_readback] select50_merge pipeline failed");
-                return;
-            }
+        let Some(sel50_merge_pipe) = make_pipe("logits_topk_select50_merge") else {
+            eprintln!("[topk_readback] select50_merge pipeline failed");
+            return;
         };
 
         let queue = device.new_command_queue();
@@ -1306,12 +1268,9 @@ fn bench_metal_topk_plus_readback(c: &mut Criterion) {
     {
         use metal::{CompileOptions, Device, MTLResourceOptions};
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[topk_readback] No Metal device — skipping plus_readback bench");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_readback] No Metal device — skipping plus_readback bench");
+            return;
         };
         let opts = CompileOptions::new();
         let lib = match device.new_library_with_source(TOPK_BENCH_MSL_SRC, &opts) {
@@ -1326,37 +1285,29 @@ fn bench_metal_topk_plus_readback(c: &mut Criterion) {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f))
                 .ok()
         };
-        let argmax_first_pipe = match make_pipe("logits_argmax_first") {
-            Some(p) => p,
-            None => return,
+        let Some(argmax_first_pipe) = make_pipe("logits_argmax_first") else {
+            return;
         };
-        let argmax_merge_pipe = match make_pipe("logits_argmax_merge") {
-            Some(p) => p,
-            None => return,
+        let Some(argmax_merge_pipe) = make_pipe("logits_argmax_merge") else {
+            return;
         };
-        let fast_first_pipe = match make_pipe("logits_topk_fast_first") {
-            Some(p) => p,
-            None => return,
+        let Some(fast_first_pipe) = make_pipe("logits_topk_fast_first") else {
+            return;
         };
-        let merge_pass_pipe = match make_pipe("logits_topk_merge_pass") {
-            Some(p) => p,
-            None => return,
+        let Some(merge_pass_pipe) = make_pipe("logits_topk_merge_pass") else {
+            return;
         };
-        let sel64_first_pipe = match make_pipe("logits_topk_select64_first") {
-            Some(p) => p,
-            None => return,
+        let Some(sel64_first_pipe) = make_pipe("logits_topk_select64_first") else {
+            return;
         };
-        let sel64_merge_pipe = match make_pipe("logits_topk_select64_merge") {
-            Some(p) => p,
-            None => return,
+        let Some(sel64_merge_pipe) = make_pipe("logits_topk_select64_merge") else {
+            return;
         };
-        let sel50_first_pipe = match make_pipe("logits_topk_select50_first") {
-            Some(p) => p,
-            None => return,
+        let Some(sel50_first_pipe) = make_pipe("logits_topk_select50_first") else {
+            return;
         };
-        let sel50_merge_pipe = match make_pipe("logits_topk_select50_merge") {
-            Some(p) => p,
-            None => return,
+        let Some(sel50_merge_pipe) = make_pipe("logits_topk_select50_merge") else {
+            return;
         };
 
         let queue = device.new_command_queue();
@@ -1679,6 +1630,8 @@ fn topk_cpu_oracle(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
 ///
 /// Routes k=1 through argmax kernels, k>1 through fast_first + merge.
 /// Tile size 1024; no padding waste.
+// bench dispatch helper — explicit pipeline-state args are clearer than a wrapper struct
+#[allow(clippy::too_many_arguments)]
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn gpu_topk_dispatch(
     device: &metal::Device,
@@ -1889,12 +1842,9 @@ fn bench_topk_parity(c: &mut Criterion) {
     {
         use metal::{CompileOptions, Device};
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[topk_parity] No Metal device — skipping");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[topk_parity] No Metal device — skipping");
+            return;
         };
         let opts = CompileOptions::new();
         let lib = match device.new_library_with_source(TOPK_BENCH_MSL_SRC, &opts) {
@@ -1909,47 +1859,29 @@ fn bench_topk_parity(c: &mut Criterion) {
                 .and_then(|f| device.new_compute_pipeline_state_with_function(&f))
                 .ok()
         };
-        let argmax_first_pipe = match make_pipe("logits_argmax_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] argmax_first pipeline failed");
-                return;
-            }
+        let Some(argmax_first_pipe) = make_pipe("logits_argmax_first") else {
+            eprintln!("[topk_parity] argmax_first pipeline failed");
+            return;
         };
-        let argmax_merge_pipe = match make_pipe("logits_argmax_merge") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] argmax_merge pipeline failed");
-                return;
-            }
+        let Some(argmax_merge_pipe) = make_pipe("logits_argmax_merge") else {
+            eprintln!("[topk_parity] argmax_merge pipeline failed");
+            return;
         };
-        let fast_first_pipe = match make_pipe("logits_topk_fast_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] topk_fast_first pipeline failed");
-                return;
-            }
+        let Some(fast_first_pipe) = make_pipe("logits_topk_fast_first") else {
+            eprintln!("[topk_parity] topk_fast_first pipeline failed");
+            return;
         };
-        let merge_pipe = match make_pipe("logits_topk_merge_pass") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] merge_pass pipeline failed");
-                return;
-            }
+        let Some(merge_pipe) = make_pipe("logits_topk_merge_pass") else {
+            eprintln!("[topk_parity] merge_pass pipeline failed");
+            return;
         };
-        let sel50_first_pipe = match make_pipe("logits_topk_select50_first") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] select50_first pipeline failed");
-                return;
-            }
+        let Some(sel50_first_pipe) = make_pipe("logits_topk_select50_first") else {
+            eprintln!("[topk_parity] select50_first pipeline failed");
+            return;
         };
-        let sel50_merge_pipe = match make_pipe("logits_topk_select50_merge") {
-            Some(p) => p,
-            None => {
-                eprintln!("[topk_parity] select50_merge pipeline failed");
-                return;
-            }
+        let Some(sel50_merge_pipe) = make_pipe("logits_topk_select50_merge") else {
+            eprintln!("[topk_parity] select50_merge pipeline failed");
+            return;
         };
         let queue = device.new_command_queue();
 

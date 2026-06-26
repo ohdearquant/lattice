@@ -407,12 +407,9 @@ fn bench_reference_decode(c: &mut Criterion) {
 
         const HEAD_DIM: u32 = 256;
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[decode_attn_bench] No Metal device — skipping reference benchmarks");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[decode_attn_bench] No Metal device — skipping reference benchmarks");
+            return;
         };
         let queue = device.new_command_queue();
 
@@ -530,12 +527,9 @@ fn bench_flash_decode(c: &mut Criterion) {
         const PARTITION_TOKENS: u32 = 1024;
         const DIRECT_THRESHOLD: u32 = 512;
 
-        let device = match Device::system_default() {
-            Some(d) => d,
-            None => {
-                eprintln!("[decode_attn_bench] No Metal device — skipping flash benchmarks");
-                return;
-            }
+        let Some(device) = Device::system_default() else {
+            eprintln!("[decode_attn_bench] No Metal device — skipping flash benchmarks");
+            return;
         };
         let queue = device.new_command_queue();
 

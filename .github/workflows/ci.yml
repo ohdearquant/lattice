@@ -98,11 +98,13 @@ jobs:
       # features only, so the entire metal-gpu surface — including the ~18K-line
       # metal_qwen35.rs — was never linted, and 34 clippy errors accumulated
       # invisibly (#240). Lint the Metal surface on macOS so it cannot rot.
-      # f16,metal-gpu is the production decode combo; this also reaches the
-      # chat_metal bin target.
+      # f16,metal-gpu is the production decode combo. --all-targets extends the
+      # gate to examples, benches, and #[cfg(test)] modules — the same surface
+      # where a second wave of lint debt (manual_let_else, approx_constant,
+      # dead bench fields) had silently accumulated past the lib+bins gate.
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
-        run: cargo clippy -p lattice-inference --features f16,metal-gpu -- -D warnings
+        run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings

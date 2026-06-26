@@ -78,10 +78,10 @@ fn run() {
     }
 
     let mean = latencies_ms.iter().sum::<f64>() / n_measure as f64;
-    let min = latencies_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    let min = latencies_ms.iter().copied().fold(f64::INFINITY, f64::min);
     let max = latencies_ms
         .iter()
-        .cloned()
+        .copied()
         .fold(f64::NEG_INFINITY, f64::max);
     let variance = latencies_ms.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n_measure as f64;
     let std_dev = variance.sqrt();

@@ -182,8 +182,7 @@ fn run_bench() {
         };
 
         println!(
-            "{:>10}  {:>8}  {:>10.1}ms  {:>10.1}ms  {:>9.2}x  {:>9.4}",
-            label, seq_len, cpu_ms, metal_ms, speedup, cos_sim
+            "{label:>10}  {seq_len:>8}  {cpu_ms:>10.1}ms  {metal_ms:>10.1}ms  {speedup:>9.2}x  {cos_sim:>9.4}"
         );
     }
 
@@ -203,7 +202,10 @@ fn run_bench() {
         "RESTful API design principles for building robust and maintainable web services".into(),
         "Container orchestration with kubernetes enables automated deployment and scaling".into(),
     ];
-    let batch_refs: Vec<&str> = batch_texts.iter().map(|s| s.as_str()).collect();
+    let batch_refs: Vec<&str> = batch_texts
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
 
     // Batch encode (sequential GPU forwards)
     cpu_model.cache_clear();
