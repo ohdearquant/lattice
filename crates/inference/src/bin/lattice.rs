@@ -232,9 +232,10 @@ mod serve {
     /// OpenAI-compatible chat completions request.
     ///
     /// Known-but-unsupported fields (`stream=true`, `tools`, `tool_choice`,
-    /// `logprobs=true`, `n > 1`, `stop`, `response_format` other than `"text"`)
-    /// are parsed and explicitly rejected with HTTP 400 rather than silently
-    /// dropped.  Unknown fields are ignored by default (serde default).
+    /// `logprobs=true`, `n > 1`, `response_format` other than `"text"`) are
+    /// parsed and explicitly rejected with HTTP 400 rather than silently dropped.
+    /// `stop` is accepted and parsed into string-level stop sequences.
+    /// Unknown fields are ignored by default (serde default).
     #[derive(Deserialize)]
     pub struct ChatCompletionRequest {
         /// Required: must match the served model identifier.
@@ -250,7 +251,8 @@ mod serve {
         pub top_p: Option<f32>,
         /// SSE streaming — not yet supported; rejected with 400.
         pub stream: Option<bool>,
-        /// Stop sequences — not yet supported; rejected with 400.
+        /// Stop sequences — a JSON string or array of strings (up to 4, non-empty).
+        /// Parsed by `parse_stop_strings`; null/absent → empty vec (no stops).
         pub stop: Option<Value>,
         /// Deterministic sampling seed.  Mapped into `GenerateConfig`.
         pub seed: Option<u64>,
@@ -393,6 +395,73 @@ mod serve {
         Ok(top_p)
     }
 
+    /// Parse the OpenAI `stop` field into a `Vec<String>`.
+    ///
+    /// Accepted forms:
+    /// - `null` / absent → empty vec (no string-level stops)
+    /// - a JSON string → `vec![s]`
+    /// - a JSON array of 1–4 non-empty strings → that vec
+    ///
+    /// Returns `Err(BadRequest)` for:
+    /// - an empty array
+    /// - an array with more than 4 elements
+    /// - any array element that is not a string
+    /// - any stop string that is empty
+    fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError> {
+        match stop {
+            None => Ok(vec![]),
+            Some(Value::Null) => Ok(vec![]),
+            Some(Value::String(s)) => {
+                if s.is_empty() {
+                    return Err(ApiError::BadRequest {
+                        message: "stop string must not be empty".to_string(),
+                        code: "invalid_stop",
+                    });
+                }
+                Ok(vec![s.clone()])
+            }
+            Some(Value::Array(arr)) => {
+                if arr.is_empty() {
+                    return Err(ApiError::BadRequest {
+                        message: "stop array must not be empty".to_string(),
+                        code: "invalid_stop",
+                    });
+                }
+                if arr.len() > 4 {
+                    return Err(ApiError::BadRequest {
+                        message: format!("stop array has {} elements; maximum is 4", arr.len()),
+                        code: "invalid_stop",
+                    });
+                }
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    match item {
+                        Value::String(s) => {
+                            if s.is_empty() {
+                                return Err(ApiError::BadRequest {
+                                    message: "stop string must not be empty".to_string(),
+                                    code: "invalid_stop",
+                                });
+                            }
+                            out.push(s.clone());
+                        }
+                        _ => {
+                            return Err(ApiError::BadRequest {
+                                message: "each element of stop must be a string".to_string(),
+                                code: "invalid_stop",
+                            });
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Some(_) => Err(ApiError::BadRequest {
+                message: "stop must be a string or array of strings".to_string(),
+                code: "invalid_stop",
+            }),
+        }
+    }
+
     /// Reject OpenAI fields that are parsed but not yet implemented.
     fn reject_unsupported(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         if req.stream.unwrap_or(false) {
@@ -416,12 +485,6 @@ mod serve {
         if req.n.unwrap_or(1) > 1 {
             return Err(ApiError::BadRequest {
                 message: "n > 1 is not supported".to_string(),
-                code: "unsupported_feature",
-            });
-        }
-        if req.stop.is_some() {
-            return Err(ApiError::BadRequest {
-                message: "stop sequences are not supported by this server".to_string(),
                 code: "unsupported_feature",
             });
         }
@@ -516,6 +579,20 @@ mod serve {
     }
 
     // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Maps a `GenerateOutput` to the OpenAI `finish_reason` string.
+    ///
+    /// Returns `"stop"` when the library explicitly ended generation via a stop
+    /// condition (EOS token, stop-token-id, or stop-string match); `"length"` when
+    /// the token budget was exhausted without a stop condition.
+    pub(super) fn finish_reason_for(
+        output: &lattice_inference::model::qwen35_config::GenerateOutput,
+    ) -> &'static str {
+        if output.stopped { "stop" } else { "length" }
+    }
+
     // Handlers
     // -----------------------------------------------------------------------
 
@@ -602,11 +679,14 @@ mod serve {
             });
         }
 
+        let stop_strings = parse_stop_strings(&req.stop)?;
+
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
             max_new_tokens: max_tokens,
             temperature,
             top_p,
             seed: req.seed,
+            stop_strings,
             ..Default::default()
         };
 
@@ -628,10 +708,9 @@ mod serve {
                 }
             })?;
 
-        // Distinguish "hit token cap" from "natural stop" (EOS / stop token).
-        // `GenerateOutput` does not carry an explicit stop reason, so we infer
-        // it: if the model generated exactly `max_new_tokens` tokens the cap
-        // was reached.  Log and return 500 if the invariant is violated.
+        // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
+        // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
+        // Log and return 500 if the invariant is violated.
         if output.generated_tokens > max_tokens {
             eprintln!(
                 "generation invariant violation: generated_tokens={} max_tokens={}",
@@ -641,11 +720,7 @@ mod serve {
                 message: "inference failed".to_string(),
             });
         }
-        let finish_reason = if output.generated_tokens == max_tokens {
-            "length"
-        } else {
-            "stop"
-        };
+        let finish_reason = finish_reason_for(&output);
 
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -873,18 +948,71 @@ mod serve {
             ));
         }
 
-        // The original test was tautological (max_tokens == max_tokens is always true).
-        // This replacement exercises the actual handler condition:
-        //   finish_reason = if output.generated_tokens == max_tokens { "length" } else { "stop" }
+        // Exercises finish_reason_for via the real helper function used by the handler.
+        // A cap-reached output has stopped=false → "length".
+        // A stop-condition output has stopped=true → "stop".
         #[test]
         fn finish_reason_length_only_at_cap() {
-            let decide = |generated: usize, cap: usize| {
-                if generated == cap { "length" } else { "stop" }
+            use lattice_inference::model::qwen35_config::GenerateOutput;
+            let cap = GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: 10,
+                generated_tokens: 64,
+                stopped: false,
             };
-            assert_eq!(decide(64, 64), "length"); // hit cap
-            assert_eq!(decide(63, 64), "stop"); // natural stop, one token under
-            assert_eq!(decide(0, 64), "stop"); // immediate EOS
-            assert_eq!(decide(1, 1), "length"); // single-token cap
+            assert_eq!(super::finish_reason_for(&cap), "length");
+
+            let natural = GenerateOutput {
+                text: "hello".into(),
+                token_ids: vec![1, 2, 3],
+                prompt_tokens: 10,
+                generated_tokens: 3,
+                stopped: true,
+            };
+            assert_eq!(super::finish_reason_for(&natural), "stop");
+        }
+
+        // M1 regression: a stop-string hit at exactly max_new_tokens must yield "stop",
+        // not "length". The old token-count formula (generated == cap → "length") would
+        // mislabel this case because the stop-completing token is included in generated_ids
+        // before the stop is detected.
+        //
+        // This test calls the real finish_reason_for helper. It is RED when
+        // finish_reason_for reverts to the old `generated_tokens == max_tokens` formula.
+        #[test]
+        fn finish_reason_stop_string_at_cap_is_stop_not_length() {
+            use lattice_inference::model::qwen35_config::GenerateOutput;
+            let max_tokens: usize = 4;
+            // stop-string hit at exactly the token budget:
+            // stopped=true because a stop string matched; generated_tokens==max_tokens
+            // because the matching token is included in generated_ids before truncation.
+            let output = GenerateOutput {
+                text: "hi".into(),
+                token_ids: vec![1, 2, 3, 4],
+                prompt_tokens: 5,
+                generated_tokens: max_tokens,
+                stopped: true,
+            };
+            assert_eq!(
+                super::finish_reason_for(&output),
+                "stop",
+                "stop-string hit at cap must yield finish_reason=stop, not length"
+            );
+        }
+
+        // Natural length cap (no stop condition) must still yield "length".
+        #[test]
+        fn finish_reason_natural_length_cap_is_length() {
+            use lattice_inference::model::qwen35_config::GenerateOutput;
+            let output = GenerateOutput {
+                text: "hi".into(),
+                token_ids: vec![1, 2, 3, 4],
+                prompt_tokens: 5,
+                generated_tokens: 4,
+                stopped: false,
+            };
+            assert_eq!(super::finish_reason_for(&output), "length");
         }
 
         #[test]
@@ -1045,19 +1173,105 @@ mod serve {
         }
 
         #[test]
-        fn reject_unsupported_stop_rejected() {
+        fn reject_unsupported_stop_now_accepted() {
+            // stop is no longer rejected by reject_unsupported; it is parsed separately.
             let req = ChatCompletionRequest {
                 stop: Some(serde_json::json!("</s>")),
                 ..bare_req()
             };
-            let err = reject_unsupported(&req).unwrap_err();
+            assert!(reject_unsupported(&req).is_ok());
+        }
+
+        // -----------------------------------------------------------------------
+        // parse_stop_strings
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn parse_stop_strings_null_gives_empty() {
+            assert_eq!(parse_stop_strings(&None).unwrap(), Vec::<String>::new());
+            assert_eq!(
+                parse_stop_strings(&Some(serde_json::Value::Null)).unwrap(),
+                Vec::<String>::new()
+            );
+        }
+
+        #[test]
+        fn parse_stop_strings_single_string_gives_vec_of_one() {
+            let v = parse_stop_strings(&Some(serde_json::json!("</s>"))).unwrap();
+            assert_eq!(v, vec!["</s>".to_string()]);
+        }
+
+        #[test]
+        fn parse_stop_strings_array_of_two_accepted() {
+            let v = parse_stop_strings(&Some(serde_json::json!(["</s>", "\nUser:"]))).unwrap();
+            assert_eq!(v, vec!["</s>".to_string(), "\nUser:".to_string()]);
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_array_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!([]))).unwrap_err();
             assert!(matches!(
                 err,
                 ApiError::BadRequest {
-                    code: "unsupported_feature",
+                    code: "invalid_stop",
                     ..
                 }
             ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_over_four_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["a", "b", "c", "d", "e"])))
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_with_number_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["ok", 42]))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_string_element_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(["ok", ""]))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_empty_string_scalar_rejected() {
+            let err = parse_stop_strings(&Some(serde_json::json!(""))).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_stop",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn parse_stop_strings_array_exactly_four_accepted() {
+            let v = parse_stop_strings(&Some(serde_json::json!(["a", "b", "c", "d"]))).unwrap();
+            assert_eq!(v.len(), 4);
         }
 
         #[test]

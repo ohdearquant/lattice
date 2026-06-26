@@ -646,6 +646,9 @@ pub struct GenerateConfig {
     /// When set, `mask_logits` is called on CPU logits before sampling on every step.
     /// The Metal path copies logits to CPU before sampling — no additional GPU transfer needed.
     pub grammar: Option<Arc<GrammarEngine>>,
+    /// Additional string-level stop sequences. When any appears in the output, generation
+    /// halts and the matched text is excluded. Empty = disabled (default; parity-safe).
+    pub stop_strings: Vec<String>,
 }
 
 impl std::fmt::Debug for GenerateConfig {
@@ -661,6 +664,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("enable_thinking", &self.enable_thinking)
             .field("enable_mtp", &self.enable_mtp)
             .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
+            .field("stop_strings", &self.stop_strings)
             .finish()
     }
 }
@@ -678,6 +682,7 @@ impl Default for GenerateConfig {
             enable_thinking: true,
             enable_mtp: None,
             grammar: None,
+            stop_strings: vec![],
         }
     }
 }
@@ -693,6 +698,10 @@ pub struct GenerateOutput {
     pub prompt_tokens: usize,
     /// Total tokens generated (excluding prompt).
     pub generated_tokens: usize,
+    /// True when generation ended via a stop condition (EOS, a stop token, or a
+    /// stop string); false when it ended by reaching `max_new_tokens`. Serve maps
+    /// this to the OpenAI `finish_reason` ("stop" vs "length").
+    pub stopped: bool,
 }
 
 /// Compute the layer type pattern: every `interval`-th layer (1-indexed) is full attention.
