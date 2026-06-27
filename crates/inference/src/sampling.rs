@@ -933,9 +933,10 @@ mod tests {
     #[test]
     fn apply_temperature_tiny_positive_temp_stays_greedy() {
         // A finite-but-tiny temperature has a reciprocal that overflows f32. The
-        // t -> 0+ limit must stay greedy (argmax). Without the clamp, `1.0 / 1e-45 ==
-        // +inf` collapses both logits to +inf; the sort then tie-breaks on ascending
-        // token_id and `sample_top_p` returns token 0 instead of the argmax (token 1).
+        // t -> 0+ limit must stay greedy (argmax). Without the degenerate-branch
+        // collapse, `1.0 / 1e-45 == +inf` scales both logits to +inf; the sort then
+        // tie-breaks on ascending token_id and `sample_top_p` returns token 0 instead
+        // of the argmax (token 1).
         let mut cs = CandidateSet::from_full_logits(&[10.0, 11.0]);
         cs.apply_temperature(1e-45);
         // top_p = 1.0 (no nucleus truncation) + r = 0.0 => pure argmax selection.
