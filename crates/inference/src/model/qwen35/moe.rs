@@ -73,6 +73,18 @@ pub(crate) fn compute_router_probs(
         for v in &mut scratch.router_logits[..num_experts] {
             *v /= denom;
         }
+    } else {
+        // Fail closed on a non-finite denom, mirroring generate.rs
+        // compute_attention's `else { scores.fill(0.0) }` guard. The early
+        // `max_logit` check only catches an all-non-finite row; a row with a
+        // FINITE max but a NaN/±inf in another lane keeps `max_logit` finite
+        // (Rust `f32::max` ignores a single NaN), so the NaN propagates through
+        // `exp` into `denom` (NaN) here and `denom > 0.0` is false. Without this
+        // else the routed logits would stay un-normalized (raw `exp` values that
+        // do not sum to 1), mixing experts with wrong weights. Zeroing drops the
+        // routed-expert path (the shared expert still runs) rather than routing
+        // on garbage.
+        scratch.router_logits[..num_experts].fill(0.0);
     }
 }
 
@@ -599,6 +611,67 @@ mod tests {
                 .iter()
                 .all(|(id, _)| *id < num_experts),
             "degenerate router must not leave a usize::MAX sentinel selected"
+        );
+    }
+
+    /// A FINITE-max router row with a single NaN lane (e.g. one corrupt router
+    /// gate weight) keeps `max_logit` finite — Rust `f32::max` ignores the NaN —
+    /// so the early `!max_logit.is_finite()` guard does NOT fire. The NaN then
+    /// propagates through `exp` into `denom` (NaN), `denom > 0.0` is false, and
+    /// without the `else` branch the router would leave un-normalized raw `exp`
+    /// values (here `[NaN, 1, 1, 1]`) and route over the finite experts with
+    /// wrong weights. The denom-else must fail closed by zeroing the row.
+    #[test]
+    fn test_moe_router_finite_max_nan_tail_fails_closed() {
+        use crate::model::qwen35::weights::{
+            MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert,
+        };
+        let num_experts = 4usize;
+        let hidden = 4usize;
+        let inter = 2usize;
+        let top_k = 2usize;
+
+        // Gate rows: expert e selects input[e]. A single corrupt weight
+        // (gate[0][0] = NaN) makes ONLY expert 0's logit NaN; experts 1..3 stay
+        // finite, so max_logit = 1.0 (finite) and the early guard is bypassed.
+        let mut gate = vec![0.0f32; num_experts * hidden];
+        for e in 0..num_experts {
+            gate[e * hidden + e] = 1.0;
+        }
+        gate[0] = f32::NAN;
+        let router = MoeRouter::new(gate, num_experts, top_k, hidden).unwrap();
+        let gate_up = vec![0.0f32; num_experts * 2 * inter * hidden];
+        let down = vec![0.0f32; num_experts * hidden * inter];
+        let experts = RoutedExperts::new(gate_up, down, num_experts, hidden, inter).unwrap();
+        let shared = SharedExpert::new(
+            vec![0.0f32; inter * hidden],
+            vec![0.0f32; inter * hidden],
+            vec![0.0f32; hidden * inter],
+            vec![0.0f32; hidden],
+            hidden,
+            inter,
+        )
+        .unwrap();
+        let moe = MoeLayerWeights {
+            router,
+            experts,
+            shared_expert: shared,
+        };
+        let mut scratch = make_scratch(num_experts, top_k, hidden);
+        for v in scratch.input_tmp[..hidden].iter_mut() {
+            *v = 1.0;
+        }
+
+        compute_router_probs(&moe, &mut scratch, hidden, num_experts);
+
+        // Fail closed: the whole router row must be zeroed, not a mix of NaN and
+        // un-normalized 1.0 probabilities.
+        assert!(
+            scratch.router_logits[..num_experts]
+                .iter()
+                .all(|p| *p == 0.0),
+            "finite-max NaN-tail router row must fail closed to all-zero, got {:?}",
+            &scratch.router_logits[..num_experts]
         );
     }
 
