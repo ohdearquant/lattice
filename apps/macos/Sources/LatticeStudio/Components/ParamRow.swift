@@ -53,20 +53,39 @@ struct ParamRowField: View {
     @Binding var text: String
     var placeholder: String = ""
 
+    @FocusState private var focused: Bool
+
     var body: some View {
         HStack {
             Text(label)
                 .instrumentLabel()
             Spacer()
+            // Recessed input well: a fill + border distinguish an editable field from a
+            // read-only readout (which is a bare Text on the same hairline row). The border
+            // brightens to the signal accent on focus so the edit target is unmistakable.
             TextField(placeholder, text: $text)
                 .font(Theme.Fonts.readout)
                 .foregroundStyle(Theme.Palette.ink)
                 .monospacedDigit()
                 .multilineTextAlignment(.trailing)
-                .frame(maxWidth: 240)
                 .textFieldStyle(.plain)
+                .focused($focused)
+                .frame(maxWidth: 200)
+                .padding(.horizontal, Theme.Space.sm)
+                .padding(.vertical, Theme.Space.xs)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                        .fill(Theme.Palette.wellSink)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                        .strokeBorder(
+                            focused ? Theme.Palette.signal : Theme.Palette.hairline,
+                            lineWidth: focused ? 1.5 : 1
+                        )
+                )
         }
-        .frame(height: Theme.Space.rowHeight)
+        .frame(height: Theme.Space.rowHeightComfortable)
         .padding(.horizontal, Theme.Space.lg)
         .overlay(alignment: .bottom) {
             Theme.Palette.hairline.frame(height: 1)
