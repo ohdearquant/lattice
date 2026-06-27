@@ -1002,6 +1002,14 @@ fn compute_attention(
                 for s in scores.iter_mut() {
                     *s *= inv;
                 }
+            } else {
+                // Fail closed, mirroring the q_seq_len==1 online fast path (l > 0.0
+                // guard above). A non-finite score (e.g. a NaN Q/K activation) makes
+                // `sum` NaN; `NaN > 0.0` is false, so without this branch the
+                // unnormalized NaN weights would flow into the V accumulation and
+                // poison the attention output. Zeroing the row drops this query's
+                // contribution instead of propagating garbage into the logits.
+                scores.fill(0.0);
             }
 
             // Weighted sum of V
@@ -1162,6 +1170,40 @@ mod tests {
         assert!((output[0] - 1.0).abs() < 1e-3, "output[0] = {}", output[0]);
         assert!((output[1] - 0.0).abs() < 1e-3, "output[1] = {}", output[1]);
         // Query 1 (pos=1) attends to both keys → weighted average
+    }
+
+    #[test]
+    fn test_compute_attention_prefill_nan_score_fails_closed() {
+        // Generic prefill path (q_seq_len > 1) must fail closed on a non-finite
+        // score row, mirroring the q_seq_len==1 online fast path. A NaN Q
+        // activation makes the softmax `sum` NaN; without the else-branch guard
+        // the unnormalized NaN weights would poison the attention output.
+        let cfg = GqaConfig {
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+        };
+        let q = vec![f32::NAN, 0.0]; // query 0 is NaN
+        let k = vec![1.0f32, 1.0];
+        let v = vec![7.0f32, 11.0];
+        let mut output = vec![0.0f32; 2];
+        let mut scores = vec![0.0f32; 2];
+
+        compute_attention(&mut output, &q, &k, &v, 2, 2, 0, &cfg, &mut scores, 2);
+
+        // Query 0's row is non-finite → output must be zeroed, not NaN/inf.
+        assert!(
+            output[0].is_finite(),
+            "prefill attention must fail closed on NaN score, got {}",
+            output[0]
+        );
+        assert_eq!(output[0], 0.0, "failed-closed row must be zeroed");
+        // Query 1 has a finite score and must still produce a finite result.
+        assert!(
+            output[1].is_finite(),
+            "finite query must be unaffected, got {}",
+            output[1]
+        );
     }
 
     /// Reference implementation of compute_attention that never takes the fast path.
