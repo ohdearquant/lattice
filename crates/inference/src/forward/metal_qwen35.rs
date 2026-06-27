@@ -1060,10 +1060,10 @@ kernel void gdn_recurrence_fused(
     device const float* conv_out     [[buffer(1)]],   // [qkv_dim]
     device const float* z_proj       [[buffer(2)]],   // [output_dim]
     device const float* hidden_in    [[buffer(3)]],   // [hidden_size]
-    device const half*  in_proj_b    [[buffer(4)]],   // [num_key_heads, hidden_size]
-    device const half*  in_proj_a    [[buffer(5)]],   // [num_key_heads, hidden_size]
-    device const float* a_log        [[buffer(6)]],   // [num_key_heads]
-    device const float* dt_bias      [[buffer(7)]],   // [num_key_heads]
+    device const half*  in_proj_b    [[buffer(4)]],   // [num_value_heads, hidden_size]
+    device const half*  in_proj_a    [[buffer(5)]],   // [num_value_heads, hidden_size]
+    device const float* a_log        [[buffer(6)]],   // [num_value_heads]
+    device const float* dt_bias      [[buffer(7)]],   // [num_value_heads]
     device const float* norm_w       [[buffer(8)]],   // [value_dim]
     device float* output             [[buffer(9)]],   // [output_dim]
     constant GdnRecurParams& p       [[buffer(10)]],
@@ -1084,8 +1084,8 @@ kernel void gdn_recurrence_fused(
     threadgroup float q_tg[128];
     threadgroup float k_tg[128];
 
-    // Beta = sigmoid(hidden @ in_proj_b[k_head]^T)
-    device const half* wb = in_proj_b + k_head * hd;
+    // Beta = sigmoid(hidden @ in_proj_b[h]^T)
+    device const half* wb = in_proj_b + h * hd;
     float bp = 0.0f;
     for (uint i = tid; i < hd; i += 128) bp += float(wb[i]) * hidden_in[i];
     bp = simd_sum(bp);
@@ -1096,7 +1096,7 @@ kernel void gdn_recurrence_fused(
     float beta_val = sg_buf[0];
 
     // Alpha
-    device const half* wa = in_proj_a + k_head * hd;
+    device const half* wa = in_proj_a + h * hd;
     float ap = 0.0f;
     for (uint i = tid; i < hd; i += 128) ap += float(wa[i]) * hidden_in[i];
     ap = simd_sum(ap);
@@ -1130,8 +1130,8 @@ kernel void gdn_recurrence_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate
-    float a = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
+    float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
     float g = exp(-a * sp);
 
     // k[:] @ q[:] — shared dot product, same for all value rows in this head
@@ -1220,8 +1220,8 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup float q_tg[128];
     threadgroup float k_tg[128];
 
-    // Beta = sigmoid(hidden @ in_proj_b[k_head])
-    device const half* wb = in_proj_b + k_head * hd;
+    // Beta = sigmoid(hidden @ in_proj_b[h])
+    device const half* wb = in_proj_b + h * hd;
     float bp = 0.0f;
     for (uint i = tid; i < hd; i += 128) bp += float(wb[i]) * hidden_in[i];
     bp = simd_sum(bp);
@@ -1231,8 +1231,8 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float beta_val = sg_buf[0];
 
-    // Alpha = hidden @ in_proj_a[k_head]
-    device const half* wa = in_proj_a + k_head * hd;
+    // Alpha = hidden @ in_proj_a[h]
+    device const half* wa = in_proj_a + h * hd;
     float ap = 0.0f;
     for (uint i = tid; i < hd; i += 128) ap += float(wa[i]) * hidden_in[i];
     ap = simd_sum(ap);
@@ -1264,8 +1264,8 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate
-    float a = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
+    float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
     float g = exp(-a * sp);
 
     // k dot q (scalar, same for all value rows in this head)
@@ -1313,9 +1313,13 @@ kernel void gdn_recurrence_fused_q36(
 }
 
 // ===== GDN H1+H3: Three-kernel sharded path for Qwen3.6-27B =====
-// H3: gdn_precompute_keys hoists key-head preprocessing (beta, g, q_norm, k_norm, k_dot_q)
-//     that the fused kernel repeated 3x per key head (ratio = 48 vh / 16 kh = 3).
-//     Scratch layout per key head: [q_norm(0..128) | k_norm(128..256) | beta | g | k_dot_q]
+// H3: gdn_precompute_keys dispatches per VALUE head (num_value_heads TGs × 128 threads).
+//     Scratch uses a split layout (floats):
+//       Key section:   key_stride = 2*kd+1; key_base(kh) = kh * key_stride
+//                      [q_norm(0..kd) | k_norm(kd..2kd) | k_dot_q]  — one row per key head
+//       Value section: value_base = num_key_heads * key_stride; stride = 2
+//                      [beta | g]  — one slot per value head
+//       Total size: num_key_heads * (2*kd+1) + num_value_heads * 2
 // H1: gdn_recurrence_sharded expands from 48 TG/layer to 1536 TG/layer (32x48).
 //     Each TG owns 4 S-rows x 32 key lanes; simd_sum reduces kv/old_q within a row.
 // gdn_norm_silu: RMSNorm + SiLU gate on raw_out, writes result to gdn_qkvz for output proj.
@@ -1323,13 +1327,13 @@ kernel void gdn_recurrence_fused_q36(
 kernel void gdn_precompute_keys(
     device const float* conv_out     [[buffer(0)]],
     device const float* hidden_in    [[buffer(1)]],
-    device const half*  in_proj_b    [[buffer(2)]],
-    device const half*  in_proj_a    [[buffer(3)]],
-    device const float* a_log        [[buffer(4)]],
-    device const float* dt_bias      [[buffer(5)]],
+    device const half*  in_proj_b    [[buffer(2)]],  // [num_value_heads, hidden_size]
+    device const half*  in_proj_a    [[buffer(3)]],  // [num_value_heads, hidden_size]
+    device const float* a_log        [[buffer(4)]],  // [num_value_heads]
+    device const float* dt_bias      [[buffer(5)]],  // [num_value_heads]
     device float* key_scratch        [[buffer(6)]],
     constant GdnRecurParams& p       [[buffer(7)]],
-    uint k_head    [[threadgroup_position_in_grid]],
+    uint h         [[threadgroup_position_in_grid]],
     uint tid       [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint sgitg     [[simdgroup_index_in_threadgroup]])
@@ -1337,9 +1341,14 @@ kernel void gdn_precompute_keys(
     constexpr uint kd = 128;
     constexpr uint hd = 5120;
 
+    if (h >= p.num_value_heads) return;
+    uint ratio  = p.num_value_heads / p.num_key_heads;
+    uint k_head = h / ratio;
+
     threadgroup float sg_buf[4];
 
-    device const half* wb = in_proj_b + k_head * hd;
+    // Beta = sigmoid(hidden @ in_proj_b[h])  — per VALUE head
+    device const half* wb = in_proj_b + h * hd;
     float bp = 0.0f;
     for (uint i = tid; i < hd; i += kd) bp += float(wb[i]) * hidden_in[i];
     bp = simd_sum(bp);
@@ -1349,7 +1358,8 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float beta_val = sg_buf[0];
 
-    device const half* wa = in_proj_a + k_head * hd;
+    // Alpha = hidden @ in_proj_a[h]  — per VALUE head
+    device const half* wa = in_proj_a + h * hd;
     float ap = 0.0f;
     for (uint i = tid; i < hd; i += kd) ap += float(wa[i]) * hidden_in[i];
     ap = simd_sum(ap);
@@ -1359,6 +1369,7 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float alpha_val = sg_buf[0];
 
+    // Q/K stay per KEY head (repeat_interleave: k_head = h / ratio)
     float q_val = conv_out[k_head * kd + tid];
     float q_sq  = simd_sum(q_val * q_val);
     if (simd_lane == 0) sg_buf[sgitg] = q_sq;
@@ -1377,8 +1388,9 @@ kernel void gdn_precompute_keys(
     float ks_inv      = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
     float k_norm_val  = k_val * ks_inv;
 
-    float a  = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
-    float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
+    // Decay gate — per VALUE head
+    float a  = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = log(1.0f + exp(alpha_val + dt_bias[h]));
     float g  = exp(-a * sp);
 
     float kq_part = k_norm_val * q_norm_val;
@@ -1389,13 +1401,26 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_dot_q = sg_buf[0];
 
-    device float* ks_out = key_scratch + k_head * (2 * kd + 3);
-    ks_out[tid]      = q_norm_val;
-    ks_out[kd + tid] = k_norm_val;
+    // Split scratch layout:
+    //   Key section:   key_stride = 2*kd+1; one row per key head → [q_norm | k_norm | k_dot_q]
+    //   Value section: value_base = num_key_heads * key_stride; one slot per value head → [beta | g]
+    constexpr uint key_stride = 2 * kd + 1;
+    uint value_base = p.num_key_heads * key_stride;
+
+    // Write beta/g for every value head (each TG writes its own slot — no conflict)
+    device float* vs = key_scratch + value_base + h * 2;
     if (tid == 0) {
-        ks_out[2 * kd]     = beta_val;
-        ks_out[2 * kd + 1] = g;
-        ks_out[2 * kd + 2] = k_dot_q;
+        vs[0] = beta_val;
+        vs[1] = g;
+    }
+
+    // Write q_norm/k_norm/k_dot_q only from the unique representative value head for this key head.
+    // For each kh, only h = kh * ratio satisfies (h % ratio == 0) — no two TGs write the same row.
+    if ((h % ratio) == 0) {
+        device float* ks_out = key_scratch + k_head * key_stride;
+        ks_out[tid]      = q_norm_val;
+        ks_out[kd + tid] = k_norm_val;
+        if (tid == 0) ks_out[2 * kd] = k_dot_q;
     }
 }
 
@@ -1422,7 +1447,14 @@ kernel void gdn_recurrence_sharded(
 
     uint k_head = h / (p.num_value_heads / p.num_key_heads);
     device float*       sr = S_all       + h * vd * kd + row * kd;
-    device const float* ks = key_scratch + k_head * (2 * kd + 3);
+
+    // Split scratch layout (mirrors gdn_precompute_keys):
+    //   Key section:   key_stride = 2*kd+1; ks[0..kd)=q_norm, ks[kd..2kd)=k_norm, ks[2*kd]=k_dot_q
+    //   Value section: value_base = num_key_heads * key_stride; vs[0]=beta, vs[1]=g
+    constexpr uint key_stride = 2 * kd + 1;
+    uint value_base = p.num_key_heads * key_stride;
+    device const float* ks = key_scratch + k_head * key_stride;
+    device const float* vs = key_scratch + value_base + h * 2;
 
     float kv    = 0.0f;
     float old_q = 0.0f;
@@ -1442,9 +1474,9 @@ kernel void gdn_recurrence_sharded(
     kv    = simd_sum(kv);
     old_q = simd_sum(old_q);
 
-    float beta    = ks[2 * kd];
-    float g       = ks[2 * kd + 1];
-    float k_dot_q = ks[2 * kd + 2];
+    float beta    = vs[0];
+    float g       = vs[1];
+    float k_dot_q = ks[2 * kd];
     float v       = conv_out[p.v_offset + h * vd + row];
     float delta   = (v - g * kv) * beta;
 
@@ -2655,16 +2687,16 @@ struct GdnChunkParams {
 // Kernel 1: Conv1d+SiLU, Q/K L2-norm, beta, log_alpha, V for each (chunk, value_head).
 // Grid: (num_chunks, num_value_heads, 1). Threads: (32, 4, 1) = 128 per TG.
 // Each thread `tid` handles dim `tid` of Q, K, V (tid in [0,127]).
-// kh = h for 0.8B (num_value_heads == num_key_heads, ratio=1).
+// kh = h / ratio for Q/K channel offsets; decay params (beta, a_log, dt_bias, in_proj_b/a) indexed by h.
 kernel void gdn_chunk_materialize_c32(
     device float*       conv_buf    [[buffer(0)]],  // [qkv_dim, buf_len] rolling shift register
     device const float* gdn_qkv     [[buffer(1)]],  // [n_tokens, qkv_dim]
     device const float* conv_weight [[buffer(2)]],  // [qkv_dim, kernel_size]
     device const float* hidden_in   [[buffer(3)]],  // [n_tokens, hidden_size]
-    device const half*  in_proj_b   [[buffer(4)]],  // [num_key_heads, hidden_size]
-    device const half*  in_proj_a   [[buffer(5)]],  // [num_key_heads, hidden_size]
-    device const float* a_log       [[buffer(6)]],  // [num_key_heads]
-    device const float* dt_bias     [[buffer(7)]],  // [num_key_heads]
+    device const half*  in_proj_b   [[buffer(4)]],  // [num_value_heads, hidden_size]
+    device const half*  in_proj_a   [[buffer(5)]],  // [num_value_heads, hidden_size]
+    device const float* a_log       [[buffer(6)]],  // [num_value_heads]
+    device const float* dt_bias     [[buffer(7)]],  // [num_value_heads]
     device float*       out_q       [[buffer(8)]],  // [num_chunks, num_value_heads, C, key_dim]
     device float*       out_k       [[buffer(9)]],  // [num_chunks, num_value_heads, C, key_dim]
     device float*       out_v       [[buffer(10)]], // [num_chunks, num_value_heads, C, value_dim]
@@ -2686,7 +2718,8 @@ kernel void gdn_chunk_materialize_c32(
     constexpr uint ks      = 4u;
     constexpr uint buf_len = ks - 1u;  // 3
 
-    uint kh         = h;  // ratio=1 for 0.8B
+    uint ratio      = p.num_value_heads / p.num_key_heads;
+    uint kh         = h / ratio;  // Q/K use key-head index; decay params use h
     uint chunk_base = chunk_idx * p.chunk_size;
     uint ci         = min(p.chunk_size, p.n_tokens - chunk_base);
     uint chunk_head = chunk_idx * p.num_value_heads + h;
@@ -2762,9 +2795,9 @@ kernel void gdn_chunk_materialize_c32(
         out_k[head_row * kd + tid] = k_silu * ks_inv;
         out_v[head_row * vd + tid] = v_silu;
 
-        // Beta = sigmoid(hidden[j] @ in_proj_b[kh])
+        // Beta = sigmoid(hidden[j] @ in_proj_b[h])  — per value head
         {
-            device const half*  wb = in_proj_b + kh * hd;
+            device const half*  wb = in_proj_b + h * hd;
             device const float* hr = hidden_in + global_row * hd;
             float bp = 0.0f;
             for (uint i = tid; i < hd; i += 128u) bp += float(wb[i]) * hr[i];
@@ -2779,9 +2812,9 @@ kernel void gdn_chunk_materialize_c32(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // Log-alpha = -exp(a_log[kh]) * softplus(hidden[j] @ in_proj_a[kh] + dt_bias[kh])
+        // Log-alpha = -exp(a_log[h]) * softplus(hidden[j] @ in_proj_a[h] + dt_bias[h])  — per value head
         {
-            device const half*  wa = in_proj_a + kh * hd;
+            device const half*  wa = in_proj_a + h * hd;
             device const float* hr = hidden_in + global_row * hd;
             float ap = 0.0f;
             for (uint i = tid; i < hd; i += 128u) ap += float(wa[i]) * hr[i];
@@ -2791,8 +2824,8 @@ kernel void gdn_chunk_materialize_c32(
             if (tid == 0) {
                 float s = 0.0f;
                 for (uint si = 0u; si < 4u; si++) s += sg_buf[si];
-                float a  = exp(a_log[kh]);
-                float sp = log(1.0f + exp(s + dt_bias[kh]));
+                float a  = exp(a_log[h]);
+                float sp = log(1.0f + exp(s + dt_bias[h]));
                 // Floor the per-token log-decay so the chunked cumulative-log scan stays
                 // closed under saturated decay.  An overflowing softplus drives -a*sp to
                 // -inf; the prefix-log differences in gdn_chunk_solve_c32 then form
@@ -3901,7 +3934,7 @@ kernel void gdn_chunk_norm_silu_c32(
         gdn_qkv: Buffer,         // [qkv_dim]  — used by batch/prefill and CPU paths
         gdn_z: Buffer,           // [output_dim] — used by batch/prefill and CPU paths
         gdn_qkvz: Buffer,        // [qkv_dim+output_dim] — decode-only fused projection scratch
-        gdn_key_scratch: Buffer, // [num_key_heads * (2*key_dim+3)] — H3 precomputed key-head values
+        gdn_key_scratch: Buffer, // [num_key_heads*(2*key_dim+1) + num_value_heads*2] — H3 split key/value scratch
         gdn_raw_out: Buffer,     // [output_dim] — H1 raw recurrence output before norm+SiLU
         gdn_chunk: GdnChunkScratch, // chunked-scan scratch (default path; serial if LATTICE_GDN_CHUNKED=0)
         logits: Buffer,             // [vocab_size]
@@ -5359,7 +5392,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 gdn_qkvz: make_zero_buffer(device, qkv_dim + output_dim, "act_gdn_qkvz"),
                 gdn_key_scratch: make_zero_buffer(
                     device,
-                    cfg.linear_num_key_heads * (2 * cfg.linear_key_head_dim + 3),
+                    cfg.linear_num_key_heads * (2 * cfg.linear_key_head_dim + 1)
+                        + cfg.linear_num_value_heads() * 2,
                     "act_gdn_key_scratch",
                 ),
                 gdn_raw_out: make_zero_buffer(device, output_dim, "act_gdn_raw_out"),
@@ -9848,42 +9882,42 @@ kernel void gdn_chunk_norm_silu_c32(
             // conv1d_weight, norm_weight: f32 buffers (read directly)
             // SAFETY: Layer parameter buffers are StorageModeShared and sized
             // during initialization from the same model config.
-            let a_log = unsafe { read_buffer(&*w_a_log, num_heads) };
+            let a_log = unsafe { read_buffer(&*w_a_log, value_heads) };
             // SAFETY: Layer parameter buffers are StorageModeShared and sized
             // during initialization from the same model config.
-            let dt_bias = unsafe { read_buffer(&*w_dt_bias, num_heads) };
-            // SAFETY: The f16 projection buffer has num_heads * hidden elements.
-            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, num_heads * hidden) };
-            // SAFETY: The f16 projection buffer has num_heads * hidden elements.
-            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, num_heads * hidden) };
+            let dt_bias = unsafe { read_buffer(&*w_dt_bias, value_heads) };
+            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
+            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, value_heads * hidden) };
+            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
+            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, value_heads * hidden) };
             // SAFETY: Conv1d weights are StorageModeShared and sized qkv_dim * kernel_size.
             let conv1d_weight = unsafe { read_buffer(&*w_conv1d, qkv_dim * kernel_size) };
             // SAFETY: Norm weights are StorageModeShared and sized value_dim.
             let norm_weight = unsafe { read_buffer(&*w_norm, value_dim) };
 
-            // Beta projection (small): [num_heads, hidden] @ hidden -> [num_heads]
-            let mut beta_proj = vec![0.0f32; num_heads];
+            // Beta projection (small): [value_heads, hidden] @ hidden -> [value_heads]
+            let mut beta_proj = vec![0.0f32; value_heads];
             crate::forward::cpu::matmul_bt(
                 &hidden_vec,
                 &in_proj_b,
                 &mut beta_proj,
                 1,
                 hidden,
-                num_heads,
+                value_heads,
             );
             for b in &mut beta_proj {
                 *b = 1.0 / (1.0 + (-*b).exp());
             }
 
-            // Alpha projection (small): [num_heads, hidden] @ hidden -> [num_heads]
-            let mut alpha_proj = vec![0.0f32; num_heads];
+            // Alpha projection (small): [value_heads, hidden] @ hidden -> [value_heads]
+            let mut alpha_proj = vec![0.0f32; value_heads];
             crate::forward::cpu::matmul_bt(
                 &hidden_vec,
                 &in_proj_a,
                 &mut alpha_proj,
                 1,
                 hidden,
-                num_heads,
+                value_heads,
             );
 
             // --- CPU: conv1d + SiLU ---
@@ -9919,8 +9953,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 simd_l2_normalize(&mut q_head);
                 simd_l2_normalize(&mut k_head);
 
-                let a = a_log[kh].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
-                let sp = softplus(alpha_proj[kh] + dt_bias[kh]);
+                let a = a_log[h].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
+                let sp = softplus(alpha_proj[h] + dt_bias[h]);
                 let g = (-a * sp).exp();
 
                 let s_off = h * key_dim * value_dim;
@@ -9929,7 +9963,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 let mut kv_mem = vec![0.0f32; value_dim];
                 simd_matvec_transpose(s, &k_head, &mut kv_mem, key_dim, value_dim);
 
-                let beta_h = beta_proj[kh];
+                let beta_h = beta_proj[h];
                 let mut delta = vec![0.0f32; value_dim];
                 for j in 0..value_dim {
                     delta[j] = (v[j] - kv_mem[j] * g) * beta_h;
@@ -10031,41 +10065,41 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // SAFETY: Layer parameter buffers are StorageModeShared and sized
             // during initialization from the same model config.
-            let a_log_v = unsafe { read_buffer(&*w_a_log, num_heads) };
+            let a_log_v = unsafe { read_buffer(&*w_a_log, value_heads) };
             // SAFETY: Layer parameter buffers are StorageModeShared and sized
             // during initialization from the same model config.
-            let dt_bias_v = unsafe { read_buffer(&*w_dt_bias, num_heads) };
-            // SAFETY: The f16 projection buffer has num_heads * hidden elements.
-            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, num_heads * hidden) };
-            // SAFETY: The f16 projection buffer has num_heads * hidden elements.
-            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, num_heads * hidden) };
+            let dt_bias_v = unsafe { read_buffer(&*w_dt_bias, value_heads) };
+            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
+            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, value_heads * hidden) };
+            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
+            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, value_heads * hidden) };
             // SAFETY: Conv1d weights are StorageModeShared and sized qkv_dim * kernel_size.
             let conv1d_weight = unsafe { read_buffer(&*w_conv1d, qkv_dim * kernel_size) };
             // SAFETY: Norm weights are StorageModeShared and sized value_dim.
             let norm_weight = unsafe { read_buffer(&*w_norm, value_dim) };
 
             // Beta/alpha projections
-            let mut beta_proj = vec![0.0f32; num_heads];
+            let mut beta_proj = vec![0.0f32; value_heads];
             crate::forward::cpu::matmul_bt(
                 &hidden_vec,
                 &in_proj_b,
                 &mut beta_proj,
                 1,
                 hidden,
-                num_heads,
+                value_heads,
             );
             for b in &mut beta_proj {
                 *b = 1.0 / (1.0 + (-*b).exp());
             }
 
-            let mut alpha_proj = vec![0.0f32; num_heads];
+            let mut alpha_proj = vec![0.0f32; value_heads];
             crate::forward::cpu::matmul_bt(
                 &hidden_vec,
                 &in_proj_a,
                 &mut alpha_proj,
                 1,
                 hidden,
-                num_heads,
+                value_heads,
             );
 
             // Conv1d + SiLU
@@ -10100,8 +10134,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 simd_l2_normalize(&mut q_head);
                 simd_l2_normalize(&mut k_head);
 
-                let a = a_log_v[kh].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
-                let sp = softplus(alpha_proj[kh] + dt_bias_v[kh]);
+                let a = a_log_v[h].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
+                let sp = softplus(alpha_proj[h] + dt_bias_v[h]);
                 let g = (-a * sp).exp();
 
                 let s_off = h * key_dim * value_dim;
@@ -10110,7 +10144,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 let mut kv_mem = vec![0.0f32; value_dim];
                 simd_matvec_transpose(s, &k_head, &mut kv_mem, key_dim, value_dim);
 
-                let beta_h = beta_proj[kh];
+                let beta_h = beta_proj[h];
                 let mut delta = vec![0.0f32; value_dim];
                 for j in 0..value_dim {
                     delta[j] = (v[j] - kv_mem[j] * g) * beta_h;
@@ -10617,7 +10651,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     let p_bytes = std::mem::size_of::<GdnRecurParams>() as u64;
                     let p_ptr = &params as *const GdnRecurParams as *const _;
 
-                    // H3: precompute key-head values once — 16 TGs × 128 threads
+                    // H3: precompute per-value-head decay/beta/g + per-key-head Q/K norms — num_vh TGs × 128 threads
                     enc.set_compute_pipeline_state(
                         self.engine.pipelines.gdn_precompute_keys.as_ref().unwrap(),
                     );
@@ -10630,7 +10664,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     enc.set_buffer(6, Some(&self.session.activations.gdn_key_scratch), 0);
                     enc.set_bytes(7, p_bytes, p_ptr);
                     enc.dispatch_thread_groups(
-                        MTLSize::new(num_h as u64, 1, 1),
+                        MTLSize::new(num_vh as u64, 1, 1),
                         MTLSize::new(128, 1, 1),
                     );
 
@@ -14095,7 +14129,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 gdn_qkvz: make_zero_buffer(&device, qkv_dim + output_dim, "act_gdn_qkvz"),
                 gdn_key_scratch: make_zero_buffer(
                     &device,
-                    cfg.linear_num_key_heads * (2 * cfg.linear_key_head_dim + 3),
+                    cfg.linear_num_key_heads * (2 * cfg.linear_key_head_dim + 1)
+                        + cfg.linear_num_value_heads() * 2,
                     "act_gdn_key_scratch",
                 ),
                 gdn_raw_out: make_zero_buffer(&device, output_dim, "act_gdn_raw_out"),
