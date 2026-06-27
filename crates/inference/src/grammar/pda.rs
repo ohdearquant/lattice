@@ -184,17 +184,15 @@ pub enum StepResult {
 /// If no alternative can accept `b`, try other alternatives for the current
 /// frame's rule via backtracking.
 pub fn advance_byte(state: &mut GrammarState, grammar: &CompiledGrammar, b: u8) -> StepResult {
-    // We snapshot the stack on entry; if all alternatives fail, restore it.
-    let snapshot = state.stack.clone();
-
+    // `try_advance_byte` operates on a clone of `state.stack` and only writes it
+    // back on success, so `state.stack` is already left untouched on rejection.
+    // No outer snapshot/restore is needed (would be one redundant clone per byte).
     if try_advance_byte(state, grammar, b) {
         state.partial_token_bytes.push(b);
         // Check for completion after consuming the byte.
         state.complete = is_accepting(state, grammar);
         StepResult::Accepted
     } else {
-        // Restore snapshot — byte was rejected.
-        state.stack = snapshot;
         StepResult::Rejected
     }
 }
@@ -679,6 +677,46 @@ mod tests {
         let mut state = GrammarState::initial();
         advance_byte(&mut state, &g, b'a');
         assert_eq!(advance_byte(&mut state, &g, b'x'), StepResult::Rejected);
+    }
+
+    #[test]
+    fn rejected_byte_leaves_state_intact_and_resumes() {
+        // A rejected byte must not corrupt the matcher: the consumed prefix
+        // stays committed and the correct continuation still completes. This
+        // locks the rollback-on-reject contract that `advance_byte` relies on
+        // (`try_advance_byte` clones the stack and only commits it on success,
+        // so no outer snapshot is needed).
+        //
+        // The grammar must be *nested* so the rejecting byte forces
+        // `try_advance_stack` to truncate a child frame before it fails:
+        //   root  ::= "a" child
+        //   child ::= "bc"
+        // Feeding `a`,`b` descends into `child` (frame pushed, one byte
+        // consumed). The wrong byte at child's second position truncates the
+        // child frame, then exhausts root's alternatives and returns false,
+        // mutating the working stack en route. Only the inner clone keeps
+        // `state.stack` intact so the correct `c` can still complete. A flat
+        // grammar (reject at the root frame returns false without mutating)
+        // never exercises this and would make the test vacuous.
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        let child_id = b.reserve("child");
+        b.set_alts(
+            child_id,
+            vec![vec![Symbol::Terminal(b'b'), Symbol::Terminal(b'c')]],
+        );
+        b.set_alts(
+            root_id,
+            vec![vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(child_id)]],
+        );
+        let g = b.build();
+
+        let mut state = GrammarState::initial();
+        assert_eq!(advance_byte(&mut state, &g, b'a'), StepResult::Accepted);
+        assert_eq!(advance_byte(&mut state, &g, b'b'), StepResult::Accepted);
+        assert_eq!(advance_byte(&mut state, &g, b'x'), StepResult::Rejected);
+        assert_eq!(advance_byte(&mut state, &g, b'c'), StepResult::Accepted);
+        assert!(state.complete);
     }
 
     #[test]
