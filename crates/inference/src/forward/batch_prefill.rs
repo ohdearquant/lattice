@@ -1087,7 +1087,9 @@ fn apply_causal_conv1d_prefill(
 /// Local copy of the private GatedDeltaNet decay gate computation.
 #[inline]
 fn compute_decay_gate_prefill(a_log: f32, alpha: f32, dt_bias: f32) -> f32 {
-    let a = a_log.exp();
+    // Clamp exp(a_log) to finite (mirror gdn.rs compute_decay_gate): a_log>~88 -> +inf,
+    // inf*0 (softplus underflow) = NaN poisons the recurrent state.
+    let a = a_log.exp().min(f32::MAX);
     let sp = softplus_prefill(alpha + dt_bias);
     (-a * sp).exp()
 }

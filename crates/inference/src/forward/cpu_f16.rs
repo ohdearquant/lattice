@@ -141,8 +141,9 @@ pub fn gated_delta_net_step_fused_f16(
         simd_l2_normalize(&mut scratch.q_head[..key_dim]);
         simd_l2_normalize(&mut scratch.k_head[..key_dim]);
 
-        // Decay gate (f32 weights: a_log, dt_bias)
-        let a = weights.a_log[h].exp();
+        // Decay gate (f32 weights: a_log, dt_bias). Clamp exp(a_log) to finite
+        // (mirror gdn.rs compute_decay_gate): a_log>~88 -> +inf, inf*0 = NaN poisons state.
+        let a = weights.a_log[h].exp().min(f32::MAX);
         let sp = softplus(scratch.alpha_proj[h] + weights.dt_bias[h]);
         let g = (-a * sp).exp();
 
