@@ -93,7 +93,7 @@ pub fn gated_delta_net_step_fused_q8(
     debug_assert!(input.len() >= hidden);
     debug_assert!(output.len() >= hidden);
 
-    scratch.ensure_capacity(qkv_dim, output_dim, num_heads, key_dim, value_dim);
+    scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (Q8 weights)
     matmul_bt_q8(
@@ -117,23 +117,23 @@ pub fn gated_delta_net_step_fused_q8(
     matmul_bt_q8(
         input,
         &weights.in_proj_b,
-        &mut scratch.beta_proj[..num_heads],
+        &mut scratch.beta_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     matmul_bt_q8(
         input,
         &weights.in_proj_a,
-        &mut scratch.alpha_proj[..num_heads],
+        &mut scratch.alpha_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     // sigmoid(beta)
-    for b in &mut scratch.beta_proj[..num_heads] {
+    for b in &mut scratch.beta_proj[..value_heads] {
         *b = sigmoid(*b);
     }
 
@@ -171,8 +171,8 @@ pub fn gated_delta_net_step_fused_q8(
         // it overflows to +inf for a_log > ~88, and `inf * softplus(very_negative)=0.0`
         // is NaN that poisons the recurrent state. Mirrors gdn_fused::compute_decay_gate
         // (#314) — the inlined Q8 copy must keep the same clamp.
-        let a = weights.a_log[k_head].exp().min(f32::MAX);
-        let sp = softplus(scratch.alpha_proj[k_head] + weights.dt_bias[k_head]);
+        let a = weights.a_log[h].exp().min(f32::MAX);
+        let sp = softplus(scratch.alpha_proj[h] + weights.dt_bias[h]);
         let g = (-a * sp).exp();
 
         let s_offset = h * key_dim * value_dim;
@@ -188,7 +188,7 @@ pub fn gated_delta_net_step_fused_q8(
         );
 
         // Delta: (v - g * kv_mem) * beta
-        let beta_h = scratch.beta_proj[k_head];
+        let beta_h = scratch.beta_proj[h];
         for ((d, &vj), &mem) in scratch.delta[..value_dim]
             .iter_mut()
             .zip(&v[..value_dim])
