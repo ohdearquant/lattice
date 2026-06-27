@@ -115,7 +115,12 @@ struct ChatScreen: View {
         }
         .inspector(isPresented: $store.inspectorPresented) {
             settingsInspector
-                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                // Fixed width, not a resizable range. The inspector holds greedy full-width
+                // content (status pills with Spacers, the Load button); auto-sizing to that
+                // content within a min/ideal/max range has no single stable width, so the
+                // column oscillated every time layout re-ran (the 1 Hz memory tick re-triggered
+                // it). A fixed column cannot resize itself.
+                .inspectorColumnWidth(320)
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
@@ -255,7 +260,8 @@ struct ChatScreen: View {
                                 .foregroundStyle(canLoad ? Theme.Palette.signal : Theme.Palette.inkDim)
                                 .padding(.vertical, Theme.Space.sm)
                                 .padding(.horizontal, Theme.Space.md)
-                                .frame(maxWidth: .infinity)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                                 .background(
                                     RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
                                         .fill(canLoad ? Theme.Palette.signalGlow : Theme.Palette.wellSink)
@@ -445,7 +451,7 @@ struct ChatScreen: View {
                 Text(turn.prompt)
                     .font(Theme.Fonts.body)
                     .foregroundStyle(Theme.Palette.ink)
-                    .multilineTextAlignment(.trailing)
+                    .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
@@ -501,14 +507,9 @@ struct ChatScreen: View {
                         }
 
                     } else {
-                        // Normal response — ALWAYS ink color. Red is for errors only.
-                        // (Previous code used Theme.Palette.error for failed status regardless
-                        // of whether the text was a real error or a base/adapter reply.)
-                        Text(turn.responseText)
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.ink)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
+                        // Normal response — rendered as Markdown (headings, lists, code, **bold**).
+                        // Red is for errors only; MarkdownText uses ink throughout.
+                        MarkdownText(text: turn.responseText)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
                             .background(assistantBubbleBackground)
