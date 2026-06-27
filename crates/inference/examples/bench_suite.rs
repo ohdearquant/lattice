@@ -376,7 +376,7 @@ fn bench_llm_q8() -> Vec<Metric> {
     let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
 
     let t_quant = Instant::now();
-    let q8_weights = quantize_from_model(&model);
+    let q8_weights = quantize_from_model(&model).expect("Q8 quantization failed");
     let quant_ms = t_quant.elapsed().as_millis() as f64;
 
     // Drop the f32 model to free memory

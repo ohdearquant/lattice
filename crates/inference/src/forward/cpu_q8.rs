@@ -38,7 +38,12 @@ use crate::weights::q8_weights::{
 /// The embedding table and final norm remain f32 (embedding is tied to the LM head,
 /// norms are numerically sensitive). All large projection matrices are quantized
 /// per-row symmetric INT8.
-pub fn quantize_from_model(model: &Qwen35Model) -> Q8ModelWeights {
+///
+/// Returns `Err(InferenceError::UnsupportedModel)` for checkpoints that contain MoE
+/// layers, which Q8 quantization does not support.
+pub fn quantize_from_model(
+    model: &Qwen35Model,
+) -> Result<Q8ModelWeights, crate::error::InferenceError> {
     let cfg = model.config.clone();
     crate::weights::q8_weights::quantize_model_weights(&model.weights, &cfg)
 }
