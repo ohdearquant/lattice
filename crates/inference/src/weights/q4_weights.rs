@@ -714,6 +714,23 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 
     f.read_exact(&mut b8)?;
     let original_len = u64::from_le_bytes(b8) as usize;
+
+    // Fail closed on a header whose shape disagrees with its element count.
+    // The quantize paths enforce `shape.product() == data.len()` via
+    // `assert_shape_matches_data_len`; the loader must reject the same
+    // inconsistency rather than return a tensor whose `shape` overstates the
+    // block payload (downstream matmuls would read stale, out-of-range data).
+    let shape_product = shape
+        .iter()
+        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+        .ok_or("shape dims overflow usize")?;
+    if shape_product != original_len {
+        return Err(format!(
+            "shape product {shape_product} (shape={shape:?}) != original_len {original_len}"
+        )
+        .into());
+    }
+
     let n_blocks = original_len.div_ceil(32);
 
     let raw_len = checked_alloc_bytes(n_blocks, 20, file_len, "block payload")?;
@@ -1598,6 +1615,31 @@ mod tests {
         assert!(
             r.is_err(),
             "2^62 original_len must be rejected, not OOM-aborted"
+        );
+    }
+
+    #[test]
+    fn test_q4_rejects_shape_product_mismatch() {
+        // shape product (4*16=64) disagrees with original_len (32): the header
+        // claims twice as many elements as the block payload covers. The
+        // quantize paths reject this via assert_shape_matches_data_len; the
+        // loader must too, with a clean Err rather than a Q4Tensor whose shape
+        // overstates its data (downstream matmuls would read stale elements).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version
+        buf.extend_from_slice(&2u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&16u64.to_le_bytes()); // shape[1] → product 64
+        buf.extend_from_slice(&32u64.to_le_bytes()); // original_len (≠ 64)
+        buf.extend_from_slice(&[0u8; 20]); // one valid-size block payload
+        let path = std::path::PathBuf::from("/tmp/test_q4_shape_mismatch.q4");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_q4_file(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            r.is_err(),
+            "shape product 64 != original_len 32 must be rejected"
         );
     }
 
