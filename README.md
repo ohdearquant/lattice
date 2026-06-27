@@ -1,33 +1,99 @@
 # Lattice
 
-Pure Rust inference engine for transformer models on Apple Silicon.
+Pure Rust inference engine for transformer models on Apple Silicon, with a native macOS app.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
 [![CI](https://github.com/ohdearquant/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/lattice/actions)
 
 No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full compute graph
-— weight loading, tokenization, forward pass, and vector operations — in Rust, with hand-written
-Metal shaders and SIMD kernels.
-
-![Benchmark: Lattice vs Ollama vs MLX — decode throughput vs context length](docs/bench_results/context_scaling_benchmark.png)
-
-**Lattice is the only inference engine that correctly runs Qwen3.5's hybrid GatedDeltaNet architecture at 4-bit on Apple Silicon** — with QuaRot-Q4 and LoRA hot-swap that neither Ollama nor MLX support. On a fair end-to-end decode measurement it is **1.6–2.0× faster than Ollama/llama.cpp** depending on context length (187 vs 93 tok/s at 64 tokens; 146 vs 88 tok/s at 256 tokens). Apple's MLX (Metal-native, private AMX API) decodes faster than Lattice at raw throughput — Lattice's edge is portability (pure Rust, no Python/framework) plus those Q4 + adapter capabilities. Full table and methodology below.
-
-```bash
-# Reproduce on your hardware (macOS + ollama + uv):
-./scripts/bench_apples_to_apples.sh
-```
-
-Built for inference on CPU and macOS GPU. Optimized for AVX2 (x86), NEON (ARM),
-and Metal (Apple Silicon) — not CUDA. If you need NVIDIA GPU inference, use
-[candle](https://github.com/huggingface/candle) or [mistral.rs](https://github.com/EricLBuehler/mistral.rs).
-Lattice targets the other 90% of deployments: servers, edge, laptops, and library dependencies
-that shouldn't drag in a 300 MB ONNX runtime.
+in Rust: weight loading, tokenization, forward pass, vector operations, quantization, and LoRA
+training. Hand-written Metal shaders accelerate inference on Apple Silicon. SIMD kernels (AVX2
+on x86, NEON on ARM) handle the CPU path.
 
 ---
 
-## Quick Start
+## What is Lattice
+
+Lattice is two things in one repo.
+
+**A Rust inference library.** Five published crates covering embeddings, generation, quantization,
+LoRA fine-tuning, and optimal transport. Use `lattice-embed` as a library dependency, or run
+the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
+
+**Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives the Rust engine
+via CLI subprocesses. Train LoRA adapters with a live loss oscilloscope, quantize models with
+a before/after comparison, hot-swap adapters in chat with zero reload, and manage your model
+library from a single window.
+
+---
+
+## Capabilities
+
+| | |
+|---|---|
+| Pure Rust compute | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA. |
+| Metal GPU backend | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform. |
+| Generation models | Qwen3.5-0.8B / 2B, Qwen3.6-35B-A3B (MoE), Qwen3.6-27B. Hybrid GatedDeltaNet + GQA architecture. |
+| Embedding models | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants. |
+| Three tokenizers | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension. |
+| Quantization | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5. |
+| LoRA | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`. |
+| HTTP API | OpenAI-compatible `/v1/chat/completions` via `lattice serve`. |
+| Safetensors native | Memory-mapped weight loading. Single-file and sharded checkpoints. |
+| KV cache | Incremental decoding with key-value caching. |
+| Speculative decoding | Draft-model acceleration on the CPU path. |
+| Grammar decoding | Constrained output via a pushdown automaton. OpenAI string-level stop sequences. |
+| MRL support | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32). |
+| LRU cache | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats. |
+| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`. |
+| Optimal transport | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`. |
+
+---
+
+## Benchmarks
+
+Measured on Apple M2 Max, Qwen3.5-0.8B, slope method (token throughput excluding prompt prefill
+and model load). Greedy decoding, median of 5 runs.
+
+| Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
+|---------|------------------------|---------------|-------------------|-------------------|
+| 64 tok  | **187 tok/s**          | 93            | 265               | 2.0x              |
+| 128 tok | **171 tok/s**          | 92            | 263               | 1.9x              |
+| 256 tok | **146 tok/s**          | 88            | 260               | 1.6x              |
+
+MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal compute API,
+the same tier as Ollama. MLX decodes faster than Lattice at raw throughput. Lattice's edge is
+portability (pure Rust, zero Python, zero framework) plus capabilities neither Ollama nor MLX
+provide for this model family:
+
+| Capability | Lattice | MLX | Ollama |
+|---|---|---|---|
+| QuaRot 4-bit (rotation-based quant) | yes | no | no |
+| Q4 + LoRA hot-swap (no reload) | yes | no | no |
+| Pure Rust, zero Python or framework | yes | no | no |
+
+PPL parity confirmed: Lattice 20.60, MLX 20.67 on wikitext-2 (2048 tokens). Reproduce:
+`./scripts/bench_context_scaling.sh`
+
+---
+
+## Crates
+
+| Crate | Description | crates.io |
+|-------|-------------|-----------|
+| [`lattice-embed`](crates/embed/) | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed) |
+| [`lattice-inference`](crates/inference/) | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference) |
+| [`lattice-fann`](crates/fann/) | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann) |
+| [`lattice-tune`](crates/tune/) | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune) |
+| [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
+
+The three leaf crates (`inference`, `fann`, `transport`) have zero intra-workspace dependencies
+and can be used standalone.
+
+---
+
+## Quick Start: Embeddings
 
 ```toml
 [dependencies]
@@ -67,142 +133,186 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Model weights are downloaded from HuggingFace on first use and cached at `~/.lattice/models`
 (or `$LATTICE_MODEL_CACHE`).
 
----
+### GPU acceleration (macOS)
 
-## Features
-
-| Feature                    | Description                                                                                                                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Pure Rust compute          | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                                                                                                |
-| Multiple model families    | BERT/BGE encoder (CLS pooling), E5/MiniLM encoder (mean pooling), Qwen3 decoder embedding, Qwen3.5/3.6 generation, CrossEncoder reranker — see [docs/models.md](docs/models.md) |
-| 9 local embedding models   | BGE, mE5, MiniLM, Qwen3-Embedding families — full support matrix: [docs/models.md](docs/models.md)                                                                              |
-| Metal GPU backend          | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.                                                                                      |
-| Three pure Rust tokenizers | WordPiece, SentencePiece, BPE — no Hugging Face tokenizers C extension                                                                                                          |
-| Safetensors native         | Memory-mapped weight loading from HuggingFace `.safetensors` format                                                                                                             |
-| MRL support                | Matryoshka truncation for Qwen3 models (configurable output dimension >= 32)                                                                                                    |
-| LRU embedding cache        | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats                                                                                                        |
-| LoRA adapter injection     | Inference hook, `Qwen35Model::set_lora`, `lattice-tune` PEFT safetensors, Metal single-adapter path — see [docs/models.md §3](docs/models.md#3-inference-features)              |
-| Knowledge distillation     | Train small models from Claude/GPT/Gemini teacher soft labels                                                                                                                   |
-| Optimal transport          | Sinkhorn-Knopp solver (log-domain, epsilon-scaling) for embedding drift detection                                                                                               |
-| Tiny fast networks         | `lattice-fann`: sub-5ms classifiers with pre-allocated buffers, zero-alloc forward pass                                                                                         |
-
----
-
-## Architecture
-
-```
-Application
-    |
-    v
-lattice-embed          (public API — embedding service, SIMD distance ops, LRU cache)
-    |
-    v
-lattice-inference      (transformer kernel — BERT/Qwen3 forward pass, tokenizers, weights)
-    |
-    +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
-          AVX2/NEON kernels   Apple Silicon      Vulkan/DX12
-
-
-lattice-fann           (standalone — tiny network primitives, <5ms CPU inference)
-lattice-transport      (standalone — optimal transport math, Wasserstein distances)
-lattice-tune           (depends on fann + inference — LoRA, distillation, model registry)
+```toml
+lattice-embed = { version = "0.4", features = ["metal-gpu"] }
 ```
 
-The three leaf crates (`inference`, `fann`, `transport`) have zero intra-workspace dependencies
-and can be used standalone.
+### Cross-platform GPU
+
+```toml
+lattice-embed = { version = "0.4", features = ["wgpu-gpu"] }
+```
 
 ---
 
-## Crates
+## Quick Start: CLI
 
-| Crate                                    | Description                                                                                                                                                                    | LOC     |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| [`lattice-embed`](crates/embed/)         | Embedding service — `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill, migration                               | ~12 k   |
-| [`lattice-inference`](crates/inference/) | Transformer kernel — safetensors loading, BERT/BGE/Qwen3 forward pass, WordPiece/SentencePiece/BPE tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding | ~104 k  |
-| [`lattice-fann`](crates/fann/)           | Fast neural network primitives — `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer, FANN binary format                                         | ~6.5 k  |
-| [`lattice-tune`](crates/tune/)           | Training infrastructure — knowledge distillation pipeline, dataset management, LoRA adapter management, model registry with semver lineage                                     | ~15.6 k |
-| [`lattice-transport`](crates/transport/) | Optimal transport math — Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection, log-domain throughout                                     | ~5.4 k  |
+Build from source (requires Rust 1.80+ and, for Metal, macOS 14+):
+
+```bash
+git clone https://github.com/ohdearquant/lattice
+cd lattice
+
+# CLI binary (chat + serve)
+cargo build --release -p lattice-inference --bin lattice
+
+# Interactive chat
+./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
+
+# OpenAI-compatible HTTP server
+./target/release/lattice serve --model ~/.lattice/models/qwen3.5-0.8b --port 8080
+```
+
+With Metal GPU (macOS only):
+
+```bash
+cargo build --release -p lattice-inference --bin lattice --features metal-gpu,f16
+```
+
+### HTTP API
+
+`lattice serve` exposes an OpenAI-compatible endpoint:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-0.8b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 128,
+    "temperature": 0.7
+  }'
+```
+
+---
+
+## Lattice Studio (macOS App)
+
+Lattice Studio is a native SwiftUI app for macOS 14+. It wraps the Rust engine in an
+instrument-panel interface: live loss curves, before/after quantization comparisons,
+LoRA hot-swap in chat, and a model library manager.
+
+### Build and package
+
+```bash
+# Requires: Xcode (Swift 6.3+), Rust toolchain
+./apps/macos/scripts/package-app.sh
+```
+
+This builds the Swift frontend, compiles all Rust engine binaries in release mode, and
+assembles a self-contained `LatticeStudio.app` bundle at `apps/macos/dist/`. A `.dmg`
+and `.zip` are also produced. The packaged app needs no Rust toolchain on the recipient
+machine.
+
+```bash
+# Skip Swift rebuild (use existing build output)
+./apps/macos/scripts/package-app.sh --skip-build
+
+# Skip Cargo rebuild
+./apps/macos/scripts/package-app.sh --skip-cargo
+```
+
+### Install
+
+Drag `LatticeStudio.app` from the `.dmg` to `/Applications`.
+
+The app is ad-hoc signed. On first launch, right-click and choose "Open" to bypass
+Gatekeeper, then click "Open" in the dialog. macOS remembers the exception for subsequent
+launches. Alternatively:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/LatticeStudio.app
+```
+
+### What is in Lattice Studio
+
+**Models (cmd-1).** A table of all local models and adapters under `~/.lattice/models`, with
+file manifests, config details (18 GatedDeltaNet + 6 GQA layers called out explicitly), and
+Download/Verify/Reveal in Finder actions.
+
+**Train (cmd-2).** LoRA fine-tuning with a live loss oscilloscope. A 56-point hero loss numeral
+ticks digit-by-digit as the run progresses. Scrub the loss curve to freeze all metric readouts
+(lr, grad-norm, tok/s, ETA) to any step. Results stream as line-delimited JSON from the engine.
+
+**Quantize (cmd-3).** Q4 or QuaRot quantization. A side-by-side comparison shows size,
+bits, and estimated PPL before and after. True-scale bars animate to show the compression
+ratio. A gate pill states the result: PASS, WARN, or FAIL.
+
+**Chat (cmd-4).** Side-by-side base vs. base+adapter columns streaming the same prompt in
+parallel. The adapter selector is a console fader: slide it and the engine swaps the adapter
+with no reload. A "0 ms reload" stamp confirms it. Each column shows live tok/s and time-to-first-token.
+
+**Data (cmd-5).** Paste raw text or load files. Preview the derived `{prompt, completion}` pairs
+as a JSONL table, validate token counts (using the same tokenizer the engine uses), and export
+straight into the Train dataset field.
+
+**Runs (cmd-6).** Archive of every training and quantization run. Select a row to reopen its
+exact config and view the frozen loss curve.
+
+The command bar (cmd-K) runs everything from a single keyboard shortcut:
+`train qwen3.5 r8` or `quantize quarot` parse into argument chips and fire a run.
 
 ---
 
 ## Supported Models
 
-For the full support matrix — all embedding and generation models, attention variants, inference
-features, and tokenizer details — see **[docs/models.md](docs/models.md)**.
+### Embedding models
 
-Quick reference for the local embedding models available through `EmbeddingModel`:
+| Variant | HuggingFace ID | Dims | Max tokens | Auto-download |
+|---------|---------------|------|-----------|---------------|
+| `BgeSmallEnV15` | `BAAI/bge-small-en-v1.5` | 384 | 512 | yes |
+| `BgeBaseEnV15` | `BAAI/bge-base-en-v1.5` | 768 | 512 | yes |
+| `BgeLargeEnV15` | `BAAI/bge-large-en-v1.5` | 1024 | 512 | yes |
+| `MultilingualE5Small` | `intfloat/multilingual-e5-small` | 384 | 512 | yes |
+| `MultilingualE5Base` | `intfloat/multilingual-e5-base` | 768 | 512 | yes |
+| `AllMiniLmL6V2` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | 256 | yes |
+| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | 128 | yes |
+| `Qwen3Embedding0_6B` | `Qwen/Qwen3-Embedding-0.6B` | 1024 | 8192 | local dir only |
+| `Qwen3Embedding4B` | `Qwen/Qwen3-Embedding-4B` | 2560* | 8192 | local dir only |
 
-| Variant                             | HuggingFace ID                                                | Dims  | Max tokens | Auto-download  |
-| ----------------------------------- | ------------------------------------------------------------- | :---: | :--------: | :------------: |
-| `BgeSmallEnV15`                     | `BAAI/bge-small-en-v1.5`                                      |  384  |    512     |       ✓        |
-| `BgeBaseEnV15`                      | `BAAI/bge-base-en-v1.5`                                       |  768  |    512     |       ✓        |
-| `BgeLargeEnV15`                     | `BAAI/bge-large-en-v1.5`                                      | 1024  |    512     |       ✓        |
-| `MultilingualE5Small`               | `intfloat/multilingual-e5-small`                              |  384  |    512     |       ✓        |
-| `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               |  768  |    512     |       ✓        |
-| `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      |  384  |    256     |       ✓        |
-| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |  384  |    128     |       ✓        |
-| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  |    8192    | local dir only |
-| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560† |    8192    | local dir only |
+*Qwen3-Embedding-4B and 0.6B support MRL truncation to any dimension >= 32.
+BGE v1.5 uses CLS pooling. E5 and MiniLM use mean pooling.
+E5 `embed_passage()` applies the `"passage: "` prefix automatically.
 
-†Both Qwen3 embedding variants support MRL truncation to any dimension ≥ 32.
-BGE v1.5 uses CLS pooling; E5 and MiniLM use mean pooling.
-E5 `document_instruction()` returns `"passage: "` — `embed_passage()` applies it automatically.
+### Generation models (local files required)
+
+| Config preset | Description |
+|---------------|-------------|
+| `Qwen35Config::qwen35_0_8b` | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental. |
+| `Qwen35Config::qwen35_2b` | 24 layers, 2048 hidden, dense FFN, tied embeddings. |
+| `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported. |
+| `Qwen35Config::qwen36_27b` | 64 layers, 5120 hidden, dense FFN. |
+
+The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA attention layers.
+Lattice is the only open-source engine that correctly runs this hybrid recurrence at Q4 on Apple Silicon.
 
 ---
 
-## Selecting a Model
+## Model Selection (Embeddings)
 
 ```rust
 use lattice_embed::EmbeddingModel;
 
-// Fast general-purpose English retrieval
-let model = EmbeddingModel::BgeSmallEnV15;   // 384-dim, fastest
+// Fast English retrieval
+let model = EmbeddingModel::BgeSmallEnV15;   // 384-dim, fastest, auto-download
 
 // Balanced quality/speed
-let model = EmbeddingModel::BgeBaseEnV15;   // 768-dim
+let model = EmbeddingModel::BgeBaseEnV15;    // 768-dim, auto-download
 
 // Best quality, English
-let model = EmbeddingModel::BgeLargeEnV15;  // 1024-dim
+let model = EmbeddingModel::BgeLargeEnV15;   // 1024-dim, auto-download
 
 // Multilingual retrieval
 let model = EmbeddingModel::MultilingualE5Base;  // 768-dim, 100+ languages
 
-// Long context + multilingual (requires GPU for practical throughput)
+// Long context + multilingual (local files required)
 let model = EmbeddingModel::Qwen3Embedding0_6B;  // 1024-dim, 8K context
 
 // MRL: variable output dimension
 use lattice_embed::ModelConfig;
 let config = ModelConfig::try_new(EmbeddingModel::Qwen3Embedding4B, Some(512))?;
-```
-
----
-
-## Feature Flags
-
-### lattice-embed
-
-| Feature     | Default | Description                                 |
-| ----------- | ------- | ------------------------------------------- |
-| `native`    | yes     | Pure Rust inference via `lattice-inference` |
-| `metal-gpu` | no      | Metal GPU acceleration (macOS)              |
-| `avx512`    | no      | AVX-512 SIMD kernels (requires nightly)     |
-
-### lattice-inference
-
-| Feature     | Default | Description                                            |
-| ----------- | ------- | ------------------------------------------------------ |
-| `f16`       | no      | Half-precision weights                                 |
-| `metal-gpu` | no      | Metal compute backend                                  |
-| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                        |
-| `download`  | yes     | HuggingFace weight download with checksum verification |
-| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)         |
-
-```toml
-# GPU acceleration on macOS
-lattice-embed = { version = "0.3", features = ["metal-gpu"] }
-
-# Cross-platform GPU
-lattice-embed = { version = "0.3", features = ["wgpu-gpu"] }
 ```
 
 ---
@@ -225,117 +335,109 @@ utils::normalize(&mut vector);  // in-place L2 normalization
 let sims = utils::batch_cosine_similarity(&pairs);
 ```
 
-Measured performance on normalized 384-dim vectors (internal benchmarks, subject to hardware):
+Measured performance on normalized vectors (internal benchmarks, subject to hardware):
 
-| Operation                    | Scalar   | SIMD    |
-| ---------------------------- | -------- | ------- |
-| cosine similarity (384-dim)  | ~650 ns  | ~90 ns  |
-| cosine similarity (768-dim)  | ~1300 ns | ~180 ns |
+| Operation | Scalar | SIMD |
+|-----------|--------|------|
+| cosine similarity (384-dim) | ~650 ns | ~90 ns |
+| cosine similarity (768-dim) | ~1300 ns | ~180 ns |
 | cosine similarity (1024-dim) | ~1700 ns | ~240 ns |
 
 ---
 
-## lattice-fann: Fast Neural Networks
+## Feature Flags
 
-For tiny classifiers that need to run in under 5 ms on CPU:
+### lattice-embed
 
-```rust
-use lattice_fann::{NetworkBuilder, Activation, BackpropTrainer, TrainingConfig, Trainer};
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `native` | yes | Pure Rust inference via `lattice-inference` |
+| `metal-gpu` | no | Metal GPU acceleration (macOS) |
+| `avx512` | no | AVX-512 SIMD kernels (requires nightly) |
 
-// Build a network
-let mut network = NetworkBuilder::new()
-    .input(784)
-    .hidden(128, Activation::ReLU)
-    .hidden(64, Activation::ReLU)
-    .output(10, Activation::Softmax)
-    .build()?;
+### lattice-inference
 
-println!("{}", network.architecture()); // "784 -> ReLU(128) -> ReLU(64) -> Softmax(10)"
-println!("Parameters: {}", network.total_params());
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `f16` | no | Half-precision weights |
+| `metal-gpu` | no | Metal compute backend |
+| `wgpu-gpu` | no | WGPU cross-platform GPU backend |
+| `download` | yes | HuggingFace weight download with checksum verification |
+| `backfill` | no | Re-embedding coordinator (requires `rusqlite`) |
 
-// Forward pass (no heap allocation)
-let output = network.forward(&input)?;
+---
 
-// Serialize to compact binary (magic "FANN")
-let bytes = network.to_bytes();
-let restored = lattice_fann::Network::from_bytes(&bytes)?;
+## Architecture
+
+```
+Application
+    |
+    v
+lattice-embed          (public API: embedding service, SIMD distance ops, LRU cache)
+    |
+    v
+lattice-inference      (transformer kernel: BERT/Qwen3 forward pass, tokenizers, weights)
+    |
+    +---> CPU (primary)      Metal (macOS)     WGPU (fallback)
+          AVX2/NEON kernels   Apple Silicon      Vulkan/DX12
+
+
+lattice-fann           (standalone: tiny network primitives, <5ms CPU inference)
+lattice-transport      (standalone: optimal transport math, Wasserstein distances)
+lattice-tune           (depends on fann + inference: LoRA, distillation, model registry)
 ```
 
 ---
 
-## lattice-transport: Optimal Transport
+## Running Benchmarks
 
-Entropy-regularized optimal transport for measuring embedding geometry drift:
-
-```rust
-// Sinkhorn-Knopp in log-domain (numerically stable, no Gibbs kernel materialization)
-// Balanced OT, unbalanced OT (KL-relaxed), Wasserstein barycenters
-// Pre-allocated SinkhornWorkspace for zero-alloc inner loops
-```
-
-Primary use case: detect when an embedding model update has shifted the distribution of stored
-vectors enough to warrant re-indexing.
-
----
-
-## Benchmarks
-
-### Qwen3.5-0.8B Decode Throughput (Apple M2 Max)
-
-Fair end-to-end measurement — **slope method**: `tok/s = (N₂−N₁) / (T(N₂)−T(N₁))` for a fixed
-prompt, so prompt prefill, model load, and per-call overhead cancel and every engine is measured
-the _same_ way (greedy, median of 5 runs).
-
-| Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
-| ------- | ---------------------- | ------------- | ----------------- | ----------------- |
-| 64 tok  | **187**                | 93            | 265               | **2.0×**          |
-| 128 tok | **171**                | 92            | 263               | **1.9×**          |
-| 256 tok | **146**                | 88            | 260               | **1.6×**          |
-
-MLX uses Apple's private MPS/AMX matrix engines — a different category than public-Metal-compute
-engines (Lattice, Ollama). **MLX decodes faster than Lattice.** Lattice's value is portability
-plus capabilities no other engine has on this model:
-
-| Lattice-only capability            | MLX | Ollama |
-| ---------------------------------- | --- | ------ |
-| QuaRot 4-bit (rotated quant)       | ✗   | ✗      |
-| Q4 + LoRA r8 hot-swap (no reload)  | ✗   | ✗      |
-| Pure Rust, zero Python / framework | ✗   | ✗      |
-
-All three engines implement the full GDN recurrence for Qwen3.5's hybrid architecture
-(18 GatedDeltaNet + 6 GQA layers). PPL parity confirmed: Lattice 20.60 vs MLX 20.67 on
-wikitext-2 (2048 tokens). Reproducible via `./scripts/bench_context_scaling.sh`.
-
-### Embedding & Kernel Benchmarks
+### Embedding throughput
 
 ```bash
-# Embedding throughput
 cargo bench --package lattice-embed
-
-# Metal GPU decode (macOS only, requires model weights)
-cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
-
-# Attention kernel
-cargo bench --package lattice-inference --bench attention_bench
 ```
 
-Performance depends on hardware, model size, batch size, and sequence length. Run the benchmarks
-on your target hardware to get representative numbers.
+### Metal GPU decode (macOS only, requires model weights)
+
+```bash
+cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
+```
+
+### Context scaling (Qwen3.5-0.8B vs Ollama vs MLX)
+
+```bash
+./scripts/bench_context_scaling.sh
+```
+
+Performance depends on hardware, model size, batch size, and sequence length. Run benchmarks
+on your target hardware for representative numbers.
 
 ---
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — crate dependency graph, design decisions, stability tiers
-- ADR directory: `docs/adr/` — architectural decision records
+- [Architecture](docs/architecture.md): crate dependency graph, design decisions, stability tiers
+- [Models](docs/models.md): full model support matrix, attention variants, inference features
+- [Getting started](docs/getting-started.md): step-by-step setup guide
+- [Examples](docs/examples.md): code samples for common tasks
+- ADR directory: `docs/adr/`
+
+---
+
+## Publishing
+
+Leaf crates publish first: `inference` then `fann` then `transport` (wait 30s) then `embed`
+(wait 30s) then `tune`.
+
+```bash
+make publish
+```
 
 ---
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
-
----
 
 Built by [Ocean (HaiyangLi)](https://github.com/ohdearquant). Powers
 [khive](https://khive.ai), a cognitive infrastructure for AI agents.
