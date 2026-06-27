@@ -1,12 +1,24 @@
 //! Metal GPU generation — JSON event mode for Lattice Studio app, plus interactive REPL.
 //!
-//! # Usage — JSON streaming mode (used by Lattice Studio)
+//! # Usage — JSON one-shot mode (used by Lattice Studio; legacy, one process per message)
 //!
 //! ```
 //! chat_metal --model ~/.lattice/models/qwen3.5-0.8b --prompt "Hello" --max-tokens 64 --json
 //! chat_metal --model qwen3.5-0.8b-q4 --prompt "Hello" --max-tokens 64 --json
 //! chat_metal --model qwen3.5-0.8b --lora adapter.safetensors --prompt "..." --json
 //! ```
+//!
+//! # Usage — JSON serve mode (used by Lattice Studio; one process per model, keeps model warm)
+//!
+//! ```
+//! chat_metal --model ~/.lattice/models/qwen3.5-0.8b --json --serve
+//! ```
+//!
+//! Reads newline-delimited JSON request objects from stdin:
+//! `{"prompt":"<chatml>","max_tokens":64,"temperature":0.7,"top_k":50,"top_p":0.9,"repetition_penalty":1.1,"seed":42}`
+//! All fields except `prompt` are optional and fall back to the CLI defaults.
+//! Emits the same `@@lattice gen_token` event stream as the one-shot path for each request.
+//! Exits cleanly on stdin EOF (app closed) or broken pipe.
 //!
 //! Emits `@@lattice` gen_token events identical to `generate_lora` so the app parser
 //! needs no changes. Every response bubble produced by this binary is labelled
@@ -360,6 +372,80 @@ fn load_lora_safetensors(
     Ok((layers, scale))
 }
 
+// ─── JSON generation helper (shared by one-shot and serve paths) ────────────
+
+/// Emit a single streaming JSON generation response on stdout.
+///
+/// Writes one `@@lattice gen_token` line per token (done:false), then a final
+/// done:true line with tok_s and ttft_ms. Format is byte-identical to generate_lora
+/// so the app parser needs no changes. Returns Err on broken pipe or flush failure.
+///
+/// Used by both `--json --prompt` (one-shot) and `--json --serve` (serve loop) so
+/// the event format cannot drift between the two paths.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn emit_json_generation(
+    prompt: &str,
+    metal: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
+    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    gen_cfg: &lattice_inference::model::qwen35_config::GenerateConfig,
+    model_format: &str,
+    lora_tag: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let mut stdout = std::io::stdout();
+    let mut first_token_emitted = false;
+    let mut ttft_ms: f64 = 0.0;
+    let t1 = std::time::Instant::now();
+
+    // Capture the first write/flush failure so we can stop generation and return Err
+    // rather than silently completing a run whose output was never received.
+    let mut stream_err: Option<std::io::Error> = None;
+    let output = metal.generate_streaming(prompt, tokenizer, gen_cfg, |delta, _token_id| {
+        if !first_token_emitted {
+            ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            first_token_emitted = true;
+        }
+        let token_json = json_escape(delta);
+        let write_result = writeln!(
+            stdout,
+            "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"done\":false}}"
+        )
+        .and_then(|()| stdout.flush());
+        if let Err(e) = write_result {
+            stream_err = Some(e);
+            return false; // downstream consumer is gone — stop generating
+        }
+        true // continue generation
+    });
+
+    if let Some(e) = stream_err {
+        return Err(format!("streaming stdout write failed: {e}").into());
+    }
+
+    let gen_ms = t1.elapsed().as_millis();
+    let tok_s = if gen_ms > 0 {
+        output.generated_tokens as f64 / (gen_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+
+    // Final done event — format identical to generate_lora so app parser needs no change.
+    writeln!(
+        stdout,
+        "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
+    )
+    .and_then(|()| stdout.flush())
+    .map_err(|e| format!("streaming done-event write failed: {e}"))?;
+
+    eprintln!(
+        "[chat_metal] GPU Metal {model_format}{lora_tag}: {} prompt + {} gen in {}ms = {tok_s:.1} tok/s",
+        output.prompt_tokens, output.generated_tokens, gen_ms
+    );
+
+    Ok(())
+}
+
 // ─── main logic ─────────────────────────────────────────────────────────────
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -375,6 +461,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Arg parsing ──────────────────────────────────────────────────────────
 
     let emit_json = parse_flag(&args, "--json");
+    let serve_mode = parse_flag(&args, "--serve");
 
     let prompt_opt = parse_arg(&args, "--prompt");
 
@@ -555,66 +642,126 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         stop_strings: vec![],
     };
 
-    // ── JSON streaming mode (used by Lattice Studio app) ────────────────────
+    // ── JSON modes (used by Lattice Studio app) ─────────────────────────────
 
     if emit_json {
-        let Some(prompt) = prompt_opt else {
-            return Err("--json mode requires --prompt".into());
-        };
+        let lora_tag = if has_lora { "+lora" } else { "" };
 
-        let mut stdout = std::io::stdout();
-        let mut first_token_emitted = false;
-        let mut ttft_ms: f64 = 0.0;
-        let t1 = std::time::Instant::now();
+        if serve_mode {
+            // Persistent serve loop: load once, process requests until stdin closes.
+            // Each request is a newline-delimited JSON object; responses are the same
+            // @@lattice gen_token event stream as the one-shot path.
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            let stdin_lock = stdin.lock();
+            let mut lines = stdin_lock.lines();
 
-        // generate_streaming: returns GenerateOutput (not Result), callback returns bool.
-        // A discarded stdout error (broken pipe) would let generation run to
-        // completion and still report success, so capture the first write/flush
-        // failure and stop the stream on it.
-        let mut stream_err: Option<std::io::Error> = None;
-        let output = metal.generate_streaming(&prompt, &tokenizer, &gen_cfg, |delta, _token_id| {
-            if !first_token_emitted {
-                ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
-                first_token_emitted = true;
+            loop {
+                let line = match lines.next() {
+                    None => break, // stdin closed (app teardown) → exit cleanly
+                    Some(Ok(l)) => l,
+                    Some(Err(_)) => break, // read error → exit cleanly
+                };
+                let line = line.trim().to_owned();
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Parse the request object.
+                let req_val: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let mut out = std::io::stdout();
+                        use std::io::Write;
+                        let msg = json_escape(&format!("malformed request: {e}"));
+                        let _ = writeln!(out, "@@lattice {{\"ev\":\"error\",\"msg\":{msg}}}");
+                        let _ = out.flush();
+                        continue; // robustness: keep loop alive on bad input
+                    }
+                };
+
+                let prompt = match req_val["prompt"].as_str() {
+                    Some(p) => p.to_owned(),
+                    None => {
+                        let mut out = std::io::stdout();
+                        use std::io::Write;
+                        let _ = writeln!(
+                            out,
+                            "@@lattice {{\"ev\":\"error\",\"msg\":\"missing \\\"prompt\\\" field\"}}"
+                        );
+                        let _ = out.flush();
+                        continue;
+                    }
+                };
+
+                // Build per-request config, falling back to CLI defaults for absent fields.
+                let req_max_tokens = req_val["max_tokens"]
+                    .as_u64()
+                    .map(|v| v as usize)
+                    .unwrap_or(max_tokens);
+                let req_temperature = req_val["temperature"]
+                    .as_f64()
+                    .map(|v| v as f32)
+                    .unwrap_or(temperature);
+                let req_top_k = req_val["top_k"]
+                    .as_u64()
+                    .map(|v| v as usize)
+                    .unwrap_or(top_k);
+                let req_top_p = req_val["top_p"].as_f64().map(|v| v as f32).unwrap_or(top_p);
+                let req_repetition_penalty = req_val["repetition_penalty"]
+                    .as_f64()
+                    .map(|v| v as f32)
+                    .unwrap_or(repetition_penalty);
+                let req_seed = req_val["seed"].as_u64().or(seed);
+
+                let req_cfg = GenerateConfig {
+                    max_new_tokens: req_max_tokens,
+                    temperature: req_temperature,
+                    top_k: req_top_k,
+                    top_p: req_top_p,
+                    repetition_penalty: req_repetition_penalty,
+                    seed: req_seed,
+                    stop_token_ids: vec![],
+                    enable_thinking: true,
+                    enable_mtp: None,
+                    grammar: None,
+                    stop_strings: vec![],
+                };
+
+                // Stateless per request: full ChatML history comes in the prompt.
+                metal.reset_state();
+
+                // Broken pipe means the app closed its read end — stop the loop cleanly.
+                if let Err(e) = emit_json_generation(
+                    &prompt,
+                    &mut metal,
+                    &tokenizer,
+                    &req_cfg,
+                    model_format,
+                    lora_tag,
+                ) {
+                    eprintln!("[chat_metal] serve: generation stopped: {e}");
+                    break;
+                }
             }
-            let token_json = json_escape(delta);
-            let write_result = writeln!(
-                stdout,
-                "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"done\":false}}"
-            )
-            .and_then(|()| stdout.flush());
-            if let Err(e) = write_result {
-                stream_err = Some(e);
-                return false; // downstream consumer is gone — stop generating
-            }
-            true // continue generation
-        });
-        if let Some(e) = stream_err {
-            return Err(format!("chat_metal: streaming stdout write failed: {e}").into());
+
+            return Ok(());
         }
 
-        let gen_ms = t1.elapsed().as_millis();
-        let tok_s = if gen_ms > 0 {
-            output.generated_tokens as f64 / (gen_ms as f64 / 1000.0)
-        } else {
-            0.0
+        // One-shot mode (--json without --serve): requires --prompt.
+        let Some(prompt) = prompt_opt else {
+            return Err(
+                "--json mode requires --prompt (or --serve for persistent serve mode)".into(),
+            );
         };
-
-        // Final done event — format identical to generate_lora so app parser needs no change.
-        writeln!(
-            stdout,
-            "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
-        )
-        .and_then(|()| stdout.flush())
-        .map_err(|e| format!("chat_metal: streaming done-event write failed: {e}"))?;
-
-        // Emit timing to stderr (not captured by app).
-        let lora_tag = if has_lora { "+lora" } else { "" };
-        eprintln!(
-            "[chat_metal] GPU Metal {model_format}{lora_tag}: {} prompt + {} gen in {}ms = {tok_s:.1} tok/s",
-            output.prompt_tokens, output.generated_tokens, gen_ms
-        );
-
+        emit_json_generation(
+            &prompt,
+            &mut metal,
+            &tokenizer,
+            &gen_cfg,
+            model_format,
+            lora_tag,
+        )?;
         return Ok(());
     }
 

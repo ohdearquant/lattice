@@ -1,6 +1,21 @@
 import SwiftUI
 import Observation
 
+// MARK: - Chat GPU serve request payload
+//
+// Serialized to a newline-delimited JSON line and written to the persistent
+// `chat_metal --json --serve` process's stdin for each chat turn.
+// Field names use snake_case to match the Rust serde_json::Value field lookups.
+private struct ChatServeRequest: Encodable {
+    let prompt: String
+    let max_tokens: Int
+    let temperature: Double
+    let top_k: Int
+    let top_p: Double
+    let repetition_penalty: Double
+    let seed: UInt64?
+}
+
 // MARK: - The single source of truth (Observation framework, @MainActor).
 //
 // One @Observable store held in @State at the app root, handed to views as `@Bindable`.
@@ -105,6 +120,28 @@ final class AppStore {
     // finish() (and the run's onComplete) would never fire and an awaiting chat turn would hang
     // .running forever. Each handle removes itself from this map inside its own onExit.
     private var retiringHandles: [ObjectIdentifier: RunHandle] = [:]
+
+    // MARK: - Chat GPU session (persistent serve process — keeps model warm across turns)
+    //
+    // A single chat_metal --json --serve process is kept alive for the selected model so
+    // the model is loaded once and stays resident in GPU memory between chat turns. This
+    // eliminates the 10-second reload that occurred when the app spawned a fresh process
+    // per message. The session is isolated to the Chat GPU flow; Train/Eval screens use
+    // `runGenerate` unchanged.
+    //
+    // Stop-button semantics: terminating the session unloads the model. The next GPU send
+    // respawns it — one reload per explicit Stop only.
+
+    /// The persistent chat_metal serve process for GPU Metal inference. Nil when not yet
+    /// spawned or after the session has exited (Stop pressed / model changed / app quit).
+    private var chatSessionHandle: RunHandle?
+    /// Model path the live session was spawned for (empty string when no session).
+    private var chatSessionModelPath: String = ""
+    /// Tokenizer path the live session was spawned for (nil when not needed).
+    private var chatSessionTokenizerPath: String?
+
+    /// True when a warm chat_metal serve process is resident and holding the model in GPU memory.
+    var isChatSessionWarm: Bool { chatSessionHandle?.isRunning == true }
 
     init() {
         runs = Self.loadRunArchive()
@@ -371,9 +408,123 @@ final class AppStore {
         run.onComplete?(run)
     }
 
+    // MARK: Chat GPU serve session management
+
+    /// Launch (or reuse) a persistent `chat_metal --json --serve` session and send one request.
+    ///
+    /// Keeps the model resident in GPU memory between chat turns by writing JSON request objects
+    /// to the session's stdin. A new session is spawned on the first send, and on any subsequent
+    /// send where the model or tokenizer path has changed. The existing session is reused for all
+    /// sends that target the same model — no reload between turns.
+    ///
+    /// Isolated to the Chat GPU flow; Train/Eval screens continue to use `runGenerate` unchanged.
+    @discardableResult
+    @MainActor
+    func runChatGPU(_ config: GenConfig) -> LiveRun {
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+        let modelName: String
+        if let dir = config.modelDir {
+            modelName = dir.lastPathComponent
+        } else if let name = config.model {
+            modelName = name
+        } else {
+            modelName = "chat"
+        }
+
+        let run = LiveRun(kind: .chat, modelName: modelName)
+        liveRun = run
+
+        // Tear down the existing session if the model or tokenizer has changed.
+        if chatSessionHandle?.isRunning == true,
+           (chatSessionModelPath != modelPath || chatSessionTokenizerPath != tokenizerPath) {
+            chatSessionHandle?.stop()
+            chatSessionHandle = nil
+        }
+
+        // Spawn a new session if none is alive.
+        if chatSessionHandle?.isRunning != true {
+            var args: [String] = ["--json", "--serve"]
+            if let dir = config.modelDir {
+                args += ["--model-dir", dir.path]
+            } else if let name = config.model {
+                args += ["--model", name]
+            }
+            if let tokDir = config.tokenizerDir {
+                args += ["--tokenizer-dir", tokDir.path]
+            }
+
+            guard let spec = LatticeBridge.launchSpec(.chatMetal, args: args) else {
+                run.status = .failed
+                run.appendLog("error: could not resolve `chat_metal` — no prebuilt binary and no cargo fallback. Run `make build` in the lattice repo, or set LATTICE_BIN_DIR.")
+                return run
+            }
+            run.appendLog("$ \(spec.executable.lastPathComponent) \(args.joined(separator: " "))")
+
+            let h = RunHandle()
+            h.onEvent = { [weak self] ev in
+                // Route events to the current chat LiveRun only while it is in flight.
+                guard let self = self,
+                      let lr = self.liveRun, lr.kind == .chat, lr.status == .running else { return }
+                self.consume(ev, into: lr)
+                // The serve loop does not exit between requests, so we drive completion
+                // via the done:true token event rather than the process exit.
+                if case .genToken(let g) = ev, g.done == true {
+                    self.finish(lr, code: 0)
+                }
+            }
+            h.onExit = { [weak self] code in
+                guard let self = self else { return }
+                self.chatSessionHandle = nil
+                self.chatSessionModelPath = ""
+                self.chatSessionTokenizerPath = nil
+                // Resolve any in-flight turn when the session exits unexpectedly.
+                if let lr = self.liveRun, lr.kind == .chat, lr.status == .running {
+                    self.finish(lr, code: code)
+                }
+            }
+
+            do {
+                try h.start(spec)
+            } catch {
+                run.status = .failed
+                run.appendLog("launch failed: \(error.localizedDescription)")
+                return run
+            }
+
+            chatSessionHandle = h
+            chatSessionModelPath = modelPath
+            chatSessionTokenizerPath = tokenizerPath
+        }
+
+        // Encode the request and write it to the session's stdin.
+        let req = ChatServeRequest(
+            prompt: config.prompt,
+            max_tokens: config.maxTokens,
+            temperature: config.temperature,
+            top_k: config.topK,
+            top_p: config.topP,
+            repetition_penalty: config.repetitionPenalty,
+            seed: config.seed
+        )
+        guard let reqData = try? JSONEncoder().encode(req),
+              let reqLine = String(data: reqData, encoding: .utf8) else {
+            run.status = .failed
+            run.appendLog("error: failed to encode request JSON")
+            return run
+        }
+        chatSessionHandle?.send(line: reqLine)
+        return run
+    }
+
     func pauseRun() { handle?.pause(); liveRun?.status = .paused }
     func resumeRun() { handle?.resume(); liveRun?.status = .running }
-    func stopRun() { handle?.stop() }
+    func stopRun() {
+        handle?.stop()
+        // Stop the chat GPU session so the model unloads from GPU memory.
+        // The next GPU chat send will respawn it — one reload per explicit Stop only.
+        chatSessionHandle?.stop()
+    }
 
     func liveRun(matching kinds: Set<RunKind>) -> LiveRun? {
         guard let r = liveRun, kinds.contains(r.kind) else { return nil }

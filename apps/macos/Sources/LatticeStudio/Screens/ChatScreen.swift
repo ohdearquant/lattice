@@ -88,13 +88,19 @@ struct ChatScreen: View {
             && !isRunning
     }
 
-    // MARK: Subtitle (model + disk availability; honest — never claims residency)
+    // MARK: Subtitle (model + residency status; honest)
 
     private var subtitle: String {
         guard let model = selectedModel else { return "no models found" }
-        // "ready" when the model directory exists on disk; never claim "loaded" since
-        // the app shells out a fresh subprocess per generation and nothing stays in memory.
-        let diskStatus = FileManager.default.fileExists(atPath: model.path.path) ? "ready" : "not found"
+        // "warm"  — GPU serve session is resident and the model is loaded in GPU memory.
+        // "ready" — model directory exists on disk but no warm session (CPU mode, or first GPU send).
+        // "not found" — model path is missing from disk.
+        let diskStatus: String
+        if FileManager.default.fileExists(atPath: model.path.path) {
+            diskStatus = (store.chatUseGPU && store.isChatSessionWarm) ? "warm" : "ready"
+        } else {
+            diskStatus = "not found"
+        }
         return "\(model.name) · \(diskStatus)"
     }
 
@@ -689,7 +695,9 @@ struct ChatScreen: View {
             useGPU: useGPU
         )
 
-        let run = store.runGenerate(cfg)
+        // GPU Metal path: use the persistent serve session (model stays warm between turns).
+        // CPU path: keep using the one-shot generate_lora subprocess (unchanged).
+        let run = useGPU ? store.runChatGPU(cfg) : store.runGenerate(cfg)
 
         // Resolve via the run's own completion hook so the turn lands even if Ocean navigates
         // away from Chat before generation finishes (the .onChange handlers only fire while
@@ -736,7 +744,9 @@ struct ChatScreen: View {
             useGPU: config.useGPU
         )
 
-        let run = store.runGenerate(cfg)
+        // GPU Metal path: use the persistent serve session (model stays warm between turns).
+        // CPU path: keep using the one-shot generate_lora subprocess (unchanged).
+        let run = config.useGPU ? store.runChatGPU(cfg) : store.runGenerate(cfg)
         run.onComplete = { [turnID = turn.id] completed in
             self.resolveTurn(id: turnID, from: completed, status: completed.status)
         }
