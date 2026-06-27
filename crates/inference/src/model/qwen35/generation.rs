@@ -39,6 +39,22 @@ impl Qwen35Model {
             });
         }
 
+        // Context preflight: prefill + decode drive RoPE positions up to
+        // prompt_len + max_new_tokens, and apply_partial_rope indexes the
+        // precomputed cos/sin table unchecked. Past max_context() that is an
+        // out-of-bounds slice access — a release panic, not a clean error.
+        // Mirror the HTTP server's contract (bin/lattice.rs) so direct and HTTP
+        // generation agree on when a request is too long. Same guard in
+        // generate_streaming.
+        let max_context = self.max_context();
+        if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+                 model context window ({max_context})",
+                gen_cfg.max_new_tokens
+            )));
+        }
+
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
         let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
@@ -182,6 +198,18 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
             });
+        }
+
+        // Context preflight: see generate() for rationale — apply_partial_rope
+        // indexes the RoPE table unchecked, so a request past max_context() would
+        // panic in the decode loop. Mirror the HTTP server's contract.
+        let max_context = self.max_context();
+        if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+                 model context window ({max_context})",
+                gen_cfg.max_new_tokens
+            )));
         }
 
         let num_linear = cfg.num_linear_attention_layers();
