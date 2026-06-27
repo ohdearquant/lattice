@@ -411,8 +411,11 @@ fn gdn_step_q8_neon(
         l2_normalize_vec(&mut gdn_scratch.q_head[..key_dim]);
         l2_normalize_vec(&mut gdn_scratch.k_head[..key_dim]);
 
-        // Decay gate
-        let a_val = weights.a_log[k_head].exp();
+        // Decay gate. Clamp exp(a_log) to f32::MAX: for a_log > ~88 the
+        // exponential overflows to +inf, and inf * softplus(very_negative)=0.0
+        // yields NaN which poisons the recurrent state. Mirrors
+        // attention::gdn_fused::compute_decay_gate and forward::cpu_q8.
+        let a_val = weights.a_log[k_head].exp().min(f32::MAX);
         let sp = softplus(gdn_scratch.alpha_proj[k_head] + weights.dt_bias[k_head]);
         let g = (-a_val * sp).exp();
 
@@ -634,9 +637,17 @@ fn full_attention_step_q8_neon(
             scratch.scores[scores_start + t] = e;
             sum_exp += e;
         }
-        let inv_sum = 1.0 / sum_exp;
-        for t in 0..cur_seq_len {
-            scratch.scores[scores_start + t] *= inv_sum;
+        // Fail closed: a non-finite score (NaN/+inf from a corrupt Q/K
+        // activation) poisons sum_exp; `NaN > 0.0` is false, so the else
+        // branch zeros the row instead of scaling by a NaN inv_sum. Mirrors
+        // the Q8 CPU and f32 siblings (forward::cpu_q8, generate::compute_attention).
+        if sum_exp > 0.0 {
+            let inv_sum = 1.0 / sum_exp;
+            for t in 0..cur_seq_len {
+                scratch.scores[scores_start + t] *= inv_sum;
+            }
+        } else {
+            scratch.scores[scores_start..scores_start + cur_seq_len].fill(0.0);
         }
 
         // Weighted sum of V
@@ -875,6 +886,18 @@ pub fn generate_q8_neon(
         return Err(crate::error::InferenceError::Inference(
             "empty prompt".into(),
         ));
+    }
+
+    // Reject requests whose total token budget exceeds the RoPE table's
+    // position capacity before allocating caches or dereferencing weights.
+    // Mirrors Qwen35Model::generate and forward::cpu_q8::generate_q8.
+    let max_context = rope.max_positions();
+    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+             model context window ({max_context})",
+            gen_cfg.max_new_tokens
+        )));
     }
 
     // Initialize states
@@ -2168,5 +2191,233 @@ mod tests {
                 "{name} = {dim} is not a multiple of 32 (required for Q8_0)"
             );
         }
+    }
+
+    /// Fail-closed: a non-finite cached K (corrupt activation) drives a score
+    /// row non-finite; without the `sum_exp > 0.0` else-branch the NaN inv_sum
+    /// poisons `scratch.context`. NEON sibling of
+    /// `test_full_attn_step_q8_nan_score_fails_closed` in cpu_q8.rs, with the
+    /// NaN injected into a prior cached K position.
+    #[test]
+    fn test_full_attn_step_q8_neon_nan_score_fails_closed() {
+        let head_dim: usize = 32;
+        let hidden: usize = 64;
+        let q_dim = head_dim; // 1 q head
+        let kv_dim = head_dim; // 1 kv head
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+
+        // Identity q/k/v projections so q_buf, k_buf, v_buf are nonzero finite.
+        let identity = |rows: usize| {
+            let mut mat = vec![0.0f32; rows * hidden];
+            for j in 0..rows.min(hidden) {
+                mat[j * hidden + j] = 1.0;
+            }
+            pack_weights_q8(&mat, rows, hidden)
+        };
+        let weights = Q8NeonFullAttnWeights {
+            q_proj_packed: identity(2 * q_dim),
+            q_proj_rows: 2 * q_dim,
+            q_proj_cols: hidden,
+            k_proj_packed: identity(kv_dim),
+            k_proj_rows: kv_dim,
+            k_proj_cols: hidden,
+            v_proj_packed: identity(kv_dim),
+            v_proj_rows: kv_dim,
+            v_proj_cols: hidden,
+            o_proj_packed: zero_packed(hidden, q_dim),
+            o_proj_rows: hidden,
+            o_proj_cols: q_dim,
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 4);
+        let mut kv_cache = KvCache::new(1);
+        kv_cache.reserve(4, kv_dim);
+
+        // Position 0: real finite K/V appended at cache index 0.
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+        full_attention_step_q8_neon(
+            &weights,
+            0,
+            0,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        // Corrupt the prior cached K (position 0) and advance to position 1 so
+        // the score loop reads the NaN at t = 0.
+        kv_cache.seq_len = 1;
+        kv_cache.k[0][0] = f32::NAN;
+
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+        full_attention_step_q8_neon(
+            &weights,
+            0,
+            1,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        for (d, &v) in scratch.context[..q_dim].iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "context[{d}] = {v} is non-finite; NEON Q8 softmax must fail \
+                 closed on a NaN score row"
+            );
+        }
+    }
+
+    /// Fail-closed: an overflowing decay gate (large a_log, very negative
+    /// dt_bias) makes exp(a_log)=+inf and inf*softplus(...)=NaN without the
+    /// `.min(f32::MAX)` clamp, poisoning the recurrent state. NEON sibling of
+    /// `test_gdn_q8_decay_gate_overflow_fails_closed` in cpu_q8.rs.
+    #[test]
+    fn test_gdn_step_q8_neon_decay_gate_overflow_fails_closed() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let hidden = cfg.hidden_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let num_heads = cfg.linear_num_key_heads;
+
+        let mut weights = Q8NeonGdnWeights {
+            in_proj_qkv_packed: zero_packed(qkv_dim, hidden),
+            in_proj_qkv_rows: qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z_packed: zero_packed(output_dim, hidden),
+            in_proj_z_rows: output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b_packed: zero_packed(num_heads, hidden),
+            in_proj_b_rows: num_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a_packed: zero_packed(num_heads, hidden),
+            in_proj_a_rows: num_heads,
+            in_proj_a_cols: hidden,
+            out_proj_packed: zero_packed(hidden, output_dim),
+            out_proj_rows: hidden,
+            out_proj_cols: output_dim,
+            a_log: vec![0.0; num_heads],
+            dt_bias: vec![0.0; num_heads],
+            conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
+            conv_dim: qkv_dim,
+            kernel_size: cfg.linear_conv_kernel_dim,
+            norm_weight: vec![0.0; cfg.linear_value_head_dim],
+        };
+        // Overflow the decay gate on head 0: exp(100) -> +inf, softplus(-100) -> 0.
+        weights.a_log[0] = 100.0;
+        weights.dt_bias[0] = -100.0;
+
+        let mut state = GatedDeltaNetState::new(&cfg);
+        let input = vec![0.05f32; hidden];
+        let mut output = vec![0.0f32; hidden];
+        let mut gdn_scratch = GatedDeltaNetFusedScratch::default();
+        let mut x_q_scratch = Vec::new();
+
+        gdn_step_q8_neon(
+            &input,
+            &mut state,
+            &weights,
+            &cfg,
+            &mut gdn_scratch,
+            &mut x_q_scratch,
+            &mut output,
+        );
+
+        for (i, &v) in output[..hidden].iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "output[{i}] = {v} non-finite; decay gate must not overflow to NaN"
+            );
+        }
+        for (i, &v) in state.s_matrices.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "state.s_matrices[{i}] = {v} non-finite; decay gate overflow poisoned state"
+            );
+        }
+    }
+
+    /// generate_q8_neon must reject a request whose prompt + max_new_tokens
+    /// exceeds the RoPE context window before allocating caches or
+    /// dereferencing weights. NEON sibling of
+    /// `test_generate_q8_rejects_context_overflow` in cpu_q8.rs.
+    #[test]
+    fn test_generate_q8_neon_rejects_context_overflow() {
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let model = Q8NeonModel {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            lm_head_packed: vec![],
+            lm_head_rows: 0,
+            lm_head_cols: 0,
+            layers: vec![],
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: usize::MAX,
+            ..Default::default()
+        };
+
+        let err = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
+            .expect_err("expected context-window rejection");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window"),
+            "error should mention context window, got: {msg}"
+        );
     }
 }
