@@ -1,6 +1,21 @@
 import SwiftUI
 import Observation
 
+// MARK: - Chat GPU serve request payload
+//
+// Serialized to a newline-delimited JSON line and written to the persistent
+// `chat_metal --json --serve` process's stdin for each chat turn.
+// Field names use snake_case to match the Rust serde_json::Value field lookups.
+private struct ChatServeRequest: Encodable {
+    let prompt: String
+    let max_tokens: Int
+    let temperature: Double
+    let top_k: Int
+    let top_p: Double
+    let repetition_penalty: Double
+    let seed: UInt64?
+}
+
 // MARK: - The single source of truth (Observation framework, @MainActor).
 //
 // One @Observable store held in @State at the app root, handed to views as `@Bindable`.
@@ -35,7 +50,9 @@ final class AppStore {
     var chatSelectedAdapterName: String = "none"
     // Generation knob text fields.
     var chatTempText: String = "0.7"
-    var chatMaxTokensText: String = "256"
+    // 2048 default: 256 truncated thinking models (Qwen3.x) mid-reasoning, leaving no room
+    // for the answer. Per-model defaults overwrite temp/top-k/top-p from generation_config.json.
+    var chatMaxTokensText: String = "2048"
     var chatSeedText: String = ""
     var chatTopKText: String = "50"
     var chatTopPText: String = "0.9"
@@ -106,6 +123,44 @@ final class AppStore {
     // .running forever. Each handle removes itself from this map inside its own onExit.
     private var retiringHandles: [ObjectIdentifier: RunHandle] = [:]
 
+    // MARK: - Chat GPU session (persistent serve process — keeps model warm across turns)
+    //
+    // A single chat_metal --json --serve process is kept alive for the selected model so
+    // the model is loaded once and stays resident in GPU memory between chat turns. This
+    // eliminates the 10-second reload that occurred when the app spawned a fresh process
+    // per message. The session is isolated to the Chat GPU flow; Train/Eval screens use
+    // `runGenerate` unchanged.
+    //
+    // Stop-button semantics: terminating the session unloads the model. The next GPU send
+    // respawns it — one reload per explicit Stop only.
+
+    /// The persistent chat_metal serve process for GPU Metal inference. Nil when not yet
+    /// spawned or after the session has exited (Stop pressed / model changed / app quit).
+    private var chatSessionHandle: RunHandle?
+    /// Model path the live session was spawned for (empty string when no session).
+    private var chatSessionModelPath: String = ""
+    /// Tokenizer path the live session was spawned for (nil when not needed).
+    private var chatSessionTokenizerPath: String?
+
+    /// True when a warm chat_metal serve process is resident and holding the model in GPU memory.
+    var isChatSessionWarm: Bool { chatSessionHandle?.isRunning == true }
+
+    /// Display name of the model the warm chat serve process is currently holding in memory,
+    /// or nil when no session is warm. Lets the UI state exactly which model is loaded rather
+    /// than only which one is selected.
+    var chatWarmModelName: String? {
+        guard chatSessionHandle?.isRunning == true, !chatSessionModelPath.isEmpty else { return nil }
+        return models.first(where: { $0.path.path == chatSessionModelPath })?.name
+            ?? URL(fileURLWithPath: chatSessionModelPath).lastPathComponent
+    }
+
+    /// True from the moment a serve process is spawned until it emits `ready` (model resident).
+    /// The process is `isRunning` the instant it spawns, well before the weights finish loading,
+    /// so this flag — not `isChatSessionWarm` — is what gates the honest LOADED state.
+    var isChatModelLoading: Bool = false
+    /// Last chat-session spawn error (nil when none). Surfaced by the Load button.
+    var chatLoadError: String? = nil
+
     init() {
         runs = Self.loadRunArchive()
         measuredPPL = Self.loadPPLArchive()
@@ -120,6 +175,7 @@ final class AppStore {
     func onAppear() {
         refreshModels()
         binariesReady = LatticeBridge.prebuiltBinary(.lattice) != nil
+        startMemoryMonitor()
     }
 
     // MARK: Run archive persistence
@@ -337,6 +393,10 @@ final class AppStore {
             // download_done events are handled by downloadModel's dedicated RunHandle;
             // they should never reach a LiveRun's consume path.
             break
+        case .ready:
+            // ready (model-loaded) is intercepted in the chat session's onEvent handler to clear
+            // the loading flag; it carries no per-run state, so consume is a no-op.
+            break
         case .status(let line):
             run.appendLog(line)
         case .unknown(let j):
@@ -371,17 +431,210 @@ final class AppStore {
         run.onComplete?(run)
     }
 
+    // MARK: Chat GPU serve session management
+
+    /// Launch (or reuse) a persistent `chat_metal --json --serve` session and send one request.
+    ///
+    /// Keeps the model resident in GPU memory between chat turns by writing JSON request objects
+    /// to the session's stdin. A new session is spawned on the first send, and on any subsequent
+    /// send where the model or tokenizer path has changed. The existing session is reused for all
+    /// sends that target the same model — no reload between turns.
+    ///
+    /// Isolated to the Chat GPU flow; Train/Eval screens continue to use `runGenerate` unchanged.
+    @discardableResult
+    @MainActor
+    func runChatGPU(_ config: GenConfig) -> LiveRun {
+        let modelName: String
+        if let dir = config.modelDir {
+            modelName = dir.lastPathComponent
+        } else if let name = config.model {
+            modelName = name
+        } else {
+            modelName = "chat"
+        }
+
+        let run = LiveRun(kind: .chat, modelName: modelName)
+        liveRun = run
+
+        // A spawn means the weights load now; surface that as model-loading so the UI shows
+        // the same LOADING state whether the user pressed Load first or sent a cold message.
+        // "Warm" means a session for THIS exact model+tokenizer is already resident — switching
+        // the picker to a different model is a reload, so it must show LOADING too.
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+        let wasWarm = (chatSessionHandle?.isRunning == true
+            && chatSessionModelPath == modelPath
+            && chatSessionTokenizerPath == tokenizerPath)
+        guard spawnChatSession(config) else {
+            isChatModelLoading = false
+            run.status = .failed
+            run.appendLog("error: \(chatLoadError ?? "could not start chat session")")
+            return run
+        }
+        if !wasWarm { isChatModelLoading = true }
+
+        // Encode the request and write it to the session's stdin.
+        let req = ChatServeRequest(
+            prompt: config.prompt,
+            max_tokens: config.maxTokens,
+            temperature: config.temperature,
+            top_k: config.topK,
+            top_p: config.topP,
+            repetition_penalty: config.repetitionPenalty,
+            seed: config.seed
+        )
+        guard let reqData = try? JSONEncoder().encode(req),
+              let reqLine = String(data: reqData, encoding: .utf8) else {
+            run.status = .failed
+            run.appendLog("error: failed to encode request JSON")
+            return run
+        }
+        chatSessionHandle?.send(line: reqLine)
+        return run
+    }
+
+    /// Preload a model into a warm `chat_metal --json --serve` session WITHOUT sending a request.
+    ///
+    /// Backs the "Load model" button: spawns (or reuses) the serve process so the weights become
+    /// resident before the first message, turning the first turn's multi-second cold load into an
+    /// up-front, visible step. No-op when a session for this exact model+tokenizer is already warm.
+    @MainActor
+    func warmChatSession(_ config: GenConfig) {
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+        if chatSessionHandle?.isRunning == true,
+           chatSessionModelPath == modelPath, chatSessionTokenizerPath == tokenizerPath {
+            return
+        }
+        chatLoadError = nil
+        isChatModelLoading = true
+        if !spawnChatSession(config) {
+            isChatModelLoading = false
+        }
+    }
+
+    /// Ensure a warm `chat_metal --json --serve` process exists for this config's model+tokenizer,
+    /// spawning one if needed and tearing down a session bound to a different model. Does NOT send a
+    /// request — shared by `runChatGPU` (which then sends) and `warmChatSession` (load-only).
+    /// Returns true when a live session is available; on failure sets `chatLoadError` and returns false.
+    @MainActor
+    private func spawnChatSession(_ config: GenConfig) -> Bool {
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+
+        // Tear down the existing session if the model or tokenizer has changed.
+        if chatSessionHandle?.isRunning == true,
+           (chatSessionModelPath != modelPath || chatSessionTokenizerPath != tokenizerPath) {
+            chatSessionHandle?.stop()
+            chatSessionHandle = nil
+        }
+        if chatSessionHandle?.isRunning == true { return true }
+
+        var args: [String] = ["--json", "--serve"]
+        if let dir = config.modelDir {
+            args += ["--model-dir", dir.path]
+        } else if let name = config.model {
+            args += ["--model", name]
+        }
+        if let tokDir = config.tokenizerDir {
+            args += ["--tokenizer-dir", tokDir.path]
+        }
+
+        guard let spec = LatticeBridge.launchSpec(.chatMetal, args: args) else {
+            chatLoadError = "could not resolve `chat_metal` — no prebuilt binary and no cargo fallback. Run `make build` in the lattice repo, or set LATTICE_BIN_DIR."
+            return false
+        }
+
+        let h = RunHandle()
+        h.onEvent = { [weak self] ev in
+            guard let self = self else { return }
+            // `ready` fires once when the weights finish loading. Clear the loading flag even
+            // when no generation turn is in flight (the Load button warms with no request).
+            if case .ready = ev {
+                self.isChatModelLoading = false
+                return
+            }
+            // Route generation events to the current chat LiveRun only while it is in flight.
+            guard let lr = self.liveRun, lr.kind == .chat, lr.status == .running else { return }
+            self.consume(ev, into: lr)
+            // The serve loop does not exit between requests, so we drive completion
+            // via the done:true token event rather than the process exit.
+            if case .genToken(let g) = ev, g.done == true {
+                self.finish(lr, code: 0)
+            }
+        }
+        h.onExit = { [weak self, weak h] code in
+            // Identity guard: a superseded session (model switch) exits asynchronously AFTER its
+            // replacement is already installed. Without this check, the old session's exit would
+            // clobber the new chatSessionHandle, mark the new (running) turn .failed, and drop the
+            // freshly-warmed model. Only act when this handle is still the current session.
+            guard let self = self, self.chatSessionHandle === h else { return }
+            self.chatSessionHandle = nil
+            self.chatSessionModelPath = ""
+            self.chatSessionTokenizerPath = nil
+            self.isChatModelLoading = false
+            // Resolve any in-flight turn when the session exits unexpectedly.
+            if let lr = self.liveRun, lr.kind == .chat, lr.status == .running {
+                self.finish(lr, code: code)
+            }
+        }
+
+        do {
+            try h.start(spec)
+        } catch {
+            chatLoadError = "launch failed: \(error.localizedDescription)"
+            return false
+        }
+
+        chatSessionHandle = h
+        chatSessionModelPath = modelPath
+        chatSessionTokenizerPath = tokenizerPath
+        return true
+    }
+
     func pauseRun() { handle?.pause(); liveRun?.status = .paused }
     func resumeRun() { handle?.resume(); liveRun?.status = .running }
-    func stopRun() { handle?.stop() }
+    func stopRun() {
+        handle?.stop()
+        // Stop the chat GPU session so the model unloads from GPU memory.
+        // The next GPU chat send will respawn it — one reload per explicit Stop only.
+        chatSessionHandle?.stop()
+    }
 
     func liveRun(matching kinds: Set<RunKind>) -> LiveRun? {
         guard let r = liveRun, kinds.contains(r.kind) else { return nil }
         return r
     }
 
-    var memoryUsage: (usedGB: Double, totalGB: Double) {
+    /// Live unified-memory readout, refreshed every second by `startMemoryMonitor()` so the
+    /// value tracks model load and OS page eviction in real time. As a bare computed property
+    /// it only re-read when an @Observable dependency changed, so the readout stayed frozen
+    /// between runs and only jumped when a turn finished. This stored snapshot fixes that.
+    private(set) var memoryUsage: (usedGB: Double, totalGB: Double) = (0, 0)
+
+    private var memoryTimer: Timer?
+
+    /// Begin the 1 Hz memory monitor. Idempotent; safe to call repeatedly from onAppear.
+    func startMemoryMonitor() {
+        guard memoryTimer == nil else { return }
+        memoryUsage = computeMemoryUsage()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            // The timer is installed on RunLoop.main below, so this callback always fires on
+            // the main thread — assumeIsolated is safe and lets us touch main-actor state.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.memoryUsage = self.computeMemoryUsage()
+            }
+        }
+        // .common mode keeps the readout ticking during menu tracking / scrolling.
+        RunLoop.main.add(timer, forMode: .common)
+        memoryTimer = timer
+    }
+
+    private func computeMemoryUsage() -> (usedGB: Double, totalGB: Double) {
         let total = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+
+        // App-self resident size.
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
         let kerr = withUnsafeMutablePointer(to: &info) {
@@ -389,7 +642,25 @@ final class AppStore {
                 task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
             }
         }
-        let used = kerr == KERN_SUCCESS ? Double(info.resident_size) / 1_073_741_824.0 : 0
+        let selfBytes: UInt64 = kerr == KERN_SUCCESS ? info.resident_size : 0
+
+        // Physical footprint of live lattice subprocesses — the model lives there.
+        // proc_pid_rusage ri_phys_footprint matches the "Memory" column in Activity Monitor.
+        var subBytes: UInt64 = 0
+        for bh in [chatSessionHandle, handle].compactMap({ $0 }) where bh.isRunning {
+            var rinfo = rusage_info_v2()
+            // proc_pid_rusage writes a full rusage_info_v2 at the pointer it is given, so the
+            // buffer MUST be the struct itself (rebound to the rusage_info_t? element type),
+            // not the address of a pointer variable — the latter overflows an 8-byte slot.
+            let rc: Int32 = withUnsafeMutablePointer(to: &rinfo) { ptr in
+                ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                    proc_pid_rusage(bh.pid, RUSAGE_INFO_V2, $0)
+                }
+            }
+            if rc == 0 { subBytes += rinfo.ri_phys_footprint }
+        }
+
+        let used = (Double(selfBytes) + Double(subBytes)) / 1_073_741_824.0
         return (used, total)
     }
 }

@@ -88,13 +88,19 @@ struct ChatScreen: View {
             && !isRunning
     }
 
-    // MARK: Subtitle (model + disk availability; honest — never claims residency)
+    // MARK: Subtitle (model + residency status; honest)
 
     private var subtitle: String {
         guard let model = selectedModel else { return "no models found" }
-        // "ready" when the model directory exists on disk; never claim "loaded" since
-        // the app shells out a fresh subprocess per generation and nothing stays in memory.
-        let diskStatus = FileManager.default.fileExists(atPath: model.path.path) ? "ready" : "not found"
+        // "warm"  — GPU serve session is resident and the model is loaded in GPU memory.
+        // "ready" — model directory exists on disk but no warm session (CPU mode, or first GPU send).
+        // "not found" — model path is missing from disk.
+        let diskStatus: String
+        if FileManager.default.fileExists(atPath: model.path.path) {
+            diskStatus = (store.chatUseGPU && store.isChatSessionWarm) ? "warm" : "ready"
+        } else {
+            diskStatus = "not found"
+        }
         return "\(model.name) · \(diskStatus)"
     }
 
@@ -109,10 +115,20 @@ struct ChatScreen: View {
         }
         .inspector(isPresented: $store.inspectorPresented) {
             settingsInspector
-                .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
+                // Fixed width, not a resizable range. The inspector holds greedy full-width
+                // content (status pills with Spacers, the Load button); auto-sizing to that
+                // content within a min/ideal/max range has no single stable width, so the
+                // column oscillated every time layout re-ran (the 1 Hz memory tick re-triggered
+                // it). A fixed column cannot resize itself.
+                .inspectorColumnWidth(320)
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
+        .onChange(of: store.chatSelectedModelName) { _, _ in
+            // Picking a different model resets the sampling knobs to that model's recommended
+            // defaults (from its generation_config.json). Manual edits hold until the next switch.
+            if let model = selectedModel { applySamplingDefaults(for: model) }
+        }
         .onChange(of: store.chatUseGPU) { _, _ in
             // Backend toggle changes the eligible model set (CPU drops Q4) — re-validate
             // the selection so the picker never shows a model that isn't in chatModels.
@@ -166,21 +182,101 @@ struct ChatScreen: View {
                         )
                     )
 
-                    // Disk status — honest, never claims "loaded"
+                    // Disk + load state — honest. States exactly which model is resident in
+                    // memory, distinct from which is merely selected on disk.
                     if let model = selectedModel {
                         let exists = FileManager.default.fileExists(atPath: model.path.path)
-                        HStack(spacing: 6) {
-                            GatePill(exists ? .pass : .fail, label: exists ? "READY" : "NOT FOUND")
-                            if let liveRun = store.liveRun(matching: [.chat]),
-                               liveRun.status == .running {
-                                GatePill(.run, label: liveRun.genText.isEmpty ? "LOADING" : "GEN")
+                        let warmName = store.chatWarmModelName
+                        // `warmName` is set the instant the serve process spawns, which is BEFORE
+                        // the weights finish loading. Gate the resident state on the loading flag so
+                        // "LOADED" never shows while the model is still streaming off disk.
+                        let modelLoading = store.isChatModelLoading
+                        let selectedLoaded = (warmName == model.name) && !modelLoading
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                GatePill(exists ? .pass : .fail, label: exists ? "ON DISK" : "NOT FOUND")
+                                if modelLoading {
+                                    GatePill(.run, label: "LOADING MODEL")
+                                } else if selectedLoaded {
+                                    GatePill(.pass, label: "LOADED")
+                                } else if warmName != nil {
+                                    GatePill(.warn, label: "WILL RELOAD")
+                                } else {
+                                    Text("not loaded")
+                                        .font(Theme.Fonts.cell)
+                                        .foregroundStyle(Theme.Palette.inkDim)
+                                }
+                                if let liveRun = store.liveRun(matching: [.chat]),
+                                   liveRun.status == .running {
+                                    // Empty genText = prefill (TTFT) phase, not model load — label it
+                                    // honestly so a slow prefill doesn't read as a stuck model load.
+                                    GatePill(.run, label: liveRun.genText.isEmpty ? "PREFILL" : "GEN")
+                                }
+                                Spacer()
                             }
-                            Spacer()
+                            // Explicit "what is in GPU memory right now" line — suppressed mid-load
+                            // since the model is not actually resident until `ready` arrives.
+                            if let warmName, !modelLoading {
+                                HStack(spacing: 4) {
+                                    Text("IN MEMORY")
+                                        .font(Theme.Fonts.cell)
+                                        .foregroundStyle(Theme.Palette.inkDim)
+                                    Text(warmName)
+                                        .font(Theme.Fonts.readout)
+                                        .foregroundStyle(selectedLoaded ? Theme.Palette.signal : Theme.Palette.ink)
+                                    Spacer()
+                                }
+                            }
                         }
-                        .frame(height: Theme.Space.rowHeight)
+                        .frame(minHeight: Theme.Space.rowHeight)
+                        .padding(.vertical, Theme.Space.xs)
                         .padding(.horizontal, Theme.Space.lg)
                         .overlay(alignment: .bottom) {
                             Theme.Palette.hairline.frame(height: 1)
+                        }
+
+                        // Explicit preload control — warms the serve session so the first message
+                        // doesn't pay the multi-second cold model load. GPU mode only; the CPU path
+                        // is a one-shot subprocess with no persistent session to warm.
+                        if store.chatUseGPU {
+                            let canLoad = !modelLoading && !selectedLoaded && !isRunning
+                            Button {
+                                if let cfg = warmGenConfig() { store.warmChatSession(cfg) }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if modelLoading {
+                                        ProgressView().controlSize(.small)
+                                        Text("Loading model…")
+                                    } else if selectedLoaded {
+                                        Image(systemName: "checkmark.circle.fill")
+                                        Text("Model loaded")
+                                    } else {
+                                        Image(systemName: "arrow.down.circle")
+                                        Text("Load model")
+                                    }
+                                    Spacer()
+                                }
+                                .font(Theme.Fonts.readout)
+                                .foregroundStyle(canLoad ? Theme.Palette.signal : Theme.Palette.inkDim)
+                                .padding(.vertical, Theme.Space.sm)
+                                .padding(.horizontal, Theme.Space.md)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .background(
+                                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                        .fill(canLoad ? Theme.Palette.signalGlow : Theme.Palette.wellSink)
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                        .strokeBorder(canLoad ? Theme.Palette.signal : Theme.Palette.hairline, lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!canLoad)
+                            .padding(.vertical, Theme.Space.sm)
+                            .padding(.horizontal, Theme.Space.lg)
+                            .help(selectedLoaded ? "Model is resident in GPU memory"
+                                : "Preload the model into GPU memory before sending")
                         }
                     }
                 }
@@ -355,7 +451,7 @@ struct ChatScreen: View {
                 Text(turn.prompt)
                     .font(Theme.Fonts.body)
                     .foregroundStyle(Theme.Palette.ink)
-                    .multilineTextAlignment(.trailing)
+                    .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
@@ -411,14 +507,9 @@ struct ChatScreen: View {
                         }
 
                     } else {
-                        // Normal response — ALWAYS ink color. Red is for errors only.
-                        // (Previous code used Theme.Palette.error for failed status regardless
-                        // of whether the text was a real error or a base/adapter reply.)
-                        Text(turn.responseText)
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.ink)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
+                        // Normal response — rendered as Markdown (headings, lists, code, **bold**).
+                        // Red is for errors only; MarkdownText uses ink throughout.
+                        MarkdownText(text: turn.responseText)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
                             .background(assistantBubbleBackground)
@@ -587,6 +678,74 @@ struct ChatScreen: View {
         }
     }
 
+    /// Load a model's recommended sampling defaults from its `generation_config.json` whenever
+    /// the selected model changes. Qwen3.6 ships temperature 1.0 / top-k 20 / top-p 0.95; its
+    /// config omits repetition_penalty, so 1.0 (off) is the correct default — not the 0.0 a
+    /// hand-typed value might suggest. Manual edits persist until the model is switched again.
+    private func applySamplingDefaults(for model: ModelInfo) {
+        // Always-reset knobs the config never carries.
+        store.chatRepPenaltyText = "1.0"
+
+        // Resolve generation_config.json: the model dir first, then the bf16 sibling for Q4
+        // models that don't ship the file alongside the weights.
+        let base = model.name
+            .replacingOccurrences(of: "-q4", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "-quarot", with: "", options: .caseInsensitive)
+        var dirs = [model.path]
+        if base != model.name {
+            dirs.append(LatticeBridge.modelCacheDir.appendingPathComponent(base, isDirectory: true))
+        }
+        let configURL = dirs
+            .map { $0.appendingPathComponent("generation_config.json") }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+
+        guard let url = configURL,
+              let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+
+        if let t = json["temperature"] as? Double { store.chatTempText = trimNumber(t) }
+        if let k = json["top_k"] as? Int { store.chatTopKText = String(k) }
+        if let p = json["top_p"] as? Double { store.chatTopPText = trimNumber(p) }
+    }
+
+    /// Build a prompt-less GenConfig for the selected GPU model, used to warm the serve session
+    /// from the Load button. Mirrors `send()`'s model + tokenizer resolution (Q4 tokenizer lives
+    /// in the bf16 sibling). Returns nil when GPU mode is off or no model is selected.
+    private func warmGenConfig() -> GenConfig? {
+        guard store.chatUseGPU, let model = selectedModel else { return nil }
+        let tokenizerDirURL: URL? = {
+            guard model.format == .q4 else { return nil }
+            let baseName = model.name
+                .replacingOccurrences(of: "-q4", with: "", options: .caseInsensitive)
+                .replacingOccurrences(of: "-quarot", with: "", options: .caseInsensitive)
+            let siblingURL = LatticeBridge.modelCacheDir.appendingPathComponent(baseName, isDirectory: true)
+            let tokenizerJSON = siblingURL.appendingPathComponent("tokenizer.json")
+            return FileManager.default.fileExists(atPath: tokenizerJSON.path) ? siblingURL : nil
+        }()
+        return GenConfig(
+            modelDir: model.path,
+            model: nil,
+            tokenizerDir: tokenizerDirURL,
+            adapterPath: nil,
+            prompt: "",
+            maxTokens: 1,
+            seed: nil,
+            temperature: 0.7,
+            topK: 50,
+            topP: 0.9,
+            repetitionPenalty: 1.0,
+            useGPU: true
+        )
+    }
+
+    /// Format a sampling value without float noise: 1.0 -> "1.0", 0.95 -> "0.95", 0.7 -> "0.7".
+    private func trimNumber(_ v: Double) -> String {
+        var s = String(format: "%.4f", v)
+        while s.hasSuffix("0") && !s.hasSuffix(".0") { s.removeLast() }
+        return s
+    }
+
     /// Clear conversation transcript while preserving model/adapter/settings selections.
     private func newConversation() {
         store.chatTurns = []
@@ -689,7 +848,9 @@ struct ChatScreen: View {
             useGPU: useGPU
         )
 
-        let run = store.runGenerate(cfg)
+        // GPU Metal path: use the persistent serve session (model stays warm between turns).
+        // CPU path: keep using the one-shot generate_lora subprocess (unchanged).
+        let run = useGPU ? store.runChatGPU(cfg) : store.runGenerate(cfg)
 
         // Resolve via the run's own completion hook so the turn lands even if Ocean navigates
         // away from Chat before generation finishes (the .onChange handlers only fire while
@@ -736,7 +897,9 @@ struct ChatScreen: View {
             useGPU: config.useGPU
         )
 
-        let run = store.runGenerate(cfg)
+        // GPU Metal path: use the persistent serve session (model stays warm between turns).
+        // CPU path: keep using the one-shot generate_lora subprocess (unchanged).
+        let run = config.useGPU ? store.runChatGPU(cfg) : store.runGenerate(cfg)
         run.onComplete = { [turnID = turn.id] completed in
             self.resolveTurn(id: turnID, from: completed, status: completed.status)
         }
