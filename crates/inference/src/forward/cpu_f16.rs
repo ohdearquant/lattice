@@ -553,10 +553,13 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
     for idx in 0..top_k {
         let (expert_id, weight) = scratch.router_selected[idx];
         // Defense in depth: never index expert weights with an unfilled sentinel
-        // slot. A degenerate router row can leave `(usize::MAX, _)` for a rank it
-        // could not fill; `usize::MAX * gate_up_stride` overflows/panics. The
-        // debug_assert below documents the invariant the denom-else now enforces.
-        if expert_id >= num_experts {
+        // slot or a router-only expert id. A degenerate router row can leave
+        // `(usize::MAX, _)` for a rank it could not fill, and a public f16 weight
+        // set may declare more router experts than routed-expert storage; either
+        // way `expert_id * gate_up_stride` would overflow / OOB the `moe.experts`
+        // slices below. Bound on the storage count `moe.experts.num_experts`,
+        // matching the f32 sibling (qwen35/moe.rs::accumulate_routed_experts).
+        if expert_id >= moe.experts.num_experts {
             continue;
         }
         debug_assert_ne!(expert_id, usize::MAX);
@@ -1328,4 +1331,86 @@ mod tests {
             "degenerate f16 router must not leave a usize::MAX sentinel selected"
         );
     }
+
+    /// The non-obvious case the denom-else (not a max-only guard) is meant to
+    /// catch: ONE router row is NaN while the rest are finite, so `max_logit`
+    /// stays finite (Rust `f32::max` ignores a single NaN) but the NaN still
+    /// lands in `denom`. A max-only guard (`if !max_logit.is_finite()`) would
+    /// pass this and leave un-normalized raw `exp` mass; the denom-else fills
+    /// the row with 0.0. f16 analogue of qwen35/moe.rs
+    /// `test_moe_router_finite_max_nan_tail_fails_closed`.
+    #[test]
+    fn test_moe_ffn_step_f16_finite_max_nan_tail_fails_closed() {
+        use crate::weights::f16_weights::{
+            F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
+        };
+        let num_experts = 4usize;
+        let hidden = 4usize;
+        let inter = 2usize;
+        let shared_inter = 2usize;
+        let top_k = 2usize;
+
+        let nan16 = F16::from_f32(f32::NAN).0;
+        let zeros = |n: usize| vec![F16::from_f32(0.0).0; n];
+
+        // Only expert 0's gate row is NaN → logit[0] = NaN, logit[1..] finite,
+        // so `max_logit` is finite but `denom` is NaN.
+        let mut gate = zeros(num_experts * hidden);
+        for w in &mut gate[..hidden] {
+            *w = nan16;
+        }
+        let router = F16MoeRouter::new(gate, num_experts, top_k, hidden).unwrap();
+        let experts = F16RoutedExperts::new(
+            zeros(num_experts * 2 * inter * hidden),
+            zeros(num_experts * hidden * inter),
+            num_experts,
+            hidden,
+            inter,
+        )
+        .unwrap();
+        let shared = F16SharedExpert::new(
+            zeros(shared_inter * hidden),
+            zeros(shared_inter * hidden),
+            zeros(hidden * shared_inter),
+            zeros(hidden),
+            hidden,
+            shared_inter,
+        )
+        .unwrap();
+        let moe = F16MoeLayerWeights {
+            router,
+            experts,
+            shared_expert: shared,
+        };
+
+        let mut scratch = ForwardScratch::new();
+        let buf = inter.max(shared_inter);
+        scratch.ffn_out.resize(hidden, 1.0);
+        scratch.input_tmp.resize(hidden, 0.0);
+        scratch.expert_out.resize(hidden, 0.0);
+        scratch.gate_buf.resize(buf, 0.0);
+        scratch.up_buf.resize(buf, 0.0);
+        scratch.down_input.resize(buf, 0.0);
+        scratch.router_logits.resize(num_experts, 0.0);
+        scratch.router_selected.resize(top_k, (usize::MAX, 0.0));
+
+        moe_ffn_step_f16(&moe, &mut scratch, hidden);
+
+        assert!(
+            scratch.router_logits[..num_experts]
+                .iter()
+                .all(|p| *p == 0.0),
+            "finite-max + NaN-tail router row must fail closed to all-zero probs \
+             (a max-only guard would miss this)"
+        );
+    }
+
+    // NOTE: the storage-bound guard (`expert_id >= moe.experts.num_experts`) is
+    // release-only defense-in-depth — in debug the `debug_assert_eq!(moe.experts
+    // .num_experts, num_experts)` at the top of `moe_ffn_step_f16` fires first on
+    // a router/expert count mismatch, so the guard cannot be exercised by a debug
+    // unit test. It mirrors the f32 sibling guard (qwen35/moe.rs) and costs one
+    // comparison; it hardens the bench-only public `generate_f16` path against a
+    // manually constructed f16 weight set whose router declares more experts than
+    // the routed-expert storage holds.
 }
