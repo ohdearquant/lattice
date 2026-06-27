@@ -458,7 +458,13 @@ final class AppStore {
 
         // A spawn means the weights load now; surface that as model-loading so the UI shows
         // the same LOADING state whether the user pressed Load first or sent a cold message.
-        let wasWarm = (chatSessionHandle?.isRunning == true)
+        // "Warm" means a session for THIS exact model+tokenizer is already resident — switching
+        // the picker to a different model is a reload, so it must show LOADING too.
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+        let wasWarm = (chatSessionHandle?.isRunning == true
+            && chatSessionModelPath == modelPath
+            && chatSessionTokenizerPath == tokenizerPath)
         guard spawnChatSession(config) else {
             isChatModelLoading = false
             run.status = .failed
@@ -557,8 +563,12 @@ final class AppStore {
                 self.finish(lr, code: 0)
             }
         }
-        h.onExit = { [weak self] code in
-            guard let self = self else { return }
+        h.onExit = { [weak self, weak h] code in
+            // Identity guard: a superseded session (model switch) exits asynchronously AFTER its
+            // replacement is already installed. Without this check, the old session's exit would
+            // clobber the new chatSessionHandle, mark the new (running) turn .failed, and drop the
+            // freshly-warmed model. Only act when this handle is still the current session.
+            guard let self = self, self.chatSessionHandle === h else { return }
             self.chatSessionHandle = nil
             self.chatSessionModelPath = ""
             self.chatSessionTokenizerPath = nil
