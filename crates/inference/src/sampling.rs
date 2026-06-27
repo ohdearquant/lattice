@@ -1650,13 +1650,17 @@ mod tests {
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
-        // Build a 65-token history: token 1 is the oldest entry (position 0).
-        // Filler tokens use ids >= 2 so they do not compete with tokens 0 or 1.
-        let mut history: Vec<u32> = vec![1];
-        history.extend(2u32..66); // 64 filler tokens → total history length = 65
-        sampler.seed_history(&history);
+        // Build a 65-token history THROUGH push_token, the path the removed 64-cap
+        // actually lived on. token 1 is the oldest entry (pushed first). Filler tokens
+        // use ids >= 2 so they do not compete with tokens 0 or 1.
+        sampler.push_token(1);
+        for t in 2u32..66 {
+            sampler.push_token(t); // 64 filler tokens → total history length = 65
+        }
         // Without cap: token 1 penalty applies → 10.0/2.0 = 5.0 < 6.0 → token 0 wins.
-        // With old 64-cap: token 1 was evicted from the window → 10.0 wins, token 1 wins.
+        // With old 64-cap restored in push_token: token 1 was evicted from the window →
+        // raw_best (token 1) is no longer in history so the greedy shortcut returns it
+        // un-penalized → token 1 wins.
         let token = sampler.sample(&[6.0, 10.0]);
         assert_eq!(
             token, 0,
