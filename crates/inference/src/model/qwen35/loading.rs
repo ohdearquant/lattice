@@ -205,14 +205,15 @@ fn load_full_attention_weights<T: TensorSource + ?Sized>(
 
 fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     source: &mut T,
-    _cfg: &Qwen35Config,
+    cfg: &Qwen35Config,
     prefix: &str,
     hidden: usize,
-    num_heads: usize,
+    _num_heads: usize,
     qkv_dim: usize,
     output_dim: usize,
     kernel_size: usize,
 ) -> Result<AttentionWeights, InferenceError> {
+    let value_heads = cfg.linear_num_value_heads();
     let qkv = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_qkv.weight"))?;
     let z = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_z.weight"))?;
     let b = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_b.weight"))?;
@@ -232,10 +233,10 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: b,
-        in_proj_b_rows: num_heads,
+        in_proj_b_rows: value_heads,
         in_proj_b_cols: hidden,
         in_proj_a: a,
-        in_proj_a_rows: num_heads,
+        in_proj_a_rows: value_heads,
         in_proj_a_cols: hidden,
         a_log: alog,
         dt_bias: dtb,

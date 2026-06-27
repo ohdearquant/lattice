@@ -55,20 +55,17 @@ pub fn gated_delta_net_step_fused_f16(
     let hidden = cfg.hidden_size;
     let num_heads = cfg.linear_num_key_heads;
     let value_heads = cfg.linear_num_value_heads();
+    let ratio = value_heads / num_heads;
     let key_dim = cfg.linear_key_head_dim;
     let value_dim = cfg.linear_value_head_dim;
     let qkv_dim = cfg.linear_qkv_dim();
     let output_dim = cfg.linear_output_dim();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
-    debug_assert_eq!(
-        num_heads, value_heads,
-        "fused kernel assumes matched key/value head counts"
-    );
     debug_assert!(input.len() >= hidden);
     debug_assert!(output.len() >= hidden);
 
-    scratch.ensure_capacity(qkv_dim, output_dim, num_heads, key_dim, value_dim);
+    scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (f16 weights)
     matmul_bt_f16(
@@ -92,23 +89,23 @@ pub fn gated_delta_net_step_fused_f16(
     matmul_bt_f16(
         input,
         &weights.in_proj_b,
-        &mut scratch.beta_proj[..num_heads],
+        &mut scratch.beta_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     matmul_bt_f16(
         input,
         &weights.in_proj_a,
-        &mut scratch.alpha_proj[..num_heads],
+        &mut scratch.alpha_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     // sigmoid(beta)
-    for b in &mut scratch.beta_proj[..num_heads] {
+    for b in &mut scratch.beta_proj[..value_heads] {
         *b = sigmoid(*b);
     }
 
@@ -128,9 +125,10 @@ pub fn gated_delta_net_step_fused_f16(
     let v_offset = q_total + k_total;
     let scale = 1.0 / (key_dim as f32).sqrt();
 
-    for h in 0..num_heads {
-        let q_start = h * key_dim;
-        let k_start = q_total + h * key_dim;
+    for h in 0..value_heads {
+        let k_head = h / ratio;
+        let q_start = k_head * key_dim;
+        let k_start = q_total + k_head * key_dim;
         let v_start = v_offset + h * value_dim;
 
         scratch.q_head[..key_dim].copy_from_slice(&scratch.conv_output[q_start..q_start + key_dim]);
@@ -193,7 +191,7 @@ pub fn gated_delta_net_step_fused_f16(
     let gamma = &weights.norm_weight[..value_dim];
     debug_assert_eq!(gamma.len(), value_dim);
 
-    for h in 0..num_heads {
+    for h in 0..value_heads {
         let start = h * value_dim;
         let end = start + value_dim;
         simd_gated_rms_norm(

@@ -385,7 +385,7 @@ pub fn gated_delta_net_step_fused(
     debug_assert!(input.len() >= hidden);
     debug_assert!(output.len() >= hidden);
 
-    scratch.ensure_capacity(qkv_dim, output_dim, num_heads, key_dim, value_dim);
+    scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (with LoRA hooks for fine-tuned adapters)
     matmul_bt(
@@ -421,35 +421,35 @@ pub fn gated_delta_net_step_fused(
     matmul_bt(
         input,
         &weights.in_proj_b,
-        &mut scratch.beta_proj[..num_heads],
+        &mut scratch.beta_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
     lora.apply(
         layer_idx,
         "in_proj_b",
         input,
-        &mut scratch.beta_proj[..num_heads],
+        &mut scratch.beta_proj[..value_heads],
     );
 
     matmul_bt(
         input,
         &weights.in_proj_a,
-        &mut scratch.alpha_proj[..num_heads],
+        &mut scratch.alpha_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
     lora.apply(
         layer_idx,
         "in_proj_a",
         input,
-        &mut scratch.alpha_proj[..num_heads],
+        &mut scratch.alpha_proj[..value_heads],
     );
 
     // sigmoid(beta)
-    for b in &mut scratch.beta_proj[..num_heads] {
+    for b in &mut scratch.beta_proj[..value_heads] {
         *b = sigmoid(*b);
     }
 
@@ -483,12 +483,8 @@ pub fn gated_delta_net_step_fused(
         simd_l2_normalize(&mut scratch.q_head[..key_dim]);
         simd_l2_normalize(&mut scratch.k_head[..key_dim]);
 
-        // Decay gate
-        let g = compute_decay_gate(
-            weights.a_log[k_head],
-            scratch.alpha_proj[k_head],
-            weights.dt_bias[k_head],
-        );
+        // Decay gate (indexed per value head)
+        let g = compute_decay_gate(weights.a_log[h], scratch.alpha_proj[h], weights.dt_bias[h]);
         let s_offset = h * key_dim * value_dim;
         let s = &mut state.s_matrices[s_offset..s_offset + key_dim * value_dim];
 
@@ -504,7 +500,7 @@ pub fn gated_delta_net_step_fused(
         // Delta: (v - g * kv_mem) * beta
         // Using (v - g * kv_mem) preserves the reference semantics where
         // retrieval happens from the decayed state g * S_old.
-        let beta_h = scratch.beta_proj[k_head];
+        let beta_h = scratch.beta_proj[h];
         for j in 0..value_dim {
             scratch.delta[j] = (v[j] - scratch.kv_mem[j] * g) * beta_h;
         }
@@ -945,7 +941,7 @@ mod tests {
         seed: u64,
     ) -> (GatedDeltaNetWeights, Qwen35Config) {
         let hidden = cfg.hidden_size;
-        let num_heads = cfg.linear_num_key_heads;
+        let value_heads = cfg.linear_num_value_heads();
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
         let value_dim = cfg.linear_value_head_dim;
@@ -955,13 +951,13 @@ mod tests {
 
         let mut in_proj_qkv = vec![0.0; qkv_dim * hidden];
         let mut in_proj_z = vec![0.0; output_dim * hidden];
-        let mut in_proj_b = vec![0.0; num_heads * hidden];
-        let mut in_proj_a = vec![0.0; num_heads * hidden];
+        let mut in_proj_b = vec![0.0; value_heads * hidden];
+        let mut in_proj_a = vec![0.0; value_heads * hidden];
         let mut conv1d_weight = vec![0.0; qkv_dim * kernel_size];
         let mut out_proj = vec![0.0; hidden * output_dim];
         let mut norm_weight = vec![0.0; value_dim];
-        let mut a_log = vec![0.0; num_heads];
-        let mut dt_bias = vec![0.0; num_heads];
+        let mut a_log = vec![0.0; value_heads];
+        let mut dt_bias = vec![0.0; value_heads];
 
         rng.fill_gaussian(&mut in_proj_qkv, 0.02);
         rng.fill_gaussian(&mut in_proj_z, 0.02);
@@ -988,10 +984,10 @@ mod tests {
                 in_proj_z_rows: output_dim,
                 in_proj_z_cols: hidden,
                 in_proj_b,
-                in_proj_b_rows: num_heads,
+                in_proj_b_rows: value_heads,
                 in_proj_b_cols: hidden,
                 in_proj_a,
-                in_proj_a_rows: num_heads,
+                in_proj_a_rows: value_heads,
                 in_proj_a_cols: hidden,
                 a_log,
                 dt_bias,
@@ -1541,6 +1537,153 @@ mod tests {
     // length-mismatched call must fail closed (panic) rather than read OOB. The
     // guards are release-active `assert!`s, so these `#[should_panic]` tests hold
     // in both debug and release builds.
+
+    /// Mutation-sensitive test: verifies that the 4 decay params (a_log, dt_bias,
+    /// alpha, beta) are indexed per VALUE head, not per key head. With ratio=3,
+    /// value heads {3,4,5} share k_head=1.
+    ///
+    /// Design: beta is IDENTICAL within each key group (in_proj_b rows use k_head
+    /// index so same weight → same beta). V rows are identical within a group
+    /// (uniform in_proj_qkv). S matrices are pre-seeded equal within a group.
+    /// After one step the ONLY source of divergence between S[3] and S[4] is the
+    /// decay gate: `S_new = g*S_old + outer(k, (v - g*kv_mem)*beta)`. With distinct
+    /// a_log and alpha, g3≠g4, so S_new[3]≠S_new[4].
+    ///
+    /// If indexing reverts to [k_head]: g3=g4=g5 (all use k_head=1) and with
+    /// equal beta/v/S_old the update is identical → S_new[3]=S_new[4] → assertion FAILS.
+    ///
+    /// Mutation-verification protocol (NEVER use `git checkout` to revert):
+    ///   1. Edit: change `weights.a_log[h]` → `weights.a_log[k_head]` (and alpha/dt_bias)
+    ///   2. `touch crates/inference/src/attention/gdn_fused.rs`
+    ///   3. `cargo test -p lattice-inference test_fused_asymmetric_decay_params` → MUST FAIL
+    ///   4. Forward-patch back to `[h]`; re-run → MUST PASS
+    #[test]
+    fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
+        // key=4, value=12, ratio=3. Value heads {3,4,5} share k_head=1.
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.hidden_size = 16;
+        cfg.linear_num_key_heads = 4;
+        cfg.linear_num_value_heads = Some(12);
+        cfg.linear_key_head_dim = 4;
+        cfg.linear_value_head_dim = 2;
+        cfg.linear_conv_kernel_dim = 1;
+
+        let key_heads = cfg.linear_num_key_heads;
+        let value_heads = cfg.linear_num_value_heads();
+        let ratio = value_heads / key_heads; // 3
+        let hidden = cfg.hidden_size;
+        let qkv_dim = cfg.linear_qkv_dim(); // 4*4*2 + 12*2 = 56
+        let output_dim = cfg.linear_output_dim(); // 12*2 = 24
+        let key_dim = cfg.linear_key_head_dim;
+        let value_dim = cfg.linear_value_head_dim;
+        let kernel_size = cfg.linear_conv_kernel_dim;
+
+        // in_proj_a: each value head h has a DISTINCT leading weight so alpha[h] differs.
+        // in_proj_b: each head uses the SAME weight as its key head so beta[h] is equal
+        // within a key group — removing beta as a driver of S divergence, isolating decay.
+        let mut in_proj_a = vec![0.0_f32; value_heads * hidden];
+        let mut in_proj_b = vec![0.0_f32; value_heads * hidden];
+        for h in 0..value_heads {
+            in_proj_a[h * hidden] = (h as f32 + 1.0) * 0.3; // distinct per value head
+            let k_head = h / ratio;
+            in_proj_b[h * hidden] = (k_head as f32 + 1.0) * 0.2; // same within key group
+        }
+
+        // Distinct a_log and dt_bias per value head (the core parameters being fixed).
+        let a_log: Vec<f32> = (0..value_heads).map(|h| (h as f32) * 0.5 - 2.5).collect();
+        let dt_bias: Vec<f32> = (0..value_heads).map(|h| (h as f32) * 0.1 - 0.5).collect();
+
+        // QKV, Z, out weights: uniform so V rows are identical across value heads.
+        let in_proj_qkv = vec![0.01_f32; qkv_dim * hidden];
+        let in_proj_z = vec![0.01_f32; output_dim * hidden];
+        let conv1d_weight = vec![1.0_f32; qkv_dim * kernel_size];
+        let out_proj = vec![0.01_f32; hidden * output_dim];
+        let norm_weight = vec![1.0_f32; value_dim];
+
+        let weights = GatedDeltaNetWeights {
+            in_proj_qkv,
+            in_proj_qkv_rows: qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z,
+            in_proj_z_rows: output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b,
+            in_proj_b_rows: value_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a,
+            in_proj_a_rows: value_heads,
+            in_proj_a_cols: hidden,
+            a_log,
+            dt_bias,
+            conv1d_weight,
+            conv_dim: qkv_dim,
+            kernel_size,
+            norm_weight,
+            out_proj,
+            out_proj_rows: hidden,
+            out_proj_cols: output_dim,
+        };
+
+        let mut state = GatedDeltaNetState::new(&cfg);
+        let s_size = key_dim * value_dim; // 4*2 = 8
+
+        // Pre-seed S matrices for group {3,4,5} with equal non-zero values so the
+        // decay term `g * S_old` is non-trivial and different g values drive divergence.
+        for j in 0..s_size {
+            state.s_matrices[3 * s_size + j] = 0.5;
+            state.s_matrices[4 * s_size + j] = 0.5;
+            state.s_matrices[5 * s_size + j] = 0.5;
+        }
+
+        let mut scratch = GatedDeltaNetFusedScratch::default();
+        let mut output = vec![0.0_f32; hidden];
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32 + 1.0) / (hidden as f32))
+            .collect();
+
+        gated_delta_net_step_fused(
+            &input,
+            &mut state,
+            &weights,
+            &cfg,
+            &mut scratch,
+            &mut output,
+            &crate::lora_hook::NoopLoraHook,
+            0,
+        );
+
+        assert!(
+            scratch.alpha_proj.len() >= value_heads,
+            "alpha_proj len {} < value_heads {}; ensure_capacity must use value_heads",
+            scratch.alpha_proj.len(),
+            value_heads
+        );
+        assert!(
+            scratch.beta_proj.len() >= value_heads,
+            "beta_proj len {} < value_heads {}",
+            scratch.beta_proj.len(),
+            value_heads
+        );
+
+        // With correct value-head indexing: a_log[3]≠a_log[4] and alpha_proj[3]≠alpha_proj[4]
+        // → g3≠g4.  With regression to k_head indexing: g3=g4=g5 (all k_head=1).
+        // S[3] and S[4] start equal (both seeded 0.5).  S_new = g*S_old + outer(k, delta).
+        // delta = (v - g*kv_mem)*beta where v,beta,kv_mem are equal for h=3,4 by construction.
+        // Therefore divergence in S_new[3] vs S_new[4] is SOLELY from g3 ≠ g4.
+        let s3 = state.s_matrices[3 * s_size..4 * s_size].to_vec();
+        let s4 = state.s_matrices[4 * s_size..5 * s_size].to_vec();
+        assert_ne!(
+            s3, s4,
+            "S[h=3] and S[h=4] must diverge after one step (decay gates g3≠g4 drive it); \
+             regression to k_head indexing collapses g3=g4 → S stays equal"
+        );
+        let s4 = state.s_matrices[4 * s_size..5 * s_size].to_vec();
+        let s5 = state.s_matrices[5 * s_size..6 * s_size].to_vec();
+        assert_ne!(
+            s4, s5,
+            "S[h=4] and S[h=5] must also diverge (decay gates g4≠g5)"
+        );
+    }
 
     #[test]
     #[should_panic]
