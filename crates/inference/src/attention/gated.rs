@@ -24,8 +24,9 @@ use crate::forward::cpu::simd_config;
 ///
 /// # Panics
 ///
-/// Panics (debug-only) if `q_and_gate.len() != 2 * num_heads * head_dim`,
-/// `q_buf.len() != num_heads * head_dim`, or `gate_buf.len() != num_heads * head_dim`.
+/// Panics if `num_heads * head_dim` or `2 * q_dim` overflows `usize`, or if
+/// `q_and_gate.len() != 2 * num_heads * head_dim`, `q_buf.len() != num_heads * head_dim`,
+/// or `gate_buf.len() != num_heads * head_dim`.
 #[inline]
 pub fn deinterleave_q_gate(
     q_and_gate: &[f32],
@@ -34,10 +35,36 @@ pub fn deinterleave_q_gate(
     num_heads: usize,
     head_dim: usize,
 ) {
+    assert!(
+        num_heads.checked_mul(head_dim).is_some(),
+        "deinterleave_q_gate shape overflow: num_heads * head_dim"
+    );
     let q_dim = num_heads * head_dim;
-    debug_assert_eq!(q_and_gate.len(), 2 * q_dim);
-    debug_assert_eq!(q_buf.len(), q_dim);
-    debug_assert_eq!(gate_buf.len(), q_dim);
+    assert!(
+        q_dim.checked_mul(2).is_some(),
+        "deinterleave_q_gate shape overflow: 2 * q_dim"
+    );
+    assert_eq!(
+        q_and_gate.len(),
+        2 * q_dim,
+        "deinterleave_q_gate: q_and_gate.len()={} != 2 * num_heads * head_dim={}",
+        q_and_gate.len(),
+        2 * q_dim
+    );
+    assert_eq!(
+        q_buf.len(),
+        q_dim,
+        "deinterleave_q_gate: q_buf.len()={} != num_heads * head_dim={}",
+        q_buf.len(),
+        q_dim
+    );
+    assert_eq!(
+        gate_buf.len(),
+        q_dim,
+        "deinterleave_q_gate: gate_buf.len()={} != num_heads * head_dim={}",
+        gate_buf.len(),
+        q_dim
+    );
 
     for h in 0..num_heads {
         let src = h * head_dim * 2;
@@ -363,6 +390,23 @@ mod tests {
         deinterleave_q_gate(&packed, &mut q_buf, &mut gate_buf, num_heads, head_dim);
         assert_eq!(q_buf, [1.0, 2.0, 5.0, 6.0]);
         assert_eq!(gate_buf, [3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "q_and_gate.len()")]
+    fn test_deinterleave_rejects_overlong_packed_input() {
+        // A too-LONG packed buffer does not index-panic in the copy loop (the
+        // source has enough elements), so without the release-active length
+        // assert it would silently process only the first 2*q_dim and succeed.
+        // The guard must reject it. Mutation-sensitive: removing the assert_eq!
+        // makes this test fail (no panic on the silent partial result).
+        let num_heads = 2usize;
+        let head_dim = 2usize;
+        let q_dim = num_heads * head_dim;
+        let overlong = vec![0.0f32; 2 * q_dim + 2];
+        let mut q_buf = vec![0.0f32; q_dim];
+        let mut gate_buf = vec![0.0f32; q_dim];
+        deinterleave_q_gate(&overlong, &mut q_buf, &mut gate_buf, num_heads, head_dim);
     }
 
     // ---------------------------------------------------------------
