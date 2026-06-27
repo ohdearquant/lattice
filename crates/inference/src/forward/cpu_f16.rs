@@ -504,6 +504,18 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
         for v in &mut scratch.router_logits[..num_experts] {
             *v /= denom;
         }
+    } else {
+        // Fail closed on a non-finite denom (NaN/±inf router logit from a corrupt
+        // f16 router gate weight or an upstream activation overflow), mirroring
+        // the f32 router fix in qwen35/moe.rs::compute_router_probs and
+        // generate.rs compute_attention (#409/#410). `max_logit` can stay finite
+        // when only one lane is NaN (Rust `f32::max` ignores a single NaN), so
+        // the NaN propagates into `denom` here and `denom > 0.0` is false.
+        // Without this the router would leave un-normalized raw `exp` values and,
+        // worse, an all-NaN row selects nothing below (`NaN > NEG_INF` is false),
+        // leaving a `usize::MAX` sentinel that overflows expert indexing. Zeroing
+        // drops the routed path (the shared expert still runs).
+        scratch.router_logits[..num_experts].fill(0.0);
     }
 
     // Insertion-sort top-k selection.
@@ -540,6 +552,13 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
 
     for idx in 0..top_k {
         let (expert_id, weight) = scratch.router_selected[idx];
+        // Defense in depth: never index expert weights with an unfilled sentinel
+        // slot. A degenerate router row can leave `(usize::MAX, _)` for a rank it
+        // could not fill; `usize::MAX * gate_up_stride` overflows/panics. The
+        // debug_assert below documents the invariant the denom-else now enforces.
+        if expert_id >= num_experts {
+            continue;
+        }
         debug_assert_ne!(expert_id, usize::MAX);
 
         let gate_up_stride = 2 * inter * hidden;
@@ -1232,5 +1251,81 @@ mod tests {
                 "zero weights + zero input should produce zero output"
             );
         }
+    }
+
+    /// A NaN reaching the f16 MoE router (corrupt f16 router gate weight or an
+    /// upstream activation overflow) makes every router logit NaN. Before the
+    /// fail-closed guards `moe_ffn_step_f16` left NaN probabilities (the
+    /// `denom > 0.0` path was skipped), top-k selected nothing (`NaN > NEG_INF`
+    /// is false), and the routed-expert loop indexed expert weights at
+    /// `usize::MAX * stride` → overflow/OOB panic on the (bench-only public)
+    /// `generate_f16` path. This is the f16 sibling of the f32 fix in
+    /// qwen35/moe.rs (#410). The router must fail closed and no `usize::MAX`
+    /// sentinel may reach accumulation.
+    #[test]
+    fn test_moe_ffn_step_f16_nan_router_fails_closed_no_panic() {
+        use crate::weights::f16_weights::{
+            F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
+        };
+        let num_experts = 4usize;
+        let hidden = 4usize;
+        let inter = 2usize;
+        let shared_inter = 2usize;
+        let top_k = 2usize;
+
+        let nan16 = F16::from_f32(f32::NAN).0;
+        let zeros = |n: usize| vec![F16::from_f32(0.0).0; n];
+
+        // Every router gate weight is NaN → every router logit is NaN.
+        let router = F16MoeRouter::new(
+            vec![nan16; num_experts * hidden],
+            num_experts,
+            top_k,
+            hidden,
+        )
+        .unwrap();
+        let experts = F16RoutedExperts::new(
+            zeros(num_experts * 2 * inter * hidden),
+            zeros(num_experts * hidden * inter),
+            num_experts,
+            hidden,
+            inter,
+        )
+        .unwrap();
+        let shared = F16SharedExpert::new(
+            zeros(shared_inter * hidden),
+            zeros(shared_inter * hidden),
+            zeros(hidden * shared_inter),
+            zeros(hidden),
+            hidden,
+            shared_inter,
+        )
+        .unwrap();
+        let moe = F16MoeLayerWeights {
+            router,
+            experts,
+            shared_expert: shared,
+        };
+
+        let mut scratch = ForwardScratch::new();
+        let buf = inter.max(shared_inter);
+        scratch.ffn_out.resize(hidden, 1.0);
+        scratch.input_tmp.resize(hidden, 0.0);
+        scratch.expert_out.resize(hidden, 0.0);
+        scratch.gate_buf.resize(buf, 0.0);
+        scratch.up_buf.resize(buf, 0.0);
+        scratch.down_input.resize(buf, 0.0);
+        scratch.router_logits.resize(num_experts, 0.0);
+        scratch.router_selected.resize(top_k, (usize::MAX, 0.0));
+
+        // Must not panic (was: usize::MAX expert_id → OOB slice / overflow).
+        moe_ffn_step_f16(&moe, &mut scratch, hidden);
+
+        assert!(
+            scratch.router_selected[..top_k]
+                .iter()
+                .all(|(id, _)| *id < num_experts),
+            "degenerate f16 router must not leave a usize::MAX sentinel selected"
+        );
     }
 }
