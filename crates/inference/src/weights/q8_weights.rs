@@ -316,6 +316,16 @@ pub(crate) fn quantize_model_weights(
 ///
 /// Quantize a `GatedDeltaNetWeights` bundle into its Q8 representation.
 pub fn quantize_gdn_weights(w: &GatedDeltaNetWeights) -> Q8GatedDeltaNetWeights {
+    debug_assert_eq!(
+        w.in_proj_b_rows,
+        w.a_log.len(),
+        "in_proj_b_rows must equal num_value_heads (a_log.len)"
+    );
+    debug_assert_eq!(
+        w.in_proj_a_rows,
+        w.dt_bias.len(),
+        "in_proj_a_rows must equal num_value_heads (dt_bias.len)"
+    );
     Q8GatedDeltaNetWeights {
         in_proj_qkv: quantize_matrix(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols),
         in_proj_z: quantize_matrix(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols),
@@ -390,7 +400,7 @@ pub fn memory_report(cfg: &Qwen35Config) -> (usize, usize, f32) {
 
     let qkv_dim = cfg.linear_qkv_dim();
     let linear_output_dim = cfg.linear_output_dim();
-    let linear_heads = cfg.linear_num_key_heads;
+    let linear_heads = cfg.linear_num_value_heads();
 
     let q_dim = cfg.full_q_dim();
     let kv_dim = cfg.full_kv_dim();
