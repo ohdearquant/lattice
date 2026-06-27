@@ -39,13 +39,20 @@ impl Qwen35Model {
             });
         }
 
-        // Context preflight: prefill + decode drive RoPE positions up to
-        // prompt_len + max_new_tokens, and apply_partial_rope indexes the
-        // precomputed cos/sin table unchecked. Past max_context() that is an
-        // out-of-bounds slice access — a release panic, not a clean error.
-        // Mirror the HTTP server's contract (bin/lattice.rs) so direct and HTTP
-        // generation agree on when a request is too long. Same guard in
-        // generate_streaming.
+        // Context preflight. apply_partial_rope indexes the precomputed cos/sin
+        // table unchecked, so a position at or past max_context() is an
+        // out-of-bounds slice access — a release panic, not a clean error. The
+        // exact highest position the CPU loop reaches is prompt_len +
+        // max_new_tokens - 2 (prefill 0..prompt_len-1; the first token reuses
+        // prefill logits with no new RoPE lookup; decode runs `1..max_new_tokens`
+        // from position prompt_len), so the precise RoPE-safe bound is
+        // prompt_len + max_new_tokens - 1 <= max_context. We deliberately adopt
+        // the stricter total-token policy prompt_len + max_new_tokens <=
+        // max_context instead: it is the OpenAI-style "prompt plus requested
+        // completion fits the window" contract and matches the HTTP server
+        // (bin/lattice.rs) verbatim, so direct and HTTP generation agree on when
+        // a request is too long. Strictly safe (it can only reject one extra
+        // edge request, never admit a panic). Same guard in generate_streaming.
         let max_context = self.max_context();
         if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
             return Err(InferenceError::Inference(format!(
@@ -200,9 +207,10 @@ impl Qwen35Model {
             });
         }
 
-        // Context preflight: see generate() for rationale — apply_partial_rope
-        // indexes the RoPE table unchecked, so a request past max_context() would
-        // panic in the decode loop. Mirror the HTTP server's contract.
+        // Context preflight: see generate() for the full rationale and the exact
+        // vs. adopted-bound discussion. apply_partial_rope indexes the RoPE table
+        // unchecked, so a request past max_context() would panic in the decode
+        // loop; this mirrors the HTTP server's total-token contract verbatim.
         let max_context = self.max_context();
         if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
             return Err(InferenceError::Inference(format!(
