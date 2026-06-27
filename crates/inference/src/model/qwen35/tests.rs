@@ -815,4 +815,58 @@ mod lora_serving {
         assert!(out.token_ids.is_empty(), "token_ids must be empty");
         assert!(out.prompt_tokens > 0, "prompt must still be counted");
     }
+
+    #[test]
+    fn generate_rejects_request_exceeding_context_window() {
+        // A direct generate() call whose prompt + max_new_tokens exceeds the
+        // RoPE table capacity must return a clean error, NOT panic in the
+        // decode loop by indexing the cos/sin table past its end. The HTTP
+        // server preflights this (bin/lattice.rs); the public library method
+        // must agree. Mutation-sensitive: the preflight is the only path to
+        // Err for a non-empty prompt with a large max_new_tokens — without it
+        // this input either panics (index OOB) or returns Ok, both of which
+        // fail expect_err.
+        let cfg = test_config();
+        let model = build_model(cfg, 0xBEEF_CAFE);
+        let max_context = model.max_context();
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens: max_context + 16,
+            ..Default::default()
+        };
+        let err = model
+            .generate("abc", &gen_cfg)
+            .expect_err("request beyond context window must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window") && msg.contains(&format!("{max_context}")),
+            "error must name the context window and the bound; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn generate_streaming_rejects_request_exceeding_context_window() {
+        // Same preflight contract as generate(); the streaming variant shares
+        // the guard. on_token must never fire because the error returns before
+        // any forward pass.
+        let cfg = test_config();
+        let model = build_model(cfg, 0xBEEF_CAFD);
+        let max_context = model.max_context();
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens: max_context + 16,
+            ..Default::default()
+        };
+        let mut emitted = 0usize;
+        let err = model
+            .generate_streaming("abc", &gen_cfg, |_| emitted += 1)
+            .expect_err("request beyond context window must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window") && msg.contains(&format!("{max_context}")),
+            "error must name the context window and the bound; got: {msg}"
+        );
+        assert_eq!(
+            emitted, 0,
+            "no tokens may stream when the request is rejected"
+        );
+    }
 }
