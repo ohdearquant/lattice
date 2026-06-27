@@ -107,17 +107,28 @@ impl CandidateSet {
     /// non-positive, or non-finite (NaN/±inf) — none of those carry a valid
     /// scaling, and `1.0 / NaN` would poison every logit with NaN.
     ///
-    /// A finite-but-tiny temperature has a reciprocal that overflows `f32`. Left
-    /// unclamped it would collapse every logit to `+inf`, destroying their order, and
-    /// downstream sampling would then return token 0 instead of the argmax — even though
-    /// the `t -> 0+` limit must stay greedy. The multiplier is clamped to the same bound
-    /// `temperature_degenerate` uses, so for any logit within `MAX_PLAUSIBLE_ABS_LOGIT` the
-    /// scaled value stays finite and the argmax is preserved (softmax -> one-hot on argmax).
+    /// A finite-but-tiny temperature has a reciprocal that overflows `f32`, so it carries
+    /// no valid finite scaling: the `t -> 0+` limit is hard-greedy. Scaling such a
+    /// temperature (even with a clamped multiplier) leaves close logits near 50/50, so
+    /// `sample_top_p` could still return a non-argmax token. Instead collapse the set to a
+    /// one-hot on the argmax — the same hard-argmax route the main `Sampler` takes for a
+    /// degenerate temperature (see `temperature_degenerate`).
     pub fn apply_temperature(&mut self, temperature: f32) {
         if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
             return;
         }
-        let inv = (1.0 / temperature).min(f32::MAX / MAX_PLAUSIBLE_ABS_LOGIT);
+        if temperature_degenerate(temperature) {
+            let best = self.argmax();
+            for c in &mut self.candidates {
+                c.logit = if c.token_id == best {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+            return;
+        }
+        let inv = 1.0 / temperature;
         for c in &mut self.candidates {
             c.logit *= inv;
         }
@@ -932,6 +943,22 @@ mod tests {
             cs.sample_top_p(1.0, 0.0),
             1,
             "tiny positive temperature must resolve to the argmax (greedy), not token 0"
+        );
+    }
+
+    #[test]
+    fn apply_temperature_tiny_temp_is_hard_greedy_for_close_logits() {
+        // Even an arbitrarily small logit gap must resolve to hard argmax under a
+        // degenerate temperature (the t -> 0+ limit), matching the main Sampler's
+        // `temperature_degenerate` route. A finite multiplier (clamped or not) would
+        // leave these two near 50/50, so `sample_top_p(1.0, 0.75)` could draw token 0;
+        // the one-hot collapse makes the argmax (token 1) the only reachable draw.
+        let mut cs = CandidateSet::from_full_logits(&[0.0, f32::from_bits(1)]);
+        cs.apply_temperature(1e-45);
+        assert_eq!(
+            cs.sample_top_p(1.0, 0.75),
+            1,
+            "degenerate temperature must be hard-greedy even for adjacent logits"
         );
     }
 
