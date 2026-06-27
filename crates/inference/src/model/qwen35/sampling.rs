@@ -90,18 +90,25 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
     }
 }
 
+/// Greedy argmax with **first-wins** tie-break.
+///
+/// `Iterator::max_by` keeps the *last* element on `Ordering::Equal`, so tied
+/// maximum logits (e.g. `[0.0, 1.0, 1.0]`) returned the higher token-id — the
+/// opposite of the engine-wide greedy contract. `speculative::argmax`,
+/// `sampling::argmax_f32_scalar`, the Metal greedy path, and `torch.argmax` all
+/// return the *first* occurrence (#280). This mirrors them exactly: strict `>`
+/// from `NEG_INFINITY` skips `NaN` (a `NaN` comparison is always false) and
+/// returns 0 on empty / all-`NaN` input.
 fn greedy_token(adjusted: &[f32]) -> u32 {
-    adjusted
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| match (a.is_nan(), b.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        })
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in adjusted.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }
 
 fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize, f32)>> {
@@ -235,6 +242,29 @@ mod tests {
                 "degenerate temperature {bad} must fall back to argmax (token 1)"
             );
         }
+    }
+
+    #[test]
+    fn test_greedy_tie_break_is_first_wins() {
+        // Tied maximum logits must return the FIRST occurrence, matching
+        // speculative::argmax, sampling::argmax_f32_scalar, the Metal greedy
+        // path, and torch.argmax (#280). The prior `max_by` returned the LAST
+        // tied index (token 2 here) — a silent greedy-parity divergence on ties.
+        let logits = [0.0_f32, 1.0, 1.0];
+        assert_eq!(greedy_token(&logits), 1, "first-wins on tied max");
+
+        // Same contract through the public degenerate-temperature entry point.
+        let mut rng = 3u64;
+        let token = sample_token(&logits, &cfg(0.0, 0), &[], &mut rng);
+        assert_eq!(token, 1, "temperature=0 greedy must be first-wins on ties");
+
+        // NaN is skipped; the first finite max wins.
+        let with_nan = [f32::NAN, 2.0_f32, 2.0];
+        assert_eq!(
+            greedy_token(&with_nan),
+            1,
+            "NaN skipped, first finite max wins"
+        );
     }
 
     #[test]
