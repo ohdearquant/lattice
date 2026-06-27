@@ -1130,7 +1130,7 @@ kernel void gdn_recurrence_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate
-    float a = exp(a_log[k_head]);
+    float a = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
     float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
     float g = exp(-a * sp);
 
@@ -1264,7 +1264,7 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate
-    float a = exp(a_log[k_head]);
+    float a = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
     float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
     float g = exp(-a * sp);
 
@@ -1377,7 +1377,7 @@ kernel void gdn_precompute_keys(
     float ks_inv      = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
     float k_norm_val  = k_val * ks_inv;
 
-    float a  = exp(a_log[k_head]);
+    float a  = min(exp(a_log[k_head]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
     float sp = log(1.0f + exp(alpha_val + dt_bias[k_head]));
     float g  = exp(-a * sp);
 
@@ -9919,7 +9919,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 simd_l2_normalize(&mut q_head);
                 simd_l2_normalize(&mut k_head);
 
-                let a = a_log[kh].exp();
+                let a = a_log[kh].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
                 let sp = softplus(alpha_proj[kh] + dt_bias[kh]);
                 let g = (-a * sp).exp();
 
@@ -10100,7 +10100,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 simd_l2_normalize(&mut q_head);
                 simd_l2_normalize(&mut k_head);
 
-                let a = a_log_v[kh].exp();
+                let a = a_log_v[kh].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
                 let sp = softplus(alpha_proj[kh] + dt_bias_v[kh]);
                 let g = (-a * sp).exp();
 
@@ -18099,7 +18099,11 @@ kernel void decode_attention_reference(
             let vocab = 32usize;
             let num_kh = 1usize;
             let kd = 16usize;
-            let vd = 16usize;
+            // vd * num_kh = GDN out_dim = the contraction dim K of the out_proj Q8
+            // GEMM, which the GEMV/GEMM kernel requires to be a multiple of 32 (real
+            // configs use vd=128). 16 made the GDN-only GPU tests crash on real Apple
+            // hardware (and silently skip in paravirtual CI where no Metal device exists).
+            let vd = 32usize;
             let qkv_dim = num_kh * kd * 2 + num_kh * vd; // Q+K+V
             let out_dim = num_kh * vd;
             let ks = 4usize;
@@ -18242,6 +18246,46 @@ kernel void decode_attention_reference(
             assert!(
                 logits.iter().all(|v| v.is_finite()),
                 "all GDN-only logits must be finite"
+            );
+        }
+
+        /// Mutation-sensitive guard for the GDN decode decay-gate clamp.
+        ///
+        /// When `a_log > ~88`, the kernel's `exp(a_log)` overflows to `+inf`; when
+        /// `alpha + dt_bias` drives softplus to exactly `0.0`, the *unclamped*
+        /// product is `inf * 0 = NaN`, which poisons the recurrent state and every
+        /// subsequent logit (coherent-early / garbage-late on long generations).
+        /// The fix mirrors the CPU `compute_decay_gate` clamp (`exp(a_log).min(MAX)`).
+        /// This test FAILS (non-finite logits) if the decode clamp is reverted and
+        /// PASSES once it is present.
+        #[test]
+        fn forward_step_gdn_only_decay_gate_clamps_overflow() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, mut weights) = tiny_hybrid_fixture();
+
+            // Drive every GDN head into the overflow corner: a_log huge (exp -> +inf)
+            // and dt_bias very negative (softplus -> 0). Unclamped: inf * 0 = NaN.
+            for (attn, _) in weights.layers.iter_mut() {
+                if let AttentionWeights::Linear(gdn) = attn {
+                    for a in gdn.a_log.iter_mut() {
+                        *a = 100.0;
+                    }
+                    for b in gdn.dt_bias.iter_mut() {
+                        *b = -200.0;
+                    }
+                }
+            }
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let logits = state.forward_step_gdn_only(1, 0);
+
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "GDN decode decay-gate must clamp exp(a_log) to finite; got non-finite \
+                 logits (inf * 0 = NaN poison) — the decode clamp was reverted"
             );
         }
 
