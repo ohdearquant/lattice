@@ -154,6 +154,13 @@ final class AppStore {
             ?? URL(fileURLWithPath: chatSessionModelPath).lastPathComponent
     }
 
+    /// True from the moment a serve process is spawned until it emits `ready` (model resident).
+    /// The process is `isRunning` the instant it spawns, well before the weights finish loading,
+    /// so this flag — not `isChatSessionWarm` — is what gates the honest LOADED state.
+    var isChatModelLoading: Bool = false
+    /// Last chat-session spawn error (nil when none). Surfaced by the Load button.
+    var chatLoadError: String? = nil
+
     init() {
         runs = Self.loadRunArchive()
         measuredPPL = Self.loadPPLArchive()
@@ -386,6 +393,10 @@ final class AppStore {
             // download_done events are handled by downloadModel's dedicated RunHandle;
             // they should never reach a LiveRun's consume path.
             break
+        case .ready:
+            // ready (model-loaded) is intercepted in the chat session's onEvent handler to clear
+            // the loading flag; it carries no per-run state, so consume is a no-op.
+            break
         case .status(let line):
             run.appendLog(line)
         case .unknown(let j):
@@ -433,8 +444,6 @@ final class AppStore {
     @discardableResult
     @MainActor
     func runChatGPU(_ config: GenConfig) -> LiveRun {
-        let modelPath = config.modelDir?.path ?? config.model ?? ""
-        let tokenizerPath = config.tokenizerDir?.path
         let modelName: String
         if let dir = config.modelDir {
             modelName = dir.lastPathComponent
@@ -447,67 +456,16 @@ final class AppStore {
         let run = LiveRun(kind: .chat, modelName: modelName)
         liveRun = run
 
-        // Tear down the existing session if the model or tokenizer has changed.
-        if chatSessionHandle?.isRunning == true,
-           (chatSessionModelPath != modelPath || chatSessionTokenizerPath != tokenizerPath) {
-            chatSessionHandle?.stop()
-            chatSessionHandle = nil
+        // A spawn means the weights load now; surface that as model-loading so the UI shows
+        // the same LOADING state whether the user pressed Load first or sent a cold message.
+        let wasWarm = (chatSessionHandle?.isRunning == true)
+        guard spawnChatSession(config) else {
+            isChatModelLoading = false
+            run.status = .failed
+            run.appendLog("error: \(chatLoadError ?? "could not start chat session")")
+            return run
         }
-
-        // Spawn a new session if none is alive.
-        if chatSessionHandle?.isRunning != true {
-            var args: [String] = ["--json", "--serve"]
-            if let dir = config.modelDir {
-                args += ["--model-dir", dir.path]
-            } else if let name = config.model {
-                args += ["--model", name]
-            }
-            if let tokDir = config.tokenizerDir {
-                args += ["--tokenizer-dir", tokDir.path]
-            }
-
-            guard let spec = LatticeBridge.launchSpec(.chatMetal, args: args) else {
-                run.status = .failed
-                run.appendLog("error: could not resolve `chat_metal` — no prebuilt binary and no cargo fallback. Run `make build` in the lattice repo, or set LATTICE_BIN_DIR.")
-                return run
-            }
-            run.appendLog("$ \(spec.executable.lastPathComponent) \(args.joined(separator: " "))")
-
-            let h = RunHandle()
-            h.onEvent = { [weak self] ev in
-                // Route events to the current chat LiveRun only while it is in flight.
-                guard let self = self,
-                      let lr = self.liveRun, lr.kind == .chat, lr.status == .running else { return }
-                self.consume(ev, into: lr)
-                // The serve loop does not exit between requests, so we drive completion
-                // via the done:true token event rather than the process exit.
-                if case .genToken(let g) = ev, g.done == true {
-                    self.finish(lr, code: 0)
-                }
-            }
-            h.onExit = { [weak self] code in
-                guard let self = self else { return }
-                self.chatSessionHandle = nil
-                self.chatSessionModelPath = ""
-                self.chatSessionTokenizerPath = nil
-                // Resolve any in-flight turn when the session exits unexpectedly.
-                if let lr = self.liveRun, lr.kind == .chat, lr.status == .running {
-                    self.finish(lr, code: code)
-                }
-            }
-
-            do {
-                try h.start(spec)
-            } catch {
-                run.status = .failed
-                run.appendLog("launch failed: \(error.localizedDescription)")
-                return run
-            }
-
-            chatSessionHandle = h
-            chatSessionModelPath = modelPath
-            chatSessionTokenizerPath = tokenizerPath
-        }
+        if !wasWarm { isChatModelLoading = true }
 
         // Encode the request and write it to the session's stdin.
         let req = ChatServeRequest(
@@ -527,6 +485,101 @@ final class AppStore {
         }
         chatSessionHandle?.send(line: reqLine)
         return run
+    }
+
+    /// Preload a model into a warm `chat_metal --json --serve` session WITHOUT sending a request.
+    ///
+    /// Backs the "Load model" button: spawns (or reuses) the serve process so the weights become
+    /// resident before the first message, turning the first turn's multi-second cold load into an
+    /// up-front, visible step. No-op when a session for this exact model+tokenizer is already warm.
+    @MainActor
+    func warmChatSession(_ config: GenConfig) {
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+        if chatSessionHandle?.isRunning == true,
+           chatSessionModelPath == modelPath, chatSessionTokenizerPath == tokenizerPath {
+            return
+        }
+        chatLoadError = nil
+        isChatModelLoading = true
+        if !spawnChatSession(config) {
+            isChatModelLoading = false
+        }
+    }
+
+    /// Ensure a warm `chat_metal --json --serve` process exists for this config's model+tokenizer,
+    /// spawning one if needed and tearing down a session bound to a different model. Does NOT send a
+    /// request — shared by `runChatGPU` (which then sends) and `warmChatSession` (load-only).
+    /// Returns true when a live session is available; on failure sets `chatLoadError` and returns false.
+    @MainActor
+    private func spawnChatSession(_ config: GenConfig) -> Bool {
+        let modelPath = config.modelDir?.path ?? config.model ?? ""
+        let tokenizerPath = config.tokenizerDir?.path
+
+        // Tear down the existing session if the model or tokenizer has changed.
+        if chatSessionHandle?.isRunning == true,
+           (chatSessionModelPath != modelPath || chatSessionTokenizerPath != tokenizerPath) {
+            chatSessionHandle?.stop()
+            chatSessionHandle = nil
+        }
+        if chatSessionHandle?.isRunning == true { return true }
+
+        var args: [String] = ["--json", "--serve"]
+        if let dir = config.modelDir {
+            args += ["--model-dir", dir.path]
+        } else if let name = config.model {
+            args += ["--model", name]
+        }
+        if let tokDir = config.tokenizerDir {
+            args += ["--tokenizer-dir", tokDir.path]
+        }
+
+        guard let spec = LatticeBridge.launchSpec(.chatMetal, args: args) else {
+            chatLoadError = "could not resolve `chat_metal` — no prebuilt binary and no cargo fallback. Run `make build` in the lattice repo, or set LATTICE_BIN_DIR."
+            return false
+        }
+
+        let h = RunHandle()
+        h.onEvent = { [weak self] ev in
+            guard let self = self else { return }
+            // `ready` fires once when the weights finish loading. Clear the loading flag even
+            // when no generation turn is in flight (the Load button warms with no request).
+            if case .ready = ev {
+                self.isChatModelLoading = false
+                return
+            }
+            // Route generation events to the current chat LiveRun only while it is in flight.
+            guard let lr = self.liveRun, lr.kind == .chat, lr.status == .running else { return }
+            self.consume(ev, into: lr)
+            // The serve loop does not exit between requests, so we drive completion
+            // via the done:true token event rather than the process exit.
+            if case .genToken(let g) = ev, g.done == true {
+                self.finish(lr, code: 0)
+            }
+        }
+        h.onExit = { [weak self] code in
+            guard let self = self else { return }
+            self.chatSessionHandle = nil
+            self.chatSessionModelPath = ""
+            self.chatSessionTokenizerPath = nil
+            self.isChatModelLoading = false
+            // Resolve any in-flight turn when the session exits unexpectedly.
+            if let lr = self.liveRun, lr.kind == .chat, lr.status == .running {
+                self.finish(lr, code: code)
+            }
+        }
+
+        do {
+            try h.start(spec)
+        } catch {
+            chatLoadError = "launch failed: \(error.localizedDescription)"
+            return false
+        }
+
+        chatSessionHandle = h
+        chatSessionModelPath = modelPath
+        chatSessionTokenizerPath = tokenizerPath
+        return true
     }
 
     func pauseRun() { handle?.pause(); liveRun?.status = .paused }

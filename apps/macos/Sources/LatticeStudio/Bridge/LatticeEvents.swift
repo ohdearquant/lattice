@@ -21,6 +21,7 @@ enum LatticeEvent: Equatable {
     case quantLayer(QuantLayer)
     case quantDone(QuantDone)
     case genToken(GenToken)
+    case ready                    // chat_metal --serve: model fully loaded, serve loop ready
     case perplexity(Perplexity)   // eval_perplexity --json: one row per measurement label
     case embedDone(EmbedDone)         // embed --json: cosine matrix + optional preview vectors
     case downloadDone(DownloadDone)   // embed --download-only --json: one event on completion
@@ -173,6 +174,7 @@ enum LatticeEventParser {
         case "quant_layer": return (try? decoder.decode(LatticeEvent.QuantLayer.self, from: data)).map(LatticeEvent.quantLayer) ?? .unknown(jsonText)
         case "quant_done":  return (try? decoder.decode(LatticeEvent.QuantDone.self, from: data)).map(LatticeEvent.quantDone) ?? .unknown(jsonText)
         case "gen_token":   return (try? decoder.decode(LatticeEvent.GenToken.self, from: data)).map(LatticeEvent.genToken) ?? .unknown(jsonText)
+        case "ready":       return .ready
         case "perplexity":  return (try? decoder.decode(LatticeEvent.Perplexity.self, from: data)).map(LatticeEvent.perplexity) ?? .unknown(jsonText)
         case "embed_done":     return (try? decoder.decode(LatticeEvent.EmbedDone.self, from: data)).map(LatticeEvent.embedDone) ?? .unknown(jsonText)
         case "download_done":  return (try? decoder.decode(LatticeEvent.DownloadDone.self, from: data)).map(LatticeEvent.downloadDone) ?? .unknown(jsonText)

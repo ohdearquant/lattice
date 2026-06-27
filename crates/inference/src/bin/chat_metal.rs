@@ -658,6 +658,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let stdin_lock = stdin.lock();
             let mut lines = stdin_lock.lines();
 
+            // The model is fully loaded by this point (built above, before the serve loop).
+            // Emit a `ready` event so the app can spawn this process from a "Load model" button
+            // and show an honest LOADED state once the weights are resident — without having to
+            // send a generation request first.
+            {
+                use std::io::Write;
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "@@lattice {{\"ev\":\"ready\"}}");
+                let _ = out.flush();
+            }
+
             loop {
                 let line = match lines.next() {
                     None => break, // stdin closed (app teardown) → exit cleanly
