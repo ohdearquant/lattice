@@ -31,3 +31,6 @@ Thumbs.db
 # Codex/review scratch artifacts (repo-root only)
 /review*.md
 /pr_review*.md
+
+*__pycache__/
+uv.lock
