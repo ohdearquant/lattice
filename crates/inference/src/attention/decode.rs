@@ -876,6 +876,41 @@ mod tests {
         );
     }
 
+    /// A `NaN` inside a 16-wide chunk when `kv_seq_len % 16 == 0` (NO scalar
+    /// tail) must still fail closed. This is the subtlest fail-closed case: with
+    /// no tail lane, the explicit `is_nan` scan in the tail loop never runs, so
+    /// correctness rests entirely on the chunk reduction (`vmaxq_f32` /
+    /// `vmaxvq_f32`, ARM `FMAX`) *propagating* the NaN into `max_val`, which the
+    /// `!max_val.is_finite()` branch then rejects. A future swap to `FMAXNM`
+    /// (`vmaxnmq_f32`, numeric-max that suppresses NaN) would silently normalize
+    /// the NaN row against a finite max instead — this test is the regression
+    /// guard for that. Must match `softmax_decode_scores` (all-zero row).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_decode_softmax_neon_chunk_nan_no_tail_fails_closed() {
+        let kv_seq_len = 16usize; // exactly one 16-wide chunk, zero scalar tail
+        let stride = kv_seq_len;
+        let mut row_neon = vec![0.5f32; kv_seq_len];
+        row_neon[5] = f32::NAN; // NaN in the chunk; no tail lane exists to catch it
+        let mut row_scalar = row_neon.clone();
+        unsafe {
+            softmax_decode_neon(&mut row_neon, 1, kv_seq_len, stride);
+        }
+        softmax_decode_scores(&mut row_scalar, 1, kv_seq_len, stride);
+        assert!(
+            row_neon.iter().all(|x| x.is_finite()),
+            "neon row non-finite: {row_neon:?}"
+        );
+        assert!(
+            row_neon.iter().all(|&x| x == 0.0),
+            "neon no-tail chunk-NaN row should fail closed, got {row_neon:?}"
+        );
+        assert!(
+            row_scalar.iter().all(|&x| x == 0.0),
+            "scalar no-tail chunk-NaN row should fail closed, got {row_scalar:?}"
+        );
+    }
+
     /// An absurd `num_heads` makes `num_heads * head_dim` wrap `usize`; the
     /// release-active overflow guard must reject it before any length check or
     /// unsafe NEON dispatch can act on the wrapped (too-small) product.
