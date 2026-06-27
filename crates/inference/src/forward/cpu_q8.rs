@@ -167,8 +167,11 @@ pub fn gated_delta_net_step_fused_q8(
         simd_l2_normalize(&mut scratch.q_head[..key_dim]);
         simd_l2_normalize(&mut scratch.k_head[..key_dim]);
 
-        // Decay gate (f32 weights: a_log, dt_bias)
-        let a = weights.a_log[k_head].exp();
+        // Decay gate (f32 weights: a_log, dt_bias). Clamp `a_log.exp()` to finite:
+        // it overflows to +inf for a_log > ~88, and `inf * softplus(very_negative)=0.0`
+        // is NaN that poisons the recurrent state. Mirrors gdn_fused::compute_decay_gate
+        // (#314) — the inlined Q8 copy must keep the same clamp.
+        let a = weights.a_log[k_head].exp().min(f32::MAX);
         let sp = softplus(scratch.alpha_proj[k_head] + weights.dt_bias[k_head]);
         let g = (-a * sp).exp();
 
@@ -389,16 +392,24 @@ fn full_attention_step_q8(
             }
         }
 
-        // Softmax
+        // Softmax. Fail closed on a non-finite score row: a NaN Q/K activation
+        // (e.g. from an infinite Q8 scale via `0.0 * inf`) makes `sum_exp` NaN, and
+        // `NaN > 0.0` is false, so without the else-branch the unnormalized NaN
+        // weights would flow into the V accumulation and poison the logits. Mirrors
+        // generate.rs::compute_attention (#409) and cpu_f16 moe_ffn_step_f16 (#411).
         let mut sum_exp = 0.0f32;
         for t in 0..cur_seq_len {
             let e = (scratch.scores[scores_start + t] - max_score).exp();
             scratch.scores[scores_start + t] = e;
             sum_exp += e;
         }
-        let inv_sum = 1.0 / sum_exp;
-        for t in 0..cur_seq_len {
-            scratch.scores[scores_start + t] *= inv_sum;
+        if sum_exp > 0.0 {
+            let inv_sum = 1.0 / sum_exp;
+            for t in 0..cur_seq_len {
+                scratch.scores[scores_start + t] *= inv_sum;
+            }
+        } else {
+            scratch.scores[scores_start..scores_start + cur_seq_len].fill(0.0);
         }
 
         // Weighted sum of V
@@ -663,6 +674,21 @@ pub fn generate_q8(
         return Err(crate::error::InferenceError::Inference(
             "empty prompt".into(),
         ));
+    }
+
+    // Context preflight. The RoPE cos/sin tables are indexed unchecked in
+    // full_attention_step_q8 (`rope.cos_at(position * half + i)`), so a position
+    // at or past the table capacity is an out-of-bounds slice access — a release
+    // panic, not a clean error. Mirror Qwen35Model::generate's total-token policy
+    // (prompt_len + max_new_tokens <= max_context) so direct and HTTP generation
+    // agree on when a request is too long.
+    let max_context = rope.max_positions();
+    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+             model context window ({max_context})",
+            gen_cfg.max_new_tokens
+        )));
     }
 
     // Initialize states
@@ -1049,5 +1075,220 @@ mod tests {
                 "zero weights + zero input should produce zero output"
             );
         }
+    }
+
+    /// Builds the tiny single-head full-attention Q8 fixture used by the
+    /// fail-closed test (mirrors `test_full_attn_step_q8_rope_stride_half_parity`).
+    fn tiny_full_attn_fixture() -> (Qwen35Config, RopeTable, Q8FullAttentionLayerWeights, usize) {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::q8_weights::quantize_matrix;
+
+        let head_dim: usize = 32;
+        let num_q_heads: usize = 1;
+        let num_kv_heads: usize = 1;
+        let hidden: usize = 64;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_q_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+
+        let mut k_proj_f32 = vec![0.0f32; kv_dim * hidden];
+        for j in 0..kv_dim {
+            k_proj_f32[j * hidden + j] = 1.0;
+        }
+        let zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
+            quantize_matrix(&vec![0.0f32; rows * cols], rows, cols)
+        };
+        let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
+        for j in 0..q_dim {
+            q_proj_f32[j * hidden + j] = 1.0;
+        }
+        let weights = Q8FullAttentionLayerWeights {
+            q_proj: quantize_matrix(&q_proj_f32, 2 * q_dim, hidden),
+            k_proj: quantize_matrix(&k_proj_f32, kv_dim, hidden),
+            v_proj: zero_q8(kv_dim, hidden),
+            o_proj: zero_q8(hidden, q_dim),
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+        (cfg, rope, weights, hidden)
+    }
+
+    /// A non-finite attention score row (from an infinite Q8 scale) must fail
+    /// closed instead of propagating NaN into the context and logits. Mutation
+    /// check: deleting the `else { fill(0.0) }` branch leaves NaN in
+    /// `scratch.context`, failing the assertion.
+    #[test]
+    fn test_full_attn_step_q8_nan_score_fails_closed() {
+        let (cfg, rope, mut weights, hidden) = tiny_full_attn_fixture();
+        let q_dim = cfg.full_q_dim();
+
+        // Corrupt Q-projection row 0: zero data * infinite scale => NaN Q lane,
+        // which qwen35_rms_norm spreads across head 0, yielding a NaN score.
+        for d in weights.q_proj.data[0..hidden].iter_mut() {
+            *d = 0;
+        }
+        weights.q_proj.scales[0] = f32::INFINITY;
+
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+        let mut kv_cache = KvCache::new(1);
+
+        full_attention_step_q8(
+            &weights,
+            0,
+            3,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        assert!(
+            scratch.context[..q_dim].iter().all(|v| v.is_finite()),
+            "Q8 attention must fail closed (zero context), not propagate NaN"
+        );
+    }
+
+    /// A decay-gate overflow (`a_log.exp() == +inf`) combined with a softplus
+    /// underflow (`== 0.0`) yields `inf * 0.0 == NaN`, which poisons the
+    /// recurrent state unless `a` is clamped to `f32::MAX`. Mutation check:
+    /// removing `.min(f32::MAX)` leaves NaN in `state.s_matrices`.
+    #[test]
+    fn test_gdn_q8_decay_gate_overflow_fails_closed() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let hidden = cfg.hidden_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let num_heads = cfg.linear_num_key_heads;
+        let kernel_size = cfg.linear_conv_kernel_dim;
+
+        let make_zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
+            crate::weights::q8_weights::Q8Matrix {
+                data: vec![0i8; rows * cols],
+                scales: vec![1.0f32; rows],
+                rows,
+                cols,
+            }
+        };
+
+        let mut a_log = vec![0.0f32; num_heads];
+        let mut dt_bias = vec![0.0f32; num_heads];
+        a_log[0] = 100.0; // exp(100) overflows to +inf
+        dt_bias[0] = -100.0; // softplus(-100) underflows to 0.0
+
+        let weights = Q8GatedDeltaNetWeights {
+            in_proj_qkv: make_zero_q8(qkv_dim, hidden),
+            in_proj_z: make_zero_q8(output_dim, hidden),
+            in_proj_b: make_zero_q8(num_heads, hidden),
+            in_proj_a: make_zero_q8(num_heads, hidden),
+            a_log,
+            dt_bias,
+            conv1d_weight: vec![0.0f32; qkv_dim * kernel_size],
+            conv_dim: qkv_dim,
+            kernel_size,
+            norm_weight: vec![0.0f32; cfg.linear_value_head_dim],
+            out_proj: make_zero_q8(hidden, output_dim),
+        };
+
+        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut scratch = GatedDeltaNetFusedScratch::default();
+        let input = vec![0.0f32; hidden];
+        let mut output = vec![0.0f32; hidden];
+
+        gated_delta_net_step_fused_q8(
+            &input,
+            &mut state,
+            &weights,
+            &cfg,
+            &mut scratch,
+            &mut output,
+        );
+
+        assert!(
+            state.s_matrices.iter().all(|v| v.is_finite()),
+            "GDN recurrent state must stay finite when the decay gate overflows"
+        );
+        assert!(
+            output[..hidden].iter().all(|v| v.is_finite()),
+            "GDN output must stay finite when the decay gate overflows"
+        );
+    }
+
+    /// `generate_q8` must reject a request whose prompt + max_new_tokens exceeds
+    /// the RoPE table capacity with a clean error, not an out-of-bounds RoPE
+    /// panic. The preflight returns before any weight is read, so an empty
+    /// model is sufficient. Mutation check: removing the preflight makes this
+    /// `expect_err` fail (the call would panic or run instead).
+    #[test]
+    fn test_generate_q8_rejects_context_overflow() {
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = Q8ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: usize::MAX,
+            ..Default::default()
+        };
+
+        let err = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
+            .expect_err("request beyond context window must error, not panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window"),
+            "error must name the context window; got: {msg}"
+        );
     }
 }
