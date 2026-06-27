@@ -262,10 +262,11 @@ impl Rng {
 pub struct Sampler {
     config: SamplingConfig,
     rng: Rng,
-    /// Recently generated token IDs (for repetition penalty).
+    /// Token IDs seen since the last `reset`: prompt tokens (from `seed_history`)
+    /// followed by all generated tokens.  Full history is retained for repetition penalty.
     recent_tokens: Vec<u32>,
-    /// Max tokens to track for repetition penalty.
-    max_recent: usize,
+    /// Reused dedup set for penalty application; cleared at the start of each use.
+    penalty_seen: std::collections::HashSet<u32>,
     /// Reused candidate buffer; avoids 1.9 MB alloc per call at vocab=248,320.
     candidate_scratch: Vec<Candidate>,
     /// Reused probability buffer for top-p softmax.
@@ -289,7 +290,7 @@ impl Sampler {
             config,
             rng: Rng::new(seed),
             recent_tokens: Vec::new(),
-            max_recent: 64,
+            penalty_seen: std::collections::HashSet::new(),
             candidate_scratch: Vec::new(),
             prob_scratch: Vec::new(),
             logit_scratch: Vec::new(),
@@ -300,6 +301,15 @@ impl Sampler {
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.rng = Rng::new(seed);
         self
+    }
+
+    /// **Unstable**: seed the repetition-penalty history with prompt tokens.
+    ///
+    /// Call once after construction and before the first `sample` call so
+    /// prompt tokens are penalized from the very first generated token,
+    /// matching the Qwen3.5 full-history contract.
+    pub fn seed_history(&mut self, prompt_ids: &[u32]) {
+        self.recent_tokens.extend_from_slice(prompt_ids);
     }
 
     /// **Unstable**: sample a token ID; sampling strategy details may change.
@@ -341,18 +351,8 @@ impl Sampler {
             // raw argmax would change once the penalty is applied — clone + re-scan.
             self.logit_scratch.clear();
             self.logit_scratch.extend_from_slice(logits);
-            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
-                // Penalize each id once (recent_tokens may repeat). recent_tokens is
-                // capped at max_recent (64), so this O(n²) scan stays well under the
-                // full-vocab argmax cost and avoids a per-call allocation.
-                if self.recent_tokens[..pos].contains(&tok) {
-                    continue;
-                }
-                let idx = tok as usize;
-                if idx < self.logit_scratch.len() {
-                    self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
-                }
-            }
+            // Penalize each unique id exactly once (HF gather-once semantics).
+            self.apply_penalty_to_logit_scratch(penalty);
             let token = argmax_f32(&self.logit_scratch);
             self.push_token(token);
             return token;
@@ -361,21 +361,11 @@ impl Sampler {
         // Non-greedy path: clone logits for in-place penalty + fused top-k.
         self.logit_scratch.clear();
         self.logit_scratch.extend_from_slice(logits);
-        let adj = &mut self.logit_scratch;
 
         if self.config.repetition_penalty != 1.0 {
-            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
-                // Penalize each id once (recent_tokens may repeat); applying it per
-                // occurrence compounds to penalty^N. Capped at max_recent (64), so the
-                // O(n²) dedup scan is negligible against the fused top-k over the vocab.
-                if self.recent_tokens[..pos].contains(&tok) {
-                    continue;
-                }
-                let idx = tok as usize;
-                if idx < adj.len() {
-                    adj[idx] = penalized_logit(adj[idx], self.config.repetition_penalty);
-                }
-            }
+            let penalty = self.config.repetition_penalty;
+            // Penalize each unique id exactly once (HF gather-once semantics).
+            self.apply_penalty_to_logit_scratch(penalty);
         }
 
         let inv_temp = if self.config.temperature != 1.0 {
@@ -387,7 +377,7 @@ impl Sampler {
         // Streaming min-heap top-k with fused temperature scaling.
         // ~95% of vocab elements are skipped by the NEON threshold gate.
         select_top_k(
-            adj,
+            &self.logit_scratch,
             self.config.top_k,
             inv_temp,
             &mut self.candidate_scratch,
@@ -404,8 +394,18 @@ impl Sampler {
 
     fn push_token(&mut self, token: u32) {
         self.recent_tokens.push(token);
-        if self.recent_tokens.len() > self.max_recent {
-            self.recent_tokens.remove(0);
+    }
+
+    /// Apply `penalty` in-place to `logit_scratch` for every unique token id in
+    /// `recent_tokens`, penalizing each id exactly once (HF gather-once semantics).
+    /// `penalty_seen` is cleared first so capacity is retained across calls.
+    fn apply_penalty_to_logit_scratch(&mut self, penalty: f32) {
+        self.penalty_seen.clear();
+        for &tok in &self.recent_tokens {
+            let idx = tok as usize;
+            if idx < self.logit_scratch.len() && self.penalty_seen.insert(tok) {
+                self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
+            }
         }
     }
 
@@ -1605,5 +1605,95 @@ mod tests {
                 "uniform_f32_from_u64({x:#018x}) = {f} is not in [0, 1)"
             );
         }
+    }
+
+    // ── #387 repetition-penalty history contract tests ───────────────────────
+
+    /// First-token prompt penalty: seeded prompt tokens must be penalized on the
+    /// very first `sample` call.
+    ///
+    /// Mutation-sensitive: reverting `seed_history` (or not calling it in
+    /// `generate.rs`) leaves `recent_tokens` empty, so token 1 is NOT penalized
+    /// and wins with logit 10.0, failing this assertion.
+    #[test]
+    fn test_seed_history_penalizes_prompt_token_on_first_sample() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Seed token 1 as a prompt token.
+        sampler.seed_history(&[1u32]);
+        // logits: token 1 = 10.0 wins raw, but 10.0/2.0 = 5.0 < token 0's 6.0 after penalty.
+        let token = sampler.sample(&[6.0, 10.0]);
+        assert_eq!(
+            token, 0,
+            "token 1 was seeded in history; penalty 2.0 reduces its adjusted logit \
+             below token 0; without seed_history, token 1 wins (mutation: omit seed_history)"
+        );
+    }
+
+    /// Beyond-64-token history: a token at position 0 in a 65-entry history must
+    /// still be penalized after the old 64-entry cap is removed.
+    ///
+    /// Mutation-sensitive: re-introducing the `max_recent` truncation evicts token 1
+    /// from the window, leaving it unpenalized, so token 1 wins with logit 10.0
+    /// instead of token 0 with logit 6.0.
+    #[test]
+    fn test_uncapped_history_penalizes_tokens_beyond_64() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Build a 65-token history THROUGH push_token, the path the removed 64-cap
+        // actually lived on. token 1 is the oldest entry (pushed first). Filler tokens
+        // use ids >= 2 so they do not compete with tokens 0 or 1.
+        sampler.push_token(1);
+        for t in 2u32..66 {
+            sampler.push_token(t); // 64 filler tokens → total history length = 65
+        }
+        // Without cap: token 1 penalty applies → 10.0/2.0 = 5.0 < 6.0 → token 0 wins.
+        // With old 64-cap restored in push_token: token 1 was evicted from the window →
+        // raw_best (token 1) is no longer in history so the greedy shortcut returns it
+        // un-penalized → token 1 wins.
+        let token = sampler.sample(&[6.0, 10.0]);
+        assert_eq!(
+            token, 0,
+            "token 1 at position 0 in a 65-entry history must still be penalized; \
+             the old 64-cap silently dropped it (mutation: restore max_recent truncation)"
+        );
+    }
+
+    /// Penalize-once / no compounding: a token repeated many times in history is
+    /// penalized exactly once, not penalty^N times.
+    ///
+    /// Mutation-sensitive: reverting the HashSet dedup to per-occurrence penalty
+    /// compounds to penalty^4 = 16.0, reducing the adjusted logit from 5.0 to 0.625,
+    /// so token 0 wins instead of token 1.
+    #[test]
+    fn test_penalty_applied_exactly_once_for_repeated_history_token() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Token 1 repeated 4 times in history.
+        sampler.seed_history(&[1, 1, 1, 1]);
+        // Once penalized: 10.0/2.0 = 5.0 > 4.9 → token 1 wins (correct).
+        // Per-occurrence (penalty^4): 10.0/16.0 = 0.625 < 4.9 → token 0 wins (wrong).
+        let token = sampler.sample(&[4.9, 10.0]);
+        assert_eq!(
+            token, 1,
+            "token 1 repeated 4× must be penalized once (5.0 > 4.9, token 1 wins); \
+             per-occurrence compounding yields 0.625 and wrongly selects token 0 \
+             (mutation: replace HashSet dedup with per-occurrence penalty)"
+        );
     }
 }

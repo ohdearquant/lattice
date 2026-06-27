@@ -324,8 +324,10 @@ pub fn generate(
     // Decode calls use seq_len=1, which is always within this capacity.
     scratch.ensure_capacity(cfg, prompt_len.max(1), effective_cap);
 
-    // 3. Initialize sampler
+    // 3. Initialize sampler and seed prompt history so prompt tokens are included
+    // in repetition-penalty scoring from the very first generated token.
     let mut sampler = Sampler::new(config.sampling.clone());
+    sampler.seed_history(&prompt_ids[..prompt_len]);
 
     // 4. Initialise grammar state if grammar-constrained decoding is requested.
     let mut grammar_state = config.grammar.as_ref().map(|g| g.initial_state());
