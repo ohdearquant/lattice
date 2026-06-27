@@ -168,3 +168,50 @@ jobs:
         continue-on-error: true
         with:
           command: check advisories
+
+  # Observation job: rustdoc build and intra-doc link lint.
+  # NON-BLOCKING — continue-on-error: true. Do NOT add to required-status checks.
+  # Surfaces doc-build failures and broken intra-doc links (a verified absent gap)
+  # without wedging merges during the initial observation period.
+  rustdoc-lint:
+    name: rustdoc-lint (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rustdoc-lint
+          cache-on-failure: true
+      - name: cargo doc — broken-intra-doc-links and doc warnings (informational)
+        env:
+          RUSTDOCFLAGS: >-
+            -D warnings
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps
+
+  # Observation job: unwrap/expect usage in workspace library targets.
+  # NON-BLOCKING — continue-on-error: true. Do NOT add to required-status checks.
+  # Surfaces panic-safety debt in library code (a verified absent gap) without
+  # changing merge behavior. Expected to show existing debt on first run.
+  unwrap-in-lib-lint:
+    name: unwrap-in-lib-lint (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unwrap-in-lib-lint
+          cache-on-failure: true
+      - name: clippy — unwrap/expect in library targets (informational)
+        run: cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::expect_used
