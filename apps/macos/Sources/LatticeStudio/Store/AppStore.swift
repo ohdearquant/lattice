@@ -50,7 +50,9 @@ final class AppStore {
     var chatSelectedAdapterName: String = "none"
     // Generation knob text fields.
     var chatTempText: String = "0.7"
-    var chatMaxTokensText: String = "256"
+    // 2048 default: 256 truncated thinking models (Qwen3.x) mid-reasoning, leaving no room
+    // for the answer. Per-model defaults overwrite temp/top-k/top-p from generation_config.json.
+    var chatMaxTokensText: String = "2048"
     var chatSeedText: String = ""
     var chatTopKText: String = "50"
     var chatTopPText: String = "0.9"
@@ -143,6 +145,15 @@ final class AppStore {
     /// True when a warm chat_metal serve process is resident and holding the model in GPU memory.
     var isChatSessionWarm: Bool { chatSessionHandle?.isRunning == true }
 
+    /// Display name of the model the warm chat serve process is currently holding in memory,
+    /// or nil when no session is warm. Lets the UI state exactly which model is loaded rather
+    /// than only which one is selected.
+    var chatWarmModelName: String? {
+        guard chatSessionHandle?.isRunning == true, !chatSessionModelPath.isEmpty else { return nil }
+        return models.first(where: { $0.path.path == chatSessionModelPath })?.name
+            ?? URL(fileURLWithPath: chatSessionModelPath).lastPathComponent
+    }
+
     init() {
         runs = Self.loadRunArchive()
         measuredPPL = Self.loadPPLArchive()
@@ -157,6 +168,7 @@ final class AppStore {
     func onAppear() {
         refreshModels()
         binariesReady = LatticeBridge.prebuiltBinary(.lattice) != nil
+        startMemoryMonitor()
     }
 
     // MARK: Run archive persistence
@@ -531,7 +543,32 @@ final class AppStore {
         return r
     }
 
-    var memoryUsage: (usedGB: Double, totalGB: Double) {
+    /// Live unified-memory readout, refreshed every second by `startMemoryMonitor()` so the
+    /// value tracks model load and OS page eviction in real time. As a bare computed property
+    /// it only re-read when an @Observable dependency changed, so the readout stayed frozen
+    /// between runs and only jumped when a turn finished. This stored snapshot fixes that.
+    private(set) var memoryUsage: (usedGB: Double, totalGB: Double) = (0, 0)
+
+    private var memoryTimer: Timer?
+
+    /// Begin the 1 Hz memory monitor. Idempotent; safe to call repeatedly from onAppear.
+    func startMemoryMonitor() {
+        guard memoryTimer == nil else { return }
+        memoryUsage = computeMemoryUsage()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            // The timer is installed on RunLoop.main below, so this callback always fires on
+            // the main thread — assumeIsolated is safe and lets us touch main-actor state.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.memoryUsage = self.computeMemoryUsage()
+            }
+        }
+        // .common mode keeps the readout ticking during menu tracking / scrolling.
+        RunLoop.main.add(timer, forMode: .common)
+        memoryTimer = timer
+    }
+
+    private func computeMemoryUsage() -> (usedGB: Double, totalGB: Double) {
         let total = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
 
         // App-self resident size.

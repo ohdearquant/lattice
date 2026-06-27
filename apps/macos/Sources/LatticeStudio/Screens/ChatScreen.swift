@@ -119,6 +119,11 @@ struct ChatScreen: View {
         }
         .onAppear { applyDefaults() }
         .onChange(of: store.models) { _, _ in applyDefaults() }
+        .onChange(of: store.chatSelectedModelName) { _, _ in
+            // Picking a different model resets the sampling knobs to that model's recommended
+            // defaults (from its generation_config.json). Manual edits hold until the next switch.
+            if let model = selectedModel { applySamplingDefaults(for: model) }
+        }
         .onChange(of: store.chatUseGPU) { _, _ in
             // Backend toggle changes the eligible model set (CPU drops Q4) — re-validate
             // the selection so the picker never shows a model that isn't in chatModels.
@@ -172,18 +177,45 @@ struct ChatScreen: View {
                         )
                     )
 
-                    // Disk status — honest, never claims "loaded"
+                    // Disk + load state — honest. States exactly which model is resident in
+                    // memory, distinct from which is merely selected on disk.
                     if let model = selectedModel {
                         let exists = FileManager.default.fileExists(atPath: model.path.path)
-                        HStack(spacing: 6) {
-                            GatePill(exists ? .pass : .fail, label: exists ? "READY" : "NOT FOUND")
-                            if let liveRun = store.liveRun(matching: [.chat]),
-                               liveRun.status == .running {
-                                GatePill(.run, label: liveRun.genText.isEmpty ? "LOADING" : "GEN")
+                        let warmName = store.chatWarmModelName
+                        let selectedLoaded = (warmName == model.name)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 6) {
+                                GatePill(exists ? .pass : .fail, label: exists ? "ON DISK" : "NOT FOUND")
+                                if selectedLoaded {
+                                    GatePill(.pass, label: "LOADED")
+                                } else if warmName != nil {
+                                    GatePill(.warn, label: "WILL RELOAD")
+                                } else {
+                                    Text("not loaded")
+                                        .font(Theme.Fonts.cell)
+                                        .foregroundStyle(Theme.Palette.inkDim)
+                                }
+                                if let liveRun = store.liveRun(matching: [.chat]),
+                                   liveRun.status == .running {
+                                    GatePill(.run, label: liveRun.genText.isEmpty ? "LOADING" : "GEN")
+                                }
+                                Spacer()
                             }
-                            Spacer()
+                            // Explicit "what is in GPU memory right now" line.
+                            if let warmName {
+                                HStack(spacing: 4) {
+                                    Text("IN MEMORY")
+                                        .font(Theme.Fonts.cell)
+                                        .foregroundStyle(Theme.Palette.inkDim)
+                                    Text(warmName)
+                                        .font(Theme.Fonts.readout)
+                                        .foregroundStyle(selectedLoaded ? Theme.Palette.signal : Theme.Palette.ink)
+                                    Spacer()
+                                }
+                            }
                         }
-                        .frame(height: Theme.Space.rowHeight)
+                        .frame(minHeight: Theme.Space.rowHeight)
+                        .padding(.vertical, Theme.Space.xs)
                         .padding(.horizontal, Theme.Space.lg)
                         .overlay(alignment: .bottom) {
                             Theme.Palette.hairline.frame(height: 1)
@@ -591,6 +623,44 @@ struct ChatScreen: View {
                 store.chatSelectedModelName = chatModels.first?.name ?? ""
             }
         }
+    }
+
+    /// Load a model's recommended sampling defaults from its `generation_config.json` whenever
+    /// the selected model changes. Qwen3.6 ships temperature 1.0 / top-k 20 / top-p 0.95; its
+    /// config omits repetition_penalty, so 1.0 (off) is the correct default — not the 0.0 a
+    /// hand-typed value might suggest. Manual edits persist until the model is switched again.
+    private func applySamplingDefaults(for model: ModelInfo) {
+        // Always-reset knobs the config never carries.
+        store.chatRepPenaltyText = "1.0"
+
+        // Resolve generation_config.json: the model dir first, then the bf16 sibling for Q4
+        // models that don't ship the file alongside the weights.
+        let base = model.name
+            .replacingOccurrences(of: "-q4", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "-quarot", with: "", options: .caseInsensitive)
+        var dirs = [model.path]
+        if base != model.name {
+            dirs.append(LatticeBridge.modelCacheDir.appendingPathComponent(base, isDirectory: true))
+        }
+        let configURL = dirs
+            .map { $0.appendingPathComponent("generation_config.json") }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+
+        guard let url = configURL,
+              let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+
+        if let t = json["temperature"] as? Double { store.chatTempText = trimNumber(t) }
+        if let k = json["top_k"] as? Int { store.chatTopKText = String(k) }
+        if let p = json["top_p"] as? Double { store.chatTopPText = trimNumber(p) }
+    }
+
+    /// Format a sampling value without float noise: 1.0 -> "1.0", 0.95 -> "0.95", 0.7 -> "0.7".
+    private func trimNumber(_ v: Double) -> String {
+        var s = String(format: "%.4f", v)
+        while s.hasSuffix("0") && !s.hasSuffix(".0") { s.removeLast() }
+        return s
     }
 
     /// Clear conversation transcript while preserving model/adapter/settings selections.
