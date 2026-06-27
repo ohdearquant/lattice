@@ -452,7 +452,9 @@ fn emit_json_generation(
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::{
+        GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
+    };
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::io::Write;
 
@@ -635,7 +637,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         top_p,
         repetition_penalty,
         seed,
-        stop_token_ids: vec![],
+        stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
         enable_thinking: true,
         enable_mtp: None,
         grammar: None,
@@ -721,7 +723,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     top_p: req_top_p,
                     repetition_penalty: req_repetition_penalty,
                     seed: req_seed,
-                    stop_token_ids: vec![],
+                    stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
                     enable_thinking: true,
                     enable_mtp: None,
                     grammar: None,

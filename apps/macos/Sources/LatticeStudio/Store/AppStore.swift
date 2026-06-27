@@ -533,6 +533,8 @@ final class AppStore {
 
     var memoryUsage: (usedGB: Double, totalGB: Double) {
         let total = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+
+        // App-self resident size.
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
         let kerr = withUnsafeMutablePointer(to: &info) {
@@ -540,7 +542,21 @@ final class AppStore {
                 task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
             }
         }
-        let used = kerr == KERN_SUCCESS ? Double(info.resident_size) / 1_073_741_824.0 : 0
+        let selfBytes: UInt64 = kerr == KERN_SUCCESS ? info.resident_size : 0
+
+        // Physical footprint of live lattice subprocesses — the model lives there.
+        // proc_pid_rusage ri_phys_footprint matches the "Memory" column in Activity Monitor.
+        var subBytes: UInt64 = 0
+        for bh in [chatSessionHandle, handle].compactMap({ $0 }) where bh.isRunning {
+            var rinfo = rusage_info_v2()
+            let rc: Int32 = withUnsafeMutablePointer(to: &rinfo) { ptr in
+                var buf: rusage_info_t? = UnsafeMutableRawPointer(ptr)
+                return proc_pid_rusage(bh.pid, RUSAGE_INFO_V2, &buf)
+            }
+            if rc == 0 { subBytes += rinfo.ri_phys_footprint }
+        }
+
+        let used = (Double(selfBytes) + Double(subBytes)) / 1_073_741_824.0
         return (used, total)
     }
 }
