@@ -549,9 +549,13 @@ final class AppStore {
         var subBytes: UInt64 = 0
         for bh in [chatSessionHandle, handle].compactMap({ $0 }) where bh.isRunning {
             var rinfo = rusage_info_v2()
+            // proc_pid_rusage writes a full rusage_info_v2 at the pointer it is given, so the
+            // buffer MUST be the struct itself (rebound to the rusage_info_t? element type),
+            // not the address of a pointer variable — the latter overflows an 8-byte slot.
             let rc: Int32 = withUnsafeMutablePointer(to: &rinfo) { ptr in
-                var buf: rusage_info_t? = UnsafeMutableRawPointer(ptr)
-                return proc_pid_rusage(bh.pid, RUSAGE_INFO_V2, &buf)
+                ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+                    proc_pid_rusage(bh.pid, RUSAGE_INFO_V2, $0)
+                }
             }
             if rc == 0 { subBytes += rinfo.ri_phys_footprint }
         }
