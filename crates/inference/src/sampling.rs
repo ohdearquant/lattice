@@ -106,11 +106,18 @@ impl CandidateSet {
     /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
     /// non-positive, or non-finite (NaN/±inf) — none of those carry a valid
     /// scaling, and `1.0 / NaN` would poison every logit with NaN.
+    ///
+    /// A finite-but-tiny temperature has a reciprocal that overflows `f32`. Left
+    /// unclamped it would collapse every logit to `+inf`, destroying their order, and
+    /// downstream sampling would then return token 0 instead of the argmax — even though
+    /// the `t -> 0+` limit must stay greedy. The multiplier is clamped to the same bound
+    /// `temperature_degenerate` uses, so for any logit within `MAX_PLAUSIBLE_ABS_LOGIT` the
+    /// scaled value stays finite and the argmax is preserved (softmax -> one-hot on argmax).
     pub fn apply_temperature(&mut self, temperature: f32) {
         if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
             return;
         }
-        let inv = 1.0 / temperature;
+        let inv = (1.0 / temperature).min(f32::MAX / MAX_PLAUSIBLE_ABS_LOGIT);
         for c in &mut self.candidates {
             c.logit *= inv;
         }
@@ -910,6 +917,22 @@ mod tests {
             );
             assert_eq!(cs.argmax(), 1);
         }
+    }
+
+    #[test]
+    fn apply_temperature_tiny_positive_temp_stays_greedy() {
+        // A finite-but-tiny temperature has a reciprocal that overflows f32. The
+        // t -> 0+ limit must stay greedy (argmax). Without the clamp, `1.0 / 1e-45 ==
+        // +inf` collapses both logits to +inf; the sort then tie-breaks on ascending
+        // token_id and `sample_top_p` returns token 0 instead of the argmax (token 1).
+        let mut cs = CandidateSet::from_full_logits(&[10.0, 11.0]);
+        cs.apply_temperature(1e-45);
+        // top_p = 1.0 (no nucleus truncation) + r = 0.0 => pure argmax selection.
+        assert_eq!(
+            cs.sample_top_p(1.0, 0.0),
+            1,
+            "tiny positive temperature must resolve to the argmax (greedy), not token 0"
+        );
     }
 
     #[test]
