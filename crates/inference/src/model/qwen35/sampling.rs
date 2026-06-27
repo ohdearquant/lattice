@@ -37,15 +37,35 @@ pub(crate) fn sample_token(
             adjusted[b]
                 .partial_cmp(&adjusted[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&b))
         });
         indices.truncate(k);
     }
 
+    // Sort indices by descending adjusted logit + ascending token-id so that
+    // build_softmax_probs iterates in the same order as
+    // CandidateSet::sample_top_p_with_scratch (which sorts candidates first).
+    // Identical iteration order guarantees bit-identical softmax sums and
+    // therefore bit-identical probabilities — required for the cross-path
+    // parity test and for exact numerical alignment at the draw boundary.
+    indices.sort_unstable_by(|&a, &b| {
+        adjusted[b]
+            .partial_cmp(&adjusted[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+
+    // `indices` is already in (descending adjusted-logit, ascending token-id)
+    // order from the pre-sort above. softmax is monotonic in the logit, so the
+    // probabilities build_softmax_probs returns inherit exactly that order
+    // (descending probability, ties broken by ascending token-id) without any
+    // further sorting. Re-sorting here would double the sort cost — and for the
+    // supported `top_k == 0` (no top-k filtering) that means sorting the full
+    // vocabulary twice per decode step. apply_top_p and draw_index both rely only
+    // on this descending order, which the pre-sort already guarantees.
     let Some(mut probs) = build_softmax_probs(&adjusted, &indices) else {
         return greedy_token(&adjusted);
     };
-
-    probs.sort_unstable_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
 
     if cfg.top_p < 1.0 {
         apply_top_p(&mut probs, cfg.top_p);
@@ -70,18 +90,25 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
     }
 }
 
+/// Greedy argmax with **first-wins** tie-break.
+///
+/// `Iterator::max_by` keeps the *last* element on `Ordering::Equal`, so tied
+/// maximum logits (e.g. `[0.0, 1.0, 1.0]`) returned the higher token-id — the
+/// opposite of the engine-wide greedy contract. `speculative::argmax`,
+/// `sampling::argmax_f32_scalar`, the Metal greedy path, and `torch.argmax` all
+/// return the *first* occurrence (#280). This mirrors them exactly: strict `>`
+/// from `NEG_INFINITY` skips `NaN` (a `NaN` comparison is always false) and
+/// returns 0 on empty / all-`NaN` input.
 fn greedy_token(adjusted: &[f32]) -> u32 {
-    adjusted
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| match (a.is_nan(), b.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        })
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in adjusted.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }
 
 fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize, f32)>> {
@@ -137,8 +164,15 @@ fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
 /// `r`. The boundary is strict `r < cumsum`: the canonical uniform draw gives
 /// `r` in `[0, 1)`, so `r < cumsum` is the textbook-correct inverse-CDF and never
 /// double-counts a bucket boundary (`r <= cumsum` would, and is also unsafe for an
-/// `r` that reached exactly 1.0). Falls back to the first (highest-probability)
-/// token only if float error leaves the final cumsum just under `r`.
+/// `r` that reached exactly 1.0).
+///
+/// Falls back to the LAST element when float-summation error leaves the final
+/// cumsum just under `r`. Probs are sorted descending and renormalised to
+/// sum≈1.0, so cumulative thresholds are c_0<c_1<...<c_{n-1}≈1.0. The last
+/// bucket owns the half-open interval `[c_{n-2}, 1.0)`. A draw `r` that floats
+/// past c_{n-1} lies in that final interval, so the correct token is the LAST
+/// iterated one. This matches `CandidateSet::sample_top_p_with_scratch` (Path A),
+/// which also returns `candidates.last()` for the same reason.
 fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
     let mut cumsum = 0.0f32;
     for &(idx, p) in probs {
@@ -147,18 +181,24 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
             return idx as u32;
         }
     }
-    probs[0].0 as u32
+    // Callers guarantee non-empty: build_softmax_probs returns None for empty
+    // indices, so draw_index is only reached when probs has at least one element.
+    probs[probs.len() - 1].0 as u32
 }
 
 /// Canonical uniform f32 in [0, 1) via the shared xorshift64 primitive.
 ///
 /// Delegates to `crate::sampling::xorshift64_next` (shifts 13/7/17, full period
 /// over nonzero state) and `crate::sampling::uniform_f32_from_u64` (top-24-bit
-/// conversion, provably strictly < 1.0). Both CPU sampling paths now share this
-/// canonical RNG primitive, so a fixed seed yields the same uniform draw stream.
-/// This does NOT guarantee identical token streams: the two paths still diverge
-/// below the RNG layer (top-k tie-break and the candidate-exhaustion fallback
-/// pick in opposite directions), so equal draws can still select different tokens.
+/// conversion, provably strictly < 1.0). Both CPU sampling paths share this
+/// primitive so a fixed seed yields the same uniform draw stream. After the
+/// fallback unification (`draw_index` now returns the LAST element, matching
+/// `CandidateSet::sample_top_p_with_scratch`) and the tie-break alignment (the
+/// top-k selection and the single pre-softmax index sort fix both the tie order
+/// and the softmax summation order to match Path A), a fixed seed produces
+/// token-identical streams for the same (logits, config, seed) — including inputs
+/// with exact logit ties at the top-k boundary, which the matched ascending
+/// token-id tie-break now resolves identically in both paths.
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
     let x = crate::sampling::xorshift64_next(state);
     crate::sampling::uniform_f32_from_u64(x)
@@ -202,6 +242,29 @@ mod tests {
                 "degenerate temperature {bad} must fall back to argmax (token 1)"
             );
         }
+    }
+
+    #[test]
+    fn test_greedy_tie_break_is_first_wins() {
+        // Tied maximum logits must return the FIRST occurrence, matching
+        // speculative::argmax, sampling::argmax_f32_scalar, the Metal greedy
+        // path, and torch.argmax (#280). The prior `max_by` returned the LAST
+        // tied index (token 2 here) — a silent greedy-parity divergence on ties.
+        let logits = [0.0_f32, 1.0, 1.0];
+        assert_eq!(greedy_token(&logits), 1, "first-wins on tied max");
+
+        // Same contract through the public degenerate-temperature entry point.
+        let mut rng = 3u64;
+        let token = sample_token(&logits, &cfg(0.0, 0), &[], &mut rng);
+        assert_eq!(token, 1, "temperature=0 greedy must be first-wins on ties");
+
+        // NaN is skipped; the first finite max wins.
+        let with_nan = [f32::NAN, 2.0_f32, 2.0];
+        assert_eq!(
+            greedy_token(&with_nan),
+            1,
+            "NaN skipped, first finite max wins"
+        );
     }
 
     #[test]
@@ -273,6 +336,78 @@ mod tests {
         assert_eq!(token, 0, "NaN penalty must be a no-op");
     }
 
+    /// Realistic-input parity regression guard: `Sampler::sample` (Path A) and
+    /// `sample_token` (Path B) must produce IDENTICAL token sequences for the same
+    /// logits, config, and seed on a typical no-tie logit vector.
+    ///
+    /// This guards against future drift but does NOT by itself isolate the three
+    /// consolidation alignments — its input has no exact ties (so the tie-break
+    /// never engages) and never forces the CDF fallback (it fires only on rare
+    /// float-rounding events). The mutation-sensitive per-fix proofs live in
+    /// `draw_index_fallback_returns_last_bucket_not_first` (fallback) and
+    /// `cross_path_parity_with_logit_ties` (tie-break + summation order). What this
+    /// test does prove: with the pre-sort in place, the two paths' softmax sums are
+    /// bit-identical, so they agree on a full 200-draw realistic stream.
+    ///
+    /// Seed alignment: `Sampler::with_seed(S)` calls `Rng::new(S)` which sets
+    /// `state = S` (for S ≠ 0). `sample_token` takes `rng_state: &mut u64`; when
+    /// initialised to `S`, the first `xorshift64(&mut rng_state)` call advances
+    /// the same way as `Rng::next_f32()` in Path A. Both paths consume exactly one
+    /// RNG step per token draw, so the draw streams are permanently aligned.
+    #[test]
+    fn cross_path_parity_sampler_vs_sample_token() {
+        use crate::model::qwen35_config::GenerateConfig;
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        // 64-entry logit vector; hash-derived values in [-10, 10] with no exact
+        // ties (all 64 u64 hash values differ in the top 24 bits of f32 with
+        // overwhelming probability — expected collisions < 0.001).
+        let logits: Vec<f32> = (0..64u64)
+            .map(|i| {
+                let h = i
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (h as f32 / u64::MAX as f32) * 20.0 - 10.0
+            })
+            .collect();
+
+        let temperature = 0.8f32;
+        let top_k = 40usize;
+        let top_p = 0.95f32;
+        let seed = 0xdead_beef_cafe_babe_u64;
+        let n = 200usize;
+
+        // Path A: Sampler — internal Rng seeded to `seed` via `with_seed`.
+        let config_a = SamplingConfig {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config_a).with_seed(seed);
+        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
+
+        // Path B: sample_token — rng_state initialised to the same seed; the first
+        // xorshift64_next call advances identically to Rng::next_u64 in Path A.
+        let config_b = GenerateConfig {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng_state = seed;
+        let tokens_b: Vec<u32> = (0..n)
+            .map(|_| sample_token(&logits, &config_b, &[], &mut rng_state))
+            .collect();
+
+        assert_eq!(
+            tokens_a, tokens_b,
+            "Sampler::sample and sample_token must produce identical token streams \
+             for the same logits, config, and seed (consolidation parity proof)"
+        );
+    }
+
     #[test]
     fn canonical_rng_streams_match_across_sampling_paths() {
         // Both CPU sampling paths must produce the same seeded float stream once
@@ -319,8 +454,9 @@ mod tests {
              token 0 and select token 1 (a `r <= cumsum` regression selects token 0)"
         );
 
-        // Sanity: r below the first bucket selects token 0; r at/above the last
-        // bucket's cumsum (only reachable via float error) falls back to token 0.
+        // Sanity: r below the first bucket selects token 0; r between the two
+        // bucket boundaries selects token 1 (these probs sum to exactly 1.0, so
+        // the fallback branch is never reached here — see the dedicated test below).
         assert_eq!(
             draw_index(&probs, 0.25),
             0,
@@ -330,6 +466,106 @@ mod tests {
             draw_index(&probs, 0.75),
             1,
             "r between the two bucket boundaries picks token 1"
+        );
+    }
+
+    #[test]
+    fn draw_index_fallback_returns_last_bucket_not_first() {
+        // Directly force the float-error fallback branch: probs that sum to LESS
+        // than r so `r < cumsum` never fires and the loop runs to completion. The
+        // correct fallback is the LAST bucket — on a descending-prob, sum≈1.0 CDF
+        // the final bucket owns [c_{n-2}, 1.0), so an r that floats past the last
+        // threshold belongs to the LAST token. This matches Path A's
+        // `CandidateSet::sample_top_p_with_scratch`, which returns `candidates.last()`.
+        //
+        // This test is the mutation-sensitive proof of the fallback alignment:
+        // reverting `draw_index` to the old `probs[probs.len()-1]` → `probs[0]`
+        // returns idx 7 and fails this assertion. The full-stream parity tests do
+        // NOT exercise this branch (it fires only on ~1e-7 float-rounding events),
+        // which is exactly why this direct unit test exists.
+        let probs: Vec<(usize, f32)> = vec![(7, 0.3), (8, 0.3), (9, 0.3)]; // sum 0.9 < r
+        assert_eq!(
+            draw_index(&probs, 0.95),
+            9,
+            "when cumsum never reaches r (float error), the draw belongs to the \
+             LAST bucket (idx 9); the old `probs[0]` behaviour returns idx 7"
+        );
+    }
+
+    /// Mutation-sensitive tie-break parity proof: both sampling paths must produce
+    /// IDENTICAL token sequences when the logit set contains exact f32 ties, AND
+    /// this test must FAIL if Path B breaks ties towards the higher token-id.
+    ///
+    /// The earlier version of this test was vacuous (codex round-1 finding): it put
+    /// the ties at low-probability positions (logit 25 of 64) and used top_p=0.95,
+    /// so the nucleus truncated the tied tokens before they could affect a draw —
+    /// a reversed tie-break still passed. The fix is to give the tied tokens real
+    /// probability mass and disable nucleus truncation so the tie-break is observable:
+    ///
+    /// - **top_p = 1.0** — no truncation; every kept token participates in draws.
+    /// - **Tie at the maximum** (indices 0 & 1 both = 10.0): they carry ~0.38 of the
+    ///   mass EACH. A reversed sort-order tie-break swaps which of the two owns the
+    ///   first CDF bucket [0, 0.38), so ~77 of 200 draws flip.
+    /// - **Tie at the top-k=3 boundary** (indices 2 & 3 both = 9.5): rank 3 is
+    ///   contested. The correct selection tie-break retains index 2 (lower id, prob
+    ///   ~0.23); a reversed one retains index 3 instead → a different ~0.23-mass token
+    ///   appears in ~46 of 200 draws.
+    ///
+    /// Both ties carry enough probability that a reversed tie-break in EITHER the
+    /// `select_nth_unstable_by` selection OR the pre-softmax sort diverges the stream
+    /// well within 200 draws. Empirically verified mutation-sensitive: reverting
+    /// either Path-B tie-break comparator to descending token-id fails this assertion.
+    #[test]
+    fn cross_path_parity_with_logit_ties() {
+        use crate::model::qwen35_config::GenerateConfig;
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        // 8 tokens. Two ties, both at HIGH-probability positions:
+        //   idx 0 & 1 tie at the maximum (10.0)        -> sort-order tie-break
+        //   idx 2 & 3 tie at the top_k=3 boundary (9.5) -> selection tie-break
+        // Remaining tokens descend so the rest of the order is unambiguous.
+        let logits: Vec<f32> = vec![10.0, 10.0, 9.5, 9.5, 9.0, 8.0, 7.0, 6.0];
+
+        let temperature = 1.0f32;
+        let top_k = 3usize; // rank 3 contested between idx 2 and idx 3
+        let top_p = 1.0f32; // NO nucleus truncation — tied tokens stay in play
+        let seed = 0xdead_beef_cafe_babe_u64;
+        let n = 200usize;
+
+        // Path A: Sampler (CandidateSet::sample_top_p_with_scratch). Keeps {0,1,2}
+        // (idx 2 wins the rank-3 tie by lower id), ordered [0,1,2] (lower id first).
+        let config_a = SamplingConfig {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config_a).with_seed(seed);
+        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
+
+        // Path B: sample_token (this module's pipeline). With matching tie-breaks it
+        // also keeps {0,1,2} ordered [0,1,2]; a reversed tie-break keeps {0,1,3}
+        // and/or orders the max tie [1,0], diverging the stream.
+        let config_b = GenerateConfig {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut rng_state = seed;
+        let tokens_b: Vec<u32> = (0..n)
+            .map(|_| sample_token(&logits, &config_b, &[], &mut rng_state))
+            .collect();
+
+        assert_eq!(
+            tokens_a, tokens_b,
+            "Sampler::sample and sample_token must produce identical token streams \
+             with high-probability ties at the max (idx 0 & 1) and the top_k=3 \
+             boundary (idx 2 & 3). A backwards tie-break in either the selection or \
+             the pre-softmax sort changes which token wins the contested rank or the \
+             order of the two max-probability buckets, flipping dozens of the 200 \
+             draws and failing this assertion."
         );
     }
 }

@@ -1,0 +1,100 @@
+name: embed-parity-release
+# Release-cadence embedding parity gate. NOT a per-PR / per-commit check — the
+# per-PR coverage is the BGE-small `embed-drift` job in e2e-parity.yml. This one
+# runs the heavier full HF-reference parity suite across the production embedding
+# models (the ones khive actually serves: all-minilm-l6-v2 and
+# paraphrase-multilingual-minilm-l12-v2) plus bge-small and multilingual-e5-small,
+# on the release branch / tag, where the cost of provisioning every model's
+# weights is justified.
+#
+# Why release-cadence and not per-PR: provisioning four model checkpoints (~600 MB
+# total) on every PR is wasteful, and the forward path that produces these vectors
+# is stable (only #232 NEON normalize + #214 f16 conversion touched it since
+# v0.3.0). Drift is caught per-PR for BGE; this gate is the broader release
+# backstop so a production-model geometry regression cannot ship un-noticed.
+#
+# Anti-silent-skip: the parity tests skip when weights are absent. This workflow
+# sets LATTICE_PARITY_GATE_ENFORCE=1 so a missing checkpoint (provisioning
+# regression) FAILS the job instead of passing a gate that verified nothing.
+# (qwen3-embedding-0.6b is #[ignore]'d for lattice#103 and is intentionally not
+# covered here.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - 'release-prep/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  embed-parity:
+    name: embed parity (production models)
+    # arm64 to exercise the NEON normalize path production lattice runs on.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embed-parity-release
+
+      # Weights are immutable, so the cache keys never need to change unless a
+      # model revision is bumped (then bump the matching key suffix).
+      - name: Cache bge-small-en-v1.5 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-v1
+
+      - name: Cache multilingual-e5-small weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/multilingual-e5-small
+          key: multilingual-e5-small-v1
+
+      - name: Cache all-minilm-l6-v2 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/all-minilm-l6-v2
+          key: all-minilm-l6-v2-v1
+
+      - name: Cache paraphrase-multilingual-minilm-l12-v2 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/paraphrase-multilingual-minilm-l12-v2
+          key: paraphrase-multilingual-minilm-l12-v2-v1
+
+      # Download any model not restored from cache. --download-only is idempotent:
+      # a cache hit leaves the weights in place and this just re-verifies them.
+      - name: Provision model weights
+        run: |
+          set -euo pipefail
+          for model in \
+            bge-small-en-v1.5 \
+            multilingual-e5-small \
+            all-minilm-l6-v2 \
+            paraphrase-multilingual-minilm-l12-v2; do
+            echo "::group::provision $model"
+            cargo run --release -p lattice-embed --bin embed -- --model "$model" --download-only
+            echo "::endgroup::"
+          done
+
+      - name: Run embedding parity gate
+        # LATTICE_PARITY_GATE_ENFORCE=1 makes a missing checkpoint fail-closed
+        # instead of silently skipping (see record_vector_weight_skip).
+        env:
+          LATTICE_PARITY_GATE_ENFORCE: '1'
+        run: |
+          cargo test --release -p lattice-embed --test embed_parity_vs_hf \
+            -- --nocapture

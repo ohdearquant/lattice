@@ -8718,6 +8718,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -8743,12 +8744,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
+                    stopped: true,
                 };
             }
 
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut pending_token = pending_first;
             let mut metrics = MetalMtpDecodeMetrics::default();
+            let mut stopped = false;
 
             while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
@@ -8857,7 +8860,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 ) {
                     super::MtpRoundOutcome::EmitAndStop(tokens) => {
                         let remaining = gen_cfg.max_new_tokens - generated_ids.len();
-                        generated_ids.extend_from_slice(&tokens[..tokens.len().min(remaining)]);
+                        let emit_len = tokens.len().min(remaining);
+                        generated_ids.extend_from_slice(&tokens[..emit_len]);
+                        // The stop token is the last element of `tokens`; it is a real stop
+                        // only if it was emitted, not clipped off by the remaining budget.
+                        stopped = emit_len == tokens.len();
                         break;
                     }
                     super::MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
@@ -8905,6 +8912,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -8936,6 +8944,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -8962,12 +8971,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![pending_first],
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
+                    stopped: true,
                 };
             }
 
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut pending_token = pending_first;
             let mut metrics = SelfSpecMetrics::default();
+            let mut stopped = false;
 
             'round: while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
@@ -8998,6 +9009,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
+                            stopped = true;
                         }
                         break;
                     }
@@ -9022,6 +9034,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
+                            stopped = true;
                         }
                         break;
                     }
@@ -9079,6 +9092,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
+                            stopped = true;
                         }
                         break;
                     }
@@ -9111,7 +9125,11 @@ kernel void gdn_chunk_norm_silu_c32(
                         accepted_drafts += 1;
                         metrics.accepted_extra_tokens += 1;
                         if is_stop(draft) {
-                            break;
+                            // Emitted stop token (within budget — loop-top guard ensures a
+                            // slot) terminates generation; break the outer round, not just
+                            // the inner draft loop, and record the stop.
+                            stopped = true;
+                            break 'round;
                         }
                     } else {
                         rejection_next = Some(target);
@@ -9129,6 +9147,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if is_stop(next_token) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next_token);
+                            stopped = true;
                         }
                         break;
                     }
@@ -9154,6 +9173,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 if is_stop(next_pending) {
                     if generated_ids.len() < gen_cfg.max_new_tokens {
                         generated_ids.push(next_pending);
+                        stopped = true;
                     }
                     break;
                 }
@@ -9183,6 +9203,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -9227,6 +9248,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -9321,6 +9343,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
+                        stopped: false,
                     };
                 }
             }
@@ -9339,6 +9362,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: true,
                 };
             }
 
@@ -9353,6 +9377,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !use_compact;
 
             // Autoregressive decode
+            let mut stopped = false;
             for _ in 1..gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
@@ -9392,6 +9417,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
 
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -9415,6 +9441,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -9468,6 +9495,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 });
             }
 
@@ -9615,32 +9643,38 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: visual_tokens,
                     generated_tokens: 0,
+                    stopped: false,
                 });
             }
 
             // Sample the first token from last logits.
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
+            let mut stopped = false;
             let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
-            if !is_stop(first_id) {
+            if is_stop(first_id) {
+                stopped = true;
+            } else {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
             }
 
             // Autoregressive decode loop.
             let mut pos = visual_tokens + text_ids.len();
-            while generated_ids.len() < gen_cfg.max_new_tokens {
+            while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
                 }
                 let last_token = *all_ids.last().unwrap_or(&cfg.eos_token_id);
                 if is_stop(last_token) {
+                    stopped = true;
                     break;
                 }
                 let step_logits = self.forward_step(last_token, pos);
                 pos += 1;
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
                 generated_ids.push(next_id);
@@ -9653,6 +9687,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             })
         }
 
@@ -11484,7 +11519,7 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.set_bytes(3, 4, &n as *const u32 as *const _);
             enc.set_bytes(4, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(4) as u64, 1, 1), // NR=4
+                MTLSize::new(n.div_ceil(2) as u64, 1, 1), // gemv_q4_decode writes NR=2 rows/threadgroup
                 MTLSize::new(32, 4, 1),
             );
         }
@@ -13078,6 +13113,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
+                    stopped: false,
                 };
             }
 
@@ -13133,6 +13169,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
+                        stopped: false, // grammar constraint, not an OpenAI stop condition
                     };
                 }
             }
@@ -13151,6 +13188,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
+                    stopped: true, // EOS/stop-token hit immediately after prefill
                 };
             }
 
@@ -13173,8 +13211,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
                 };
             }
+            let mut stopped = false;
             let mut stopped_by_caller = false;
 
             // Autoregressive decode with streaming
@@ -13212,6 +13252,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
 
                 if is_stop(next_id) {
+                    stopped = true;
                     break;
                 }
 
@@ -13248,6 +13289,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
+                stopped,
             }
         }
 
@@ -13301,10 +13343,11 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut f16_data: Vec<u16> = Vec::with_capacity(tensor.original_len);
             for block in &tensor.blocks {
                 let scale = q4_f16_to_f32(block.scale);
+                let bias = q4_f16_to_f32(block.bias);
                 for b in 0..16 {
                     let byte_val = block.packed[b];
-                    let w0 = ((byte_val & 0x0f) as f32 - 8.0) * scale;
-                    let w1 = ((byte_val >> 4) as f32 - 8.0) * scale;
+                    let w0 = (byte_val & 0x0f) as f32 * scale + bias;
+                    let w1 = (byte_val >> 4) as f32 * scale + bias;
                     f16_data.push(q4_f32_to_f16(w0));
                     f16_data.push(q4_f32_to_f16(w1));
                 }
@@ -14421,6 +14464,86 @@ kernel void gdn_chunk_norm_silu_c32(
         }
     }
 
+    impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
+        fn cache_position(&self) -> usize {
+            self.session.kv_cache.seq_len
+        }
+
+        fn rollback_cache_to(
+            &mut self,
+            seq_len: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            self.rollback_speculative_state_to(seq_len)
+        }
+
+        fn verify_tokens(
+            &mut self,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            let out = self.verify_tokens_batched(tokens, start_pos)?;
+            Ok(out.logits)
+        }
+
+        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let mut snap = Vec::with_capacity(num_layers);
+            for i in 0..num_layers {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                // SAFETY: GPU buffers are StorageModeShared (allocated with
+                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
+                // `contents()` points to host-readable memory. `length()` is the
+                // exact allocated byte length and is divisible by 4 (we always
+                // allocate f32 buffers). Callers of `snapshot_gdn_states` invoke it
+                // outside any in-flight command buffer (in `mtp_verify_draft` before
+                // `target.verify_tokens`), so no GPU write can race with this read.
+                let conv = unsafe {
+                    let ptr = conv_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, conv_floats).to_vec()
+                };
+                let s = unsafe {
+                    let ptr = s_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, s_floats).to_vec()
+                };
+                snap.push((s, conv));
+            }
+            snap
+        }
+
+        fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            if snapshot.is_empty() {
+                return;
+            }
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            debug_assert_eq!(snapshot.len(), num_layers);
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_bytes = conv_snap.len() * 4;
+                let s_bytes = s_snap.len() * 4;
+                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
+                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
+                // the buffer directly; callers invoke this outside any in-flight command
+                // buffer (rejection branch in `mtp_verify_draft`).
+                unsafe {
+                    let dst = conv_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
+                }
+                unsafe {
+                    let dst = s_buf.contents() as *mut f32;
+                    std::ptr::copy_nonoverlapping(s_snap.as_ptr(), dst, s_snap.len());
+                }
+                if i < self.session.gdn_states.len() {
+                    self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -14561,9 +14684,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_read_buffer_f16_conversion() {
             // Verify read_buffer_f16 produces correct f32 values
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return, // skip on non-Metal systems
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let test_f32 = vec![1.0f32, -0.5, 0.25, 0.0, 100.0];
@@ -14588,9 +14710,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_gemv_decode_kernel_compiles() {
             // Verify the MSL source compiles and GEMV pipeline is creatable.
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let opts = CompileOptions::new();
@@ -14618,9 +14739,8 @@ kernel void gdn_chunk_norm_silu_c32(
         #[test]
         fn test_gemv_decode_numerical() {
             // Run a small GEMM through both f32 and f16 paths, compare results.
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let opts = CompileOptions::new();
@@ -14680,11 +14800,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 enc.set_bytes(4, 4, &n as *const u32 as *const _);
                 enc.set_bytes(5, 4, &k as *const u32 as *const _);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        (n as u64 + tile - 1) / tile,
-                        (m as u64 + tile - 1) / tile,
-                        1,
-                    ),
+                    MTLSize::new((n as u64).div_ceil(tile), (m as u64).div_ceil(tile), 1),
                     MTLSize::new(tile, tile, 1),
                 );
                 enc.end_encoding();
@@ -14748,9 +14864,8 @@ kernel void gdn_chunk_norm_silu_c32(
 
         #[test]
         fn test_make_buffer_f16_halves_size() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
 
             let data = vec![1.0f32; 1024];
@@ -15112,14 +15227,12 @@ kernel void decode_attention_reference(
         /// Strict parity gate: required matrix {128,512,2048} × {8Q/2KV,16Q/2KV}, tolerance 1e-4.
         #[test]
         fn test_decode_attention_parity_required_matrix() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let pipes = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some(pipes) = build_parity_pipelines(&device) else {
+                return;
             };
 
             for &(num_q_heads, num_kv_heads) in &[(8u32, 2u32), (16u32, 2u32)] {
@@ -15140,14 +15253,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_8q2kv_512() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 512);
@@ -15160,14 +15271,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_8q2kv_4096() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 4096);
@@ -15181,14 +15290,12 @@ kernel void decode_attention_reference(
         #[test]
         #[ignore = "slow: reference kernel ~721ms at cache_len=32768; run with --include-ignored"]
         fn test_decode_attention_parity_8q2kv_32768() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 32768);
@@ -15201,14 +15308,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_16q2kv_512() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 512);
@@ -15221,14 +15326,12 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_decode_attention_parity_16q2kv_4096() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 4096);
@@ -15242,14 +15345,12 @@ kernel void decode_attention_reference(
         #[test]
         #[ignore = "slow: reference kernel ~723ms at cache_len=32768; run with --include-ignored"]
         fn test_decode_attention_parity_16q2kv_32768() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 16, 2, 32768);
@@ -15266,14 +15367,12 @@ kernel void decode_attention_reference(
         /// so flash output must equal the old reference exactly (same f32 arithmetic).
         #[test]
         fn test_decode_attention_edge_cache_len_1() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             // Use 8Q/2KV; first token is on the direct path (cache_len=1 <= 512)
             let (max_d, mean_d, nans) = parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 1);
@@ -15292,14 +15391,12 @@ kernel void decode_attention_reference(
         /// cache_len=257: crosses the 256-token TILE_TOKENS boundary (direct path).
         #[test]
         fn test_decode_attention_edge_cache_len_257() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 257);
@@ -15313,14 +15410,12 @@ kernel void decode_attention_reference(
         /// cache_len=513: just above DIRECT_THRESHOLD — forces partitioned path.
         #[test]
         fn test_decode_attention_edge_cache_len_513() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 513);
@@ -15334,14 +15429,12 @@ kernel void decode_attention_reference(
         /// cache_len=1025: crosses PARTITION_TOKENS boundary in the partitioned path.
         #[test]
         fn test_decode_attention_edge_cache_len_1025() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
-            let (pr, pf, pp, prr) = match build_parity_pipelines(&device) {
-                Some(p) => p,
-                None => return,
+            let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
+                return;
             };
             let (max_d, _mean_d, nans) =
                 parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 1025);
@@ -15423,9 +15516,8 @@ kernel void decode_attention_reference(
 
         #[test]
         fn test_gpu_argmax_parity_k1() {
-            let device = match Device::system_default() {
-                Some(d) => d,
-                None => return,
+            let Some(device) = Device::system_default() else {
+                return;
             };
             let queue = device.new_command_queue();
             let opts = CompileOptions::new();
@@ -15536,7 +15628,7 @@ kernel void decode_attention_reference(
                 },
                 Case {
                     name: "all same values (tie → lowest id = 0)",
-                    logits: vec![3.14f32; 4096],
+                    logits: vec![1.5f32; 4096],
                     expect_gpu_eq_cpu: true,
                 },
                 Case {
@@ -16248,14 +16340,10 @@ kernel void decode_attention_reference(
                 std::env::temp_dir().join(format!("lattice-q4-test-mpe-{}", std::process::id()));
             // The validator runs before any file I/O so an empty / non-
             // existent dir is fine for this regression.
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                1024,
-            ) {
-                Ok(_) => panic!("max_cache_len > max_position_embeddings must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 1024)
+            else {
+                panic!("max_cache_len > max_position_embeddings must error")
             };
             assert!(
                 err.contains("max_cache_len") && err.contains("max_position_embeddings"),
@@ -16271,14 +16359,10 @@ kernel void decode_attention_reference(
             let (cfg, _weights) = tiny_metal_qwen35_fixture();
             let tmp =
                 std::env::temp_dir().join(format!("lattice-q4-test-zero-{}", std::process::id()));
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                0,
-            ) {
-                Ok(_) => panic!("max_cache_len = 0 must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 0)
+            else {
+                panic!("max_cache_len = 0 must error")
             };
             assert!(
                 err.contains("max_cache_len"),
@@ -16315,14 +16399,10 @@ kernel void decode_attention_reference(
             let lm_head_file = tmp.join("lm_head_weight.q4");
             std::fs::write(&lm_head_file, b"placeholder").expect("write lm_head placeholder");
 
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                16,
-            ) {
-                Ok(_) => panic!("tied config with stray lm_head.q4 must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("tied config with stray lm_head.q4 must error")
             };
             assert!(
                 err.contains("lm_head") && err.contains("tie_word_embeddings"),
@@ -16351,14 +16431,10 @@ kernel void decode_attention_reference(
                 std::env::temp_dir().join(format!("lattice-q4-test-untied-{}", std::process::id()));
             std::fs::create_dir_all(&tmp).expect("tempdir create");
             // Empty dir → lm_head.weight.q4 does not exist.
-            let err = match MetalQwen35State::from_q4_dir(
-                &tmp,
-                std::path::Path::new("/dev/null"),
-                &cfg,
-                16,
-            ) {
-                Ok(_) => panic!("untied config without lm_head artifact must error"),
-                Err(e) => e,
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(&tmp, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("untied config without lm_head artifact must error")
             };
             assert!(
                 err.contains("lm_head") && err.contains("tie_word_embeddings"),
@@ -16545,7 +16621,7 @@ kernel void decode_attention_reference(
 
             let cmd = state.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc, &x_buf, 0, &y_buf, 0, 0, "o_proj");
+            state.dispatch_lora_if_active(enc, &x_buf, 0, &y_buf, 0, 0, "o_proj");
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
@@ -16590,7 +16666,7 @@ kernel void decode_attention_reference(
             );
             let cmd2 = state.engine.queue.new_command_buffer();
             let enc2 = cmd2.new_compute_command_encoder();
-            state.dispatch_lora_if_active(&enc2, &x_buf, 0, &y_buf2, 0, 0, "v_proj");
+            state.dispatch_lora_if_active(enc2, &x_buf, 0, &y_buf2, 0, 0, "v_proj");
             enc2.end_encoding();
             cmd2.commit();
             cmd2.wait_until_completed();
@@ -16952,6 +17028,98 @@ kernel void decode_attention_reference(
                     "[shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
                 );
             }
+        }
+
+        /// Regression for the Q4 decode dispatch-geometry bug (codex 2026-06-26).
+        ///
+        /// `gemv_q4_decode` writes NR=2 output rows per threadgroup, so
+        /// `dispatch_matmul_q4` MUST launch `ceil(N/2)` groups. The prior `ceil(N/4)`
+        /// left the upper ~half of the rows unwritten — on the Q4 decode/logits path
+        /// (`final_logits` → `dispatch_matmul` for `QuantFormat::Q4_0`, N = vocab_size)
+        /// this silently corrupted every token after the first prefill token, because
+        /// the upper half of the vocabulary logits were never produced.
+        ///
+        /// N=6 is the minimal shape that exposes it: `ceil(6/4)=2` groups write only
+        /// rows 0..4 (rows 4,5 dropped); `ceil(6/2)=3` groups write all 6. Pre-fill Y
+        /// with a sentinel and assert every row is overwritten and matches the CPU
+        /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
+        #[test]
+        fn dispatch_matmul_q4_writes_all_rows() {
+            // Fail closed under enforce: a CI runner that provisions a Metal GPU but
+            // silently skips here would make this regression gate verify nothing —
+            // the same silent-skip class as the embed parity gate (#383). The
+            // dedicated macOS test step sets LATTICE_METAL_TEST_ENFORCE=1.
+            //
+            // Note: NO Apple7 family gate. `gemv_q4_decode` uses only `simd_sum` +
+            // threadgroup memory, not the Apple7-gated `simdgroup_matrix` MMA path,
+            // so it runs on GitHub's paravirtual macOS GPU (which reports a Metal
+            // device but NOT Apple7). The tiled-GEMM tests below DO need Apple7 and
+            // skip on CI; this decode-geometry test genuinely runs there.
+            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let (n, k) = (6usize, 64usize);
+            let (qw_raw, w_deq) = make_q4_weight_ref(&device, 0x0FF0_1234_u64, n, k);
+            let qw = Q4WeightBuf::from_buffer(qw_raw);
+
+            let mut xrng = 0x1234_5678_u64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| {
+                    xrng = xrng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect();
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            // Pre-fill the output with a sentinel far outside the achievable result
+            // range (|y| < K = 64 here); any row left untouched keeps it.
+            const SENTINEL: f32 = -123_456.0;
+            let y_init = vec![SENTINEL; n];
+            let y_buf = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (n * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_matmul_q4(enc, &x_buf, &qw, &y_buf, 1, n as u32, k as u32);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // SAFETY: StorageModeShared, GPU work completed, size matches allocation.
+            let y: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n) };
+            let y_ref = cpu_matmul_ref(&x, &w_deq, 1, n, k);
+
+            for (row, &val) in y.iter().enumerate() {
+                assert!(
+                    val.to_bits() != SENTINEL.to_bits(),
+                    "row {row} of {n} never written — dispatch grid under-covers \
+                     gemv_q4_decode (NR=2 rows/group). This is the codex P0 decode-geometry bug."
+                );
+            }
+            let diff = max_abs_diff(y, &y_ref);
+            assert!(
+                diff < 1e-3,
+                "dispatch_matmul_q4 result diverges from CPU dequant ref: max_abs_diff={diff:.4e}"
+            );
         }
 
         // ── Q8 GEMM numeric differential gate ────────────────────────────────
@@ -18087,7 +18255,9 @@ kernel void decode_attention_reference(
         fn with_self_spec_env<R>(f: impl FnOnce() -> R) -> R {
             use std::sync::Mutex;
             static ENV_LOCK: Mutex<()> = Mutex::new(());
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY: only this serialized closure mutates LATTICE_SELF_SPEC. The lock
             // forbids concurrent test threads from reading or writing it.
             unsafe {
@@ -18111,7 +18281,9 @@ kernel void decode_attention_reference(
         fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
             use std::sync::Mutex;
             static GPU_LOCK: Mutex<()> = Mutex::new(());
-            GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+            GPU_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
@@ -18168,6 +18340,7 @@ kernel void decode_attention_reference(
                 enable_thinking: false,
                 enable_mtp: Some(false),
                 grammar: None,
+                stop_strings: vec![],
             };
 
             let out = with_self_spec_env(|| {
@@ -18263,6 +18436,7 @@ kernel void decode_attention_reference(
                 enable_thinking: false,
                 enable_mtp: Some(false),
                 grammar: None,
+                stop_strings: vec![],
             };
 
             let mut state = with_self_spec_env(|| {
@@ -18303,7 +18477,7 @@ kernel void decode_attention_reference(
                 "tiny hybrid fixture must have GDN layers"
             );
 
-            let real_prefill = state.forward_prefill(&vec![0u32]);
+            let real_prefill = state.forward_prefill(&[0u32]);
             // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
             // exact state the self-spec round will see at `pos = kv.seq_len`.
             let snap_pre_round = state.snapshot_gdn_states();
@@ -19411,86 +19585,6 @@ kernel void decode_attention_reference(
             );
         }
     }
-
-    impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
-        fn cache_position(&self) -> usize {
-            self.session.kv_cache.seq_len
-        }
-
-        fn rollback_cache_to(
-            &mut self,
-            seq_len: usize,
-        ) -> Result<(), crate::error::InferenceError> {
-            self.rollback_speculative_state_to(seq_len)
-        }
-
-        fn verify_tokens(
-            &mut self,
-            tokens: &[u32],
-            start_pos: usize,
-        ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
-            let out = self.verify_tokens_batched(tokens, start_pos)?;
-            Ok(out.logits)
-        }
-
-        fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            let mut snap = Vec::with_capacity(num_layers);
-            for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_floats = (conv_buf.length() / 4) as usize;
-                let s_floats = (s_buf.length() / 4) as usize;
-                // SAFETY: GPU buffers are StorageModeShared (allocated with
-                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
-                // `contents()` points to host-readable memory. `length()` is the
-                // exact allocated byte length and is divisible by 4 (we always
-                // allocate f32 buffers). Callers of `snapshot_gdn_states` invoke it
-                // outside any in-flight command buffer (in `mtp_verify_draft` before
-                // `target.verify_tokens`), so no GPU write can race with this read.
-                let conv = unsafe {
-                    let ptr = conv_buf.contents() as *const f32;
-                    std::slice::from_raw_parts(ptr, conv_floats).to_vec()
-                };
-                let s = unsafe {
-                    let ptr = s_buf.contents() as *const f32;
-                    std::slice::from_raw_parts(ptr, s_floats).to_vec()
-                };
-                snap.push((s, conv));
-            }
-            snap
-        }
-
-        fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
-            if snapshot.is_empty() {
-                return;
-            }
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            debug_assert_eq!(snapshot.len(), num_layers);
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_bytes = conv_snap.len() * 4;
-                let s_bytes = s_snap.len() * 4;
-                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
-                debug_assert_eq!(s_bytes as u64, s_buf.length());
-                // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
-                // the buffer directly; callers invoke this outside any in-flight command
-                // buffer (rejection branch in `mtp_verify_draft`).
-                unsafe {
-                    let dst = conv_buf.contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
-                }
-                unsafe {
-                    let dst = s_buf.contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(s_snap.as_ptr(), dst, s_snap.len());
-                }
-                if i < self.session.gdn_states.len() {
-                    self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19658,6 +19752,7 @@ impl MetalQwen35State {
             token_ids: vec![],
             prompt_tokens: 0,
             generated_tokens: 0,
+            stopped: false,
         }
     }
 
@@ -20340,6 +20435,130 @@ mod mtp_greedy_round_tests {
             self.0
         }
     }
+
+    // -----------------------------------------------------------------------
+    // FIX 1: EmitAndStop `stopped` semantics.
+    //
+    // `generate_greedy_mtp` (under #[cfg(feature="metal-gpu")]) computes:
+    //
+    //   let emit_len = tokens.len().min(remaining);
+    //   generated_ids.extend_from_slice(&tokens[..emit_len]);
+    //   stopped = emit_len == tokens.len();   // ← FIX 1
+    //
+    // The pre-fix code was `stopped = true` unconditionally, which is wrong when
+    // the budget clips the emission so the stop token (last element of `tokens`)
+    // is never actually pushed — in that case the reason for termination is
+    // the length cap, not the stop condition.
+    //
+    // `generate_greedy_mtp` requires Metal hardware and cannot be called from
+    // `cargo test` (no GPU). `simulate_mtp_with_stopped` mirrors the call-site
+    // logic exactly; tests here are mutation-sensitive against that logic.
+    //
+    // Mutation-sensitivity: change `stopped = emit_len == tokens.len()` in
+    // `simulate_mtp_with_stopped` below back to `stopped = true` → both
+    // cap-clipped tests go RED (expected false, got true).
+    // -----------------------------------------------------------------------
+    fn simulate_mtp_with_stopped(
+        logit_rows: &[Vec<f32>],
+        draft_seq: &[u32],
+        max_len: usize,
+    ) -> (Vec<u32>, bool) {
+        let mut out: Vec<u32> = Vec::new();
+        let mut stopped = false;
+        let mut pos = 0usize;
+        let mut draft_idx = 0usize;
+
+        loop {
+            if out.len() >= max_len {
+                break;
+            }
+            let pending_token = argmax(&logit_rows[pos]);
+            if is_stop(pending_token) {
+                out.push(pending_token);
+                stopped = true;
+                break;
+            }
+            if pos + 1 >= logit_rows.len() {
+                out.push(pending_token);
+                break;
+            }
+            let draft_token = if draft_idx < draft_seq.len() {
+                draft_seq[draft_idx]
+            } else {
+                out.push(pending_token);
+                break;
+            };
+            draft_idx += 1;
+
+            let target_logits_0 = &logit_rows[pos + 1];
+            let accepted = draft_token == argmax(target_logits_0);
+            let bonus_token = if accepted {
+                if pos + 2 < logit_rows.len() {
+                    argmax(&logit_rows[pos + 2])
+                } else {
+                    0
+                }
+            } else {
+                argmax(target_logits_0)
+            };
+
+            match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
+                MtpRoundOutcome::EmitAndStop(tokens) => {
+                    let remaining = max_len - out.len();
+                    let emit_len = tokens.len().min(remaining);
+                    out.extend_from_slice(&tokens[..emit_len]);
+                    // FIX 1: stopped only when stop token was actually emitted (not clipped).
+                    stopped = emit_len == tokens.len();
+                    break;
+                }
+                MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
+                    let remaining = max_len - out.len();
+                    out.extend_from_slice(&emit[..emit.len().min(remaining)]);
+                    if out.len() >= max_len {
+                        break;
+                    }
+                    pos = if accepted { pos + 2 } else { pos + 1 };
+                    let _ = next_pending;
+                }
+            }
+        }
+        (out, stopped)
+    }
+
+    #[test]
+    fn test_mtp_stopped_stop_token_emitted() {
+        // Budget=10: all of [10, 20, EOS] fit → emit_len=3 == tokens.len()=3 → stopped=true.
+        let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![20u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 10);
+        assert_eq!(tokens, vec![10, 20, EOS]);
+        assert!(stopped, "stop token emitted → stopped must be true");
+    }
+
+    #[test]
+    fn test_mtp_stopped_stop_token_clipped_at_budget_2() {
+        // Budget=2: cap lands before the bonus EOS.
+        // EmitAndStop([10, 20, EOS]): emit_len=2 < tokens.len()=3 → stopped=false.
+        // Pre-fix (stopped = true): this test goes RED.
+        let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![20u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
+        assert_eq!(tokens, vec![10, 20]);
+        assert!(
+            !stopped,
+            "stop token clipped by budget cap → stopped must be false (length cap, not stop)"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_stop_token_clipped_at_budget_1() {
+        // Budget=1: only the pending token fits; EOS never reached → stopped=false.
+        let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![20u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(!stopped, "EOS not reached at all → stopped must be false");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -20846,5 +21065,205 @@ mod self_spec_eos_tests {
                 .wrapping_add(1442695040888963407);
             self.0
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 2 & FIX 3: `stopped` semantics for fallback and accepted-draft paths.
+    //
+    // FIX 2 (five fallback/rejection/full-accept sites in generate_greedy_self_spec):
+    //   Pre-fix: `stopped = true` was placed OUTSIDE the budget guard, so a clipped
+    //   stop (budget already full) incorrectly set stopped=true. Fix: move
+    //   `stopped = true` INSIDE the `generated_ids.len() < max_new_tokens` guard.
+    //
+    // FIX 3 (accepted-draft stop, inside `for (i, &draft) in draft_tokens...`):
+    //   Pre-fix: `break` only exited the inner draft loop, leaving the outer 'round
+    //   loop to continue an extra iteration without recording stopped=true. Fix:
+    //   `stopped = true; break 'round;` to exit both loops and record the stop.
+    //
+    // `generate_greedy_self_spec` requires Metal hardware (GPU). These tests drive
+    // the identical decision logic via simulate_self_spec_with_stopped.
+    //
+    // Mutation-sensitivity for FIX 2: move `stopped = true` back outside the guard
+    // in simulate_self_spec_with_stopped → test_self_spec_stopped_fallback_eos_clipped
+    // goes RED (expected false, got true).
+    //
+    // Mutation-sensitivity for FIX 3: replace `break 'round` with plain `break` and
+    // remove `stopped = true` from simulate_self_spec_with_stopped →
+    // test_self_spec_stopped_accepted_draft_stop goes RED (expected true, got false).
+    // -----------------------------------------------------------------------
+    fn simulate_self_spec_with_stopped(
+        logit_rows: &[Vec<f32>],
+        draft_seq: &[u32],
+        simulate_fallback: bool,
+        max_len: usize,
+    ) -> (Vec<u32>, bool) {
+        assert!(!logit_rows.is_empty(), "need at least one logit row");
+        let mut out: Vec<u32> = Vec::new();
+        let mut stopped = false;
+        let mut pos = 0usize;
+
+        let pending_first = argmax(&logit_rows[pos]);
+        if is_stop(pending_first) {
+            if max_len > 0 {
+                out.push(pending_first);
+                stopped = true;
+            }
+            return (out, stopped);
+        }
+
+        let mut pending_token = pending_first;
+        let mut round = 0usize;
+
+        'round: loop {
+            if out.len() >= max_len {
+                break;
+            }
+
+            if simulate_fallback || pos + 1 >= logit_rows.len() || round >= draft_seq.len() {
+                out.push(pending_token);
+                // Mirror production check order: is_stop(next) is evaluated BEFORE the
+                // budget guard, exactly as in generate_greedy_self_spec. This makes the
+                // simulation mutation-sensitive for FIX 2: when budget is exactly full
+                // after pushing pending, the stop token is clipped → stopped stays false.
+                if pos + 1 < logit_rows.len() {
+                    let next = argmax(&logit_rows[pos + 1]);
+                    if is_stop(next) {
+                        // FIX 2: stopped=true only when the stop token is actually emitted.
+                        // When out.len() >= max_len the stop is clipped → stopped stays false.
+                        if out.len() < max_len {
+                            out.push(next);
+                            stopped = true; // inside budget guard
+                        }
+                        break;
+                    }
+                    // Not a stop: continue if budget allows.
+                    if out.len() < max_len {
+                        pending_token = next;
+                        pos += 1;
+                        round += 1;
+                        continue 'round;
+                    }
+                }
+                break;
+            }
+
+            let draft = draft_seq[round];
+            round += 1;
+
+            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let accepted = target_at_pos1 == draft;
+
+            if accepted {
+                out.push(pending_token);
+                if is_stop(draft) {
+                    if out.len() < max_len {
+                        out.push(draft);
+                        // FIX 3: record stop and break the outer round loop.
+                        stopped = true;
+                    }
+                    break 'round;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                out.push(draft);
+                if out.len() >= max_len {
+                    break;
+                }
+                let next_pending_pos = pos + 2;
+                if next_pending_pos >= logit_rows.len() {
+                    break;
+                }
+                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                if is_stop(next_pending) {
+                    // FIX 2 (full-accept path): stopped only when emitted.
+                    if out.len() < max_len {
+                        out.push(next_pending);
+                        stopped = true;
+                    }
+                    break;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                pending_token = next_pending;
+                pos += 2;
+            } else {
+                out.push(pending_token);
+                let replacement = target_at_pos1;
+                if is_stop(replacement) {
+                    // FIX 2 (rejection path): stopped only when emitted.
+                    if out.len() < max_len {
+                        out.push(replacement);
+                        stopped = true;
+                    }
+                    break;
+                }
+                if out.len() >= max_len {
+                    break;
+                }
+                pending_token = replacement;
+                pos += 1;
+            }
+        }
+        (out, stopped)
+    }
+
+    // FIX 2: fallback path, budget not full → stop token emitted → stopped=true.
+    #[test]
+    fn test_self_spec_stopped_fallback_eos_emitted() {
+        // Fallback: pending=10, next=EOS. Budget=10. EOS fits → stopped=true.
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[], true, 10);
+        assert_eq!(tokens, vec![10, EOS]);
+        assert!(
+            stopped,
+            "EOS emitted in fallback path → stopped must be true"
+        );
+    }
+
+    // FIX 2: fallback path, budget already full after pushing pending → stop clipped → stopped=false.
+    #[test]
+    fn test_self_spec_stopped_fallback_eos_clipped() {
+        // Fallback: pending=10, next=EOS. Budget=1. After pushing pending, out.len()=1 >= max_len=1.
+        // EOS is clipped → stopped=false.
+        // Pre-fix (stopped=true outside guard): this test goes RED.
+        let logit_rows = vec![make_logit(10), make_logit(EOS)];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[], true, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "EOS clipped by budget cap in fallback path → stopped must be false (length cap)"
+        );
+    }
+
+    // FIX 3: accepted draft is stop token, budget allows → draft emitted → stopped=true.
+    #[test]
+    fn test_self_spec_stopped_accepted_draft_stop() {
+        // logit_rows[0]=10 (pending), logit_rows[1]=EOS (target agrees with draft=EOS).
+        // draft accepted, is_stop(draft)=true, budget=10 → EOS pushed → stopped=true.
+        // Pre-fix (plain `break` without `stopped=true`): this test goes RED.
+        let logit_rows = vec![make_logit(10), make_logit(EOS), make_logit(30)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &draft_seq, false, 10);
+        assert_eq!(tokens, vec![10, EOS]);
+        assert!(
+            stopped,
+            "accepted draft is stop token → stopped must be true"
+        );
+    }
+
+    // FIX 3: accepted draft is stop, but budget is already full after pending → draft clipped → stopped=false.
+    #[test]
+    fn test_self_spec_stopped_accepted_draft_stop_clipped() {
+        // pending=10 pushed (budget=1 full), draft=EOS clipped → stopped=false.
+        let logit_rows = vec![make_logit(10), make_logit(EOS), make_logit(30)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &draft_seq, false, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "accepted draft EOS clipped by budget cap → stopped must be false"
+        );
     }
 }

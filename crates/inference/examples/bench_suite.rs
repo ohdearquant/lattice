@@ -376,7 +376,7 @@ fn bench_llm_q8() -> Vec<Metric> {
     let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
 
     let t_quant = Instant::now();
-    let q8_weights = quantize_from_model(&model);
+    let q8_weights = quantize_from_model(&model).expect("Q8 quantization failed");
     let quant_ms = t_quant.elapsed().as_millis() as f64;
 
     // Drop the f32 model to free memory
@@ -527,7 +527,7 @@ fn bench_llm_metal() -> Vec<Metric> {
 
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");

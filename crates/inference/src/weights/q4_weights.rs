@@ -57,7 +57,9 @@
 /// ```text
 /// byte[b] = (q[2b+1] << 4) | q[2b]
 /// ```
-/// where `q[i] = clamp(round(weight[i] / scale) + 8, 0, 15)`.
+/// where `q[i] = clamp(round((weight[i] - bias) / scale), 0, 15)` for the default
+/// asymmetric format (`bias` = per-block minimum). The legacy symmetric variant
+/// fixes `bias = -8 * scale`, giving `q[i] = clamp(round(weight[i] / scale) + 8, 0, 15)`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Q4Block {

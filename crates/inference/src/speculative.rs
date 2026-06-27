@@ -519,18 +519,28 @@ impl<'a> MtpVerifier<'a> {
                 config.num_hidden_layers
             )));
         }
-        if embed_tokens.len() != config.vocab_size * config.hidden_size {
+        // Checked product so a pathological public config returns a typed error
+        // instead of overflow-panicking (debug) or wrapping (release) before the
+        // shape comparison. Matches the FlatKVCache checked-arithmetic precedent.
+        let embed_numel = config
+            .vocab_size
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "MtpConfig vocab_size ({}) * hidden_size ({}) overflows usize",
+                    config.vocab_size, config.hidden_size
+                ))
+            })?;
+        if embed_tokens.len() != embed_numel {
             return Err(InferenceError::Inference(format!(
-                "embed_tokens length {} != vocab_size * hidden_size = {}",
+                "embed_tokens length {} != vocab_size * hidden_size = {embed_numel}",
                 embed_tokens.len(),
-                config.vocab_size * config.hidden_size
             )));
         }
-        if lm_head_weight.len() != config.vocab_size * config.hidden_size {
+        if lm_head_weight.len() != embed_numel {
             return Err(InferenceError::Inference(format!(
-                "lm_head_weight length {} != vocab_size * hidden_size = {}",
+                "lm_head_weight length {} != vocab_size * hidden_size = {embed_numel}",
                 lm_head_weight.len(),
-                config.vocab_size * config.hidden_size
             )));
         }
         if config.draft_length > 8 {
@@ -544,7 +554,97 @@ impl<'a> MtpVerifier<'a> {
             ));
         }
 
+        // Guard structural scalars: zero values cause divide-by-zero or OOB on
+        // first forward_one; partial_rotary_factor outside [0,1] produces a
+        // rope_dim > head_dim which overreads the per-head slice in
+        // mtp_apply_partial_rope.
+        if config.hidden_size == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig hidden_size must be > 0".into(),
+            ));
+        }
+        if config.vocab_size == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig vocab_size must be > 0".into(),
+            ));
+        }
+        if config.head_dim == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig head_dim must be > 0".into(),
+            ));
+        }
+        if config.num_attention_heads == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig num_attention_heads must be > 0".into(),
+            ));
+        }
+        if config.num_key_value_heads == 0 {
+            return Err(InferenceError::Inference(
+                "MtpConfig num_key_value_heads must be > 0".into(),
+            ));
+        }
+        if config.num_attention_heads % config.num_key_value_heads != 0 {
+            return Err(InferenceError::Inference(format!(
+                "MtpConfig num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+                config.num_attention_heads, config.num_key_value_heads
+            )));
+        }
+        if !config.partial_rotary_factor.is_finite()
+            || !(0.0..=1.0).contains(&config.partial_rotary_factor)
+        {
+            return Err(InferenceError::Inference(format!(
+                "MtpConfig partial_rotary_factor {} is not in [0.0, 1.0]",
+                config.partial_rotary_factor
+            )));
+        }
+
         let rope_dim = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+        // Reject zero-width RoPE: rope_dim < 2 gives half_dim == 0, so
+        // RopeTable::max_positions() == 0 and the forward_one position bound
+        // would reject every position. A no-RoPE MTP is unsupported (Qwen3.5
+        // always uses partial RoPE); fail closed rather than run without
+        // positional encoding.
+        if rope_dim < 2 {
+            return Err(InferenceError::UnsupportedModel(format!(
+                "MTP requires a non-zero RoPE width: head_dim ({}) * partial_rotary_factor ({}) \
+                 yields rope_dim {rope_dim}, need >= 2",
+                config.head_dim, config.partial_rotary_factor
+            )));
+        }
+        // Checked derived-dimension products. MtpScratch::new and FlatKVCache
+        // allocate from these, and num_attention_heads/head_dim can be oversized
+        // in a public config even with tiny weights (only weights.layers.len()
+        // is checked above), so a pathological config could overflow-panic
+        // (debug) or wrap (release) before construction. Validate the products
+        // here — the private MtpScratch::new and the cache config are only
+        // reached through this constructor, so upstream checking is sufficient.
+        let checked_dim = |a: usize, b: usize, what: &str| -> Result<usize, InferenceError> {
+            a.checked_mul(b).ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "MtpConfig dimension product {what} ({a} * {b}) overflows usize"
+                ))
+            })
+        };
+        let q_dim = checked_dim(
+            config.num_attention_heads,
+            config.head_dim,
+            "num_attention_heads * head_dim",
+        )?;
+        let kv_dim = checked_dim(
+            config.num_key_value_heads,
+            config.head_dim,
+            "num_key_value_heads * head_dim",
+        )?;
+        checked_dim(2, config.hidden_size, "2 * hidden_size")?;
+        checked_dim(2, q_dim, "2 * q_dim")?;
+        checked_dim(2, config.moe_intermediate_size, "2 * moe_intermediate_size")?;
+        checked_dim(
+            config.num_attention_heads,
+            max_seq_len,
+            "num_attention_heads * max_seq_len",
+        )?;
+        checked_dim(kv_dim, max_seq_len, "kv_dim * max_seq_len")?;
+
         // RopeTable built with head_dim=rope_dim so half_dim = rope_dim/2
         let rope = crate::rope::RopeTable::new(rope_dim, max_seq_len.max(1), config.rope_theta);
 
@@ -606,6 +706,18 @@ impl<'a> MtpVerifier<'a> {
             return Err(InferenceError::InvalidInput(format!(
                 "MTP KV cache is full ({} tokens); call rollback_cache_to or reset_cache before forward_one",
                 self.cache.seq_len()
+            )));
+        }
+
+        // Guard RoPE table bounds: `position` is an independent parameter and
+        // can exceed `max_seq_len` even when the cache is not full.
+        // mtp_apply_partial_rope indexes at `position * half_dim + i`; if
+        // position >= rope.max_positions() that index is past the end of the
+        // precomputed table and panics.  Fail closed instead.
+        if position >= self.rope.max_positions() {
+            return Err(InferenceError::InvalidInput(format!(
+                "MTP forward_one position {position} out of range for RoPE table of {} positions",
+                self.rope.max_positions()
             )));
         }
 
@@ -1546,6 +1658,38 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Validate that a logit row is usable for probabilistic softmax sampling.
+///
+/// The probabilistic path turns every logit row into a probability distribution
+/// via [`softmax_into`]. A `NaN` or `+inf` logit poisons that softmax: the sum
+/// becomes `NaN`, the `sum > 0.0` normalization guard is skipped, and `out` is
+/// left holding un-normalized / `NaN` mass, which silently corrupts the
+/// acceptance test `min(1, p/q)` and breaks ADR-050's distribution-preservation
+/// guarantee. `-inf` is a legitimate zero-probability sentinel, but only when at
+/// least one finite logit remains so the softmax is well defined. Fail closed on
+/// everything else (same bug class as the #327 / #335 / #361 sampling hardening).
+fn validate_probabilistic_logits(
+    label: &str,
+    logits: &[f32],
+) -> Result<(), crate::error::InferenceError> {
+    use crate::error::InferenceError;
+    let mut has_finite = false;
+    for (i, &l) in logits.iter().enumerate() {
+        if l.is_nan() || (l.is_infinite() && l.is_sign_positive()) {
+            return Err(InferenceError::InvalidInput(format!(
+                "{label}[{i}] must be finite or -inf for probabilistic rejection sampling, got {l}"
+            )));
+        }
+        has_finite |= l.is_finite();
+    }
+    if !has_finite {
+        return Err(InferenceError::InvalidInput(format!(
+            "{label} has no finite logit; probabilistic rejection sampling needs a well-defined softmax"
+        )));
+    }
+    Ok(())
+}
+
 /// Xorshift64 PRNG local to this module — used only in rejection sampling.
 /// Mirrors the implementation in `sampling.rs` so callers do not need to
 /// expose or import that module's private `Rng`.
@@ -1755,6 +1899,17 @@ pub fn rejection_sample_draft(
                     dl.len()
                 )));
             }
+        }
+        // Value finiteness: the probabilistic path softmaxes every row, so a
+        // NaN/+inf logit would silently poison the distribution and corrupt the
+        // accept/reject decision. The greedy path is robust (argmax skips NaN),
+        // so this guard is probabilistic-only.
+        validate_probabilistic_logits("initial_target_logits", initial_target_logits)?;
+        for (i, tl) in target_logits.iter().enumerate() {
+            validate_probabilistic_logits(&format!("target_logits[{i}]"), tl)?;
+        }
+        for (i, dl) in draft_logits.iter().enumerate() {
+            validate_probabilistic_logits(&format!("draft_logits[{i}]"), dl)?;
         }
     }
 
@@ -2963,6 +3118,96 @@ mod tests {
     }
 
     #[test]
+    fn rejection_probabilistic_rejects_nonfinite_logits() {
+        // The probabilistic path turns every logit row into a softmax. A NaN or
+        // +inf logit poisons softmax_into (sum=NaN -> the `sum > 0.0` guard skips
+        // normalization -> un-normalized/NaN mass corrupts the accept test), so
+        // the verifier must fail closed with InvalidInput rather than silently
+        // accepting an invalid distribution. (#327/#335/#361 bug class.)
+        // Each case mutates exactly ONE logit row; reverting the guard makes the
+        // call return Ok(...) instead of Err, so this is mutation-sensitive.
+        const VOCAB: usize = 4;
+
+        let mut nan_target = uniform_logits(VOCAB);
+        nan_target[1] = f32::NAN;
+        let mut pos_inf_target = uniform_logits(VOCAB);
+        pos_inf_target[2] = f32::INFINITY;
+        let all_neg_inf = vec![f32::NEG_INFINITY; VOCAB];
+
+        // (label, initial_target, draft_logits[0])
+        let cases: [(&str, Vec<f32>, Vec<f32>); 4] = [
+            ("nan_initial_target", nan_target, uniform_logits(VOCAB)),
+            (
+                "pos_inf_initial_target",
+                pos_inf_target,
+                uniform_logits(VOCAB),
+            ),
+            ("nan_draft", uniform_logits(VOCAB), {
+                let mut d = uniform_logits(VOCAB);
+                d[0] = f32::NAN;
+                d
+            }),
+            (
+                "all_neg_inf_initial_target",
+                all_neg_inf,
+                uniform_logits(VOCAB),
+            ),
+        ];
+
+        for (label, initial_target, draft) in cases {
+            let err = rejection_sample_draft(
+                &[1u32],
+                &[draft],
+                &initial_target,
+                &[peaked_logits(VOCAB, 2, 5.0)],
+                false,
+                Some(7),
+            )
+            .expect_err(&format!(
+                "{label}: probabilistic verifier must reject non-finite logits"
+            ));
+            assert!(
+                matches!(err, crate::error::InferenceError::InvalidInput(_)),
+                "{label}: expected InvalidInput, got {err:?}"
+            );
+        }
+
+        // The same non-finite inputs are tolerated by the GREEDY path (argmax is
+        // NaN-robust): the guard must NOT regress greedy callers.
+        let mut nan_target = uniform_logits(VOCAB);
+        nan_target[1] = f32::NAN;
+        let greedy_ok = rejection_sample_draft(
+            &[2u32],
+            &[],
+            &nan_target,
+            &[peaked_logits(VOCAB, 2, 5.0)],
+            true,
+            Some(7),
+        );
+        assert!(
+            greedy_ok.is_ok(),
+            "greedy path must remain robust to non-finite logits, got {greedy_ok:?}"
+        );
+
+        // A legitimate -inf zero-probability sentinel WITH a finite peak must
+        // still be accepted (this is how the other rejection tests build rows).
+        let mut peaked_with_neg_inf = vec![f32::NEG_INFINITY; VOCAB];
+        peaked_with_neg_inf[2] = 5.0;
+        let valid = rejection_sample_draft(
+            &[2u32],
+            &[peaked_with_neg_inf.clone()],
+            &peaked_with_neg_inf,
+            &[peaked_with_neg_inf.clone()],
+            false,
+            Some(7),
+        );
+        assert!(
+            valid.is_ok(),
+            "-inf with a finite peak is a valid distribution, got {valid:?}"
+        );
+    }
+
+    #[test]
     fn rejection_identical_distributions_accept_all() {
         // When draft and target have exactly the same distribution (including the
         // distribution that predicts draft[0]), p(x)/q(x) = 1 everywhere so all
@@ -3655,6 +3900,149 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidInput for full cache, got {other:?}"),
         }
+    }
+
+    /// forward_one returns Err (not a panic) when `position` equals max_seq_len even
+    /// though the KV cache is not yet full.  This guards the RoPE table OOB path in
+    /// mtp_apply_partial_rope (independent `position` param, distinct from the #290
+    /// is_full guard).
+    #[test]
+    fn mtp_verifier_forward_one_out_of_range_position_returns_err() {
+        let cfg = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&cfg);
+
+        let embed: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..cfg.vocab_size * cfg.hidden_size)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+
+        let h = cfg.hidden_size;
+        let max_seq = 4usize;
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        // Cache starts empty (seq_len == 0); pass position == max_seq so the
+        // cache is not full but the position is past the RoPE table.
+        let mut v = MtpVerifier::new(cfg, &weights, &embed, &lm_head, max_seq).unwrap();
+        assert_eq!(v.cache.seq_len(), 0, "cache must start empty");
+        assert!(!v.cache.is_full(), "cache must not be full yet");
+
+        match v.forward_one(1, max_seq, &prev_hidden) {
+            Ok(_) => panic!(
+                "forward_one with out-of-range position must return Err, not panic or succeed"
+            ),
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("position"),
+                    "error message should mention position, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected InvalidInput for out-of-range position, got {other:?}"),
+        }
+    }
+
+    /// MtpVerifier::new rejects a config whose partial_rotary_factor is outside [0,1].
+    /// Factor 2.0 would produce rope_dim = 2 * head_dim, making mtp_apply_partial_rope
+    /// index head_vec[head_dim] on a head_dim-length slice (Bug 2 / scalar validation).
+    #[test]
+    fn mtp_new_rejects_partial_rotary_factor_above_one() {
+        let mut cfg = tiny_mtp_config();
+        cfg.partial_rotary_factor = 2.0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("partial_rotary_factor > 1 must be rejected");
+        };
+        assert!(
+            format!("{err:?}").contains("partial_rotary_factor"),
+            "expected partial_rotary_factor rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new rejects a config with num_key_value_heads == 0.
+    /// Zero kv heads causes divide-by-zero at `groups = num_q_heads / num_kv_heads`
+    /// on the first forward_one (Bug 2 / scalar validation).
+    #[test]
+    fn mtp_new_rejects_zero_kv_heads() {
+        let mut cfg = tiny_mtp_config();
+        cfg.num_key_value_heads = 0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("num_key_value_heads == 0 must be rejected");
+        };
+        assert!(
+            format!("{err:?}").contains("num_key_value_heads"),
+            "expected num_key_value_heads rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new rejects zero-width RoPE (partial_rotary_factor == 0.0,
+    /// which the [0,1] scalar check accepts) before constructing a degenerate
+    /// RopeTable whose max_positions() == 0 would reject every forward_one
+    /// position (codex #362 Major: position-bound exactness for zero-width RoPE).
+    #[test]
+    fn mtp_new_rejects_zero_partial_rotary_factor() {
+        let mut cfg = tiny_mtp_config();
+        cfg.partial_rotary_factor = 0.0;
+        let weights = tiny_mtp_weights(&cfg);
+        let embed: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; cfg.vocab_size * cfg.hidden_size];
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("zero-width RoPE (partial_rotary_factor == 0) must be rejected");
+        };
+        assert!(
+            format!("{err:?}").contains("RoPE width"),
+            "expected zero-width RoPE rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new returns Err (not a debug overflow-panic / release wrap)
+    /// when vocab_size * hidden_size overflows usize. Weights/embeds are tiny;
+    /// the checked product fires before any tensor-shape comparison
+    /// (codex #362 Medium: unchecked dimension products).
+    #[test]
+    fn mtp_new_rejects_dimension_product_overflow() {
+        let base = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&base);
+        let embed: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let mut cfg = tiny_mtp_config();
+        cfg.hidden_size = usize::MAX / 2 + 1;
+        cfg.vocab_size = 2;
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("overflowing vocab_size * hidden_size must return Err, not panic");
+        };
+        assert!(
+            format!("{err:?}").contains("overflows usize"),
+            "expected overflow rejection, got: {err:?}"
+        );
+    }
+
+    /// MtpVerifier::new returns Err (not a panic) when num_attention_heads *
+    /// head_dim overflows. Reachable with TINY weights — only weights.layers.len()
+    /// is checked before MtpScratch/cache construction, so an oversized
+    /// num_attention_heads passes the scalar/divisibility checks (kv_heads=1)
+    /// yet overflows q_dim (codex #362 round-2 Medium: derived-dimension products).
+    #[test]
+    fn mtp_new_rejects_head_dim_product_overflow() {
+        let base = tiny_mtp_config();
+        let weights = tiny_mtp_weights(&base);
+        let embed: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let lm_head: Vec<f32> = vec![0.0; base.vocab_size * base.hidden_size];
+        let mut cfg = tiny_mtp_config();
+        cfg.num_key_value_heads = 1;
+        cfg.num_attention_heads = usize::MAX / 4 + 1; // * head_dim (4) overflows
+        let Err(err) = MtpVerifier::new(cfg, &weights, &embed, &lm_head, 8) else {
+            panic!("overflowing num_attention_heads * head_dim must return Err, not panic");
+        };
+        assert!(
+            format!("{err:?}").contains("overflows usize"),
+            "expected dimension-product overflow rejection, got: {err:?}"
+        );
     }
 
     #[test]

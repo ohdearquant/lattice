@@ -263,16 +263,17 @@ impl BatchWorker {
         }
 
         let id = self.seq_manager.next_id();
+        let mut sampler = Sampler::new(request.sampling.clone());
+        sampler.seed_history(&request.prompt_ids);
         let seq = Sequence::new(
             id,
             request.prompt_ids,
-            request.sampling.clone(),
+            request.sampling,
             request.lora_adapter,
             request.max_new_tokens,
         );
         let page_size = self.kv_pool_page_size();
         self.seq_manager.add(seq, page_size);
-        let sampler = Sampler::new(request.sampling);
         self.samplers.insert(id, sampler);
         self.scheduler.enqueue(id);
         Some(id)
@@ -648,6 +649,45 @@ mod tests {
             max_new_tokens: 10, // 60 + 10 = 70 > 64
         };
         assert!(worker.submit(req).is_none());
+    }
+
+    /// Regression guard for #387 batch path: `submit` must seed the sampler's
+    /// repetition-penalty history with the prompt tokens so the FIRST sampled
+    /// token already penalizes any token that appeared in the prompt.
+    ///
+    /// Mutation-sensitive: removing `sampler.seed_history(&request.prompt_ids)`
+    /// from `submit()` leaves `recent_tokens` empty at the first sample call.
+    /// The greedy fast-path shortcut then fires (`penalty > 1.0 &&
+    /// !recent_tokens.contains(&raw_best)` is true for empty history), returning
+    /// the un-penalized argmax (token 3) instead of the penalized winner (token 4).
+    #[test]
+    fn submit_seeds_prompt_history_for_repetition_penalty() {
+        let mut worker = test_worker();
+        worker.submit(InferenceRequest {
+            prompt_ids: vec![3], // token 3 is in the prompt; must be penalized
+            sampling: SamplingConfig {
+                temperature: 0.0, // greedy fast path
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 2.0,
+            },
+            lora_adapter: None,
+            max_new_tokens: 1,
+        });
+
+        // logits: token 3 raw-wins (9.0 > 5.5) but loses after penalty (4.5 < 5.5).
+        let mut logits = vec![0.0f32; 8];
+        logits[3] = 9.0; // prompt token — raw winner, must be penalized
+        logits[4] = 5.5; // penalty-adjusted winner
+
+        let out = worker.step(|_input, _pool| logits.clone());
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].token_id, 4,
+            "prompt token 3 must be penalized (9.0/2.0=4.5 < 5.5) so token 4 wins; \
+             without seed_history in submit(), token 3 is not penalized and wins raw \
+             (mutation: remove seed_history call from submit())"
+        );
     }
 
     // --- BatchWorker step: sequence lifecycle ---

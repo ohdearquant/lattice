@@ -45,6 +45,16 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
             let start = (h * seq_len + s) * seq_len;
             let row = &mut x[start..start + seq_len];
             let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max_val.is_finite() {
+                // Every score in this row is masked (-inf): there is no valid key to
+                // attend to. Emit a zero distribution instead of computing
+                // `fast_exp(-inf - -inf) = fast_exp(NaN)`, whose value is path-dependent
+                // (0.0 on scalar/NEON, but a tiny nonzero on AVX2 where MAXPS returns
+                // the finite operand on a NaN input) and would otherwise diverge across
+                // SIMD backends. Zeroing keeps every backend fail-closed and identical.
+                row.fill(0.0);
+                continue;
+            }
             let mut sum = 0.0f32;
             for val in row.iter_mut() {
                 *val = fast_exp(*val - max_val);
@@ -121,21 +131,37 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
             let chunks = n / CHUNK;
 
             // --- Step 1: Find row max with 4x unrolling ---
+            // Use the maxNum intrinsics (FMAXNM: vmaxnmq/vmaxnmvq) rather than FMAX
+            // (vmaxq/vmaxvq). FMAX PROPAGATES a NaN operand; Rust `f32::max` in the
+            // scalar reference (and the scalar tail below) follows IEEE maxNum and
+            // DROPS a single NaN. With FMAX, a NaN anywhere in the row makes the whole
+            // reduced max NaN, every `neon_exp(x - NaN)` underflows to 0.0, the sum is
+            // 0.0, and the row is left all-zeros — diverging from the scalar path,
+            // which ignores the NaN and normalizes the finite logits. FMAXNM matches
+            // the scalar reference exactly and is byte-identical on all-finite rows
+            // (the only case that occurs in healthy inference), at no extra cost.
             let mut m0 = vdupq_n_f32(f32::NEG_INFINITY);
             let mut m1 = m0;
             let mut m2 = m0;
             let mut m3 = m0;
             for c in 0..chunks {
                 let base = c * CHUNK;
-                m0 = vmaxq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
-                m1 = vmaxq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
-                m2 = vmaxq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
-                m3 = vmaxq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
+                m0 = vmaxnmq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
+                m1 = vmaxnmq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
+                m2 = vmaxnmq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
+                m3 = vmaxnmq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
             }
-            let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
-            let mut max_val = vmaxvq_f32(vmax);
+            let vmax = vmaxnmq_f32(vmaxnmq_f32(m0, m1), vmaxnmq_f32(m2, m3));
+            let mut max_val = vmaxnmvq_f32(vmax);
             for i in (chunks * CHUNK)..n {
                 max_val = max_val.max(*ptr.add(i));
+            }
+
+            // All-masked row (max stayed -inf): zero it and skip, matching the scalar
+            // reference. Avoids `neon_exp(-inf - -inf)` and keeps every backend identical.
+            if !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
             }
 
             // --- Step 2: Subtract max + fast exp + accumulate sum ---
@@ -233,6 +259,15 @@ unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize
             let mut max_val = _mm_cvtss_f32(max32);
             for i in (chunks * 8)..n {
                 max_val = max_val.max(*ptr.add(i));
+            }
+
+            // All-masked row (max stayed -inf): zero it and skip, matching the scalar
+            // reference. Without this, the SIMD lanes compute `fast_exp_avx2(-inf - -inf)`
+            // where MAXPS returns the finite clamp on a NaN input, yielding a tiny nonzero
+            // weight and a uniform row — diverging from scalar/NEON which produce zeros.
+            if !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
             }
 
             // --- Step 2: Subtract max + fast exp + accumulate sum (all SIMD) ---

@@ -89,7 +89,25 @@ fn load_fixture(filename: &str) -> Vec<Golden> {
     serde_json::from_str(&data).unwrap_or_else(|e| panic!("bad JSON in {filename}: {e}"))
 }
 
+/// Handle the no-weights case: skip locally, but FAIL CLOSED in CI.
+///
+/// Locally and in the workspace-wide `cargo test` job the weights are usually
+/// absent, so each parity test calls this and `return`s — a clean skip. The
+/// dedicated release-cadence gate (`.github/workflows/embed-parity-release.yml`)
+/// provisions the weights AND sets `LATTICE_PARITY_GATE_ENFORCE=1`; there a
+/// missing model means provisioning failed and a silent skip would be pure
+/// theater (a green gate that verified nothing). Under the enforce flag this
+/// panics instead of returning, so the gate fails loudly. Mirrors the
+/// `LATTICE_DRIFT_GATE_ENFORCE` guard in `embed_drift_baseline.rs`.
 fn record_vector_weight_skip(test_name: &str, model_dir: &std::path::Path) {
+    if std::env::var("LATTICE_PARITY_GATE_ENFORCE").is_ok() {
+        panic!(
+            "parity gate weights missing despite LATTICE_PARITY_GATE_ENFORCE=1 — \
+             provisioning failed for {test_name} (expected weights at {}). A silent \
+             skip here would make the release parity gate verify nothing.",
+            model_dir.display()
+        );
+    }
     eprintln!(
         "LATTICE_VECTOR_PARITY_SKIPPED test={test_name} reason=missing_weights path={}",
         model_dir.display()

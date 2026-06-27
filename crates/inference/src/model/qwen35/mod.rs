@@ -45,6 +45,9 @@ pub(crate) use weights::{
 };
 
 #[cfg(test)]
+pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
+
+#[cfg(test)]
 pub use detokenize::bytes_to_unicode;
 #[cfg(test)]
 pub use generation::should_stop_token;

@@ -1643,6 +1643,17 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
              num_key_value_heads ({num_key_value_heads}) must both be non-zero"
         )));
     }
+    // GQA grouping requires num_attention_heads divisible by num_key_value_heads.
+    // `GqaConfig::groups()` only `debug_assert`s this (stripped in release), and
+    // `apply_gqa_attention` hard-asserts it; a non-divisible caller-supplied
+    // config.json would otherwise panic deep in the forward pass. Reject it here
+    // at load time, mirroring `Qwen35Config::from_json_str`.
+    if num_attention_heads % num_key_value_heads != 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "config.json: num_attention_heads ({num_attention_heads}) must be \
+             divisible by num_key_value_heads ({num_key_value_heads})"
+        )));
+    }
     let hidden_size = get("hidden_size")?;
     // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
     let head_dim =
@@ -1742,6 +1753,47 @@ mod tests {
         assert!(
             parse_qwen_config(&cfg_ok).is_ok(),
             "valid config must still parse"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_parse_config_non_divisible_gqa_heads_is_error_not_panic() {
+        let tmp = std::env::temp_dir().join("lattice_test_nondiv_gqa_heads");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // num_attention_heads=16 not divisible by num_key_value_heads=6.
+        // `GqaConfig::groups()` only `debug_assert`s divisibility (stripped in
+        // release), so without this load-time guard a release build would reach
+        // the hard `assert_eq!` in `apply_gqa_attention` and panic deep in the
+        // forward pass. Must be rejected as InvalidInput at parse time.
+        let cfg_bad = tmp.join("non_divisible.json");
+        std::fs::write(
+            &cfg_bad,
+            r#"{"vocab_size":151669,"hidden_size":1024,"num_hidden_layers":1,"num_attention_heads":16,"num_key_value_heads":6,"head_dim":128,"intermediate_size":3072,"max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        let r = parse_qwen_config(&cfg_bad);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "non-divisible GQA heads must be InvalidInput, not panic; got {r:?}"
+        );
+        assert!(
+            r.unwrap_err().to_string().contains("divisible"),
+            "error message must name the divisibility violation"
+        );
+
+        // Sanity: an evenly-divisible config (16 % 8 == 0) still parses.
+        let cfg_ok = tmp.join("divisible.json");
+        std::fs::write(
+            &cfg_ok,
+            r#"{"vocab_size":151669,"hidden_size":1024,"num_hidden_layers":1,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"intermediate_size":3072,"max_position_embeddings":32768}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_qwen_config(&cfg_ok).is_ok(),
+            "divisible config must still parse"
         );
 
         std::fs::remove_dir_all(&tmp).ok();

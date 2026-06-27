@@ -11,7 +11,6 @@ use core::mem::size_of;
 /// We leave headroom for non-tile data (stack, loop variables, etc.) by
 /// targeting 75% of the minimum common L1d size (64 KiB * 0.75 = 48 KiB).
 const L1_BUDGET_BYTES: usize = 48 * 1024;
-const MASK_VALUE: f32 = -10_000.0;
 
 /// Threshold below which the full materialized scores matrix fits in L1 cache,
 /// making tiling overhead not worthwhile. At 32KB L1, sqrt(32768/4) ~ 90 tokens.
@@ -188,6 +187,8 @@ impl TiledAttentionBuffers {
         let d = config.head_dim.max(1);
         let seq = max_seq_len.max(1);
 
+        assert_tiled_scratch_no_overflow(br, bc, d, seq);
+
         resize_zeroed(&mut self.q_tile, br * d);
         resize_zeroed(&mut self.k_tile, bc * d);
         resize_zeroed(&mut self.v_tile, bc * d);
@@ -230,6 +231,75 @@ fn resize_zeroed(buffer: &mut Vec<f32>, len: usize) {
     if buffer.len() < len {
         buffer.resize(len, 0.0);
     }
+}
+
+/// Reject tile/sequence shape products that wrap `usize` before scratch allocation.
+///
+/// `TiledAttentionConfig::{tile_size_q, tile_size_kv, head_dim}` are public, caller-controlled
+/// fields, so an arbitrary tile size can wrap a scratch-length product (`tile_q * tile_kv`,
+/// `tile_kv * head_dim`, ...) to a small value. `resize_zeroed` would then allocate an undersized
+/// buffer that the core kernel later slices as if the unwrapped tile were present, panicking from
+/// an internal bound instead of rejecting the impossible config. This is the non-causal sibling of
+/// the `flash_causal.rs` tile-scratch overflow guard (#366). Release-active: the wrap is invisible
+/// to a debug-only check.
+#[inline]
+fn assert_tiled_scratch_no_overflow(br: usize, bc: usize, head_dim: usize, seq: usize) {
+    assert!(
+        br.checked_mul(bc).is_some(),
+        "tiled scratch overflow: tile_q * tile_kv"
+    );
+    assert!(
+        br.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: tile_q * head_dim"
+    );
+    assert!(
+        bc.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: tile_kv * head_dim"
+    );
+    assert!(
+        seq.checked_mul(head_dim).is_some(),
+        "tiled scratch overflow: max_seq_len * head_dim"
+    );
+}
+
+/// Reject multi-head projection shape products that wrap `usize` before the release length asserts.
+///
+/// The release-active `assert_eq!(hidden_size, num_q_heads * head_dim)` and the derived
+/// `seq_len * q_proj_dim` / `seq_len * kv_proj_dim` slice lengths in
+/// `tiled_multi_head_attention_in_place` are computed with plain `*`. A wrapping
+/// `num_q_heads * head_dim` makes the `hidden_size` assert *accept* an impossible head layout, then
+/// per-head extraction (`head_index * head_dim`, `src[start..start + head_dim]`) indexes a buffer
+/// sized for the wrapped (tiny) shape and reads out of bounds. Mirrors
+/// `flash_causal.rs::assert_flash_no_overflow` (#366). Caller guarantees `num_kv_heads != 0` and
+/// `num_q_heads % num_kv_heads == 0` (asserted at the call site).
+#[inline]
+fn assert_flash_tiled_no_overflow(
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    hidden_size: usize,
+) {
+    assert!(
+        num_q_heads.checked_mul(head_dim).is_some(),
+        "tiled shape overflow: num_q_heads * head_dim"
+    );
+    assert!(
+        num_kv_heads.checked_mul(head_dim).is_some(),
+        "tiled shape overflow: num_kv_heads * head_dim"
+    );
+    assert!(
+        seq_len.checked_mul(hidden_size).is_some(),
+        "tiled shape overflow: seq_len * hidden_size"
+    );
+    assert!(
+        seq_len.checked_mul(num_q_heads * head_dim).is_some(),
+        "tiled shape overflow: seq_len * q_proj_dim"
+    );
+    assert!(
+        seq_len.checked_mul(num_kv_heads * head_dim).is_some(),
+        "tiled shape overflow: seq_len * kv_proj_dim"
+    );
 }
 
 #[inline]
@@ -372,10 +442,16 @@ fn run_tiled_attention_head(
                 let row = &mut s_tile_used[r * kv_rows..(r + 1) * kv_rows];
                 let mut local_max = f32::NEG_INFINITY;
                 for c in 0..kv_rows {
-                    let mut value = row[c] * scale;
-                    if attention_mask[kv_start + c] == 0 {
-                        value = MASK_VALUE;
-                    }
+                    // Masked keys are excluded structurally with a -inf score so their
+                    // softmax weight is exactly zero no matter how low a valid score sits.
+                    // A finite sentinel can be *exceeded* by a valid logit below it, which
+                    // would make the masked key the row max and hand it dominant
+                    // probability (#361).
+                    let value = if attention_mask[kv_start + c] == 0 {
+                        f32::NEG_INFINITY
+                    } else {
+                        row[c] * scale
+                    };
                     row[c] = value;
                     local_max = local_max.max(value);
                 }
@@ -390,9 +466,19 @@ fn run_tiled_attention_head(
                 };
 
                 let mut tile_sum = 0.0f32;
-                for value in row.iter_mut() {
-                    *value = (*value - new_max).exp();
-                    tile_sum += *value;
+                if new_max.is_finite() {
+                    for value in row.iter_mut() {
+                        // exp(-inf - finite) = 0 for masked columns; never NaN here
+                        // because new_max is finite.
+                        *value = (*value - new_max).exp();
+                        tile_sum += *value;
+                    }
+                } else {
+                    // Every key seen so far in this row is masked (new_max == -inf), so
+                    // `*value - new_max` would be `-inf - -inf = NaN`. Define the masked
+                    // probabilities as zero; an all-masked row then carries a zero
+                    // row_sum and the final normalization emits a zero output, not NaN.
+                    row.fill(0.0);
                 }
                 row_sum_new[r] = row_sum[r] * row_scale[r] + tile_sum;
             }
@@ -617,6 +703,8 @@ pub(crate) fn tiled_multi_head_attention_in_place(
         "config.num_kv_heads must match"
     );
     assert_eq!(config.head_dim, head_dim, "config.head_dim must match");
+    assert_ne!(num_kv_heads, 0, "num_kv_heads must be > 0");
+    assert_flash_tiled_no_overflow(num_q_heads, num_kv_heads, head_dim, seq_len, hidden_size);
     assert_eq!(hidden_states.len(), seq_len * hidden_size);
     assert_eq!(attention_mask.len(), seq_len);
     assert_eq!(hidden_size, num_q_heads * head_dim);
@@ -749,6 +837,12 @@ mod tests {
     use crate::forward::cpu::{matmul_bt, softmax_attention};
     use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+
+    /// Legacy finite mask sentinel, retained only as the reference path's masking
+    /// convention. The kernel itself now masks with `-inf` (see #361); for the
+    /// in-distribution inputs these reference tests use, the two agree to within
+    /// the SIMD-softmax tolerance.
+    const MASK_VALUE: f32 = -10_000.0;
 
     #[derive(Clone)]
     struct Lcg {
@@ -1294,6 +1388,123 @@ mod tests {
     }
 
     #[test]
+    fn masked_key_below_finite_sentinel_does_not_dominate() {
+        // #361 trigger. A valid score below the old finite sentinel (-10000) must not
+        // let a masked key win the softmax.
+        //   seq_len=2, head_dim=1, scale=1
+        //   q=[-20000, 0], k=[1, 0], v=[1, 100], mask=[1, 0]  (key 1 masked)
+        // Row 0: valid key-0 score = -20000, key 1 masked. The masked key's weight
+        // must be exactly 0, so output[0] = v[0] = 1.0. The old finite sentinel made
+        // -10000 the row max and output[0] = v[1] = 100.0 (the masked value wins).
+        let head_dim = 1usize;
+        let seq_len = 2usize;
+        let scale = 1.0f32;
+        let q = vec![-20000.0f32, 0.0];
+        let k = vec![1.0f32, 0.0];
+        let v = vec![1.0f32, 100.0];
+        let mask = vec![1u32, 0u32];
+        let config = TiledAttentionConfig::new(1, 1, head_dim);
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "row 0 output={} expected 1.0 (masked key must not dominate; old sentinel gives 100.0)",
+            out[0]
+        );
+        // Row 1 (query 0): key-0 score = 0 (valid), key 1 masked → output = v[0] = 1.0.
+        assert!(
+            (out[1] - 1.0).abs() < 1e-6,
+            "row 1 output={} expected 1.0",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn all_masked_row_yields_zero_output_not_nan() {
+        // Degenerate guard: if every key is masked, the row max stays -inf. The kernel
+        // must define a zero output (zero row_sum → zero-fill), never NaN from
+        // exp(-inf - -inf).
+        let head_dim = 2usize;
+        let seq_len = 2usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q = vec![0.5f32, -0.5, 1.0, 2.0];
+        let k = vec![0.3f32, 0.7, -0.2, 0.1];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mask = vec![0u32, 0u32];
+        let config = TiledAttentionConfig::new(1, 1, head_dim);
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        for (i, &o) in out.iter().enumerate() {
+            assert!(o.is_finite(), "output[{i}]={o} must be finite (no NaN)");
+            assert_eq!(o, 0.0, "output[{i}]={o} expected 0.0 for an all-masked row");
+        }
+    }
+
+    #[test]
+    fn all_masked_multi_tile_row_yields_zero_output_not_nan() {
+        // Single-tile coverage above does not exercise the cross-tile case where the
+        // running `new_max` stays -inf across SEVERAL KV tiles. Force tile_size_kv=1
+        // over a 3-key all-masked row so the `if new_max.is_finite()` guard is hit on
+        // every tile; without it `exp(-inf - -inf)` poisons row_sum to NaN.
+        let head_dim = 2usize;
+        let seq_len = 3usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q = vec![0.5f32, -0.5, 1.0, 2.0, -1.0, 0.25];
+        let k = vec![0.3f32, 0.7, -0.2, 0.1, 0.9, -0.4];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mask = vec![0u32, 0u32, 0u32];
+        let config = TiledAttentionConfig {
+            tile_size_q: 1,
+            tile_size_kv: 1,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim,
+        };
+        let mut buffers = TiledAttentionBuffers::new(seq_len, &config);
+        let mut out = vec![0.0f32; seq_len * head_dim];
+        tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            &mask,
+            seq_len,
+            head_dim,
+            scale,
+            &config,
+            &mut buffers,
+        );
+        for (i, &o) in out.iter().enumerate() {
+            assert!(o.is_finite(), "output[{i}]={o} must be finite (no NaN)");
+            assert_eq!(o, 0.0, "output[{i}]={o} expected 0.0 for an all-masked row");
+        }
+    }
+
+    #[test]
     fn test_should_use_tiled_threshold() {
         let config = TiledAttentionConfig::new(12, 12, 32);
         assert!(!config.should_use_tiled(32));
@@ -1411,5 +1622,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "tiled scratch overflow")]
+    fn tile_config_scratch_overflow_is_rejected() {
+        // Public `TiledAttentionConfig` fields let a caller pick a tile size that wraps
+        // `tile_kv * head_dim` to 0; the guard must reject it before `ensure_capacity` allocates
+        // an undersized scratch buffer. External head shapes are valid.
+        let config = TiledAttentionConfig {
+            tile_size_q: 2,
+            tile_size_kv: 1usize << 63,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 2,
+        };
+        let _buffers = TiledAttentionBuffers::new(2, &config);
+    }
+
+    #[test]
+    #[should_panic(expected = "tiled shape overflow")]
+    fn entry_shape_overflow_is_rejected_not_silently_accepted() {
+        // `num_q_heads * head_dim` wraps to a small value; without the guard the
+        // `hidden_size == num_q_heads * head_dim` release assert would accept an impossible head
+        // layout and per-head extraction would index out of bounds. Exercised directly because the
+        // only call site (`tiled_multi_head_attention_in_place`) needs a fully-populated
+        // 16-tensor `TransformerLayerWeights`; the guard placement before the products is verified
+        // by inspection/review.
+        assert_flash_tiled_no_overflow((1usize << 63) + 1, 1, 2, 2, 2);
     }
 }

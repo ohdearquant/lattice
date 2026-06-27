@@ -30,7 +30,7 @@ fn main() {
 fn run() {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
-    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
+    use lattice_inference::tokenizer::BpeTokenizer;
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -108,8 +108,7 @@ fn run() {
     };
 
     eprintln!(
-        "[bench_stability] Generating {} tokens per prompt (greedy), window={}",
-        max_tokens, window_size
+        "[bench_stability] Generating {max_tokens} tokens per prompt (greedy), window={window_size}"
     );
     eprintln!();
 
@@ -156,7 +155,7 @@ fn run() {
         );
 
         let mut windows: Vec<WindowMetrics> = Vec::new();
-        let num_windows = (n + window_size - 1) / window_size;
+        let num_windows = n.div_ceil(window_size);
 
         for w in 0..num_windows {
             let start = w * window_size;
@@ -168,7 +167,7 @@ fn run() {
             let rep_rate = ngram_repetition_rate(window_tokens, 4);
 
             // Token diversity: unique tokens / window size
-            let unique: std::collections::HashSet<u32> = window_tokens.iter().cloned().collect();
+            let unique: std::collections::HashSet<u32> = window_tokens.iter().copied().collect();
             let diversity = unique.len() as f64 / wlen as f64;
 
             // EOS count in window
@@ -325,7 +324,7 @@ fn ngram_repetition_rate(tokens: &[u32], n: usize) -> f64 {
 fn summary_stats(windows: &[WindowMetrics], f: impl Fn(&WindowMetrics) -> f64) -> (f64, f64) {
     let vals: Vec<f64> = windows.iter().map(&f).collect();
     let mean = vals.iter().sum::<f64>() / vals.len() as f64;
-    let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     (mean, max)
 }
 
@@ -336,6 +335,6 @@ fn summary_stats_min(windows: &[WindowMetrics], f: impl Fn(&WindowMetrics) -> f6
         return (0.0, 0.0);
     }
     let mean = vals.iter().sum::<f64>() / vals.len() as f64;
-    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let min = vals.iter().copied().fold(f64::INFINITY, f64::min);
     (mean, min)
 }

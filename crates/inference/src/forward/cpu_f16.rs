@@ -300,7 +300,7 @@ fn full_attention_step_f16(
         );
     }
 
-    // Partial RoPE: only first rope_dim dimensions of each head (interleaved pairing)
+    // Partial RoPE: stride-half pairing (i, half+i) — matches apply_partial_rope / HF rotate_half
     let half = rope_dim / 2;
     for h in 0..num_q_heads {
         let start = h * head_dim;
@@ -308,10 +308,10 @@ fn full_attention_step_f16(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.q_buf[start + 2 * i];
-            let x1 = scratch.q_buf[start + 2 * i + 1];
-            scratch.q_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.q_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.q_buf[start + i];
+            let x1 = scratch.q_buf[start + half + i];
+            scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
     for h in 0..num_kv_heads {
@@ -320,10 +320,10 @@ fn full_attention_step_f16(
         for i in 0..half {
             let cos_val = rope.cos_at(base + i);
             let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.k_buf[start + 2 * i];
-            let x1 = scratch.k_buf[start + 2 * i + 1];
-            scratch.k_buf[start + 2 * i] = x0 * cos_val - x1 * sin_val;
-            scratch.k_buf[start + 2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            let x0 = scratch.k_buf[start + i];
+            let x1 = scratch.k_buf[start + half + i];
+            scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
+            scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
         }
     }
 
@@ -504,6 +504,18 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
         for v in &mut scratch.router_logits[..num_experts] {
             *v /= denom;
         }
+    } else {
+        // Fail closed on a non-finite denom (NaN/±inf router logit from a corrupt
+        // f16 router gate weight or an upstream activation overflow), mirroring
+        // the f32 router fix in qwen35/moe.rs::compute_router_probs and
+        // generate.rs compute_attention (#409/#410). `max_logit` can stay finite
+        // when only one lane is NaN (Rust `f32::max` ignores a single NaN), so
+        // the NaN propagates into `denom` here and `denom > 0.0` is false.
+        // Without this the router would leave un-normalized raw `exp` values and,
+        // worse, an all-NaN row selects nothing below (`NaN > NEG_INF` is false),
+        // leaving a `usize::MAX` sentinel that overflows expert indexing. Zeroing
+        // drops the routed path (the shared expert still runs).
+        scratch.router_logits[..num_experts].fill(0.0);
     }
 
     // Insertion-sort top-k selection.
@@ -540,6 +552,16 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
 
     for idx in 0..top_k {
         let (expert_id, weight) = scratch.router_selected[idx];
+        // Defense in depth: never index expert weights with an unfilled sentinel
+        // slot or a router-only expert id. A degenerate router row can leave
+        // `(usize::MAX, _)` for a rank it could not fill, and a public f16 weight
+        // set may declare more router experts than routed-expert storage; either
+        // way `expert_id * gate_up_stride` would overflow / OOB the `moe.experts`
+        // slices below. Bound on the storage count `moe.experts.num_experts`,
+        // matching the f32 sibling (qwen35/moe.rs::accumulate_routed_experts).
+        if expert_id >= moe.experts.num_experts {
+            continue;
+        }
         debug_assert_ne!(expert_id, usize::MAX);
 
         let gate_up_stride = 2 * inter * hidden;
@@ -887,12 +909,14 @@ pub fn generate_f16(
             token_ids: vec![],
             prompt_tokens: prompt_len,
             generated_tokens: 0,
+            stopped: true,
         });
     }
 
     generated_ids.push(next_id);
     all_ids.push(next_id);
 
+    let mut stopped = false;
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
@@ -920,6 +944,7 @@ pub fn generate_f16(
         );
 
         if next_id == cfg.eos_token_id {
+            stopped = true;
             break;
         }
 
@@ -935,6 +960,7 @@ pub fn generate_f16(
         token_ids: generated_ids.clone(),
         prompt_tokens: prompt_len,
         generated_tokens: generated_ids.len(),
+        stopped,
     })
 }
 
@@ -994,6 +1020,185 @@ mod tests {
         );
     }
 
+    /// Regression test for #392: cpu F16 RoPE must use stride-half pairing (i, half+i), not
+    /// interleaved (2i, 2i+1).
+    ///
+    /// Design: call `full_attention_step_f16` with an identity K-projection so k_buf equals
+    /// the input exactly (1.0 in f16 is exact, no rounding error on the diagonal).
+    /// Independently reproduce the same matmul + QK-norm + stride-half RoPE in the test body
+    /// and compare against the post-call KV-cache. The two paths agree to <1e-4 when the
+    /// production loops are correct; reverting either loop to 2*i interleaved produces
+    /// max_diff ~0.9 (observed during mutation verification).
+    #[test]
+    fn test_full_attn_step_f16_rope_stride_half_parity() {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::f16_weights::f32_to_f16_slice;
+
+        let head_dim: usize = 32;
+        let num_q_heads: usize = 1;
+        let num_kv_heads: usize = 1;
+        let hidden: usize = 64;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let position: usize = 3;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_q_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5, // rope_dim = 16, half = 8
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope_dim = cfg.rope_dim(); // = 16
+        let half = rope_dim / 2; // = 8
+        let rope = RopeTable::new(rope_dim, 512, cfg.rope_theta);
+
+        // Helper: convert f32 slice to packed f16 Vec<u16>.
+        let to_f16 = |src: &[f32]| -> Vec<u16> {
+            let mut dst = vec![0u16; src.len()];
+            f32_to_f16_slice(src, &mut dst);
+            dst
+        };
+
+        // W_k = identity [kv_dim, hidden]: row j selects input[j] exactly (1.0 in f16 is exact).
+        let mut k_proj_f32 = vec![0.0f32; kv_dim * hidden];
+        for j in 0..kv_dim {
+            k_proj_f32[j * hidden + j] = 1.0;
+        }
+
+        // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
+        // Row j selects input[j] exactly so scratch.q_buf is non-trivial and Q-loop mutation
+        // changes the assertion result.
+        let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
+        for j in 0..q_dim {
+            q_proj_f32[j * hidden + j] = 1.0;
+        }
+
+        let weights = F16FullAttentionLayerWeights {
+            q_proj: to_f16(&q_proj_f32),
+            k_proj: to_f16(&k_proj_f32),
+            v_proj: to_f16(&vec![0.0f32; kv_dim * hidden]),
+            o_proj: to_f16(&vec![0.0f32; hidden * q_dim]),
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        // Distinct non-trivial input values (positions 0..64 scaled to small floats).
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+
+        let mut kv_cache = KvCache::new(1);
+        full_attention_step_f16(
+            &weights,
+            0,
+            position,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        // Reference: reproduce the same matmul + QK-norm + stride-half RoPE.
+        // Using the same production matmul and norm keeps f16 rounding error identical on
+        // both sides, so the only source of divergence under mutation is the RoPE pairing.
+
+        // --- K reference ---
+        let mut k_ref = vec![0.0f32; kv_dim];
+        matmul_bt_f16(&input, &weights.k_proj, &mut k_ref, 1, hidden, kv_dim);
+        qwen35_rms_norm(&mut k_ref, &weights.k_norm, head_dim, cfg.rms_norm_eps);
+
+        // Stride-half reference (correct pairing).
+        let base = position * half;
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = k_ref[i];
+            let x1 = k_ref[half + i];
+            k_ref[i] = x0 * cos_val - x1 * sin_val;
+            k_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let k_cached = &kv_cache.k[0][..kv_dim];
+        let max_k_diff = k_cached
+            .iter()
+            .zip(k_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_k_diff < 1e-4,
+            "cpu F16 K-loop stride-half RoPE diverges from reference: max_k_diff = {max_k_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+
+        // --- Q reference (guards the Q loop mutation) ---
+        // The production scatter copies q_and_gate[0..q_dim] → scratch.q_buf[0..q_dim]
+        // for head 0 (num_q_heads=1).
+        let mut q_and_gate_ref = vec![0.0f32; 2 * q_dim];
+        matmul_bt_f16(
+            &input,
+            &weights.q_proj,
+            &mut q_and_gate_ref,
+            1,
+            hidden,
+            2 * q_dim,
+        );
+        let mut q_ref = q_and_gate_ref[..q_dim].to_vec();
+        qwen35_rms_norm(&mut q_ref, &weights.q_norm, head_dim, cfg.rms_norm_eps);
+
+        for i in 0..half {
+            let cos_val = rope.cos_at(base + i);
+            let sin_val = rope.sin_at(base + i);
+            let x0 = q_ref[i];
+            let x1 = q_ref[half + i];
+            q_ref[i] = x0 * cos_val - x1 * sin_val;
+            q_ref[half + i] = x0 * sin_val + x1 * cos_val;
+        }
+
+        let max_q_diff = scratch.q_buf[..q_dim]
+            .iter()
+            .zip(q_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_q_diff < 1e-4,
+            "cpu F16 Q-loop stride-half RoPE diverges from reference: max_q_diff = {max_q_diff:.6}. \
+             With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+    }
+
     #[test]
     fn test_gdn_f16_step_with_zeros() {
         // Run the GDN f16 step with zero weights/inputs to verify it doesn't crash.
@@ -1050,4 +1255,162 @@ mod tests {
             );
         }
     }
+
+    /// A NaN reaching the f16 MoE router (corrupt f16 router gate weight or an
+    /// upstream activation overflow) makes every router logit NaN. Before the
+    /// fail-closed guards `moe_ffn_step_f16` left NaN probabilities (the
+    /// `denom > 0.0` path was skipped), top-k selected nothing (`NaN > NEG_INF`
+    /// is false), and the routed-expert loop indexed expert weights at
+    /// `usize::MAX * stride` → overflow/OOB panic on the (bench-only public)
+    /// `generate_f16` path. This is the f16 sibling of the f32 fix in
+    /// qwen35/moe.rs (#410). The router must fail closed and no `usize::MAX`
+    /// sentinel may reach accumulation.
+    #[test]
+    fn test_moe_ffn_step_f16_nan_router_fails_closed_no_panic() {
+        use crate::weights::f16_weights::{
+            F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
+        };
+        let num_experts = 4usize;
+        let hidden = 4usize;
+        let inter = 2usize;
+        let shared_inter = 2usize;
+        let top_k = 2usize;
+
+        let nan16 = F16::from_f32(f32::NAN).0;
+        let zeros = |n: usize| vec![F16::from_f32(0.0).0; n];
+
+        // Every router gate weight is NaN → every router logit is NaN.
+        let router = F16MoeRouter::new(
+            vec![nan16; num_experts * hidden],
+            num_experts,
+            top_k,
+            hidden,
+        )
+        .unwrap();
+        let experts = F16RoutedExperts::new(
+            zeros(num_experts * 2 * inter * hidden),
+            zeros(num_experts * hidden * inter),
+            num_experts,
+            hidden,
+            inter,
+        )
+        .unwrap();
+        let shared = F16SharedExpert::new(
+            zeros(shared_inter * hidden),
+            zeros(shared_inter * hidden),
+            zeros(hidden * shared_inter),
+            zeros(hidden),
+            hidden,
+            shared_inter,
+        )
+        .unwrap();
+        let moe = F16MoeLayerWeights {
+            router,
+            experts,
+            shared_expert: shared,
+        };
+
+        let mut scratch = ForwardScratch::new();
+        let buf = inter.max(shared_inter);
+        scratch.ffn_out.resize(hidden, 1.0);
+        scratch.input_tmp.resize(hidden, 0.0);
+        scratch.expert_out.resize(hidden, 0.0);
+        scratch.gate_buf.resize(buf, 0.0);
+        scratch.up_buf.resize(buf, 0.0);
+        scratch.down_input.resize(buf, 0.0);
+        scratch.router_logits.resize(num_experts, 0.0);
+        scratch.router_selected.resize(top_k, (usize::MAX, 0.0));
+
+        // Must not panic (was: usize::MAX expert_id → OOB slice / overflow).
+        moe_ffn_step_f16(&moe, &mut scratch, hidden);
+
+        assert!(
+            scratch.router_selected[..top_k]
+                .iter()
+                .all(|(id, _)| *id < num_experts),
+            "degenerate f16 router must not leave a usize::MAX sentinel selected"
+        );
+    }
+
+    /// The non-obvious case the denom-else (not a max-only guard) is meant to
+    /// catch: ONE router row is NaN while the rest are finite, so `max_logit`
+    /// stays finite (Rust `f32::max` ignores a single NaN) but the NaN still
+    /// lands in `denom`. A max-only guard (`if !max_logit.is_finite()`) would
+    /// pass this and leave un-normalized raw `exp` mass; the denom-else fills
+    /// the row with 0.0. f16 analogue of qwen35/moe.rs
+    /// `test_moe_router_finite_max_nan_tail_fails_closed`.
+    #[test]
+    fn test_moe_ffn_step_f16_finite_max_nan_tail_fails_closed() {
+        use crate::weights::f16_weights::{
+            F16, F16MoeLayerWeights, F16MoeRouter, F16RoutedExperts, F16SharedExpert,
+        };
+        let num_experts = 4usize;
+        let hidden = 4usize;
+        let inter = 2usize;
+        let shared_inter = 2usize;
+        let top_k = 2usize;
+
+        let nan16 = F16::from_f32(f32::NAN).0;
+        let zeros = |n: usize| vec![F16::from_f32(0.0).0; n];
+
+        // Only expert 0's gate row is NaN → logit[0] = NaN, logit[1..] finite,
+        // so `max_logit` is finite but `denom` is NaN.
+        let mut gate = zeros(num_experts * hidden);
+        for w in &mut gate[..hidden] {
+            *w = nan16;
+        }
+        let router = F16MoeRouter::new(gate, num_experts, top_k, hidden).unwrap();
+        let experts = F16RoutedExperts::new(
+            zeros(num_experts * 2 * inter * hidden),
+            zeros(num_experts * hidden * inter),
+            num_experts,
+            hidden,
+            inter,
+        )
+        .unwrap();
+        let shared = F16SharedExpert::new(
+            zeros(shared_inter * hidden),
+            zeros(shared_inter * hidden),
+            zeros(hidden * shared_inter),
+            zeros(hidden),
+            hidden,
+            shared_inter,
+        )
+        .unwrap();
+        let moe = F16MoeLayerWeights {
+            router,
+            experts,
+            shared_expert: shared,
+        };
+
+        let mut scratch = ForwardScratch::new();
+        let buf = inter.max(shared_inter);
+        scratch.ffn_out.resize(hidden, 1.0);
+        scratch.input_tmp.resize(hidden, 0.0);
+        scratch.expert_out.resize(hidden, 0.0);
+        scratch.gate_buf.resize(buf, 0.0);
+        scratch.up_buf.resize(buf, 0.0);
+        scratch.down_input.resize(buf, 0.0);
+        scratch.router_logits.resize(num_experts, 0.0);
+        scratch.router_selected.resize(top_k, (usize::MAX, 0.0));
+
+        moe_ffn_step_f16(&moe, &mut scratch, hidden);
+
+        assert!(
+            scratch.router_logits[..num_experts]
+                .iter()
+                .all(|p| *p == 0.0),
+            "finite-max + NaN-tail router row must fail closed to all-zero probs \
+             (a max-only guard would miss this)"
+        );
+    }
+
+    // NOTE: the storage-bound guard (`expert_id >= moe.experts.num_experts`) is
+    // release-only defense-in-depth — in debug the `debug_assert_eq!(moe.experts
+    // .num_experts, num_experts)` at the top of `moe_ffn_step_f16` fires first on
+    // a router/expert count mismatch, so the guard cannot be exercised by a debug
+    // unit test. It mirrors the f32 sibling guard (qwen35/moe.rs) and costs one
+    // comparison; it hardens the bench-only public `generate_f16` path against a
+    // manually constructed f16 weight set whose router declares more experts than
+    // the routed-expert storage holds.
 }

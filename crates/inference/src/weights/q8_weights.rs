@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 use crate::attention::gdn::GatedDeltaNetWeights;
+use crate::error::InferenceError;
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, FullAttentionLayerWeights,
     ModelWeights,
@@ -283,7 +284,10 @@ pub struct Q8ModelWeights {
 /// The embedding table and final norm are cloned as-is (f32) since the embedding
 /// is tied to the LM head and norms are numerically sensitive. All large projection
 /// matrices are quantized per-row symmetric INT8.
-pub(crate) fn quantize_model_weights(weights: &ModelWeights, cfg: &Qwen35Config) -> Q8ModelWeights {
+pub(crate) fn quantize_model_weights(
+    weights: &ModelWeights,
+    cfg: &Qwen35Config,
+) -> Result<Q8ModelWeights, InferenceError> {
     let layers = weights
         .layers
         .iter()
@@ -296,16 +300,16 @@ pub(crate) fn quantize_model_weights(weights: &ModelWeights, cfg: &Qwen35Config)
                     Q8AttentionWeights::Full(quantize_full_attn_weights(full, cfg))
                 }
             };
-            let q8_common = quantize_common_weights(common);
-            (q8_attn, q8_common)
+            let q8_common = quantize_common_weights(common)?;
+            Ok((q8_attn, q8_common))
         })
-        .collect();
+        .collect::<Result<Vec<_>, InferenceError>>()?;
 
-    Q8ModelWeights {
+    Ok(Q8ModelWeights {
         embed_tokens: weights.embed_tokens.clone(),
         final_norm: weights.final_norm.clone(),
         layers,
-    }
+    })
 }
 
 /// **Unstable**: convert GatedDeltaNet weights to Q8; output type may change.
@@ -349,23 +353,27 @@ pub(crate) fn quantize_full_attn_weights(
 }
 
 /// Quantize the common per-layer MLP weights into their Q8 representation (dense only).
-pub(crate) fn quantize_common_weights(w: &CommonLayerWeights) -> Q8CommonLayerWeights {
+pub(crate) fn quantize_common_weights(
+    w: &CommonLayerWeights,
+) -> Result<Q8CommonLayerWeights, InferenceError> {
     let dense = match &w.ffn {
         FeedForwardWeights::Dense(d) => d,
         FeedForwardWeights::Moe(_) => {
-            panic!("Q8 quantization is dense-only; MoE layers are not supported");
+            return Err(InferenceError::UnsupportedModel(
+                "Q8 quantization is dense-only; MoE layers are not supported".to_string(),
+            ));
         }
     };
     let hidden = w.input_layernorm.len();
     let ((gate_rows, _), (up_rows, _), (down_rows, down_cols)) = infer_dense_shapes(dense, hidden);
 
-    Q8CommonLayerWeights {
+    Ok(Q8CommonLayerWeights {
         input_layernorm: w.input_layernorm.clone(),
         post_attention_layernorm: w.post_attention_layernorm.clone(),
         gate_proj: quantize_matrix(&dense.gate_proj, gate_rows, hidden),
         up_proj: quantize_matrix(&dense.up_proj, up_rows, hidden),
         down_proj: quantize_matrix(&dense.down_proj, down_rows, down_cols),
-    }
+    })
 }
 
 /// **Unstable**: compute Q8 vs f32 memory usage; return tuple shape may change.
@@ -744,5 +752,86 @@ mod tests {
         let last_row_scale = q.scales[rows - 1];
         assert!(first_row_scale > 0.0);
         assert!(last_row_scale > 0.0);
+    }
+
+    #[test]
+    fn test_quantize_common_weights_moe_returns_err_not_panic() {
+        use crate::error::InferenceError;
+        use crate::model::qwen35::{
+            CommonLayerWeights, FeedForwardWeights, MoeLayerWeights, MoeRouter, RoutedExperts,
+            SharedExpert,
+        };
+
+        let hidden = 4usize;
+        let num_experts = 2usize;
+        let num_experts_per_tok = 1usize;
+        let inter = 2usize;
+
+        let router = MoeRouter::new(
+            vec![0.0f32; num_experts * hidden],
+            num_experts,
+            num_experts_per_tok,
+            hidden,
+        )
+        .expect("valid router shape");
+
+        let experts = RoutedExperts::new(
+            vec![0.0f32; num_experts * 2 * inter * hidden],
+            vec![0.0f32; num_experts * hidden * inter],
+            num_experts,
+            hidden,
+            inter,
+        )
+        .expect("valid experts shape");
+
+        let shared_expert = SharedExpert::new(
+            vec![0.0f32; inter * hidden],
+            vec![0.0f32; inter * hidden],
+            vec![0.0f32; hidden * inter],
+            vec![0.0f32; hidden],
+            hidden,
+            inter,
+        )
+        .expect("valid shared expert shape");
+
+        let moe_common = CommonLayerWeights {
+            input_layernorm: vec![0.0f32; hidden],
+            post_attention_layernorm: vec![0.0f32; hidden],
+            ffn: FeedForwardWeights::Moe(MoeLayerWeights {
+                router,
+                experts,
+                shared_expert,
+            }),
+        };
+
+        let result = quantize_common_weights(&moe_common);
+        assert!(
+            matches!(result, Err(InferenceError::UnsupportedModel(_))),
+            "expected Err(UnsupportedModel), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_quantize_common_weights_dense_returns_ok() {
+        use crate::model::qwen35::{CommonLayerWeights, DenseFfnWeights, FeedForwardWeights};
+
+        let hidden = 4usize;
+        let inter = 2usize;
+
+        let dense_common = CommonLayerWeights {
+            input_layernorm: vec![0.0f32; hidden],
+            post_attention_layernorm: vec![0.0f32; hidden],
+            ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                gate_proj: vec![0.0f32; inter * hidden],
+                up_proj: vec![0.0f32; inter * hidden],
+                down_proj: vec![0.0f32; hidden * inter],
+            }),
+        };
+
+        let result = quantize_common_weights(&dense_common);
+        assert!(
+            result.is_ok(),
+            "expected Ok for dense layer, got: {result:?}"
+        );
     }
 }

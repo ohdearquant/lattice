@@ -400,7 +400,7 @@ kernel void decode_attention_flash_reduce_bench(
         let mean = samples.iter().sum::<f64>() / n;
         let var = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
         let stdev = var.sqrt();
-        let min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
         let mut sorted = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let p50 = sorted[((sorted.len() - 1) as f64 * 0.50) as usize];
@@ -424,12 +424,9 @@ kernel void decode_attention_flash_reduce_bench(
     // -----------------------------------------------------------------------
     // Metal setup
     // -----------------------------------------------------------------------
-    let device = match Device::system_default() {
-        Some(d) => d,
-        None => {
-            eprintln!("No Metal device");
-            std::process::exit(1);
-        }
+    let Some(device) = Device::system_default() else {
+        eprintln!("No Metal device");
+        std::process::exit(1);
     };
     let queue = device.new_command_queue();
     eprintln!("[bench] device: {}", device.name());
@@ -700,15 +697,14 @@ kernel void decode_attention_flash_reduce_bench(
             let golden_dir = std::path::Path::new("benchmarks/golden_logits");
             let _ = std::fs::create_dir_all(golden_dir);
             let label_safe = cfg.label.to_lowercase().replace('/', "");
-            let golden_path = golden_dir.join(format!("golden_{}_{}_ref.f32", label_safe, clen));
+            let golden_path = golden_dir.join(format!("golden_{label_safe}_{clen}_ref.f32"));
             unsafe {
                 let bytes =
                     std::slice::from_raw_parts(out_ref.contents() as *const u8, q_dim as usize * 4);
                 match std::fs::write(&golden_path, bytes) {
-                    Ok(()) => eprintln!(
-                        "[bench] Golden ref saved: {:?} ({} f32 values)",
-                        golden_path, q_dim
-                    ),
+                    Ok(()) => {
+                        eprintln!("[bench] Golden ref saved: {golden_path:?} ({q_dim} f32 values)")
+                    }
                     Err(e) => eprintln!("[bench] Warning: golden save failed: {e}"),
                 }
             }

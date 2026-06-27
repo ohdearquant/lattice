@@ -552,6 +552,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         enable_thinking: true,
         enable_mtp: None,
         grammar: None,
+        stop_strings: vec![],
     };
 
     // ── JSON streaming mode (used by Lattice Studio app) ────────────────────

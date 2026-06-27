@@ -50,6 +50,7 @@ const TOKEN_CYCLE: u32 = 64;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // bench scaffolding: some fields carried for Debug output only
 struct TimingStats {
     label: &'static str,
     tokens: usize,
@@ -67,6 +68,7 @@ struct MemorySnapshot {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // bench scaffolding: some fields carried for Debug output only
 struct MemoryPreflight {
     sessions: usize,
     loaded_states: usize,
@@ -80,7 +82,7 @@ struct MemoryPreflight {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn snapshot_memory(device: &metal::Device) -> Result<MemorySnapshot, String> {
     let rss_bytes = get_process_rss()?;
-    let metal_allocated_bytes = device.current_allocated_size() as u64;
+    let metal_allocated_bytes = device.current_allocated_size();
     let metal_recommended_working_set_bytes = device.recommended_max_working_set_size();
     Ok(MemorySnapshot {
         rss_bytes,
@@ -197,6 +199,7 @@ fn measure_concurrent_interleaved(
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[allow(clippy::too_many_arguments)] // bench reporter: explicit timing args clearer than a struct
 fn report_results(
     device_name: &str,
     total_steps: usize,

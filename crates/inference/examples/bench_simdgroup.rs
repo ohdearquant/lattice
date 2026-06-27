@@ -109,15 +109,15 @@ fn main() {
             let n: u32 = 2048;
             let k: u32 = 1024;
             let a = device.new_buffer(
-                (m as u64 * k as u64 * 4),
+                m as u64 * k as u64 * 4,
                 MTLResourceOptions::StorageModeShared,
             );
             let b = device.new_buffer(
-                (n as u64 * k as u64 * 4),
+                n as u64 * k as u64 * 4,
                 MTLResourceOptions::StorageModeShared,
             );
             let c = device.new_buffer(
-                (m as u64 * n as u64 * 4),
+                m as u64 * n as u64 * 4,
                 MTLResourceOptions::StorageModeShared,
             );
 
@@ -148,11 +148,7 @@ fn main() {
                 let tg_m = 16u64;
                 let tg_n = 16u64;
                 enc.dispatch_thread_groups(
-                    MTLSize::new(
-                        (n as u64 + tg_n - 1) / tg_n,
-                        (m as u64 + tg_m - 1) / tg_m,
-                        1,
-                    ),
+                    MTLSize::new((n as u64).div_ceil(tg_n), (m as u64).div_ceil(tg_m), 1),
                     MTLSize::new(128, 1, 1), // 4 simdgroups × 32 threads
                 );
                 enc.end_encoding();
@@ -178,11 +174,7 @@ fn main() {
                     let tg_m = 16u64;
                     let tg_n = 16u64;
                     enc.dispatch_thread_groups(
-                        MTLSize::new(
-                            (n as u64 + tg_n - 1) / tg_n,
-                            (m as u64 + tg_m - 1) / tg_m,
-                            1,
-                        ),
+                        MTLSize::new((n as u64).div_ceil(tg_n), (m as u64).div_ceil(tg_m), 1),
                         MTLSize::new(128, 1, 1),
                     );
                 }
@@ -263,15 +255,15 @@ fn main() {
     let n: u32 = 2048;
     let k: u32 = 1024;
     let a = device.new_buffer(
-        (m as u64 * k as u64 * 4),
+        m as u64 * k as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
     let b = device.new_buffer(
-        (n as u64 * k as u64 * 4),
+        n as u64 * k as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
     let c = device.new_buffer(
-        (m as u64 * n as u64 * 4),
+        m as u64 * n as u64 * 4,
         MTLResourceOptions::StorageModeShared,
     );
     let rounds = 20;
@@ -289,7 +281,7 @@ fn main() {
             enc.set_bytes(4, 4, &n as *const u32 as *const _);
             enc.set_bytes(5, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(((n as u64) + 15) / 16, ((m as u64) + 15) / 16, 1),
+                MTLSize::new((n as u64).div_ceil(16), (m as u64).div_ceil(16), 1),
                 MTLSize::new(16, 16, 1),
             );
         }

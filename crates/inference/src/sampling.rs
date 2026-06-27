@@ -106,8 +106,26 @@ impl CandidateSet {
     /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
     /// non-positive, or non-finite (NaN/±inf) — none of those carry a valid
     /// scaling, and `1.0 / NaN` would poison every logit with NaN.
+    ///
+    /// A finite-but-tiny temperature has a reciprocal that overflows `f32`, so it carries
+    /// no valid finite scaling: the `t -> 0+` limit is hard-greedy. Scaling such a
+    /// temperature (even with a clamped multiplier) leaves close logits near 50/50, so
+    /// `sample_top_p` could still return a non-argmax token. Instead collapse the set to a
+    /// one-hot on the argmax — the same hard-argmax route the main `Sampler` takes for a
+    /// degenerate temperature (see `temperature_degenerate`).
     pub fn apply_temperature(&mut self, temperature: f32) {
         if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
+            return;
+        }
+        if temperature_degenerate(temperature) {
+            let best = self.argmax();
+            for c in &mut self.candidates {
+                c.logit = if c.token_id == best {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
             return;
         }
         let inv = 1.0 / temperature;
@@ -140,6 +158,21 @@ impl CandidateSet {
         if self.candidates.is_empty() {
             return 0;
         }
+
+        // #328: normalise top_p into a defined regime before the `top_p < 1.0`
+        // gate below. The raw argument is otherwise interpreted by undefined
+        // behaviour: NaN makes `top_p < 1.0` false and silently disables nucleus
+        // truncation (full distribution sampled); a negative top_p passes the
+        // gate and the `cumsum >= top_p` cutoff matches on the first (largest)
+        // token, collapsing to greedy. Mapping NaN/+Inf/>1 → 1.0 (no truncation)
+        // and clamping the rest into [0, 1] preserves today's behaviour exactly
+        // while making it explicit and refactor-safe. `f32::clamp` returns NaN
+        // for a NaN input, so NaN is handled before the clamp.
+        let top_p = if top_p.is_nan() {
+            1.0
+        } else {
+            top_p.clamp(0.0, 1.0)
+        };
 
         // Sort descending for deterministic top-p traversal.
         self.candidates.sort_by(candidate_order);
@@ -247,10 +280,11 @@ impl Rng {
 pub struct Sampler {
     config: SamplingConfig,
     rng: Rng,
-    /// Recently generated token IDs (for repetition penalty).
+    /// Token IDs seen since the last `reset`: prompt tokens (from `seed_history`)
+    /// followed by all generated tokens.  Full history is retained for repetition penalty.
     recent_tokens: Vec<u32>,
-    /// Max tokens to track for repetition penalty.
-    max_recent: usize,
+    /// Reused dedup set for penalty application; cleared at the start of each use.
+    penalty_seen: std::collections::HashSet<u32>,
     /// Reused candidate buffer; avoids 1.9 MB alloc per call at vocab=248,320.
     candidate_scratch: Vec<Candidate>,
     /// Reused probability buffer for top-p softmax.
@@ -274,7 +308,7 @@ impl Sampler {
             config,
             rng: Rng::new(seed),
             recent_tokens: Vec::new(),
-            max_recent: 64,
+            penalty_seen: std::collections::HashSet::new(),
             candidate_scratch: Vec::new(),
             prob_scratch: Vec::new(),
             logit_scratch: Vec::new(),
@@ -287,42 +321,56 @@ impl Sampler {
         self
     }
 
+    /// **Unstable**: seed the repetition-penalty history with prompt tokens.
+    ///
+    /// Call once after construction and before the first `sample` call so
+    /// prompt tokens are penalized from the very first generated token,
+    /// matching the Qwen3.5 full-history contract.
+    pub fn seed_history(&mut self, prompt_ids: &[u32]) {
+        self.recent_tokens.extend_from_slice(prompt_ids);
+    }
+
     /// **Unstable**: sample a token ID; sampling strategy details may change.
     ///
     /// `logits` is the raw output from the model's final linear layer,
     /// shape `[vocab_size]`.
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
         // Greedy fast path: skip the full-vocab clone when argmax is not penalized.
-        // Repetition penalty only lowers penalized tokens, so argmax(raw) == argmax(penalized)
-        // whenever the raw argmax token is not in recent_tokens. In the common case
-        // (recent_tokens empty or raw argmax not recently generated) this avoids the
-        // 993 KB extend_from_slice entirely.
+        // A repetition penalty >= 1.0 only lowers penalized tokens, so argmax(raw) ==
+        // argmax(penalized) whenever the raw argmax token is not in recent_tokens. In the
+        // common case (recent_tokens empty or raw argmax not recently generated) this
+        // avoids the 993 KB extend_from_slice entirely. A penalty in (0, 1) BOOSTS recent
+        // tokens, so it must fall through to the re-scan even when raw_best is not recent.
         //
         // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so that its
         // reciprocal overflows) carries no valid scaling and is routed here to the same
         // deterministic argmax as the t -> 0+ limit. See `temperature_degenerate`.
         if temperature_degenerate(self.config.temperature) || self.config.top_k == 1 {
             let raw_best = argmax_f32(logits);
-            if self.config.repetition_penalty == 1.0 || !self.recent_tokens.contains(&raw_best) {
+            // Conservative sufficient gate (not maximal): take the shortcut when the
+            // penalty cannot promote a non-argmax token above raw_best. That holds when
+            // the penalty is inactive (a no-op in `penalized_logit`), or it only demotes
+            // (> 1.0) AND raw_best is not itself penalized. A penalty in (0, 1) divides a
+            // positive logit by < 1, boosting recent tokens, so a non-recent raw_best can
+            // be overtaken by a boosted recent token — that case must re-scan.
+            //
+            // One always-safe case is intentionally left to the re-scan for simplicity:
+            // (0, 1) penalty where raw_best is ITSELF recent. `penalized_logit` is monotone,
+            // so boosting raw_best keeps it >= every non-recent logit and preserves order
+            // against other recent logits, leaving it the argmax. Shortcutting it would
+            // need an extra `contains` probe on the hot path to save a rare clone, so we
+            // fall through instead — correct, just not maximal.
+            let penalty = self.config.repetition_penalty;
+            let penalty_inactive = penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0;
+            if penalty_inactive || (penalty > 1.0 && !self.recent_tokens.contains(&raw_best)) {
                 self.push_token(raw_best);
                 return raw_best;
             }
-            // Rare: raw argmax is a recently penalized token — clone + re-scan.
+            // raw argmax would change once the penalty is applied — clone + re-scan.
             self.logit_scratch.clear();
             self.logit_scratch.extend_from_slice(logits);
-            let penalty = self.config.repetition_penalty;
-            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
-                // Penalize each id once (recent_tokens may repeat). recent_tokens is
-                // capped at max_recent (64), so this O(n²) scan stays well under the
-                // full-vocab argmax cost and avoids a per-call allocation.
-                if self.recent_tokens[..pos].contains(&tok) {
-                    continue;
-                }
-                let idx = tok as usize;
-                if idx < self.logit_scratch.len() {
-                    self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
-                }
-            }
+            // Penalize each unique id exactly once (HF gather-once semantics).
+            self.apply_penalty_to_logit_scratch(penalty);
             let token = argmax_f32(&self.logit_scratch);
             self.push_token(token);
             return token;
@@ -331,21 +379,11 @@ impl Sampler {
         // Non-greedy path: clone logits for in-place penalty + fused top-k.
         self.logit_scratch.clear();
         self.logit_scratch.extend_from_slice(logits);
-        let adj = &mut self.logit_scratch;
 
         if self.config.repetition_penalty != 1.0 {
-            for (pos, &tok) in self.recent_tokens.iter().enumerate() {
-                // Penalize each id once (recent_tokens may repeat); applying it per
-                // occurrence compounds to penalty^N. Capped at max_recent (64), so the
-                // O(n²) dedup scan is negligible against the fused top-k over the vocab.
-                if self.recent_tokens[..pos].contains(&tok) {
-                    continue;
-                }
-                let idx = tok as usize;
-                if idx < adj.len() {
-                    adj[idx] = penalized_logit(adj[idx], self.config.repetition_penalty);
-                }
-            }
+            let penalty = self.config.repetition_penalty;
+            // Penalize each unique id exactly once (HF gather-once semantics).
+            self.apply_penalty_to_logit_scratch(penalty);
         }
 
         let inv_temp = if self.config.temperature != 1.0 {
@@ -357,7 +395,7 @@ impl Sampler {
         // Streaming min-heap top-k with fused temperature scaling.
         // ~95% of vocab elements are skipped by the NEON threshold gate.
         select_top_k(
-            adj,
+            &self.logit_scratch,
             self.config.top_k,
             inv_temp,
             &mut self.candidate_scratch,
@@ -374,8 +412,18 @@ impl Sampler {
 
     fn push_token(&mut self, token: u32) {
         self.recent_tokens.push(token);
-        if self.recent_tokens.len() > self.max_recent {
-            self.recent_tokens.remove(0);
+    }
+
+    /// Apply `penalty` in-place to `logit_scratch` for every unique token id in
+    /// `recent_tokens`, penalizing each id exactly once (HF gather-once semantics).
+    /// `penalty_seen` is cleared first so capacity is retained across calls.
+    fn apply_penalty_to_logit_scratch(&mut self, penalty: f32) {
+        self.penalty_seen.clear();
+        for &tok in &self.recent_tokens {
+            let idx = tok as usize;
+            if idx < self.logit_scratch.len() && self.penalty_seen.insert(tok) {
+                self.logit_scratch[idx] = penalized_logit(self.logit_scratch[idx], penalty);
+            }
         }
     }
 
@@ -883,6 +931,39 @@ mod tests {
     }
 
     #[test]
+    fn apply_temperature_tiny_positive_temp_stays_greedy() {
+        // A finite-but-tiny temperature has a reciprocal that overflows f32. The
+        // t -> 0+ limit must stay greedy (argmax). Without the degenerate-branch
+        // collapse, `1.0 / 1e-45 == +inf` scales both logits to +inf; the sort then
+        // tie-breaks on ascending token_id and `sample_top_p` returns token 0 instead
+        // of the argmax (token 1).
+        let mut cs = CandidateSet::from_full_logits(&[10.0, 11.0]);
+        cs.apply_temperature(1e-45);
+        // top_p = 1.0 (no nucleus truncation) + r = 0.0 => pure argmax selection.
+        assert_eq!(
+            cs.sample_top_p(1.0, 0.0),
+            1,
+            "tiny positive temperature must resolve to the argmax (greedy), not token 0"
+        );
+    }
+
+    #[test]
+    fn apply_temperature_tiny_temp_is_hard_greedy_for_close_logits() {
+        // Even an arbitrarily small logit gap must resolve to hard argmax under a
+        // degenerate temperature (the t -> 0+ limit), matching the main Sampler's
+        // `temperature_degenerate` route. A finite multiplier (clamped or not) would
+        // leave these two near 50/50, so `sample_top_p(1.0, 0.75)` could draw token 0;
+        // the one-hot collapse makes the argmax (token 1) the only reachable draw.
+        let mut cs = CandidateSet::from_full_logits(&[0.0, f32::from_bits(1)]);
+        cs.apply_temperature(1e-45);
+        assert_eq!(
+            cs.sample_top_p(1.0, 0.75),
+            1,
+            "degenerate temperature must be hard-greedy even for adjacent logits"
+        );
+    }
+
+    #[test]
     fn test_top_k_limits_candidates() {
         let config = SamplingConfig {
             temperature: 1.0,
@@ -924,6 +1005,51 @@ mod tests {
         // Second sample: token 1 is penalized, should pick 2
         let second = sampler.sample(&logits);
         assert_eq!(second, 2);
+    }
+
+    /// A repetition penalty in (0, 1) BOOSTS recent tokens. The greedy fast path
+    /// must not shortcut to the raw argmax when a boosted recent token would
+    /// overtake it, even though the raw argmax itself is not recent (codex
+    /// sampling discovery: the fast-path invariant only holds for penalty >= 1.0).
+    #[test]
+    fn test_greedy_sub_one_penalty_boosts_recent_token() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy fast path
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 0.5, // < 1.0 boosts recent tokens
+        };
+        let mut sampler = Sampler::new(config);
+
+        // Step 1: token 1 is the clear argmax; becomes a recent token.
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+
+        // Step 2: raw argmax is token 0 (5.0) and is NOT recent, but recent token
+        // 1 is boosted to 4.0 / 0.5 = 8.0 > 5.0, so the penalized argmax is token
+        // 1. Before the fix the fast path returned the raw argmax token 0.
+        assert_eq!(sampler.sample(&[5.0, 4.0]), 1);
+    }
+
+    /// The documented always-safe case the conservative gate leaves to the re-scan:
+    /// a (0, 1) penalty where the raw argmax is ITSELF recent. `penalized_logit` is
+    /// monotone, so boosting raw_best keeps it the argmax — the fall-through must
+    /// still return it. Regression guard for the comment at the gate.
+    #[test]
+    fn test_greedy_sub_one_penalty_recent_argmax_unchanged() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy fast path
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 0.5, // < 1.0 boosts recent tokens
+        };
+        let mut sampler = Sampler::new(config);
+
+        // Step 1: token 1 is the clear argmax; becomes a recent token.
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+
+        // Step 2: raw argmax is token 1 (6.0) and IS recent. Boosting it to
+        // 6.0 / 0.5 = 12.0 keeps it above token 0's 5.0, so it stays the argmax.
+        assert_eq!(sampler.sample(&[5.0, 6.0]), 1);
     }
 
     #[test]
@@ -1186,6 +1312,59 @@ mod tests {
             token, 0,
             "tail-NaN poisons the softmax sum; must fall back to argmax (token 0), not last()"
         );
+    }
+
+    #[test]
+    fn test_sample_top_p_invalid_top_p_normalized() {
+        // #328: an out-of-range top_p must resolve to defined behaviour, not the
+        // accidental fall-through of the raw `top_p < 1.0` gate. NaN / +Inf / >1
+        // map to 1.0 (no nucleus truncation, identical to top_p == 1.0); a
+        // negative top_p collapses to greedy (argmax only). A fresh candidate set
+        // is built per call because sample_top_p truncates its buffers in place.
+        let make = || {
+            CandidateSet::from_candidates(vec![
+                Candidate {
+                    token_id: 0,
+                    logit: 3.0,
+                },
+                Candidate {
+                    token_id: 1,
+                    logit: 2.0,
+                },
+                Candidate {
+                    token_id: 2,
+                    logit: 1.0,
+                },
+                Candidate {
+                    token_id: 3,
+                    logit: 0.0,
+                },
+            ])
+        };
+
+        for &r in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
+            let baseline = make().sample_top_p(1.0, r);
+            assert_eq!(
+                make().sample_top_p(f32::NAN, r),
+                baseline,
+                "NaN top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(1.5, r),
+                baseline,
+                ">1 top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(f32::INFINITY, r),
+                baseline,
+                "+Inf top_p must behave as top_p == 1.0 at r={r}"
+            );
+            assert_eq!(
+                make().sample_top_p(-0.5, r),
+                0,
+                "negative top_p must collapse to greedy argmax at r={r}"
+            );
+        }
     }
 
     // ── H1: select_top_k correctness tests ──────────────────────────────────
@@ -1477,5 +1656,95 @@ mod tests {
                 "uniform_f32_from_u64({x:#018x}) = {f} is not in [0, 1)"
             );
         }
+    }
+
+    // ── #387 repetition-penalty history contract tests ───────────────────────
+
+    /// First-token prompt penalty: seeded prompt tokens must be penalized on the
+    /// very first `sample` call.
+    ///
+    /// Mutation-sensitive: reverting `seed_history` (or not calling it in
+    /// `generate.rs`) leaves `recent_tokens` empty, so token 1 is NOT penalized
+    /// and wins with logit 10.0, failing this assertion.
+    #[test]
+    fn test_seed_history_penalizes_prompt_token_on_first_sample() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Seed token 1 as a prompt token.
+        sampler.seed_history(&[1u32]);
+        // logits: token 1 = 10.0 wins raw, but 10.0/2.0 = 5.0 < token 0's 6.0 after penalty.
+        let token = sampler.sample(&[6.0, 10.0]);
+        assert_eq!(
+            token, 0,
+            "token 1 was seeded in history; penalty 2.0 reduces its adjusted logit \
+             below token 0; without seed_history, token 1 wins (mutation: omit seed_history)"
+        );
+    }
+
+    /// Beyond-64-token history: a token at position 0 in a 65-entry history must
+    /// still be penalized after the old 64-entry cap is removed.
+    ///
+    /// Mutation-sensitive: re-introducing the `max_recent` truncation evicts token 1
+    /// from the window, leaving it unpenalized, so token 1 wins with logit 10.0
+    /// instead of token 0 with logit 6.0.
+    #[test]
+    fn test_uncapped_history_penalizes_tokens_beyond_64() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Build a 65-token history THROUGH push_token, the path the removed 64-cap
+        // actually lived on. token 1 is the oldest entry (pushed first). Filler tokens
+        // use ids >= 2 so they do not compete with tokens 0 or 1.
+        sampler.push_token(1);
+        for t in 2u32..66 {
+            sampler.push_token(t); // 64 filler tokens → total history length = 65
+        }
+        // Without cap: token 1 penalty applies → 10.0/2.0 = 5.0 < 6.0 → token 0 wins.
+        // With old 64-cap restored in push_token: token 1 was evicted from the window →
+        // raw_best (token 1) is no longer in history so the greedy shortcut returns it
+        // un-penalized → token 1 wins.
+        let token = sampler.sample(&[6.0, 10.0]);
+        assert_eq!(
+            token, 0,
+            "token 1 at position 0 in a 65-entry history must still be penalized; \
+             the old 64-cap silently dropped it (mutation: restore max_recent truncation)"
+        );
+    }
+
+    /// Penalize-once / no compounding: a token repeated many times in history is
+    /// penalized exactly once, not penalty^N times.
+    ///
+    /// Mutation-sensitive: reverting the HashSet dedup to per-occurrence penalty
+    /// compounds to penalty^4 = 16.0, reducing the adjusted logit from 5.0 to 0.625,
+    /// so token 0 wins instead of token 1.
+    #[test]
+    fn test_penalty_applied_exactly_once_for_repeated_history_token() {
+        let config = SamplingConfig {
+            temperature: 0.0, // greedy
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(1);
+        // Token 1 repeated 4 times in history.
+        sampler.seed_history(&[1, 1, 1, 1]);
+        // Once penalized: 10.0/2.0 = 5.0 > 4.9 → token 1 wins (correct).
+        // Per-occurrence (penalty^4): 10.0/16.0 = 0.625 < 4.9 → token 0 wins (wrong).
+        let token = sampler.sample(&[4.9, 10.0]);
+        assert_eq!(
+            token, 1,
+            "token 1 repeated 4× must be penalized once (5.0 > 4.9, token 1 wins); \
+             per-occurrence compounding yields 0.625 and wrongly selects token 0 \
+             (mutation: replace HashSet dedup with per-occurrence penalty)"
+        );
     }
 }
