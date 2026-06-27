@@ -11519,7 +11519,7 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.set_bytes(3, 4, &n as *const u32 as *const _);
             enc.set_bytes(4, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(4) as u64, 1, 1), // NR=4
+                MTLSize::new(n.div_ceil(2) as u64, 1, 1), // gemv_q4_decode writes NR=2 rows/threadgroup
                 MTLSize::new(32, 4, 1),
             );
         }
@@ -13343,10 +13343,11 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut f16_data: Vec<u16> = Vec::with_capacity(tensor.original_len);
             for block in &tensor.blocks {
                 let scale = q4_f16_to_f32(block.scale);
+                let bias = q4_f16_to_f32(block.bias);
                 for b in 0..16 {
                     let byte_val = block.packed[b];
-                    let w0 = ((byte_val & 0x0f) as f32 - 8.0) * scale;
-                    let w1 = ((byte_val >> 4) as f32 - 8.0) * scale;
+                    let w0 = (byte_val & 0x0f) as f32 * scale + bias;
+                    let w1 = (byte_val >> 4) as f32 * scale + bias;
                     f16_data.push(q4_f32_to_f16(w0));
                     f16_data.push(q4_f32_to_f16(w1));
                 }
@@ -17027,6 +17028,98 @@ kernel void decode_attention_reference(
                     "[shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
                 );
             }
+        }
+
+        /// Regression for the Q4 decode dispatch-geometry bug (codex 2026-06-26).
+        ///
+        /// `gemv_q4_decode` writes NR=2 output rows per threadgroup, so
+        /// `dispatch_matmul_q4` MUST launch `ceil(N/2)` groups. The prior `ceil(N/4)`
+        /// left the upper ~half of the rows unwritten — on the Q4 decode/logits path
+        /// (`final_logits` → `dispatch_matmul` for `QuantFormat::Q4_0`, N = vocab_size)
+        /// this silently corrupted every token after the first prefill token, because
+        /// the upper half of the vocabulary logits were never produced.
+        ///
+        /// N=6 is the minimal shape that exposes it: `ceil(6/4)=2` groups write only
+        /// rows 0..4 (rows 4,5 dropped); `ceil(6/2)=3` groups write all 6. Pre-fill Y
+        /// with a sentinel and assert every row is overwritten and matches the CPU
+        /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
+        #[test]
+        fn dispatch_matmul_q4_writes_all_rows() {
+            // Fail closed under enforce: a CI runner that provisions a Metal GPU but
+            // silently skips here would make this regression gate verify nothing —
+            // the same silent-skip class as the embed parity gate (#383). The
+            // dedicated macOS test step sets LATTICE_METAL_TEST_ENFORCE=1.
+            //
+            // Note: NO Apple7 family gate. `gemv_q4_decode` uses only `simd_sum` +
+            // threadgroup memory, not the Apple7-gated `simdgroup_matrix` MMA path,
+            // so it runs on GitHub's paravirtual macOS GPU (which reports a Metal
+            // device but NOT Apple7). The tiled-GEMM tests below DO need Apple7 and
+            // skip on CI; this decode-geometry test genuinely runs there.
+            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let (n, k) = (6usize, 64usize);
+            let (qw_raw, w_deq) = make_q4_weight_ref(&device, 0x0FF0_1234_u64, n, k);
+            let qw = Q4WeightBuf::from_buffer(qw_raw);
+
+            let mut xrng = 0x1234_5678_u64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| {
+                    xrng = xrng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect();
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            // Pre-fill the output with a sentinel far outside the achievable result
+            // range (|y| < K = 64 here); any row left untouched keeps it.
+            const SENTINEL: f32 = -123_456.0;
+            let y_init = vec![SENTINEL; n];
+            let y_buf = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (n * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_matmul_q4(enc, &x_buf, &qw, &y_buf, 1, n as u32, k as u32);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // SAFETY: StorageModeShared, GPU work completed, size matches allocation.
+            let y: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n) };
+            let y_ref = cpu_matmul_ref(&x, &w_deq, 1, n, k);
+
+            for (row, &val) in y.iter().enumerate() {
+                assert!(
+                    val.to_bits() != SENTINEL.to_bits(),
+                    "row {row} of {n} never written — dispatch grid under-covers \
+                     gemv_q4_decode (NR=2 rows/group). This is the codex P0 decode-geometry bug."
+                );
+            }
+            let diff = max_abs_diff(y, &y_ref);
+            assert!(
+                diff < 1e-3,
+                "dispatch_matmul_q4 result diverges from CPU dequant ref: max_abs_diff={diff:.4e}"
+            );
         }
 
         // ── Q8 GEMM numeric differential gate ────────────────────────────────

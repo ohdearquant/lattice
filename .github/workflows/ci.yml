@@ -108,6 +108,17 @@ jobs:
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
+      # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
+      # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
+      # were local-only — a green CI here verified compilation, not behavior.
+      # Run the Q4 Metal correctness tests on the Apple-silicon runner.
+      # LATTICE_METAL_TEST_ENFORCE=1 makes the dispatch regression fail closed if
+      # the runner ever loses its Apple7 GPU, rather than skip-passing silently.
+      - name: inference — metal-gpu Q4 tests (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
 
   # The benchmark harnesses live behind their own feature flags / target gates
   # and are never built by `cargo test`. A `Qwen35Config` field added to the
