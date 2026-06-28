@@ -779,6 +779,49 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
     tokens
 }
 
+/// Parse the subset of `added_tokens` that should be **rendered as literal text**
+/// when decoding, i.e. those whose `"special"` flag is `false` (or absent).
+///
+/// HF's `decode(skip_special_tokens=True)` — the chat default — skips only the
+/// `special=true` set (control/chat/vision markers like `<|im_end|>`), while
+/// `special=false` added tokens (`<think>`/`</think>`, `<tool_call>`, FIM markers)
+/// are emitted verbatim. The base BPE vocab does not contain any added-token ids,
+/// so without this map their decode falls through to nothing and they are silently
+/// swallowed from the output stream. Returns `content -> id`.
+pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
+    let mut tokens = HashMap::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return tokens;
+    };
+
+    for item in array {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        // Absent "special" defaults to false (matches HF AddedToken), so render it.
+        if object
+            .get("special")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(id) = object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
+            continue;
+        };
+        tokens.insert(content.to_string(), id);
+    }
+
+    tokens
+}
+
 pub(crate) fn known_special_id(vocab: &HashMap<String, u32>, names: &[&str]) -> Option<u32> {
     names.iter().find_map(|name| vocab.get(*name).copied())
 }
@@ -1010,6 +1053,31 @@ mod tests {
             Some(1)
         );
         assert_eq!(parse_added_tokens(&json).get("<bos>").copied(), Some(42));
+    }
+
+    #[test]
+    fn test_parse_rendered_added_tokens_filters_special() {
+        let json = parse_json(
+            r#"{
+                "added_tokens": [
+                    {"id": 1, "content": "<|im_start|>", "special": true},
+                    {"id": 2, "content": "</think>", "special": false},
+                    {"id": 3, "content": "<think>"},
+                    {"id": 4, "content": "<tool_call>", "special": false}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let rendered = parse_rendered_added_tokens(&json);
+        // special=true is excluded (HF skip_special_tokens=True swallows it).
+        assert_eq!(rendered.get("<|im_start|>"), None);
+        // special=false renders verbatim.
+        assert_eq!(rendered.get("</think>").copied(), Some(2));
+        // absent special field defaults to false → renders.
+        assert_eq!(rendered.get("<think>").copied(), Some(3));
+        assert_eq!(rendered.get("<tool_call>").copied(), Some(4));
+        assert_eq!(rendered.len(), 3);
     }
 
     #[test]
