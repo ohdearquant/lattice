@@ -412,6 +412,9 @@ fn test_simd_distance_consumer_contract() {
     assert_eq!(euclidean_distance(&a4, &b3), f32::MAX);
     assert_eq!(dot_product(&a4, &b3), 0.0);
     assert_eq!(cosine_similarity(&a4, &b3), 0.0);
+
+    // cosine_similarity additionally documents empty-input → 0.0 (explicit guard).
+    assert_eq!(cosine_similarity(&[], &[]), 0.0);
 }
 
 #[test]
