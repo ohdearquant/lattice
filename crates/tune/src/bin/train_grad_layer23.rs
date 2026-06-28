@@ -64,7 +64,7 @@ Options:
   --seq-len    <N>      Max tokens per sample (default: 64)
   --max-train  <N>      Training samples cap (default: 3)
   --log-every  <N>      Print NLL every N steps (default: 5)
-  --save       <PATH>   Save trained adapter as PEFT safetensors (needs --features safetensors)
+  --save       <PATH>   Save trained adapter as PEFT safetensors (requires --features train-backward)
   -h, --help            Print this help"
     );
 }
@@ -736,7 +736,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "safetensors"))]
         {
             let _ = save_path;
-            return Err("--save requires building with --features safetensors".into());
+            return Err("--save requires building with --features train-backward".into());
         }
     }
 
