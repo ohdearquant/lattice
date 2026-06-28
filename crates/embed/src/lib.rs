@@ -6,9 +6,11 @@
 //! **Exception — stable khive ANN consumer contract:**
 //! `simd::{squared_euclidean_distance, euclidean_distance, dot_product, cosine_similarity}`
 //! are a stable consumer contract for khive's ANN indexes (`khive-hnsw`, `khive-vamana`;
-//! ADR-012): their `(&[f32], &[f32]) -> f32` signatures and documented degenerate-input /
-//! squared-L2 ordering behaviour are guaranteed across the 0.4.x line. The rest of `simd/`
-//! remains unstable.
+//! ADR-012): their `(&[f32], &[f32]) -> f32` signatures and documented degenerate-input
+//! behaviour are guaranteed across the 0.4.x line, as is the squared-L2 ordering invariant
+//! relative to this crate's Euclidean wrapper (both derive from the same accumulated squared
+//! distance; SIMD is not bit-identical to scalar and promises no exact ordering of near-ties).
+//! The rest of `simd/` remains unstable.
 //!
 //! The 21 `unsafe` blocks are gated SIMD intrinsic calls (AVX512/AVX2/NEON); the
 //! 1 `dead_code_allows` retains a superseded dot-product fallback for reference.

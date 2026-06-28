@@ -68,10 +68,13 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 /// This is the primary hot-path distance for khive's ANN indexes (`khive-hnsw`
 /// today, `khive-vamana` next; ADR-012). The `(&[f32], &[f32]) -> f32` signature,
 /// the length-mismatch behaviour (returns [`f32::MAX`]), and the squared-L2 ordering
-/// invariant above are a **stable consumer contract** across the 0.4.x line. SIMD
-/// results are not bit-identical to the scalar reference (FP non-associativity), but
-/// the ordering — the only property an ANN graph relies on — is guaranteed. For the
-/// general-purpose ergonomic wrapper use `lattice_embed::utils::euclidean_distance`.
+/// invariant above — vs this crate's [`euclidean_distance`], which derives from the
+/// same accumulated squared distance — are a **stable consumer contract** across the
+/// 0.4.x line. SIMD accumulates terms in a different order than the scalar reference,
+/// so results are not bit-identical and no exact scalar ordering of near-ties is
+/// promised; the documented squared-vs-Euclidean equivalence is the property an ANN
+/// graph relies on. For the general-purpose ergonomic wrapper use
+/// `lattice_embed::utils::euclidean_distance`.
 #[inline]
 pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
