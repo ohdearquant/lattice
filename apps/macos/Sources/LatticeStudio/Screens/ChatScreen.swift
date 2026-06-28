@@ -805,7 +805,11 @@ struct ChatScreen: View {
         }
         buf += "<|im_start|>user\n\(newUserText)<|im_end|>\n"
         if enableThinking {
-            buf += "<|im_start|>assistant\n"
+            // Open think block = the official template's enable_thinking=true path
+            // (chat_template.jinja:152). A thinking checkpoint continues inside the block
+            // and closes with </think> before the answer; renderChatML's split keys on that
+            // boundary. A non-thinking checkpoint ignores the prefix and answers directly.
+            buf += "<|im_start|>assistant\n<think>\n"
         } else {
             // Closed empty think block = the official template's enable_thinking=false path;
             // the model emits the answer directly with no reasoning.
