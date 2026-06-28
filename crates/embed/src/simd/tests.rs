@@ -343,6 +343,77 @@ fn test_avx512_euclidean_distance_dimensions() {
     }
 }
 
+/// Consumer contract for khive ANN indexes (`khive-hnsw`, `khive-vamana`; ADR-012).
+///
+/// Locks the guarantees the downstream indexes depend on so the surface cannot
+/// silently drift:
+/// 1. **Signature stability** — the four distance fns keep the
+///    `(&[f32], &[f32]) -> f32` shape (compile-time gate).
+/// 2. **Numerical stability** — `squared_euclidean_distance` tracks the scalar
+///    reference within FP tolerance across the queried dims (384 is the live
+///    embed dim).
+/// 3. **Ordering invariant** — squared-L2 sorts identically to true L2, the only
+///    property an ANN graph relies on.
+/// 4. **Degenerate-input behaviour** — the documented length-mismatch returns.
+#[test]
+fn test_simd_distance_consumer_contract() {
+    // The `(&[f32], &[f32]) -> f32` shape khive ANN indexes bind to.
+    type DistFn = fn(&[f32], &[f32]) -> f32;
+
+    // (1) Signature gate: fails to compile if any signature drifts.
+    let _contract: [DistFn; 4] = [
+        squared_euclidean_distance,
+        euclidean_distance,
+        dot_product,
+        cosine_similarity,
+    ];
+
+    // (2) squared_euclidean_distance == scalar reference, within FP tolerance.
+    for dim in AVX512_TEST_DIMS {
+        let a = generate_random_vector_seeded(dim, 911);
+        let b = generate_random_vector_seeded(dim, 1013);
+
+        let simd_result = squared_euclidean_distance(&a, &b);
+        let scalar_result = distance::squared_euclidean_distance_scalar(&a, &b);
+
+        assert_close(
+            simd_result,
+            scalar_result,
+            1e-3,
+            1e-4,
+            &format!("squared_euclidean_distance contract dim {dim}"),
+        );
+    }
+
+    // (3) Ordering invariant: sorting by squared-L2 matches sorting by true L2.
+    let query = generate_random_vector_seeded(384, 1);
+    let candidates: Vec<Vec<f32>> = (0..16)
+        .map(|i| generate_random_vector_seeded(384, 100 + i as u64))
+        .collect();
+    let order_by = |dist: DistFn| {
+        let mut idx: Vec<usize> = (0..candidates.len()).collect();
+        idx.sort_by(|&x, &y| {
+            dist(&query, &candidates[x])
+                .partial_cmp(&dist(&query, &candidates[y]))
+                .unwrap()
+        });
+        idx
+    };
+    assert_eq!(
+        order_by(squared_euclidean_distance),
+        order_by(euclidean_distance),
+        "squared_euclidean_distance must preserve true-L2 ordering (ANN invariant)"
+    );
+
+    // (4) Documented degenerate-input behaviour is part of the contract.
+    let a4 = [1.0_f32, 2.0, 3.0, 4.0];
+    let b3 = [1.0_f32, 2.0, 3.0];
+    assert_eq!(squared_euclidean_distance(&a4, &b3), f32::MAX);
+    assert_eq!(euclidean_distance(&a4, &b3), f32::MAX);
+    assert_eq!(dot_product(&a4, &b3), 0.0);
+    assert_eq!(cosine_similarity(&a4, &b3), 0.0);
+}
+
 #[test]
 fn test_avx512f_config_detection() {
     let config = SimdConfig::detect();

@@ -38,7 +38,16 @@ fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
     squared_euclidean_distance_scalar(a, b)
 }
 
-/// **Unstable**: SIMD dispatch layer; use `lattice_embed::utils::euclidean_distance` for the stable wrapper.
+/// Euclidean (L2) distance over equal-length `f32` slices.
+///
+/// # Stability — khive ANN consumer contract
+///
+/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
+/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
+/// and length-mismatch behaviour (returns [`f32::MAX`]) are a **stable consumer
+/// contract** across the 0.4.x line. For the general-purpose ergonomic wrapper use
+/// `lattice_embed::utils::euclidean_distance`; prefer [`squared_euclidean_distance`]
+/// on hot paths where only ordering matters (it skips the final sqrt).
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -48,11 +57,21 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     dispatch_squared(a, b).sqrt()
 }
 
-/// **Unstable**: squared Euclidean distance — skips the final sqrt.
+/// Squared Euclidean distance — skips the final sqrt.
 ///
 /// Ordering is preserved: `sq_dist(a,b) <= sq_dist(a,c) ↔ dist(a,b) <= dist(a,c)`.
-/// Use this for HNSW graph comparisons where only ordering matters; apply `.sqrt()`
+/// Use this for ANN graph comparisons where only ordering matters; apply `.sqrt()`
 /// at the output boundary when the true L2 distance is required.
+///
+/// # Stability — khive ANN consumer contract
+///
+/// This is the primary hot-path distance for khive's ANN indexes (`khive-hnsw`
+/// today, `khive-vamana` next; ADR-012). The `(&[f32], &[f32]) -> f32` signature,
+/// the length-mismatch behaviour (returns [`f32::MAX`]), and the squared-L2 ordering
+/// invariant above are a **stable consumer contract** across the 0.4.x line. SIMD
+/// results are not bit-identical to the scalar reference (FP non-associativity), but
+/// the ordering — the only property an ANN graph relies on — is guaranteed. For the
+/// general-purpose ergonomic wrapper use `lattice_embed::utils::euclidean_distance`.
 #[inline]
 pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {

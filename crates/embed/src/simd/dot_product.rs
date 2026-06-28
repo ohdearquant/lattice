@@ -160,10 +160,19 @@ fn dot_product_neon_kernel(a: &[f32], b: &[f32]) -> f32 {
     unsafe { dot_product_neon_unrolled(a, b) }
 }
 
-/// **Unstable**: SIMD dispatch layer; use `lattice_embed::utils::dot_product` for the stable wrapper.
+/// Dot product over equal-length `f32` slices.
 ///
-/// For normalized vectors, this equals cosine similarity.
+/// For normalized vectors, this equals cosine similarity (and `sq-L2 = 2*(1 - dot)`),
+/// so it backs cosine/inner-product ANN search on unit-norm vectors.
 /// Returns 0.0 if vectors have different lengths.
+///
+/// # Stability — khive ANN consumer contract
+///
+/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
+/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
+/// and length-mismatch behaviour (returns 0.0) are a **stable consumer contract**
+/// across the 0.4.x line. For the general-purpose ergonomic wrapper use
+/// `lattice_embed::utils::dot_product`.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     // Runtime length check to prevent UB in release builds
