@@ -142,7 +142,11 @@ struct ChatScreen: View {
             guard let turnID = store.chatAwaitingTurnID,
                   let idx = store.chatTurns.firstIndex(where: { $0.id == turnID })
             else { return }
-            let parsed = splitThinking(newText ?? "")
+            // Same prefill-aware split as finalization: while reasoning (thinking-on, no
+            // </think> yet) the stream stays in the thinking area instead of flashing in the
+            // answer bubble and then vanishing when resolveTurn corrects it.
+            let parsed = ChatFinalization.finalize(newText ?? "",
+                                                   prefilledOpenThink: store.chatTurns[idx].prefilledOpenThink)
             store.chatTurns[idx].thinkingText = parsed.thinking
             store.chatTurns[idx].responseText = parsed.response
         }
@@ -818,29 +822,7 @@ struct ChatScreen: View {
         return buf
     }
 
-    /// Split a cumulative generation string into (thinking, response) on the <think>…</think> boundary.
-    /// - If `</think>` is present: text before it (minus a leading `<think>`) is thinking; text after is response.
-    /// - If only `<think>` is present (still reasoning): everything after it is thinking; response is empty.
-    /// - If neither tag is present: all of it is the response; thinking is empty.
-    /// Always parses the FULL cumulative string, so a tag split across token deltas resolves on the next delta.
-    private func splitThinking(_ raw: String) -> (thinking: String, response: String) {
-        let openTag = "<think>"
-        let closeTag = "</think>"
-        if let closeRange = raw.range(of: closeTag) {
-            var thinking = String(raw[raw.startIndex..<closeRange.lowerBound])
-            if let openRange = thinking.range(of: openTag) {
-                thinking = String(thinking[openRange.upperBound...])
-            }
-            let response = String(raw[closeRange.upperBound...])
-            return (thinking.trimmingCharacters(in: .whitespacesAndNewlines),
-                    response.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        if let openRange = raw.range(of: openTag) {
-            let thinking = String(raw[openRange.upperBound...])
-            return (thinking.trimmingCharacters(in: .whitespacesAndNewlines), "")
-        }
-        return ("", raw.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
+    // Reasoning split/finalization lives in ChatFinalization (pure, unit-tested).
 
     // MARK: Single-mode send
 
@@ -902,6 +884,10 @@ struct ChatScreen: View {
         var turn = ChatTurn(prompt: rawUserText)
         turn.retryConfig = retryCfg
         turn.inferenceLabel = inferenceLabel
+        // Thinking-on prefills an open <think> into the prompt (renderChatML), so a truncated
+        // reasoning stream is tagless. Snapshot the mode so finalization treats such a stream
+        // as unfinished reasoning rather than the answer (prevents history poisoning).
+        turn.prefilledOpenThink = store.chatEnableThinking
         let turnID = turn.id
         store.chatTurns.append(turn)
         store.chatAwaitingTurnID = turnID
@@ -996,23 +982,14 @@ struct ChatScreen: View {
         let responseText: String
         let thinkingText: String
         if !run.genText.isEmpty {
-            let parsed = splitThinking(run.genText)
+            // Prefill-aware finalization. When thinking was prefilled (open <think> in the
+            // prompt) and the stream has no </think>, the whole stream is unfinished reasoning,
+            // not the answer — keep it as thinkingText and leave responseText empty so the turn
+            // is skipped from history (renderChatML gates history on non-empty responseText).
+            let parsed = ChatFinalization.finalize(run.genText,
+                                                   prefilledOpenThink: store.chatTurns[idx].prefilledOpenThink)
             thinkingText = parsed.thinking
-            if !parsed.response.isEmpty {
-                responseText = parsed.response
-            } else if parsed.thinking.isEmpty {
-                // No <think> tags at all → the raw stream is the answer.
-                responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
-            } else {
-                // Thinking present but no final answer: generation ended before
-                // </think> (max tokens / stop / model quirk), or produced empty
-                // post-think output. Do NOT fall back to raw genText — that leaves
-                // a raw "<think>…" in the response bubble and, worse, re-injects it
-                // as assistant history on the next turn (history uses responseText,
-                // gated on non-empty). Keep the parsed reasoning; leave the response
-                // empty so the unfinished turn is skipped from history.
-                responseText = ""
-            }
+            responseText = parsed.response
         } else {
             thinkingText = ""
             let cleaned = run.log

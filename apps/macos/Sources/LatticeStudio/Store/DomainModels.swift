@@ -193,6 +193,13 @@ struct ChatTurn: Identifiable {
     /// Honest hardware label, snapshotted at send time: "GPU Metal bf16", "CPU bf16", etc.
     /// Never updated after the run starts — what launched is what ran.
     var inferenceLabel: String? = nil
+    /// Whether this turn's prompt PREFILLED an open `<think>` block (the enable_thinking=true
+    /// path in renderChatML). When true the model's stream carries no opening tag — it begins
+    /// mid-reasoning and only emits `</think>` before the answer — so a completed stream with
+    /// no `</think>` boundary is unfinished reasoning, not the answer. Finalization keeps it as
+    /// thinkingText and leaves responseText empty so the unfinished turn is skipped from history.
+    /// Snapshotted at send time (Retry mutates the turn in place and keeps this flag).
+    var prefilledOpenThink: Bool = false
 }
 
 /// The generation parameters needed to retry a failed/empty turn.
