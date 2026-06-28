@@ -64,6 +64,7 @@ Options:
   --seq-len    <N>      Max tokens per sample (default: 64)
   --max-train  <N>      Training samples cap (default: 3)
   --log-every  <N>      Print NLL every N steps (default: 5)
+  --save       <PATH>   Save trained adapter as PEFT safetensors (needs --features safetensors)
   -h, --help            Print this help"
     );
 }
@@ -433,6 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log_every: usize = parse_arg(&args, "--log-every")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    let save_path = parse_arg(&args, "--save");
 
     println!("=== exact-gradient LoRA trainer (layer {LAYER}, gated GQA) ===");
     println!("model-dir:  {}", model_dir.display());
@@ -689,5 +691,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_nll - base_nll,
         tstep.elapsed().as_secs_f64()
     );
+
+    // Persist the trained low-rank factors as a PEFT-format adapter. The trainer
+    // stores B as row-major [d_out, rank] and A as [rank, d_in] (see ops::lora_vjp),
+    // which is exactly LoraLayer's convention -- no transpose. q_proj is gated, so
+    // its d_out spans the full 2*q_dim output (Q rows + gate rows).
+    if let Some(save_path) = save_path.as_deref() {
+        #[cfg(feature = "safetensors")]
+        {
+            use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
+            use std::collections::HashMap;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (LAYER, "q_proj".to_string()),
+                LoraLayer {
+                    a: lora_a_q.clone(),
+                    b: lora_b_q.clone(),
+                    d_in: dims.hidden,
+                    d_out: 2 * q_dim,
+                    rank,
+                },
+            );
+            layers.insert(
+                (LAYER, "v_proj".to_string()),
+                LoraLayer {
+                    a: lora_a_v.clone(),
+                    b: lora_b_v.clone(),
+                    d_in: dims.hidden,
+                    d_out: kv_dim,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha,
+                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            };
+            let adapter = LoraAdapter::new(config, layers);
+            adapter
+                .save_safetensors(std::path::Path::new(save_path))
+                .map_err(|e| format!("save adapter: {e}"))?;
+            println!("saved adapter (layer {LAYER}, q_proj+v_proj, rank {rank}) → {save_path}");
+        }
+        #[cfg(not(feature = "safetensors"))]
+        {
+            let _ = save_path;
+            return Err("--save requires building with --features safetensors".into());
+        }
+    }
+
     Ok(())
 }
