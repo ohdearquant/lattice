@@ -998,9 +998,21 @@ struct ChatScreen: View {
         if !run.genText.isEmpty {
             let parsed = splitThinking(run.genText)
             thinkingText = parsed.thinking
-            responseText = parsed.response.isEmpty
-                ? run.genText.trimmingCharacters(in: .whitespacesAndNewlines)  // no </think> closed yet → show raw
-                : parsed.response
+            if !parsed.response.isEmpty {
+                responseText = parsed.response
+            } else if parsed.thinking.isEmpty {
+                // No <think> tags at all → the raw stream is the answer.
+                responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                // Thinking present but no final answer: generation ended before
+                // </think> (max tokens / stop / model quirk), or produced empty
+                // post-think output. Do NOT fall back to raw genText — that leaves
+                // a raw "<think>…" in the response bubble and, worse, re-injects it
+                // as assistant history on the next turn (history uses responseText,
+                // gated on non-empty). Keep the parsed reasoning; leave the response
+                // empty so the unfinished turn is skipped from history.
+                responseText = ""
+            }
         } else {
             thinkingText = ""
             let cleaned = run.log
