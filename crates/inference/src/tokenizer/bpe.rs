@@ -8,7 +8,8 @@ use crate::error::InferenceError;
 use crate::tokenizer::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, invert_vocab, json_object_to_vocab,
     json_path, known_special_id, pad_ids, parse_added_tokens, parse_json,
-    parse_post_processor_flags, push_eos_preserving_limit, vocab_txt_to_map,
+    parse_post_processor_flags, parse_rendered_added_tokens, push_eos_preserving_limit,
+    vocab_txt_to_map,
 };
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -40,6 +41,12 @@ struct BpeInner {
     byte_encoder: Vec<char>,
     special_tokens: HashMap<String, u32>,
     special_tokens_sorted: Vec<String>,
+    /// Decode-side map for added tokens with `special=false` (`<think>`/`</think>`,
+    /// `<tool_call>`, FIM markers). These ids are absent from the base BPE `vocab`,
+    /// so `token_for_id` falls back to this map to render them as literal text
+    /// instead of silently dropping them. `special=true` markers are deliberately
+    /// excluded so they stay swallowed (matching `skip_special_tokens=True`).
+    added_render: HashMap<u32, String>,
     pad_id: u32,
     unk_id: Option<u32>,
     bos_id: Option<u32>,
@@ -152,11 +159,13 @@ impl BpeTokenizer {
         })?;
         let merges = parse_merges_json(merges_value)?;
         let added = parse_added_tokens(&root);
+        let rendered_added = parse_rendered_added_tokens(&root);
 
         let mut tokenizer = Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
             added,
+            rendered_added,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
         )?;
@@ -191,6 +200,7 @@ impl BpeTokenizer {
             vocab,
             merges,
             HashMap::new(),
+            HashMap::new(),
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
         )
@@ -200,10 +210,18 @@ impl BpeTokenizer {
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
+        rendered_added: HashMap<String, u32>,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
         let id_to_token = invert_vocab(&vocab)?;
+        // Invert the renderable added-token set to id -> content for decode-side
+        // lookup. Built once at construction; consulted by `token_for_id` only
+        // when the base table misses (added-token ids exceed the base vocab range).
+        let added_render: HashMap<u32, String> = rendered_added
+            .into_iter()
+            .map(|(content, id)| (id, content))
+            .collect();
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
             // First occurrence defines the rank: merges are listed in priority
@@ -256,6 +274,7 @@ impl BpeTokenizer {
             byte_encoder: bytes_to_unicode(),
             special_tokens,
             special_tokens_sorted,
+            added_render,
             pad_id,
             unk_id,
             bos_id,
@@ -281,6 +300,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -306,6 +326,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id,
             bos_id: self.inner.bos_id,
@@ -335,6 +356,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -358,6 +380,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -381,6 +404,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
             bos_id: self.inner.bos_id,
@@ -410,7 +434,15 @@ impl BpeTokenizer {
     ///
     /// Reverse lookup for debugging.
     pub fn token_for_id(&self, id: u32) -> Option<&str> {
-        self.inner.id_to_token.get(id as usize).map(String::as_str)
+        // Base vocab first; added tokens with `special=false` (think/tool/FIM
+        // markers) live beyond the base range, so fall back to `added_render` to
+        // render them as text instead of dropping them. `special=true` markers
+        // are absent from both maps and stay swallowed.
+        self.inner
+            .id_to_token
+            .get(id as usize)
+            .map(String::as_str)
+            .or_else(|| self.inner.added_render.get(&id).map(String::as_str))
     }
 
     /// **Unstable**: look up special token ID by name; set of known special tokens may change.
@@ -1186,6 +1218,7 @@ mod tests {
             vocab,
             Vec::new(),
             added,
+            HashMap::new(),
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
         )
@@ -1241,6 +1274,100 @@ mod tests {
         // prior generate.rs detokenize block discarded the text entirely.
         assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
         assert_eq!(tokenizer.decode(&[]), Some(String::new()));
+    }
+
+    #[test]
+    fn test_decode_renders_nonspecial_added_tokens() {
+        // Regression (qwen3.6-27b think-tag bug): added tokens with special=false
+        // (`</think>`, `<tool_call>`, FIM markers) live BEYOND the base vocab range,
+        // so before the fix `token_for_id` returned None and they decoded to the
+        // empty string — silently swallowed from the output stream even though the
+        // model sampled them correctly. They must now render as their literal text.
+        // special=true markers (im_end-style) must STILL be swallowed.
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2)] {
+            vocab.insert(s.to_string(), i);
+        }
+        // rendered_added = the special=false subset (content -> id), ids past base max.
+        let mut rendered = HashMap::new();
+        rendered.insert("</think>".to_string(), 100u32);
+        rendered.insert("<think>".to_string(), 101u32);
+        rendered.insert("<tool_call>".to_string(), 102u32);
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            HashMap::new(),
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct tokenizer with rendered added tokens");
+
+        // special=false added tokens render verbatim (byte-level decode is identity
+        // for printable ASCII).
+        assert_eq!(tokenizer.decode(&[101]), Some("<think>".to_string()));
+        assert_eq!(tokenizer.decode(&[100]), Some("</think>".to_string()));
+        assert_eq!(tokenizer.decode(&[102]), Some("<tool_call>".to_string()));
+        // Mixed with base content tokens, in stream order.
+        assert_eq!(
+            tokenizer.decode(&[0, 1, 100, 2]),
+            Some("ab</think>c".to_string())
+        );
+        // An id present in neither base vocab nor the rendered set (e.g. a
+        // special=true marker) stays swallowed — token_for_id returns None.
+        assert_eq!(tokenizer.decode(&[200]), Some(String::new()));
+
+        // The incremental streaming detokenizer must agree byte-for-byte.
+        use crate::model::qwen35::detokenize::IncrementalDetokenizer;
+        let mut detok = IncrementalDetokenizer::new();
+        let mut out = String::new();
+        for id in [0u32, 100, 1] {
+            out.push_str(&detok.push(&tokenizer, id));
+        }
+        out.push_str(&detok.finish());
+        assert_eq!(out, "a</think>b");
+    }
+
+    #[test]
+    fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
+        // End-to-end regression gate for the qwen3.6 think-tag detok bug, driving
+        // the REAL public loader (`from_tokenizer_json_str`) with the EXACT added-token
+        // ids and special flags from the shipped qwen tokenizer.json (verified identical
+        // on both qwen3.5-0.8b and qwen3.6-27b): `<think>`=248068, `</think>`=248069 are
+        // special=false and live FAR above the base vocab max (248043). This exercises
+        // the full wiring parse_rendered_added_tokens → added_render → token_for_id →
+        // decode; a token-level parity gate (e2e-parity compares token IDS) is BLIND to
+        // this class because the ids matched while the rendered text dropped the tag.
+        let json = r#"{
+            "model": {
+                "type": "BPE",
+                "vocab": {"a": 0, "b": 1},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 248045, "content": "<|im_start|>", "special": true},
+                {"id": 248046, "content": "<|im_end|>", "special": true},
+                {"id": 248058, "content": "<tool_call>", "special": false},
+                {"id": 248068, "content": "<think>", "special": false},
+                {"id": 248069, "content": "</think>", "special": false}
+            ]
+        }"#;
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(json).expect("load tokenizer.json fixture");
+
+        // special=false think/tool tags render verbatim (the bug: these were swallowed).
+        assert_eq!(tokenizer.decode(&[248069]), Some("</think>".to_string()));
+        assert_eq!(tokenizer.decode(&[248068]), Some("<think>".to_string()));
+        assert_eq!(tokenizer.decode(&[248058]), Some("<tool_call>".to_string()));
+        // special=true chat-control markers stay swallowed (HF skip_special_tokens=True).
+        assert_eq!(tokenizer.decode(&[248046]), Some(String::new()));
+        assert_eq!(tokenizer.decode(&[248045]), Some(String::new()));
+        // A close tag mid-stream between base content tokens renders in order.
+        assert_eq!(
+            tokenizer.decode(&[0, 248069, 1]),
+            Some("a</think>b".to_string())
+        );
     }
 
     #[test]
