@@ -216,10 +216,26 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     let value_heads = cfg.linear_num_value_heads();
     let qkv = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_qkv.weight"))?;
     let z = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_z.weight"))?;
-    let b = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_b.weight"))?;
-    let a = load_owned_tensor(source, &format!("{prefix}.linear_attn.in_proj_a.weight"))?;
-    let alog = load_owned_tensor(source, &format!("{prefix}.linear_attn.A_log"))?;
-    let dtb = load_owned_tensor(source, &format!("{prefix}.linear_attn.dt_bias"))?;
+    let b = load_owned_tensor_checked(
+        source,
+        &format!("{prefix}.linear_attn.in_proj_b.weight"),
+        &[value_heads, hidden],
+    )?;
+    let a = load_owned_tensor_checked(
+        source,
+        &format!("{prefix}.linear_attn.in_proj_a.weight"),
+        &[value_heads, hidden],
+    )?;
+    let alog = load_owned_tensor_checked(
+        source,
+        &format!("{prefix}.linear_attn.A_log"),
+        &[value_heads],
+    )?;
+    let dtb = load_owned_tensor_checked(
+        source,
+        &format!("{prefix}.linear_attn.dt_bias"),
+        &[value_heads],
+    )?;
     let cw = load_owned_tensor(source, &format!("{prefix}.linear_attn.conv1d.weight"))?;
     let nw = load_owned_tensor(source, &format!("{prefix}.linear_attn.norm.weight"))?;
     let op = load_owned_tensor(source, &format!("{prefix}.linear_attn.out_proj.weight"))?;
@@ -332,6 +348,29 @@ mod tests {
 
     struct NullTensorSource;
 
+    /// A mock tensor source backed by a HashMap. Returns MissingTensor for unknown names.
+    struct MockTensorSource {
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+    }
+
+    impl TensorSource for MockTensorSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
     impl TensorSource for NullTensorSource {
         fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
             Ok(false)
@@ -344,6 +383,85 @@ mod tests {
             name: &str,
         ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
             Err(InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// Verify that a key-head-shaped in_proj_b tensor in an asymmetric GDN config is rejected
+    /// at load time (returns Err, not Ok or panic).
+    #[test]
+    fn gdn_decay_tensor_key_head_shape_rejected() {
+        // qwen36_35b_a3b has linear_num_key_heads=16, linear_num_value_heads=Some(32) —
+        // an asymmetric config so the shape check actually does something.
+        let cfg = Qwen35Config::qwen36_35b_a3b();
+        let hidden = cfg.hidden_size; // 2048
+        let key_heads = cfg.linear_num_key_heads; // 16
+        let value_heads = cfg.linear_num_value_heads(); // 32
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let kernel_size = cfg.linear_conv_kernel_dim;
+
+        assert_ne!(
+            key_heads, value_heads,
+            "test requires asymmetric key/value heads"
+        );
+
+        let prefix = "layers.0";
+        let mut src = MockTensorSource {
+            tensors: [
+                // qkv and z are loaded with unchecked load_owned_tensor — any data passes
+                (
+                    format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                    (vec![0.0f32; 1], vec![1]),
+                ),
+                (
+                    format!("{prefix}.linear_attn.in_proj_z.weight"),
+                    (vec![0.0f32; 1], vec![1]),
+                ),
+                // in_proj_b is key-head-shaped ([16, hidden]) instead of value-head-shaped
+                // ([32, hidden]) — this should be caught by load_owned_tensor_checked
+                (
+                    format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    (vec![0.0f32; key_heads * hidden], vec![key_heads, hidden]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let result = load_linear_attention_weights(
+            &mut src,
+            &cfg,
+            prefix,
+            hidden,
+            key_heads,
+            qkv_dim,
+            output_dim,
+            kernel_size,
+        );
+
+        match result {
+            Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert!(
+                    name.contains("in_proj_b"),
+                    "mismatch should name the in_proj_b tensor, got: {name}"
+                );
+                assert_eq!(
+                    expected,
+                    vec![value_heads, hidden],
+                    "expected shape should be value-head-sized"
+                );
+                assert_eq!(
+                    actual,
+                    vec![key_heads, hidden],
+                    "actual shape should reflect the key-head-shaped data we supplied"
+                );
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for key-head-shaped decay tensor, got Ok"),
         }
     }
 

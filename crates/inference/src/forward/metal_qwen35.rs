@@ -3609,10 +3609,10 @@ kernel void gdn_chunk_norm_silu_c32(
         in_proj_qkv: Q4WeightBuf,  // [qkv_dim, hidden] — Q4/Q8
         in_proj_z: Q4WeightBuf,    // [output_dim, hidden] — Q4/Q8
         in_proj_qkvz: Q4WeightBuf, // [qkv_dim+output_dim, hidden] — Q4/Q8; concat of qkv||z rows for fused decode GEMV
-        in_proj_b: Buffer,         // [num_heads, hidden] — f16 (CPU-read via unified mem)
-        in_proj_a: Buffer,         // [num_heads, hidden] — f16 (CPU-read via unified mem)
-        a_log: Buffer,             // [num_heads] — f32 (small, precision-sensitive)
-        dt_bias: Buffer,           // [num_heads] — f32 (small, precision-sensitive)
+        in_proj_b: Buffer,         // [num_value_heads, hidden] — f16 (CPU-read via unified mem)
+        in_proj_a: Buffer,         // [num_value_heads, hidden] — f16 (CPU-read via unified mem)
+        a_log: Buffer,             // [num_value_heads] — f32 (small, precision-sensitive)
+        dt_bias: Buffer,           // [num_value_heads] — f32 (small, precision-sensitive)
         conv1d_weight: Buffer,     // [qkv_dim, kernel_size] — f32 (small, CPU-read)
         norm_weight: Buffer,       // [value_dim] — f32 (small, CPU-read)
         out_proj: Q4WeightBuf,     // [hidden, output_dim] — Q4/Q8
