@@ -848,7 +848,7 @@ pub fn load_f16_weights(
     let kv_dim = cfg.full_kv_dim();
     let qkv_dim = cfg.linear_qkv_dim();
     let output_dim = cfg.linear_output_dim();
-    let num_heads = cfg.linear_num_key_heads;
+    let value_heads = cfg.linear_num_value_heads();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
     let embed_tokens = load_f16_tensor_checked(
@@ -1026,26 +1026,26 @@ pub fn load_f16_weights(
                 in_proj_b: load_f16_tensor_checked(
                     sf,
                     &format!("{prefix}.linear_attn.in_proj_b.weight"),
-                    &[num_heads, hidden],
+                    &[value_heads, hidden],
                 )?,
-                in_proj_b_rows: num_heads,
+                in_proj_b_rows: value_heads,
                 in_proj_b_cols: hidden,
                 in_proj_a: load_f16_tensor_checked(
                     sf,
                     &format!("{prefix}.linear_attn.in_proj_a.weight"),
-                    &[num_heads, hidden],
+                    &[value_heads, hidden],
                 )?,
-                in_proj_a_rows: num_heads,
+                in_proj_a_rows: value_heads,
                 in_proj_a_cols: hidden,
                 a_log: load_f32_tensor_checked(
                     sf,
                     &format!("{prefix}.linear_attn.A_log"),
-                    &[num_heads],
+                    &[value_heads],
                 )?,
                 dt_bias: load_f32_tensor_checked(
                     sf,
                     &format!("{prefix}.linear_attn.dt_bias"),
-                    &[num_heads],
+                    &[value_heads],
                 )?,
                 conv1d_weight: load_conv1d_weight(
                     sf,
@@ -1088,7 +1088,7 @@ fn estimate_f32_model_bytes(cfg: &Qwen35Config) -> usize {
     let kv_dim = cfg.full_kv_dim();
     let qkv_dim = cfg.linear_qkv_dim();
     let output_dim = cfg.linear_output_dim();
-    let num_heads = cfg.linear_num_key_heads;
+    let value_heads = cfg.linear_num_value_heads();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
     let mut bytes = 0usize;
@@ -1113,10 +1113,10 @@ fn estimate_f32_model_bytes(cfg: &Qwen35Config) -> usize {
         } else {
             bytes += (qkv_dim * hidden) * 4;
             bytes += (output_dim * hidden) * 4;
-            bytes += (num_heads * hidden) * 4;
-            bytes += (num_heads * hidden) * 4;
-            bytes += num_heads * 4;
-            bytes += num_heads * 4;
+            bytes += (value_heads * hidden) * 4;
+            bytes += (value_heads * hidden) * 4;
+            bytes += value_heads * 4;
+            bytes += value_heads * 4;
             bytes += (qkv_dim * kernel_size) * 4;
             bytes += output_dim * 4;
             bytes += (hidden * output_dim) * 4;
@@ -1134,7 +1134,7 @@ fn estimate_f16_model_bytes(cfg: &Qwen35Config) -> usize {
     let kv_dim = cfg.full_kv_dim();
     let qkv_dim = cfg.linear_qkv_dim();
     let output_dim = cfg.linear_output_dim();
-    let num_heads = cfg.linear_num_key_heads;
+    let value_heads = cfg.linear_num_value_heads();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
     let mut bytes = 0usize;
@@ -1159,10 +1159,10 @@ fn estimate_f16_model_bytes(cfg: &Qwen35Config) -> usize {
         } else {
             bytes += (qkv_dim * hidden) * 2;
             bytes += (output_dim * hidden) * 2;
-            bytes += (num_heads * hidden) * 2;
-            bytes += (num_heads * hidden) * 2;
-            bytes += num_heads * 4;
-            bytes += num_heads * 4;
+            bytes += (value_heads * hidden) * 2;
+            bytes += (value_heads * hidden) * 2;
+            bytes += value_heads * 4;
+            bytes += value_heads * 4;
             bytes += (qkv_dim * kernel_size) * 4;
             bytes += output_dim * 4;
             bytes += (hidden * output_dim) * 2;

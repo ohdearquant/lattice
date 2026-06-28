@@ -201,13 +201,13 @@ pub struct Q8GatedDeltaNetWeights {
     pub in_proj_qkv: Q8Matrix,
     /// Quantized output-gate projection `[output_dim, hidden]`.
     pub in_proj_z: Q8Matrix,
-    /// Quantized update-rate projection `[num_heads, hidden]`.
+    /// Quantized update-rate projection `[num_value_heads, hidden]`.
     pub in_proj_b: Q8Matrix,
-    /// Quantized decay-input projection `[num_heads, hidden]`.
+    /// Quantized decay-input projection `[num_value_heads, hidden]`.
     pub in_proj_a: Q8Matrix,
-    /// Learnable log-decay values, kept in f32.
+    /// Learnable log-decay values `[num_value_heads]`, kept in f32.
     pub a_log: Vec<f32>,
-    /// Learnable timestep biases, kept in f32.
+    /// Learnable timestep biases `[num_value_heads]`, kept in f32.
     pub dt_bias: Vec<f32>,
     /// Depthwise conv1d weights, kept in f32.
     pub conv1d_weight: Vec<f32>,
@@ -294,7 +294,7 @@ pub(crate) fn quantize_model_weights(
         .map(|(attn, common)| {
             let q8_attn = match attn {
                 AttentionWeights::Linear(gdn) => {
-                    Q8AttentionWeights::Linear(quantize_gdn_weights(gdn))
+                    Q8AttentionWeights::Linear(quantize_gdn_weights(gdn)?)
                 }
                 AttentionWeights::Full(full) => {
                     Q8AttentionWeights::Full(quantize_full_attn_weights(full, cfg))
@@ -315,8 +315,53 @@ pub(crate) fn quantize_model_weights(
 /// **Unstable**: convert GatedDeltaNet weights to Q8; output type may change.
 ///
 /// Quantize a `GatedDeltaNetWeights` bundle into its Q8 representation.
-pub fn quantize_gdn_weights(w: &GatedDeltaNetWeights) -> Q8GatedDeltaNetWeights {
-    Q8GatedDeltaNetWeights {
+///
+/// Returns `Err` (never panics) when the decay parameter shapes are inconsistent:
+/// `in_proj_b` and `in_proj_a` data lengths must equal their declared `rows * cols`;
+/// `a_log` and `dt_bias` lengths must equal `in_proj_b_rows` (the value-head count).
+pub fn quantize_gdn_weights(
+    w: &GatedDeltaNetWeights,
+) -> Result<Q8GatedDeltaNetWeights, InferenceError> {
+    let value_head_rows = w.in_proj_b_rows;
+
+    if w.in_proj_b.len() != w.in_proj_b_rows * w.in_proj_b_cols {
+        return Err(InferenceError::InvalidInput(format!(
+            "GDN in_proj_b data length {} does not match rows({}) * cols({})",
+            w.in_proj_b.len(),
+            w.in_proj_b_rows,
+            w.in_proj_b_cols
+        )));
+    }
+    if w.in_proj_a.len() != w.in_proj_a_rows * w.in_proj_a_cols {
+        return Err(InferenceError::InvalidInput(format!(
+            "GDN in_proj_a data length {} does not match rows({}) * cols({})",
+            w.in_proj_a.len(),
+            w.in_proj_a_rows,
+            w.in_proj_a_cols
+        )));
+    }
+    if w.in_proj_a_rows != value_head_rows {
+        return Err(InferenceError::InvalidInput(format!(
+            "GDN in_proj_a_rows ({}) does not match in_proj_b_rows ({})",
+            w.in_proj_a_rows, value_head_rows
+        )));
+    }
+    if w.a_log.len() != value_head_rows {
+        return Err(InferenceError::InvalidInput(format!(
+            "GDN a_log length ({}) does not match value_head rows ({})",
+            w.a_log.len(),
+            value_head_rows
+        )));
+    }
+    if w.dt_bias.len() != value_head_rows {
+        return Err(InferenceError::InvalidInput(format!(
+            "GDN dt_bias length ({}) does not match value_head rows ({})",
+            w.dt_bias.len(),
+            value_head_rows
+        )));
+    }
+
+    Ok(Q8GatedDeltaNetWeights {
         in_proj_qkv: quantize_matrix(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols),
         in_proj_z: quantize_matrix(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols),
         in_proj_b: quantize_matrix(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols),
@@ -328,7 +373,7 @@ pub fn quantize_gdn_weights(w: &GatedDeltaNetWeights) -> Q8GatedDeltaNetWeights 
         kernel_size: w.kernel_size,
         norm_weight: w.norm_weight.clone(),
         out_proj: quantize_matrix(&w.out_proj, w.out_proj_rows, w.out_proj_cols),
-    }
+    })
 }
 
 /// Quantize a full-attention layer into its Q8 representation.
@@ -390,7 +435,7 @@ pub fn memory_report(cfg: &Qwen35Config) -> (usize, usize, f32) {
 
     let qkv_dim = cfg.linear_qkv_dim();
     let linear_output_dim = cfg.linear_output_dim();
-    let linear_heads = cfg.linear_num_key_heads;
+    let linear_heads = cfg.linear_num_value_heads();
 
     let q_dim = cfg.full_q_dim();
     let kv_dim = cfg.full_kv_dim();
@@ -570,6 +615,60 @@ mod tests {
         }
         for (orig, recon) in w.iter().zip(dq.iter()) {
             assert!(approx_eq(*orig, *recon, 1e-6));
+        }
+    }
+
+    /// Build a GatedDeltaNetWeights whose decay params are internally consistent at
+    /// value-head granularity: a_log/dt_bias length == in_proj_b_rows == in_proj_a_rows.
+    fn valid_gdn_weights(value_heads: usize, hidden: usize) -> GatedDeltaNetWeights {
+        let qkv_rows = value_heads * 4;
+        let z_rows = value_heads * 2;
+        GatedDeltaNetWeights {
+            in_proj_qkv: vec![0.0; qkv_rows * hidden],
+            in_proj_qkv_rows: qkv_rows,
+            in_proj_qkv_cols: hidden,
+            in_proj_z: vec![0.0; z_rows * hidden],
+            in_proj_z_rows: z_rows,
+            in_proj_z_cols: hidden,
+            in_proj_b: vec![0.0; value_heads * hidden],
+            in_proj_b_rows: value_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a: vec![0.0; value_heads * hidden],
+            in_proj_a_rows: value_heads,
+            in_proj_a_cols: hidden,
+            a_log: vec![0.0; value_heads],
+            dt_bias: vec![0.0; value_heads],
+            conv1d_weight: vec![0.0; qkv_rows * 4],
+            conv_dim: qkv_rows,
+            kernel_size: 4,
+            norm_weight: vec![1.0; z_rows],
+            out_proj: vec![0.0; hidden * z_rows],
+            out_proj_rows: hidden,
+            out_proj_cols: z_rows,
+        }
+    }
+
+    #[test]
+    fn quantize_gdn_weights_accepts_consistent_value_head_shapes() {
+        let w = valid_gdn_weights(3, 8);
+        let q = quantize_gdn_weights(&w).expect("consistent value-head shapes must quantize");
+        assert_eq!(q.a_log.len(), 3);
+        assert_eq!(q.dt_bias.len(), 3);
+    }
+
+    #[test]
+    fn quantize_gdn_weights_rejects_decay_shape_mismatch() {
+        // a_log length (4) disagrees with the value-head row count (3). The #262 loader
+        // bug would have masked an asymmetric mismatch; the quantizer must fail closed
+        // (return Err — not panic via quantize_matrix's assert, not silently proceed).
+        let mut w = valid_gdn_weights(3, 8);
+        w.a_log = vec![0.0; 4];
+        match quantize_gdn_weights(&w) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(msg.contains("a_log"), "error must name a_log, got: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for decay shape mismatch, got Ok"),
         }
     }
 

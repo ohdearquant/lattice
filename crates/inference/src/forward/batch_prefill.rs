@@ -159,7 +159,7 @@ impl PrefillScratch {
         let inter = cfg.intermediate_size;
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
-        let num_linear_heads = cfg.linear_num_key_heads;
+        let num_linear_value_heads = cfg.linear_num_value_heads();
         let key_dim = cfg.linear_key_head_dim;
         let value_dim = cfg.linear_value_head_dim;
 
@@ -175,8 +175,8 @@ impl PrefillScratch {
 
         resize(&mut self.gdn_qkv_batch, seq_len * qkv_dim);
         resize(&mut self.gdn_z_batch, seq_len * output_dim);
-        resize(&mut self.gdn_beta_batch, seq_len * num_linear_heads);
-        resize(&mut self.gdn_alpha_batch, seq_len * num_linear_heads);
+        resize(&mut self.gdn_beta_batch, seq_len * num_linear_value_heads);
+        resize(&mut self.gdn_alpha_batch, seq_len * num_linear_value_heads);
         resize(&mut self.gdn_out_batch, seq_len * output_dim);
 
         resize(&mut self.gate_batch, seq_len * inter);
@@ -701,38 +701,38 @@ impl Qwen35Model {
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_b,
-            &mut scratch.gdn_beta_batch[..seq_len * num_heads],
+            &mut scratch.gdn_beta_batch[..seq_len * value_heads],
             seq_len,
             hidden,
-            num_heads,
+            value_heads,
         );
         for t in 0..seq_len {
             lora.apply(
                 layer_idx,
                 "in_proj_b",
                 &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_beta_batch[t * num_heads..(t + 1) * num_heads],
+                &mut scratch.gdn_beta_batch[t * value_heads..(t + 1) * value_heads],
             );
         }
         matmul_bt(
             &scratch.hidden[..seq_len * hidden],
             &weights.in_proj_a,
-            &mut scratch.gdn_alpha_batch[..seq_len * num_heads],
+            &mut scratch.gdn_alpha_batch[..seq_len * value_heads],
             seq_len,
             hidden,
-            num_heads,
+            value_heads,
         );
         for t in 0..seq_len {
             lora.apply(
                 layer_idx,
                 "in_proj_a",
                 &scratch.hidden[t * hidden..(t + 1) * hidden],
-                &mut scratch.gdn_alpha_batch[t * num_heads..(t + 1) * num_heads],
+                &mut scratch.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads],
             );
         }
 
         // Sigmoid(beta) exactly as in the decode path.
-        for beta in &mut scratch.gdn_beta_batch[..seq_len * num_heads] {
+        for beta in &mut scratch.gdn_beta_batch[..seq_len * value_heads] {
             *beta = sigmoid(*beta);
         }
 
@@ -740,8 +740,8 @@ impl Qwen35Model {
         for t in 0..seq_len {
             let qkv_row = &scratch.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim];
             let z_row = &scratch.gdn_z_batch[t * output_dim..(t + 1) * output_dim];
-            let beta_row = &scratch.gdn_beta_batch[t * num_heads..(t + 1) * num_heads];
-            let alpha_row = &scratch.gdn_alpha_batch[t * num_heads..(t + 1) * num_heads];
+            let beta_row = &scratch.gdn_beta_batch[t * value_heads..(t + 1) * value_heads];
+            let alpha_row = &scratch.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads];
             let out_row = &mut scratch.gdn_out_batch[t * output_dim..(t + 1) * output_dim];
 
             apply_causal_conv1d_prefill(
@@ -774,11 +774,8 @@ impl Qwen35Model {
                 l2_normalize_vec(&mut scratch.gdn_q_tmp[..key_dim]);
                 l2_normalize_vec(&mut scratch.gdn_k_tmp[..key_dim]);
 
-                let g = compute_decay_gate_prefill(
-                    weights.a_log[k_head],
-                    alpha_row[k_head],
-                    weights.dt_bias[k_head],
-                );
+                let g =
+                    compute_decay_gate_prefill(weights.a_log[h], alpha_row[h], weights.dt_bias[h]);
 
                 let s = &mut state.s_matrices[h * s_size..(h + 1) * s_size];
 
@@ -798,7 +795,7 @@ impl Qwen35Model {
                 }
 
                 // delta = (v - kv_mem) * beta
-                let beta_h = beta_row[k_head];
+                let beta_h = beta_row[h];
                 for (delta, (&v_j, &mem_j)) in scratch.gdn_delta[..value_dim]
                     .iter_mut()
                     .zip(v_vec.iter().zip(&scratch.gdn_kv_mem[..value_dim]))
@@ -1394,7 +1391,7 @@ mod tests {
                 "down_proj" => (cfg.intermediate_size, h),
                 "in_proj_qkv" => (h, cfg.linear_qkv_dim()),
                 "in_proj_z" => (h, cfg.linear_output_dim()),
-                "in_proj_b" | "in_proj_a" => (h, cfg.linear_num_key_heads),
+                "in_proj_b" | "in_proj_a" => (h, cfg.linear_num_value_heads()),
                 "out_proj" => (cfg.linear_output_dim(), h),
                 other => panic!("unexpected module in batch prefill hook: {other}"),
             };

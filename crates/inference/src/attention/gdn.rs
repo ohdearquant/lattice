@@ -191,13 +191,15 @@ pub fn gated_delta_net_step(
 ) {
     let hidden = cfg.hidden_size;
     let num_heads = cfg.linear_num_key_heads;
+    let value_heads = cfg.linear_num_value_heads();
+    let ratio = value_heads / num_heads;
     let key_dim = cfg.linear_key_head_dim;
     let value_dim = cfg.linear_value_head_dim;
     let qkv_dim = cfg.linear_qkv_dim();
     let output_dim = cfg.linear_output_dim();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
-    scratch.ensure_capacity(qkv_dim, output_dim, num_heads, hidden);
+    scratch.ensure_capacity(qkv_dim, output_dim, value_heads, hidden);
 
     // 1. Projections (BLAS: input [1, hidden] @ weight^T [qkv_dim, hidden])
     matmul_bt(
@@ -221,23 +223,23 @@ pub fn gated_delta_net_step(
     matmul_bt(
         input,
         &weights.in_proj_b,
-        &mut scratch.beta_proj[..num_heads],
+        &mut scratch.beta_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     matmul_bt(
         input,
         &weights.in_proj_a,
-        &mut scratch.alpha_proj[..num_heads],
+        &mut scratch.alpha_proj[..value_heads],
         1,
         hidden,
-        num_heads,
+        value_heads,
     );
 
     // Apply sigmoid to beta
-    for b in &mut scratch.beta_proj[..num_heads] {
+    for b in &mut scratch.beta_proj[..value_heads] {
         *b = sigmoid(*b);
     }
 
@@ -263,10 +265,11 @@ pub fn gated_delta_net_step(
     // V starts after Q and K
     let v_offset = q_total + k_total;
 
-    // 4-7. Process each head
-    for h in 0..num_heads {
-        let q_start = h * key_dim;
-        let k_start = q_total + h * key_dim;
+    // 4-7. Process each head (value-head loop; Q/K use k_head = h/ratio)
+    for h in 0..value_heads {
+        let k_head = h / ratio;
+        let q_start = k_head * key_dim;
+        let k_start = q_total + k_head * key_dim;
         let v_start = v_offset + h * value_dim;
 
         // Extract per-head Q, K, V
@@ -330,7 +333,7 @@ pub fn gated_delta_net_step(
     // norm_weight is [value_dim] (per-head), applied to each head independently
     // Then gated with z: out = z * (x / rms(x)) * gamma (per head)
     let value_dim = cfg.linear_value_head_dim;
-    for h in 0..num_heads {
+    for h in 0..value_heads {
         let start = h * value_dim;
         let end = start + value_dim;
         gated_rms_norm(

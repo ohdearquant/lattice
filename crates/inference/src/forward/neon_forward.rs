@@ -326,7 +326,7 @@ fn gdn_step_q8_neon(
     let output_dim = cfg.linear_output_dim();
     let kernel_size = cfg.linear_conv_kernel_dim;
 
-    gdn_scratch.ensure_capacity(qkv_dim, output_dim, num_heads, key_dim, value_dim);
+    gdn_scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (Q8 NEON) — zero allocations after warmup
     matmul_q8_neon_into(
@@ -348,22 +348,22 @@ fn gdn_step_q8_neon(
     matmul_q8_neon_into(
         input,
         &weights.in_proj_b_packed,
-        num_heads,
+        value_heads,
         hidden,
-        &mut gdn_scratch.beta_proj[..num_heads],
+        &mut gdn_scratch.beta_proj[..value_heads],
         x_q_scratch,
     );
     matmul_q8_neon_into(
         input,
         &weights.in_proj_a_packed,
-        num_heads,
+        value_heads,
         hidden,
-        &mut gdn_scratch.alpha_proj[..num_heads],
+        &mut gdn_scratch.alpha_proj[..value_heads],
         x_q_scratch,
     );
 
     // sigmoid(beta) in place
-    for b in &mut gdn_scratch.beta_proj[..num_heads] {
+    for b in &mut gdn_scratch.beta_proj[..value_heads] {
         *b = sigmoid(*b);
     }
 
@@ -411,12 +411,12 @@ fn gdn_step_q8_neon(
         l2_normalize_vec(&mut gdn_scratch.q_head[..key_dim]);
         l2_normalize_vec(&mut gdn_scratch.k_head[..key_dim]);
 
-        // Decay gate. Clamp exp(a_log) to f32::MAX: for a_log > ~88 the
-        // exponential overflows to +inf, and inf * softplus(very_negative)=0.0
-        // yields NaN which poisons the recurrent state. Mirrors
-        // attention::gdn_fused::compute_decay_gate and forward::cpu_q8.
-        let a_val = weights.a_log[k_head].exp().min(f32::MAX);
-        let sp = softplus(gdn_scratch.alpha_proj[k_head] + weights.dt_bias[k_head]);
+        // Decay gate indexed per value head. Clamp exp(a_log) to f32::MAX: for
+        // a_log > ~88 the exponential overflows to +inf, and
+        // inf * softplus(very_negative)=0.0 yields NaN which poisons the
+        // recurrent state. Mirrors attention::gdn_fused::compute_decay_gate.
+        let a_val = weights.a_log[h].exp().min(f32::MAX);
+        let sp = softplus(gdn_scratch.alpha_proj[h] + weights.dt_bias[h]);
         let g = (-a_val * sp).exp();
 
         let s_off = h * key_dim * value_dim;
@@ -432,7 +432,7 @@ fn gdn_step_q8_neon(
         }
 
         // Delta: (v - g * kv_mem) * beta
-        let beta_h = gdn_scratch.beta_proj[k_head];
+        let beta_h = gdn_scratch.beta_proj[h];
         for j in 0..value_dim {
             let v_j = gdn_scratch.conv_output[v_start + j];
             gdn_scratch.delta[j] = (v_j - gdn_scratch.kv_mem[j] * g) * beta_h;
@@ -1117,20 +1117,20 @@ pub mod bench_support {
                 in_proj_z_rows: lin_output_dim,
                 in_proj_z_cols: hidden,
 
-                in_proj_b_packed: gen_weights_q8(lin_key_heads, hidden, &mut rng),
-                in_proj_b_rows: lin_key_heads,
+                in_proj_b_packed: gen_weights_q8(lin_val_heads, hidden, &mut rng),
+                in_proj_b_rows: lin_val_heads,
                 in_proj_b_cols: hidden,
 
-                in_proj_a_packed: gen_weights_q8(lin_key_heads, hidden, &mut rng),
-                in_proj_a_rows: lin_key_heads,
+                in_proj_a_packed: gen_weights_q8(lin_val_heads, hidden, &mut rng),
+                in_proj_a_rows: lin_val_heads,
                 in_proj_a_cols: hidden,
 
                 out_proj_packed: gen_weights_q8(hidden, lin_output_dim, &mut rng),
                 out_proj_rows: hidden,
                 out_proj_cols: lin_output_dim,
 
-                a_log: vec![0.0f32; lin_key_heads],
-                dt_bias: vec![0.0f32; lin_key_heads],
+                a_log: vec![0.0f32; lin_val_heads],
+                dt_bias: vec![0.0f32; lin_val_heads],
                 conv1d_weight: vec![0.01f32; lin_qkv_dim * kernel_size],
                 conv_dim: lin_qkv_dim,
                 kernel_size,
@@ -1217,7 +1217,7 @@ pub mod bench_support {
             let inter = cfg.intermediate_size;
             let qkv_dim = cfg.linear_qkv_dim();
             let output_dim = cfg.linear_output_dim();
-            let num_heads_lin = cfg.linear_num_key_heads;
+            let num_heads_lin = cfg.linear_num_value_heads();
             let lin_val_dim = cfg.linear_value_head_dim;
             let kernel_size = cfg.linear_conv_kernel_dim;
             let q_dim = cfg.full_q_dim();
@@ -1422,14 +1422,14 @@ mod tests {
             in_proj_z: vec![0.0; output_dim * hidden],
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
-            in_proj_b: vec![0.0; cfg.linear_num_key_heads * hidden],
-            in_proj_b_rows: cfg.linear_num_key_heads,
+            in_proj_b: vec![0.0; cfg.linear_num_value_heads() * hidden],
+            in_proj_b_rows: cfg.linear_num_value_heads(),
             in_proj_b_cols: hidden,
-            in_proj_a: vec![0.0; cfg.linear_num_key_heads * hidden],
-            in_proj_a_rows: cfg.linear_num_key_heads,
+            in_proj_a: vec![0.0; cfg.linear_num_value_heads() * hidden],
+            in_proj_a_rows: cfg.linear_num_value_heads(),
             in_proj_a_cols: hidden,
-            a_log: vec![0.0; cfg.linear_num_key_heads],
-            dt_bias: vec![0.0; cfg.linear_num_key_heads],
+            a_log: vec![0.0; cfg.linear_num_value_heads()],
+            dt_bias: vec![0.0; cfg.linear_num_value_heads()],
             conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
             conv_dim: qkv_dim,
             kernel_size: cfg.linear_conv_kernel_dim,
@@ -1646,7 +1646,7 @@ mod tests {
         let hidden = cfg.hidden_size;
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
-        let num_heads = cfg.linear_num_key_heads;
+        let value_heads = cfg.linear_num_value_heads();
 
         let weights = Q8NeonGdnWeights {
             in_proj_qkv_packed: zero_packed(qkv_dim, hidden),
@@ -1655,17 +1655,17 @@ mod tests {
             in_proj_z_packed: zero_packed(output_dim, hidden),
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
-            in_proj_b_packed: zero_packed(num_heads, hidden),
-            in_proj_b_rows: num_heads,
+            in_proj_b_packed: zero_packed(value_heads, hidden),
+            in_proj_b_rows: value_heads,
             in_proj_b_cols: hidden,
-            in_proj_a_packed: zero_packed(num_heads, hidden),
-            in_proj_a_rows: num_heads,
+            in_proj_a_packed: zero_packed(value_heads, hidden),
+            in_proj_a_rows: value_heads,
             in_proj_a_cols: hidden,
             out_proj_packed: zero_packed(hidden, output_dim),
             out_proj_rows: hidden,
             out_proj_cols: output_dim,
-            a_log: vec![0.0; num_heads],
-            dt_bias: vec![0.0; num_heads],
+            a_log: vec![0.0; value_heads],
+            dt_bias: vec![0.0; value_heads],
             conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
             conv_dim: qkv_dim,
             kernel_size: cfg.linear_conv_kernel_dim,
