@@ -180,6 +180,9 @@ struct ChatTurn: Identifiable {
     let id = UUID()
     let prompt: String
     var responseText: String = ""
+    /// Reasoning trace parsed from the <think>…</think> block in the stream.
+    /// Empty when the turn has no reasoning (thinking disabled, or model emitted none).
+    var thinkingText: String = ""
     var status: TurnStatus = .running
     var tokensPerSecond: Double? = nil
     /// Error message from the run log — set when the turn finishes with an empty response.
