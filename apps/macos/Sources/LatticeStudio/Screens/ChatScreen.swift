@@ -59,6 +59,8 @@ struct ChatScreen: View {
 
     // Composer text is ephemeral — clearing on navigation is acceptable
     @State private var composerText: String = ""
+    // Which turns have their reasoning disclosure open (auto-open while streaming).
+    @State private var expandedThinking: Set<UUID> = []
 
     // MARK: Store-backed derived helpers
 
@@ -140,7 +142,13 @@ struct ChatScreen: View {
             guard let turnID = store.chatAwaitingTurnID,
                   let idx = store.chatTurns.firstIndex(where: { $0.id == turnID })
             else { return }
-            store.chatTurns[idx].responseText = newText ?? ""
+            // Same prefill-aware split as finalization: while reasoning (thinking-on, no
+            // </think> yet) the stream stays in the thinking area instead of flashing in the
+            // answer bubble and then vanishing when resolveTurn corrects it.
+            let parsed = ChatFinalization.finalize(newText ?? "",
+                                                   prefilledOpenThink: store.chatTurns[idx].prefilledOpenThink)
+            store.chatTurns[idx].thinkingText = parsed.thinking
+            store.chatTurns[idx].responseText = parsed.response
         }
     }
 
@@ -365,6 +373,17 @@ struct ChatScreen: View {
                         ),
                         placeholder: "random"
                     )
+
+                    // Reasoning — when off, inject a closed <think></think> so the model skips
+                    // its reasoning trace and answers directly.
+                    ParamRowPicker(
+                        label: "Reasoning",
+                        options: ["On", "Off"],
+                        selection: Binding(
+                            get: { store.chatEnableThinking ? "On" : "Off" },
+                            set: { store.chatEnableThinking = ($0 == "On") }
+                        )
+                    )
                 }
                 .instrumentPanel()
                 .padding(.horizontal, Theme.Space.lg)
@@ -468,6 +487,32 @@ struct ChatScreen: View {
             // Assistant bubble — left-aligned, surfaceRaised fill
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
+                    // Reasoning disclosure — visible whenever the turn produced a thinking trace.
+                    // Auto-expands while streaming (running + no final answer yet), collapsible after.
+                    if !turn.thinkingText.isEmpty {
+                        let isExpanded = Binding<Bool>(
+                            get: { expandedThinking.contains(turn.id) || (turn.status == .running && turn.responseText.isEmpty) },
+                            set: { now in
+                                if now { expandedThinking.insert(turn.id) } else { expandedThinking.remove(turn.id) }
+                            }
+                        )
+                        DisclosureGroup(isExpanded: isExpanded) {
+                            Text(turn.thinkingText)
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 4)
+                        } label: {
+                            Label("Reasoning", systemImage: "brain")
+                                .font(Theme.Fonts.caption)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(assistantBubbleBackground)
+                    }
+
                     if turn.status == .running && turn.responseText.isEmpty {
                         // Typing indicator: distinguish "loading model" from "generating"
                         HStack(spacing: Theme.Space.xs) {
@@ -755,7 +800,7 @@ struct ChatScreen: View {
     }
 
     /// Build ChatML from completed turns (single-mode history as context).
-    private func renderChatML(newUserText: String) -> String {
+    private func renderChatML(newUserText: String, enableThinking: Bool) -> String {
         var buf = ""
         for turn in store.chatTurns {
             guard turn.status == .done, !turn.responseText.isEmpty else { continue }
@@ -763,9 +808,21 @@ struct ChatScreen: View {
             buf += "<|im_start|>assistant\n\(turn.responseText)<|im_end|>\n"
         }
         buf += "<|im_start|>user\n\(newUserText)<|im_end|>\n"
-        buf += "<|im_start|>assistant\n"
+        if enableThinking {
+            // Open think block = the official template's enable_thinking=true path
+            // (chat_template.jinja:152). A thinking checkpoint continues inside the block
+            // and closes with </think> before the answer; renderChatML's split keys on that
+            // boundary. A non-thinking checkpoint ignores the prefix and answers directly.
+            buf += "<|im_start|>assistant\n<think>\n"
+        } else {
+            // Closed empty think block = the official template's enable_thinking=false path;
+            // the model emits the answer directly with no reasoning.
+            buf += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        }
         return buf
     }
+
+    // Reasoning split/finalization lives in ChatFinalization (pure, unit-tested).
 
     // MARK: Single-mode send
 
@@ -779,7 +836,7 @@ struct ChatScreen: View {
         let topK = Int(store.chatTopKText) ?? 50
         let topP = Double(store.chatTopPText) ?? 0.9
         let repetitionPenalty = Double(store.chatRepPenaltyText) ?? 1.1
-        let chatMLPrompt = renderChatML(newUserText: rawUserText)
+        let chatMLPrompt = renderChatML(newUserText: rawUserText, enableThinking: store.chatEnableThinking)
         let useGPU = store.chatUseGPU
 
         // For Q4 models on the GPU path: the tokenizer lives in the bf16 sibling directory.
@@ -827,6 +884,10 @@ struct ChatScreen: View {
         var turn = ChatTurn(prompt: rawUserText)
         turn.retryConfig = retryCfg
         turn.inferenceLabel = inferenceLabel
+        // Thinking-on prefills an open <think> into the prompt (renderChatML), so a truncated
+        // reasoning stream is tagless. Snapshot the mode so finalization treats such a stream
+        // as unfinished reasoning rather than the answer (prevents history poisoning).
+        turn.prefilledOpenThink = store.chatEnableThinking
         let turnID = turn.id
         store.chatTurns.append(turn)
         store.chatAwaitingTurnID = turnID
@@ -919,9 +980,18 @@ struct ChatScreen: View {
         store.chatUserStoppedTurnID = nil
 
         let responseText: String
+        let thinkingText: String
         if !run.genText.isEmpty {
-            responseText = run.genText.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Prefill-aware finalization. When thinking was prefilled (open <think> in the
+            // prompt) and the stream has no </think>, the whole stream is unfinished reasoning,
+            // not the answer — keep it as thinkingText and leave responseText empty so the turn
+            // is skipped from history (renderChatML gates history on non-empty responseText).
+            let parsed = ChatFinalization.finalize(run.genText,
+                                                   prefilledOpenThink: store.chatTurns[idx].prefilledOpenThink)
+            thinkingText = parsed.thinking
+            responseText = parsed.response
         } else {
+            thinkingText = ""
             let cleaned = run.log
                 .filter { !$0.hasPrefix("$ ") }
                 .joined(separator: "\n")
@@ -935,6 +1005,7 @@ struct ChatScreen: View {
         }
 
         store.chatTurns[idx].responseText = responseText
+        store.chatTurns[idx].thinkingText = thinkingText
 
         if wasUserStopped {
             store.chatTurns[idx].status = .done

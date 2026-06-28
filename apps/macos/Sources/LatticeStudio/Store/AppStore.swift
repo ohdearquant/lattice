@@ -57,6 +57,7 @@ final class AppStore {
     var chatTopKText: String = "50"
     var chatTopPText: String = "0.9"
     var chatRepPenaltyText: String = "1.1"
+    var chatEnableThinking: Bool = true
     // In-flight tracking — must be store-owned so a generation that finishes while
     // the user is on another screen still lands in chatTurns.
     var chatAwaitingTurnID: UUID? = nil
