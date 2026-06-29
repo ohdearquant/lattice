@@ -6,6 +6,19 @@ use std::path::{Path, PathBuf};
 ///
 /// Ensure that the model files exist locally, downloading them if needed.
 pub fn ensure_model_files(model_name: &str, cache_dir: &Path) -> Result<PathBuf, InferenceError> {
+    // Offline gate: when LATTICE_OFFLINE is set, never touch the network — a cache miss
+    // fails fast instead of implicitly fetching from Hugging Face. Downstream consumers
+    // (khive CI, sandboxed builds) set this. Reading the env here keeps the public
+    // signature stable while `ensure_model_files_inner` stays env-free and unit-testable.
+    let offline = std::env::var_os("LATTICE_OFFLINE").is_some();
+    ensure_model_files_inner(model_name, cache_dir, offline)
+}
+
+fn ensure_model_files_inner(
+    model_name: &str,
+    cache_dir: &Path,
+    offline: bool,
+) -> Result<PathBuf, InferenceError> {
     let model_name = canonical_model_name(model_name)?;
     let model_dir = cache_dir.join(model_name);
     let safetensors_path = model_dir.join("model.safetensors");
@@ -17,6 +30,18 @@ pub fn ensure_model_files(model_name: &str, cache_dir: &Path) -> Result<PathBuf,
     if safetensors_path.exists() && has_tokenizer {
         tracing::debug!(path = %model_dir.display(), "model files already cached");
         return Ok(model_dir);
+    }
+
+    // Offline mode blocks the network entirely: a cache miss is a hard, clear error
+    // rather than a download attempt. Applies whether or not the `download` feature
+    // is compiled in.
+    if offline {
+        return Err(InferenceError::ModelNotFound(format!(
+            "model files not found at {} and LATTICE_OFFLINE is set (offline mode: no \
+             download attempted). Pre-fetch the model into the cache, or unset \
+             LATTICE_OFFLINE to allow downloading.",
+            model_dir.display()
+        )));
     }
 
     #[cfg(not(feature = "download"))]
@@ -253,4 +278,37 @@ fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Offline mode + cache miss must error immediately, never attempting a download.
+    #[test]
+    fn offline_cache_miss_errors_without_download() {
+        let tmp = std::env::temp_dir().join(format!("lattice_offline_miss_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let res = ensure_model_files_inner("all-minilm-l6-v2", &tmp, true);
+        assert!(
+            matches!(res, Err(InferenceError::ModelNotFound(_))),
+            "offline + cache miss must return ModelNotFound, got {res:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Offline mode still serves a populated cache — it blocks the network, not cache reads.
+    #[test]
+    fn offline_cache_hit_succeeds() {
+        let tmp = std::env::temp_dir().join(format!("lattice_offline_hit_{}", std::process::id()));
+        let model_dir = tmp.join("all-minilm-l6-v2");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&model_dir).expect("create temp model dir");
+        std::fs::write(model_dir.join("model.safetensors"), b"stub")
+            .expect("write safetensors stub");
+        std::fs::write(model_dir.join("vocab.txt"), b"stub").expect("write vocab stub");
+        let res = ensure_model_files_inner("all-minilm-l6-v2", &tmp, true);
+        assert!(res.is_ok(), "offline + cache hit must succeed, got {res:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
