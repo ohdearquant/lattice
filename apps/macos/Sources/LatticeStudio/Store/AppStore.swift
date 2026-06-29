@@ -74,7 +74,9 @@ final class AppStore {
     // no </think>, the engine force-injects </think> so the model commits to an answer
     // (s1 budget forcing). The answer then gets its own full max-tokens budget. 0 = no cap.
     var chatReasoningBudgetText: String = "1024"
-    var chatEnableThinking: Bool = true
+    // Off by default: the 0.8B rambles without ever closing <think> or emitting EOS, and even the
+    // 27B's thinking pass is slow for interactive chat. Users can toggle reasoning on per-chat.
+    var chatEnableThinking: Bool = false
     // In-flight tracking — must be store-owned so a generation that finishes while
     // the user is on another screen still lands in chatTurns.
     var chatAwaitingTurnID: UUID? = nil
