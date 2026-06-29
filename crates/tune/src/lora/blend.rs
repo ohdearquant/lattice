@@ -685,13 +685,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIX 1+2 contract: malformed huge dimension → Err, not panic.
+    // Contract: a malformed huge dimension returns Err, never panics.
     //
     // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
-    // The pre-pass catches it first (rank_total*(d_in+d_out) overflows usize
-    // via checked_mul → Err); the per-entry checked_mul is defense-in-depth
-    // for the same overflow class.
-    // Contract: blend_lora_adapters must return Err, never panic.
+    // Through the public entry the aggregate pre-pass catches it first
+    // (rank_total*(d_in+d_out) overflows usize via checked_mul → Err); the
+    // per-entry checked_mul is defense-in-depth for the same overflow class,
+    // isolated directly by blend_layer_entries_per_entry_product_overflow.
     // -----------------------------------------------------------------------
     #[test]
     fn blend_malformed_huge_dim_returns_err_not_panic() {
@@ -727,7 +727,42 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIX 1 contract: aggregate element budget exceeded → Err.
+    // Isolates the per-entry rank*d_in checked_mul directly. Through the public
+    // blend_lora_adapters the aggregate pre-pass catches this overflow class
+    // first; calling the per-group helper with a single malformed entry
+    // (rank_total below the per-projection cap, no aggregate stage) reaches the
+    // per-entry guard as the first and only overflow check. Pinning the error
+    // message makes it mutation-sensitive: reverting the checked_mul makes the
+    // overflow either panic (debug) or surface via a different guard (release),
+    // both of which fail this assertion.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_layer_entries_per_entry_product_overflow_returns_err() {
+        let rank = 2usize;
+        let d_in = usize::MAX / 2 + 1; // rank*d_in = 2 * 2^63 overflows usize
+        let d_out = 1usize;
+        let layer = LoraLayer {
+            a: vec![],                     // length checked only after the product
+            b: vec![0.0f32; rank * d_out], // well-formed B (= 2)
+            d_in,
+            d_out,
+            rank,
+        };
+        let layer_idx = 0usize;
+        let module = "q_proj".to_string();
+        let entries = [(&layer, 1.0f32)];
+        let key = (&layer_idx, &module);
+        let err = super::blend_layer_entries(&entries, &key)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rank*d_in overflowed"),
+            "expected the per-entry rank*d_in guard to fire; got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract: an aggregate element budget overrun returns Err before alloc.
     //
     // 65 layers each with rank=4096, d_in=2048, d_out=2048, empty a/b so the
     // test allocates nothing. Per-group: rank_total=4096 == cap (passes the

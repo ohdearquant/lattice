@@ -20146,13 +20146,15 @@ kernel void decode_attention_reference(
         }
 
         // -----------------------------------------------------------------
-        // FIX 1+2 contract: malformed huge dimension -> Err, not panic.
+        // Contract: a malformed huge dimension returns Err, never panics.
         //
         // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
-        // The pre-pass catches it first (rank_total*(d_in+d_out) overflows
-        // via checked_mul -> Err); the per-entry checked_mul is
-        // defense-in-depth for the same overflow class.
-        // Contract: blend_lora_layer_data must return Err, never panic.
+        // blend_lora_layer_data is monolithic here: the aggregate pre-pass
+        // (rank_total*(d_in+d_out)) strictly dominates the per-entry
+        // checked_mul, so no input reaches the per-entry guard without
+        // tripping the pre-pass first. This pins the public Err-not-panic
+        // contract; the per-entry checked_mul is defense-in-depth, isolated
+        // on the tune side where blend_layer_entries is a separable helper.
         // -----------------------------------------------------------------
         #[test]
         fn blend_malformed_huge_dim_returns_err_not_panic() {
@@ -20178,7 +20180,7 @@ kernel void decode_attention_reference(
         }
 
         // -----------------------------------------------------------------
-        // FIX 1 contract: aggregate element budget exceeded -> Err.
+        // Contract: an aggregate element budget overrun returns Err before alloc.
         //
         // 65 layers with rank=4096, d_in=2048, d_out=2048, empty a/b, so
         // the test allocates nothing. Per-group: rank_total=4096 == cap
