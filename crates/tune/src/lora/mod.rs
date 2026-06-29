@@ -41,6 +41,8 @@ pub mod loader;
 pub mod manifest;
 pub mod online;
 pub mod optimizer;
+#[cfg(feature = "mixture")]
+pub mod router_update;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 #[cfg(feature = "train-backward")]

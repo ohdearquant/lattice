@@ -24,6 +24,9 @@ inference-hook = ["dep:lattice-inference"]
 train-backward = ["dep:lattice-inference", "lattice-inference/train-backward", "lattice-inference/f16", "safetensors", "serde"]
 # SQLite-backed model registry storage
 sqlite = ["dep:rusqlite", "serde"]
+# Online adapter-selector refit from preference feedback (experimental, bench-gated).
+# Pulls in the lattice-fann training primitives (RLOO / EWC++) for gate updates.
+mixture = ["lattice-fann/online-router"]
 
 [dependencies]
 lattice-fann = { version = "0.4.2", path = "../fann" }
