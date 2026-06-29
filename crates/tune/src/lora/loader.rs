@@ -32,7 +32,9 @@ pub struct LoadedAdapter {
 ///
 /// For each `ManifestEntry` in `manifest.adapters`:
 /// 1. `status == Approved` — else `Err` (quarantined/revoked message).
-/// 2. Resolve `uri` against `base_dir` (relative) or use as-is (absolute).
+/// 2. Resolve `uri` under `base_dir`. Absolute URIs and `..` components are
+///    rejected; the resolved path is canonicalized and must stay within a
+///    canonicalized `base_dir` (symlink-escape proof).
 /// 3. File exists — else `Err(TuneError::Io(...))`.
 /// 4. File readable and SHA-256 of bytes == `integrity_sha256` — else `Err`.
 /// 5. Bytes parse as a valid PEFT safetensors adapter — else `Err` (propagated).
@@ -150,27 +152,35 @@ pub fn load_adapters_from_manifest(
                     }
                     canonical_joined
                 }
-                Err(_) => {
-                    // File does not exist; pass through to Check 3 for the
-                    // standard "not found" error rather than a confusing
-                    // canonicalize failure.
-                    joined
+                Err(e) => {
+                    // Fail closed. A real approved adapter always exists and
+                    // canonicalizes (we are about to read and hash it). A
+                    // canonicalize failure means the target is missing, a path
+                    // component is unreadable, or a parent is an unresolved
+                    // symlink. Falling back to the lexical `joined` would read
+                    // through a path the confinement check never proved in-base,
+                    // so report not-found directly instead.
+                    return Err(TuneError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "adapter '{}': file '{}' does not exist or is not accessible within base directory",
+                            entry.id,
+                            joined.display()
+                        ),
+                    )));
                 }
             }
         };
 
-        // Check 3: File existence.
-        if !full_path.exists() {
-            return Err(TuneError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "adapter '{}': file '{}' does not exist",
-                    entry.id,
-                    full_path.display()
-                ),
-            )));
-        }
-
+        // Check 3 (existence) is folded into Check 4: `full_path` is the
+        // canonicalized, in-base path proven above, and the size-bounded read
+        // opens it and fails closed if it is missing or unreadable. A separate
+        // `exists()` precheck would only widen the canonicalize-to-open window.
+        // The residual window (the proven path's final component being swapped to
+        // a symlink between canonicalization and open) is backstopped by the
+        // SHA-256 integrity check in Check 4 and grants no capability without
+        // write access to base_dir, which already defeats confinement.
+        //
         // Check 4: Read bytes (size-bounded) and verify SHA-256 integrity. The
         // size bound is enforced by a metadata stat before the read, so a
         // manifest URI pointing at an oversized file is refused without
@@ -797,6 +807,53 @@ mod tests {
         assert!(
             msg.contains("alpha mismatch"),
             "expected alpha mismatch rejection; got: {msg}"
+        );
+    }
+
+    /// FIX-3 (round 2), mutation-sensitive: a symlink inside base_dir that points
+    /// to a real file OUTSIDE base_dir must not let an adapter escape confinement.
+    /// The canonicalized path resolves outside base, so the loader rejects it
+    /// rather than reading through the symlink. Removing the `starts_with`
+    /// confinement check makes this load the outside file (then fail later on the
+    /// "dummy" hash) — a different error — so this test fails when the guard is
+    /// absent.
+    #[cfg(unix)]
+    #[test]
+    fn loader_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // A real adapter sits OUTSIDE base_dir.
+        let secret = outside.path().join("secret.safetensors");
+        write_test_adapter(&secret, 4, 8.0, &["q_proj"], None);
+        // base_dir/link.safetensors -> outside/secret.safetensors
+        let link = base.path().join("link.safetensors");
+        symlink(&secret, &link).unwrap();
+
+        let mut manifest = LoraManifest::new();
+        manifest.adapters.push(make_entry(
+            "escape",
+            "link.safetensors",
+            "dummy",
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        ));
+        let result = load_adapters_from_manifest(
+            &manifest,
+            base.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "symlink escaping base_dir must be rejected"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("escapes base directory"),
+            "expected escape rejection; got: {msg}"
         );
     }
 }

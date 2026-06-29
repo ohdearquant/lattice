@@ -81,11 +81,14 @@ impl Default for MicroLoraConfig {
 /// Validate all caller-supplied inputs for [`train_micro_lora`].
 ///
 /// Extracted so the validation logic can be tested without a real model
-/// checkpoint. `vocab_size` comes from `model.config().vocab_size`.
+/// checkpoint. `vocab_size` and `num_hidden_layers` come from `model.config()`;
+/// `num_hidden_layers` bounds the layer range the trainer will index, so a model
+/// with too few layers is rejected before any layer access.
 ///
 /// Returns `Err(TuneError::Validation)` on the first anomaly found.
 pub(crate) fn validate_micro_lora_inputs(
     vocab_size: usize,
+    num_hidden_layers: usize,
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
 ) -> Result<()> {
@@ -115,6 +118,25 @@ pub(crate) fn validate_micro_lora_inputs(
         return Err(TuneError::Validation(format!(
             "train_micro_lora: max_seq_len {} exceeds maximum {}",
             config.max_seq_len, MAX_TRAIN_SEQ_LEN
+        )));
+    }
+    // first_layer and the hardcoded TOP_LAYER must both be valid indices into the
+    // model's layer stack. train_micro_lora iterates `first_layer ..= TOP_LAYER`
+    // and indexes `model.weights.layers[idx]` directly (through gqa_layer_weights /
+    // gdn_layer_weights), which panics out of bounds. A model with fewer than
+    // TOP_LAYER + 1 layers, or a first_layer past TOP_LAYER, must be rejected here,
+    // before any model access in the layer loop below.
+    if config.first_layer > TOP_LAYER {
+        return Err(TuneError::Validation(format!(
+            "train_micro_lora: first_layer {} exceeds maximum trainable layer index {TOP_LAYER}",
+            config.first_layer
+        )));
+    }
+    if num_hidden_layers <= TOP_LAYER {
+        return Err(TuneError::Validation(format!(
+            "train_micro_lora: model has {num_hidden_layers} layers but the trainer \
+             requires at least {} (layer indices 0..={TOP_LAYER})",
+            TOP_LAYER + 1
         )));
     }
     for (pair_idx, pair) in pairs.iter().enumerate() {
@@ -176,6 +198,8 @@ pub(crate) fn validate_micro_lora_inputs(
 /// - `config.rank == 0` or exceeds [`MAX_LORA_RANK`].
 /// - `config.steps` exceeds [`MAX_TRAIN_STEPS`].
 /// - `config.max_seq_len` exceeds [`MAX_TRAIN_SEQ_LEN`].
+/// - `config.first_layer` exceeds the top trainable layer, or the model has
+///   fewer layers than the trainer indexes.
 /// - Buffer-size arithmetic overflows (rank × hidden, etc.).
 /// - The model architecture contains unexpected layer types.
 /// - The frozen-prefix capture fails.
@@ -194,7 +218,8 @@ pub fn train_micro_lora(
     // Validate all caller-supplied inputs before any model access or allocation.
     // The extracted helper is separately testable without a real checkpoint.
     let vocab_size = model.config().vocab_size;
-    validate_micro_lora_inputs(vocab_size, pairs, config)?;
+    let num_hidden_layers = model.config().num_hidden_layers;
+    validate_micro_lora_inputs(vocab_size, num_hidden_layers, pairs, config)?;
 
     let cfg = model.config().clone();
     let dims = Dims {
@@ -999,7 +1024,7 @@ mod tests {
     /// Mutation-sensitive: if the `pairs.is_empty()` guard is removed, this fails.
     #[test]
     fn validation_rejects_empty_pairs() {
-        let err = validate_micro_lora_inputs(1000, &[], &default_cfg())
+        let err = validate_micro_lora_inputs(1000, 24, &[], &default_cfg())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1012,7 +1037,7 @@ mod tests {
     #[test]
     fn validation_rejects_pair_with_one_token() {
         let pairs = [pair(vec![1], 0)];
-        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+        let err = validate_micro_lora_inputs(1000, 24, &pairs, &default_cfg())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1028,7 +1053,7 @@ mod tests {
     fn validation_rejects_completion_start_zero() {
         // Two tokens required to pass the length check first.
         let pairs = [pair(vec![1, 2], 0)];
-        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+        let err = validate_micro_lora_inputs(1000, 24, &pairs, &default_cfg())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1042,7 +1067,7 @@ mod tests {
     #[test]
     fn validation_rejects_completion_start_at_len() {
         let pairs = [pair(vec![1, 2, 3], 3)]; // completion_start == tokens.len()
-        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+        let err = validate_micro_lora_inputs(1000, 24, &pairs, &default_cfg())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1057,7 +1082,7 @@ mod tests {
     fn validation_rejects_out_of_vocab_token() {
         // vocab_size = 100; token 200 is out of range.
         let pairs = [pair(vec![0, 200, 1], 1)];
-        let err = validate_micro_lora_inputs(100, &pairs, &default_cfg())
+        let err = validate_micro_lora_inputs(100, 24, &pairs, &default_cfg())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1073,7 +1098,7 @@ mod tests {
         let pairs = [pair(vec![1, 2], 1)];
         let mut cfg = default_cfg();
         cfg.rank = 0;
-        let err = validate_micro_lora_inputs(1000, &pairs, &cfg)
+        let err = validate_micro_lora_inputs(1000, 24, &pairs, &cfg)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1086,6 +1111,48 @@ mod tests {
     #[test]
     fn validation_accepts_valid_inputs() {
         let pairs = [pair(vec![1, 2, 3], 1)];
-        validate_micro_lora_inputs(1000, &pairs, &default_cfg()).unwrap();
+        validate_micro_lora_inputs(1000, 24, &pairs, &default_cfg()).unwrap();
+    }
+
+    /// Mutation-sensitive: if the `num_hidden_layers <= TOP_LAYER` guard is
+    /// removed, a model with fewer than TOP_LAYER + 1 layers reaches a direct
+    /// `model.weights.layers[idx]` index in the layer loop and panics. The guard
+    /// must reject it as a Validation error instead.
+    #[test]
+    fn validation_rejects_model_with_too_few_layers() {
+        let pairs = [pair(vec![1, 2, 3], 1)];
+        // 12-layer model: TOP_LAYER (23) would be out of bounds.
+        let err = validate_micro_lora_inputs(1000, 12, &pairs, &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires at least"),
+            "expected too-few-layers rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if the `first_layer > TOP_LAYER` guard is removed, an
+    /// out-of-range first_layer yields an inverted/empty layer range.
+    #[test]
+    fn validation_rejects_first_layer_above_top() {
+        let pairs = [pair(vec![1, 2, 3], 1)];
+        let mut cfg = default_cfg();
+        cfg.first_layer = 24; // > TOP_LAYER (23)
+        let err = validate_micro_lora_inputs(1000, 48, &pairs, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("first_layer") && err.contains("exceeds"),
+            "expected first_layer rejection; got: {err}"
+        );
+    }
+
+    /// A model with at least TOP_LAYER + 1 layers and an in-range first_layer
+    /// passes the new layer-bound checks.
+    #[test]
+    fn validation_accepts_valid_layer_bounds() {
+        let pairs = [pair(vec![1, 2, 3], 1)];
+        // 48-layer model with default first_layer = 19.
+        validate_micro_lora_inputs(1000, 48, &pairs, &default_cfg()).unwrap();
     }
 }
