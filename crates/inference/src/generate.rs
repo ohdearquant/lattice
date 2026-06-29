@@ -237,7 +237,7 @@ fn check_alloc_capacity(
     num_layers: usize,
     effective_cap: usize,
 ) -> Result<(), InferenceError> {
-    // Guard the base dimension product before using it in any further multiply.
+    // Guard the base KV dimension product before using it in any further multiply.
     // A pathological config (e.g. num_key_value_heads = usize::MAX) can make the
     // raw `num_key_value_heads * head_dim` multiply wrap in release builds,
     // producing a silently tiny kv_dim that passes every downstream checked_mul
@@ -248,6 +248,25 @@ fn check_alloc_capacity(
         .checked_mul(cfg.head_dim)
         .ok_or_else(|| {
             InferenceError::InvalidInput("num_key_value_heads * head_dim overflows usize".into())
+        })?;
+    // Guard the query-side dimension product. A config with num_attention_heads
+    // near usize::MAX and a small head_dim overflows q_dim even when kv_dim is
+    // safe — producing a tiny q_buf / attn_out / qkv_buf that causes an OOB
+    // panic on the first prefill write into the undersized buffers.
+    let q_dim = cfg
+        .num_attention_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("num_attention_heads * head_dim overflows usize".into())
+        })?;
+    // Guard the fused QKV projection width (sizes qkv_buf). q_dim and kv_dim are
+    // already validated above; this guards the final addition so a huge q_dim
+    // combined with a non-trivial kv_dim cannot wrap the sum.
+    kv_dim
+        .checked_mul(2)
+        .and_then(|two_kv| q_dim.checked_add(two_kv))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("q_dim + 2*kv_dim (qkv_dim) overflows usize".into())
         })?;
     // Per-position element coefficients that scale with the cache length:
     //   KV cache (K+V across all layers): 2 * num_layers * kv_dim
@@ -1160,6 +1179,42 @@ mod tests {
         assert!(
             matches!(err, InferenceError::InvalidInput(_)),
             "expected InvalidInput on kv_dim overflow, got {err:?}"
+        );
+    }
+
+    /// check_alloc_capacity rejects a config whose num_attention_heads * head_dim
+    /// overflows usize while kv_dim remains safe (num_key_value_heads = 1).
+    /// This closes the residual query-side gap found in the PR #449 cross-family review:
+    /// the existing kv_dim guard let this config through, then q_dim wrapped silently
+    /// in release mode, undersizing q_buf / attn_out / qkv_buf for the prefill write.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Remove or bypass the `q_dim = cfg.num_attention_heads.checked_mul(cfg.head_dim)…`
+    ///   guard: in release mode `(usize::MAX/4 + 1) * 4` wraps to 0, the function
+    ///   returns Ok, and `unwrap_err()` panics — the test fails.  In debug mode the raw
+    ///   multiplication panics instead, also failing the test.  Either outcome confirms the
+    ///   guard is load-bearing.
+    #[test]
+    fn check_alloc_capacity_rejects_q_dim_overflow() {
+        // kv_dim = 1 * 4 = 4 — passes the kv_dim guard.
+        // q_dim = (usize::MAX/4 + 1) * 4 — overflows; the new q_dim guard must reject it.
+        let overflow_q_heads = usize::MAX / 4 + 1;
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: overflow_q_heads,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let err = check_alloc_capacity(&cfg, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on q_dim overflow, got {err:?}"
         );
     }
 
