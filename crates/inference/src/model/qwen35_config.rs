@@ -432,6 +432,23 @@ impl Qwen35Config {
                 cfg.partial_rotary_factor
             )));
         }
+        // rope_dim = (head_dim * partial_rotary_factor) as usize.  apply_partial_rope pairs
+        // dimensions as (i, half+i) for i in 0..half, where half = rope_dim / 2.  An odd
+        // rope_dim silently truncates: only 2*(rope_dim/2) dims are rotated, leaving one dim
+        // inside the documented "first rope_dim dimensions" range untouched — wrong output
+        // with no error signal.  rope_dim == 0 makes RopeTable::max_positions() return 0,
+        // which causes every non-empty-sequence call to the capacity-guarded APIs to fail
+        // instead of the intended no-op.  Reject both fail-closed; no-RoPE variants that
+        // need rope_dim==0 require an explicit dispatch path (Refs #401).
+        let rope_dim = cfg.rope_dim();
+        if rope_dim < 2 || rope_dim % 2 != 0 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: derived rope_dim ({rope_dim}) must be even and \
+                 >= 2 (head_dim={hd}, partial_rotary_factor={prf})",
+                hd = cfg.head_dim,
+                prf = cfg.partial_rotary_factor,
+            )));
+        }
         // The GatedDeltaNet fused path divides by these head counts: `value_heads / key_heads`
         // (gdn_fused.rs ratio) and `h / ratio` per value head. A parseable config with
         // `linear_num_key_heads == 0`, `linear_num_value_heads == 0`, or value-heads not a
@@ -1168,6 +1185,41 @@ mod tests {
             Qwen35Config::from_config_json_str(json).is_ok(),
             "partial_rotary_factor == 1.0 (full rotary) must be accepted"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // rope_dim invariant tests (issue #401)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_odd_rope_dim_errors_not_panics() {
+        // Mutation contract: removing the `rope_dim < 2 || rope_dim % 2 != 0` guard must
+        // make this test FAIL (the call returns Ok instead of Err).
+        //
+        // head_dim=10, partial_rotary_factor=0.3 → rope_dim = (10 * 0.3) as usize = 3 (odd).
+        // apply_partial_rope uses half = rope_dim / 2 = 1, rotating only pair (0,1) and
+        // leaving dim 2 (inside the declared rotate range) silently unrotated — wrong output.
+        let json = r#"{"text_config": {"head_dim": 10, "partial_rotary_factor": 0.3}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("odd rope_dim must yield an InferenceError, not silent wrong output")
+            .to_string();
+        assert!(err.contains("rope_dim"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_zero_rope_dim_errors_not_panics() {
+        // Mutation contract: removing the `rope_dim < 2 || rope_dim % 2 != 0` guard must
+        // make this test FAIL (the call returns Ok instead of Err).
+        //
+        // partial_rotary_factor=0.0 → rope_dim = 0.  RopeTable::new(0, ..) gives
+        // max_positions()=0, so every non-empty-sequence call to the capacity-guarded APIs
+        // rejects the input rather than applying a no-op — contrary to caller expectations.
+        // Reject fail-closed until a dedicated no-RoPE dispatch path exists (Refs #401).
+        let json = r#"{"text_config": {"partial_rotary_factor": 0.0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("zero rope_dim must yield an InferenceError, not capacity-zero surprise")
+            .to_string();
+        assert!(err.contains("rope_dim"), "wrong guard fired: {err}");
     }
 
     #[test]
