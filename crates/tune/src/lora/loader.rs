@@ -127,9 +127,11 @@ pub fn load_adapters_from_manifest(
                 }
             }
             let joined = base_dir.join(p);
-            // Canonicalize to catch symlink escapes. If the target does not yet
-            // exist, canonicalize fails; pass the non-canonical joined path so
-            // Check 3 reports the expected "file not found" error.
+            // Canonicalize both base_dir and the joined target to catch symlink
+            // escapes, then require the resolved target to stay under base_dir.
+            // A canonicalize failure (missing target, unreadable component, or an
+            // unresolved parent symlink) fails closed below — we never read a path
+            // whose canonical form was not proven in-base.
             let canonical_base = std::fs::canonicalize(base_dir).map_err(|e| {
                 TuneError::Io(std::io::Error::new(
                     e.kind(),
