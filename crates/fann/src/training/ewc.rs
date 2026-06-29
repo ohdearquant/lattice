@@ -9,7 +9,7 @@
 //! neural networks", PNAS 2017; Chaudhry et al., "Efficient Lifelong Learning
 //! with A-GEM", ICLR 2019 (EWC++ online variant).
 
-use crate::error::{FannError, FannResult};
+use crate::error::{FannError, FannResult, validate_allocation_size};
 
 /// Diagonal Fisher information matrix for Elastic Weight Consolidation (EWC++).
 ///
@@ -44,14 +44,34 @@ impl DiagonalFisher {
     /// Fisher estimate, then [`set_anchor`] once at the task boundary before
     /// starting the next task.
     ///
+    /// # Errors
+    ///
+    /// Returns [`FannError::InvalidDistributionParams`] if `decay` is non-finite
+    /// or outside the supported open interval `(0, 1)`.  Outside this interval the
+    /// EMA update `F ← decay·F + (1−decay)·g²` either stalls (`decay ≥ 1`, making
+    /// `1−decay ≤ 0` which reverses the penalty sign) or degenerates (`decay = 0`,
+    /// pure replacement with no memory).
+    ///
+    /// Returns [`FannError::ShapeTooLarge`] if `num_params` exceeds the
+    /// allocation safety limit.
+    ///
     /// [`observe_gradient`]: DiagonalFisher::observe_gradient
     /// [`set_anchor`]: DiagonalFisher::set_anchor
-    pub fn new(num_params: usize, decay: f32) -> Self {
-        Self {
+    pub fn new(num_params: usize, decay: f32) -> FannResult<Self> {
+        // Reject decay outside (0, 1) and non-finite values before any allocation.
+        // decay ≥ 1 makes (1−decay) ≤ 0, which reverses accumulated importance;
+        // decay = 0 collapses to pure-replacement with no EMA memory.
+        if !decay.is_finite() || decay <= 0.0 || decay >= 1.0 {
+            return Err(FannError::InvalidDistributionParams(format!(
+                "EWC decay must be finite and in the open interval (0, 1), got {decay}"
+            )));
+        }
+        validate_allocation_size(num_params)?;
+        Ok(Self {
             values: vec![0.0; num_params],
             anchor: vec![0.0; num_params],
             decay,
-        }
+        })
     }
 
     /// Update the diagonal Fisher estimate with one gradient observation.
@@ -168,12 +188,14 @@ impl DiagonalFisher {
 mod tests {
     use super::*;
 
+    use crate::error::MAX_ALLOWED_ELEMENTS;
+
     /// A degenerate Fisher (all-zero values) must leave delta unchanged.
     ///
     /// Verifies the early-return path in project_delta — no projection, no panic.
     #[test]
     fn ewc_degenerate_fisher_is_identity() {
-        let fisher = DiagonalFisher::new(4, 0.9);
+        let fisher = DiagonalFisher::new(4, 0.9).unwrap();
         let mut delta = vec![1.0_f32, -2.0, 3.0, -4.0];
         let original = delta.clone();
         // values are all zero → f_max < 1e-8 → early return.
@@ -187,21 +209,20 @@ mod tests {
     /// High-Fisher entry blocks its parameter's update; zero-Fisher entry passes.
     #[test]
     fn ewc_high_fisher_blocks() {
-        let mut fisher = DiagonalFisher::new(2, 0.0);
-        // decay=0 → observe_gradient fully replaces values with g².
+        let mut fisher = DiagonalFisher::new(2, 0.9).unwrap();
+        // decay=0.9 → F[0] = 0.9*0 + 0.1*100² = 1000; F[1] = 0.
         fisher.observe_gradient(&[100.0, 0.0]).unwrap();
-        // values == [10000.0, 0.0]; f_max == 10000.0.
 
         let mut delta = vec![1.0_f32, 1.0];
         fisher.project_delta(&mut delta);
 
-        // values[0] == f_max → scale = (1 - 1.0).max(0) = 0 → blocked.
+        // F[0] == f_max → scale = (1 - 1000/1000).max(0) = 0 → blocked.
         assert!(
             delta[0].abs() < 1e-6,
             "high-Fisher entry should be blocked, got {}",
             delta[0]
         );
-        // values[1] == 0 → scale = (1 - 0.0).max(0) = 1 → passes through.
+        // F[1] == 0 → scale = (1 - 0/1000).max(0) = 1 → passes through.
         assert!(
             (delta[1] - 1.0).abs() < 1e-6,
             "zero-Fisher entry should pass through, got {}",
@@ -209,11 +230,16 @@ mod tests {
         );
     }
 
-    /// With anchor=0, params=[2], Fisher=1, lambda=1 → out accumulates +2.
+    /// With anchor=0, params=[2], Fisher≈1, lambda=1 → out accumulates ≈+2.
+    ///
+    /// Uses decay=f32::EPSILON so (1−decay)≈1 and one unit-gradient observation
+    /// gives F[0]≈1.0; the penalty gradient is thus ≈ lambda·F[0]·(θ−θ*)=2.
+    /// This regression test pins the direction: positive gradient means the
+    /// update (w -= lr·g) pulls θ back toward the anchor, not away from it.
     #[test]
     fn ewc_penalty_gradient_pulls_to_anchor() {
-        let mut fisher = DiagonalFisher::new(1, 0.0);
-        // decay=0 → values[0] = g² = 1.0 after one unit-gradient observation.
+        let mut fisher = DiagonalFisher::new(1, f32::EPSILON).unwrap();
+        // decay≈0 → values[0] ≈ g² = 1.0 after one unit-gradient observation.
         fisher.observe_gradient(&[1.0]).unwrap();
         // anchor remains at zero (default).
 
@@ -221,20 +247,24 @@ mod tests {
         let mut out = vec![0.0_f32];
         fisher.penalty_gradient(&params, 1.0, &mut out).unwrap();
 
-        // Gradient = lambda * F[0] * (theta[0] - anchor[0]) = 1 * 1 * (2 - 0) = +2.
-        // Positive: this term is subtracted in gradient descent, pulling theta
-        // back toward the anchor and resisting forgetting.
+        // Gradient = lambda · F[0] · (theta[0] − anchor[0]) ≈ 1 · 1 · (2 − 0) = +2.
+        // Positive: subtracted in gradient descent → θ moves toward anchor.
         assert!(
-            (out[0] - 2.0).abs() < 1e-6,
-            "expected penalty gradient +2.0, got {}",
+            (out[0] - 2.0).abs() < 1e-5,
+            "expected penalty gradient ≈+2.0 (toward anchor), got {}",
             out[0]
+        );
+        // Direction check: penalty gradient must be strictly positive when θ > anchor.
+        assert!(
+            out[0] > 0.0,
+            "penalty gradient must be positive when theta > anchor (toward anchor)"
         );
     }
 
     /// Two EMA steps with decay=0.9 and unit gradient must match the closed-form.
     #[test]
     fn ewc_fisher_ema_accumulates() {
-        let mut fisher = DiagonalFisher::new(1, 0.9);
+        let mut fisher = DiagonalFisher::new(1, 0.9).unwrap();
 
         // Step 1: F = 0.9 * 0 + 0.1 * 1² = 0.1
         fisher.observe_gradient(&[1.0]).unwrap();
@@ -256,16 +286,92 @@ mod tests {
     /// observe_gradient with a wrong-length slice must return Err, not panic.
     #[test]
     fn ewc_length_mismatch_errors() {
-        let mut fisher = DiagonalFisher::new(4, 0.9);
+        let mut fisher = DiagonalFisher::new(4, 0.9).unwrap();
         let result = fisher.observe_gradient(&[1.0, 2.0]); // 2 != 4
         assert!(result.is_err(), "expected Err on length mismatch, got Ok");
+    }
+
+    // ---- BLOCKER 2 guard tests (allocation bounds) --------------------------
+
+    /// Constructing with num_params > MAX_ALLOWED_ELEMENTS must return Err, not panic.
+    ///
+    /// Mutation that breaks this: removing the `validate_allocation_size` call.
+    #[test]
+    fn diagonal_fisher_new_too_large_returns_err() {
+        let result = DiagonalFisher::new(MAX_ALLOWED_ELEMENTS + 1, 0.9);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "expected ShapeTooLarge error for num_params > MAX, got {result:?}"
+        );
+    }
+
+    // ---- MAJOR 1 guard tests (decay validation) ----------------------------
+
+    /// decay = 0.0 must be rejected (lower bound of the open interval).
+    ///
+    /// Mutation that breaks this: removing or inverting the `decay <= 0.0` check.
+    #[test]
+    fn diagonal_fisher_new_decay_zero_returns_err() {
+        let result = DiagonalFisher::new(4, 0.0);
+        assert!(
+            matches!(result, Err(FannError::InvalidDistributionParams(_))),
+            "expected InvalidDistributionParams for decay=0.0, got {result:?}"
+        );
+    }
+
+    /// decay = 1.0 must be rejected (upper bound of the open interval).
+    ///
+    /// Mutation that breaks this: removing or inverting the `decay >= 1.0` check.
+    #[test]
+    fn diagonal_fisher_new_decay_one_returns_err() {
+        let result = DiagonalFisher::new(4, 1.0);
+        assert!(
+            matches!(result, Err(FannError::InvalidDistributionParams(_))),
+            "expected InvalidDistributionParams for decay=1.0, got {result:?}"
+        );
+    }
+
+    /// decay = -0.5 must be rejected (below zero).
+    ///
+    /// Mutation that breaks this: removing the `decay <= 0.0` check.
+    #[test]
+    fn diagonal_fisher_new_decay_negative_returns_err() {
+        let result = DiagonalFisher::new(4, -0.5);
+        assert!(
+            matches!(result, Err(FannError::InvalidDistributionParams(_))),
+            "expected InvalidDistributionParams for decay=-0.5, got {result:?}"
+        );
+    }
+
+    /// decay = NaN must be rejected.
+    ///
+    /// Mutation that breaks this: removing the `is_finite()` check.
+    #[test]
+    fn diagonal_fisher_new_decay_nan_returns_err() {
+        let result = DiagonalFisher::new(4, f32::NAN);
+        assert!(
+            matches!(result, Err(FannError::InvalidDistributionParams(_))),
+            "expected InvalidDistributionParams for decay=NaN, got {result:?}"
+        );
+    }
+
+    /// decay = +Inf must be rejected.
+    ///
+    /// Mutation that breaks this: removing the `is_finite()` check.
+    #[test]
+    fn diagonal_fisher_new_decay_inf_returns_err() {
+        let result = DiagonalFisher::new(4, f32::INFINITY);
+        assert!(
+            matches!(result, Err(FannError::InvalidDistributionParams(_))),
+            "expected InvalidDistributionParams for decay=+Inf, got {result:?}"
+        );
     }
 
     /// Serialise then deserialise must produce a structurally equal value.
     #[cfg(feature = "serde")]
     #[test]
     fn ewc_fisher_roundtrips() {
-        let mut fisher = DiagonalFisher::new(3, 0.9);
+        let mut fisher = DiagonalFisher::new(3, 0.9).unwrap();
         fisher.observe_gradient(&[1.0, 2.0, 3.0]).unwrap();
         fisher.set_anchor(&[0.1, 0.2, 0.3]).unwrap();
 

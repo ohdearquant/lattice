@@ -9,7 +9,7 @@
 //! parameters independently of the policy-gradient update.
 
 use crate::activation::Activation;
-use crate::error::{FannError, FannResult};
+use crate::error::{FannError, FannResult, validate_allocation_size};
 use crate::network::Network;
 
 use rand::Rng;
@@ -215,6 +215,10 @@ impl RlooTrainer {
                 "rloo_step: m_samples must be >= 1".into(),
             ));
         }
+
+        // Reject caller-supplied sizes that would cause Vec::with_capacity to OOM.
+        // m_samples drives two allocations of that length below.
+        validate_allocation_size(m_samples)?;
 
         {
             let layers = gate.layers();
@@ -483,6 +487,7 @@ fn log_sum_exp(logits: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::activation::Activation;
+    use crate::error::MAX_ALLOWED_ELEMENTS;
     use crate::network::NetworkBuilder;
 
     /// Build a deterministic 4-input → 8-hidden(ReLU) → 4-output(Linear) gate.
@@ -620,6 +625,22 @@ mod tests {
             delta_e > delta_i,
             "explicit reward (+1.0) must move action score more than implicit (+0.5): \
              delta_e={delta_e}, delta_i={delta_i}"
+        );
+    }
+
+    // ---- BLOCKER 2 guard test (allocation bounds) ---------------------------
+
+    /// rloo_step with m_samples > MAX_ALLOWED_ELEMENTS must return Err, not panic.
+    ///
+    /// Mutation that breaks this: removing the `validate_allocation_size(m_samples)?` call.
+    #[test]
+    fn rloo_step_m_samples_too_large_returns_err() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let result = trainer.rloo_step(&mut gate, &CTX, 0, 1, MAX_ALLOWED_ELEMENTS + 1);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "expected ShapeTooLarge error for m_samples > MAX, got {result:?}"
         );
     }
 }

@@ -4,13 +4,17 @@
 //! and optimization strategies.
 
 mod backprop;
+#[cfg(feature = "online-router")]
 pub mod ewc;
 mod gradient;
+#[cfg(feature = "online-router")]
 pub mod rloo;
 
 pub use backprop::BackpropTrainer;
+#[cfg(feature = "online-router")]
 pub use ewc::DiagonalFisher;
 pub use gradient::GradientGuardStrategy;
+#[cfg(feature = "online-router")]
 pub use rloo::{RlooConfig, RlooTrainer};
 
 use crate::error::FannResult;
@@ -147,6 +151,23 @@ pub trait Trainer {
         targets: &[Vec<f32>],
         config: &TrainingConfig,
     ) -> FannResult<TrainingResult>;
+}
+
+// Structural reachability test: when online-router is enabled the public types
+// must be importable through the training module path.  Without the feature the
+// entire ewc/rloo sub-modules are absent, so the check is compile-time only.
+#[cfg(all(test, feature = "online-router"))]
+mod online_router_reachability {
+    use super::{DiagonalFisher, RlooConfig, RlooTrainer};
+
+    #[test]
+    fn online_router_types_are_reachable() {
+        // Merely naming the types proves the feature gate exposes them.
+        let _: Option<DiagonalFisher> = None;
+        let _config = RlooConfig::default();
+        // RlooTrainer::new is non-Copy but constructible — just confirm the path resolves.
+        let _trainer = RlooTrainer::new(RlooConfig::default());
+    }
 }
 
 #[cfg(test)]
