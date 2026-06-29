@@ -284,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(default_model_dir);
     let data_dir = parse_arg(&args, "--data-dir")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/claude-logs-lora"));
+        .unwrap_or_else(|| PathBuf::from("data/lora-train"));
     let steps: usize = parse_arg(&args, "--steps")
         .and_then(|s| s.parse().ok())
         .unwrap_or(150);

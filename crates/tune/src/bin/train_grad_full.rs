@@ -66,7 +66,7 @@ fn usage() {
 
 Options:
   --model-dir   <PATH>   Model directory (default: $HOME/.lattice/models/qwen3.5-0.8b)
-  --data-dir    <PATH>   Dataset directory with train.jsonl + valid.jsonl (default: data/claude-logs-lora)
+  --data-dir    <PATH>   Dataset directory with train.jsonl + valid.jsonl (default: data/lora-train)
   --first-layer <N>      First materialised (trained) layer (default: 19)
   --steps       <N>      Adam steps (default: 25)
   --lr          <F>      Learning rate (default: 1e-3)
@@ -699,7 +699,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(default_model_dir);
     let data_dir = parse_arg(&args, "--data-dir")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/claude-logs-lora"));
+        .unwrap_or_else(|| PathBuf::from("data/lora-train"));
     let first_layer: usize = parse_arg(&args, "--first-layer")
         .and_then(|s| s.parse().ok())
         .unwrap_or(19);
