@@ -385,7 +385,7 @@ mod tests {
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
-        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
+        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits).unwrap()).collect();
 
         // Path B: sample_token — rng_state initialised to the same seed; the first
         // xorshift64_next call advances identically to Rng::next_u64 in Path A.
@@ -541,7 +541,7 @@ mod tests {
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
-        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits)).collect();
+        let tokens_a: Vec<u32> = (0..n).map(|_| sampler.sample(&logits).unwrap()).collect();
 
         // Path B: sample_token (this module's pipeline). With matching tie-breaks it
         // also keeps {0,1,2} ordered [0,1,2]; a reversed tie-break keeps {0,1,3}

@@ -167,6 +167,17 @@ impl CandidateSet {
         self.candidates.truncate(k);
     }
 
+    /// Returns `true` when every logit in the set is `-inf` or NaN, i.e. no
+    /// candidate carries a valid probability mass.  A `+inf` logit is NOT masked:
+    /// `c.logit > f32::NEG_INFINITY` is `true` for any finite value or `+inf` and
+    /// `false` for `-inf` and NaN, so a `+inf` candidate escapes this predicate.
+    ///
+    /// Used by both `sample_top_p` and `Sampler::sample` to share the fail-closed
+    /// guard without duplicating the predicate (#451, shared-guard-public-boundary).
+    fn all_masked(&self) -> bool {
+        !self.candidates.iter().any(|c| c.logit > f32::NEG_INFINITY)
+    }
+
     /// Sort descending, apply softmax, optionally truncate with top-p nucleus
     /// filtering, renormalise, and return a weighted-random sample.
     ///
@@ -194,9 +205,7 @@ impl CandidateSet {
         // `sample_top_p_with_scratch` guard (`!max_logit.is_finite()`) catches both
         // -inf and +inf and returns `candidates[0].token_id`; for -inf that token is
         // arbitrary and may not be a valid member of a grammar-compacted set.
-        // `c.logit > f32::NEG_INFINITY` is false for -inf and NaN but true for any
-        // finite value or +inf, so +inf candidates still reach the inner guard.
-        if !self.candidates.iter().any(|c| c.logit > f32::NEG_INFINITY) {
+        if self.all_masked() {
             return Err(crate::error::InferenceError::InvalidInput(
                 "sample_top_p on a fully-masked (all -inf or NaN) candidate set".into(),
             ));
@@ -386,7 +395,14 @@ impl Sampler {
     ///
     /// `logits` is the raw output from the model's final linear layer,
     /// shape `[vocab_size]`.
-    pub fn sample(&mut self, logits: &[f32]) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::InferenceError::InvalidInput`] when every logit is
+    /// [`f32::NEG_INFINITY`] or NaN (a fully masked set with no valid draw).  This
+    /// mirrors the guard in [`CandidateSet::sample_top_p`] — both delegate to
+    /// [`CandidateSet::all_masked`] so the predicate is defined in one place (#451).
+    pub fn sample(&mut self, logits: &[f32]) -> Result<u32, crate::error::InferenceError> {
         // Greedy fast path: skip the full-vocab clone when argmax is not penalized.
         // A repetition penalty >= 1.0 only lowers penalized tokens, so argmax(raw) ==
         // argmax(penalized) whenever the raw argmax token is not in recent_tokens. In the
@@ -416,7 +432,7 @@ impl Sampler {
             let penalty_inactive = penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0;
             if penalty_inactive || (penalty > 1.0 && !self.recent_tokens.contains(&raw_best)) {
                 self.push_token(raw_best);
-                return raw_best;
+                return Ok(raw_best);
             }
             // raw argmax would change once the penalty is applied — clone + re-scan.
             self.logit_scratch.clear();
@@ -425,7 +441,7 @@ impl Sampler {
             self.apply_penalty_to_logit_scratch(penalty);
             let token = argmax_f32(&self.logit_scratch);
             self.push_token(token);
-            return token;
+            return Ok(token);
         }
 
         // Non-greedy path: clone logits for in-place penalty + fused top-k.
@@ -455,11 +471,24 @@ impl Sampler {
         let mut cs = CandidateSet {
             candidates: std::mem::take(&mut self.candidate_scratch),
         };
+
+        // Mirror the all-masked guard from CandidateSet::sample_top_p (#451).
+        // sample_top_p_with_scratch returns candidates[0].token_id when max_logit
+        // is not finite, which for an all-(-inf) set is an arbitrary token — not a
+        // fail-closed response. The public guard lives on sample_top_p, but this
+        // path calls the private scratch variant directly, bypassing it.
+        if cs.all_masked() {
+            self.candidate_scratch = cs.candidates; // restore scratch capacity before returning
+            return Err(crate::error::InferenceError::InvalidInput(
+                "sample on a fully-masked (all -inf or NaN) logit vector".into(),
+            ));
+        }
+
         let r = self.rng.next_f32();
         let token = cs.sample_top_p_with_scratch(self.config.top_p, r, &mut self.prob_scratch);
         self.candidate_scratch = cs.candidates; // restore scratch capacity
         self.push_token(token);
-        token
+        Ok(token)
     }
 
     fn push_token(&mut self, token: u32) {
@@ -839,7 +868,7 @@ mod tests {
         let config = SamplingConfig::greedy();
         let mut sampler = Sampler::new(config);
         let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-        assert_eq!(sampler.sample(&logits), 3);
+        assert_eq!(sampler.sample(&logits).unwrap(), 3);
     }
 
     #[test]
@@ -850,7 +879,7 @@ mod tests {
         };
         let mut sampler = Sampler::new(config);
         let logits = vec![1.0, 5.0, 2.0];
-        assert_eq!(sampler.sample(&logits), 1);
+        assert_eq!(sampler.sample(&logits).unwrap(), 1);
     }
 
     #[test]
@@ -869,7 +898,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits),
+                sampler.sample(&logits).unwrap(),
                 1,
                 "temperature {bad} must fall back to argmax, not collapse to token 0"
             );
@@ -893,7 +922,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits),
+                sampler.sample(&logits).unwrap(),
                 1,
                 "tiny temperature {tiny} must fall back to argmax, not collapse to token 0"
             );
@@ -952,7 +981,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits),
+                sampler.sample(&logits).unwrap(),
                 1,
                 "residual-band temperature {band} must fall back to argmax, not collapse"
             );
@@ -1028,7 +1057,7 @@ mod tests {
         let logits = vec![0.0, 10.0, 0.0, 9.0, 0.0];
         let mut counts = [0u32; 5];
         for _ in 0..100 {
-            let tok = sampler.sample(&logits);
+            let tok = sampler.sample(&logits).unwrap();
             counts[tok as usize] += 1;
         }
         // Only tokens 1 and 3 should appear
@@ -1051,11 +1080,11 @@ mod tests {
         let logits = vec![0.0, 5.0, 4.9]; // token 1 is best
 
         // First sample: picks 1 (highest)
-        let first = sampler.sample(&logits);
+        let first = sampler.sample(&logits).unwrap();
         assert_eq!(first, 1);
 
         // Second sample: token 1 is penalized, should pick 2
-        let second = sampler.sample(&logits);
+        let second = sampler.sample(&logits).unwrap();
         assert_eq!(second, 2);
     }
 
@@ -1074,12 +1103,12 @@ mod tests {
         let mut sampler = Sampler::new(config);
 
         // Step 1: token 1 is the clear argmax; becomes a recent token.
-        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+        assert_eq!(sampler.sample(&[0.0, 10.0]).unwrap(), 1);
 
         // Step 2: raw argmax is token 0 (5.0) and is NOT recent, but recent token
         // 1 is boosted to 4.0 / 0.5 = 8.0 > 5.0, so the penalized argmax is token
         // 1. Before the fix the fast path returned the raw argmax token 0.
-        assert_eq!(sampler.sample(&[5.0, 4.0]), 1);
+        assert_eq!(sampler.sample(&[5.0, 4.0]).unwrap(), 1);
     }
 
     /// The documented always-safe case the conservative gate leaves to the re-scan:
@@ -1097,11 +1126,11 @@ mod tests {
         let mut sampler = Sampler::new(config);
 
         // Step 1: token 1 is the clear argmax; becomes a recent token.
-        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
+        assert_eq!(sampler.sample(&[0.0, 10.0]).unwrap(), 1);
 
         // Step 2: raw argmax is token 1 (6.0) and IS recent. Boosting it to
         // 6.0 / 0.5 = 12.0 keeps it above token 0's 5.0, so it stays the argmax.
-        assert_eq!(sampler.sample(&[5.0, 6.0]), 1);
+        assert_eq!(sampler.sample(&[5.0, 6.0]).unwrap(), 1);
     }
 
     #[test]
@@ -1117,7 +1146,7 @@ mod tests {
         let logits = vec![10.0, 1.0, 1.0, 1.0, 1.0];
         let mut counts = [0u32; 5];
         for _ in 0..100 {
-            counts[sampler.sample(&logits) as usize] += 1;
+            counts[sampler.sample(&logits).unwrap() as usize] += 1;
         }
         // Token 0 should get almost all samples (its probability >> 0.5)
         assert!(counts[0] > 90);
@@ -1127,7 +1156,7 @@ mod tests {
     fn test_sampler_reset() {
         let config = SamplingConfig::greedy();
         let mut sampler = Sampler::new(config);
-        sampler.sample(&[1.0, 2.0, 3.0]);
+        sampler.sample(&[1.0, 2.0, 3.0]).unwrap();
         assert!(!sampler.recent_tokens.is_empty());
         sampler.reset();
         assert!(sampler.recent_tokens.is_empty());
@@ -1599,7 +1628,7 @@ mod tests {
         let logits = vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let mut counts = [0u32; 8];
         for _ in 0..400 {
-            counts[sampler.sample(&logits) as usize] += 1;
+            counts[sampler.sample(&logits).unwrap() as usize] += 1;
         }
         let nonzero = counts.iter().filter(|&&c| c > 0).count();
         assert!(
@@ -1674,13 +1703,13 @@ mod tests {
         })
         .with_seed(1);
         // Step 1: token 1 is the clear argmax; recent_tokens -> [1].
-        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]).unwrap(), 1);
         // Step 2: token 1 penalized once (10/2 = 5) still wins; recent_tokens -> [1, 1].
-        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]).unwrap(), 1);
         // Step 3: token 1 penalized ONCE (10/2 = 5) must beat token 2 (logit 3).
         // The per-occurrence bug penalizes twice (10/2/2 = 2.5) and wrongly picks token 2.
         assert_eq!(
-            s.sample(&[0.0, 10.0, 3.0]),
+            s.sample(&[0.0, 10.0, 3.0]).unwrap(),
             1,
             "duplicate history id must be penalized once, not per occurrence"
         );
@@ -1730,7 +1759,7 @@ mod tests {
         // Seed token 1 as a prompt token.
         sampler.seed_history(&[1u32]);
         // logits: token 1 = 10.0 wins raw, but 10.0/2.0 = 5.0 < token 0's 6.0 after penalty.
-        let token = sampler.sample(&[6.0, 10.0]);
+        let token = sampler.sample(&[6.0, 10.0]).unwrap();
         assert_eq!(
             token, 0,
             "token 1 was seeded in history; penalty 2.0 reduces its adjusted logit \
@@ -1764,7 +1793,7 @@ mod tests {
         // With old 64-cap restored in push_token: token 1 was evicted from the window →
         // raw_best (token 1) is no longer in history so the greedy shortcut returns it
         // un-penalized → token 1 wins.
-        let token = sampler.sample(&[6.0, 10.0]);
+        let token = sampler.sample(&[6.0, 10.0]).unwrap();
         assert_eq!(
             token, 0,
             "token 1 at position 0 in a 65-entry history must still be penalized; \
@@ -1791,7 +1820,7 @@ mod tests {
         sampler.seed_history(&[1, 1, 1, 1]);
         // Once penalized: 10.0/2.0 = 5.0 > 4.9 → token 1 wins (correct).
         // Per-occurrence (penalty^4): 10.0/16.0 = 0.625 < 4.9 → token 0 wins (wrong).
-        let token = sampler.sample(&[4.9, 10.0]);
+        let token = sampler.sample(&[4.9, 10.0]).unwrap();
         assert_eq!(
             token, 1,
             "token 1 repeated 4× must be penalized once (5.0 > 4.9, token 1 wins); \
@@ -1894,6 +1923,75 @@ mod tests {
         assert!(
             cs.apply_temperature(1e-45).is_err(),
             "degenerate temperature on an all-masked set must be Err"
+        );
+    }
+
+    // ── H5b: Sampler::sample fail-closed regression tests (#451) ─────────────
+    //
+    // Before the fix, the non-greedy path in Sampler::sample called
+    // sample_top_p_with_scratch directly, bypassing the all-masked guard that
+    // lives on the public CandidateSet::sample_top_p.  sample_top_p_with_scratch
+    // reaches its inner `!max_logit.is_finite()` branch for an all-(-inf) set
+    // and returns candidates[0].token_id — token 0 — rather than an error.
+    //
+    // These tests FAIL on the pre-fix path (returns Ok(0)) and PASS after the
+    // fix (returns Err).  They are the mutation-sensitive gate for #451.
+
+    /// Non-greedy all-masked: the shared-guard-public-boundary fix.
+    ///
+    /// Mutation-sensitive: remove the `cs.all_masked()` guard in Sampler::sample
+    /// and this test receives `Ok(0)` from the inner scratch path, causing the
+    /// `is_err()` assertion to fail.  The token ids in the vocab are default
+    /// (0-indexed), so token 0 is the incorrect-but-undetectable sentinel the
+    /// pre-fix code emitted — making the non-zero expectation in the mixed-set
+    /// companion test the cleaner reversion detector.
+    #[test]
+    fn test_sampler_sample_all_neg_inf_non_greedy_returns_err() {
+        // Non-greedy config: temperature=1.0 keeps temperature_degenerate false,
+        // top_k > 1 prevents the greedy shortcut, so the non-greedy path executes.
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(0);
+        let all_neg_inf = vec![f32::NEG_INFINITY; 8];
+        assert!(
+            sampler.sample(&all_neg_inf).is_err(),
+            "Sampler::sample on an all-(-inf) logit vector must be Err, not Ok(token 0) \
+             (mutation: remove the cs.all_masked() guard added for #451)"
+        );
+    }
+
+    /// Mixed set (one finite, rest -inf): the guard must NOT fire.
+    ///
+    /// Mutation-sensitive: an overly-broad guard that rejects any set containing
+    /// a -inf candidate would cause this to return Err instead of Ok(3), failing
+    /// the unwrap and producing a panic.
+    #[test]
+    fn test_sampler_sample_mixed_finite_and_neg_inf_samples_finite_token() {
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0, // disabled — keep all candidates
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(0);
+        // Token 3 is the only candidate with a finite logit; the guard must pass
+        // and sample_top_p_with_scratch must return it (softmax collapses to one-hot).
+        let logits = vec![
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            5.0_f32,
+            f32::NEG_INFINITY,
+        ];
+        let token = sampler.sample(&logits).unwrap();
+        assert_eq!(
+            token, 3,
+            "a mixed set with one finite logit must sample that token, not Err \
+             (mutation: broaden the guard to reject any -inf candidate)"
         );
     }
 }
