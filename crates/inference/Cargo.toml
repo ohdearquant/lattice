@@ -18,6 +18,10 @@ bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq", "dep:sha2"]
 train-backward = []
+# AdapterRouter gate: enables the lattice-fann backed routing module.
+# blend_lora_layer_data and generate_with_lora_mixture do NOT require this
+# feature — they are always available.
+mixture = ["dep:lattice-fann"]
 
 [dependencies]
 half.workspace = true
@@ -43,6 +47,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lattice-fann = { version = "0.4.0", path = "../fann", optional = true }
 
 [[bin]]
 name = "lattice"
@@ -65,6 +70,11 @@ required-features = ["f16", "metal-gpu"]
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[bin]]
+name = "bench_lora_mixture"
+path = "src/bin/bench_lora_mixture.rs"
 required-features = ["f16", "metal-gpu"]
 
 [[bin]]
