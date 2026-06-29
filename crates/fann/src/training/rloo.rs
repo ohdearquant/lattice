@@ -169,6 +169,15 @@ impl RlooTrainer {
     ///
     /// This is not the default path — activate via the bench harness when
     /// comparing against Phase-1.
+    ///
+    /// Invariant for any future activation: this path consumes only
+    /// preferred-known (positive) events, so it MUST be paired with the M=1
+    /// [`Self::step`] negative path; never run it positive-only. The
+    /// convergence bench's positive-only arm collapsed to chance (policy
+    /// entropy toward zero, mass on a single output) because dropping
+    /// negative feedback removes the signal that pushes a wrongly-selected
+    /// output down. Carrying both polarities is a correctness requirement,
+    /// not a tuning choice.
     pub fn rloo_step(
         &mut self,
         gate: &mut Network,
