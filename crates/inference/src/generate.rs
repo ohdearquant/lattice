@@ -237,7 +237,75 @@ fn check_alloc_capacity(
     num_layers: usize,
     effective_cap: usize,
 ) -> Result<(), InferenceError> {
-    let kv_dim = cfg.kv_dim();
+    // Guard the base KV dimension product before using it in any further multiply.
+    // A pathological config (e.g. num_key_value_heads = usize::MAX) can make the
+    // raw `num_key_value_heads * head_dim` multiply wrap in release builds,
+    // producing a silently tiny kv_dim that passes every downstream checked_mul
+    // even though the real allocation would be absurd. Fail closed here so the
+    // error is reported on the path that controls all subsequent buffer sizing.
+    let kv_dim = cfg
+        .num_key_value_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("num_key_value_heads * head_dim overflows usize".into())
+        })?;
+    // Guard the query-side dimension product. A config with num_attention_heads
+    // near usize::MAX and a small head_dim overflows q_dim even when kv_dim is
+    // safe — producing a tiny q_buf / attn_out / qkv_buf that causes an OOB
+    // panic on the first prefill write into the undersized buffers.
+    let q_dim = cfg
+        .num_attention_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("num_attention_heads * head_dim overflows usize".into())
+        })?;
+    // Guard the fused QKV projection width (sizes qkv_buf). q_dim and kv_dim are
+    // already validated above; this guards the final addition so a huge q_dim
+    // combined with a non-trivial kv_dim cannot wrap the sum.
+    let qkv_dim = kv_dim
+        .checked_mul(2)
+        .and_then(|two_kv| q_dim.checked_add(two_kv))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("q_dim + 2*kv_dim (qkv_dim) overflows usize".into())
+        })?;
+    // Guard every activation buffer that ForwardScratch::ensure_capacity sizes as
+    // `seq_len_cap * DIM`. The invariant seq_len_cap <= effective_cap holds because
+    // check_kv_cache_capacity rejects any cap smaller than prompt_len, and
+    // ensure_capacity is called with at most prompt_len (prefill) or 1 (decode).
+    // Guarding effective_cap * DIM up-front prevents any grow() call from wrapping
+    // usize and silently undersizing a buffer before the first prefill write.
+    //
+    // Buffers covered and their per-token coefficients:
+    //   hidden, residual, ffn_out  — hidden_size
+    //   qkv_buf                    — qkv_dim  (= q_dim + 2*kv_dim)
+    //   q_buf, attn_out            — q_dim    (= num_attention_heads * head_dim)
+    //   k_buf, v_buf               — kv_dim   (= num_key_value_heads * head_dim)
+    //   gate_up_buf                — 2 * intermediate_size
+    //   gate_buf, up_buf           — intermediate_size
+    let inter = cfg.intermediate_size;
+    effective_cap.checked_mul(cfg.hidden_size).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * hidden_size overflows usize".into())
+    })?;
+    effective_cap.checked_mul(qkv_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * qkv_dim overflows usize".into())
+    })?;
+    effective_cap.checked_mul(q_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * q_dim overflows usize".into())
+    })?;
+    effective_cap.checked_mul(kv_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * kv_dim overflows usize".into())
+    })?;
+    inter
+        .checked_mul(2)
+        .and_then(|two_inter| effective_cap.checked_mul(two_inter))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "effective_cap * 2 * intermediate_size overflows usize".into(),
+            )
+        })?;
+    effective_cap.checked_mul(inter).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * intermediate_size overflows usize".into())
+    })?;
     // Per-position element coefficients that scale with the cache length:
     //   KV cache (K+V across all layers): 2 * num_layers * kv_dim
     //   dequant scratch (cached_k_f32 + cached_v_f32): 2 * kv_dim
@@ -256,6 +324,19 @@ fn check_alloc_capacity(
         ))
     })?;
     Ok(())
+}
+
+/// Returns `true` when at least one logit is strictly greater than
+/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
+///
+/// A grammar engine calls `mask_logits` to set every disallowed position to
+/// `NEG_INFINITY`. If it blocks every token, all logits become `NEG_INFINITY`
+/// and the sampler's non-finite-max short-circuit silently emits token 0 — the
+/// lowest-id token after sorting an all-NEG_INFINITY candidate set by ascending
+/// token_id. That violates the grammar contract. This helper lets the caller
+/// detect and reject the empty-mask case before invoking the sampler (#398).
+fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
 }
 
 /// **Unstable**: text generation entry point for Qwen3 models; the full
@@ -318,7 +399,11 @@ pub fn generate(
         cfg.head_dim,
         effective_cap,
     );
-    let mut cache = FlatKVCache::new(cache_cfg);
+    // try_new validates every dimension product before any Vec allocation.
+    // check_alloc_capacity (above) guards the same products, but try_new provides
+    // a second layer at the exact allocation boundary — a defence against future
+    // refactors that might move or remove the upstream guard.
+    let mut cache = FlatKVCache::try_new(cache_cfg)?;
     let mut scratch = ForwardScratch::new();
     // Size scratch for the largest possible call (prefill at prompt_len tokens).
     // Decode calls use seq_len=1, which is always within this capacity.
@@ -347,6 +432,16 @@ pub fn generate(
     // Apply grammar masking on the logit buffer in-place before sampling.
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
         engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+        // If the grammar blocked every token the sampler's non-finite-max
+        // short-circuit would silently return token 0 (the lowest id after
+        // sorting an all-NEG_INFINITY candidate set). Fail closed instead (#398).
+        if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+            return Err(InferenceError::InvalidInput(
+                "grammar constraint blocked every token at step 0; \
+                 no legal first token exists in the current grammar state"
+                    .into(),
+            ));
+        }
     }
 
     // 6. Sample first token from the last position's logits.
@@ -357,21 +452,23 @@ pub fn generate(
     // is already validated allocation-safe by check_alloc_capacity above.
     let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens.min(effective_cap));
     let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
-    generated_ids.push(first_token);
 
-    // Advance grammar state after sampling.
+    // Advance grammar state after sampling. The token is pushed to generated_ids
+    // only after a successful advance so a grammar-rejected token (sampled despite
+    // the mask, e.g. from rounding on a boundary logit) does not appear in the
+    // output (#398).
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
         if !engine.advance(gs, first_token) {
-            let text = tokenizer.decode(&generated_ids).unwrap_or_default();
             return Ok(GenerateOutput {
-                text,
+                text: String::new(),
                 prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                token_ids: generated_ids,
+                generated_tokens: 0,
+                token_ids: vec![],
                 stopped_by_eos: false,
             });
         }
     }
+    generated_ids.push(first_token);
 
     let mut stopped_by_eos = false;
     if config.eos_token_id == Some(first_token) {
@@ -401,6 +498,15 @@ pub fn generate(
             // Apply grammar masking before sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                // Same empty-mask guard as the first-token path: an all-NEG_INFINITY
+                // logit buffer would cause the sampler to silently emit token 0 (#398).
+                if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token; \
+                         no legal continuation exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
@@ -1064,6 +1170,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn has_finite_logit_detects_all_neg_infinity() {
+        // Regression test for the empty-mask fail-closed guard (#398).
+        //
+        // When a grammar engine blocks every token, all logits become
+        // NEG_INFINITY. Without the guard, the sampler's non-finite-max
+        // short-circuit silently emits token 0 (the lowest id after sorting
+        // an all-NEG_INFINITY candidate set). The guard must detect this and
+        // allow the caller to return a typed error instead.
+        //
+        // Mutation sensitivity: change has_finite_logit to always return true
+        // → the first assertion fails because the guard would pass silently
+        // on an all-blocked logit buffer.
+        assert!(
+            !has_finite_logit(&[f32::NEG_INFINITY; 8]),
+            "all-NEG_INFINITY must fail the guard (empty grammar mask)"
+        );
+        // A single finite logit makes the mask non-empty; the guard passes.
+        let mut mixed = vec![f32::NEG_INFINITY; 4];
+        mixed[2] = 1.0_f32;
+        assert!(
+            has_finite_logit(&mixed),
+            "a single finite logit must pass the guard"
+        );
+        // All-zero is a valid (uniform) distribution; token 0 wins by argmax.
+        assert!(has_finite_logit(&[0.0_f32; 4]));
+        // Positive infinity is still a finite-or-higher winner; not blocked.
+        let mut with_inf = vec![f32::NEG_INFINITY; 4];
+        with_inf[1] = f32::INFINITY;
+        assert!(has_finite_logit(&with_inf));
+    }
+
+    #[test]
     fn test_generate_config_default() {
         let cfg = GenerateConfig::default();
         assert_eq!(cfg.max_new_tokens, 256);
@@ -1109,6 +1247,79 @@ mod tests {
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 4096).is_ok());
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 262_144).is_ok());
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 0).is_ok());
+    }
+
+    /// check_alloc_capacity rejects a config whose num_key_value_heads * head_dim
+    /// overflows usize, even when the wrapped (modular) result would be 0 and would
+    /// otherwise silently pass every subsequent checked_mul in the coeff formula.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Revert `check_alloc_capacity` to the unchecked `let kv_dim = cfg.kv_dim()`
+    ///   form: `(usize::MAX / 4 + 1) * 4` wraps to 0 in release mode, the coeff
+    ///   formula reduces to `num_attention_heads`, `effective_cap * coeff` does not
+    ///   overflow, and the function returns Ok — causing the `unwrap_err()` call to
+    ///   panic and the test to fail. FlatKVCache::try_new (generate.rs call site) is
+    ///   the second guard at the allocation boundary that catches the same class of
+    ///   overflow independently; this test covers the upstream guard.
+    #[test]
+    fn check_alloc_capacity_rejects_kv_dim_overflow() {
+        // On 64-bit: (usize::MAX / 4 + 1) * 4 overflows to 0 in release mode
+        // (wrapping arithmetic). The checked_mul guard must reject this before
+        // the wrapped zero reaches any downstream computation.
+        let overflow_kv_heads = usize::MAX / 4 + 1;
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: overflow_kv_heads,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let err = check_alloc_capacity(&cfg, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on kv_dim overflow, got {err:?}"
+        );
+    }
+
+    /// check_alloc_capacity rejects a config whose num_attention_heads * head_dim
+    /// overflows usize while kv_dim remains safe (num_key_value_heads = 1).
+    /// This closes the residual query-side gap found in the PR #449 cross-family review:
+    /// the existing kv_dim guard let this config through, then q_dim wrapped silently
+    /// in release mode, undersizing q_buf / attn_out / qkv_buf for the prefill write.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Remove or bypass the `q_dim = cfg.num_attention_heads.checked_mul(cfg.head_dim)…`
+    ///   guard: in release mode `(usize::MAX/4 + 1) * 4` wraps to 0, the function
+    ///   returns Ok, and `unwrap_err()` panics — the test fails.  In debug mode the raw
+    ///   multiplication panics instead, also failing the test.  Either outcome confirms the
+    ///   guard is load-bearing.
+    #[test]
+    fn check_alloc_capacity_rejects_q_dim_overflow() {
+        // kv_dim = 1 * 4 = 4 — passes the kv_dim guard.
+        // q_dim = (usize::MAX/4 + 1) * 4 — overflows; the new q_dim guard must reject it.
+        let overflow_q_heads = usize::MAX / 4 + 1;
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: overflow_q_heads,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let err = check_alloc_capacity(&cfg, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on q_dim overflow, got {err:?}"
+        );
     }
 
     #[test]
@@ -1464,5 +1675,64 @@ mod tests {
         assert_eq!(effective(Some(30)), 30, "cap < max_seq -> respected");
         assert_eq!(effective(Some(0)), 1, "cap=0 -> clamped to 1");
         assert_eq!(effective(Some(1)), 1, "cap=1 -> 1 (minimum)");
+    }
+
+    /// check_alloc_capacity rejects a config where every standalone dimension
+    /// product (kv_dim, q_dim, qkv_dim) fits in usize, but
+    /// effective_cap * qkv_dim wraps on 64-bit targets.
+    ///
+    /// Config: num_key_value_heads=1, head_dim=4 → kv_dim=4 (standalone guard passes).
+    ///         num_attention_heads=1000, head_dim=4 → q_dim=4000 (standalone guard passes).
+    ///         qkv_dim = 4000 + 2*4 = 4008 (addition guard passes).
+    ///         hidden_size=1, intermediate_size=1 (all other per-token coefficients are 1).
+    ///         effective_cap chosen so that effective_cap * 4008 > usize::MAX but
+    ///         the pre-existing coeff guard (effective_cap * ~1016) does not overflow,
+    ///         meaning only the new effective_cap * qkv_dim compound guard catches it.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Remove the `effective_cap.checked_mul(qkv_dim)` guard line: the function
+    ///   advances past it, the remaining guards (hidden_size=1, q_dim=4000,
+    ///   kv_dim=4, 2*inter=2, inter=1, coeff≈1016) all pass within usize on 64-bit,
+    ///   and the function returns Ok — causing `unwrap_err()` to panic and the test
+    ///   to fail. This confirms the guard is load-bearing for this defect class.
+    #[test]
+    fn check_alloc_capacity_rejects_seq_scaled_qkv_overflow() {
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1000,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        // On 64-bit: usize::MAX / 4008 < effective_cap, so effective_cap * 4008 overflows.
+        // usize::MAX / 1016 > effective_cap, so the prior coeff guard would pass.
+        let effective_cap = 4_602_481_056_314_759usize;
+        let err = check_alloc_capacity(&cfg, 1, effective_cap).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on seq-scaled qkv overflow, got {err:?}"
+        );
+    }
+
+    /// A realistic model config with a modest context cap must not be falsely
+    /// rejected by the new effective_cap * DIM compound guards.
+    #[test]
+    fn check_alloc_capacity_accepts_realistic_scratch_dims() {
+        // Qwen3-Embedding-0.6B dimensions: hidden=1024, heads=16/8, head_dim=128,
+        // intermediate=3072 — representative of deployed model shapes.
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        assert!(
+            check_alloc_capacity(&cfg, cfg.num_hidden_layers, 4_096).is_ok(),
+            "4K-token cap rejected"
+        );
+        assert!(
+            check_alloc_capacity(&cfg, cfg.num_hidden_layers, 32_768).is_ok(),
+            "32K-token cap rejected"
+        );
     }
 }

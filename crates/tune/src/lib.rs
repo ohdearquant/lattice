@@ -178,7 +178,11 @@ pub use train::{
 pub use train::{GpuTrainer, GpuTrainerBuilder};
 
 // LoRA re-exports
-pub use lora::{LoraAdapter, LoraConfig, LoraLayer};
+#[cfg(all(feature = "safetensors", feature = "serde"))]
+pub use lora::LoadedAdapter;
+#[cfg(feature = "serde")]
+pub use lora::{AdapterId, LoraManifest, ManifestEntry};
+pub use lora::{LoraAdapter, LoraConfig, LoraLayer, blend_lora_adapters};
 
 // Registry re-exports
 pub use registry::{
@@ -197,7 +201,7 @@ pub mod prelude {
         LabelingResult, TeacherConfig, TeacherProvider,
     };
     pub use crate::error::{Result, TuneError};
-    pub use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
+    pub use crate::lora::{LoraAdapter, LoraConfig, LoraLayer, blend_lora_adapters};
     pub use crate::registry::{
         LiveModel, ModelMetadata, ModelRegistry, ModelStatus, RegisteredModel, RollbackController,
         RollbackRecord, ShadowComparison, ShadowConfig, ShadowSession, ShadowState, StorageBackend,

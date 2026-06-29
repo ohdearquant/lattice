@@ -199,51 +199,17 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Load a LoRA adapter from a PEFT-format safetensors file.
+/// Load a LoRA adapter from raw PEFT-format safetensors bytes.
 ///
-/// Reads the file, parses all LoRA tensor keys, pairs A/B matrices per
-/// (layer_idx, module), and assembles the adapter.
+/// This is the byte-level counterpart of [`load_peft_safetensors`]. It is
+/// used by the manifest-driven loader, which reads and integrity-checks the
+/// bytes externally before calling this function.
 ///
-/// # Errors
-///
-/// Returns an error if:
-/// - The file cannot be read or is not valid safetensors
-/// - A/B matrix pairs are incomplete (A without B or vice versa)
-/// - Tensor shapes are inconsistent (ranks must match within a pair)
-pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
-    const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
-    let file_size = std::fs::metadata(path)
-        .map_err(|e| {
-            TuneError::Io(std::io::Error::new(
-                e.kind(),
-                format!("failed to read metadata for {}: {e}", path.display()),
-            ))
-        })?
-        .len();
-    if file_size > MAX_LORA_SIZE {
-        return Err(TuneError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "LoRA file {} is {} bytes, exceeds maximum of {} bytes",
-                path.display(),
-                file_size,
-                MAX_LORA_SIZE
-            ),
-        )));
-    }
-    let data = std::fs::read(path).map_err(|e| {
-        TuneError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to read LoRA adapter from {}: {e}", path.display()),
-        ))
-    })?;
-
-    let tensors = SafeTensors::deserialize(&data).map_err(|e| {
-        TuneError::Serialization(format!(
-            "failed to parse safetensors from {}: {e}",
-            path.display()
-        ))
-    })?;
+/// Error messages omit the original file path because the caller has already
+/// provided that context.
+pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, TuneError> {
+    let tensors = SafeTensors::deserialize(bytes)
+        .map_err(|e| TuneError::Serialization(format!("failed to parse safetensors: {e}")))?;
 
     // Collect all parsed LoRA keys
     let names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
@@ -405,7 +371,7 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
     // alpha = rank (scale = 1.0), applying a model trained at alpha != rank at the
     // wrong magnitude. Fall back to `rank` (scale = 1.0) when the metadata is
     // absent or unparseable, preserving behavior for adapters that lack it.
-    let alpha = SafeTensors::read_metadata(&data)
+    let alpha = SafeTensors::read_metadata(bytes)
         .ok()
         .and_then(|(_, meta)| {
             meta.metadata()
@@ -423,6 +389,111 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
         },
         layers,
     })
+}
+
+/// Read the `adapter_id` metadata key from a PEFT safetensors byte slice.
+///
+/// Returns `None` if the bytes cannot be parsed, the header has no metadata,
+/// or the `adapter_id` key is absent. Used by the manifest loader to enforce
+/// the id consistency check (loader check 10).
+pub(crate) fn read_peft_header_adapter_id(data: &[u8]) -> Option<String> {
+    SafeTensors::read_metadata(data).ok().and_then(|(_, meta)| {
+        meta.metadata()
+            .as_ref()
+            .and_then(|m| m.get("adapter_id").cloned())
+    })
+}
+
+/// Maximum on-disk size of a single LoRA adapter file, in bytes (10 GiB).
+///
+/// Adapter files are read fully into memory before parsing, so an unbounded
+/// read of a caller-supplied path is an allocation-DoS vector. Every path that
+/// materialises adapter bytes from disk routes through [`read_lora_file_bounded`]
+/// with this ceiling, so a second reader cannot reintroduce the bypass.
+pub(crate) const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Read a file into memory after rejecting it if it exceeds `max_bytes`.
+///
+/// Two-layer defence against oversized reads:
+///
+/// 1. **Fast-path stat**: `metadata().len()` checked before the file is opened.
+///    A known-huge file is refused without any allocation.
+/// 2. **Bounded read**: `File::open` + `.take(max_bytes + 1)` enforces the cap
+///    at read time. The `+1` sentinel detects a file that grew between the stat
+///    and the open (TOCTOU window), because an exactly-at-cap file reads fully
+///    while any larger file produces `buf.len() > max_bytes` after the read.
+///
+/// This is the single guarded entry point for loading adapter bytes from disk;
+/// both the path-based [`load_peft_safetensors`] and the manifest-driven loader
+/// route through here, so the size bound cannot be bypassed by a second reader.
+///
+/// # Errors
+///
+/// Returns an error if the file metadata cannot be read, the file is larger
+/// than `max_bytes`, or the read itself fails.
+pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TuneError> {
+    // Fast-path: stat before open. A known-oversized file is refused without
+    // allocating for its contents (defence-in-depth — the read is also bounded).
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| {
+            TuneError::Io(std::io::Error::new(
+                e.kind(),
+                format!("failed to read metadata for {}: {e}", path.display()),
+            ))
+        })?
+        .len();
+    if file_size > max_bytes {
+        return Err(TuneError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "LoRA file {} is {file_size} bytes, exceeds maximum of {max_bytes} bytes",
+                path.display()
+            ),
+        )));
+    }
+    // Bounded read: take max_bytes + 1 bytes so a file that grew after the
+    // stat is still caught. If buf.len() exceeds max_bytes at read time, the
+    // file is rejected even though the stat passed.
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| {
+        TuneError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to open LoRA adapter from {}: {e}", path.display()),
+        ))
+    })?;
+    let mut buf = Vec::new();
+    f.take(max_bytes + 1).read_to_end(&mut buf).map_err(|e| {
+        TuneError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read LoRA adapter from {}: {e}", path.display()),
+        ))
+    })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(TuneError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "LoRA file {} exceeds maximum of {max_bytes} bytes at read time (grew after stat)",
+                path.display()
+            ),
+        )));
+    }
+    Ok(buf)
+}
+
+/// Load a LoRA adapter from a PEFT-format safetensors file.
+///
+/// Reads the file, parses all LoRA tensor keys, pairs A/B matrices per
+/// (layer_idx, module), and assembles the adapter.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The file cannot be read or is not valid safetensors
+/// - A/B matrix pairs are incomplete (A without B or vice versa)
+/// - Tensor shapes are inconsistent (ranks must match within a pair)
+pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
+    let data = read_lora_file_bounded(path, MAX_LORA_SIZE)?;
+    load_peft_safetensors_bytes(&data)
 }
 
 /// Save a LoRA adapter to a PEFT-format safetensors file.
@@ -499,6 +570,35 @@ pub fn save_peft_safetensors(adapter: &LoraAdapter, path: &Path) -> Result<(), T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_lora_file_bounded_rejects_oversized_before_read() {
+        // A 64-byte file with a 32-byte cap must be refused by the metadata
+        // stat, before its contents are read into memory. The file is trivially
+        // readable, so a failure here is the size policy firing, not an IO error.
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0u8; 64]).unwrap();
+        f.flush().unwrap();
+        let err = read_lora_file_bounded(f.path(), 32)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exceeds maximum"),
+            "expected the size guard to fire; got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_lora_file_bounded_reads_within_cap() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        let payload = [7u8; 64];
+        f.write_all(&payload).unwrap();
+        f.flush().unwrap();
+        let bytes = read_lora_file_bounded(f.path(), 1024).unwrap();
+        assert_eq!(bytes, payload);
+    }
 
     #[test]
     fn test_parse_peft_key_self_attn() {
@@ -1054,7 +1154,7 @@ mod tests {
         let mut raw: Vec<u8> = Vec::new();
         raw.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
         raw.extend_from_slice(header_bytes);
-        let payload: Vec<u8> = (0u32..12).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0u32..12).flat_map(u32::to_le_bytes).collect();
         raw.extend_from_slice(&payload);
         std::fs::write(&path, &raw).unwrap();
 

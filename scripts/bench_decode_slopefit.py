@@ -199,6 +199,11 @@ result = {
     "dispatches_per_token": None,
     "command_buffers_per_token": None,
     # Diagnostics (not in ADR spec — informational only).
+    "_metric": (
+        "decode-only tok/s (steady-state generation; prompt prefill and model "
+        "load EXCLUDED). per_tok_ms = intercept + slope*ctx; tok_s = 1000/per_tok_ms. "
+        "Wall-clock chat throughput is lower because it includes prefill."
+    ),
     "_n_ctx_points": len(ctx_vals),
     "_n_raw_repeats": len(all_pairs),
     "_n_boot_samples": len(boot_slopes),

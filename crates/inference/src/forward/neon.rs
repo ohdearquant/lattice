@@ -8,6 +8,8 @@
 //! WITHOUT converting to f32 first. This avoids the CPU format conversion trap
 //! that made dequant-then-BLAS slower than native f32.
 
+use crate::error::InferenceError;
+
 /// Q8_0 block: 4-byte f32 scale + 32 int8 weights = 36 bytes.
 const QK8_0: usize = 32;
 const Q8_0_BLOCK_BYTES: usize = 4 + QK8_0;
@@ -306,7 +308,15 @@ pub fn matmul_q8_neon_into(
 /// Pack f32 weight matrix `[N, K]` into Q8_0 format.
 ///
 /// Returns packed bytes where each row is `K/32` blocks of `[f32_scale, 32×i8]`.
-pub fn pack_weights_q8(weights: &[f32], n: usize, k: usize) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any element in `weights` is non-finite.
+/// IEEE-754 `NaN > x` is always false; a NaN would silently leave `max_abs` unchanged,
+/// producing a wrong (finite) scale while quantizing the corrupt element to a clamped
+/// i8 — wrong-but-quiet. Rejecting here makes the error point at the source weights
+/// rather than a downstream matmul producing garbage output.
+pub fn pack_weights_q8(weights: &[f32], n: usize, k: usize) -> Result<Vec<u8>, InferenceError> {
     assert_eq!(weights.len(), n * k);
     assert_eq!(k % QK8_0, 0);
     let blocks_per_row = k / QK8_0;
@@ -319,6 +329,14 @@ pub fn pack_weights_q8(weights: &[f32], n: usize, k: usize) -> Vec<u8> {
 
         for b in 0..blocks_per_row {
             let block_data = &row_data[b * QK8_0..(b + 1) * QK8_0];
+            for (i, &v) in block_data.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "Q8_0 NEON weight block {b} in row {row} offset {i} contains a \
+                         non-finite value ({v}); source weights must be finite"
+                    )));
+                }
+            }
             let max_abs = block_data
                 .iter()
                 .copied()
@@ -334,7 +352,7 @@ pub fn pack_weights_q8(weights: &[f32], n: usize, k: usize) -> Vec<u8> {
         }
     }
 
-    packed
+    Ok(packed)
 }
 
 #[cfg(test)]
@@ -365,7 +383,7 @@ mod tests {
         let n = 4;
         let k = 64;
         let w: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
         assert_eq!(packed.len(), n * (k / QK8_0) * Q8_0_BLOCK_BYTES);
     }
 
@@ -390,7 +408,7 @@ mod tests {
 
         // Q8 scalar
         let (x_q, x_scale) = quantize_vec_q8(&x);
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
         let mut q8_out = vec![0.0f32; n];
         matvec_q8_scalar(&x_q, x_scale, &packed, n, k, &mut q8_out);
 
@@ -417,7 +435,7 @@ mod tests {
             .collect();
 
         let (x_q, x_scale) = quantize_vec_q8(&x);
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
 
         let mut scalar_out = vec![0.0f32; n];
         matvec_q8_scalar(&x_q, x_scale, &packed, n, k, &mut scalar_out);
@@ -444,7 +462,7 @@ mod tests {
         let w: Vec<f32> = (0..n * k)
             .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
             .collect();
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
         let out = matmul_q8_neon(&x, &packed, n, k);
         assert_eq!(out.len(), n);
         // Each row alternates 0.5/-0.5, dot with all-1s = 0.0
@@ -461,7 +479,7 @@ mod tests {
         let w: Vec<f32> = (0..n * k)
             .map(|i| ((i % 37) as f32 - 18.0) * 0.01)
             .collect();
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
         let out = matmul_q8_neon(&x, &packed, n, k);
         assert_eq!(out.len(), n);
         // Smoke test: no NaN/Inf
@@ -478,7 +496,7 @@ mod tests {
         let w: Vec<f32> = (0..n * k)
             .map(|i| ((i * 13 + 7) % 23) as f32 * 0.04 - 0.46)
             .collect();
-        let packed = pack_weights_q8(&w, n, k);
+        let packed = pack_weights_q8(&w, n, k).unwrap();
 
         let expected = matmul_q8_neon(&x, &packed, n, k);
 
@@ -489,6 +507,39 @@ mod tests {
         assert_eq!(
             expected, out,
             "matmul_q8_neon_into must produce bitwise-identical output to matmul_q8_neon"
+        );
+    }
+
+    /// Mutation check: removing the `!v.is_finite()` guard in `pack_weights_q8`
+    /// makes this test pass NaN weights silently (NaN never updates `max_abs` via `>`,
+    /// so the scale stays finite and the corrupt element is clamped to an arbitrary
+    /// i8 value without error). The test must FAIL when the guard is removed.
+    #[test]
+    fn pack_weights_q8_rejects_nan() {
+        let n = 1;
+        let k = 32;
+        let mut w = vec![0.5f32; n * k];
+        w[15] = f32::NAN;
+        assert!(
+            pack_weights_q8(&w, n, k).is_err(),
+            "pack_weights_q8 must return Err when a block element is NaN"
+        );
+    }
+
+    /// Mutation check: removing the `!v.is_finite()` guard in `pack_weights_q8`
+    /// makes this test pass +Inf weights silently (`f32::INFINITY > max_abs` is true,
+    /// so max_abs becomes +Inf and scale becomes +Inf / 127 = +Inf, propagating
+    /// infinity into every quantized row without a typed error). The test must FAIL
+    /// when the guard is removed.
+    #[test]
+    fn pack_weights_q8_rejects_inf() {
+        let n = 1;
+        let k = 32;
+        let mut w = vec![0.5f32; n * k];
+        w[0] = f32::INFINITY;
+        assert!(
+            pack_weights_q8(&w, n, k).is_err(),
+            "pack_weights_q8 must return Err when a block element is +Inf"
         );
     }
 }

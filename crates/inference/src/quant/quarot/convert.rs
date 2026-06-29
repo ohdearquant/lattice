@@ -438,7 +438,7 @@ pub fn convert_quarot_qwen35(
             let n_blocks = entry.data.len().div_ceil(32) as u64;
             total_bytes_out += header_bytes + n_blocks.saturating_mul(20);
             if !opts.dry_run {
-                let q4 = quantize_f64_to_q4(&entry.data, &entry.shape);
+                let q4 = quantize_f64_to_q4(&entry.data, &entry.shape)?;
                 let file_name = format!("{sanitized}.q4");
                 let out_path = output_dir.join(&file_name);
                 save_q4_file(&out_path, &q4).map_err(|e| {

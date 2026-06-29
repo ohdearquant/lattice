@@ -481,7 +481,8 @@ fn main() {
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect();
 
-                let q4 = quantize_bf16_to_q4(&bf16_vals, shape);
+                let q4 = quantize_bf16_to_q4(&bf16_vals, shape)
+                    .expect("Q4 quantization failed: source weights contain non-finite values");
                 let bytes_out = (q4.blocks.len() * 18) as u64;
                 total_bytes_out += bytes_out;
 

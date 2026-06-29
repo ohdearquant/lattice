@@ -103,7 +103,7 @@ Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `tune
 
 ## Publishing
 
-Leaf crates publish first: inference → fann → transport → (wait 30s) → embed → (wait 30s) → tune. Use `make publish`. Internal path deps' `version =` field must match the current workspace version (bump them in lockstep when bumping `[workspace.package].version`).
+Publish order follows the internal dependency DAG (deps before dependents): fann, transport (leaves) → (wait 30s) → inference (depends on fann via the `mixture` feature) → (wait 30s) → embed, tune. Use `make publish`. Internal path deps' `version =` field must match the current workspace version (bump them in lockstep when bumping `[workspace.package].version`). When a feature adds a new internal dep (e.g. `mixture` made inference depend on fann), the publish order changes — re-derive it from `crates/*/Cargo.toml` path deps, do not assume the old order.
 
 **Shipped-bug recovery (bump-and-yank).** crates.io versions are immutable. When a published release has a correctness bug:
 

@@ -458,7 +458,7 @@ fn bench_llm_q8_neon() -> Vec<Metric> {
     let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
 
     let t_quant = Instant::now();
-    let q8_model = quantize_model(model.weights(), &cfg);
+    let q8_model = quantize_model(model.weights(), &cfg).expect("quantize_model failed");
     let quant_ms = t_quant.elapsed().as_millis() as f64;
 
     drop(model);
