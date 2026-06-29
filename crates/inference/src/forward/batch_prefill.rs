@@ -26,7 +26,7 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, decode_tokens,
-    qwen35_rms_norm, resize, sample_token,
+    qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::tokenizer::common::Tokenizer;
@@ -409,7 +409,7 @@ impl Qwen35Model {
         // Sample from the final prefill logits.
         let next_id = sample_token(&logits[..cfg.vocab_size], gen_cfg, &all_ids, &mut rng_state);
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
                 text: String::new(),
                 token_ids: vec![],
@@ -446,7 +446,7 @@ impl Qwen35Model {
                 &mut rng_state,
             );
 
-            if next_id == cfg.eos_token_id {
+            if should_stop_token(cfg, gen_cfg, next_id) {
                 stopped = true;
                 break;
             }
@@ -1727,6 +1727,158 @@ mod tests {
         x ^= x << 17;
         *state = x;
         (x >> 32) as u32
+    }
+
+    /// Build a zero-layer Qwen35Model for generate_with_batch_prefill unit tests.
+    ///
+    /// All-zero embed_tokens → logits all 0 → greedy picks token 0.
+    /// eos_token_id=96 (vocab-1) so token 0 is NOT eos, making stop_token_ids=[0]
+    /// detectable as a distinct stop path.
+    fn zero_layer_batch_prefill_fixture() -> Qwen35Model {
+        let cfg = make_test_config(64, 128, 97, 0);
+        // make_test_config sets eos_token_id = vocab_size-1 = 96 ≠ 0 ✓
+
+        let rope_dim = cfg.rope_dim();
+        let rope_max = cfg.max_position_embeddings.min(8192);
+        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+
+        Qwen35Model {
+            config: cfg.clone(),
+            weights: ModelWeights {
+                // All zeros → logits all 0 → greedy always picks token 0.
+                embed_tokens: vec![0.0f32; cfg.vocab_size * cfg.hidden_size],
+                lm_head: None,
+                final_norm: vec![0.0f32; cfg.hidden_size],
+                layers: vec![],
+            },
+            tokenizer: dummy_tokenizer(),
+            rope,
+            lora: Box::new(crate::lora_hook::NoopLoraHook),
+        }
+    }
+
+    /// Build a 0-layer model where the greedy sequence is: token 1 → 2 → 3 (stop).
+    ///
+    /// embed_tokens uses standard basis vectors: embed[i][i] = 1.0 for i in 1..4 so
+    /// that each token lives in its own orthogonal direction. embed[0] and embed[4..]
+    /// are all zeros.
+    ///
+    /// lm_head is untied (ModelWeights::lm_head = Some(...)). It is a forward-shift
+    /// by one index in the basis:
+    ///   row 2 has col-1 = 1.0  → logit[2] wins from the embed[1] direction
+    ///   row 3 has col-2 = 1.0  → logit[3] wins from the embed[2] direction
+    ///
+    /// Greedy sequence from prompt "a" (→ token 1, eos_token_id=6):
+    ///   post-prefill: RMSNorm(embed[1]) = [0, 4, 0, …] → logit[2] = 4 wins → token 2
+    ///   decode step 1: RMSNorm(embed[2]) = [0, 0, 4, …] → logit[3] = 4 wins → stop(3)
+    fn rotation_model_fixture() -> Qwen35Model {
+        let cfg = make_test_config(16, 16, 7, 0);
+        let rope_dim = cfg.rope_dim();
+        let rope_max = cfg.max_position_embeddings.min(8192);
+        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+        let hidden = cfg.hidden_size; // 16
+        let vocab = cfg.vocab_size; // 7
+
+        // Standard basis: each active token lives in its own orthogonal dimension.
+        let mut embed = vec![0.0f32; vocab * hidden];
+        embed[hidden + 1] = 1.0; // token 1 → e_1
+        embed[2 * hidden + 2] = 1.0; // token 2 → e_2
+        embed[3 * hidden + 3] = 1.0; // token 3 → e_3 (stop)
+
+        // Forward-shift lm_head: e_1 direction wins token 2; e_2 direction wins token 3.
+        // With RMSNorm(gamma=0), hidden = 4 * e_i for token i (inv_rms = 4.0 at hidden=16).
+        let mut lm_head = vec![0.0f32; vocab * hidden];
+        lm_head[2 * hidden + 1] = 1.0; // logit[2] = 4 * 1 = 4 from token 1
+        lm_head[3 * hidden + 2] = 1.0; // logit[3] = 4 * 1 = 4 from token 2
+
+        Qwen35Model {
+            config: cfg.clone(),
+            weights: ModelWeights {
+                embed_tokens: embed,
+                lm_head: Some(lm_head),
+                final_norm: vec![0.0f32; hidden],
+                layers: vec![],
+            },
+            tokenizer: dummy_tokenizer(),
+            rope,
+            lora: Box::new(crate::lora_hook::NoopLoraHook),
+        }
+    }
+
+    /// `generate_with_batch_prefill` must stop on a token in `stop_token_ids`
+    /// even when that token differs from `eos_token_id`.
+    ///
+    /// Setup: all-zero weights → greedy sampling always picks token 0.
+    /// Config has eos_token_id=96 (not 0) and stop_token_ids=[0].
+    /// With the fix the first sampled token (0) hits the stop list and the
+    /// function returns 0 generated tokens.
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` in either check causes `0 == 96` to be false,
+    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_with_batch_prefill_honors_stop_token_ids() {
+        let model = zero_layer_batch_prefill_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (96)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = model
+            .generate_with_batch_prefill("a", &gen_cfg)
+            .expect("generate_with_batch_prefill must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "generate_with_batch_prefill must stop immediately when the first \
+             greedy token (0) is in stop_token_ids — got {} generated tokens instead",
+            out.generated_tokens
+        );
+    }
+
+    /// `generate_with_batch_prefill` must also stop when the stop token first
+    /// appears in the **decode loop**, not only at the post-prefill check.
+    ///
+    /// Fixture: rotation_model_fixture(). Greedy sequence from prompt "a" (token 1):
+    ///   post-prefill  → token 2  (not stop=3)
+    ///   decode step 1 → token 3  (stop) → decode-loop fires
+    ///
+    /// Mutation proof: reverting ONLY the decode-loop `should_stop_token` check
+    /// (line 444 at time of writing) to `next_id == cfg.eos_token_id` leaves
+    /// token 3 uncaught (3 ≠ eos=6), the sequence continues, and generated_tokens
+    /// becomes ≥ 2 — failing the assertion below.
+    #[test]
+    fn test_generate_with_batch_prefill_honors_stop_token_ids_decode_loop() {
+        let model = rotation_model_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            stop_token_ids: vec![3], // stop on token 3 mid-decode-loop; eos_token_id=6≠3
+            temperature: 0.0,        // greedy: deterministic forward-shift sequence
+            ..Default::default()
+        };
+
+        // Prompt "a" → token 1.
+        // Post-prefill generates token 2 (not stop).
+        // Decode step 1 generates token 3 → decode-loop stop fires.
+        let out = model
+            .generate_with_batch_prefill("a", &gen_cfg)
+            .expect("generate_with_batch_prefill must succeed");
+
+        assert_eq!(
+            out.generated_tokens, 1,
+            "generate_with_batch_prefill must stop at decode-loop step 1 when token 3 \
+             is in stop_token_ids — got {} tokens; reverting only the decode-loop check \
+             lets token 3 through and produces ≥ 2 tokens",
+            out.generated_tokens
+        );
+        assert!(
+            out.stopped,
+            "generate_with_batch_prefill must set stopped=true when the decode-loop stop fires"
+        );
     }
 
     /// Minimal byte-level BPE tokenizer parsed from a string — no temp file, no

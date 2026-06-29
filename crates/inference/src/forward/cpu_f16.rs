@@ -15,6 +15,7 @@ use crate::attention::gdn_fused::{
 use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::model::qwen35::{
     ForwardScratch, KvCache, decode_tokens, qwen35_rms_norm, resize, sample_token,
+    should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
@@ -908,7 +909,7 @@ pub fn generate_f16(
         &mut rng_state,
     );
 
-    if next_id == cfg.eos_token_id {
+    if should_stop_token(cfg, gen_cfg, next_id) {
         return Ok(GenerateOutput {
             text: String::new(),
             token_ids: vec![],
@@ -948,7 +949,7 @@ pub fn generate_f16(
             &mut rng_state,
         );
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
             break;
         }
@@ -1418,6 +1419,233 @@ mod tests {
     // comparison; it hardens the bench-only public `generate_f16` path against a
     // manually constructed f16 weight set whose router declares more experts than
     // the routed-expert storage holds.
+
+    /// Build a zero-layer F16 model fixture for generate_f16 unit tests.
+    ///
+    /// All-zero u16 (= f16 zero) embeddings → logits all 0 → greedy picks token 0.
+    /// eos_token_id = 5 so that greedy token 0 is NOT eos, making stop_token_ids=[0]
+    /// detectable as a distinct stop path.
+    fn zero_layer_f16_fixture() -> (Qwen35Config, F16ModelWeights, RopeTable, BpeTokenizer) {
+        use std::collections::HashMap;
+
+        let hidden = 4usize;
+        let vocab = 8usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos is 5 so that greedy token 0 is NOT eos — allows stop_token_ids=[0]
+            // to be a distinct, detectable stop signal.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // embed_tokens is [vocab * hidden] packed u16 (f16 zeros = 0u16).
+        // All zeros → logits all 0 → greedy always picks token 0.
+        let weights = F16ModelWeights {
+            embed_tokens: vec![0u16; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            layers: vec![],
+        };
+
+        // rope_dim = head_dim * partial_rotary_factor = 4 * 0.5 = 2.
+        let rope = RopeTable::new(2, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        (cfg, weights, rope, tokenizer)
+    }
+
+    /// `generate_f16` must stop on a token in `stop_token_ids` even when that
+    /// token differs from `eos_token_id`.
+    ///
+    /// Setup: all-zero f16 weights → greedy sampling always picks token 0.
+    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0].
+    /// With the fix the first sampled token (0) hits the stop list and the
+    /// function returns 0 generated tokens.
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` in either check causes `0 == 5` to be false,
+    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_f16_honors_stop_token_ids() {
+        let (cfg, weights, rope, tokenizer) = zero_layer_f16_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "h", &gen_cfg)
+            .expect("generate_f16 must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "generate_f16 must stop immediately when the first greedy token (0) \
+             is in stop_token_ids — got {} generated tokens instead",
+            out.generated_tokens
+        );
+    }
+
+    /// `generate_f16` must also stop when the stop token first appears in the
+    /// **decode loop**, not only at the post-prefill check.
+    ///
+    /// Fixture: a "bouncing" 0-layer f16 model.
+    ///   embed[0] = [-1, 1, 0, 0]  (token 0, f16)
+    ///   embed[1] = [ 1, 1, 0, 0]  (token 1, f16)
+    ///   final_norm gamma = [-2, 0, 0, 0]
+    ///
+    /// The negative gamma at dim-0 flips the sign of that component after RMSNorm,
+    /// creating a "bounce" between tokens 0 and 1:
+    ///   from token 1: hidden = [-√2, +√2, 0, 0] → logit[0] = 2√2 wins → generates 0
+    ///   from token 0: hidden = [+√2, +√2, 0, 0] → logit[1] = 2√2 wins → generates 1
+    ///
+    /// Greedy sequence from prompt "e" (→ token 1, eos_token_id=5):
+    ///   post-prefill  → token 0  (not stop=1)
+    ///   decode step 1 → token 1  (stop) → decode-loop fires
+    ///
+    /// Mutation proof: reverting ONLY the decode-loop `should_stop_token` check
+    /// (line 946 at time of writing) to `next_id == cfg.eos_token_id` leaves
+    /// token 1 uncaught (1 ≠ eos=5), the sequence continues, and generated_tokens
+    /// becomes ≥ 2 — failing the assertion below.
+    #[test]
+    fn test_generate_f16_honors_stop_token_ids_decode_loop() {
+        use crate::weights::f16_weights::f32_to_f16_slice;
+        use std::collections::HashMap;
+
+        let hidden = 4usize;
+        let vocab = 8usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos=5 so the stop at token 1 is detectable only via stop_token_ids.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // The negative gamma at dim-0 flips the sign of that component after
+        // RMSNorm, creating a deterministic "bounce" between tokens 0 and 1.
+        // from embed[1]=[1,1,0,0]: hidden→[-√2,+√2,0,0] → dot(embed[0]=[-1,1,..]) = 2√2 > 0
+        // from embed[0]=[-1,1,0,0]: hidden→[+√2,+√2,0,0] → dot(embed[1]=[1,1,..]) = 2√2 > 0
+        let embed_f32: Vec<f32> = {
+            let mut v = vec![0.0f32; vocab * hidden];
+            v[0] = -1.0; // token 0, dim 0
+            v[1] = 1.0; // token 0, dim 1
+            v[hidden] = 1.0; // token 1, dim 0
+            v[hidden + 1] = 1.0; // token 1, dim 1
+            v
+        };
+        let mut embed_f16 = vec![0u16; vocab * hidden];
+        f32_to_f16_slice(&embed_f32, &mut embed_f16);
+
+        let weights = F16ModelWeights {
+            embed_tokens: embed_f16,
+            final_norm: vec![-2.0f32, 0.0, 0.0, 0.0],
+            layers: vec![],
+        };
+
+        let rope = RopeTable::new(2, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            stop_token_ids: vec![1], // stop on token 1 mid-decode-loop; eos_token_id=5≠1
+            temperature: 0.0,        // greedy: deterministic bouncing sequence
+            ..Default::default()
+        };
+
+        // Prompt "e" → token 1.
+        // Post-prefill generates token 0 (not stop=1).
+        // Decode step 1 generates token 1 → decode-loop stop fires.
+        let out = generate_f16(&weights, &cfg, &tokenizer, &rope, "e", &gen_cfg)
+            .expect("generate_f16 must succeed");
+
+        assert_eq!(
+            out.generated_tokens, 1,
+            "generate_f16 must stop at decode-loop step 1 when token 1 is in \
+             stop_token_ids — got {} tokens; reverting only the decode-loop check \
+             lets token 1 through and produces ≥ 2 tokens",
+            out.generated_tokens
+        );
+        assert!(
+            out.stopped,
+            "generate_f16 must set stopped=true when the decode-loop stop fires"
+        );
+    }
 
     /// `generate_f16` must reject a `GenerateConfig` that sets `grammar` with a
     /// typed `InvalidInput` error before sampling any token (#397/#398).

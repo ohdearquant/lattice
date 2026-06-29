@@ -18,12 +18,13 @@ use crate::attention::gdn::{
     GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
 };
 use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
+use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, ModelWeights, decode_tokens, qwen35_rms_norm, resize,
-    sample_token,
+    sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
@@ -162,25 +163,29 @@ pub struct Q8NeonModel {
 // -----------------------------------------------------------------------
 
 /// Convert GDN weights to Q8_0 NEON packed format.
-fn pack_gdn_weights(w: &GatedDeltaNetWeights) -> Q8NeonGdnWeights {
-    Q8NeonGdnWeights {
-        in_proj_qkv_packed: pack_weights_q8(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols),
+fn pack_gdn_weights(w: &GatedDeltaNetWeights) -> Result<Q8NeonGdnWeights, InferenceError> {
+    Ok(Q8NeonGdnWeights {
+        in_proj_qkv_packed: pack_weights_q8(
+            &w.in_proj_qkv,
+            w.in_proj_qkv_rows,
+            w.in_proj_qkv_cols,
+        )?,
         in_proj_qkv_rows: w.in_proj_qkv_rows,
         in_proj_qkv_cols: w.in_proj_qkv_cols,
 
-        in_proj_z_packed: pack_weights_q8(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols),
+        in_proj_z_packed: pack_weights_q8(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols)?,
         in_proj_z_rows: w.in_proj_z_rows,
         in_proj_z_cols: w.in_proj_z_cols,
 
-        in_proj_b_packed: pack_weights_q8(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols),
+        in_proj_b_packed: pack_weights_q8(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols)?,
         in_proj_b_rows: w.in_proj_b_rows,
         in_proj_b_cols: w.in_proj_b_cols,
 
-        in_proj_a_packed: pack_weights_q8(&w.in_proj_a, w.in_proj_a_rows, w.in_proj_a_cols),
+        in_proj_a_packed: pack_weights_q8(&w.in_proj_a, w.in_proj_a_rows, w.in_proj_a_cols)?,
         in_proj_a_rows: w.in_proj_a_rows,
         in_proj_a_cols: w.in_proj_a_cols,
 
-        out_proj_packed: pack_weights_q8(&w.out_proj, w.out_proj_rows, w.out_proj_cols),
+        out_proj_packed: pack_weights_q8(&w.out_proj, w.out_proj_rows, w.out_proj_cols)?,
         out_proj_rows: w.out_proj_rows,
         out_proj_cols: w.out_proj_cols,
 
@@ -190,69 +195,74 @@ fn pack_gdn_weights(w: &GatedDeltaNetWeights) -> Q8NeonGdnWeights {
         conv_dim: w.conv_dim,
         kernel_size: w.kernel_size,
         norm_weight: w.norm_weight.clone(),
-    }
+    })
 }
 
 /// Convert full-attention weights to Q8_0 NEON packed format.
 fn pack_full_attn_weights(
     w: &FullAttentionLayerWeights,
     cfg: &Qwen35Config,
-) -> Q8NeonFullAttnWeights {
+) -> Result<Q8NeonFullAttnWeights, InferenceError> {
     let hidden = cfg.hidden_size;
     let q_dim = cfg.full_q_dim();
     let kv_dim = cfg.full_kv_dim();
     let q_proj_rows = 2 * q_dim; // Q + gate interleaved
 
-    Q8NeonFullAttnWeights {
-        q_proj_packed: pack_weights_q8(&w.q_proj, q_proj_rows, hidden),
+    Ok(Q8NeonFullAttnWeights {
+        q_proj_packed: pack_weights_q8(&w.q_proj, q_proj_rows, hidden)?,
         q_proj_rows,
         q_proj_cols: hidden,
 
-        k_proj_packed: pack_weights_q8(&w.k_proj, kv_dim, hidden),
+        k_proj_packed: pack_weights_q8(&w.k_proj, kv_dim, hidden)?,
         k_proj_rows: kv_dim,
         k_proj_cols: hidden,
 
-        v_proj_packed: pack_weights_q8(&w.v_proj, kv_dim, hidden),
+        v_proj_packed: pack_weights_q8(&w.v_proj, kv_dim, hidden)?,
         v_proj_rows: kv_dim,
         v_proj_cols: hidden,
 
-        o_proj_packed: pack_weights_q8(&w.o_proj, hidden, q_dim),
+        o_proj_packed: pack_weights_q8(&w.o_proj, hidden, q_dim)?,
         o_proj_rows: hidden,
         o_proj_cols: q_dim,
 
         q_norm: w.q_norm.clone(),
         k_norm: w.k_norm.clone(),
-    }
+    })
 }
 
 /// Convert common layer weights (MLP) to Q8_0 NEON packed format.
-fn pack_common_weights(w: &CommonLayerWeights, cfg: &Qwen35Config) -> Q8NeonCommonWeights {
+fn pack_common_weights(
+    w: &CommonLayerWeights,
+    cfg: &Qwen35Config,
+) -> Result<Q8NeonCommonWeights, InferenceError> {
     let hidden = cfg.hidden_size;
     let inter = cfg.intermediate_size;
 
     let (gate_proj, up_proj, down_proj) = match &w.ffn {
         FeedForwardWeights::Dense(dense) => (&dense.gate_proj, &dense.up_proj, &dense.down_proj),
         FeedForwardWeights::Moe(_) => {
-            panic!("Q8 NEON packing is dense-only; MoE configs are not supported");
+            return Err(InferenceError::InvalidInput(
+                "Q8 NEON packing is dense-only; MoE layer configs are not supported".into(),
+            ));
         }
     };
 
-    Q8NeonCommonWeights {
+    Ok(Q8NeonCommonWeights {
         input_layernorm: w.input_layernorm.clone(),
         post_attention_layernorm: w.post_attention_layernorm.clone(),
 
-        gate_proj_packed: pack_weights_q8(gate_proj, inter, hidden),
+        gate_proj_packed: pack_weights_q8(gate_proj, inter, hidden)?,
         gate_proj_rows: inter,
         gate_proj_cols: hidden,
 
-        up_proj_packed: pack_weights_q8(up_proj, inter, hidden),
+        up_proj_packed: pack_weights_q8(up_proj, inter, hidden)?,
         up_proj_rows: inter,
         up_proj_cols: hidden,
 
-        down_proj_packed: pack_weights_q8(down_proj, hidden, inter),
+        down_proj_packed: pack_weights_q8(down_proj, hidden, inter)?,
         down_proj_rows: hidden,
         down_proj_cols: inter,
-    }
+    })
 }
 
 /// **Unstable**: quantize model weights to Q8_0 NEON format; packing strategy may change.
@@ -265,7 +275,15 @@ fn pack_common_weights(w: &CommonLayerWeights, cfg: &Qwen35Config) -> Q8NeonComm
 ///
 /// The lm_head (logits projection) is packed separately from the embedding table:
 /// embed_tokens stays f32 for lookup, lm_head gets Q8_0 for the final matmul.
-pub fn quantize_model(weights: &ModelWeights, cfg: &Qwen35Config) -> Q8NeonModel {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any weight element is non-finite,
+/// or if the model contains MoE layers (Q8 NEON packing is dense-only).
+pub fn quantize_model(
+    weights: &ModelWeights,
+    cfg: &Qwen35Config,
+) -> Result<Q8NeonModel, InferenceError> {
     let hidden = cfg.hidden_size;
     let vocab = cfg.vocab_size;
 
@@ -275,28 +293,28 @@ pub fn quantize_model(weights: &ModelWeights, cfg: &Qwen35Config) -> Q8NeonModel
         .map(|(attn, common)| {
             let q8_attn = match attn {
                 AttentionWeights::Linear(gdn_w) => {
-                    Q8NeonAttentionWeights::Linear(pack_gdn_weights(gdn_w))
+                    Q8NeonAttentionWeights::Linear(pack_gdn_weights(gdn_w)?)
                 }
                 AttentionWeights::Full(full_w) => {
-                    Q8NeonAttentionWeights::Full(pack_full_attn_weights(full_w, cfg))
+                    Q8NeonAttentionWeights::Full(pack_full_attn_weights(full_w, cfg)?)
                 }
             };
-            let q8_common = pack_common_weights(common, cfg);
-            (q8_attn, q8_common)
+            let q8_common = pack_common_weights(common, cfg)?;
+            Ok((q8_attn, q8_common))
         })
-        .collect();
+        .collect::<Result<Vec<_>, InferenceError>>()?;
 
     // Pack the actual output projection; for Qwen3.6 this is untied lm_head.weight.
-    let lm_head_packed = pack_weights_q8(weights.logits_weight(), vocab, hidden);
+    let lm_head_packed = pack_weights_q8(weights.logits_weight(), vocab, hidden)?;
 
-    Q8NeonModel {
+    Ok(Q8NeonModel {
         embed_tokens: weights.embed_tokens.clone(),
         final_norm: weights.final_norm.clone(),
         lm_head_packed,
         lm_head_rows: vocab,
         lm_head_cols: hidden,
         layers,
-    }
+    })
 }
 
 // -----------------------------------------------------------------------
@@ -950,7 +968,7 @@ pub fn generate_q8_neon(
         &mut rng_state,
     );
 
-    if next_id == cfg.eos_token_id {
+    if should_stop_token(cfg, gen_cfg, next_id) {
         return Ok(GenerateOutput {
             text: String::new(),
             token_ids: vec![],
@@ -990,7 +1008,7 @@ pub fn generate_q8_neon(
             &mut rng_state,
         );
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
             break;
         }
@@ -1046,7 +1064,8 @@ pub mod bench_support {
 
     fn gen_weights_q8(n: usize, k: usize, rng: &mut u64) -> Vec<u8> {
         let floats: Vec<f32> = (0..n * k).map(|_| xorshift64(rng)).collect();
-        pack_weights_q8(&floats, n, k)
+        // Fixture weights are generated from a bounded LCG — always finite.
+        pack_weights_q8(&floats, n, k).unwrap()
     }
 
     impl Q8ForwardBenchFixture {
@@ -1188,7 +1207,8 @@ pub mod bench_support {
                     s as f32 / 0x10000_u64 as f32 * 0.04 - 0.02
                 })
                 .collect();
-            let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden);
+            // Fixture embed is bounded LCG output — always finite.
+            let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden).unwrap();
 
             let model = Q8NeonModel {
                 embed_tokens,
@@ -1307,7 +1327,8 @@ pub mod bench_support {
                     s as f32 / 0x10000_u64 as f32 * 0.04 - 0.02
                 })
                 .collect();
-            let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden);
+            // Fixture embed is bounded LCG output — always finite.
+            let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden).unwrap();
 
             let model = Q8NeonModel {
                 embed_tokens,
@@ -1400,7 +1421,7 @@ mod tests {
 
     /// Helper: create a zero Q8_0 packed weight buffer for [n, k].
     fn zero_packed(n: usize, k: usize) -> Vec<u8> {
-        pack_weights_q8(&vec![0.0f32; n * k], n, k)
+        pack_weights_q8(&vec![0.0f32; n * k], n, k).unwrap()
     }
 
     #[test]
@@ -1477,7 +1498,7 @@ mod tests {
             ],
         };
 
-        let q8 = quantize_model(&weights, &cfg);
+        let q8 = quantize_model(&weights, &cfg).unwrap();
 
         // Check lm_head packed size
         assert_eq!(q8.lm_head_packed.len(), q8_packed_size(vocab, hidden));
@@ -1799,7 +1820,7 @@ mod tests {
             for j in 0..kv_dim {
                 mat[j * hidden + j] = 1.0;
             }
-            pack_weights_q8(&mat, kv_dim, hidden)
+            pack_weights_q8(&mat, kv_dim, hidden).unwrap()
         };
 
         // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
@@ -1810,7 +1831,7 @@ mod tests {
             for j in 0..q_dim {
                 mat[j * hidden + j] = 1.0;
             }
-            pack_weights_q8(&mat, 2 * q_dim, hidden)
+            pack_weights_q8(&mat, 2 * q_dim, hidden).unwrap()
         };
 
         let weights = Q8NeonFullAttnWeights {
@@ -1995,7 +2016,8 @@ mod tests {
                     ((seed >> 33) as f32 / u32::MAX as f32) * 0.04 - 0.02
                 })
                 .collect();
-            pack_weights_q8(&floats, n, k)
+            // LCG output is bounded — always finite.
+            pack_weights_q8(&floats, n, k).unwrap()
         };
 
         let gdn_w = Q8NeonGdnWeights {
@@ -2049,7 +2071,8 @@ mod tests {
                         ((*seed >> 33) as f32 / u32::MAX as f32) * 0.04 - 0.02
                     })
                     .collect();
-                pack_weights_q8(&floats, n, k)
+                // LCG output is bounded — always finite.
+                pack_weights_q8(&floats, n, k).unwrap()
             };
             Q8NeonCommonWeights {
                 input_layernorm: vec![0.0f32; hidden],
@@ -2076,7 +2099,8 @@ mod tests {
                 s as f32 / 0x10000_u64 as f32 * 0.04 - 0.02
             })
             .collect();
-        let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden);
+        // Fixture embed is bounded hash output — always finite.
+        let lm_head_packed = pack_weights_q8(&embed_tokens, vocab, hidden).unwrap();
 
         let model = Q8NeonModel {
             embed_tokens,
@@ -2252,7 +2276,8 @@ mod tests {
             for j in 0..rows.min(hidden) {
                 mat[j * hidden + j] = 1.0;
             }
-            pack_weights_q8(&mat, rows, hidden)
+            // Identity matrices contain only 0.0 and 1.0 — always finite.
+            pack_weights_q8(&mat, rows, hidden).unwrap()
         };
         let weights = Q8NeonFullAttnWeights {
             q_proj_packed: identity(2 * q_dim),
@@ -2424,6 +2449,222 @@ mod tests {
         assert!(
             msg.contains("context window"),
             "error should mention context window, got: {msg}"
+        );
+    }
+
+    /// `generate_q8_neon` must stop on a token in `stop_token_ids` even when
+    /// that token differs from `eos_token_id`.
+    ///
+    /// Setup: hidden=64 (must be multiple of 32 for Q8_0), vocab=64, all-zero
+    /// weights → logits all 0 → greedy always picks token 0.
+    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0].
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` in either check causes `0 == 5` to be false,
+    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_q8_neon_honors_stop_token_ids() {
+        use std::collections::HashMap;
+
+        // Q8_0 requires hidden % 32 == 0; use 64.
+        let hidden = 64usize;
+        let vocab = 64usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 64,
+            linear_value_head_dim: 64,
+            linear_conv_kernel_dim: 64,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos is 5 so token 0 is NOT eos — stop_token_ids=[0] is the
+            // distinct stop path we are testing.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // All-zero packed weights: scale=0, all i8=0 → logits all 0 → greedy picks 0.
+        let model = Q8NeonModel {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            lm_head_packed: zero_packed(vocab, hidden),
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+
+        // rope_dim = head_dim * partial_rotary_factor = 64 * 0.5 = 32 (multiple of 32 ✓)
+        let rope = RopeTable::new(32, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![("h".to_string(), "e".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "h", &gen_cfg)
+            .expect("generate_q8_neon must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "generate_q8_neon must stop immediately when the first greedy token (0) \
+             is in stop_token_ids — got {} generated tokens instead",
+            out.generated_tokens
+        );
+    }
+
+    /// `generate_q8_neon` must also stop when the stop token first appears in the
+    /// **decode loop**, not only at the post-prefill check.
+    ///
+    /// Fixture: a "bouncing" 0-layer Q8 model.
+    ///   embed[0] = [-1, 1, 0, ..., 0]  (64 dims, first two non-zero)
+    ///   embed[1] = [ 1, 1, 0, ..., 0]
+    ///   lm_head_packed = pack_weights_q8 of the same matrix (mimics tied weights)
+    ///   final_norm gamma = [-2, 0, ..., 0]
+    ///
+    /// The negative gamma at dim-0 flips that component after RMSNorm, creating a
+    /// deterministic bounce between tokens 0 and 1 (Q8 rounding preserves ordering):
+    ///   from token 1: hidden ∝ [-c, +c, 0, …] → Q8 dot → logit[0] > logit[1]
+    ///   from token 0: hidden ∝ [+c, +c, 0, …] → Q8 dot → logit[1] > logit[0]
+    ///
+    /// Greedy sequence from prompt "e" (→ token 1, eos_token_id=5):
+    ///   post-prefill  → token 0  (not stop=1)
+    ///   decode step 1 → token 1  (stop) → decode-loop fires
+    ///
+    /// Mutation proof: reverting ONLY the decode-loop `should_stop_token` check
+    /// (line 987 at time of writing) to `next_id == cfg.eos_token_id` leaves
+    /// token 1 uncaught (1 ≠ eos=5), the sequence continues, and generated_tokens
+    /// becomes ≥ 2 — failing the assertion below.
+    #[test]
+    fn test_generate_q8_neon_honors_stop_token_ids_decode_loop() {
+        use std::collections::HashMap;
+
+        // Q8_0 requires hidden % 32 == 0; use 64 (same as the post-prefill test).
+        let hidden = 64usize;
+        let vocab = 64usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 64,
+            linear_value_head_dim: 64,
+            linear_conv_kernel_dim: 64,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos=5 so the stop at token 1 is detectable only via stop_token_ids.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // The negative gamma at dim-0 creates a "bounce" each decode step.
+        // from embed[1]=[1,1,0,…]: hidden∝[-c,+c,0,…] → Q8 matmul → logit[0] > 0 wins
+        // from embed[0]=[-1,1,0,…]: hidden∝[+c,+c,0,…] → Q8 matmul → logit[1] > 0 wins
+        let mut embed_f32 = vec![0.0f32; vocab * hidden];
+        embed_f32[0] = -1.0; // token 0, dim 0
+        embed_f32[1] = 1.0; // token 0, dim 1
+        embed_f32[hidden] = 1.0; // token 1, dim 0
+        embed_f32[hidden + 1] = 1.0; // token 1, dim 1
+
+        // Embed values are ±1.0 or 0.0 — all finite.
+        let lm_head_packed = pack_weights_q8(&embed_f32, vocab, hidden).unwrap();
+
+        let mut final_norm = vec![0.0f32; hidden];
+        final_norm[0] = -2.0; // flip dim-0 sign after RMSNorm to drive the bounce
+
+        let model = Q8NeonModel {
+            embed_tokens: embed_f32,
+            final_norm,
+            lm_head_packed,
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+
+        let rope = RopeTable::new(32, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![("h".to_string(), "e".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            stop_token_ids: vec![1], // stop on token 1 mid-decode-loop; eos_token_id=5≠1
+            temperature: 0.0,        // greedy: deterministic bouncing sequence
+            ..Default::default()
+        };
+
+        // Prompt "e" → token 1.
+        // Post-prefill generates token 0 (not stop=1).
+        // Decode step 1 generates token 1 → decode-loop stop fires.
+        let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "e", &gen_cfg)
+            .expect("generate_q8_neon must succeed");
+
+        assert_eq!(
+            out.generated_tokens, 1,
+            "generate_q8_neon must stop at decode-loop step 1 when token 1 is in \
+             stop_token_ids — got {} tokens; reverting only the decode-loop check \
+             lets token 1 through and produces ≥ 2 tokens",
+            out.generated_tokens
+        );
+        assert!(
+            out.stopped,
+            "generate_q8_neon must set stopped=true when the decode-loop stop fires"
         );
     }
 

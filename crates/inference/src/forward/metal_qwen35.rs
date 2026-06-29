@@ -4371,12 +4371,26 @@ kernel void gdn_chunk_norm_silu_c32(
     const Q4_0_BLOCK_SIZE: usize = 20;
 
     /// Quantize a row of f32 weights to Q8_0 blocks.
-    fn quantize_row_q8_0(src: &[f32]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any element in `src` is non-finite (NaN or ±inf).
+    /// IEEE 754: `NaN > x` is always false, so a fold-max over NaN leaves
+    /// `amax` unchanged and the NaN is silently cast to 0 by the `clamp` below.
+    fn quantize_row_q8_0(src: &[f32]) -> Result<Vec<u8>, String> {
         assert_eq!(src.len() % QK8_0, 0);
         let nblocks = src.len() / QK8_0;
         let mut packed = Vec::with_capacity(nblocks * Q8_0_BLOCK_SIZE);
         for b in 0..nblocks {
             let block = &src[b * QK8_0..(b + 1) * QK8_0];
+            for &v in block {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "Q8_0 weight block {b} contains a non-finite value ({v}); \
+                         source weights must be finite"
+                    ));
+                }
+            }
             let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             let d = amax / 127.0;
             let id = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -4385,13 +4399,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 packed.push((v * id).round().clamp(-127.0, 127.0) as i8 as u8);
             }
         }
-        packed
+        Ok(packed)
     }
 
     /// Create a Metal buffer with Q8_0 quantized weights from f32 data.
-    fn make_buffer_q8_0(device: &Device, data: &[f32], label: &str) -> Buffer {
+    fn make_buffer_q8_0(device: &Device, data: &[f32], label: &str) -> Result<Buffer, String> {
         assert_eq!(data.len() % QK8_0, 0);
-        let packed = quantize_row_q8_0(data);
+        let packed = quantize_row_q8_0(data)?;
         let byte_len = packed.len() as u64;
         let buf = device.new_buffer_with_data(
             packed.as_ptr() as *const _,
@@ -4399,17 +4413,17 @@ kernel void gdn_chunk_norm_silu_c32(
             MTLResourceOptions::StorageModeShared,
         );
         buf.set_label(label);
-        buf
+        Ok(buf)
     }
 
-    fn make_buffer_q4_0(device: &Device, data: &[f32], label: &str) -> Buffer {
+    fn make_buffer_q4_0(device: &Device, data: &[f32], label: &str) -> Result<Buffer, String> {
         assert_eq!(
             data.len() % QK4_0,
             0,
             "make_buffer_q4_0: data length {} not divisible by {QK4_0}",
             data.len()
         );
-        let packed = quantize_row_q4_0(data);
+        let packed = quantize_row_q4_0(data).map_err(|e| e.to_string())?;
         let byte_len = packed.len() as u64;
         let buf = device.new_buffer_with_data(
             packed.as_ptr() as *const _,
@@ -4417,7 +4431,7 @@ kernel void gdn_chunk_norm_silu_c32(
             MTLResourceOptions::StorageModeShared,
         );
         buf.set_label(label);
-        buf
+        Ok(buf)
     }
 
     fn make_zero_buffer(device: &Device, num_floats: usize, label: &str) -> Buffer {
@@ -5021,7 +5035,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 QuantFormat::Q8_0 => Q8_0_BLOCK_SIZE,
                 QuantFormat::Q4_0 => Q4_0_BLOCK_SIZE,
             };
-            let pack_quant = |data: &[f32]| -> Vec<u8> {
+            let pack_quant = |data: &[f32]| -> Result<Vec<u8>, String> {
                 match quant_format {
                     QuantFormat::Q8_0 => {
                         assert_eq!(data.len() % QK8_0, 0);
@@ -5034,7 +5048,7 @@ kernel void gdn_chunk_norm_silu_c32(
                             "pack_quant: data length {} not divisible by {QK4_0}",
                             data.len()
                         );
-                        quantize_row_q4_0(data)
+                        quantize_row_q4_0(data).map_err(|e| e.to_string())
                     }
                 }
             };
@@ -5055,20 +5069,21 @@ kernel void gdn_chunk_norm_silu_c32(
                     buf.set_label(label);
                     buf
                 };
-            let make_buffer_quant = |device: &Device, data: &[f32], label: &str| -> Buffer {
-                match quant_format {
-                    QuantFormat::Q8_0 => make_buffer_q8_0(device, data, label),
-                    QuantFormat::Q4_0 => make_buffer_q4_0(device, data, label),
-                }
-            };
+            let make_buffer_quant =
+                |device: &Device, data: &[f32], label: &str| -> Result<Buffer, String> {
+                    match quant_format {
+                        QuantFormat::Q8_0 => make_buffer_q8_0(device, data, label),
+                        QuantFormat::Q4_0 => make_buffer_q4_0(device, data, label),
+                    }
+                };
 
             let mut layer_weights = Vec::with_capacity(cfg.num_hidden_layers);
             for (i, (attn_w, common_w)) in weights.layers.iter().enumerate() {
                 // Build the FFN weight variant for this layer (Dense or MoE).
                 let metal_ffn = match &common_w.ffn {
                     crate::model::qwen35::FeedForwardWeights::Dense(d) => {
-                        let gate_bytes = pack_quant(&d.gate_proj);
-                        let up_bytes = pack_quant(&d.up_proj);
+                        let gate_bytes = pack_quant(&d.gate_proj)?;
+                        let up_bytes = pack_quant(&d.up_proj)?;
                         debug_assert_eq!(
                             d.gate_proj.len(),
                             cfg.intermediate_size * cfg.hidden_size
@@ -5090,7 +5105,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &d.down_proj,
                                 &format!("L{i}.down.{quant_tag}"),
-                            )),
+                            )?),
                         }
                     }
                     crate::model::qwen35::FeedForwardWeights::Moe(m) => {
@@ -5211,12 +5226,12 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &gdn_w.in_proj_qkv,
                                 &format!("L{i}.gdn.qkv.{quant_tag}"),
-                            )),
+                            )?),
                             in_proj_z: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &gdn_w.in_proj_z,
                                 &format!("L{i}.gdn.z.{quant_tag}"),
-                            )),
+                            )?),
                             in_proj_qkvz: {
                                 let mut combined = gdn_w.in_proj_qkv.clone();
                                 combined.extend_from_slice(&gdn_w.in_proj_z);
@@ -5224,7 +5239,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                     &device,
                                     &combined,
                                     &format!("L{i}.gdn.qkvz.{quant_tag}"),
-                                ))
+                                )?)
                             },
                             // in_proj_b/a: keep f16 — CPU reads these for GDN recurrence
                             in_proj_b: make_buffer_f16(
@@ -5260,7 +5275,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &gdn_w.out_proj,
                                 &format!("L{i}.gdn.out.{quant_tag}"),
-                            )),
+                            )?),
                         })
                     }
                     AttentionWeights::Full(full_w) => {
@@ -5270,22 +5285,22 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &full_w.q_proj,
                                 &format!("L{i}.full.q.{quant_tag}"),
-                            )),
+                            )?),
                             k_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.k_proj,
                                 &format!("L{i}.full.k.{quant_tag}"),
-                            )),
+                            )?),
                             v_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.v_proj,
                                 &format!("L{i}.full.v.{quant_tag}"),
-                            )),
+                            )?),
                             o_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.o_proj,
                                 &format!("L{i}.full.o.{quant_tag}"),
-                            )),
+                            )?),
                             // Norm weights stay f32 (small, precision-sensitive)
                             q_norm: make_buffer(
                                 &device,
@@ -5312,7 +5327,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 &device,
                 &weights.embed_tokens,
                 &format!("embed_tokens.{quant_tag}"),
-            ));
+            )?);
             // Final norm: f32 (small, precision-sensitive)
             let final_norm = make_buffer(&device, &weights.final_norm, "final_norm");
 
@@ -14688,6 +14703,30 @@ kernel void gdn_chunk_norm_silu_c32(
             );
         }
 
+        // Mutation proof: reverting the is_finite() guard makes this test pass NaN
+        // through undetected (NaN.abs() is NaN, m.max(NaN) == m, so amax stays 0.0,
+        // scale stays 0.0, and NaN * 0.0 = NaN → clamp → 0 silently). With the guard
+        // the function returns Err before any NaN reaches the scale computation.
+        #[test]
+        fn quantize_row_q8_0_rejects_nan() {
+            let mut row = vec![0.0f32; 32];
+            row[7] = f32::NAN;
+            assert!(
+                quantize_row_q8_0(&row).is_err(),
+                "quantize_row_q8_0 must return Err when a block element is NaN"
+            );
+        }
+
+        #[test]
+        fn quantize_row_q8_0_rejects_inf() {
+            let mut row = vec![0.5f32; 32];
+            row[0] = f32::INFINITY;
+            assert!(
+                quantize_row_q8_0(&row).is_err(),
+                "quantize_row_q8_0 must return Err when a block element is +Inf"
+            );
+        }
+
         /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` (NEON
         /// on aarch64, scalar on other targets) produces bit-identical output to the
         /// scalar `f16_to_f32` reference for every pattern.
@@ -16834,7 +16873,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
             let mut deq_weights = Vec::with_capacity(n * k);
             for row in weights_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 deq_weights.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 packed_bytes.extend_from_slice(&row_packed);
             }
@@ -17230,7 +17269,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 34);
             let mut deq_weights = Vec::with_capacity(n * k);
             for row in weights_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q8_0(row);
+                let row_packed = quantize_row_q8_0(row).unwrap();
                 // Dequantize for CPU reference: each 34-byte block has f16 scale + 32 i8 values.
                 for block in row_packed.chunks_exact(34) {
                     let scale_bits = (block[0] as u16) | ((block[1] as u16) << 8);
@@ -17543,7 +17582,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
             let mut w_deq = Vec::with_capacity(n * k);
             for row in w_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 w_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 packed_bytes.extend_from_slice(&row_packed);
             }
@@ -17622,7 +17661,7 @@ kernel void decode_attention_reference(
             let mut nz_packed = Vec::with_capacity(n * (k / 32) * 20);
             let mut nz_deq = Vec::with_capacity(n * k);
             for row in w_nz.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 nz_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 nz_packed.extend_from_slice(&row_packed);
             }
@@ -19672,6 +19711,37 @@ kernel void decode_attention_reference(
                 "RACE-LOCALIZATION: chunked-vs-serial state max_abs_diff = {:.6}",
                 max_diff(&chunked_a, &serial_a)
             );
+        }
+
+        // -------------------------------------------------------------------
+        // Q8_0 non-finite input guard — mutation-sensitive (Finding 1, PR #452)
+        //
+        // IEEE 754: `NaN > x` is always false, so a fold-max over a block
+        // containing NaN leaves `amax` unchanged, and the NaN element is
+        // silently cast to 0 by the `clamp`, producing a plausible-looking
+        // packed buffer with a wrong entry and no error.
+        //
+        // Mutation sensitivity: removing the `if !v.is_finite()` guard in
+        // `quantize_row_q8_0` converts both Err returns to Ok, making
+        // `result.is_err()` false and failing both assertions.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_quantize_row_q8_0_rejects_nan() {
+            // A block with one NaN must return Err, not silently encode it as 0.
+            let mut vals = vec![1.0f32; 32];
+            vals[5] = f32::NAN;
+            let result = quantize_row_q8_0(&vals);
+            assert!(result.is_err(), "NaN in Q8_0 weight block must return Err");
+        }
+
+        #[test]
+        fn test_quantize_row_q8_0_rejects_inf() {
+            // A block with +inf must return Err; is_finite() rejects NaN, +inf, and -inf.
+            let mut vals = vec![1.0f32; 32];
+            vals[15] = f32::INFINITY;
+            let result = quantize_row_q8_0(&vals);
+            assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
         }
     }
 }
