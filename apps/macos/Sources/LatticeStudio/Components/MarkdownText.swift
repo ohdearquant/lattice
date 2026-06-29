@@ -15,7 +15,7 @@ struct MarkdownText: View {
     let text: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+        VStack(alignment: .leading, spacing: Theme.Space.lg) {
             ForEach(Array(MarkdownParser.parse(text).enumerated()), id: \.offset) { _, block in
                 view(for: block)
             }
@@ -38,6 +38,7 @@ struct MarkdownText: View {
             MarkdownParser.inline(content)
                 .font(Theme.Fonts.body)
                 .foregroundStyle(Theme.Palette.ink)
+                .lineSpacing(5)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -53,6 +54,7 @@ struct MarkdownText: View {
                         MarkdownParser.inline(item)
                             .font(Theme.Fonts.body)
                             .foregroundStyle(Theme.Palette.ink)
+                            .lineSpacing(5)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)

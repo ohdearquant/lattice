@@ -649,6 +649,10 @@ pub struct GenerateConfig {
     /// Additional string-level stop sequences. When any appears in the output, generation
     /// halts and the matched text is excluded. Empty = disabled (default; parity-safe).
     pub stop_strings: Vec<String>,
+    /// Reasoning-budget forcing (s1-style): after this many reasoning tokens are
+    /// generated without a `</think>`, force-inject `</think>` to commit the model
+    /// to an answer. `None` or `Some(0)` = disabled (no behaviour change).
+    pub reasoning_budget: Option<usize>,
 }
 
 impl std::fmt::Debug for GenerateConfig {
@@ -665,6 +669,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("enable_mtp", &self.enable_mtp)
             .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
             .field("stop_strings", &self.stop_strings)
+            .field("reasoning_budget", &self.reasoning_budget)
             .finish()
     }
 }
@@ -683,7 +688,50 @@ impl Default for GenerateConfig {
             enable_mtp: None,
             grammar: None,
             stop_strings: vec![],
+            reasoning_budget: None,
         }
+    }
+}
+
+/// Decide whether to force-close the thinking block this step (s1 budget forcing).
+///
+/// Returns `Some(close_id)` to override the sampled token with `</think>`, else `None`.
+/// All conditions must hold: budget enabled and non-zero, thinking block is still open,
+/// enough tokens have been generated. Returns `None` immediately if any guard fails so
+/// the common disabled path costs a single `Option::None` check per step.
+#[inline]
+pub(crate) fn force_close_think(
+    reasoning_budget: Option<usize>,
+    enable_thinking: bool,
+    thinking_closed: bool,
+    generated_so_far: usize,
+    close_id: Option<u32>,
+) -> Option<u32> {
+    let budget = reasoning_budget?;
+    let close = close_id?;
+    if enable_thinking && !thinking_closed && budget > 0 && generated_so_far >= budget {
+        Some(close)
+    } else {
+        None
+    }
+}
+
+/// Decode-loop iteration cap.
+///
+/// When a reasoning budget is active, reasoning tokens get their OWN budget (`rb`) ON TOP
+/// of the answer budget (`max_new_tokens`), plus **1** for the forced `</think>` delimiter
+/// itself: worst case `rb + max_new_tokens + 1` total tokens. The +1 is necessary because
+/// the forced `</think>` is an extra token that is not part of either the reasoning content
+/// or the answer — omitting it leaves the answer one token short (off-by-one).
+///
+/// Without a budget (`None` or `Some(0)`) the cap is unchanged (`max_new_tokens`), so the
+/// disabled path is byte-identical to the pre-budget behaviour (parity-safe).
+#[inline]
+pub(crate) fn decode_cap(reasoning_budget: Option<usize>, max_new_tokens: usize) -> usize {
+    match reasoning_budget {
+        // rb reasoning-content tokens + 1 forced </think> delimiter + max_new_tokens answer tokens.
+        Some(rb) if rb > 0 => rb.saturating_add(max_new_tokens).saturating_add(1),
+        _ => max_new_tokens,
     }
 }
 
@@ -1395,6 +1443,123 @@ mod tests {
         assert_eq!(
             cfg.kv_bytes_per_token(1),
             cfg.num_hidden_layers * cfg.head_dim
+        );
+    }
+
+    // ── decode_cap unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn decode_cap_none_budget_returns_max() {
+        // Disabled path must be byte-identical to the pre-budget behaviour.
+        assert_eq!(decode_cap(None, 512), 512);
+        assert_eq!(decode_cap(None, 0), 0);
+    }
+
+    #[test]
+    fn decode_cap_zero_budget_returns_max() {
+        // Some(0) is treated as disabled.
+        assert_eq!(decode_cap(Some(0), 512), 512);
+        assert_eq!(decode_cap(Some(0), 1), 1);
+    }
+
+    #[test]
+    fn decode_cap_nonzero_budget_adds_budgets() {
+        // Worst case = rb + max_new_tokens + 1 (the +1 is the forced </think> delimiter).
+        // Mutation-sensitive: revert to rb+max and these assertions fail.
+        assert_eq!(decode_cap(Some(2048), 512), 2561);
+        assert_eq!(decode_cap(Some(1), 1), 3);
+        assert_eq!(decode_cap(Some(100), 200), 301);
+    }
+
+    #[test]
+    fn decode_cap_saturates_on_overflow() {
+        // saturating_add must not wrap on usize::MAX inputs.
+        assert_eq!(decode_cap(Some(usize::MAX), 1), usize::MAX);
+        assert_eq!(decode_cap(Some(1), usize::MAX), usize::MAX);
+    }
+
+    // ── force_close_think unit tests ────────────────────────────────────────
+
+    #[test]
+    fn force_close_think_disabled_when_budget_none() {
+        // budget=None → always returns None regardless of other args.
+        assert_eq!(
+            force_close_think(None, true, false, 100, Some(99)),
+            None,
+            "None budget must disable forcing"
+        );
+    }
+
+    #[test]
+    fn force_close_think_disabled_when_budget_zero() {
+        // budget=Some(0) → budget > 0 guard fails → None.
+        assert_eq!(
+            force_close_think(Some(0), true, false, 100, Some(99)),
+            None,
+            "budget=0 must disable forcing"
+        );
+    }
+
+    #[test]
+    fn force_close_think_disabled_when_enable_thinking_false() {
+        // enable_thinking=false → no reasoning block → forcing is a no-op.
+        assert_eq!(
+            force_close_think(Some(10), false, false, 20, Some(99)),
+            None,
+            "enable_thinking=false must disable forcing"
+        );
+    }
+
+    #[test]
+    fn force_close_think_disabled_when_already_closed() {
+        // thinking_closed=true → block already closed → should not force again.
+        assert_eq!(
+            force_close_think(Some(10), true, true, 20, Some(99)),
+            None,
+            "already-closed thinking block must not force again"
+        );
+    }
+
+    #[test]
+    fn force_close_think_disabled_when_close_id_none() {
+        // close_id=None → model has no </think> token → forcing is a no-op.
+        assert_eq!(
+            force_close_think(Some(10), true, false, 20, None),
+            None,
+            "close_id=None must disable forcing"
+        );
+    }
+
+    #[test]
+    fn force_close_think_fires_at_budget_boundary() {
+        let close_id = 248_069_u32;
+        // generated_so_far == budget → should force (mutation: >= not >).
+        assert_eq!(
+            force_close_think(Some(10), true, false, 10, Some(close_id)),
+            Some(close_id),
+            "must force when generated_so_far equals budget"
+        );
+        // generated_so_far > budget → also forces.
+        assert_eq!(
+            force_close_think(Some(10), true, false, 11, Some(close_id)),
+            Some(close_id),
+            "must force when generated_so_far exceeds budget"
+        );
+    }
+
+    #[test]
+    fn force_close_think_does_not_fire_before_budget() {
+        let close_id = 248_069_u32;
+        // generated_so_far < budget → must NOT force (mutation-sensitive boundary).
+        assert_eq!(
+            force_close_think(Some(10), true, false, 9, Some(close_id)),
+            None,
+            "must not force when generated_so_far is one below budget"
+        );
+        assert_eq!(
+            force_close_think(Some(10), true, false, 0, Some(close_id)),
+            None,
+            "must not force when zero tokens generated"
         );
     }
 }

@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-APP_NAME="LatticeStudio"
+APP_NAME="Lattice"
 BUNDLE="$OUT_DIR/$APP_NAME.app"
 VERSION="0.3.0"
 BUNDLE_ID="ai.khive.lattice.studio"
@@ -86,6 +86,11 @@ if [ "$SKIP_CARGO" = false ]; then
     cargo build --release -p lattice-inference --bin chat_metal \
         --features "f16,metal-gpu" \
         --manifest-path "$REPO_ROOT/Cargo.toml"
+    # lattice-inference: lattice_serve is the OpenAI-format HTTP daemon for the tray (bench harnesses)
+    echo "    cargo build --release -p lattice-inference --bin lattice_serve --features f16,metal-gpu"
+    cargo build --release -p lattice-inference --bin lattice_serve \
+        --features "f16,metal-gpu" \
+        --manifest-path "$REPO_ROOT/Cargo.toml"
     # lattice-embed: embed CLI (native default features)
     echo "    cargo build --release -p lattice-embed --bin embed"
     cargo build --release -p lattice-embed --bin embed \
@@ -93,13 +98,13 @@ if [ "$SKIP_CARGO" = false ]; then
 fi
 
 TARGET_RELEASE="$REPO_ROOT/target/release"
-for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal; do
+for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal lattice_serve; do
     if [ ! -x "$TARGET_RELEASE/$BIN" ]; then
         echo "ERROR: $TARGET_RELEASE/$BIN not found"
         exit 1
     fi
 done
-echo "    All 9 engine binaries present"
+echo "    All 10 engine binaries present"
 
 # --- Step 3: Construct .app bundle ---
 echo ""
@@ -113,11 +118,11 @@ cp "$SWIFT_BIN" "$BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$BUNDLE/Contents/MacOS/$APP_NAME"
 
 # Engine binaries
-for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal; do
+for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal lattice_serve; do
     cp "$TARGET_RELEASE/$BIN" "$BUNDLE/Contents/Resources/bin/$BIN"
     chmod +x "$BUNDLE/Contents/Resources/bin/$BIN"
 done
-echo "    Copied 9 engine binaries → Contents/Resources/bin/"
+echo "    Copied 10 engine binaries → Contents/Resources/bin/"
 
 # App icon
 ICNS_SRC="$MACOS_DIR/Resources/LatticeStudio.icns"
@@ -141,9 +146,9 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleName</key>
-    <string>Lattice Studio</string>
+    <string>Lattice</string>
     <key>CFBundleDisplayName</key>
-    <string>Lattice Studio</string>
+    <string>Lattice</string>
     <key>CFBundleExecutable</key>
     <string>$APP_NAME</string>
     <key>CFBundleShortVersionString</key>
@@ -184,7 +189,7 @@ ZIP="$OUT_DIR/$APP_NAME.zip"
 
 # DMG
 hdiutil create \
-    -volname "Lattice Studio" \
+    -volname "Lattice" \
     -srcfolder "$BUNDLE" \
     -ov \
     -format UDZO \

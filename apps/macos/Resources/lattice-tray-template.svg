@@ -1,0 +1,28 @@
+<svg width="44" height="44" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lattice">
+  <!-- macOS menu-bar Template image: pure black on transparent. The system tints
+       it (dark in light bar, light in dark bar) from the alpha channel.
+       Bolder strokes/nodes than the color mark so it stays crisp at 16-18px. -->
+  <g stroke="#000000" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="20" y1="16" x2="44" y2="16"/>
+    <line x1="20" y1="16" x2="8"  y2="32"/>
+    <line x1="20" y1="16" x2="32" y2="32"/>
+    <line x1="44" y1="16" x2="32" y2="32"/>
+    <line x1="44" y1="16" x2="56" y2="32"/>
+    <line x1="8"  y1="32" x2="32" y2="32"/>
+    <line x1="32" y1="32" x2="56" y2="32"/>
+    <line x1="8"  y1="32" x2="20" y2="48"/>
+    <line x1="32" y1="32" x2="20" y2="48"/>
+    <line x1="32" y1="32" x2="44" y2="48"/>
+    <line x1="56" y1="32" x2="44" y2="48"/>
+    <line x1="20" y1="48" x2="44" y2="48"/>
+  </g>
+  <g fill="#000000">
+    <circle cx="20" cy="16" r="4.6"/>
+    <circle cx="44" cy="16" r="4.6"/>
+    <circle cx="8"  cy="32" r="4.6"/>
+    <circle cx="56" cy="32" r="4.6"/>
+    <circle cx="20" cy="48" r="4.6"/>
+    <circle cx="44" cy="48" r="4.6"/>
+    <circle cx="32" cy="32" r="6.0"/>
+  </g>
+</svg>

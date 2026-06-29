@@ -114,6 +114,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         enable_mtp: None,
         grammar: None,
         stop_strings: vec![],
+        reasoning_budget: None,
     };
 
     // Same continuation prompt as the original bench, single user turn.

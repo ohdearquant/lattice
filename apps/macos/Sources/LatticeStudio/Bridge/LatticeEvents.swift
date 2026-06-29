@@ -21,7 +21,8 @@ enum LatticeEvent: Equatable {
     case quantLayer(QuantLayer)
     case quantDone(QuantDone)
     case genToken(GenToken)
-    case ready                    // chat_metal --serve: model fully loaded, serve loop ready
+    case ready                        // chat_metal --serve: model fully loaded, serve loop ready
+    case httpRequest(HttpRequest)     // lattice_serve: one event per HTTP request, after response
     case perplexity(Perplexity)   // eval_perplexity --json: one row per measurement label
     case embedDone(EmbedDone)         // embed --json: cosine matrix + optional preview vectors
     case downloadDone(DownloadDone)   // embed --download-only --json: one event on completion
@@ -72,6 +73,11 @@ enum LatticeEvent: Equatable {
         var done: Bool?
         var tok_s: Double?
         var ttft_ms: Double?
+        // Additive done-event stats (chat_metal + generate_lora). Older binaries omit them,
+        // so all are optional and the parser tolerates their absence.
+        var prompt_tokens: Int?   // input (prompt) tokens the engine actually prefilled
+        var gen_tokens: Int?      // total tokens generated this turn
+        var total_ms: Double?     // total prefill + decode wall time in ms
     }
 
     // MARK: - Perplexity event (eval_perplexity --json)
@@ -132,6 +138,23 @@ enum LatticeEvent: Equatable {
         var ok: Bool
         var error: String?
     }
+
+    // MARK: - HttpRequest event (lattice_serve per-request telemetry)
+    //
+    // CONTRACT:
+    //   @@lattice {"ev":"http_request","method":"POST","route":"/v1/chat/completions",
+    //              "status":200,"tokens":926,"dur_ms":8432.5,"stream":true}
+    //
+    // Emitted once per HTTP request after the response (including full SSE stream) is complete.
+    // `tokens` is null for non-generating routes (GET /health, GET /v1/models, GET /).
+    struct HttpRequest: Codable, Equatable {
+        var method: String
+        var route: String
+        var status: Int
+        var tokens: Int?    // nil for non-generating routes
+        var dur_ms: Double
+        var stream: Bool
+    }
 }
 
 /// Tagged envelope used to peek the `ev` discriminator before decoding the full payload.
@@ -174,8 +197,9 @@ enum LatticeEventParser {
         case "quant_layer": return (try? decoder.decode(LatticeEvent.QuantLayer.self, from: data)).map(LatticeEvent.quantLayer) ?? .unknown(jsonText)
         case "quant_done":  return (try? decoder.decode(LatticeEvent.QuantDone.self, from: data)).map(LatticeEvent.quantDone) ?? .unknown(jsonText)
         case "gen_token":   return (try? decoder.decode(LatticeEvent.GenToken.self, from: data)).map(LatticeEvent.genToken) ?? .unknown(jsonText)
-        case "ready":       return .ready
-        case "perplexity":  return (try? decoder.decode(LatticeEvent.Perplexity.self, from: data)).map(LatticeEvent.perplexity) ?? .unknown(jsonText)
+        case "ready":        return .ready
+        case "http_request": return (try? decoder.decode(LatticeEvent.HttpRequest.self, from: data)).map(LatticeEvent.httpRequest) ?? .unknown(jsonText)
+        case "perplexity":   return (try? decoder.decode(LatticeEvent.Perplexity.self, from: data)).map(LatticeEvent.perplexity) ?? .unknown(jsonText)
         case "embed_done":     return (try? decoder.decode(LatticeEvent.EmbedDone.self, from: data)).map(LatticeEvent.embedDone) ?? .unknown(jsonText)
         case "download_done":  return (try? decoder.decode(LatticeEvent.DownloadDone.self, from: data)).map(LatticeEvent.downloadDone) ?? .unknown(jsonText)
         default:               return .unknown(jsonText)

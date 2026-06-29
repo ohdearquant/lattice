@@ -360,8 +360,12 @@ extension CommandSpec {
     /// Arg hints use generic placeholders so the palette never implies a specific model
     /// is installed. ContentView.handleCommand matches args against store.models at runtime.
     static let latticeDefaults: [CommandSpec] = [
-        CommandSpec(title: "models", args: [], description: "Browse downloaded models"),
         CommandSpec(title: "chat", args: ["<model>"], description: "Open chat"),
+        CommandSpec(title: "serve", args: ["<model>"], description: "Serve over an OpenAI-compatible API"),
+        CommandSpec(title: "quantize", args: ["<model>"], description: "Quantize a model to Q4"),
+        CommandSpec(title: "train", args: ["<model>"], description: "Fine-tune with LoRA"),
+        CommandSpec(title: "inspect", args: ["<model>"], description: "Inspect model architecture"),
+        CommandSpec(title: "get models", args: [], description: "Download or import a model"),
         CommandSpec(title: "stop", args: [], description: "Stop the current run"),
     ]
 }

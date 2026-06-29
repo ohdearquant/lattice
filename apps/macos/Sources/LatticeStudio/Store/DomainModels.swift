@@ -2,27 +2,41 @@ import SwiftUI
 
 // MARK: - Navigation
 
+/// The verb tabs in the main column. The app is model-centric: a model is selected in the
+/// sidebar, then acted on through one of these verbs. Chat is home.
 enum Screen: String, CaseIterable, Identifiable, Hashable {
-    case models, chat
+    case chat, serve, quantize, train, inspect
     var id: String { rawValue }
 
     var index: String {
         switch self {
-        case .models: "01"; case .chat: "02"
+        case .chat: "01"; case .serve: "02"; case .quantize: "03"; case .train: "04"; case .inspect: "05"
         }
     }
     var title: String {
         switch self {
-        case .models: "MODELS"; case .chat: "CHAT"
+        case .chat: "Chat"; case .serve: "Serve"; case .quantize: "Quantize"
+        case .train: "Train"; case .inspect: "Inspect"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .chat:     "text.bubble"
+        case .serve:    "dot.radiowaves.left.and.right"
+        case .quantize: "rectangle.compress.vertical"
+        case .train:    "dial.high"
+        case .inspect:  "cube.transparent"
         }
     }
     var shortcut: KeyEquivalent {
         switch self {
-        case .models: "1"; case .chat: "2"
+        case .chat: "1"; case .serve: "2"; case .quantize: "3"; case .train: "4"; case .inspect: "5"
         }
     }
 
-    var hasInspector: Bool { return true }
+    /// Only Chat docks a settings inspector (target · backend · sampling). The other verbs
+    /// carry their controls inline.
+    var hasInspector: Bool { self == .chat }
 }
 
 // MARK: - Models on disk
@@ -179,12 +193,23 @@ struct ChatTurn: Identifiable {
 
     let id = UUID()
     let prompt: String
+    /// The model that produced this turn, snapshotted at send time so the assistant label stays
+    /// correct for historical turns even after the working model is switched. nil = unknown.
+    var modelName: String? = nil
     var responseText: String = ""
     /// Reasoning trace parsed from the <think>…</think> block in the stream.
     /// Empty when the turn has no reasoning (thinking disabled, or model emitted none).
     var thinkingText: String = ""
     var status: TurnStatus = .running
     var tokensPerSecond: Double? = nil
+    /// Per-turn token accounting, captured from the engine done event at resolution.
+    /// `cachedInputTokens` is always 0 today: the serve loop resets the KV cache every turn,
+    /// so there is no cross-turn prefix cache. Surfaced honestly rather than hidden.
+    var promptTokens: Int? = nil
+    var cachedInputTokens: Int = 0
+    var reasoningTokens: Int? = nil
+    var responseTokens: Int? = nil
+    var totalMs: Double? = nil
     /// Error message from the run log — set when the turn finishes with an empty response.
     /// Shown instead of "(no output)" so Ocean knows WHY the engine produced nothing.
     var errorMessage: String? = nil
@@ -344,6 +369,13 @@ final class LiveRun {
     var genText: String = ""       // accumulated incremental token deltas from gen_token events
     var genTokS: Double? = nil     // final tokens/sec from the done event (tok_s field)
     var genDone: Bool = false      // set true when the gen_token done event arrives
+    var genPromptTokens: Int? = nil   // input tokens, from the done event
+    var genTokensTotal: Int? = nil    // total generated tokens, from the done event
+    var genTotalMs: Double? = nil     // total prefill+decode wall time (ms), from the done event
+    // Reasoning/response split, counted from gen_token events around the </think> boundary in
+    // the generated text. sawThinkClose flips once </think> has streamed.
+    var genReasoningTokens: Int = 0
+    var sawThinkClose: Bool = false
 
     // Eval (eval_perplexity --json mode)
     // A single run may emit multiple rows — one per measurement label (bf16/q4/quarot/adapter).

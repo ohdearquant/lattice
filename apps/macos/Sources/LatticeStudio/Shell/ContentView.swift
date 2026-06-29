@@ -1,58 +1,32 @@
 import SwiftUI
 
+// MARK: - Content view — the redesigned shell
+//
+// A full-width runtime bar spans the top (traffic lights + brand lockup + live telemetry), and
+// beneath it a fixed model sidebar sits beside the verb-tab main column. The app is model-centric:
+// pick a model on the left, act on it through a verb tab on the right. The system title bar is
+// hidden (`.windowStyle(.hiddenTitleBar)`) so the runtime bar owns the whole top edge.
+
 struct ContentView: View {
     @Bindable var store: AppStore
 
     var body: some View {
-        NavigationSplitView {
-            LeftRail(store: store)
-                // Sidebar: fixed ideal width with a collapse range so it never overlaps
-                // the detail column on narrow windows.
-                .navigationSplitViewColumnWidth(
-                    min: Theme.Space.sidebarMin,
-                    ideal: Theme.Space.railWidth,
-                    max: Theme.Space.sidebarMax
-                )
-        } detail: {
-            ZStack {
-                Theme.Palette.canvas.ignoresSafeArea()
-                detail
-            }
-            // Enforce a minimum detail width so the split view never collapses the
-            // content area to zero on narrow resize — the window's own minWidth (1120)
-            // is the outer bound; this clamps at the column level.
-            .frame(minWidth: 640)
-            .toolbar {
-                // Run-status capsule: always reserve the slot; hide the capsule content
-                // when there is no active run.  This prevents the toolbar from reflowing
-                // when a run starts or stops, which previously caused the Embeddings
-                // HSplitView to jump.
-                ToolbarItem(placement: .primaryAction) {
-                    if let run = store.liveRun, run.status == .running || run.status == .paused {
-                        runStatusCapsule(run)
-                    } else {
-                        // Zero-size placeholder — keeps toolbar item count constant.
-                        Color.clear.frame(width: 0, height: 0)
-                    }
-                }
-                // Inspector toggle: only rendered for screens that have an inspector.
-                if store.selection.hasInspector {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            store.inspectorPresented.toggle()
-                        } label: {
-                            Image(systemName: "sidebar.right")
-                        }
-                        .help("Toggle settings (⌘\\)")
-                        .foregroundStyle(store.inspectorPresented ? Theme.Palette.signal : Theme.Palette.textSecondary)
-                    }
-                }
+        VStack(spacing: 0) {
+            SpanningRuntimeBar(store: store)
+            HStack(spacing: 0) {
+                ModelSidebar(store: store)
+                MainColumn(store: store)
+                    .frame(minWidth: 640, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .navigationTitle("")
-        // One neutral tint for every system control (Slider/Picker/Toggle/field caret).
-        // Elements that should read teal set Theme.Palette.signal explicitly, so they are
-        // unaffected — this keeps the accent reserved for live data + the single CTA.
+        // Pull the runtime bar up under the hidden titlebar so it owns the very top edge and the
+        // floating traffic lights vertically center on the wordmark — without this, SwiftUI's
+        // ~28pt top safe-area inset stacks the bar below the lights, giving a two-tier chrome.
+        .ignoresSafeArea(.container, edges: .top)
+        .background(Theme.Palette.window)
+        // One neutral tint for every system control (Slider/Picker/Toggle/field caret). Elements
+        // that should read indigo set Theme.Palette.signal explicitly, so they are unaffected —
+        // this keeps the accent reserved for live data + the single CTA.
         .tint(Theme.Palette.control)
         .background(shortcuts)
         .overlay {
@@ -62,94 +36,35 @@ struct ContentView: View {
                 onRun: handleCommand
             )
         }
+        .sheet(isPresented: $store.getModelsPresented) {
+            GetModelsSheet(store: store)
+                .frame(minWidth: 680, idealWidth: 760, maxWidth: .infinity,
+                       minHeight: 500, idealHeight: 620, maxHeight: .infinity)
+        }
     }
 
-    // Route a ⌘K command to a screen / action. A leading model-name argument
-    // preselects the working model for that screen.
+    // Route a ⌘K command to a verb tab / action. A leading model-name argument preselects the
+    // working model first, so `chat qwen3` opens Chat already pointed at that model.
     private func handleCommand(_ cmd: String, _ args: [String]) {
         func retarget() {
             guard let arg = args.first(where: { !$0.isEmpty })?.lowercased() else { return }
             if let m = store.models.first(where: { $0.name.lowercased().contains(arg) }) {
-                store.workingModel = m
+                store.selectSidebarModel(m)
             }
         }
         switch cmd {
-        case "chat":   retarget(); store.selection = .chat
-        case "models": store.selection = .models
-        case "stop":   store.stopRun()
-        default:       break
+        case "chat":       retarget(); store.selection = .chat
+        case "serve":      retarget(); store.selection = .serve
+        case "quantize":   retarget(); store.selection = .quantize
+        case "train":      retarget(); store.selection = .train
+        case "inspect":    retarget(); store.selection = .inspect
+        case "get models": store.getModelsPresented = true
+        case "stop":       store.stopRun()
+        default:           break
         }
     }
 
-    // Compact toolbar capsule shown while a run is active.
-    // Shows: status dot · model name · step counter — no invented fields.
-    // Clicking navigates to the Runs screen.
-    @ViewBuilder
-    private func runStatusCapsule(_ run: LiveRun) -> some View {
-        let activityLabel: String = {
-            switch run.kind {
-            case .train:          return "Training"
-            case .quantizeQ4:     return "Quantizing"
-            case .quantizeQuaRot: return "Quantizing"
-            case .chat:           return "Generating"
-            case .eval:           return "Evaluating"
-            case .embed:          return "Embedding"
-            }
-        }()
-        let stepLabel: String = {
-            if run.kind == .train {
-                let s = "step \(run.currentStep)"
-                if let total = run.totalSteps { return s + "/\(total)" }
-                return s
-            }
-            return run.status == .paused ? "paused" : "running"
-        }()
-
-        Button {
-            // Jump to the screen that owns this run kind.
-            switch run.kind {
-            case .chat:
-                store.selection = .chat
-            default:
-                store.selection = .models
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(Theme.Palette.running)
-                    .frame(width: 6, height: 6)
-                    .opacity(run.status == .paused ? 0.5 : 1.0)
-                Text(activityLabel)
-                    .font(Theme.Fonts.controlText)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                Text(run.modelName)
-                    .font(Theme.Fonts.controlText)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .lineLimit(1)
-                Text(stepLabel)
-                    .font(.system(size: 11, weight: .regular, design: .monospaced))
-                    .foregroundStyle(Theme.Palette.textSecondary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(
-                Theme.Palette.running.opacity(0.12)
-                    .clipShape(Capsule())
-            )
-            .overlay(Capsule().strokeBorder(Theme.Palette.running.opacity(0.28), lineWidth: 1))
-        }
-        .buttonStyle(.plain)
-        .help("View active run")
-    }
-
-    @ViewBuilder private var detail: some View {
-        switch store.selection {
-        case .models: ModelsScreen(store: store)
-        case .chat:   ChatScreen(store: store)
-        }
-    }
-
-    // Hidden buttons carry the global keyboard map (⌘1–6, ⌘K, ⌘\).
+    // Hidden buttons carry the global keyboard map (⌘1–5, ⌘K, ⌘\).
     private var shortcuts: some View {
         ZStack {
             ForEach(Screen.allCases) { s in
@@ -162,5 +77,4 @@ struct ContentView: View {
         .opacity(0)
         .frame(width: 0, height: 0)
     }
-
 }

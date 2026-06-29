@@ -16,6 +16,7 @@ enum LatticeBinary {
     case qwen35Generate       // lattice-inference
     case evalPerplexity       // lattice-inference — strided sliding-window perplexity (ADR-044)
     case embed                // lattice-embed   — batch text embedding with cosine report
+    case latticeServe         // lattice-inference, features: f16,metal-gpu — OpenAI-format HTTP daemon
 
     var binName: String {
         switch self {
@@ -28,6 +29,7 @@ enum LatticeBinary {
         case .qwen35Generate: "qwen35_generate"
         case .evalPerplexity: "eval_perplexity"
         case .embed:          "embed"
+        case .latticeServe:   "lattice_serve"
         }
     }
     var crate: String {
@@ -43,6 +45,7 @@ enum LatticeBinary {
         case .generateLora:   ["safetensors", "inference-hook"]
         case .evalPerplexity: ["f16", "metal-gpu"]
         case .chatMetal:      ["f16", "metal-gpu"]
+        case .latticeServe:   ["f16", "metal-gpu"]
         default:              []
         }
     }

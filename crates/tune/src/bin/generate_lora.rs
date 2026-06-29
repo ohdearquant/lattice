@@ -75,6 +75,9 @@ fn main() {
     let top_p: Option<f32> = parse_arg(&args, "--top-p").and_then(|s| s.parse().ok());
     let repetition_penalty: Option<f32> =
         parse_arg(&args, "--repetition-penalty").and_then(|s| s.parse().ok());
+    let reasoning_budget: Option<usize> = parse_arg(&args, "--reasoning-budget")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0);
 
     let lora_path: Option<PathBuf> = parse_arg(&args, "--lora").map(PathBuf::from);
 
@@ -153,6 +156,9 @@ fn main() {
     if let Some(r) = repetition_penalty {
         gen_cfg.repetition_penalty = r;
     }
+    if reasoning_budget.is_some() {
+        gen_cfg.reasoning_budget = reasoning_budget;
+    }
 
     println!("\nPrompt: {prompt}");
     println!(
@@ -196,10 +202,12 @@ fn main() {
                 } else {
                     0.0
                 };
-                // Final done event with stats.
+                // Final done event with stats. prompt_tokens / gen_tokens / total_ms are
+                // additive and kept byte-compatible with chat_metal's done event.
                 writeln!(
                     stdout,
-                    "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
+                    "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1},\"prompt_tokens\":{},\"gen_tokens\":{},\"total_ms\":{}}}",
+                    output.prompt_tokens, output.generated_tokens, gen_ms
                 )
                 .ok();
                 stdout.flush().ok();

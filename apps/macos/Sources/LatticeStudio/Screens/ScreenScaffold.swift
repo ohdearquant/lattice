@@ -24,18 +24,13 @@ struct ScreenScaffold<Trailing: View, Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
             HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        Text(screen.index)
-                            .font(Theme.Fonts.mono(13))
-                            .foregroundStyle(Theme.Palette.inkDim)
-                        Text(screen.title)
-                            .font(Theme.Fonts.display(17, .bold))
-                            .foregroundStyle(Theme.Palette.ink)
-                    }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(screen.title.localizedCapitalized)
+                        .font(Theme.Fonts.display(22, .bold))
+                        .foregroundStyle(Theme.Palette.ink)
                     Text(subtitle)
                         .font(Theme.Fonts.body)
-                        .foregroundStyle(Theme.Palette.inkDim)
+                        .foregroundStyle(Theme.Palette.textSecondary)
                 }
                 Spacer(minLength: Theme.Space.lg)
                 trailing()
