@@ -4252,6 +4252,237 @@ kernel void gdn_chunk_norm_silu_c32(
         pub d_out: usize,
     }
 
+    /// Maximum total rank allowed across all adapters in a single blend.
+    ///
+    /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
+    /// typical mixture).  This cap bounds allocations and rejects adversarially large
+    /// adapter pools before `Vec::with_capacity`.
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+
+    /// Aggregate cap on a blended adapter's total element count, summed across
+    /// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
+    /// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
+    /// bounds one projection; this bounds the whole blend, so a full-model adapter
+    /// that keeps every projection near the per-group cap cannot drive a multi-GiB
+    /// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
+    /// large-model mixture at modest summed rank stays within budget, while a
+    /// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
+    pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+
+    /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
+    /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
+    ///
+    /// # Blend math
+    ///
+    /// For adapter `e` with layer data `L_e` and mixture weight `w_e`, the
+    /// effective delta is `w_e · B_e @ (A_e @ x)` (the `alpha/rank` scale is
+    /// NOT present in `LoraLayerData` — it is passed separately as `scale` to
+    /// `load_lora_adapter`; here `w_e` IS that effective scale).
+    ///
+    /// The blended matrices are:
+    /// - `A_blend = vconcat[A_1; …; A_N]`       shape `(Σrank_e) × d_in`
+    /// - `B_blend = hconcat[w_1·B_1 | …]`       shape `d_out × (Σrank_e)`
+    ///
+    /// The resulting layer set should be loaded with `scale = 1.0` because
+    /// the per-adapter weights are already folded into the B blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `inputs` is empty
+    /// - Any weight is not finite
+    /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
+    /// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
+    /// - The aggregate blend size across all projections exceeds `MAX_BLEND_TOTAL_ELEMENTS`
+    /// - A layer's A or B buffer length does not match its declared `rank`, `d_in`, or `d_out`
+    /// - Rank accumulation or a size product overflows `usize`
+    pub fn blend_lora_layer_data(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        if inputs.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "blend_lora_layer_data: inputs must not be empty".into(),
+            ));
+        }
+
+        for (idx, (_, w)) in inputs.iter().enumerate() {
+            if !w.is_finite() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
+                )));
+            }
+        }
+
+        // Group by (layer_idx, module): collect refs to layer data and effective weights.
+        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        for (layers, weight) in inputs {
+            for layer in *layers {
+                grouped
+                    .entry((layer.layer_idx, layer.module.clone()))
+                    .or_default()
+                    .push((layer, *weight));
+            }
+        }
+
+        // Bound the TOTAL planned allocation across every (layer_idx, module) group.
+        // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
+        // full-model adapter can keep every group near the cap and still drive a
+        // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
+        // checked arithmetic and fail closed before any allocation.
+        let mut planned_elems: usize = 0;
+        for ((layer_idx, module), entries) in &grouped {
+            let (first, _) = entries[0]; // each key was inserted with >=1 entry
+            let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
+                ))
+            })?;
+            let mut group_rank: usize = 0;
+            for (entry, _) in entries {
+                group_rank = group_rank.checked_add(entry.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank_total overflowed usize".into(),
+                    )
+                })?;
+            }
+            let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: rank_total*(d_in+d_out) overflowed usize".into(),
+                )
+            })?;
+            planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: aggregate blend element count overflowed usize".into(),
+                )
+            })?;
+        }
+        if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
+            return Err(InferenceError::InvalidInput(format!(
+                "blend_lora_layer_data: aggregate blend size {planned_elems} elements exceeds \
+                 MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
+                 number of adapters, their rank, or the number of target projections",
+                (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
+            )));
+        }
+
+        let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
+        for ((layer_idx, module), entries) in grouped {
+            let (first, _) = entries[0];
+            let d_in = first.d_in;
+            let d_out = first.d_out;
+
+            // Validate dimension consistency across adapters for this projection.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                if entry.d_in != d_in || entry.d_out != d_out {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
+                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
+                         entry {idx}: d_in={}, d_out={})",
+                        entry.d_in, entry.d_out
+                    )));
+                }
+            }
+
+            // Accumulate rank_total with overflow protection and a hard cap
+            // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
+            let mut rank_total: usize = 0;
+            for (layer, _) in &entries {
+                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank_total overflowed usize".into(),
+                    )
+                })?;
+            }
+            if rank_total > MAX_BLEND_RANK_TOTAL {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
+                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
+                )));
+            }
+
+            // Validate source slice lengths before any allocation: a malformed adapter
+            // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                let expected_a = entry.rank.checked_mul(d_in).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank*d_in overflowed usize".into(),
+                    )
+                })?;
+                let expected_b = d_out.checked_mul(entry.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: d_out*rank overflowed usize".into(),
+                    )
+                })?;
+                if entry.a.len() != expected_a {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} A slice length {} \
+                         does not match rank*d_in={}*{}={expected_a}",
+                        entry.a.len(),
+                        entry.rank,
+                        d_in,
+                    )));
+                }
+                if entry.b.len() != expected_b {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} B slice length {} \
+                         does not match d_out*rank={}*{}={expected_b}",
+                        entry.b.len(),
+                        d_out,
+                        entry.rank,
+                    )));
+                }
+            }
+
+            let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: rank_total * d_in overflowed usize".into(),
+                )
+            })?;
+            let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: d_out * rank_total overflowed usize".into(),
+                )
+            })?;
+
+            // A_blend: vertical stack of A matrices.
+            let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
+            for (layer, _) in &entries {
+                a_blend.extend_from_slice(&layer.a);
+            }
+
+            // B_blend: horizontal concat of weight-scaled B column blocks.
+            // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
+            let mut b_blend = vec![0.0f32; b_buf_len];
+            let mut col_offset = 0usize;
+            for (layer, eff_weight) in &entries {
+                let r_e = layer.rank;
+                for row in 0..d_out {
+                    let dst = row * rank_total + col_offset;
+                    let src = row * r_e;
+                    for c in 0..r_e {
+                        b_blend[dst + c] = eff_weight * layer.b[src + c];
+                    }
+                }
+                col_offset += r_e;
+            }
+
+            result.push(LoraLayerData {
+                layer_idx,
+                module,
+                a: a_blend,
+                b: b_blend,
+                rank: rank_total,
+                d_in,
+                d_out,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// **Unstable**: Metal GPU forward pass for Qwen3.5/3.6; kernel set and weight layout evolving.
     ///
     /// Backward-compatible convenience wrapper bundling one `MetalQwen35Engine` (immutable
@@ -5875,6 +6106,77 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Returns true if a LoRA adapter is currently loaded.
         pub fn has_lora_adapter(&self) -> bool {
             self.lora.is_some()
+        }
+
+        /// Blend multiple LoRA adapter layer sets into one rank-Σr layer set, then
+        /// generate text through the existing single-adapter path.
+        ///
+        /// # Why blend instead of dispatching N adapters
+        ///
+        /// The Metal forward path holds exactly one `Option<MetalLoraAdapter>` slot.
+        /// Rather than changing that kernel contract, we pre-blend on the CPU once
+        /// at request start: the result is a valid single adapter loaded through the
+        /// unchanged `load_lora_adapter` path.
+        ///
+        /// # Arguments
+        ///
+        /// * `adapter_weights` — slices of `(Vec<LoraLayerData>, mixture_weight)`.
+        ///   Each element is one adapter's layer data paired with its effective weight
+        ///   `w_e`.  `mixture_weight` IS the fully pre-scaled effective weight: the
+        ///   caller must fold any `alpha / rank` scaling (and the mixture fraction)
+        ///   into it before calling this function.  `blend_lora_layer_data` folds
+        ///   `w_e` directly into the B column blocks and loads the result with
+        ///   `scale = 1.0`; passing a raw mixture fraction without the `alpha/rank`
+        ///   factor will produce under-scaled output.
+        /// * `prompt` — prompt text, tokenised internally.
+        /// * `tokenizer` — BPE tokeniser.
+        /// * `gen_cfg` — generation configuration.
+        ///
+        /// The adapter is unloaded after generation so the slot is free for the next
+        /// request.
+        ///
+        /// # Decode cost model
+        ///
+        /// Per-token LoRA GEMV cost grows linearly with `rank_total = Σ rank_e`
+        /// across the mixture.  The Metal kernel assumes modest rank (≤ ~64);
+        /// a large `k × r` budget will linearly increase decode latency.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if blending fails (e.g. dimension mismatch across
+        /// adapters for the same projection) or if adapter loading fails.
+        pub fn generate_with_lora_mixture(
+            &mut self,
+            adapter_weights: &[(&[LoraLayerData], f32)],
+            prompt: &str,
+            tokenizer: &crate::tokenizer::BpeTokenizer,
+            gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+        ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError>
+        {
+            if adapter_weights.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(
+                    "generate_with_lora_mixture: adapter_weights must not be empty".into(),
+                ));
+            }
+
+            // Unload any previously loaded adapter so the slot is free.
+            self.unload_lora_adapter();
+
+            // Blend on the CPU. The per-adapter scale (alpha/rank) and mixture weight
+            // are folded into the B column blocks; the resulting blended adapter uses
+            // an effective scale of 1.0.
+            let blended = blend_lora_layer_data(adapter_weights)?;
+
+            // The blended adapter has weights-already-scaled; pass scale=1.0.
+            self.load_lora_adapter(blended, 1.0, None)?;
+
+            let output = self.generate(prompt, tokenizer, gen_cfg);
+
+            // Always unload after the request so the slot does not leak into the
+            // next call on this state object.
+            self.unload_lora_adapter();
+
+            Ok(output)
         }
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
@@ -19744,6 +20046,254 @@ kernel void decode_attention_reference(
             assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
         }
     }
+    // -----------------------------------------------------------------------
+    // Blend correctness tests (inference-side LoraLayerData types)
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod blend_tests {
+        use super::*;
+
+        /// Reference: compute B @ (A @ x) using plain nested loops that match
+        /// the kernel's row-major indexing: A[r,k]=a[r*d_in+k], B[o,r]=b[o*rank+r].
+        fn lora_delta(
+            a: &[f32],
+            b: &[f32],
+            x: &[f32],
+            rank: usize,
+            d_in: usize,
+            d_out: usize,
+        ) -> Vec<f32> {
+            let mut ax = vec![0.0f32; rank];
+            for r in 0..rank {
+                for k in 0..d_in {
+                    ax[r] += a[r * d_in + k] * x[k];
+                }
+            }
+            let mut y = vec![0.0f32; d_out];
+            for o in 0..d_out {
+                for r in 0..rank {
+                    y[o] += b[o * rank + r] * ax[r];
+                }
+            }
+            y
+        }
+
+        #[test]
+        fn blend_two_adapters_equals_sum_delta() {
+            let d_in = 8usize;
+            let d_out = 6usize;
+            let r1 = 2usize;
+            let r2 = 3usize;
+
+            // Deterministic, non-trivial values: A row-major (rank × d_in), B row-major (d_out × rank).
+            let a1: Vec<f32> = (0..r1 * d_in).map(|i| i as f32 * 0.1 + 0.01).collect();
+            let b1: Vec<f32> = (0..d_out * r1).map(|i| i as f32 * 0.05 - 0.5).collect();
+            let a2: Vec<f32> = (0..r2 * d_in).map(|i| i as f32 * 0.07 + 0.03).collect();
+            let b2: Vec<f32> = (0..d_out * r2).map(|i| i as f32 * 0.03 - 0.2).collect();
+
+            let l1 = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: a1.clone(),
+                b: b1.clone(),
+                rank: r1,
+                d_in,
+                d_out,
+            };
+            let l2 = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: a2.clone(),
+                b: b2.clone(),
+                rank: r2,
+                d_in,
+                d_out,
+            };
+
+            let w1 = 0.25f32;
+            let w2 = 0.75f32;
+
+            let blended =
+                blend_lora_layer_data(&[(&[l1], w1), (&[l2], w2)]).expect("blend must not fail");
+            assert_eq!(blended.len(), 1, "one projection in, one out");
+            let bl = &blended[0];
+
+            // Structural assertions.
+            assert_eq!(bl.rank, r1 + r2);
+            assert_eq!(bl.d_in, d_in);
+            assert_eq!(bl.d_out, d_out);
+
+            // Delta equality: blended_delta(x) == w1*delta1(x) + w2*delta2(x) for all x.
+            // LoraLayerData carries no alpha/rank — w_e IS the effective scale.
+            let x: Vec<f32> = (0..d_in).map(|i| i as f32 * 0.3 - 1.0).collect();
+
+            let delta_blend = lora_delta(&bl.a, &bl.b, &x, bl.rank, d_in, d_out);
+            let delta1 = lora_delta(&a1, &b1, &x, r1, d_in, d_out);
+            let delta2 = lora_delta(&a2, &b2, &x, r2, d_in, d_out);
+            let expected: Vec<f32> = delta1
+                .iter()
+                .zip(&delta2)
+                .map(|(d1, d2)| w1 * d1 + w2 * d2)
+                .collect();
+
+            let max_err = delta_blend
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < 1e-5,
+                "blended delta diverges from reference sum: max_abs_diff={max_err}"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Summed rank exceeding MAX_BLEND_RANK_TOTAL returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_rank_exceeds_cap_returns_error() {
+            let d_in = 1usize;
+            let d_out = 1usize;
+            // rank = cap + 1; A and B are tiny (~32 KB total).
+            let rank = MAX_BLEND_RANK_TOTAL + 1;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.1f32; rank * d_in],
+                b: vec![0.1f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "summed rank exceeding cap must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // A slice with wrong length returns Err (fail-closed on
+        // malformed input before any allocation).
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_a_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                // A is one element short of rank * d_in.
+                a: vec![0.0f32; rank * d_in - 1],
+                b: vec![0.0f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched A slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // B slice with wrong length returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_b_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * d_in],
+                // B is one element short of d_out * rank.
+                b: vec![0.0f32; d_out * rank - 1],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched B slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Contract: a malformed huge dimension returns Err, never panics.
+        //
+        // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
+        // blend_lora_layer_data is monolithic here: the aggregate pre-pass
+        // (rank_total*(d_in+d_out)) strictly dominates the per-entry
+        // checked_mul, so no input reaches the per-entry guard without
+        // tripping the pre-pass first. This pins the public Err-not-panic
+        // contract; the per-entry checked_mul is defense-in-depth, isolated
+        // on the tune side where blend_layer_entries is a separable helper.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_malformed_huge_dim_returns_err_not_panic() {
+            let rank = 2usize;
+            let d_in = usize::MAX / 2 + 1;
+            let d_out = 1usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],          // empty; pre-pass fails before slice-length check
+                b: vec![0.0f32; 2], // rank * d_out = 2 * 1 = 2
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
+            // per-entry checked_mul is defense-in-depth for the same class.
+            assert!(
+                result.is_err(),
+                "malformed huge dim must return Err, not panic"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Contract: an aggregate element budget overrun returns Err before alloc.
+        //
+        // 65 layers with rank=4096, d_in=2048, d_out=2048, empty a/b, so
+        // the test allocates nothing. Per-group: rank_total=4096 == cap
+        // (passes the per-projection check). Aggregate: 4096*(2048+2048)*65
+        // = 1,090,519,040 > MAX_BLEND_TOTAL_ELEMENTS (1<<30).
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_aggregate_budget_exceeded_returns_err() {
+            // MAX_BLEND_TOTAL_ELEMENTS is in scope via `use super::*` above.
+            let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap
+            let d_in = 2048usize;
+            let d_out = 2048usize;
+            let layers: Vec<LoraLayerData> = (0..65usize)
+                .map(|idx| LoraLayerData {
+                    layer_idx: idx,
+                    module: "q_proj".into(),
+                    a: vec![], // empty; pre-pass reads only declared fields
+                    b: vec![],
+                    rank,
+                    d_in,
+                    d_out,
+                })
+                .collect();
+            let result = blend_lora_layer_data(&[(&layers, 1.0)]);
+            assert!(result.is_err(), "aggregate budget exceeded must return Err");
+            // Use result.err().expect() rather than unwrap_err() because
+            // Vec<LoraLayerData> does not implement Debug (unwrap_err requires T: Debug).
+            let msg = result.err().expect("already asserted is_err").to_string();
+            assert!(
+                msg.contains("aggregate") || msg.contains("MAX_BLEND_TOTAL_ELEMENTS"),
+                "error message must mention the aggregate budget; got: {msg}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19918,7 +20468,7 @@ pub fn mtp_greedy_round(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, format_chat_template,
+    LoraLayerData, MetalQwen35State, blend_lora_layer_data, format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
@@ -19932,6 +20482,19 @@ pub struct LoraLayerData {
     pub rank: usize,
     pub d_in: usize,
     pub d_out: usize,
+}
+
+/// Stub: blend_lora_layer_data is only meaningful on macOS + metal-gpu.
+///
+/// Always returns `Err` on other platforms so callers fail at runtime rather
+/// than silently producing wrong results.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+pub fn blend_lora_layer_data(
+    _inputs: &[(&[LoraLayerData], f32)],
+) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+    Err(crate::error::InferenceError::Inference(
+        "blend_lora_layer_data requires macOS + metal-gpu feature".into(),
+    ))
 }
 
 /// **Unstable**: Metal Qwen3.5 forward state; stub on non-macOS; full impl behind metal-gpu feature.

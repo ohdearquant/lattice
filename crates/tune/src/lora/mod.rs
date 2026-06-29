@@ -34,12 +34,14 @@
 //! ```
 
 mod apply;
+pub mod blend;
 pub mod online;
 pub mod optimizer;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 
 pub use apply::apply_lora;
+pub use blend::blend_lora_adapters;
 pub use online::{AdaptStepResult, adapt_step};
 pub use optimizer::{AdamState, LoraGradients, compute_lora_gradients};
 #[cfg(feature = "safetensors")]
