@@ -217,8 +217,17 @@ impl RlooTrainer {
         }
 
         // Reject caller-supplied sizes that would cause Vec::with_capacity to OOM.
-        // m_samples drives two allocations of that length below.
+        // m_samples sizes the rewards/subsets outer vecs directly; the retained
+        // subsets additionally hold m_samples * k indices in aggregate. k alone is
+        // range-checked, but the product can still overflow usize or exceed the
+        // allocation cap, so bound the product before any allocation runs.
         validate_allocation_size(m_samples)?;
+        let subset_storage = m_samples.checked_mul(k).ok_or_else(|| {
+            FannError::TrainingError(format!(
+                "rloo_step: m_samples ({m_samples}) * k ({k}) overflows usize"
+            ))
+        })?;
+        validate_allocation_size(subset_storage)?;
 
         {
             let layers = gate.layers();
@@ -628,7 +637,7 @@ mod tests {
         );
     }
 
-    // ---- BLOCKER 2 guard test (allocation bounds) ---------------------------
+    // ---- Allocation-bound guard tests ---------------------------------------
 
     /// rloo_step with m_samples > MAX_ALLOWED_ELEMENTS must return Err, not panic.
     ///
@@ -641,6 +650,25 @@ mod tests {
         assert!(
             matches!(result, Err(FannError::ShapeTooLarge { .. })),
             "expected ShapeTooLarge error for m_samples > MAX, got {result:?}"
+        );
+    }
+
+    /// A per-call m_samples that is itself within bounds must still be rejected
+    /// when m_samples * k (the aggregate retained-subset storage) exceeds the cap.
+    /// Here m_samples = 30M passes the standalone m_samples guard (< 100M) but
+    /// 30M * 4 = 120M exceeds it, so only the product guard can produce the error.
+    ///
+    /// Mutation that breaks this: removing the `validate_allocation_size(subset_storage)?`
+    /// product check (the standalone m_samples guard alone admits this input).
+    #[test]
+    fn rloo_step_m_samples_times_k_product_too_large_returns_err() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let k = gate.num_outputs(); // 4
+        let result = trainer.rloo_step(&mut gate, &CTX, 0, k, 30_000_000);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "expected ShapeTooLarge error for m_samples*k > MAX, got {result:?}"
         );
     }
 }

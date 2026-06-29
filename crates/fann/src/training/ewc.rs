@@ -291,7 +291,7 @@ mod tests {
         assert!(result.is_err(), "expected Err on length mismatch, got Ok");
     }
 
-    // ---- BLOCKER 2 guard tests (allocation bounds) --------------------------
+    // ---- Allocation-bound guard tests ---------------------------------------
 
     /// Constructing with num_params > MAX_ALLOWED_ELEMENTS must return Err, not panic.
     ///
@@ -305,7 +305,7 @@ mod tests {
         );
     }
 
-    // ---- MAJOR 1 guard tests (decay validation) ----------------------------
+    // ---- Decay-validation guard tests ---------------------------------------
 
     /// decay = 0.0 must be rejected (lower bound of the open interval).
     ///
