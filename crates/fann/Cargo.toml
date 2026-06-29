@@ -38,6 +38,10 @@ futures = { version = "0.3", optional = true }
 [[example]]
 name = "fann_xor"
 
+[[bench]]
+name = "router_online"
+harness = false
+
 [dev-dependencies]
 approx = "0.5"
 proptest.workspace = true

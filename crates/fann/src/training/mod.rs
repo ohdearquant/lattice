@@ -4,10 +4,14 @@
 //! and optimization strategies.
 
 mod backprop;
+pub mod ewc;
 mod gradient;
+pub mod rloo;
 
 pub use backprop::BackpropTrainer;
+pub use ewc::DiagonalFisher;
 pub use gradient::GradientGuardStrategy;
+pub use rloo::{RlooConfig, RlooTrainer};
 
 use crate::error::FannResult;
 use crate::network::Network;
