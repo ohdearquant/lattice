@@ -9541,6 +9541,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 )));
             }
 
+            // Grammar-constrained decoding is not wired into the multimodal path; reject
+            // grammar configs before any sampling to avoid silently producing unconstrained
+            // output when a caller sets gen_cfg.grammar (#397/#398).
+            crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+
             // Reset recurrent state for a clean generation.
             self.reset_state();
 
@@ -19661,6 +19666,47 @@ kernel void decode_attention_reference(
             eprintln!(
                 "RACE-LOCALIZATION: chunked-vs-serial state max_abs_diff = {:.6}",
                 max_diff(&chunked_a, &serial_a)
+            );
+        }
+
+        /// `generate_multimodal` must reject a `GenerateConfig` that sets `grammar`
+        /// with a typed `InvalidInput` error before any sampling (#397/#398).
+        ///
+        /// Full end-to-end test of the call site requires GPU hardware (creating a
+        /// `MetalQwen35State` triggers Metal device allocation). This test validates
+        /// the grammar-guard helper — `check_grammar_not_set` — directly; the same
+        /// helper is called at the entry of `generate_multimodal` via
+        /// `crate::model::qwen35::check_grammar_not_set(gen_cfg)?`.
+        ///
+        /// Mutation sensitivity: the guard helper returns `InvalidInput` when grammar
+        /// is set. Removing the call from `generate_multimodal` leaves this test
+        /// passing (it tests the helper, not the call site), but the production path
+        /// then silently ignores grammar — this test documents the contract so a
+        /// reviewer can verify the call site is present.
+        #[test]
+        fn generate_multimodal_grammar_guard_rejects_grammar_config() {
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35::check_grammar_not_set;
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
+            let grammar_vocab = vec![b"a".to_vec(), b"b".to_vec()];
+            let engine =
+                GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+
+            let gen_cfg = GenerateConfig {
+                grammar: Some(Arc::new(engine)),
+                ..Default::default()
+            };
+
+            // `check_grammar_not_set` is the guard used by `generate_multimodal` (#397/#398).
+            let result = check_grammar_not_set(&gen_cfg);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar guard must return InvalidInput when grammar is set (#397/#398); \
+                 got {result:?}"
             );
         }
     }
