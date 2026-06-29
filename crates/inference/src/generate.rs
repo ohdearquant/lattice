@@ -237,7 +237,18 @@ fn check_alloc_capacity(
     num_layers: usize,
     effective_cap: usize,
 ) -> Result<(), InferenceError> {
-    let kv_dim = cfg.kv_dim();
+    // Guard the base dimension product before using it in any further multiply.
+    // A pathological config (e.g. num_key_value_heads = usize::MAX) can make the
+    // raw `num_key_value_heads * head_dim` multiply wrap in release builds,
+    // producing a silently tiny kv_dim that passes every downstream checked_mul
+    // even though the real allocation would be absurd. Fail closed here so the
+    // error is reported on the path that controls all subsequent buffer sizing.
+    let kv_dim = cfg
+        .num_key_value_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput("num_key_value_heads * head_dim overflows usize".into())
+        })?;
     // Per-position element coefficients that scale with the cache length:
     //   KV cache (K+V across all layers): 2 * num_layers * kv_dim
     //   dequant scratch (cached_k_f32 + cached_v_f32): 2 * kv_dim
@@ -318,7 +329,11 @@ pub fn generate(
         cfg.head_dim,
         effective_cap,
     );
-    let mut cache = FlatKVCache::new(cache_cfg);
+    // try_new validates every dimension product before any Vec allocation.
+    // check_alloc_capacity (above) guards the same products, but try_new provides
+    // a second layer at the exact allocation boundary — a defence against future
+    // refactors that might move or remove the upstream guard.
+    let mut cache = FlatKVCache::try_new(cache_cfg)?;
     let mut scratch = ForwardScratch::new();
     // Size scratch for the largest possible call (prefill at prompt_len tokens).
     // Decode calls use seq_len=1, which is always within this capacity.
@@ -1109,6 +1124,43 @@ mod tests {
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 4096).is_ok());
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 262_144).is_ok());
         assert!(check_alloc_capacity(&cfg, cfg.num_hidden_layers, 0).is_ok());
+    }
+
+    /// check_alloc_capacity rejects a config whose num_key_value_heads * head_dim
+    /// overflows usize, even when the wrapped (modular) result would be 0 and would
+    /// otherwise silently pass every subsequent checked_mul in the coeff formula.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Revert `check_alloc_capacity` to the unchecked `let kv_dim = cfg.kv_dim()`
+    ///   form: `(usize::MAX / 4 + 1) * 4` wraps to 0 in release mode, the coeff
+    ///   formula reduces to `num_attention_heads`, `effective_cap * coeff` does not
+    ///   overflow, and the function returns Ok — causing the `unwrap_err()` call to
+    ///   panic and the test to fail. FlatKVCache::try_new (generate.rs call site) is
+    ///   the second guard at the allocation boundary that catches the same class of
+    ///   overflow independently; this test covers the upstream guard.
+    #[test]
+    fn check_alloc_capacity_rejects_kv_dim_overflow() {
+        // On 64-bit: (usize::MAX / 4 + 1) * 4 overflows to 0 in release mode
+        // (wrapping arithmetic). The checked_mul guard must reject this before
+        // the wrapped zero reaches any downstream computation.
+        let overflow_kv_heads = usize::MAX / 4 + 1;
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: overflow_kv_heads,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let err = check_alloc_capacity(&cfg, 1, 1).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on kv_dim overflow, got {err:?}"
+        );
     }
 
     #[test]
