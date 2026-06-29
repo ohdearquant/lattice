@@ -48,6 +48,8 @@
 // the two transmute-equivalent slice casts in stream_quantize_shard and save/load.
 #![allow(clippy::cast_possible_truncation)]
 
+use crate::error::InferenceError;
+
 /// One Q4_0 quantization block: 32 weights packed as 4-bit unsigned integers.
 ///
 /// `scale` is stored as a raw IEEE-754 f16 bit pattern in a `u16` — the `half` crate
@@ -227,12 +229,17 @@ fn bf16_to_f32(v: u16) -> f32 {
 // Core block quantization
 // ---------------------------------------------------------------------------
 
-/// Quantize exactly 32 f32 values into one [`Q4Block`].
+/// Quantize exactly 32 f32 values into one [`Q4Block`] using asymmetric mode.
 ///
-/// Uses scale = `abs_max / 7.0` (if `abs_max == 0` uses `1.0`).
 /// Nibble layout: sequential pairs — `byte[b] = (q[2b+1] << 4) | q[2b]`.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any value in `vals` is non-finite.
+/// IEEE-754 `NaN > x` is always false, so a NaN would silently leave the
+/// min/max accumulators unchanged and produce wrong-but-no-error quantization.
 #[inline]
-fn quantize_block(vals: &[f32; 32]) -> Q4Block {
+fn quantize_block(vals: &[f32; 32]) -> Result<Q4Block, InferenceError> {
     quantize_block_with_mode(vals, false)
 }
 
@@ -241,8 +248,27 @@ fn quantize_block(vals: &[f32; 32]) -> Q4Block {
 /// with non-zero distributional center. Both modes share the same on-disk
 /// format: `dequant = nibble * scale + bias`. Symmetric mode sets
 /// `bias = -8 * scale` so that nibble=8 maps to exactly 0.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any element of `vals` is
+/// non-finite. IEEE-754 `NaN > x` is always false; a NaN silently leaves
+/// `abs_max`, `min_val`, or `max_val` unchanged, yielding wrong-but-no-error
+/// quantization. Rejecting here means the error points at the source weight
+/// rather than a downstream matmul.
 #[inline]
-pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4Block {
+pub(crate) fn quantize_block_with_mode(
+    vals: &[f32; 32],
+    symmetric: bool,
+) -> Result<Q4Block, InferenceError> {
+    for (i, &v) in vals.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(InferenceError::InvalidInput(format!(
+                "Q4 weight block element {i} contains a non-finite value ({v}); \
+                 source weights must be finite"
+            )));
+        }
+    }
     if symmetric {
         let abs_max = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         let scale = if abs_max == 0.0 {
@@ -258,11 +284,11 @@ pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4B
             let q1 = ((vals[2 * b + 1] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
-        Q4Block {
+        Ok(Q4Block {
             scale: q4_f32_to_f16(scale),
             bias: q4_f32_to_f16(bias),
             packed,
-        }
+        })
     } else {
         let min_val = vals.iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -275,11 +301,11 @@ pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4B
             let q1 = (((vals[2 * b + 1] - min_val) * inv_scale).round()).clamp(0.0, 15.0) as u8;
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
-        Q4Block {
+        Ok(Q4Block {
             scale: q4_f32_to_f16(scale),
             bias: q4_f32_to_f16(min_val),
             packed,
-        }
+        })
     }
 }
 
@@ -293,13 +319,17 @@ pub(crate) fn quantize_block_with_mode(vals: &[f32; 32], symmetric: bool) -> Q4B
 /// if `src.len()` is not a multiple of 32.
 ///
 /// Returns raw bytes containing tightly-packed [`Q4Block`]s (20 bytes each).
-pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+pub fn quantize_row_q4_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
     let n_blocks = src.len().div_ceil(32);
     let mut out = Vec::with_capacity(n_blocks * 20);
     for chunk in src.chunks(32) {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
-        let block = quantize_block(&vals);
+        let block = quantize_block(&vals)?;
         // SAFETY: Q4Block is #[repr(C)] with size 20; its alignment is 2 (the
         // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
         // rule). Casting to `&[u8; 20]` is valid because the target element type
@@ -308,7 +338,7 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Vec<u8> {
         let bytes: &[u8; 20] = unsafe { &*std::ptr::from_ref(&block).cast() };
         out.extend_from_slice(bytes);
     }
-    out
+    Ok(out)
 }
 
 /// Dequantize Q4_0 blocks (raw bytes) back to f32 values.
@@ -340,7 +370,15 @@ pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
 ///
 /// `src` has shape `[rows, cols]`. Each row is quantized independently into
 /// `cols.div_ceil(32)` blocks. Returns raw bytes (20 bytes per block).
-pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+pub fn quantize_tensor_q4_0(
+    src: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>, InferenceError> {
     assert_eq!(
         src.len(),
         rows * cols,
@@ -350,9 +388,9 @@ pub fn quantize_tensor_q4_0(src: &[f32], rows: usize, cols: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(rows * blocks_per_row * 20);
     for row_idx in 0..rows {
         let row = &src[row_idx * cols..(row_idx + 1) * cols];
-        out.extend_from_slice(&quantize_row_q4_0(row));
+        out.extend_from_slice(&quantize_row_q4_0(row)?);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +425,12 @@ fn assert_shape_matches_data_len(shape: &[usize], data_len: usize) {
 /// Quantize a BF16 tensor (raw `u16` slice) into a [`Q4Tensor`].
 ///
 /// Panics if `shape.iter().product()` does not equal `data.len()`.
-pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any BF16 value decodes to a
+/// non-finite f32 (NaN or ±inf).
+pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
     assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
@@ -398,14 +441,14 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = bf16_to_f32(v);
         }
-        blocks.push(quantize_block(&vals));
+        blocks.push(quantize_block(&vals)?);
     }
 
-    Q4Tensor {
+    Ok(Q4Tensor {
         blocks,
         shape: shape.to_vec(),
         original_len,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +469,11 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Q4Tensor {
 /// avoids that truncation.
 ///
 /// Panics if `shape.iter().product()` does not equal `data.len()`.
-pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
     assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
@@ -435,14 +482,14 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
     for chunk in data.chunks(32) {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
-        blocks.push(quantize_block(&vals));
+        blocks.push(quantize_block(&vals)?);
     }
 
-    Q4Tensor {
+    Ok(Q4Tensor {
         blocks,
         shape: shape.to_vec(),
         original_len,
-    }
+    })
 }
 
 /// Quantize an `f64` tensor into a [`Q4Tensor`] via f32 downcast.
@@ -467,7 +514,12 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Q4Tensor {
 /// boundaries.
 ///
 /// Panics if `shape.iter().product()` does not equal `data.len()`.
-pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any f64 value is non-finite (NaN
+/// or ±inf), or if the f32 downcast produces a non-finite value.
+pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
     quantize_f64_to_q4_mode(data, shape, true) // symmetric — QuaRot-rotated weights are zero-mean
 }
 
@@ -478,7 +530,15 @@ pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Q4Tensor {
 /// is approximately zero anyway, producing a 0.067·abs_max error on the zero
 /// representation). Use `false` for raw weights with non-zero distributional
 /// center.
-pub fn quantize_f64_to_q4_mode(data: &[f64], shape: &[usize], symmetric: bool) -> Q4Tensor {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+pub fn quantize_f64_to_q4_mode(
+    data: &[f64],
+    shape: &[usize],
+    symmetric: bool,
+) -> Result<Q4Tensor, InferenceError> {
     assert_shape_matches_data_len(shape, data.len());
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
@@ -489,14 +549,14 @@ pub fn quantize_f64_to_q4_mode(data: &[f64], shape: &[usize], symmetric: bool) -
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = v as f32;
         }
-        blocks.push(quantize_block_with_mode(&vals, symmetric));
+        blocks.push(quantize_block_with_mode(&vals, symmetric)?);
     }
 
-    Q4Tensor {
+    Ok(Q4Tensor {
         blocks,
         shape: shape.to_vec(),
         original_len,
-    }
+    })
 }
 
 /// Dequantize all blocks of a [`Q4Tensor`] back to f32.
@@ -542,7 +602,7 @@ pub fn stream_quantize_shard(
             let v = u16::from_ne_bytes([pair[0], pair[1]]);
             vals[j] = bf16_to_f32(v);
         }
-        blocks.push(quantize_block(&vals));
+        blocks.push(quantize_block(&vals).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?);
     }
 
     Ok(blocks)
@@ -852,7 +912,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_quantize_dequantize_zeros() {
-        let data = quantize_row_q4_0(&vec![0.0f32; 64]);
+        let data = quantize_row_q4_0(&vec![0.0f32; 64]).unwrap();
         let out = dequantize_row_q4_0(&data, 64);
         assert_eq!(out.len(), 64);
         for v in &out {
@@ -866,7 +926,7 @@ mod tests {
     #[test]
     fn test_quantize_dequantize_small_values() {
         let src: Vec<f32> = (0..32).map(|i| i as f32 * 7.0 / 31.0).collect();
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         let out = dequantize_row_q4_0(&data, 32);
         let max_err = src
             .iter()
@@ -885,7 +945,7 @@ mod tests {
     #[test]
     fn test_quantize_dequantize_symmetric() {
         let src: Vec<f32> = (0..32).map(|i| (i as f32 - 15.5) / 15.5 * 7.0).collect();
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         let out = dequantize_row_q4_0(&data, 32);
         let max_err = src
             .iter()
@@ -907,7 +967,7 @@ mod tests {
         let mut src = vec![0.0f32; 32];
         src[0] = 7.0;
         src[1] = -7.0;
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         // Asymmetric: min=-7, max=7, scale = 14/15 ≈ 0.933
         // q[0] = round((7.0 - (-7.0)) / scale) = round(15) = 15 → low nibble
         // q[1] = round((-7.0 - (-7.0)) / scale) = round(0)  = 0  → high nibble
@@ -934,7 +994,7 @@ mod tests {
     fn test_quantize_single_block() {
         // Use values in [-7, 7] so scale = 7/7 = 1.0 and max quantization error = 0.5.
         let src: Vec<f32> = (0..32).map(|i| (i as f32 / 31.0) * 14.0 - 7.0).collect();
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         assert_eq!(data.len(), 20, "single block must be 20 bytes");
         let out = dequantize_row_q4_0(&data, 32);
         assert_eq!(out.len(), 32);
@@ -957,7 +1017,7 @@ mod tests {
     #[test]
     fn test_quantize_multiple_blocks() {
         let src: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) / 10.0).collect();
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         assert_eq!(data.len(), 4 * 20, "4 blocks must be 80 bytes");
         let out = dequantize_row_q4_0(&data, 128);
         assert_eq!(out.len(), 128);
@@ -1050,7 +1110,7 @@ mod tests {
         let mut src = vec![0.0f32; 32];
         src[0] = 0.0;
         src[1] = 7.0;
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         let byte0 = data[4];
         assert_eq!(
             byte0, 0xF0,
@@ -1083,7 +1143,7 @@ mod tests {
         let src: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 - 128.0) / 20.0)
             .collect();
-        let data = quantize_tensor_q4_0(&src, rows, cols);
+        let data = quantize_tensor_q4_0(&src, rows, cols).unwrap();
         let blocks_per_row = cols.div_ceil(32); // 2 blocks per row of 64 cols
         assert_eq!(
             data.len(),
@@ -1131,7 +1191,7 @@ mod tests {
     #[test]
     fn test_quantize_dequantize_round_trip_zeros_bf16() {
         let data = vec![0u16; 64];
-        let tensor = quantize_bf16_to_q4(&data, &[64]);
+        let tensor = quantize_bf16_to_q4(&data, &[64]).unwrap();
         let out = dequantize_q4_to_f32(&tensor);
         assert_eq!(out.len(), 64);
         for v in &out {
@@ -1143,7 +1203,7 @@ mod tests {
     fn test_quantize_dequantize_round_trip_positive_bf16() {
         let f32_vals: Vec<f32> = (0..32).map(|i| i as f32 * 7.0 / 31.0).collect();
         let bf16_vals = to_bf16(&f32_vals);
-        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]);
+        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]).unwrap();
         let out = dequantize_q4_to_f32(&tensor);
         // Compare against bf16-rounded originals (bf16 conversion is lossy at input).
         // Threshold 0.51 accounts for f16 scale rounding on top of the 0.5 quantization step.
@@ -1163,7 +1223,7 @@ mod tests {
         f32_vals[0] = 0.0;
         f32_vals[1] = 7.0;
         let bf16_vals = to_bf16(&f32_vals);
-        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]);
+        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]).unwrap();
         assert_eq!(tensor.blocks.len(), 1);
         assert_eq!(
             tensor.blocks[0].packed[0], 0xF0,
@@ -1177,7 +1237,7 @@ mod tests {
         let mut f32_vals = [0.0f32; 32];
         f32_vals[0] = 100.0;
         let bf16_vals = to_bf16(&f32_vals);
-        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]);
+        let tensor = quantize_bf16_to_q4(&bf16_vals, &[32]).unwrap();
         let low_nibble = tensor.blocks[0].packed[0] & 0x0f;
         assert_eq!(low_nibble, 15, "weight[0]=100 should clamp to nibble 15");
     }
@@ -1195,7 +1255,7 @@ mod tests {
             f32_vals.push(-((i % 7) as f32 + 1.0));
         } // range [-7, -1]
         let bf16_vals = to_bf16(&f32_vals);
-        let tensor = quantize_bf16_to_q4(&bf16_vals, &[64]);
+        let tensor = quantize_bf16_to_q4(&bf16_vals, &[64]).unwrap();
         assert_eq!(tensor.blocks.len(), 2);
         let out = dequantize_q4_to_f32(&tensor);
         // All block-0 values are positive [1..7], scale≈1. Dequant ≥ (1-0.5)*1 = 0.5 > 0.
@@ -1212,7 +1272,7 @@ mod tests {
     fn test_save_load_round_trip() {
         let f32_vals: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 4.0).collect();
         let bf16_vals = to_bf16(&f32_vals);
-        let original = quantize_bf16_to_q4(&bf16_vals, &[8, 8]);
+        let original = quantize_bf16_to_q4(&bf16_vals, &[8, 8]).unwrap();
         let path = std::path::PathBuf::from("/tmp/test_q4_round_trip.q4");
         save_q4_file(&path, &original).unwrap();
         let loaded = load_q4_file(&path).unwrap();
@@ -1230,7 +1290,7 @@ mod tests {
     fn test_stream_quantize_shard_matches_batch() {
         let f32_vals: Vec<f32> = (0..96).map(|i| i as f32 / 10.0).collect();
         let bf16_vals = to_bf16(&f32_vals);
-        let batch_tensor = quantize_bf16_to_q4(&bf16_vals, &[96]);
+        let batch_tensor = quantize_bf16_to_q4(&bf16_vals, &[96]).unwrap();
         // Convert bf16 u16s to raw bytes (native endian, matching stream_quantize_shard)
         let bf16_bytes: Vec<u8> = bf16_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let stream_blocks = stream_quantize_shard(&bf16_bytes).unwrap();
@@ -1245,7 +1305,7 @@ mod tests {
     fn test_shape_preservation() {
         let shape = vec![4usize, 8, 4]; // 128 elements
         let data = vec![0u16; 128];
-        let tensor = quantize_bf16_to_q4(&data, &shape);
+        let tensor = quantize_bf16_to_q4(&data, &shape).unwrap();
         assert_eq!(tensor.shape, shape);
         assert_eq!(tensor.original_len, 128);
         assert_eq!(tensor.blocks.len(), 4); // 128 / 32 = 4
@@ -1272,7 +1332,7 @@ mod tests {
             let v = ((state >> 32) as f32 / u32::MAX as f32) * 14.0 - 7.0;
             f32_vals.push(v);
         }
-        let data = quantize_row_q4_0(&f32_vals);
+        let data = quantize_row_q4_0(&f32_vals).unwrap();
         let out = dequantize_row_q4_0(&data, 1024);
         assert_eq!(out.len(), 1024);
         let mae = f32_vals
@@ -1316,7 +1376,7 @@ mod tests {
     #[test]
     fn quantize_f32_to_q4_shape_and_length() {
         let src = synthetic_f32_uniform(96, 17);
-        let q = quantize_f32_to_q4(&src, &[3, 32]);
+        let q = quantize_f32_to_q4(&src, &[3, 32]).unwrap();
         assert_eq!(q.shape, vec![3, 32]);
         assert_eq!(q.original_len, 96);
         assert_eq!(q.blocks.len(), 3, "96 elems = 3 full Q4 blocks");
@@ -1325,7 +1385,7 @@ mod tests {
     #[test]
     fn quantize_f32_to_q4_pads_partial_block() {
         let src = synthetic_f32_uniform(40, 19);
-        let q = quantize_f32_to_q4(&src, &[40]);
+        let q = quantize_f32_to_q4(&src, &[40]).unwrap();
         assert_eq!(q.original_len, 40);
         assert_eq!(q.blocks.len(), 2, "40 elems = 1 full + 1 partial Q4 block");
     }
@@ -1342,8 +1402,8 @@ mod tests {
             .map(f64::from)
             .collect();
         let src_f32: Vec<f32> = src_f64.iter().map(|&v| v as f32).collect();
-        let q_f64 = quantize_f64_to_q4_mode(&src_f64, &[256], false);
-        let q_f32 = quantize_f32_to_q4(&src_f32, &[256]);
+        let q_f64 = quantize_f64_to_q4_mode(&src_f64, &[256], false).unwrap();
+        let q_f32 = quantize_f32_to_q4(&src_f32, &[256]).unwrap();
         assert_eq!(q_f64.shape, q_f32.shape);
         assert_eq!(q_f64.original_len, q_f32.original_len);
         assert_eq!(
@@ -1372,8 +1432,8 @@ mod tests {
             .collect();
         let f32_from_bf16: Vec<f32> = bf16_bits.iter().map(|&b| bf16_to_f32(b)).collect();
 
-        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[256]);
-        let q_f32 = quantize_f32_to_q4(&f32_from_bf16, &[256]);
+        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[256]).unwrap();
+        let q_f32 = quantize_f32_to_q4(&f32_from_bf16, &[256]).unwrap();
         assert_eq!(q_bf16.blocks.len(), q_f32.blocks.len());
         for (i, (a, b)) in q_bf16.blocks.iter().zip(q_f32.blocks.iter()).enumerate() {
             assert_eq!(a.scale, b.scale, "block {i} scale should match");
@@ -1396,8 +1456,8 @@ mod tests {
         let src = synthetic_f32_uniform(2048, 31);
         let bf16_bits: Vec<u16> = src.iter().map(|&v| f32_to_bf16_bits(v)).collect();
 
-        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[2048]);
-        let q_f32 = quantize_f32_to_q4(&src, &[2048]);
+        let q_bf16 = quantize_bf16_to_q4(&bf16_bits, &[2048]).unwrap();
+        let q_f32 = quantize_f32_to_q4(&src, &[2048]).unwrap();
         let deq_bf16 = dequantize_q4_to_f32(&q_bf16);
         let deq_f32 = dequantize_q4_to_f32(&q_f32);
 
@@ -1475,8 +1535,8 @@ mod tests {
         // produce the same per-block byte layout as `quantize_row_q4_0`
         // (which the existing kernels are already validated against).
         let src = synthetic_f32_uniform(128, 37);
-        let q = quantize_f32_to_q4(&src, &[128]);
-        let row_bytes = quantize_row_q4_0(&src);
+        let q = quantize_f32_to_q4(&src, &[128]).unwrap();
+        let row_bytes = quantize_row_q4_0(&src).unwrap();
         assert_eq!(row_bytes.len(), q.blocks.len() * 20);
         // SAFETY: Q4Block is #[repr(C)] size 20 (scale + bias + 16 nibbles),
         // alignment 2; byte-cast is valid because target element type is u8.
@@ -1501,7 +1561,7 @@ mod tests {
     fn dequantize_row_q4_0_misaligned_does_not_panic() {
         // Build a valid 1-block (20-byte) buffer by quantizing 32 known values.
         let src: Vec<f32> = (0..32).map(|i| (i as f32 / 31.0) * 14.0 - 7.0).collect();
-        let mut buf = quantize_row_q4_0(&src); // exactly 20 bytes
+        let mut buf = quantize_row_q4_0(&src).unwrap(); // exactly 20 bytes
         assert_eq!(buf.len(), 20);
         // Append 5 garbage bytes — total 25, which is NOT a multiple of 20.
         buf.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xFF]);
@@ -1544,7 +1604,7 @@ mod tests {
     #[test]
     fn dequantize_row_q4_0_exact_blocks_unchanged() {
         let src: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
-        let data = quantize_row_q4_0(&src);
+        let data = quantize_row_q4_0(&src).unwrap();
         assert_eq!(data.len(), 40, "2-block input must be 40 bytes");
         let out = dequantize_row_q4_0(&data, 64);
         assert_eq!(out.len(), 64);
@@ -1676,6 +1736,48 @@ mod tests {
         assert!(
             r.is_err(),
             "u32::MAX ndim in .f16 must be rejected, not OOM-aborted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-finite input guard — mutation-sensitive tests (Finding 1, PR #452)
+    //
+    // IEEE-754: `NaN > x` and `NaN < x` are always false, so a plain
+    // `f32::max` / `f32::min` fold over a block that contains NaN silently
+    // ignores the NaN element and computes scale from the finite elements
+    // only. The NaN then quantizes to nibble 0 via a saturating cast, so
+    // no panic occurs and the caller receives a plausible-looking Q4Block
+    // with a silently wrong entry. The guard at the top of
+    // `quantize_block_with_mode` must catch this before the fold.
+    //
+    // Mutation sensitivity: removing the `if !v.is_finite()` guard converts
+    // both `Err` returns below to `Ok`, turning `result.is_err()` → false
+    // and failing the assertion.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_quantize_block_rejects_nan_input() {
+        // Block with one NaN among otherwise-valid weights must return Err.
+        let mut vals = vec![1.0f32; 32];
+        vals[7] = f32::NAN;
+        let result = quantize_row_q4_0(&vals);
+        assert!(
+            result.is_err(),
+            "NaN in weight block must be rejected with InvalidInput"
+        );
+    }
+
+    #[test]
+    fn test_quantize_block_rejects_inf_input() {
+        // Block with one +inf element must return Err; the guard covers both
+        // +inf and -inf via `is_finite()` (which returns false for any
+        // non-finite value, including NaN, +inf, and -inf).
+        let mut vals = vec![1.0f32; 32];
+        vals[15] = f32::INFINITY;
+        let result = quantize_row_q4_0(&vals);
+        assert!(
+            result.is_err(),
+            "+inf in weight block must be rejected with InvalidInput"
         );
     }
 }
