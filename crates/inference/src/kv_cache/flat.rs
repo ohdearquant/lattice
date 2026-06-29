@@ -80,24 +80,88 @@ pub struct FlatKVCache {
     seq_len: usize,
     /// Config.
     config: FlatKVCacheConfig,
+    /// Tracks which layers have been written at the current `seq_len` position.
+    /// `advance()` requires this to be all-true before bumping `seq_len`.
+    /// `advance_by()` skips this check (bulk prefill writes per-layer then advances).
+    /// Reset to all-false on every successful `advance()`, `advance_by()`,
+    /// `reset()`, `reset_fast()`, and `truncate_to()`.
+    layers_written: Vec<bool>,
 }
 
 impl FlatKVCache {
     /// **Unstable**: construct with zero-initialized buffers.
+    ///
+    /// Dimensions are not validated against overflow; production callers must
+    /// guard with `check_alloc_capacity` or equivalent before calling this.
+    /// Prefer [`try_new`][`FlatKVCache::try_new`] when constructing from
+    /// attacker-controlled or unvalidated config values.
     pub fn new(config: FlatKVCacheConfig) -> Self {
         let cap = config.layer_capacity();
-        let k = (0..config.num_layers)
-            .map(|_| vec![f16::ZERO; cap])
-            .collect();
-        let v = (0..config.num_layers)
-            .map(|_| vec![f16::ZERO; cap])
-            .collect();
+        let num_layers = config.num_layers;
+        let k = (0..num_layers).map(|_| vec![f16::ZERO; cap]).collect();
+        let v = (0..num_layers).map(|_| vec![f16::ZERO; cap]).collect();
         Self {
             k,
             v,
             seq_len: 0,
+            layers_written: vec![false; num_layers],
             config,
         }
+    }
+
+    /// **Unstable**: fallible constructor that validates all dimension products
+    /// with checked arithmetic before allocating.
+    ///
+    /// Returns `Err(InferenceError::InvalidInput)` when any intermediate product
+    /// (`num_kv_heads * head_dim`, `max_seq_len * kv_dim`, or the total element
+    /// count) would overflow `usize`. Callers that supply attacker-influenced or
+    /// user-supplied dimensions should prefer this over [`new`][`FlatKVCache::new`].
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` if any dimension product overflows `usize`.
+    pub fn try_new(config: FlatKVCacheConfig) -> Result<Self, InferenceError> {
+        // Validate kv_dim before any allocation so that Vec::with_capacity
+        // never receives a silently-wrapped (attacker-influenced) capacity.
+        let kv_dim = config
+            .num_kv_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "num_kv_heads ({}) * head_dim ({}) overflows usize",
+                    config.num_kv_heads, config.head_dim
+                ))
+            })?;
+        let layer_cap = config.max_seq_len.checked_mul(kv_dim).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "max_seq_len ({}) * kv_dim ({kv_dim}) overflows usize",
+                config.max_seq_len
+            ))
+        })?;
+        // Total element count across both K and V sides: 2 * num_layers * layer_cap.
+        let _total = 2usize
+            .checked_mul(config.num_layers)
+            .and_then(|n| n.checked_mul(layer_cap))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "2 * num_layers ({}) * layer_capacity ({layer_cap}) overflows usize",
+                    config.num_layers
+                ))
+            })?;
+
+        let num_layers = config.num_layers;
+        let k: Vec<Vec<f16>> = (0..num_layers)
+            .map(|_| vec![f16::ZERO; layer_cap])
+            .collect();
+        let v: Vec<Vec<f16>> = (0..num_layers)
+            .map(|_| vec![f16::ZERO; layer_cap])
+            .collect();
+        Ok(Self {
+            k,
+            v,
+            seq_len: 0,
+            layers_written: vec![false; num_layers],
+            config,
+        })
     }
 
     /// **Unstable**: current cached sequence length.
@@ -176,20 +240,53 @@ impl FlatKVCache {
             self.v[layer][offset + i] = f16::from_f32(val);
         }
 
+        // Mark this layer as written for the current token position.
+        // `advance()` uses this to enforce the layer-completeness contract.
+        self.layers_written[layer] = true;
+
         Ok(self.seq_len)
     }
 
     /// **Unstable**: advance position counter after all layers are appended.
     ///
+    /// Enforces the layer-completeness contract: every layer must have been
+    /// written (via [`append_kv`][`FlatKVCache::append_kv`]) at the current
+    /// `seq_len` position before the position counter is advanced. This prevents
+    /// a caller that only writes a subset of layers from publishing a position
+    /// where the remaining layers contain stale (zero-initialized) data.
+    ///
+    /// For bulk prefill that writes layers independently, use
+    /// [`prefill_layer`][`FlatKVCache::prefill_layer`] followed by
+    /// [`advance_by`][`FlatKVCache::advance_by`], which skips this check.
+    ///
     /// # Errors
-    /// Returns `InferenceError::InvalidInput` if the cache is already full.
+    /// Returns `InferenceError::InvalidInput` if the cache is already full or
+    /// if not all layers have been written at the current token position.
     pub fn advance(&mut self) -> Result<(), InferenceError> {
         if self.seq_len >= self.config.max_seq_len {
             return Err(InferenceError::InvalidInput(
                 "cannot advance: cache is full".to_string(),
             ));
         }
+        // Enforce the documented caller contract: all layers must be written
+        // before the position is published. Collect the missing layer indices
+        // for a diagnostic message rather than failing with a bare "incomplete".
+        let missing: Vec<usize> = self
+            .layers_written
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| !*w)
+            .map(|(i, _)| i)
+            .collect();
+        if !missing.is_empty() {
+            return Err(InferenceError::InvalidInput(format!(
+                "advance() requires all {} layers written at position {}; \
+                 layers {missing:?} have not been written",
+                self.config.num_layers, self.seq_len,
+            )));
+        }
         self.seq_len += 1;
+        self.layers_written.fill(false);
         Ok(())
     }
 
@@ -286,6 +383,11 @@ impl FlatKVCache {
 
     /// **Unstable**: advance position counter by n after prefilling all layers.
     ///
+    /// Skips the per-layer completeness check performed by
+    /// [`advance`][`FlatKVCache::advance`]; intended for use after
+    /// [`prefill_layer`][`FlatKVCache::prefill_layer`], which writes multiple
+    /// tokens per layer rather than one token per `advance` call.
+    ///
     /// # Errors
     /// Returns `InferenceError::InvalidInput` if `seq_len + n` would overflow
     /// `usize` or exceed `max_seq_len`.
@@ -302,6 +404,8 @@ impl FlatKVCache {
             ));
         }
         self.seq_len = new_len;
+        // Reset the per-layer write tracking so the next decode step starts clean.
+        self.layers_written.fill(false);
         Ok(())
     }
 
@@ -316,6 +420,9 @@ impl FlatKVCache {
             self.seq_len
         );
         self.seq_len = seq_len;
+        // The rewound position has no pending writes yet; reset tracking so the
+        // next append_kv → advance cycle starts from a clean state.
+        self.layers_written.fill(false);
     }
 
     /// **Unstable**: dequantize K slice for a layer into `buf` up to current seq_len.
@@ -437,6 +544,7 @@ impl FlatKVCache {
     /// **Unstable**: reset and zero all KV data; does not deallocate.
     pub fn reset(&mut self) {
         self.seq_len = 0;
+        self.layers_written.fill(false);
         // Zero out for safety (prevent stale data leaking).
         for layer in 0..self.config.num_layers {
             self.k[layer].fill(f16::ZERO);
@@ -447,6 +555,7 @@ impl FlatKVCache {
     /// **Unstable**: fast reset; stale data remains in buffers.
     pub fn reset_fast(&mut self) {
         self.seq_len = 0;
+        self.layers_written.fill(false);
     }
 
     /// **Unstable**: total memory usage of this cache in bytes.
@@ -1470,6 +1579,158 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput error, got {r:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #407: try_new() overflow guard + advance()
+    // layer-completeness contract.
+    //
+    // Mutation-sensitivity contract:
+    //   - Remove the checked_mul in try_new()  → try_new_overflow_* tests FAIL
+    //     (would return Ok, not Err).
+    //   - Remove the layers_written check in advance() → advance_requires_all_layers_written
+    //     FAILS (advance would return Ok, not Err).
+    // -----------------------------------------------------------------------
+
+    /// try_new rejects configs whose num_kv_heads * head_dim overflows usize.
+    #[test]
+    fn try_new_overflow_kv_dim_returns_err() {
+        let config = FlatKVCacheConfig {
+            num_layers: 1,
+            num_kv_heads: usize::MAX,
+            head_dim: 2,
+            max_seq_len: 1,
+        };
+        let r = FlatKVCache::try_new(config);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on kv_dim overflow, got {r:?}"
+        );
+    }
+
+    /// try_new rejects configs whose max_seq_len * kv_dim overflows usize.
+    ///
+    /// This is the exact overflow described in issue #407:
+    /// `for_qwen3(1, 8, 128, usize::MAX / kv_dim + 2)` wraps layer_capacity
+    /// to 1024 in the infallible `new()`, silently under-allocating the buffer
+    /// and causing an out-of-bounds index on a later `append_kv`. `try_new`
+    /// must return Err before any allocation.
+    #[test]
+    fn try_new_overflow_layer_capacity_returns_err() {
+        // kv_dim = 8 * 128 = 1024; max_seq_len chosen so max_seq_len * 1024 overflows usize.
+        let kv_dim: usize = 8 * 128;
+        let overflow_seq = usize::MAX / kv_dim + 2;
+        let config = FlatKVCacheConfig::for_qwen3(1, 8, 128, overflow_seq);
+        let r = FlatKVCache::try_new(config);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on layer_capacity overflow, got {r:?}"
+        );
+    }
+
+    /// try_new rejects configs whose total element count (2 * num_layers * layer_cap)
+    /// overflows usize even when individual dimension products do not.
+    #[test]
+    fn try_new_overflow_total_elements_returns_err() {
+        // Construct a config where kv_dim and layer_cap are each reasonable,
+        // but 2 * num_layers * layer_cap overflows.
+        // layer_cap = 4 * 4 = 16; 2 * (usize::MAX / 32 + 2) * 16 overflows.
+        let n_layers = usize::MAX / 32 + 2;
+        let config = FlatKVCacheConfig {
+            num_layers: n_layers,
+            num_kv_heads: 1,
+            head_dim: 4,
+            max_seq_len: 4,
+        };
+        let r = FlatKVCache::try_new(config);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on total-elements overflow, got {r:?}"
+        );
+    }
+
+    /// try_new succeeds for a valid config and produces a correctly-sized cache.
+    ///
+    /// Confirms the happy path is not broken by the overflow guards.
+    #[test]
+    fn try_new_valid_config_succeeds() {
+        let config = FlatKVCacheConfig::for_qwen3(2, 4, 8, 16);
+        let cache = FlatKVCache::try_new(config).expect("valid config must succeed");
+        assert_eq!(cache.seq_len(), 0);
+        assert_eq!(cache.num_layers(), 2);
+        assert_eq!(cache.max_seq_len(), 16);
+        assert_eq!(cache.kv_dim(), 4 * 8);
+    }
+
+    /// advance() returns Err when not all layers have been written at the current position.
+    ///
+    /// Regression for #407 Finding 2: a caller that writes only a subset of layers
+    /// before calling advance() silently publishes positions where the remaining
+    /// layers contain stale (zero-initialized) data.
+    #[test]
+    fn advance_requires_all_layers_written() {
+        // Two-layer cache; write only layer 0 then try to advance.
+        let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
+        cache.append_kv(0, &k, &v).unwrap(); // only layer 0
+
+        let r = cache.advance();
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "advance() must Err when layer 1 was not written; got {r:?}"
+        );
+        // seq_len must NOT have advanced.
+        assert_eq!(
+            cache.seq_len(),
+            0,
+            "seq_len must not advance on layer-incomplete step"
+        );
+    }
+
+    /// advance() succeeds once all layers have been written.
+    #[test]
+    fn advance_succeeds_when_all_layers_written() {
+        let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.append_kv(1, &k, &v).unwrap();
+        cache
+            .advance()
+            .expect("advance must succeed when all layers written");
+        assert_eq!(cache.seq_len(), 1);
+    }
+
+    /// After a successful advance(), layers_written is reset so the next step
+    /// starts clean and requires all layers to be written again.
+    #[test]
+    fn advance_resets_layer_tracking_between_steps() {
+        let config = FlatKVCacheConfig::for_qwen3(2, 1, 4, 4);
+        let kv_dim = config.kv_dim();
+        let mut cache = FlatKVCache::new(config);
+
+        let k = vec![1.0f32; kv_dim];
+        let v = vec![2.0f32; kv_dim];
+
+        // Step 0: write both layers, advance.
+        cache.append_kv(0, &k, &v).unwrap();
+        cache.append_kv(1, &k, &v).unwrap();
+        cache.advance().unwrap();
+
+        // Step 1: write only layer 0 — advance must still Err.
+        cache.append_kv(0, &k, &v).unwrap();
+        let r = cache.advance();
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "advance must Err on step 1 when layer 1 not written; got {r:?}"
         );
     }
 }

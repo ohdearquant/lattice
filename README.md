@@ -53,14 +53,37 @@ library from a single window.
 
 ## Benchmarks
 
-Measured on Apple M2 Max, Qwen3.5-0.8B, slope method (token throughput excluding prompt prefill
-and model load). Greedy decoding, median of 5 runs.
+Measured on Apple M2 Max, Qwen3.5-0.8B. Greedy decoding, median of 5 runs.
+
+These are **decode-only** rates: steady-state token generation speed with prompt prefill and
+one-time model load excluded. Per-token decode latency is fit as `t = intercept + slope * ctx`
+across several context lengths (the "slope method") and reported as `1000 / t` at each. `Context`
+is the number of tokens already in the KV cache when the measured token is decoded. The wall-clock
+speed you observe in an interactive chat is lower than these numbers, because it also includes
+prefill of the whole prompt (see "Why throughput falls with context" below).
 
 | Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
 |---------|------------------------|---------------|-------------------|-------------------|
 | 64 tok  | **187 tok/s**          | 93            | 265               | 2.0x              |
 | 128 tok | **171 tok/s**          | 92            | 263               | 1.9x              |
 | 256 tok | **146 tok/s**          | 88            | 260               | 1.6x              |
+
+### Why throughput falls with context
+
+Decode slows as context grows (187 → 171 → 146 tok/s above) because every generated token attends
+over the entire KV cache:
+
+- The grouped-query attention (GQA) layers do work proportional to context length on each token: the
+  full key/value cache is streamed through memory every step. Decode is memory-bandwidth bound, so
+  per-token latency rises linearly with context (`t ≈ intercept + slope * ctx`) and throughput is its
+  reciprocal.
+- The linear-attention (gated-delta) layers are constant-time in context and do not contribute to the
+  slope.
+
+In an interactive chat this compounds with prompt prefill. The serve path currently re-prefills the
+whole conversation on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462)), a
+separate and larger cost than the decode slope, and the main reason a long chat feels progressively
+slower.
 
 MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal compute API,
 the same tier as Ollama. MLX decodes faster than Lattice at raw throughput. Lattice's edge is

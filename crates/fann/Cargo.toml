@@ -11,6 +11,9 @@ description = "Fast neural network primitives for Lattice - tiny models, fast in
 default = ["std", "simd"]
 std = []
 simd = []
+# Policy-gradient router trainer and EWC forgetting guard — off by default.
+# Enable with --features online-router to access RlooTrainer and DiagonalFisher.
+online-router = []
 parallel = ["dep:rayon"]
 serde = ["dep:serde", "dep:serde_json"]
 # GPU acceleration via wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows)
@@ -37,6 +40,11 @@ futures = { version = "0.3", optional = true }
 
 [[example]]
 name = "fann_xor"
+
+[[bench]]
+name = "router_online"
+harness = false
+required-features = ["online-router"]
 
 [dev-dependencies]
 approx = "0.5"

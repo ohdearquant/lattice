@@ -68,10 +68,18 @@ fn cosine_neon_kernel(a: &[f32], b: &[f32]) -> f32 {
     unsafe { cosine_similarity_neon_unrolled(a, b) }
 }
 
-/// **Unstable**: SIMD dispatch layer; use `lattice_embed::utils::cosine_similarity` for the stable wrapper.
+/// Cosine similarity over equal-length, non-empty `f32` slices.
 ///
 /// For pre-normalized vectors (embeddings typically are), use `dot_product`
 /// directly for better performance.
+///
+/// # Stability — khive ANN consumer contract
+///
+/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
+/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
+/// and the length-mismatch / empty-input behaviour (returns 0.0) are a **stable
+/// consumer contract** across the 0.4.x line. For the general-purpose ergonomic
+/// wrapper use `lattice_embed::utils::cosine_similarity`.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {

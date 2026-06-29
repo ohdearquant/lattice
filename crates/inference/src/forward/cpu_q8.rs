@@ -17,6 +17,7 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
     ForwardScratch, KvCache, decode_tokens, qwen35_rms_norm, resize, sample_token,
+    should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
@@ -676,6 +677,24 @@ pub fn generate_q8(
         ));
     }
 
+    // max_new_tokens == 0 is a valid request: "score this prompt, return no tokens".
+    // Guard here so the decode loop (`for _ in 1..0`) never accidentally samples one
+    // token from the prefill logits before realising the budget is exhausted.
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: vec![],
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped: false,
+        });
+    }
+    // Reject grammar configs before allocating any state. Grammar masking
+    // (`mask_logits` + `advance`) is not wired into this generate loop; without
+    // the guard the grammar field would be silently ignored, producing
+    // unconstrained output despite a grammar being set (#397/#398).
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+
     // Context preflight. The RoPE cos/sin tables are indexed unchecked in
     // full_attention_step_q8 (`rope.cos_at(position * half + i)`), so a position
     // at or past the table capacity is an out-of-bounds slice access — a release
@@ -729,7 +748,7 @@ pub fn generate_q8(
         &mut rng_state,
     );
 
-    if next_id == cfg.eos_token_id {
+    if should_stop_token(cfg, gen_cfg, next_id) {
         return Ok(GenerateOutput {
             text: String::new(),
             token_ids: vec![],
@@ -746,9 +765,15 @@ pub fn generate_q8(
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
-        let last_token = *all_ids
-            .last()
-            .expect("invariant: prompt or previous sample populated all_ids");
+        // all_ids is seeded by the prompt before the loop, and the decode loop
+        // only continues when the previous sample pushed a new id, so the
+        // invariant `all_ids.is_empty() == false` should always hold here.
+        // Return an error rather than panicking so library callers can handle it.
+        let Some(&last_token) = all_ids.last() else {
+            return Err(crate::error::InferenceError::Inference(
+                "empty generation state".into(),
+            ));
+        };
 
         forward_step_q8(
             weights,
@@ -769,7 +794,7 @@ pub fn generate_q8(
             &mut rng_state,
         );
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
             break;
         }
@@ -865,7 +890,7 @@ mod tests {
         }
 
         let zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
-            quantize_matrix(&vec![0.0f32; rows * cols], rows, cols)
+            quantize_matrix(&vec![0.0f32; rows * cols], rows, cols).unwrap()
         };
         // W_q = identity for first q_dim rows (Q part), zeros for next q_dim rows (gate part).
         // Row j selects input[j] exactly so scratch.q_buf is non-trivial and Q-loop mutation
@@ -875,8 +900,8 @@ mod tests {
             q_proj_f32[j * hidden + j] = 1.0;
         }
         let weights = Q8FullAttentionLayerWeights {
-            q_proj: quantize_matrix(&q_proj_f32, 2 * q_dim, hidden),
-            k_proj: quantize_matrix(&k_proj_f32, kv_dim, hidden),
+            q_proj: quantize_matrix(&q_proj_f32, 2 * q_dim, hidden).unwrap(),
+            k_proj: quantize_matrix(&k_proj_f32, kv_dim, hidden).unwrap(),
             v_proj: zero_q8(kv_dim, hidden),
             o_proj: zero_q8(hidden, q_dim),
             q_norm: vec![0.0f32; head_dim],
@@ -1131,15 +1156,15 @@ mod tests {
             k_proj_f32[j * hidden + j] = 1.0;
         }
         let zero_q8 = |rows: usize, cols: usize| -> crate::weights::q8_weights::Q8Matrix {
-            quantize_matrix(&vec![0.0f32; rows * cols], rows, cols)
+            quantize_matrix(&vec![0.0f32; rows * cols], rows, cols).unwrap()
         };
         let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
         for j in 0..q_dim {
             q_proj_f32[j * hidden + j] = 1.0;
         }
         let weights = Q8FullAttentionLayerWeights {
-            q_proj: quantize_matrix(&q_proj_f32, 2 * q_dim, hidden),
-            k_proj: quantize_matrix(&k_proj_f32, kv_dim, hidden),
+            q_proj: quantize_matrix(&q_proj_f32, 2 * q_dim, hidden).unwrap(),
+            k_proj: quantize_matrix(&k_proj_f32, kv_dim, hidden).unwrap(),
             v_proj: zero_q8(kv_dim, hidden),
             o_proj: zero_q8(hidden, q_dim),
             q_norm: vec![0.0f32; head_dim],
@@ -1252,6 +1277,141 @@ mod tests {
         );
     }
 
+    /// Build a minimal Q8 config + weights with zero hidden layers so forward_step_q8
+    /// skips all attention and MLP blocks. The embedding lookup and final-norm steps
+    /// still execute, so embed_tokens and final_norm must have the right lengths.
+    fn zero_layer_q8_fixture() -> (Qwen35Config, Q8ModelWeights, RopeTable, BpeTokenizer) {
+        use std::collections::HashMap;
+
+        let hidden = 4usize;
+        let vocab = 8usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos is 5 so that greedy token 0 is NOT eos — this lets tests for
+            // stop_token_ids use token 0 as a distinct stop signal.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // embed_tokens is [vocab, hidden] and also serves as the tied LM head.
+        // All zeros → logits are all zeros → greedy sampling always picks token 0.
+        let weights = Q8ModelWeights {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            layers: vec![],
+        };
+
+        // rope_dim = head_dim * partial_rotary_factor = 4 * 0.5 = 2.
+        // No full-attention layers use the table, but max_positions must satisfy the
+        // context preflight (prompt_len + max_new_tokens <= max_positions).
+        let rope = RopeTable::new(2, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        (cfg, weights, rope, tokenizer)
+    }
+
+    /// `generate_q8` with `max_new_tokens == 0` must return zero generated tokens
+    /// without running a forward pass or sampling anything.
+    ///
+    /// Mutation check: removing the `max_new_tokens == 0` early return causes
+    /// the function to run prefill + sample one token from the logits, so
+    /// `generated_tokens` becomes 1 instead of 0 and the assertion fails.
+    #[test]
+    fn test_generate_q8_max_new_tokens_zero_returns_empty() {
+        let (cfg, weights, rope, tokenizer) = zero_layer_q8_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 0,
+            ..Default::default()
+        };
+
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "h", &gen_cfg)
+            .expect("max_new_tokens=0 must succeed, not error");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "max_new_tokens=0 must produce zero generated tokens"
+        );
+        assert!(
+            out.token_ids.is_empty(),
+            "max_new_tokens=0 must produce an empty token list"
+        );
+        assert_eq!(out.prompt_tokens, 1, "prompt 'h' tokenizes to one token");
+    }
+
+    /// `generate_q8` must stop on a token in `stop_token_ids` even when that
+    /// token differs from `eos_token_id`.
+    ///
+    /// Setup: all-zero weights → greedy sampling always picks token 0.
+    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0].
+    /// With the fix the first sampled token (0) hits the stop list and the
+    /// function returns 0 generated tokens.
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` causes `0 == 5` to be false, so token 0
+    /// is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_q8_honors_stop_token_ids() {
+        let (cfg, weights, rope, tokenizer) = zero_layer_q8_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = generate_q8(&weights, &cfg, &tokenizer, &rope, "h", &gen_cfg)
+            .expect("generate_q8 must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "stop token 0 must halt generation before any token is emitted"
+        );
+        assert!(
+            out.stopped,
+            "stopped flag must be true when a stop token fires"
+        );
+    }
+
     /// `generate_q8` must reject a request whose prompt + max_new_tokens exceeds
     /// the RoPE table capacity with a clean error, not an out-of-bounds RoPE
     /// panic. The preflight returns before any weight is read, so an empty
@@ -1289,6 +1449,59 @@ mod tests {
         assert!(
             msg.contains("context window"),
             "error must name the context window; got: {msg}"
+        );
+    }
+
+    /// `generate_q8` must reject a `GenerateConfig` that sets `grammar` with a
+    /// typed `InvalidInput` error before sampling any token (#397/#398).
+    ///
+    /// Before the fix, grammar was silently ignored and unconstrained output was
+    /// produced. The guard now fires before any weight dereference or state
+    /// allocation, so empty weight vecs are sufficient.
+    ///
+    /// Mutation sensitivity: removing the `check_grammar_not_set` call makes the
+    /// function proceed past the guard and attempt to forward with empty weights,
+    /// producing a panic or a non-`InvalidInput` error — this assert fails either way.
+    #[test]
+    fn generate_q8_rejects_grammar_config_before_sampling() {
+        use crate::error::InferenceError;
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = Q8ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let spec = GrammarSpec::Gbnf("root ::= \"t\" | \"f\"\n".to_string());
+        let grammar_vocab = vec![b"t".to_vec(), b"f".to_vec()];
+        let engine =
+            GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+
+        let gen_cfg = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_q8 must fail closed with InvalidInput when grammar is set (#397/#398); \
+             got {result:?}"
         );
     }
 }

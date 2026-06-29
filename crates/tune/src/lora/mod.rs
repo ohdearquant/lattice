@@ -34,12 +34,24 @@
 //! ```
 
 mod apply;
+pub mod blend;
+#[cfg(all(feature = "safetensors", feature = "serde"))]
+pub mod loader;
+#[cfg(feature = "serde")]
+pub mod manifest;
 pub mod online;
 pub mod optimizer;
 #[cfg(feature = "safetensors")]
 mod safetensors;
+#[cfg(feature = "train-backward")]
+pub mod train;
 
 pub use apply::apply_lora;
+pub use blend::blend_lora_adapters;
+#[cfg(all(feature = "safetensors", feature = "serde"))]
+pub use loader::LoadedAdapter;
+#[cfg(feature = "serde")]
+pub use manifest::{AdapterId, LoraManifest, ManifestEntry};
 pub use online::{AdaptStepResult, adapt_step};
 pub use optimizer::{AdamState, LoraGradients, compute_lora_gradients};
 #[cfg(feature = "safetensors")]

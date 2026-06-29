@@ -4252,6 +4252,237 @@ kernel void gdn_chunk_norm_silu_c32(
         pub d_out: usize,
     }
 
+    /// Maximum total rank allowed across all adapters in a single blend.
+    ///
+    /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
+    /// typical mixture).  This cap bounds allocations and rejects adversarially large
+    /// adapter pools before `Vec::with_capacity`.
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+
+    /// Aggregate cap on a blended adapter's total element count, summed across
+    /// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
+    /// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
+    /// bounds one projection; this bounds the whole blend, so a full-model adapter
+    /// that keeps every projection near the per-group cap cannot drive a multi-GiB
+    /// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
+    /// large-model mixture at modest summed rank stays within budget, while a
+    /// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
+    pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+
+    /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
+    /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
+    ///
+    /// # Blend math
+    ///
+    /// For adapter `e` with layer data `L_e` and mixture weight `w_e`, the
+    /// effective delta is `w_e · B_e @ (A_e @ x)` (the `alpha/rank` scale is
+    /// NOT present in `LoraLayerData` — it is passed separately as `scale` to
+    /// `load_lora_adapter`; here `w_e` IS that effective scale).
+    ///
+    /// The blended matrices are:
+    /// - `A_blend = vconcat[A_1; …; A_N]`       shape `(Σrank_e) × d_in`
+    /// - `B_blend = hconcat[w_1·B_1 | …]`       shape `d_out × (Σrank_e)`
+    ///
+    /// The resulting layer set should be loaded with `scale = 1.0` because
+    /// the per-adapter weights are already folded into the B blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `inputs` is empty
+    /// - Any weight is not finite
+    /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
+    /// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
+    /// - The aggregate blend size across all projections exceeds `MAX_BLEND_TOTAL_ELEMENTS`
+    /// - A layer's A or B buffer length does not match its declared `rank`, `d_in`, or `d_out`
+    /// - Rank accumulation or a size product overflows `usize`
+    pub fn blend_lora_layer_data(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        if inputs.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "blend_lora_layer_data: inputs must not be empty".into(),
+            ));
+        }
+
+        for (idx, (_, w)) in inputs.iter().enumerate() {
+            if !w.is_finite() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
+                )));
+            }
+        }
+
+        // Group by (layer_idx, module): collect refs to layer data and effective weights.
+        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        for (layers, weight) in inputs {
+            for layer in *layers {
+                grouped
+                    .entry((layer.layer_idx, layer.module.clone()))
+                    .or_default()
+                    .push((layer, *weight));
+            }
+        }
+
+        // Bound the TOTAL planned allocation across every (layer_idx, module) group.
+        // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
+        // full-model adapter can keep every group near the cap and still drive a
+        // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
+        // checked arithmetic and fail closed before any allocation.
+        let mut planned_elems: usize = 0;
+        for ((layer_idx, module), entries) in &grouped {
+            let (first, _) = entries[0]; // each key was inserted with >=1 entry
+            let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
+                ))
+            })?;
+            let mut group_rank: usize = 0;
+            for (entry, _) in entries {
+                group_rank = group_rank.checked_add(entry.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank_total overflowed usize".into(),
+                    )
+                })?;
+            }
+            let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: rank_total*(d_in+d_out) overflowed usize".into(),
+                )
+            })?;
+            planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: aggregate blend element count overflowed usize".into(),
+                )
+            })?;
+        }
+        if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
+            return Err(InferenceError::InvalidInput(format!(
+                "blend_lora_layer_data: aggregate blend size {planned_elems} elements exceeds \
+                 MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
+                 number of adapters, their rank, or the number of target projections",
+                (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
+            )));
+        }
+
+        let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
+        for ((layer_idx, module), entries) in grouped {
+            let (first, _) = entries[0];
+            let d_in = first.d_in;
+            let d_out = first.d_out;
+
+            // Validate dimension consistency across adapters for this projection.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                if entry.d_in != d_in || entry.d_out != d_out {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
+                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
+                         entry {idx}: d_in={}, d_out={})",
+                        entry.d_in, entry.d_out
+                    )));
+                }
+            }
+
+            // Accumulate rank_total with overflow protection and a hard cap
+            // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
+            let mut rank_total: usize = 0;
+            for (layer, _) in &entries {
+                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank_total overflowed usize".into(),
+                    )
+                })?;
+            }
+            if rank_total > MAX_BLEND_RANK_TOTAL {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
+                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
+                )));
+            }
+
+            // Validate source slice lengths before any allocation: a malformed adapter
+            // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                let expected_a = entry.rank.checked_mul(d_in).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank*d_in overflowed usize".into(),
+                    )
+                })?;
+                let expected_b = d_out.checked_mul(entry.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: d_out*rank overflowed usize".into(),
+                    )
+                })?;
+                if entry.a.len() != expected_a {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} A slice length {} \
+                         does not match rank*d_in={}*{}={expected_a}",
+                        entry.a.len(),
+                        entry.rank,
+                        d_in,
+                    )));
+                }
+                if entry.b.len() != expected_b {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} B slice length {} \
+                         does not match d_out*rank={}*{}={expected_b}",
+                        entry.b.len(),
+                        d_out,
+                        entry.rank,
+                    )));
+                }
+            }
+
+            let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: rank_total * d_in overflowed usize".into(),
+                )
+            })?;
+            let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: d_out * rank_total overflowed usize".into(),
+                )
+            })?;
+
+            // A_blend: vertical stack of A matrices.
+            let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
+            for (layer, _) in &entries {
+                a_blend.extend_from_slice(&layer.a);
+            }
+
+            // B_blend: horizontal concat of weight-scaled B column blocks.
+            // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
+            let mut b_blend = vec![0.0f32; b_buf_len];
+            let mut col_offset = 0usize;
+            for (layer, eff_weight) in &entries {
+                let r_e = layer.rank;
+                for row in 0..d_out {
+                    let dst = row * rank_total + col_offset;
+                    let src = row * r_e;
+                    for c in 0..r_e {
+                        b_blend[dst + c] = eff_weight * layer.b[src + c];
+                    }
+                }
+                col_offset += r_e;
+            }
+
+            result.push(LoraLayerData {
+                layer_idx,
+                module,
+                a: a_blend,
+                b: b_blend,
+                rank: rank_total,
+                d_in,
+                d_out,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// **Unstable**: Metal GPU forward pass for Qwen3.5/3.6; kernel set and weight layout evolving.
     ///
     /// Backward-compatible convenience wrapper bundling one `MetalQwen35Engine` (immutable
@@ -4371,12 +4602,26 @@ kernel void gdn_chunk_norm_silu_c32(
     const Q4_0_BLOCK_SIZE: usize = 20;
 
     /// Quantize a row of f32 weights to Q8_0 blocks.
-    fn quantize_row_q8_0(src: &[f32]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if any element in `src` is non-finite (NaN or ±inf).
+    /// IEEE 754: `NaN > x` is always false, so a fold-max over NaN leaves
+    /// `amax` unchanged and the NaN is silently cast to 0 by the `clamp` below.
+    fn quantize_row_q8_0(src: &[f32]) -> Result<Vec<u8>, String> {
         assert_eq!(src.len() % QK8_0, 0);
         let nblocks = src.len() / QK8_0;
         let mut packed = Vec::with_capacity(nblocks * Q8_0_BLOCK_SIZE);
         for b in 0..nblocks {
             let block = &src[b * QK8_0..(b + 1) * QK8_0];
+            for &v in block {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "Q8_0 weight block {b} contains a non-finite value ({v}); \
+                         source weights must be finite"
+                    ));
+                }
+            }
             let amax = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             let d = amax / 127.0;
             let id = if d != 0.0 { 1.0 / d } else { 0.0 };
@@ -4385,13 +4630,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 packed.push((v * id).round().clamp(-127.0, 127.0) as i8 as u8);
             }
         }
-        packed
+        Ok(packed)
     }
 
     /// Create a Metal buffer with Q8_0 quantized weights from f32 data.
-    fn make_buffer_q8_0(device: &Device, data: &[f32], label: &str) -> Buffer {
+    fn make_buffer_q8_0(device: &Device, data: &[f32], label: &str) -> Result<Buffer, String> {
         assert_eq!(data.len() % QK8_0, 0);
-        let packed = quantize_row_q8_0(data);
+        let packed = quantize_row_q8_0(data)?;
         let byte_len = packed.len() as u64;
         let buf = device.new_buffer_with_data(
             packed.as_ptr() as *const _,
@@ -4399,17 +4644,17 @@ kernel void gdn_chunk_norm_silu_c32(
             MTLResourceOptions::StorageModeShared,
         );
         buf.set_label(label);
-        buf
+        Ok(buf)
     }
 
-    fn make_buffer_q4_0(device: &Device, data: &[f32], label: &str) -> Buffer {
+    fn make_buffer_q4_0(device: &Device, data: &[f32], label: &str) -> Result<Buffer, String> {
         assert_eq!(
             data.len() % QK4_0,
             0,
             "make_buffer_q4_0: data length {} not divisible by {QK4_0}",
             data.len()
         );
-        let packed = quantize_row_q4_0(data);
+        let packed = quantize_row_q4_0(data).map_err(|e| e.to_string())?;
         let byte_len = packed.len() as u64;
         let buf = device.new_buffer_with_data(
             packed.as_ptr() as *const _,
@@ -4417,7 +4662,7 @@ kernel void gdn_chunk_norm_silu_c32(
             MTLResourceOptions::StorageModeShared,
         );
         buf.set_label(label);
-        buf
+        Ok(buf)
     }
 
     fn make_zero_buffer(device: &Device, num_floats: usize, label: &str) -> Buffer {
@@ -5021,7 +5266,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 QuantFormat::Q8_0 => Q8_0_BLOCK_SIZE,
                 QuantFormat::Q4_0 => Q4_0_BLOCK_SIZE,
             };
-            let pack_quant = |data: &[f32]| -> Vec<u8> {
+            let pack_quant = |data: &[f32]| -> Result<Vec<u8>, String> {
                 match quant_format {
                     QuantFormat::Q8_0 => {
                         assert_eq!(data.len() % QK8_0, 0);
@@ -5034,7 +5279,7 @@ kernel void gdn_chunk_norm_silu_c32(
                             "pack_quant: data length {} not divisible by {QK4_0}",
                             data.len()
                         );
-                        quantize_row_q4_0(data)
+                        quantize_row_q4_0(data).map_err(|e| e.to_string())
                     }
                 }
             };
@@ -5055,20 +5300,21 @@ kernel void gdn_chunk_norm_silu_c32(
                     buf.set_label(label);
                     buf
                 };
-            let make_buffer_quant = |device: &Device, data: &[f32], label: &str| -> Buffer {
-                match quant_format {
-                    QuantFormat::Q8_0 => make_buffer_q8_0(device, data, label),
-                    QuantFormat::Q4_0 => make_buffer_q4_0(device, data, label),
-                }
-            };
+            let make_buffer_quant =
+                |device: &Device, data: &[f32], label: &str| -> Result<Buffer, String> {
+                    match quant_format {
+                        QuantFormat::Q8_0 => make_buffer_q8_0(device, data, label),
+                        QuantFormat::Q4_0 => make_buffer_q4_0(device, data, label),
+                    }
+                };
 
             let mut layer_weights = Vec::with_capacity(cfg.num_hidden_layers);
             for (i, (attn_w, common_w)) in weights.layers.iter().enumerate() {
                 // Build the FFN weight variant for this layer (Dense or MoE).
                 let metal_ffn = match &common_w.ffn {
                     crate::model::qwen35::FeedForwardWeights::Dense(d) => {
-                        let gate_bytes = pack_quant(&d.gate_proj);
-                        let up_bytes = pack_quant(&d.up_proj);
+                        let gate_bytes = pack_quant(&d.gate_proj)?;
+                        let up_bytes = pack_quant(&d.up_proj)?;
                         debug_assert_eq!(
                             d.gate_proj.len(),
                             cfg.intermediate_size * cfg.hidden_size
@@ -5090,7 +5336,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &d.down_proj,
                                 &format!("L{i}.down.{quant_tag}"),
-                            )),
+                            )?),
                         }
                     }
                     crate::model::qwen35::FeedForwardWeights::Moe(m) => {
@@ -5211,12 +5457,12 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &gdn_w.in_proj_qkv,
                                 &format!("L{i}.gdn.qkv.{quant_tag}"),
-                            )),
+                            )?),
                             in_proj_z: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &gdn_w.in_proj_z,
                                 &format!("L{i}.gdn.z.{quant_tag}"),
-                            )),
+                            )?),
                             in_proj_qkvz: {
                                 let mut combined = gdn_w.in_proj_qkv.clone();
                                 combined.extend_from_slice(&gdn_w.in_proj_z);
@@ -5224,7 +5470,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                     &device,
                                     &combined,
                                     &format!("L{i}.gdn.qkvz.{quant_tag}"),
-                                ))
+                                )?)
                             },
                             // in_proj_b/a: keep f16 — CPU reads these for GDN recurrence
                             in_proj_b: make_buffer_f16(
@@ -5260,7 +5506,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &gdn_w.out_proj,
                                 &format!("L{i}.gdn.out.{quant_tag}"),
-                            )),
+                            )?),
                         })
                     }
                     AttentionWeights::Full(full_w) => {
@@ -5270,22 +5516,22 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &device,
                                 &full_w.q_proj,
                                 &format!("L{i}.full.q.{quant_tag}"),
-                            )),
+                            )?),
                             k_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.k_proj,
                                 &format!("L{i}.full.k.{quant_tag}"),
-                            )),
+                            )?),
                             v_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.v_proj,
                                 &format!("L{i}.full.v.{quant_tag}"),
-                            )),
+                            )?),
                             o_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &full_w.o_proj,
                                 &format!("L{i}.full.o.{quant_tag}"),
-                            )),
+                            )?),
                             // Norm weights stay f32 (small, precision-sensitive)
                             q_norm: make_buffer(
                                 &device,
@@ -5312,7 +5558,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 &device,
                 &weights.embed_tokens,
                 &format!("embed_tokens.{quant_tag}"),
-            ));
+            )?);
             // Final norm: f32 (small, precision-sensitive)
             let final_norm = make_buffer(&device, &weights.final_norm, "final_norm");
 
@@ -5860,6 +6106,77 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Returns true if a LoRA adapter is currently loaded.
         pub fn has_lora_adapter(&self) -> bool {
             self.lora.is_some()
+        }
+
+        /// Blend multiple LoRA adapter layer sets into one rank-Σr layer set, then
+        /// generate text through the existing single-adapter path.
+        ///
+        /// # Why blend instead of dispatching N adapters
+        ///
+        /// The Metal forward path holds exactly one `Option<MetalLoraAdapter>` slot.
+        /// Rather than changing that kernel contract, we pre-blend on the CPU once
+        /// at request start: the result is a valid single adapter loaded through the
+        /// unchanged `load_lora_adapter` path.
+        ///
+        /// # Arguments
+        ///
+        /// * `adapter_weights` — slices of `(Vec<LoraLayerData>, mixture_weight)`.
+        ///   Each element is one adapter's layer data paired with its effective weight
+        ///   `w_e`.  `mixture_weight` IS the fully pre-scaled effective weight: the
+        ///   caller must fold any `alpha / rank` scaling (and the mixture fraction)
+        ///   into it before calling this function.  `blend_lora_layer_data` folds
+        ///   `w_e` directly into the B column blocks and loads the result with
+        ///   `scale = 1.0`; passing a raw mixture fraction without the `alpha/rank`
+        ///   factor will produce under-scaled output.
+        /// * `prompt` — prompt text, tokenised internally.
+        /// * `tokenizer` — BPE tokeniser.
+        /// * `gen_cfg` — generation configuration.
+        ///
+        /// The adapter is unloaded after generation so the slot is free for the next
+        /// request.
+        ///
+        /// # Decode cost model
+        ///
+        /// Per-token LoRA GEMV cost grows linearly with `rank_total = Σ rank_e`
+        /// across the mixture.  The Metal kernel assumes modest rank (≤ ~64);
+        /// a large `k × r` budget will linearly increase decode latency.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if blending fails (e.g. dimension mismatch across
+        /// adapters for the same projection) or if adapter loading fails.
+        pub fn generate_with_lora_mixture(
+            &mut self,
+            adapter_weights: &[(&[LoraLayerData], f32)],
+            prompt: &str,
+            tokenizer: &crate::tokenizer::BpeTokenizer,
+            gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+        ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError>
+        {
+            if adapter_weights.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(
+                    "generate_with_lora_mixture: adapter_weights must not be empty".into(),
+                ));
+            }
+
+            // Unload any previously loaded adapter so the slot is free.
+            self.unload_lora_adapter();
+
+            // Blend on the CPU. The per-adapter scale (alpha/rank) and mixture weight
+            // are folded into the B column blocks; the resulting blended adapter uses
+            // an effective scale of 1.0.
+            let blended = blend_lora_layer_data(adapter_weights)?;
+
+            // The blended adapter has weights-already-scaled; pass scale=1.0.
+            self.load_lora_adapter(blended, 1.0, None)?;
+
+            let output = self.generate(prompt, tokenizer, gen_cfg);
+
+            // Always unload after the request so the slot does not leak into the
+            // next call on this state object.
+            self.unload_lora_adapter();
+
+            Ok(output)
         }
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
@@ -6628,8 +6945,12 @@ kernel void gdn_chunk_norm_silu_c32(
                         enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                         enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                         enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                        // Grid axis = num_kv_heads: the kernel maps gid → kvh and handles
+                        // each GQA group of Q heads internally per threadgroup. Dispatching
+                        // nqh wastes (nqh - nkh) threadgroups that the kernel's early-return
+                        // guard discards; output is bit-identical but scheduling is nkh-sized.
                         enc.dispatch_thread_groups(
-                            MTLSize::new(nqh as u64, 1, 1),
+                            MTLSize::new(nkh as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
 
@@ -8470,8 +8791,10 @@ kernel void gdn_chunk_norm_silu_c32(
                                 enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                                 enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                                 enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                                // Grid axis = num_kv_heads: see fallback site above for
+                                // the invariant. Same kernel, same geometry requirement.
                                 enc.dispatch_thread_groups(
-                                    MTLSize::new(nqh as u64, 1, 1),
+                                    MTLSize::new(nkh as u64, 1, 1),
                                     MTLSize::new(256, 1, 1),
                                 );
                             }
@@ -9503,6 +9826,10 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
+
+            // Reject grammar configs before any GPU work: grammar-constrained decoding
+            // is not wired into the multimodal path.
+            super::multimodal_generate_preflight(gen_cfg)?;
 
             // Validate multimodal input
             input.validate().map_err(|e| {
@@ -14678,6 +15005,30 @@ kernel void gdn_chunk_norm_silu_c32(
             );
         }
 
+        // Mutation proof: reverting the is_finite() guard makes this test pass NaN
+        // through undetected (NaN.abs() is NaN, m.max(NaN) == m, so amax stays 0.0,
+        // scale stays 0.0, and NaN * 0.0 = NaN → clamp → 0 silently). With the guard
+        // the function returns Err before any NaN reaches the scale computation.
+        #[test]
+        fn quantize_row_q8_0_rejects_nan() {
+            let mut row = vec![0.0f32; 32];
+            row[7] = f32::NAN;
+            assert!(
+                quantize_row_q8_0(&row).is_err(),
+                "quantize_row_q8_0 must return Err when a block element is NaN"
+            );
+        }
+
+        #[test]
+        fn quantize_row_q8_0_rejects_inf() {
+            let mut row = vec![0.5f32; 32];
+            row[0] = f32::INFINITY;
+            assert!(
+                quantize_row_q8_0(&row).is_err(),
+                "quantize_row_q8_0 must return Err when a block element is +Inf"
+            );
+        }
+
         /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` (NEON
         /// on aarch64, scalar on other targets) produces bit-identical output to the
         /// scalar `f16_to_f32` reference for every pattern.
@@ -16824,7 +17175,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
             let mut deq_weights = Vec::with_capacity(n * k);
             for row in weights_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 deq_weights.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 packed_bytes.extend_from_slice(&row_packed);
             }
@@ -17220,7 +17571,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 34);
             let mut deq_weights = Vec::with_capacity(n * k);
             for row in weights_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q8_0(row);
+                let row_packed = quantize_row_q8_0(row).unwrap();
                 // Dequantize for CPU reference: each 34-byte block has f16 scale + 32 i8 values.
                 for block in row_packed.chunks_exact(34) {
                     let scale_bits = (block[0] as u16) | ((block[1] as u16) << 8);
@@ -17533,7 +17884,7 @@ kernel void decode_attention_reference(
             let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 20);
             let mut w_deq = Vec::with_capacity(n * k);
             for row in w_f32.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 w_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 packed_bytes.extend_from_slice(&row_packed);
             }
@@ -17612,7 +17963,7 @@ kernel void decode_attention_reference(
             let mut nz_packed = Vec::with_capacity(n * (k / 32) * 20);
             let mut nz_deq = Vec::with_capacity(n * k);
             for row in w_nz.chunks_exact(k) {
-                let row_packed = quantize_row_q4_0(row);
+                let row_packed = quantize_row_q4_0(row).unwrap();
                 nz_deq.extend_from_slice(&dequantize_row_q4_0(&row_packed, k));
                 nz_packed.extend_from_slice(&row_packed);
             }
@@ -19663,6 +20014,355 @@ kernel void decode_attention_reference(
                 max_diff(&chunked_a, &serial_a)
             );
         }
+
+        // -------------------------------------------------------------------
+        // Q8_0 non-finite input guard — mutation-sensitive (Finding 1, PR #452)
+        //
+        // IEEE 754: `NaN > x` is always false, so a fold-max over a block
+        // containing NaN leaves `amax` unchanged, and the NaN element is
+        // silently cast to 0 by the `clamp`, producing a plausible-looking
+        // packed buffer with a wrong entry and no error.
+        //
+        // Mutation sensitivity: removing the `if !v.is_finite()` guard in
+        // `quantize_row_q8_0` converts both Err returns to Ok, making
+        // `result.is_err()` false and failing both assertions.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn test_quantize_row_q8_0_rejects_nan() {
+            // A block with one NaN must return Err, not silently encode it as 0.
+            let mut vals = vec![1.0f32; 32];
+            vals[5] = f32::NAN;
+            let result = quantize_row_q8_0(&vals);
+            assert!(result.is_err(), "NaN in Q8_0 weight block must return Err");
+        }
+
+        #[test]
+        fn test_quantize_row_q8_0_rejects_inf() {
+            // A block with +inf must return Err; is_finite() rejects NaN, +inf, and -inf.
+            let mut vals = vec![1.0f32; 32];
+            vals[15] = f32::INFINITY;
+            let result = quantize_row_q8_0(&vals);
+            assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
+        }
+    }
+    // -----------------------------------------------------------------------
+    // Blend correctness tests (inference-side LoraLayerData types)
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod blend_tests {
+        use super::*;
+
+        /// Reference: compute B @ (A @ x) using plain nested loops that match
+        /// the kernel's row-major indexing: A[r,k]=a[r*d_in+k], B[o,r]=b[o*rank+r].
+        fn lora_delta(
+            a: &[f32],
+            b: &[f32],
+            x: &[f32],
+            rank: usize,
+            d_in: usize,
+            d_out: usize,
+        ) -> Vec<f32> {
+            let mut ax = vec![0.0f32; rank];
+            for r in 0..rank {
+                for k in 0..d_in {
+                    ax[r] += a[r * d_in + k] * x[k];
+                }
+            }
+            let mut y = vec![0.0f32; d_out];
+            for o in 0..d_out {
+                for r in 0..rank {
+                    y[o] += b[o * rank + r] * ax[r];
+                }
+            }
+            y
+        }
+
+        #[test]
+        fn blend_two_adapters_equals_sum_delta() {
+            let d_in = 8usize;
+            let d_out = 6usize;
+            let r1 = 2usize;
+            let r2 = 3usize;
+
+            // Deterministic, non-trivial values: A row-major (rank × d_in), B row-major (d_out × rank).
+            let a1: Vec<f32> = (0..r1 * d_in).map(|i| i as f32 * 0.1 + 0.01).collect();
+            let b1: Vec<f32> = (0..d_out * r1).map(|i| i as f32 * 0.05 - 0.5).collect();
+            let a2: Vec<f32> = (0..r2 * d_in).map(|i| i as f32 * 0.07 + 0.03).collect();
+            let b2: Vec<f32> = (0..d_out * r2).map(|i| i as f32 * 0.03 - 0.2).collect();
+
+            let l1 = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: a1.clone(),
+                b: b1.clone(),
+                rank: r1,
+                d_in,
+                d_out,
+            };
+            let l2 = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: a2.clone(),
+                b: b2.clone(),
+                rank: r2,
+                d_in,
+                d_out,
+            };
+
+            let w1 = 0.25f32;
+            let w2 = 0.75f32;
+
+            let blended =
+                blend_lora_layer_data(&[(&[l1], w1), (&[l2], w2)]).expect("blend must not fail");
+            assert_eq!(blended.len(), 1, "one projection in, one out");
+            let bl = &blended[0];
+
+            // Structural assertions.
+            assert_eq!(bl.rank, r1 + r2);
+            assert_eq!(bl.d_in, d_in);
+            assert_eq!(bl.d_out, d_out);
+
+            // Delta equality: blended_delta(x) == w1*delta1(x) + w2*delta2(x) for all x.
+            // LoraLayerData carries no alpha/rank — w_e IS the effective scale.
+            let x: Vec<f32> = (0..d_in).map(|i| i as f32 * 0.3 - 1.0).collect();
+
+            let delta_blend = lora_delta(&bl.a, &bl.b, &x, bl.rank, d_in, d_out);
+            let delta1 = lora_delta(&a1, &b1, &x, r1, d_in, d_out);
+            let delta2 = lora_delta(&a2, &b2, &x, r2, d_in, d_out);
+            let expected: Vec<f32> = delta1
+                .iter()
+                .zip(&delta2)
+                .map(|(d1, d2)| w1 * d1 + w2 * d2)
+                .collect();
+
+            let max_err = delta_blend
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < 1e-5,
+                "blended delta diverges from reference sum: max_abs_diff={max_err}"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Summed rank exceeding MAX_BLEND_RANK_TOTAL returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_rank_exceeds_cap_returns_error() {
+            let d_in = 1usize;
+            let d_out = 1usize;
+            // rank = cap + 1; A and B are tiny (~32 KB total).
+            let rank = MAX_BLEND_RANK_TOTAL + 1;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.1f32; rank * d_in],
+                b: vec![0.1f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "summed rank exceeding cap must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // A slice with wrong length returns Err (fail-closed on
+        // malformed input before any allocation).
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_a_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                // A is one element short of rank * d_in.
+                a: vec![0.0f32; rank * d_in - 1],
+                b: vec![0.0f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched A slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // B slice with wrong length returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_b_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * d_in],
+                // B is one element short of d_out * rank.
+                b: vec![0.0f32; d_out * rank - 1],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched B slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Contract: a malformed huge dimension returns Err, never panics.
+        //
+        // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
+        // blend_lora_layer_data is monolithic here: the aggregate pre-pass
+        // (rank_total*(d_in+d_out)) strictly dominates the per-entry
+        // checked_mul, so no input reaches the per-entry guard without
+        // tripping the pre-pass first. This pins the public Err-not-panic
+        // contract; the per-entry checked_mul is defense-in-depth, isolated
+        // on the tune side where blend_layer_entries is a separable helper.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_malformed_huge_dim_returns_err_not_panic() {
+            let rank = 2usize;
+            let d_in = usize::MAX / 2 + 1;
+            let d_out = 1usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![],          // empty; pre-pass fails before slice-length check
+                b: vec![0.0f32; 2], // rank * d_out = 2 * 1 = 2
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
+            // per-entry checked_mul is defense-in-depth for the same class.
+            assert!(
+                result.is_err(),
+                "malformed huge dim must return Err, not panic"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Contract: an aggregate element budget overrun returns Err before alloc.
+        //
+        // 65 layers with rank=4096, d_in=2048, d_out=2048, empty a/b, so
+        // the test allocates nothing. Per-group: rank_total=4096 == cap
+        // (passes the per-projection check). Aggregate: 4096*(2048+2048)*65
+        // = 1,090,519,040 > MAX_BLEND_TOTAL_ELEMENTS (1<<30).
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_aggregate_budget_exceeded_returns_err() {
+            // MAX_BLEND_TOTAL_ELEMENTS is in scope via `use super::*` above.
+            let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap
+            let d_in = 2048usize;
+            let d_out = 2048usize;
+            let layers: Vec<LoraLayerData> = (0..65usize)
+                .map(|idx| LoraLayerData {
+                    layer_idx: idx,
+                    module: "q_proj".into(),
+                    a: vec![], // empty; pre-pass reads only declared fields
+                    b: vec![],
+                    rank,
+                    d_in,
+                    d_out,
+                })
+                .collect();
+            let result = blend_lora_layer_data(&[(&layers, 1.0)]);
+            assert!(result.is_err(), "aggregate budget exceeded must return Err");
+            // Use result.err().expect() rather than unwrap_err() because
+            // Vec<LoraLayerData> does not implement Debug (unwrap_err requires T: Debug).
+            let msg = result.err().expect("already asserted is_err").to_string();
+            assert!(
+                msg.contains("aggregate") || msg.contains("MAX_BLEND_TOTAL_ELEMENTS"),
+                "error message must mention the aggregate budget; got: {msg}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-free preflight helpers for the multimodal generation path.
+//
+// These functions live at module level (no cfg gate) so they compile and are
+// testable on every platform without Metal GPU hardware.
+// ---------------------------------------------------------------------------
+
+/// Validates `gen_cfg` for the multimodal generation path before any Metal
+/// device or GPU work is initiated.
+///
+/// Grammar-constrained decoding is not wired into the multimodal forward
+/// pass; this function converts a silent correctness failure (unconstrained
+/// output despite `gen_cfg.grammar` being set) into a typed `InvalidInput`
+/// error that callers can act on.
+///
+/// Compiled when Metal-GPU is enabled (the production caller lives inside
+/// `mod inner`) or during test builds so that the module-level test can
+/// exercise the guard logic on any platform without GPU hardware.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn multimodal_generate_preflight(
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+) -> Result<(), crate::error::InferenceError> {
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)
+}
+
+#[cfg(test)]
+mod multimodal_preflight_tests {
+    use super::multimodal_generate_preflight;
+    use crate::error::InferenceError;
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+    use crate::model::qwen35_config::GenerateConfig;
+    use std::sync::Arc;
+
+    /// Grammar-constrained decoding is not wired into the multimodal path; the
+    /// preflight must reject a config with `grammar` set.
+    ///
+    /// This test drives `multimodal_generate_preflight` — the exact function that
+    /// `generate_multimodal` calls as its first action — so mutating the guard
+    /// logic in that function directly fails this test.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_grammar_guard_rejects_grammar_config() {
+        let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
+        let vocab = vec![b"a".to_vec(), b"b".to_vec()];
+        let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
+
+        let cfg_with_grammar = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_grammar);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when grammar is set; got {result:?}"
+        );
+    }
+
+    /// A config with `grammar` unset must pass through the preflight without error.
+    #[test]
+    fn generate_multimodal_grammar_guard_allows_no_grammar() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "grammar = None must not trigger the preflight guard"
+        );
     }
 }
 
@@ -19768,7 +20468,7 @@ pub fn mtp_greedy_round(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, format_chat_template,
+    LoraLayerData, MetalQwen35State, blend_lora_layer_data, format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
@@ -19782,6 +20482,19 @@ pub struct LoraLayerData {
     pub rank: usize,
     pub d_in: usize,
     pub d_out: usize,
+}
+
+/// Stub: blend_lora_layer_data is only meaningful on macOS + metal-gpu.
+///
+/// Always returns `Err` on other platforms so callers fail at runtime rather
+/// than silently producing wrong results.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+pub fn blend_lora_layer_data(
+    _inputs: &[(&[LoraLayerData], f32)],
+) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+    Err(crate::error::InferenceError::Inference(
+        "blend_lora_layer_data requires macOS + metal-gpu feature".into(),
+    ))
 }
 
 /// **Unstable**: Metal Qwen3.5 forward state; stub on non-macOS; full impl behind metal-gpu feature.
