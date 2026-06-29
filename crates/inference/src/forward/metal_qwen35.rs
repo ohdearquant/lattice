@@ -9369,17 +9369,14 @@ kernel void gdn_chunk_norm_silu_c32(
             };
             // All candidates masked (grammar or repetition penalty): stop rather
             // than emitting a token outside the candidate set (#405).
-            let next_id = match next_id_result {
-                Ok(id) => id,
-                Err(_) => {
-                    return GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                    };
-                }
+            let Ok(next_id) = next_id_result else {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                };
             };
 
             // Advance grammar state after sampling the prefill token.
@@ -13213,17 +13210,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
             };
             // All candidates masked: stop rather than emitting an out-of-set token (#405).
-            let next_id = match next_id_result {
-                Ok(id) => id,
-                Err(_) => {
-                    return GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                    };
-                }
+            let Ok(next_id) = next_id_result else {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                };
             };
 
             // Advance grammar state after sampling the prefill token.
@@ -13310,10 +13304,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
                 // All candidates masked: stop rather than emitting an out-of-set token (#405).
-                let next_id = match next_id_result {
-                    Ok(id) => id,
-                    Err(_) => break,
-                };
+                let Ok(next_id) = next_id_result else { break };
 
                 // Advance grammar state after sampling.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {

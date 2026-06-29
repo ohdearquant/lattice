@@ -175,9 +175,11 @@ impl CandidateSet {
     /// # Errors
     ///
     /// Returns [`crate::error::InferenceError::InvalidInput`] when the candidate set is
-    /// empty.  A non-empty all-[`f32::NEG_INFINITY`] set is handled gracefully: after
-    /// sorting, the first candidate (arbitrary tie-break) is returned because the softmax
-    /// sum is zero — this avoids emitting an out-of-set token.
+    /// empty, or when every logit is [`f32::NEG_INFINITY`] or NaN (a fully masked set).
+    /// Both cases carry no valid sampling distribution — returning an arbitrary candidate
+    /// would violate the fail-closed contract shared with `argmax` (#405).
+    /// A set containing at least one [`f32::INFINITY`] logit is NOT fully masked; the
+    /// `+inf` token is a well-defined winner and is handled by the inner softmax guard.
     pub fn sample_top_p(
         &mut self,
         top_p: f32,
@@ -186,6 +188,17 @@ impl CandidateSet {
         if self.candidates.is_empty() {
             return Err(crate::error::InferenceError::InvalidInput(
                 "sample_top_p on an empty candidate set".into(),
+            ));
+        }
+        // Reject a fully-masked set where every logit is -inf or NaN.  The inner
+        // `sample_top_p_with_scratch` guard (`!max_logit.is_finite()`) catches both
+        // -inf and +inf and returns `candidates[0].token_id`; for -inf that token is
+        // arbitrary and may not be a valid member of a grammar-compacted set.
+        // `c.logit > f32::NEG_INFINITY` is false for -inf and NaN but true for any
+        // finite value or +inf, so +inf candidates still reach the inner guard.
+        if !self.candidates.iter().any(|c| c.logit > f32::NEG_INFINITY) {
+            return Err(crate::error::InferenceError::InvalidInput(
+                "sample_top_p on a fully-masked (all -inf or NaN) candidate set".into(),
             ));
         }
         let mut probs = Vec::new();
@@ -1837,6 +1850,34 @@ mod tests {
         assert!(
             cs.sample_top_p(1.0, 0.5).is_err(),
             "sample_top_p on an empty candidate set must be Err"
+        );
+    }
+
+    /// Mutation-sensitive guard for the all-masked `sample_top_p` fix (#405 / F1).
+    ///
+    /// Without the `any(|c| c.logit > f32::NEG_INFINITY)` guard in `sample_top_p`,
+    /// the call falls through to `sample_top_p_with_scratch`.  There, `max_logit`
+    /// is `-inf` (not finite), so the inner guard returns `candidates[0].token_id`
+    /// (token 5) wrapped in `Ok` — this test would then receive `Ok(5)` and the
+    /// `is_err()` assertion would fail, making reversion detectable.
+    ///
+    /// The token ids (5, 10) are deliberately non-zero to distinguish the guard's
+    /// output from an accidental token-0 emission.
+    #[test]
+    fn test_candidateset_sample_top_p_all_masked_returns_err() {
+        let mut cs = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 5,
+                logit: f32::NEG_INFINITY,
+            },
+            Candidate {
+                token_id: 10,
+                logit: f32::NEG_INFINITY,
+            },
+        ]);
+        assert!(
+            cs.sample_top_p(1.0, 0.5).is_err(),
+            "sample_top_p on a fully-masked (all -inf) set must be Err, not Ok(candidates[0])"
         );
     }
 
