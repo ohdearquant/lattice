@@ -36,6 +36,16 @@ use std::collections::HashMap;
 /// while bounding allocations and rejecting adversarially large adapter pools.
 pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
 
+/// Aggregate cap on a blended adapter's total element count, summed across
+/// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
+/// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
+/// bounds one projection; this bounds the whole blend, so a full-model adapter
+/// that keeps every projection near the per-group cap cannot drive a multi-GiB
+/// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
+/// large-model mixture at modest summed rank stays within budget, while a
+/// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
+pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+
 /// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
 ///
 /// Each adapter in `adapters` contributes to the blended result with its
@@ -56,6 +66,10 @@ pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
 /// - `adapters` is empty
 /// - Any weight is not finite
 /// - Two adapters share a `(layer_idx, module)` pair but disagree on `d_in` or `d_out`
+/// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
+/// - The aggregate blend size across all projections exceeds `MAX_BLEND_TOTAL_ELEMENTS`
+/// - A layer's A or B buffer length does not match its declared `rank`, `d_in`, or `d_out`
+/// - Rank accumulation or a size product overflows `usize`
 pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapter> {
     if adapters.is_empty() {
         return Err(TuneError::Validation(
@@ -83,6 +97,45 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
                 .or_default()
                 .push((layer, eff));
         }
+    }
+
+    // Bound the TOTAL planned allocation across every (layer_idx, module) group.
+    // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
+    // full-model adapter can keep every group near the cap and still drive a
+    // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
+    // checked arithmetic and fail closed before any allocation.
+    let mut planned_elems: usize = 0;
+    for ((layer_idx, module), entries) in &grouped {
+        let (first, _) = entries[0]; // each key was inserted with >=1 layer
+        let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
+            TuneError::Validation(format!(
+                "blend_lora_adapters: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
+            ))
+        })?;
+        let mut group_rank: usize = 0;
+        for (layer, _) in entries {
+            group_rank = group_rank.checked_add(layer.rank).ok_or_else(|| {
+                TuneError::Validation("blend_lora_adapters: rank_total overflowed usize".into())
+            })?;
+        }
+        let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
+            TuneError::Validation(
+                "blend_lora_adapters: rank_total*(d_in+d_out) overflowed usize".into(),
+            )
+        })?;
+        planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
+            TuneError::Validation(
+                "blend_lora_adapters: aggregate blend element count overflowed usize".into(),
+            )
+        })?;
+    }
+    if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
+        return Err(TuneError::Validation(format!(
+            "blend_lora_adapters: aggregate blend size {planned_elems} elements exceeds \
+             MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
+             number of adapters, their rank, or the number of target projections",
+            (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
+        )));
     }
 
     // Blend each (layer_idx, module) group independently.
@@ -158,8 +211,12 @@ fn blend_layer_entries(
     // Validate source slice lengths before any allocation: a malformed adapter
     // whose A or B buffer is the wrong size would cause out-of-bounds copies.
     for (idx, (layer, _)) in entries.iter().enumerate() {
-        let expected_a = layer.rank * d_in;
-        let expected_b = d_out * layer.rank;
+        let expected_a = layer.rank.checked_mul(d_in).ok_or_else(|| {
+            TuneError::Validation("blend_layer_entries: rank*d_in overflowed usize".into())
+        })?;
+        let expected_b = d_out.checked_mul(layer.rank).ok_or_else(|| {
+            TuneError::Validation("blend_layer_entries: d_out*rank overflowed usize".into())
+        })?;
         if layer.a.len() != expected_a {
             return Err(TuneError::Validation(format!(
                 "blend_layer_entries: entry {idx} A slice length {} \
@@ -625,5 +682,91 @@ mod tests {
             .fold(0.0f32, f32::max);
 
         assert!(max_diff < 1e-5, "asymmetric-rank blend max-diff={max_diff}");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 1+2 contract: malformed huge dimension → Err, not panic.
+    //
+    // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
+    // The pre-pass catches it first (rank_total*(d_in+d_out) overflows usize
+    // via checked_mul → Err); the per-entry checked_mul is defense-in-depth
+    // for the same overflow class.
+    // Contract: blend_lora_adapters must return Err, never panic.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_malformed_huge_dim_returns_err_not_panic() {
+        let rank = 2usize;
+        let d_in = usize::MAX / 2 + 1;
+        let d_out = 1usize;
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a: vec![],          // empty; pre-pass fails before slice-length check
+                b: vec![0.0f32; 2], // rank * d_out = 2 * 1 = 2
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+        let result = blend_lora_adapters(&[(&adapter, 1.0)]);
+        // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
+        // per-entry checked_mul is defense-in-depth for the same class.
+        assert!(
+            result.is_err(),
+            "malformed huge dim must return Err, not panic"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 1 contract: aggregate element budget exceeded → Err.
+    //
+    // 65 layers each with rank=4096, d_in=2048, d_out=2048, empty a/b so the
+    // test allocates nothing. Per-group: rank_total=4096 == cap (passes the
+    // per-projection check). Aggregate: 4096*(2048+2048)*65 = 1,090,519,040
+    // > MAX_BLEND_TOTAL_ELEMENTS (1<<30 = 1,073,741,824).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_aggregate_budget_exceeded_returns_err() {
+        use super::MAX_BLEND_TOTAL_ELEMENTS;
+        let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap, passes it
+        let d_in = 2048usize;
+        let d_out = 2048usize;
+        let mut layers = HashMap::new();
+        for idx in 0..65usize {
+            layers.insert(
+                (idx, "q_proj".to_string()),
+                LoraLayer {
+                    a: vec![], // empty; pre-pass reads only declared fields
+                    b: vec![],
+                    d_in,
+                    d_out,
+                    rank,
+                },
+            );
+        }
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+        let result = blend_lora_adapters(&[(&adapter, 1.0)]);
+        assert!(result.is_err(), "aggregate budget exceeded must return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("aggregate") || msg.contains("MAX_BLEND_TOTAL_ELEMENTS"),
+            "error message must mention the aggregate budget; got: {msg}"
+        );
     }
 }
