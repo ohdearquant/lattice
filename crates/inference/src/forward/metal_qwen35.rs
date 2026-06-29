@@ -9288,6 +9288,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
             }
 
+            // Fail-closed: a prompt longer than the KV cache would trip the
+            // forward_prefill length assertion (n <= max_cache_len) and panic the
+            // caller thread. Return a clean empty completion instead. Mirrors the
+            // streaming path and the CPU generate() preflight (see generate_streaming).
+            if prompt_len > self.max_context() {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: true,
+                };
+            }
+
             // Reset state for new generation
             self.reset_state();
 
@@ -13150,6 +13164,24 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
+                };
+            }
+
+            // Fail-closed: a prompt longer than the KV cache would trip the
+            // forward_prefill length assertion (n <= max_cache_len), panicking and
+            // killing this GPU worker thread — a persistent DoS for every later
+            // request routed to it. Return a clean empty completion instead so the
+            // worker survives. Mirrors the CPU generate() preflight (which returns
+            // Err); this Metal entry point has no Result, so it yields an empty
+            // stopped output. The decode loop self-limits the prompt+completion case
+            // (it breaks on seq_len >= max_cache_len), so only prefill needs guarding.
+            if prompt_len > self.max_context() {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: true,
                 };
             }
 

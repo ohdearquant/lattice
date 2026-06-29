@@ -170,13 +170,27 @@ mod imp {
         }
     }
 
+    /// KV-cache length the worker allocates (see `load_model`). A request's
+    /// `max_tokens` is clamped to this so an absurd value cannot drive
+    /// `Vec::with_capacity(max_new_tokens)` in the Metal decode path to a
+    /// capacity-overflow abort (which would kill the GPU worker thread, a
+    /// persistent DoS). The prompt+completion-exceeds-window case is handled
+    /// fail-closed inside the Metal generate path.
+    const MODEL_MAX_CONTEXT: usize = 4096;
+
     fn build_cfg(req: &ChatReq, d: &Defaults) -> GenerateConfig {
+        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
+        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
         let reasoning_budget = req
             .reasoning_budget
             .filter(|&n| n > 0)
-            .or(d.reasoning_budget);
+            .or(d.reasoning_budget)
+            .map(|n| n.min(MODEL_MAX_CONTEXT));
         GenerateConfig {
-            max_new_tokens: req.max_tokens.unwrap_or(d.max_tokens),
+            max_new_tokens: req
+                .max_tokens
+                .unwrap_or(d.max_tokens)
+                .min(MODEL_MAX_CONTEXT),
             temperature: req.temperature.unwrap_or(d.temperature),
             top_k: req.top_k.unwrap_or(d.top_k),
             top_p: req.top_p.unwrap_or(d.top_p),
@@ -252,14 +266,15 @@ mod imp {
             } else {
                 Qwen35Config::qwen36_27b()
             };
-            let metal = MetalQwen35State::from_q4_dir(model_dir, tokenizer_path, &cfg, 4096)
-                .map_err(|e| format!("Q4 model load failed: {e}"))?;
+            let metal =
+                MetalQwen35State::from_q4_dir(model_dir, tokenizer_path, &cfg, MODEL_MAX_CONTEXT)
+                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
             Ok((metal, tokenizer, "q4".to_string()))
         } else {
             let model = Qwen35Model::from_safetensors(model_dir)
                 .map_err(|e| format!("safetensors load failed: {e}"))?;
             let cfg = model.config().clone();
-            let metal = MetalQwen35State::new(model.weights(), &cfg, 4096)
+            let metal = MetalQwen35State::new(model.weights(), &cfg, MODEL_MAX_CONTEXT)
                 .map_err(|e| format!("Metal init failed: {e}"))?;
             Ok((metal, tokenizer, "bf16".to_string()))
         }
