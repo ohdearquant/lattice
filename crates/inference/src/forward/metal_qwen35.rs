@@ -37,7 +37,9 @@ mod inner {
     };
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
-    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+    use crate::model::qwen35_config::{
+        GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
+    };
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
     use crate::weights::q4_weights::quantize_row_q4_0;
@@ -13175,6 +13177,15 @@ kernel void gdn_chunk_norm_silu_c32(
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
+            // Budget forcing: resolve the </think> token id once before the loops.
+            // Only paid when reasoning_budget is Some; None path is a single branch.
+            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
+                tokenizer.special_token_id("</think>")
+            } else {
+                None
+            };
+            let mut thinking_closed = false;
+
             // Batch prefill
             let mut prefill_logits = self.forward_prefill(&prompt_ids);
 
@@ -13226,13 +13237,26 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
             }
 
+            // Track whether the thinking block has been closed after prefill sampling.
+            // Enables budget=1 to behave sanely (prefill token counts against budget).
+            if Some(next_id) == think_close_id {
+                thinking_closed = true;
+            }
+
             // Incremental detokenization: stream only complete-UTF-8 deltas. A
             // byte-level BPE codepoint (CJK/emoji) can span several tokens, so
             // per-token lossy decode would emit U+FFFD mojibake the caller cannot
             // retract. Mirrors the non-Metal path (model::qwen35::generation).
             let mut detok = IncrementalDetokenizer::new();
+            // Tracks the generated_ids length at the moment </think> was emitted;
+            // used by the answer-budget break below.
+            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
+            // Capture close-point after the prefill push (covers budget=1 edge case).
+            if thinking_closed && reasoning_end_len.is_none() {
+                reasoning_end_len = Some(generated_ids.len());
+            }
             let mut last_pushed_id = next_id;
             let delta = detok.push(tokenizer, next_id);
             if !delta.is_empty() && !on_token(&delta, next_id) {
@@ -13251,8 +13275,10 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut stopped = false;
             let mut stopped_by_caller = false;
 
-            // Autoregressive decode with streaming
-            for _ in 1..gen_cfg.max_new_tokens {
+            // Autoregressive decode with streaming.
+            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            for _ in 1..cap {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
                 }
@@ -13267,7 +13293,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     engine.mask_logits(gs, &mut step_logits);
                 }
 
-                let next_id = if use_compact {
+                let sampled_id = if use_compact {
                     sample_from_candidates(
                         &self.session.compact_result,
                         gen_cfg,
@@ -13278,11 +13304,31 @@ kernel void gdn_chunk_norm_silu_c32(
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // Advance grammar state after sampling.
+                // Budget forcing: override sampled token with </think> when the
+                // reasoning budget is exhausted and the block is still open.
+                let next_id = force_close_think(
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    thinking_closed,
+                    generated_ids.len(),
+                    think_close_id,
+                )
+                .unwrap_or(sampled_id);
+
+                // Advance grammar state after sampling (or forced token).
+                // Interaction note: if reasoning_budget AND grammar are both active and the
+                // grammar disallows </think> at this position, advance returns false → break.
+                // This is fail-closed (no grammar-illegal output emitted) but silent. The
+                // combination of grammar + reasoning_budget is unusual; document, don't change.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
                         break;
                     }
+                }
+
+                // Track when the thinking block closes (natural or forced).
+                if Some(next_id) == think_close_id {
+                    thinking_closed = true;
                 }
 
                 if is_stop(next_id) {
@@ -13292,6 +13338,11 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                // Capture the close-point after the push so </think> is the
+                // last reasoning token (not the first answer token).
+                if thinking_closed && reasoning_end_len.is_none() {
+                    reasoning_end_len = Some(generated_ids.len());
+                }
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() && !on_token(&delta, next_id) {
@@ -13300,6 +13351,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     break;
+                }
+                // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
+                if let Some(end) = reasoning_end_len {
+                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
+                        break;
+                    }
                 }
             }
 
@@ -18420,6 +18477,7 @@ kernel void decode_attention_reference(
                 enable_mtp: Some(false),
                 grammar: None,
                 stop_strings: vec![],
+                reasoning_budget: None,
             };
 
             let out = with_self_spec_env(|| {
@@ -18516,6 +18574,7 @@ kernel void decode_attention_reference(
                 enable_mtp: Some(false),
                 grammar: None,
                 stop_strings: vec![],
+                reasoning_budget: None,
             };
 
             let mut state = with_self_spec_env(|| {

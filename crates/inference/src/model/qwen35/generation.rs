@@ -4,7 +4,9 @@ use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+use crate::model::qwen35_config::{
+    GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
+};
 use crate::tokenizer::common::Tokenizer;
 
 impl Qwen35Model {
@@ -260,6 +262,22 @@ impl Qwen35Model {
         generated_ids.push(next_id);
         all_ids.push(next_id);
 
+        // Budget forcing setup: resolve the </think> token id once and seed
+        // the thinking_closed state from the prefill token so budget=1 works.
+        let think_close_id = if gen_cfg.reasoning_budget.is_some() {
+            self.tokenizer.special_token_id("</think>")
+        } else {
+            None
+        };
+        let mut thinking_closed = Some(next_id) == think_close_id;
+        // Tracks generated_ids length at the moment </think> was emitted, for the
+        // answer-budget break. None when reasoning_budget is disabled (parity-safe).
+        let mut reasoning_end_len: Option<usize> = None;
+        // Capture close-point after prefill push (covers budget=1 edge case).
+        if thinking_closed && reasoning_end_len.is_none() {
+            reasoning_end_len = Some(generated_ids.len());
+        }
+
         // Incremental detokenization: emit only complete-UTF-8 text deltas. A
         // byte-level BPE codepoint can span several tokens, so we buffer raw bytes
         // and never stream a partial codepoint (see IncrementalDetokenizer).
@@ -275,7 +293,9 @@ impl Qwen35Model {
 
             let mut stopped = false;
             // Decode loop (mirrors decode_loop free function exactly).
-            for _ in 1..gen_cfg.max_new_tokens {
+            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            for _ in 1..cap {
                 let pos = kv_cache.seq_len;
                 let Some(&last_token) = all_ids.last() else {
                     return Err(InferenceError::Inference("empty generation state".into()));
@@ -290,12 +310,28 @@ impl Qwen35Model {
                 );
                 kv_cache.seq_len += 1;
 
-                let next_id = sample_token(
+                let sampled_id = sample_token(
                     &scratch.logits[..cfg.vocab_size],
                     gen_cfg,
                     &all_ids,
                     &mut rng_state,
                 );
+
+                // Budget forcing: override sampled token with </think> when the
+                // reasoning budget is exhausted and the block is still open.
+                let next_id = force_close_think(
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    thinking_closed,
+                    generated_ids.len(),
+                    think_close_id,
+                )
+                .unwrap_or(sampled_id);
+
+                // Track when the thinking block closes (natural or forced).
+                if Some(next_id) == think_close_id {
+                    thinking_closed = true;
+                }
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -304,10 +340,21 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                // Capture close-point after push so </think> is the last reasoning token.
+                if thinking_closed && reasoning_end_len.is_none() {
+                    reasoning_end_len = Some(generated_ids.len());
+                }
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if !delta.is_empty() {
                     on_token(&delta);
+                }
+
+                // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
+                if let Some(end) = reasoning_end_len {
+                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
+                        break;
+                    }
                 }
             }
 
@@ -345,7 +392,9 @@ impl Qwen35Model {
 
             let mut stopped = false;
             // Decode loop for the string-stop path.
-            for _ in 1..gen_cfg.max_new_tokens {
+            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            for _ in 1..cap {
                 let pos = kv_cache.seq_len;
                 let Some(&last_token) = all_ids.last() else {
                     return Err(InferenceError::Inference("empty generation state".into()));
@@ -360,12 +409,28 @@ impl Qwen35Model {
                 );
                 kv_cache.seq_len += 1;
 
-                let next_id = sample_token(
+                let sampled_id = sample_token(
                     &scratch.logits[..cfg.vocab_size],
                     gen_cfg,
                     &all_ids,
                     &mut rng_state,
                 );
+
+                // Budget forcing: override sampled token with </think> when the
+                // reasoning budget is exhausted and the block is still open.
+                let next_id = force_close_think(
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    thinking_closed,
+                    generated_ids.len(),
+                    think_close_id,
+                )
+                .unwrap_or(sampled_id);
+
+                // Track when the thinking block closes (natural or forced).
+                if Some(next_id) == think_close_id {
+                    thinking_closed = true;
+                }
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -374,11 +439,22 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                // Capture close-point after push so </think> is the last reasoning token.
+                if thinking_closed && reasoning_end_len.is_none() {
+                    reasoning_end_len = Some(generated_ids.len());
+                }
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if streamer.push(&delta, &mut on_token) {
                     stopped = true;
                     break;
+                }
+
+                // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
+                if let Some(end) = reasoning_end_len {
+                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
+                        break;
+                    }
                 }
             }
 

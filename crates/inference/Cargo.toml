@@ -32,6 +32,7 @@ tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 sha2 = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
@@ -60,6 +61,11 @@ path = "src/bin/quantize_q4.rs"
 [[bin]]
 name = "chat_metal"
 path = "src/bin/chat_metal.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[bin]]
+name = "lattice_serve"
+path = "src/bin/lattice_serve.rs"
 required-features = ["f16", "metal-gpu"]
 
 [[bin]]

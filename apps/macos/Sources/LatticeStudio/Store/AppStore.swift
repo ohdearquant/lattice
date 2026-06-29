@@ -14,6 +14,7 @@ private struct ChatServeRequest: Encodable {
     let top_p: Double
     let repetition_penalty: Double
     let seed: UInt64?
+    let reasoning_budget: Int?
 }
 
 // MARK: - The single source of truth (Observation framework, @MainActor).
@@ -24,15 +25,26 @@ private struct ChatServeRequest: Encodable {
 @MainActor
 @Observable
 final class AppStore {
-    var selection: Screen = .models
+    var selection: Screen = .chat
     var models: [ModelInfo] = []
     var adapters: [AdapterInfo] = []
     var runs: [RunRecord] = []
     var liveRun: LiveRun?
-    var inspectorPresented = false
+    // The RUN CONTROLS / Decode inspector starts OPEN: the approved chat mockup docks it as a
+    // permanent right column (Think toggle, token budget, sampling), so a new session sees the
+    // exact knobs the engine will receive. The header gear (and ⌘\) collapse it to a full-width
+    // chat on demand.
+    var inspectorPresented = true
     var commandBarOpen = false
+    // Drives the Get Models sheet, presented at the shell root and triggered from the sidebar.
+    var getModelsPresented = false
     var binariesReady = false
     var rowComfortable = false
+
+    /// The OpenAI-compatible serve daemon, owned by the AppDelegate (it predates the window)
+    /// and shared here so SwiftUI surfaces — runtime telemetry, the Serve tab — observe its
+    /// live state. Wired in ContentView.onAppear; nil until then.
+    var serve: ServeController?
 
     var modelCachePath: String { LatticeBridge.modelCacheDir.path }
     var repoRootPath: String? { LatticeBridge.repoRoot?.path }
@@ -50,13 +62,18 @@ final class AppStore {
     var chatSelectedAdapterName: String = "none"
     // Generation knob text fields.
     var chatTempText: String = "0.7"
-    // 2048 default: 256 truncated thinking models (Qwen3.x) mid-reasoning, leaving no room
-    // for the answer. Per-model defaults overwrite temp/top-k/top-p from generation_config.json.
+    // 2048 = ANSWER token budget. With a thinking budget set (below), reasoning tokens are
+    // counted SEPARATELY and do not consume this — max tokens bounds the reply only.
+    // Per-model defaults overwrite temp/top-k/top-p from generation_config.json.
     var chatMaxTokensText: String = "2048"
     var chatSeedText: String = ""
     var chatTopKText: String = "50"
     var chatTopPText: String = "0.9"
     var chatRepPenaltyText: String = "1.1"
+    // 1024 thinking-token budget, SEPARATE from max tokens: at this many reasoning tokens with
+    // no </think>, the engine force-injects </think> so the model commits to an answer
+    // (s1 budget forcing). The answer then gets its own full max-tokens budget. 0 = no cap.
+    var chatReasoningBudgetText: String = "1024"
     var chatEnableThinking: Bool = true
     // In-flight tracking — must be store-owned so a generation that finishes while
     // the user is on another screen still lands in chatTurns.
@@ -155,12 +172,26 @@ final class AppStore {
             ?? URL(fileURLWithPath: chatSessionModelPath).lastPathComponent
     }
 
+    /// The resolved ModelInfo for the resident warm session, when it maps to a known model
+    /// (carries its on-disk size for the runtime pill). Honest-nil if warm but unrecognized —
+    /// the name still shows via `chatWarmModelName`, only the size is withheld.
+    var residentModel: ModelInfo? {
+        guard chatSessionHandle?.isRunning == true, !chatSessionModelPath.isEmpty else { return nil }
+        return models.first(where: { $0.path.path == chatSessionModelPath })
+    }
+
     /// True from the moment a serve process is spawned until it emits `ready` (model resident).
     /// The process is `isRunning` the instant it spawns, well before the weights finish loading,
     /// so this flag — not `isChatSessionWarm` — is what gates the honest LOADED state.
     var isChatModelLoading: Bool = false
     /// Last chat-session spawn error (nil when none). Surfaced by the Load button.
     var chatLoadError: String? = nil
+
+    var serveDisplayRunning: Bool { serve?.isRunning == true }
+    var serveDisplayReady: Bool { serve?.isReady == true }
+    var serveDisplayLog: [ServeLogEntry] { serve?.requestLog ?? [] }
+    var serveDisplayServingModel: String? { serve?.servingModelName }
+    var serveDisplayPort: Int { serve?.port ?? 11435 }
 
     init() {
         runs = Self.loadRunArchive()
@@ -192,7 +223,7 @@ final class AppStore {
             appropriateFor: nil,
             create: true
         ) else { return nil }
-        let dir = appSupport.appendingPathComponent("LatticeStudio", isDirectory: true)
+        let dir = appSupport.appendingPathComponent("Lattice", isDirectory: true)
         // Create the subdirectory on first access.
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
@@ -282,6 +313,59 @@ final class AppStore {
     func use(_ model: ModelInfo, on screen: Screen) {
         workingModel = model
         selection = screen
+    }
+
+    /// Pick a model from the sidebar: it becomes the working target for every verb tab AND
+    /// the Chat target, so the model header, Inspect/Quantize/Train, and Chat all stay in sync
+    /// with one click. Does not change the active verb tab — the user stays where they are.
+    func selectSidebarModel(_ model: ModelInfo) {
+        workingModel = model
+        // Embedding models aren't chat targets; keep the last valid chat model so switching to
+        // an embedding for Inspect doesn't strand the Chat tab on a non-generative model.
+        if !model.isEmbedding { chatSelectedModelName = model.name }
+    }
+
+    /// Resolve the tokenizer directory a quantized model needs: a `-q4`/`-quarot` checkpoint
+    /// ships weights only, so its tokenizer lives in the bf16 sibling directory. Mirrors
+    /// `ChatScreen.warmGenConfig`. nil for a model that carries its own tokenizer.
+    func tokenizerSiblingDir(for model: ModelInfo) -> URL? {
+        guard model.format.isQuantized else { return nil }
+        let baseName = model.name
+            .replacingOccurrences(of: "-q4", with: "", options: .caseInsensitive)
+            .replacingOccurrences(of: "-quarot", with: "", options: .caseInsensitive)
+        let siblingURL = LatticeBridge.modelCacheDir.appendingPathComponent(baseName, isDirectory: true)
+        let tokenizerJSON = siblingURL.appendingPathComponent("tokenizer.json")
+        return FileManager.default.fileExists(atPath: tokenizerJSON.path) ? siblingURL : nil
+    }
+
+    /// Hold `model` resident in GPU memory without sending a prompt — backs the sidebar "Load"
+    /// pill. Forces GPU + flips the Chat target so the runtime pill, sidebar dot, and Chat all
+    /// reflect the newly-resident model. No-op if a session for this exact model is already warm.
+    func loadModel(_ model: ModelInfo) {
+        selectSidebarModel(model)
+        chatUseGPU = true
+        let cfg = GenConfig(
+            modelDir: model.path,
+            model: nil,
+            tokenizerDir: tokenizerSiblingDir(for: model),
+            adapterPath: nil,
+            prompt: "",
+            maxTokens: 1,
+            seed: nil,
+            temperature: 0.7,
+            topK: 50,
+            topP: 0.9,
+            repetitionPenalty: 1.0,
+            useGPU: true
+        )
+        warmChatSession(cfg)
+    }
+
+    /// Whether a job is currently running (drives the sidebar "Jobs" footer). The engine runs
+    /// one job at a time through `liveRun`, so this is 0 or 1.
+    var jobsRunning: Int {
+        guard let run = liveRun else { return 0 }
+        return (run.status == .running || run.status == .paused) ? 1 : 0
     }
 
     // MARK: Launch / lifecycle (the generic primitive screens build typed configs on top of)
@@ -382,7 +466,19 @@ final class AppStore {
             run.genText += g.token
             if g.done == true {
                 run.genTokS = g.tok_s
+                run.genPromptTokens = g.prompt_tokens
+                run.genTokensTotal = g.gen_tokens
+                run.genTotalMs = g.total_ms
                 run.genDone = true
+            } else if !g.token.isEmpty {
+                // Split reasoning vs response by the </think> boundary in the GENERATED text.
+                // The token that completes </think> is counted as the last reasoning token.
+                if run.sawThinkClose {
+                    // response tokens are derived from the engine total at resolution, not here
+                } else {
+                    run.genReasoningTokens += 1
+                    if run.genText.contains("</think>") { run.sawThinkClose = true }
+                }
             }
         case .perplexity(let p):
             // Append — a run may emit several rows (bf16/q4/quarot/adapter).
@@ -397,6 +493,10 @@ final class AppStore {
         case .ready:
             // ready (model-loaded) is intercepted in the chat session's onEvent handler to clear
             // the loading flag; it carries no per-run state, so consume is a no-op.
+            break
+        case .httpRequest:
+            // http_request telemetry is consumed by ServeController's own onEvent handler into
+            // its request log; it belongs to the serve daemon, not a train/quant/gen LiveRun.
             break
         case .status(let line):
             run.appendLog(line)
@@ -482,7 +582,8 @@ final class AppStore {
             top_k: config.topK,
             top_p: config.topP,
             repetition_penalty: config.repetitionPenalty,
-            seed: config.seed
+            seed: config.seed,
+            reasoning_budget: config.reasoningBudget
         )
         guard let reqData = try? JSONEncoder().encode(req),
               let reqLine = String(data: reqData, encoding: .utf8) else {
@@ -605,6 +706,16 @@ final class AppStore {
     func liveRun(matching kinds: Set<RunKind>) -> LiveRun? {
         guard let r = liveRun, kinds.contains(r.kind) else { return nil }
         return r
+    }
+
+    /// Clear the chat transcript while preserving model/adapter/sampling selections. Backs the
+    /// "new conversation" affordance in the main-column header. Stops an in-flight chat turn so a
+    /// streaming response cannot land in the freshly-cleared transcript.
+    func newChatConversation() {
+        chatTurns = []
+        chatAwaitingTurnID = nil
+        chatUserStoppedTurnID = nil
+        if liveRun?.kind == .chat, liveRun?.status == .running { stopRun() }
     }
 
     /// Live unified-memory readout, refreshed every second by `startMemoryMonitor()` so the

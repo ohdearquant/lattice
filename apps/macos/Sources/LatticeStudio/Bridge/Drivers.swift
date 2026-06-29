@@ -155,6 +155,9 @@ struct GenConfig {
     /// Repetition penalty. Default 1.1. Passed as `--repetition-penalty` to both binaries.
     /// (verified: generate_lora + chat_metal both accept this flag, 2026-06-22).
     var repetitionPenalty: Double = 1.1
+    /// Cap on reasoning/thinking tokens before the engine force-injects `</think>`.
+    /// Nil/0 = no cap. Only meaningful when reasoning is enabled.
+    var reasoningBudget: Int? = nil
     /// When true, dispatch to `chat_metal` (GPU Metal) instead of `generate_lora` (CPU).
     /// Setting this to true on a non-bf16 model is valid: chat_metal auto-detects Q4.
     var useGPU: Bool = false
@@ -184,6 +187,9 @@ struct GenConfig {
         ]
         if let s = seed {
             a += ["--seed", String(s)]
+        }
+        if let rb = reasoningBudget, rb > 0 {
+            a += ["--reasoning-budget", String(rb)]
         }
         return a
     }

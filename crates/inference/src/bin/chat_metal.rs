@@ -431,9 +431,11 @@ fn emit_json_generation(
     };
 
     // Final done event — format identical to generate_lora so app parser needs no change.
+    // prompt_tokens / gen_tokens / total_ms are additive: older parsers ignore unknown fields.
     writeln!(
         stdout,
-        "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1}}}"
+        "@@lattice {{\"ev\":\"gen_token\",\"token\":\"\",\"done\":true,\"tok_s\":{tok_s:.1},\"ttft_ms\":{ttft_ms:.1},\"prompt_tokens\":{},\"gen_tokens\":{},\"total_ms\":{}}}",
+        output.prompt_tokens, output.generated_tokens, gen_ms
     )
     .and_then(|()| stdout.flush())
     .map_err(|e| format!("streaming done-event write failed: {e}"))?;
@@ -490,6 +492,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let repetition_penalty: f32 = parse_arg(&args, "--repetition-penalty")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.1);
+
+    let reasoning_budget: Option<usize> = parse_arg(&args, "--reasoning-budget")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0);
 
     let lora_path: Option<std::path::PathBuf> = parse_arg(&args, "--lora").map(|s| {
         let p = std::path::PathBuf::from(&s);
@@ -642,6 +648,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         enable_mtp: None,
         grammar: None,
         stop_strings: vec![],
+        reasoning_budget,
     };
 
     // ── JSON modes (used by Lattice Studio app) ─────────────────────────────
@@ -726,6 +733,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|v| v as f32)
                     .unwrap_or(repetition_penalty);
                 let req_seed = req_val["seed"].as_u64().or(seed);
+                let req_reasoning_budget = req_val["reasoning_budget"]
+                    .as_u64()
+                    .map(|v| v as usize)
+                    .filter(|&n| n > 0)
+                    .or(reasoning_budget);
 
                 let req_cfg = GenerateConfig {
                     max_new_tokens: req_max_tokens,
@@ -739,6 +751,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     enable_mtp: None,
                     grammar: None,
                     stop_strings: vec![],
+                    reasoning_budget: req_reasoning_budget,
                 };
 
                 // Stateless per request: full ChatML history comes in the prompt.

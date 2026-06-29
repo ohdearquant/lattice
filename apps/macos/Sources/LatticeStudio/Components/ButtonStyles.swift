@@ -120,6 +120,35 @@ private struct LatticeSecondaryButtonBody: View {
     }
 }
 
+// MARK: - Icon button — square, borderless, subtle hover. For header affordances (new chat, settings).
+
+struct LatticeIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        LatticeIconButtonBody(configuration: configuration)
+    }
+}
+
+private struct LatticeIconButtonBody: View {
+    let configuration: ButtonStyleConfiguration
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovered = false
+
+    private var fillColor: Color {
+        if configuration.isPressed { return Theme.Palette.surfaceRaised }
+        if isHovered { return Theme.Palette.surfaceHover }
+        return .clear
+    }
+
+    var body: some View {
+        configuration.label
+            .foregroundStyle(isEnabled ? Theme.Palette.textSecondary : Theme.Palette.textDisabled)
+            .frame(width: 30, height: 30)
+            .background(fillColor, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            .animation(.easeOut(duration: Theme.Motion.hover), value: isHovered)
+            .onHover { isHovered = $0 }
+    }
+}
+
 // MARK: - Previews
 
 #Preview("ButtonStyles") {

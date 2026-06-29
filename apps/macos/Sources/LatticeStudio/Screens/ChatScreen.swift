@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - 02 CHAT
@@ -50,17 +51,35 @@ private struct TypingDots: View {
     }
 }
 
+// File-scoped byte formatter for the model-bar meta + hero subline (GB-scale model sizes).
+private let chatByteFormatter: ByteCountFormatter = {
+    let f = ByteCountFormatter()
+    f.allowedUnits = [.useMB, .useGB]
+    f.countStyle = .file
+    return f
+}()
+
 // MARK: - ChatScreen
 
 struct ChatScreen: View {
     @Bindable var store: AppStore
 
+    /// When embedded in the MainColumn (the redesigned shell), the column already supplies the
+    /// model header + residency + new-chat/settings affordances, so the in-screen `chatModelBar`
+    /// is suppressed to avoid a duplicate model strip. The settings inspector stays reachable from
+    /// the column header's gear. Defaults to the standalone layout (own model bar).
+    var embedded: Bool = false
+
     // MARK: Local state (ephemeral; does NOT need to survive navigation)
 
     // Composer text is ephemeral — clearing on navigation is acceptable
     @State private var composerText: String = ""
-    // Which turns have their reasoning disclosure open (auto-open while streaming).
-    @State private var expandedThinking: Set<UUID> = []
+    // Explicit user override for the reasoning disclosure, per turn. nil = follow the default
+    // (auto-open while streaming, collapsed after). A non-nil value is the user's own toggle and
+    // always wins — including mid-stream, so reasoning is foldable while it is still generating.
+    @State private var thinkingExpandedOverride: [UUID: Bool] = [:]
+    // Turn whose response was just copied — drives the transient "Copied" affordance.
+    @State private var copiedTurnID: UUID? = nil
 
     // MARK: Store-backed derived helpers
 
@@ -90,31 +109,37 @@ struct ChatScreen: View {
             && !isRunning
     }
 
-    // MARK: Subtitle (model + residency status; honest)
-
-    private var subtitle: String {
-        guard let model = selectedModel else { return "no models found" }
-        // "warm"  — GPU serve session is resident and the model is loaded in GPU memory.
-        // "ready" — model directory exists on disk but no warm session (CPU mode, or first GPU send).
-        // "not found" — model path is missing from disk.
-        let diskStatus: String
-        if FileManager.default.fileExists(atPath: model.path.path) {
-            diskStatus = (store.chatUseGPU && store.isChatSessionWarm) ? "warm" : "ready"
-        } else {
-            diskStatus = "not found"
-        }
-        return "\(model.name) · \(diskStatus)"
-    }
-
     // MARK: Body
 
     var body: some View {
-        ScreenScaffold(screen: .chat, subtitle: subtitle) {
-            VStack(spacing: 0) {
-                transcriptArea
-                composerBar
+        VStack(spacing: 0) {
+            if !embedded {
+                chatModelBar
+                Rectangle()
+                    .fill(Theme.Palette.hairline)
+                    .frame(height: 1)
             }
+            if embedded {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("CHAT STREAM")
+                        .font(Theme.Fonts.sectionLabel)
+                        .textCase(.uppercase)
+                        .tracking(Theme.Space.labelTracking)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    Text("Resident session")
+                        .font(Theme.Fonts.caption)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .padding(.horizontal, Theme.Space.lg)
+                .padding(.vertical, Theme.Space.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Theme.Palette.hairline.frame(height: 1)
+            }
+            transcriptArea
+            composerBar
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Theme.Palette.canvas)
         .inspector(isPresented: $store.inspectorPresented) {
             settingsInspector
                 // Fixed width, not a resizable range. The inspector holds greedy full-width
@@ -152,6 +177,100 @@ struct ChatScreen: View {
         }
     }
 
+    // MARK: - Model bar  (always-visible "what am I talking to, and is it fast")
+
+    private var chatModelBar: some View {
+        HStack(spacing: Theme.Space.md) {
+            // Residency dot: generating (accent) · loaded in GPU memory (green) · ready (idle)
+            Circle()
+                .fill(statusColor)
+                .frame(width: 7, height: 7)
+
+            // Model picker — borderless menu so it reads as a title, not a boxed control
+            Menu {
+                ForEach(chatModels) { m in
+                    Button {
+                        store.chatSelectedModelName = m.name
+                    } label: {
+                        if m.name == selectedModel?.name {
+                            Label(m.name, systemImage: "checkmark")
+                        } else {
+                            Text(m.name)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(selectedModel?.name ?? "No model")
+                        .font(Theme.Fonts.bodyStrong)
+                        .foregroundStyle(Theme.Palette.ink)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .disabled(chatModels.count <= 1)
+
+            // Quiet meta: params · size · residency — the fit + local story, inline
+            if let m = selectedModel {
+                Text(metaLine(m))
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+
+            Spacer(minLength: Theme.Space.md)
+
+            // Backend — compact CPU/GPU. Full sampling/generation knobs live in the inspector.
+            Picker("", selection: Binding(
+                get: { store.chatUseGPU ? "GPU" : "CPU" },
+                set: { store.chatUseGPU = ($0 == "GPU") }
+            )) {
+                Text("CPU").tag("CPU")
+                Text("GPU").tag("GPU")
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .fixedSize()
+            .help("CPU bf16 or GPU Metal")
+
+            // New conversation
+            Button { newConversation() } label: {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(store.chatTurns.isEmpty)
+            .help("New conversation")
+        }
+        .padding(.horizontal, Theme.Space.lg)
+        .frame(height: 48)
+        .background(Theme.Palette.canvas)
+    }
+
+    // Residency color for the model-bar dot.
+    private var statusColor: Color {
+        if isRunning { return Theme.Palette.signal }
+        if store.chatUseGPU && store.isChatSessionWarm { return Theme.Palette.success }
+        return Theme.Palette.idle
+    }
+
+    // params · size · residency — honest, compact. "loaded" only when this exact model is warm.
+    private func metaLine(_ model: ModelInfo) -> String {
+        var parts: [String] = []
+        if let p = model.params { parts.append(p) }
+        parts.append(chatByteFormatter.string(fromByteCount: model.sizeBytes))
+        if !FileManager.default.fileExists(atPath: model.path.path) {
+            parts.append("not found")
+        } else if store.chatUseGPU && store.isChatSessionWarm && store.chatWarmModelName == model.name {
+            parts.append("loaded")
+        }
+        return parts.joined(separator: " · ")
+    }
+
     // MARK: - Settings inspector (inline; binds directly to store)
 
     @ViewBuilder
@@ -159,12 +278,29 @@ struct ChatScreen: View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: 0) {
 
+                // ── HEADER ──────────────────────────────────────────────────────────
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("RUN CONTROLS")
+                        .font(Theme.Fonts.sectionLabel)
+                        .tracking(Theme.Space.labelTracking)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    Text("Decode")
+                        .font(Theme.Fonts.inspectorTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .padding(.horizontal, Theme.Space.lg)
+                .padding(.top, Theme.Space.lg)
+                .padding(.bottom, Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
                 // ── TARGET ──────────────────────────────────────────────────────────
 
-                Text("Target")
-                    .instrumentLabel()
+                Text("TARGET")
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(Theme.Space.labelTracking)
+                    .foregroundStyle(Theme.Palette.textTertiary)
                     .padding(.horizontal, Theme.Space.lg)
-                    .padding(.top, Theme.Space.lg)
                     .padding(.bottom, Theme.Space.sm)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -291,10 +427,61 @@ struct ChatScreen: View {
                 .instrumentPanel()
                 .padding(.horizontal, Theme.Space.lg)
 
-                // ── SAMPLING ────────────────────────────────────────────────────────
+                // ── THINK ──────────────────────────────────────────────────────────
 
-                Text("Sampling")
-                    .instrumentLabel()
+                Text("THINK")
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(Theme.Space.labelTracking)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.top, Theme.Space.lg)
+                    .padding(.bottom, Theme.Space.sm)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 0) {
+                    // Think on/off — when off, a closed <think></think> is injected so the model
+                    // answers directly. Same boolean the composer bar "Reasoning" pill drives.
+                    HStack {
+                        Text("Think")
+                            .font(Theme.Fonts.bodyStrong)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { store.chatEnableThinking },
+                            set: { store.chatEnableThinking = $0 }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(Theme.Palette.signal)
+                    }
+                    .frame(height: Theme.Space.rowHeightComfortable)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .overlay(alignment: .bottom) {
+                        Theme.Palette.hairline.frame(height: 1)
+                    }
+
+                    // Thinking budget — cap on reasoning tokens before engine force-injects </think>.
+                    // 0 = no cap. Only meaningful when Reasoning is On. Step ±128, range 0–8192.
+                    ParamRowStepper(
+                        label: "Token budget",
+                        value: Binding(
+                            get: { Double(store.chatReasoningBudgetText) ?? 0 },
+                            set: { store.chatReasoningBudgetText = String(Int($0)) }
+                        ),
+                        range: 0...8192,
+                        step: 128,
+                        format: "%.0f"
+                    )
+                }
+                .instrumentPanel()
+                .padding(.horizontal, Theme.Space.lg)
+
+                // ── DECODE PARAMS ──────────────────────────────────────────────────
+
+                Text("DECODE")
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(Theme.Space.labelTracking)
+                    .foregroundStyle(Theme.Palette.textTertiary)
                     .padding(.horizontal, Theme.Space.lg)
                     .padding(.top, Theme.Space.lg)
                     .padding(.bottom, Theme.Space.sm)
@@ -333,38 +520,25 @@ struct ChatScreen: View {
 
                     // Repetition penalty — real flag: --repetition-penalty (default 1.1)
                     ParamRowField(
-                        label: "Rep. penalty",
+                        label: "Rep penalty",
                         text: Binding(
                             get: { store.chatRepPenaltyText },
                             set: { store.chatRepPenaltyText = $0 }
                         ),
                         placeholder: "1.1"
                     )
-                }
-                .instrumentPanel()
-                .padding(.horizontal, Theme.Space.lg)
 
-                // ── GENERATION ──────────────────────────────────────────────────────
-
-                Text("Generation")
-                    .instrumentLabel()
-                    .padding(.horizontal, Theme.Space.lg)
-                    .padding(.top, Theme.Space.lg)
-                    .padding(.bottom, Theme.Space.sm)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                VStack(spacing: 0) {
-                    // Max tokens — real flag: --max-tokens (default 256)
+                    // Max tokens — real flag: --max-tokens (default 2048 answer budget)
                     ParamRowField(
                         label: "Max tokens",
                         text: Binding(
                             get: { store.chatMaxTokensText },
                             set: { store.chatMaxTokensText = $0 }
                         ),
-                        placeholder: "256"
+                        placeholder: "2048"
                     )
 
-                    // Seed — real flag: --seed (nil = non-deterministic)
+                    // Seed — real flag: --seed (empty = non-deterministic)
                     ParamRowField(
                         label: "Seed",
                         text: Binding(
@@ -373,20 +547,30 @@ struct ChatScreen: View {
                         ),
                         placeholder: "random"
                     )
-
-                    // Reasoning — when off, inject a closed <think></think> so the model skips
-                    // its reasoning trace and answers directly.
-                    ParamRowPicker(
-                        label: "Reasoning",
-                        options: ["On", "Off"],
-                        selection: Binding(
-                            get: { store.chatEnableThinking ? "On" : "Off" },
-                            set: { store.chatEnableThinking = ($0 == "On") }
-                        )
-                    )
                 }
                 .instrumentPanel()
                 .padding(.horizontal, Theme.Space.lg)
+
+                // ── NOTE CARD ──────────────────────────────────────────────────────
+                // True statement: the serve loop resets KV state per turn — there is no
+                // cross-turn prefix cache. The GUI shows what the engine actually receives.
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("NO CROSS-TURN PROMPT CACHE")
+                        .font(Theme.Fonts.sectionLabel)
+                        .textCase(.uppercase)
+                        .tracking(Theme.Space.labelTracking)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    Text("Each turn is explicit. The GUI shows what the Rust engine actually receives.")
+                        .font(Theme.Fonts.caption)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .readoutWellSurface()
+                .padding(.horizontal, Theme.Space.lg)
+                .padding(.top, Theme.Space.lg)
 
                 // ── ACTIONS ─────────────────────────────────────────────────────────
 
@@ -442,233 +626,508 @@ struct ChatScreen: View {
     }
 
     private var emptyState: some View {
-        VStack {
-            Spacer()
-                .frame(minHeight: 0)
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
                 .frame(maxHeight: .infinity)
                 .layoutPriority(-1)
-            EmptyStateView(
-                systemImage: "text.bubble",
-                title: "Try it out",
-                message: "Send a message to run this model locally on your Mac."
-            )
-            .frame(maxWidth: .infinity)
-            Spacer()
-                .frame(minHeight: 0)
+
+            VStack(spacing: Theme.Space.lg) {
+                Image(systemName: "circle.hexagongrid.fill")
+                    .font(.system(size: 32, weight: .regular))
+                    .foregroundStyle(Theme.Palette.signal)
+
+                VStack(spacing: 6) {
+                    Text(selectedModel?.name ?? "No model loaded")
+                        .font(Theme.Fonts.display(22, .bold))
+                        .foregroundStyle(Theme.Palette.ink)
+                        .multilineTextAlignment(.center)
+                    Text(heroSubline)
+                        .font(Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                if selectedModel != nil {
+                    exampleChips
+                } else {
+                    Button("Get a model") { store.getModelsPresented = true }
+                        .buttonStyle(LatticePrimaryButtonStyle())
+                        .padding(.top, Theme.Space.xs)
+                }
+            }
+            .frame(maxWidth: 480)
+            .padding(.horizontal, Theme.Space.xl)
+
+            Spacer(minLength: 0)
                 .frame(maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity)
+    }
+
+    // Subline under the model name: params · size · "private and offline" — honest, no theater.
+    private var heroSubline: String {
+        guard let m = selectedModel else {
+            return "Add a model to start chatting locally. Private and offline, no account."
+        }
+        var parts: [String] = []
+        if let p = m.params { parts.append(p) }
+        parts.append(chatByteFormatter.string(fromByteCount: m.sizeBytes))
+        parts.append("private and offline")
+        return parts.joined(separator: " · ")
+    }
+
+    // Starter prompts — tapping one fills the composer (does NOT auto-send). Lowers the
+    // activation energy of an empty chat without committing the user to anything.
+    private let examplePrompts: [String] = [
+        "Explain how attention works, simply.",
+        "Write a Python function to dedupe a list.",
+        "Draft a polite follow-up email.",
+        "Give me three ideas for a weekend project."
+    ]
+
+    private var exampleChips: some View {
+        LazyVGrid(
+            columns: [
+                GridItem(.flexible(), spacing: Theme.Space.sm),
+                GridItem(.flexible(), spacing: Theme.Space.sm)
+            ],
+            spacing: Theme.Space.sm
+        ) {
+            ForEach(examplePrompts, id: \.self) { prompt in
+                Button { composerText = prompt } label: {
+                    Text(prompt)
+                        .font(Theme.Fonts.caption)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                .fill(Theme.Palette.surfaceRaised)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.top, Theme.Space.sm)
     }
 
     // MARK: - Turn bubbles (single mode)
 
     @ViewBuilder
     private func turnView(_ turn: ChatTurn) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            // User bubble — right-aligned, neutral panel surface (no teal)
-            HStack {
-                Spacer(minLength: Theme.Space.xxl)
+        VStack(alignment: .leading, spacing: Theme.Space.lg) {
+            userBlock(turn)
+            assistantBlock(turn)
+        }
+    }
+
+    // MARK: User block — "YOU" label over an indigo-tinted prompt block that hugs its content
+
+    private func userBlock(_ turn: ChatTurn) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("YOU")
+                .font(Theme.Fonts.sectionLabel)
+                .tracking(Theme.Space.labelTracking)
+                .foregroundStyle(Theme.Palette.textTertiary)
+            // The bubble hugs the prompt and leaves a right margin (mockup) rather than spanning
+            // the full column; long prompts grow wide but never reach the edge.
+            HStack(spacing: 0) {
                 Text(turn.prompt)
                     .font(Theme.Fonts.body)
                     .foregroundStyle(Theme.Palette.ink)
                     .multilineTextAlignment(.leading)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
                     .background(
                         RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
-                            .fill(Theme.Palette.panel)
+                            .fill(Theme.Palette.signal.opacity(0.10))
                             .overlay(
                                 RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
-                                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
+                                    .strokeBorder(Theme.Palette.signal.opacity(0.22), lineWidth: 1)
                             )
                     )
-            }
-
-            // Assistant bubble — left-aligned, surfaceRaised fill
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 4) {
-                    // Reasoning disclosure — visible whenever the turn produced a thinking trace.
-                    // Auto-expands while streaming (running + no final answer yet), collapsible after.
-                    if !turn.thinkingText.isEmpty {
-                        let isExpanded = Binding<Bool>(
-                            get: { expandedThinking.contains(turn.id) || (turn.status == .running && turn.responseText.isEmpty) },
-                            set: { now in
-                                if now { expandedThinking.insert(turn.id) } else { expandedThinking.remove(turn.id) }
-                            }
-                        )
-                        DisclosureGroup(isExpanded: isExpanded) {
-                            Text(turn.thinkingText)
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textSecondary)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.top, 4)
-                        } label: {
-                            Label("Reasoning", systemImage: "brain")
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(assistantBubbleBackground)
-                    }
-
-                    if turn.status == .running && turn.responseText.isEmpty {
-                        // Typing indicator: distinguish "loading model" from "generating"
-                        HStack(spacing: Theme.Space.xs) {
-                            TypingDots()
-                            let liveText = store.liveRun(matching: [.chat])?.genText ?? ""
-                            Text(liveText.isEmpty ? "Loading model…" : "Thinking…")
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textSecondary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(assistantBubbleBackground)
-
-                    } else if turn.status == .failed && turn.responseText.isEmpty {
-                        // Failed with NO output — show the engine reason, never silent "(no output)"
-                        let reason = turn.errorMessage ?? "Generation failed."
-                        Text(reason)
-                            .font(Theme.Fonts.body)
-                            .foregroundStyle(Theme.Palette.error)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                            .background(assistantBubbleBackground)
-
-                        // Retry — re-launches the identical GenConfig
-                        if let cfg = turn.retryConfig {
-                            Button {
-                                retryTurn(turn: turn, config: cfg)
-                            } label: {
-                                Label("Retry", systemImage: "arrow.clockwise")
-                                    .font(Theme.Fonts.caption)
-                            }
-                            .buttonStyle(LatticeSecondaryButtonStyle())
-                            .disabled(isRunning)
-                            .padding(.leading, 4)
-                        }
-
-                    } else {
-                        // Normal response — rendered as Markdown (headings, lists, code, **bold**).
-                        // Red is for errors only; MarkdownText uses ink throughout.
-                        MarkdownText(text: turn.responseText)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                            .background(assistantBubbleBackground)
-
-                        // If the run failed but we got partial text, show the reason beneath
-                        if turn.status == .failed, let reason = turn.errorMessage {
-                            Text(reason)
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.error)
-                                .padding(.leading, 4)
-                        }
-
-                        // tok/s + honest hardware label — muted, small
-                        // The label was snapshotted at send time: "GPU Metal bf16", "CPU bf16", etc.
-                        // It is never updated retroactively so what launched is always what shows.
-                        if let tps = turn.tokensPerSecond {
-                            let labelStr = turn.inferenceLabel.map { " · \($0)" } ?? ""
-                            Text(String(format: "%.1f tok/s\(labelStr)", tps))
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                                .monospacedDigit()
-                                .padding(.leading, 4)
-                        } else if let label = turn.inferenceLabel, turn.status == .running {
-                            // Show label while generating (before tok/s is known)
-                            Text(label)
-                                .font(Theme.Fonts.caption)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                                .padding(.leading, 4)
-                        }
-
-                        // Retry button for failed turns that do have partial text
-                        if turn.status == .failed, let cfg = turn.retryConfig {
-                            Button {
-                                retryTurn(turn: turn, config: cfg)
-                            } label: {
-                                Label("Retry", systemImage: "arrow.clockwise")
-                                    .font(Theme.Fonts.caption)
-                            }
-                            .buttonStyle(LatticeSecondaryButtonStyle())
-                            .disabled(isRunning)
-                            .padding(.leading, 4)
-                        }
-                    }
-                }
-                Spacer(minLength: Theme.Space.xxl)
+                Spacer(minLength: 48)
             }
         }
     }
 
-    private var assistantBubbleBackground: some View {
-        RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
-            .fill(Theme.Palette.surfaceRaised)
+    // MARK: Assistant block — "▲ MODEL" label, reasoning fold, bubble-less answer, metrics + actions
+
+    @ViewBuilder
+    private func assistantBlock(_ turn: ChatTurn) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack(spacing: 7) {
+                LatticeMark()
+                    .stroke(Theme.Palette.signal,
+                            style: StrokeStyle(lineWidth: 1.3, lineCap: .round, lineJoin: .round))
+                    .frame(width: 13, height: 13)
+                Text((turn.modelName ?? selectedModel?.name ?? "assistant").uppercased())
+                    .font(Theme.Fonts.sectionLabel)
+                    .tracking(Theme.Space.labelTracking)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+
+            if !turn.thinkingText.isEmpty {
+                reasoningDisclosure(turn)
+            }
+
+            assistantBody(turn)
+        }
+    }
+
+    // Reasoning fold — chevron + "REASONING" + italic first-line preview when collapsed; full
+    // trace when expanded. Auto-opens while reasoning streams, collapses once the answer lands;
+    // an explicit user toggle always wins (foldable mid-stream).
+    @ViewBuilder
+    private func reasoningDisclosure(_ turn: ChatTurn) -> some View {
+        let streamingOpen = (turn.status == .running && turn.responseText.isEmpty)
+        let expanded = thinkingExpandedOverride[turn.id] ?? streamingOpen
+        let preview = turn.thinkingText
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                thinkingExpandedOverride[turn.id] = !expanded
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: expanded ? "arrowtriangle.down.fill" : "arrowtriangle.right.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    Text("REASONING")
+                        .font(Theme.Fonts.sectionLabel)
+                        .tracking(Theme.Space.labelTracking)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                    if !expanded {
+                        Text(preview)
+                            .font(Theme.Fonts.caption)
+                            .italic()
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                Text(turn.thinkingText)
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
+                .fill(Theme.Palette.panel)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
+                        .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+                )
+        )
+    }
+
+    // Answer body. Markdown sits directly on the canvas (no bubble) to match the mockup; the
+    // streaming/failed states keep a light treatment so they read as transient, not the answer.
+    @ViewBuilder
+    private func assistantBody(_ turn: ChatTurn) -> some View {
+        if turn.status == .running && turn.responseText.isEmpty {
+            HStack(spacing: Theme.Space.xs) {
+                TypingDots()
+                let liveText = store.liveRun(matching: [.chat])?.genText ?? ""
+                Text(liveText.isEmpty ? "Loading model…" : "Thinking…")
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .padding(.vertical, 2)
+
+        } else if turn.status == .failed && turn.responseText.isEmpty {
+            Text(turn.errorMessage ?? "Generation failed.")
+                .font(Theme.Fonts.body)
+                .foregroundStyle(Theme.Palette.error)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
+                        .fill(Theme.Palette.error.opacity(0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
+                                .strokeBorder(Theme.Palette.error.opacity(0.25), lineWidth: 1)
+                        )
+                )
+            if let cfg = turn.retryConfig { retryButton(turn, cfg) }
+
+        } else {
+            MarkdownText(text: turn.responseText)
+                .frame(maxWidth: Theme.Space.chatReadingWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if turn.status == .failed, let reason = turn.errorMessage {
+                Text(reason)
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.error)
+            }
+
+            // Hardware label while generating, before tok/s is known.
+            if turn.tokensPerSecond == nil, let label = turn.inferenceLabel, turn.status == .running {
+                Text(label)
+                    .font(Theme.Fonts.caption)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+
+            if turn.tokensPerSecond != nil { metricsRow(turn) }
+            if !turn.responseText.isEmpty { actionRow(turn) }
+            if turn.status == .failed, let cfg = turn.retryConfig { retryButton(turn, cfg) }
+        }
+    }
+
+    // Honest per-turn telemetry as pills: hardware tag (plain) · tok/s (accent) · prompt · reasoning
+    // (only when > 0) · reply · total. No "cached" pill — there is no cross-turn prefix cache.
+    @ViewBuilder
+    private func metricsRow(_ turn: ChatTurn) -> some View {
+        if let tps = turn.tokensPerSecond {
+            HStack(spacing: 6) {
+                if let label = turn.inferenceLabel {
+                    metricPill(hardwareTag(label), highlighted: false)
+                }
+                metricPill(tpsText(tps), highlighted: true)
+                if let pt = turn.promptTokens {
+                    metricPill("\(pt.formatted()) prompt", highlighted: false)
+                }
+                if let rt = turn.reasoningTokens, rt > 0 {
+                    metricPill("\(rt.formatted()) reasoning", highlighted: false)
+                }
+                if let rp = turn.responseTokens {
+                    metricPill("\(rp.formatted()) reply", highlighted: false)
+                }
+                if let ms = turn.totalMs {
+                    metricPill(String(format: "%.1f s", ms / 1000.0), highlighted: false)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    // Outlined capsules — a thin border on a near-flush fill, as the mockup. tok/s is the one
+    // accented reading (indigo text + indigo-tinted border); every other metric stays neutral so
+    // the throughput number is the single thing the eye lands on.
+    private func metricPill(_ text: String, highlighted: Bool) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: highlighted ? .semibold : .regular, design: .monospaced))
+            .foregroundStyle(highlighted ? Theme.Palette.signal : Theme.Palette.textSecondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Capsule(style: .continuous).fill(Theme.Palette.hoverOverlay))
             .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
-                    .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+                Capsule(style: .continuous).strokeBorder(
+                    highlighted ? Theme.Palette.signal.opacity(0.35) : Theme.Palette.borderStandard,
+                    lineWidth: 1)
             )
+    }
+
+    // Copy + regenerate, icon-only in subtle bordered squares (matches mockup).
+    private func actionRow(_ turn: ChatTurn) -> some View {
+        HStack(spacing: 6) {
+            let copied = (copiedTurnID == turn.id)
+            transcriptIconButton(copied ? "checkmark" : "doc.on.doc",
+                                 active: copied,
+                                 help: "Copy response") {
+                copyResponse(turn.responseText, turnID: turn.id)
+            }
+            if let cfg = turn.retryConfig {
+                transcriptIconButton("arrow.counterclockwise",
+                                     active: false,
+                                     help: "Regenerate") {
+                    retryTurn(turn: turn, config: cfg)
+                }
+                .disabled(isRunning)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 2)
+    }
+
+    private func transcriptIconButton(_ symbol: String, active: Bool, help: String,
+                                      action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(active ? Theme.Palette.signal : Theme.Palette.textTertiary)
+                .frame(width: 28, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                        .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func retryButton(_ turn: ChatTurn, _ cfg: ChatGenConfig) -> some View {
+        Button { retryTurn(turn: turn, config: cfg) } label: {
+            Label("Retry", systemImage: "arrow.clockwise")
+                .font(Theme.Fonts.caption)
+        }
+        .buttonStyle(LatticeSecondaryButtonStyle())
+        .disabled(isRunning)
+    }
+
+    private func hardwareTag(_ label: String) -> String {
+        if label.hasPrefix("GPU") { return "GPU" }
+        if label.hasPrefix("CPU") { return "CPU" }
+        return label
+    }
+
+    private func tpsText(_ tps: Double) -> String {
+        tps >= 10 ? String(format: "%.0f tok/s", tps) : String(format: "%.1f tok/s", tps)
     }
 
     // MARK: - Composer
 
     private var composerBar: some View {
-        VStack(spacing: 0) {
-            Rectangle()
-                .fill(Theme.Palette.hairline)
-                .frame(height: 1)
-
-            HStack {
-                composerField
-                    .frame(maxWidth: Theme.Space.chatMaxWidth)
-                    .frame(maxWidth: .infinity)
-            }
-            .padding(Theme.Space.lg)
-            .background(Theme.Palette.canvas)
+        VStack(spacing: 8) {
+            composerField
+            composerFooter
         }
+        .frame(maxWidth: Theme.Space.chatMaxWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, Theme.Space.lg)
+        .padding(.vertical, Theme.Space.md)
+        .background(Theme.Palette.canvas)
     }
 
+    // The field holds the text area plus an inline control cluster — reasoning toggle, CPU/GPU
+    // backend, and Send — so the primary chat controls live where the message is typed (mockup).
     private var composerField: some View {
-        ZStack(alignment: .topLeading) {
-            // Placeholder — shown only when composer is empty
-            if composerText.isEmpty {
-                Text("Message…")
+        HStack(alignment: .bottom, spacing: 10) {
+            ZStack(alignment: .topLeading) {
+                if composerText.isEmpty {
+                    Text(composerPlaceholder)
+                        .font(Theme.Fonts.body)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.top, 7)
+                        .allowsHitTesting(false)
+                        .lineLimit(1)
+                }
+                // TextEditor wraps NSTextView in an NSScrollView with always-on scrollers;
+                // `.scrollIndicators(.never)` makes it read as an input area, not a document.
+                TextEditor(text: $composerText)
                     .font(Theme.Fonts.body)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .padding(.horizontal, 10)
-                    .padding(.top, 9)
-                    .allowsHitTesting(false)
+                    .foregroundStyle(Theme.Palette.ink)
+                    .scrollContentBackground(.hidden)
+                    .scrollIndicators(.never)
+                    .background(.clear)
+                    .frame(minHeight: 30, maxHeight: 132)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 1)
             }
-            // TextEditor on macOS wraps NSTextView inside NSScrollView which shows
-            // always-on scrollers by default. `.scrollIndicators(.never)` suppresses
-            // them so the field looks like a native input area rather than a document.
-            TextEditor(text: $composerText)
-                .font(Theme.Fonts.body)
-                .foregroundStyle(Theme.Palette.ink)
-                .scrollContentBackground(.hidden)
-                .scrollIndicators(.never)
-                .background(.clear)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .padding(.trailing, 40)
+
+            HStack(spacing: 8) {
+                reasoningToggle
+                backendToggle
+                actionButton
+            }
         }
-        // Auto-grow: starts at 44pt (single line), expands up to 160pt when content fills.
-        // The outer frame clamps max height — the inner TextEditor fills it naturally.
-        .frame(minHeight: 44, maxHeight: 160)
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
         .background(Theme.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: Theme.Radius.panel, style: .continuous)
                 .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
         )
-        .overlay(alignment: .bottomTrailing) {
-            actionButton
-                .padding(7)
+    }
+
+    private var composerPlaceholder: String {
+        if let name = selectedModel?.name { return "Message \(name)…" }
+        return "Message…"
+    }
+
+    // Reasoning on/off — when off, a closed <think></think> is injected so the model answers
+    // directly. Lives in the composer (mockup) instead of buried in the settings inspector.
+    private var reasoningToggle: some View {
+        let on = store.chatEnableThinking
+        return Button { store.chatEnableThinking.toggle() } label: {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(on ? Theme.Palette.signal : Theme.Palette.idle)
+                    .frame(width: 6, height: 6)
+                Text("Reasoning")
+                    .font(Theme.Fonts.controlText)
+                    .foregroundStyle(on ? Theme.Palette.signal : Theme.Palette.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(on ? Theme.Palette.signal.opacity(0.12) : Theme.Palette.hoverOverlay)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(on ? Theme.Palette.signal.opacity(0.30) : Theme.Palette.borderStandard,
+                                  lineWidth: 1)
+            )
+            .contentShape(Capsule())
         }
+        .buttonStyle(.plain)
+        .help(on ? "Reasoning on — the model thinks before answering"
+                 : "Reasoning off — the model answers directly")
+    }
+
+    // CPU bf16 vs GPU Metal — custom segmented control matched to the composer's visual language.
+    private var backendToggle: some View {
+        HStack(spacing: 2) {
+            backendSegment("CPU", isGPU: false)
+            backendSegment("GPU", isGPU: true)
+        }
+        .padding(2)
+        .frame(height: 30)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                .fill(Theme.Palette.wellSink)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                .strokeBorder(Theme.Palette.borderStandard, lineWidth: 1)
+        )
+    }
+
+    private func backendSegment(_ title: String, isGPU: Bool) -> some View {
+        let selected = (store.chatUseGPU == isGPU)
+        return Button { store.chatUseGPU = isGPU } label: {
+            Text(title)
+                .font(Theme.Fonts.controlText)
+                .foregroundStyle(selected ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
+                .padding(.horizontal, 11)
+                .frame(maxHeight: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.badge, style: .continuous)
+                        .fill(selected ? Theme.Palette.surfaceHover : .clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isGPU ? "GPU Metal (bf16 + Q4)" : "CPU bf16")
     }
 
     @ViewBuilder
@@ -679,27 +1138,27 @@ struct ChatScreen: View {
                 store.stopRun()
             } label: {
                 Image(systemName: "stop.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.Palette.crimson)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 36, height: 36)
                     .background(
-                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                        RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
                             .fill(Theme.Palette.crimson.opacity(0.12))
                     )
             }
             .buttonStyle(.plain)
             .help("Stop generation")
         } else {
-            Button(action: {
-                send()
-            }) {
+            Button(action: { send() }) {
                 Image(systemName: "arrow.up")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(canSend ? Theme.Palette.onAccent : Theme.Palette.textTertiary)
-                    .frame(width: 30, height: 30)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(canSend ? Theme.Palette.onAccent : Theme.Palette.onAccent.opacity(0.7))
+                    .frame(width: 36, height: 36)
                     .background(
-                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                            .fill(canSend ? Theme.Palette.signal : Theme.Palette.wellSink)
+                        // Indigo identity even when disabled (mockup): a dimmed accent, not the
+                        // near-black wellSink, so the send affordance always reads as the CTA.
+                        RoundedRectangle(cornerRadius: Theme.Radius.well, style: .continuous)
+                            .fill(canSend ? Theme.Palette.signal : Theme.Palette.signal.opacity(0.5))
                     )
             }
             .buttonStyle(.plain)
@@ -707,6 +1166,25 @@ struct ChatScreen: View {
             .keyboardShortcut(.return, modifiers: .command)
             .help("Send  ⌘↵")
         }
+    }
+
+    // Privacy reassurance + the real keyboard affordance. The shortcut text states the actual
+    // behavior (⌘↵ sends, plain ↵ inserts a newline) rather than a not-yet-wired Return-to-send.
+    private var composerFooter: some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 5) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 10, weight: .regular))
+                Text("Private · runs entirely on this Mac")
+                    .font(Theme.Fonts.caption)
+            }
+            .foregroundStyle(Theme.Palette.textTertiary)
+            Spacer()
+            Text("⌘↵ send · ↵ newline")
+                .font(Theme.Fonts.caption)
+                .foregroundStyle(Theme.Palette.textTertiary)
+        }
+        .padding(.horizontal, 4)
     }
 
     // MARK: - Actions
@@ -796,7 +1274,35 @@ struct ChatScreen: View {
         store.chatTurns = []
         store.chatAwaitingTurnID = nil
         store.chatUserStoppedTurnID = nil
+        thinkingExpandedOverride.removeAll()
+        copiedTurnID = nil
         if isRunning { store.stopRun() }
+    }
+
+    /// Copy the answer body to the clipboard and flash a transient "Copied" affordance.
+    private func copyResponse(_ text: String, turnID: UUID) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copiedTurnID = turnID
+        Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if copiedTurnID == turnID { copiedTurnID = nil }
+        }
+    }
+
+    /// Compose the per-turn metrics readout. Returns nil until the turn is finalized (tok/s known),
+    /// so a half-empty line never flashes mid-stream. "cached" is always 0: there is no cross-turn
+    /// prefix cache — the serve loop resets KV state every request — and that is shown honestly.
+    private func statsLine(_ turn: ChatTurn) -> String? {
+        guard let tps = turn.tokensPerSecond else { return nil }
+        var parts: [String] = [String(format: "%.1f tok/s", tps)]
+        if let pt = turn.promptTokens { parts.append("\(pt) in") }
+        parts.append("\(turn.cachedInputTokens) cached")
+        if let rt = turn.reasoningTokens, rt > 0 { parts.append("\(rt) reasoning") }
+        if let rp = turn.responseTokens { parts.append("\(rp) reply") }
+        if let ms = turn.totalMs { parts.append(String(format: "%.1fs total", ms / 1000.0)) }
+        if let label = turn.inferenceLabel { parts.append(label) }
+        return parts.joined(separator: "  ·  ")
     }
 
     /// Build ChatML from completed turns (single-mode history as context).
@@ -836,6 +1342,11 @@ struct ChatScreen: View {
         let topK = Int(store.chatTopKText) ?? 50
         let topP = Double(store.chatTopPText) ?? 0.9
         let repetitionPenalty = Double(store.chatRepPenaltyText) ?? 1.1
+        let reasoningBudget: Int? = {
+            guard store.chatEnableThinking else { return nil }   // only caps when reasoning is on
+            let n = Int(store.chatReasoningBudgetText) ?? 0
+            return n > 0 ? n : nil
+        }()
         let chatMLPrompt = renderChatML(newUserText: rawUserText, enableThinking: store.chatEnableThinking)
         let useGPU = store.chatUseGPU
 
@@ -882,6 +1393,7 @@ struct ChatScreen: View {
         )
 
         var turn = ChatTurn(prompt: rawUserText)
+        turn.modelName = selectedModel?.name
         turn.retryConfig = retryCfg
         turn.inferenceLabel = inferenceLabel
         // Thinking-on prefills an open <think> into the prompt (renderChatML), so a truncated
@@ -906,6 +1418,7 @@ struct ChatScreen: View {
             topK: topK,
             topP: topP,
             repetitionPenalty: repetitionPenalty,
+            reasoningBudget: reasoningBudget,
             useGPU: useGPU
         )
 
@@ -1030,6 +1543,25 @@ struct ChatScreen: View {
 
         if status == .done || wasUserStopped {
             store.chatTurns[idx].tokensPerSecond = run.genTokS
+            store.chatTurns[idx].promptTokens = run.genPromptTokens
+            store.chatTurns[idx].totalMs = run.genTotalMs
+            // Reasoning/response split. Totals are anchored to the engine's exact gen_tokens; the
+            // reasoning portion comes from the app-side count up to the </think> boundary.
+            // When no </think> was generated, prefilledOpenThink disambiguates whether the whole
+            // output was unfinished reasoning (thinking-on, truncated) or a direct answer (off).
+            if run.sawThinkClose {
+                let reasoning = run.genReasoningTokens
+                store.chatTurns[idx].reasoningTokens = reasoning
+                if let total = run.genTokensTotal {
+                    store.chatTurns[idx].responseTokens = max(0, total - reasoning)
+                }
+            } else if store.chatTurns[idx].prefilledOpenThink {
+                store.chatTurns[idx].reasoningTokens = run.genTokensTotal ?? run.genReasoningTokens
+                store.chatTurns[idx].responseTokens = 0
+            } else {
+                store.chatTurns[idx].reasoningTokens = 0
+                store.chatTurns[idx].responseTokens = run.genTokensTotal ?? run.genReasoningTokens
+            }
         }
     }
 
