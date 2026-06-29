@@ -258,6 +258,19 @@ fn check_alloc_capacity(
     Ok(())
 }
 
+/// Returns `true` when at least one logit is strictly greater than
+/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
+///
+/// A grammar engine calls `mask_logits` to set every disallowed position to
+/// `NEG_INFINITY`. If it blocks every token, all logits become `NEG_INFINITY`
+/// and the sampler's non-finite-max short-circuit silently emits token 0 — the
+/// lowest-id token after sorting an all-NEG_INFINITY candidate set by ascending
+/// token_id. That violates the grammar contract. This helper lets the caller
+/// detect and reject the empty-mask case before invoking the sampler (#398).
+fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
+}
+
 /// **Unstable**: text generation entry point for Qwen3 models; the full
 /// generation loop (prefill, decode, sampling) is under active design.
 ///
@@ -347,6 +360,16 @@ pub fn generate(
     // Apply grammar masking on the logit buffer in-place before sampling.
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
         engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+        // If the grammar blocked every token the sampler's non-finite-max
+        // short-circuit would silently return token 0 (the lowest id after
+        // sorting an all-NEG_INFINITY candidate set). Fail closed instead (#398).
+        if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+            return Err(InferenceError::InvalidInput(
+                "grammar constraint blocked every token at step 0; \
+                 no legal first token exists in the current grammar state"
+                    .into(),
+            ));
+        }
     }
 
     // 6. Sample first token from the last position's logits.
@@ -357,21 +380,23 @@ pub fn generate(
     // is already validated allocation-safe by check_alloc_capacity above.
     let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens.min(effective_cap));
     let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
-    generated_ids.push(first_token);
 
-    // Advance grammar state after sampling.
+    // Advance grammar state after sampling. The token is pushed to generated_ids
+    // only after a successful advance so a grammar-rejected token (sampled despite
+    // the mask, e.g. from rounding on a boundary logit) does not appear in the
+    // output (#398).
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
         if !engine.advance(gs, first_token) {
-            let text = tokenizer.decode(&generated_ids).unwrap_or_default();
             return Ok(GenerateOutput {
-                text,
+                text: String::new(),
                 prompt_tokens: prompt_len,
-                generated_tokens: generated_ids.len(),
-                token_ids: generated_ids,
+                generated_tokens: 0,
+                token_ids: vec![],
                 stopped_by_eos: false,
             });
         }
     }
+    generated_ids.push(first_token);
 
     let mut stopped_by_eos = false;
     if config.eos_token_id == Some(first_token) {
@@ -401,6 +426,15 @@ pub fn generate(
             // Apply grammar masking before sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                // Same empty-mask guard as the first-token path: an all-NEG_INFINITY
+                // logit buffer would cause the sampler to silently emit token 0 (#398).
+                if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token; \
+                         no legal continuation exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
@@ -1062,6 +1096,38 @@ pub mod bench_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_finite_logit_detects_all_neg_infinity() {
+        // Regression test for the empty-mask fail-closed guard (#398).
+        //
+        // When a grammar engine blocks every token, all logits become
+        // NEG_INFINITY. Without the guard, the sampler's non-finite-max
+        // short-circuit silently emits token 0 (the lowest id after sorting
+        // an all-NEG_INFINITY candidate set). The guard must detect this and
+        // allow the caller to return a typed error instead.
+        //
+        // Mutation sensitivity: change has_finite_logit to always return true
+        // → the first assertion fails because the guard would pass silently
+        // on an all-blocked logit buffer.
+        assert!(
+            !has_finite_logit(&[f32::NEG_INFINITY; 8]),
+            "all-NEG_INFINITY must fail the guard (empty grammar mask)"
+        );
+        // A single finite logit makes the mask non-empty; the guard passes.
+        let mut mixed = vec![f32::NEG_INFINITY; 4];
+        mixed[2] = 1.0_f32;
+        assert!(
+            has_finite_logit(&mixed),
+            "a single finite logit must pass the guard"
+        );
+        // All-zero is a valid (uniform) distribution; token 0 wins by argmax.
+        assert!(has_finite_logit(&[0.0_f32; 4]));
+        // Positive infinity is still a finite-or-higher winner; not blocked.
+        let mut with_inf = vec![f32::NEG_INFINITY; 4];
+        with_inf[1] = f32::INFINITY;
+        assert!(has_finite_logit(&with_inf));
+    }
 
     #[test]
     fn test_generate_config_default() {

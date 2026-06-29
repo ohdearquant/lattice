@@ -39,6 +39,8 @@ impl Qwen35Model {
             });
         }
 
+        check_grammar_not_set(gen_cfg)?;
+
         // Context preflight. apply_partial_rope indexes the precomputed cos/sin
         // table unchecked, so a position at or past max_context() is an
         // out-of-bounds slice access — a release panic, not a clean error. The
@@ -206,6 +208,8 @@ impl Qwen35Model {
                 stopped: false,
             });
         }
+
+        check_grammar_not_set(gen_cfg)?;
 
         // Context preflight: see generate() for the full rationale and the exact
         // vs. adopted-bound discussion. apply_partial_rope indexes the RoPE table
@@ -665,6 +669,26 @@ pub fn should_stop_token(cfg: &Qwen35Config, gen_cfg: &GenerateConfig, token_id:
     token_id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&token_id)
 }
 
+/// Returns `Err(InvalidInput)` when `gen_cfg.grammar` is set, to prevent the
+/// grammar field from being silently ignored on the Qwen3.5 CPU path (#397).
+///
+/// Grammar masking (`mask_logits` + `advance`) is not yet wired into the
+/// Qwen3.5 generation loop, so honouring a grammar config would require
+/// architectural changes beyond the scope of this fix. Failing closed converts
+/// a silent correctness bug (unconstrained output despite grammar being set)
+/// into a visible, typed error that callers can act on.
+fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+    if gen_cfg.grammar.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "grammar-constrained decoding is not yet supported on the Qwen3.5 CPU \
+             path; use the generic generate() in src/generate.rs, which implements \
+             grammar masking"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +743,47 @@ mod tests {
     fn earliest_stop_match_empty_stops() {
         // No stops configured → None, even for non-empty haystack.
         assert_eq!(earliest_stop_match("hello", &[]), None);
+    }
+
+    #[test]
+    fn grammar_config_is_rejected_not_silently_ignored() {
+        // Regression test for the fail-closed grammar guard (#397).
+        //
+        // Before the fix, generate() and generate_streaming() had no grammar
+        // masking, so a grammar field in GenerateConfig was silently ignored and
+        // the output was unconstrained. check_grammar_not_set must return a typed
+        // Err rather than Ok to prevent that silent failure.
+        //
+        // Mutation sensitivity: change check_grammar_not_set to always return
+        // Ok(()) → result.is_err() fails, catching the regression.
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::sync::Arc;
+
+        let spec = GrammarSpec::Gbnf("root ::= \"t\" | \"f\"\n".to_string());
+        let vocab = vec![b"t".to_vec(), b"f".to_vec()];
+        let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
+
+        let cfg_with_grammar = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = check_grammar_not_set(&cfg_with_grammar);
+        assert!(
+            result.is_err(),
+            "Qwen3.5 CPU path must reject grammar config with a typed error \
+             rather than silently ignoring the grammar field (#397)"
+        );
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "the error variant must be InvalidInput"
+        );
+
+        // A config with no grammar must pass through.
+        assert!(
+            check_grammar_not_set(&GenerateConfig::default()).is_ok(),
+            "grammar = None must not trigger the guard"
+        );
     }
 
     #[test]
