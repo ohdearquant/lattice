@@ -677,7 +677,7 @@ pub fn should_stop_token(cfg: &Qwen35Config, gen_cfg: &GenerateConfig, token_id:
 /// architectural changes beyond the scope of this fix. Failing closed converts
 /// a silent correctness bug (unconstrained output despite grammar being set)
 /// into a visible, typed error that callers can act on.
-fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+pub(crate) fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     if gen_cfg.grammar.is_some() {
         return Err(InferenceError::InvalidInput(
             "grammar-constrained decoding is not yet supported on the Qwen3.5 CPU \
