@@ -217,6 +217,10 @@ Lattice Studio is a native SwiftUI app for macOS 14+. It wraps the Rust engine i
 instrument-panel interface: live loss curves, before/after quantization comparisons,
 LoRA hot-swap in chat, and a model library manager.
 
+> New to the app? [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md) is a step-by-step
+> install, get-a-model, and first-chat guide. The reference below covers building the
+> bundle and what each screen does.
+
 ### Build and package
 
 ```bash
