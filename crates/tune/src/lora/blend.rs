@@ -29,6 +29,13 @@ use crate::error::{Result, TuneError};
 use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
 use std::collections::HashMap;
 
+/// Maximum total rank allowed across all adapters in a single blend.
+///
+/// The GEMV kernels that consume the blended adapter assume a modest rank budget
+/// (≤ ~64 per adapter in a typical mixture).  This cap allows a generous mixture
+/// while bounding allocations and rejecting adversarially large adapter pools.
+pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+
 /// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
 ///
 /// Each adapter in `adapters` contributes to the blended result with its
@@ -134,12 +141,56 @@ fn blend_layer_entries(
         }
     }
 
-    let rank_total: usize = entries.iter().map(|(l, _)| l.rank).sum();
+    // Accumulate rank_total with overflow protection and a hard cap.
+    let mut rank_total: usize = 0;
+    for (layer, _) in entries {
+        rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
+            TuneError::Validation("blend_layer_entries: rank_total overflowed usize".into())
+        })?;
+    }
+    if rank_total > MAX_BLEND_RANK_TOTAL {
+        return Err(TuneError::Validation(format!(
+            "blend_layer_entries: summed rank {rank_total} exceeds \
+             MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
+        )));
+    }
+
+    // Validate source slice lengths before any allocation: a malformed adapter
+    // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+    for (idx, (layer, _)) in entries.iter().enumerate() {
+        let expected_a = layer.rank * d_in;
+        let expected_b = d_out * layer.rank;
+        if layer.a.len() != expected_a {
+            return Err(TuneError::Validation(format!(
+                "blend_layer_entries: entry {idx} A slice length {} \
+                 does not match rank*d_in={}*{}={expected_a}",
+                layer.a.len(),
+                layer.rank,
+                d_in,
+            )));
+        }
+        if layer.b.len() != expected_b {
+            return Err(TuneError::Validation(format!(
+                "blend_layer_entries: entry {idx} B slice length {} \
+                 does not match d_out*rank={}*{}={expected_b}",
+                layer.b.len(),
+                d_out,
+                layer.rank,
+            )));
+        }
+    }
+
+    let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
+        TuneError::Validation("blend_layer_entries: rank_total * d_in overflowed usize".into())
+    })?;
+    let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
+        TuneError::Validation("blend_layer_entries: d_out * rank_total overflowed usize".into())
+    })?;
 
     // A_blend: vertical stack of A blocks.
     // Layout: rows [0..r_1] from adapter 1, then [r_1..r_1+r_2] from adapter 2, …
     // Each row has `d_in` elements.
-    let mut a_blend = Vec::with_capacity(rank_total * d_in);
+    let mut a_blend = Vec::with_capacity(a_buf_len);
     for (layer, _) in entries {
         a_blend.extend_from_slice(&layer.a);
     }
@@ -148,7 +199,7 @@ fn blend_layer_entries(
     // B is stored row-major (d_out × rank), so row r is `b[r*rank..(r+1)*rank]`.
     // After blending, row r of B_blend is:
     //   [eff_1 * B_1[r, :] | eff_2 * B_2[r, :] | …]
-    let mut b_blend = vec![0.0f32; d_out * rank_total];
+    let mut b_blend = vec![0.0f32; b_buf_len];
     let mut col_offset = 0usize;
     for (layer, eff_weight) in entries {
         let r_e = layer.rank;
@@ -356,6 +407,184 @@ mod tests {
         let adapter = make_adapter(1, 4, 4, 0.0);
         let result = blend_lora_adapters(&[(&adapter, f32::NAN)]);
         assert!(result.is_err(), "NaN weight should return an error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4a: summed rank exceeding MAX_BLEND_RANK_TOTAL returns an error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_rank_exceeds_cap_returns_error() {
+        use super::MAX_BLEND_RANK_TOTAL;
+        // rank = cap + 1; d_in=1, d_out=1 → A and B are tiny (~32 KB total).
+        let rank = MAX_BLEND_RANK_TOTAL + 1;
+        let d_in = 1;
+        let d_out = 1;
+        let a: Vec<f32> = vec![0.1f32; rank * d_in];
+        let b: Vec<f32> = vec![0.1f32; d_out * rank];
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a,
+                b,
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+        let result = blend_lora_adapters(&[(&adapter, 1.0)]);
+        assert!(
+            result.is_err(),
+            "summed rank exceeding cap must return an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4b: mismatched A slice length returns an error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_mismatched_a_length_returns_error() {
+        let rank = 2;
+        let d_in = 4;
+        let d_out = 4;
+        // A is one element short of the required rank * d_in.
+        let a: Vec<f32> = vec![0.0f32; rank * d_in - 1];
+        let b: Vec<f32> = vec![0.0f32; d_out * rank];
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a,
+                b,
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+        let result = blend_lora_adapters(&[(&adapter, 1.0)]);
+        assert!(
+            result.is_err(),
+            "mismatched A slice length must return an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 4c: mismatched B slice length returns an error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_mismatched_b_length_returns_error() {
+        let rank = 2;
+        let d_in = 4;
+        let d_out = 4;
+        let a: Vec<f32> = vec![0.0f32; rank * d_in];
+        // B is one element short of the required d_out * rank.
+        let b: Vec<f32> = vec![0.0f32; d_out * rank - 1];
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a,
+                b,
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+        let result = blend_lora_adapters(&[(&adapter, 1.0)]);
+        assert!(
+            result.is_err(),
+            "mismatched B slice length must return an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 5: alpha != rank causes scale() to be folded exactly once into B.
+    //
+    // With alpha=4, rank=2 → scale=2.0.  Blending a single adapter at
+    // mixture weight w should produce: w * scale * B @ (A @ x).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_folds_alpha_rank_scale_once() {
+        let rank = 2usize;
+        let alpha = 4.0f32; // scale = 4.0 / 2 = 2.0
+        let d_in = 3usize;
+        let d_out = 3usize;
+        let w = 0.5f32;
+
+        let a: Vec<f32> = (0..rank * d_in).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let b: Vec<f32> = (0..d_out * rank).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a: a.clone(),
+                b: b.clone(),
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha,
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        );
+
+        let blended = blend_lora_adapters(&[(&adapter, w)]).unwrap();
+        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+
+        let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32).collect();
+        let scale = alpha / rank as f32; // = 2.0
+
+        // Reference: w * scale * B @ (A @ x) — scale folded exactly once.
+        let mut inter = vec![0.0f32; rank];
+        for r in 0..rank {
+            inter[r] = (0..d_in).map(|c| a[r * d_in + c] * x[c]).sum();
+        }
+        let expected: Vec<f32> = (0..d_out)
+            .map(|row| w * scale * (0..rank).map(|c| b[row * rank + c] * inter[c]).sum::<f32>())
+            .collect();
+
+        // Blended adapter has alpha=rank_total so scale()=1.0; use layer_delta directly.
+        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+
+        let max_diff = expected
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-6,
+            "alpha/rank scale must be folded exactly once; max-diff={max_diff}"
+        );
     }
 
     // -----------------------------------------------------------------------

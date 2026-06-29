@@ -9,9 +9,9 @@
 //! on the CPU (see `crates/tune/src/lora/blend.rs`) and loaded into the Metal
 //! path through the existing single-slot adapter API.
 //!
-//! Mixture weights in PR1 are constant `1/k` (top-k uniform).  The gate network
-//! output is used only to rank adapters; the weights themselves are not learned
-//! until PR3.
+//! Mixture weights in this implementation are constant `1/k` (top-k uniform).
+//! The gate network output is used only to rank adapters; the weights themselves
+//! are fixed at selection time and are not learned.
 
 use lattice_fann::{FannError, Network};
 
@@ -67,6 +67,16 @@ pub enum RouterError {
         /// Usable count: `min(available.len(), gate.num_outputs())`
         usable: usize,
     },
+
+    /// The `available` set contains a repeated adapter ID.
+    ///
+    /// Duplicate IDs would cause one adapter to be selected and weighted twice,
+    /// silently doubling its contribution.  The router rejects this to fail closed.
+    #[error("duplicate adapter id in available set: {id}")]
+    DuplicateAdapterId {
+        /// The repeated adapter ID
+        id: String,
+    },
 }
 
 /// Routes a context vector to a top-k subset of available adapters with
@@ -77,9 +87,10 @@ pub enum RouterError {
 ///
 /// # Mixture weight semantics
 ///
-/// Weights are constant `1/k` in PR1 (ReMix constant-weight constraint).
-/// The gate network trains in PR3; until then scores are random initialisation
-/// and only the rank ordering matters.
+/// Weights are constant and uniform (`1/k`).  A learnable-softmax router can
+/// collapse to effectively one adapter under sparse, noisy reward, so the
+/// weights are fixed and only the selector is learned.  Gate scores are random
+/// at initialisation; only the rank ordering matters.
 pub struct AdapterRouter {
     gate: Network,
 }
@@ -133,6 +144,16 @@ impl AdapterRouter {
                 available: available.len(),
             });
         }
+
+        // Reject duplicate IDs before running the gate: a duplicate would cause
+        // one adapter to be selected and weighted twice (fail-open).
+        let mut seen = std::collections::HashSet::new();
+        for id in available {
+            if !seen.insert(id.as_str()) {
+                return Err(RouterError::DuplicateAdapterId { id: id.clone() });
+            }
+        }
+
         let expected_input = self.gate.num_inputs();
         if context_vector.len() != expected_input {
             return Err(RouterError::InputSizeMismatch {
@@ -267,6 +288,20 @@ mod tests {
         assert!(
             matches!(result, Err(RouterError::GateTooNarrow { k: 4, usable: 3 })),
             "expected GateTooNarrow {{k:4, usable:3}}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn route_duplicate_adapter_ids_returns_err() {
+        // available contains "same" twice; k=2 would select it twice (fail-open).
+        // The router must reject this with DuplicateAdapterId before running the gate.
+        let mut router = make_router(2, 3);
+        let available: Vec<AdapterId> = vec!["same".into(), "same".into(), "other".into()];
+        let ctx = vec![1.0f32; 2];
+        let result = router.route(&ctx, &available, 2);
+        assert!(
+            matches!(result, Err(RouterError::DuplicateAdapterId { .. })),
+            "duplicate adapter id should return DuplicateAdapterId error, got {result:?}"
         );
     }
 }

@@ -4252,6 +4252,13 @@ kernel void gdn_chunk_norm_silu_c32(
         pub d_out: usize,
     }
 
+    /// Maximum total rank allowed across all adapters in a single blend.
+    ///
+    /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
+    /// typical mixture).  This cap bounds allocations and rejects adversarially large
+    /// adapter pools before `Vec::with_capacity`.
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+
     /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
     /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
     ///
@@ -4324,17 +4331,68 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
             }
 
-            let rank_total: usize = entries.iter().map(|(l, _)| l.rank).sum();
+            // Accumulate rank_total with overflow protection and a hard cap
+            // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
+            let mut rank_total: usize = 0;
+            for (layer, _) in &entries {
+                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "blend_lora_layer_data: rank_total overflowed usize".into(),
+                    )
+                })?;
+            }
+            if rank_total > MAX_BLEND_RANK_TOTAL {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
+                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
+                )));
+            }
+
+            // Validate source slice lengths before any allocation: a malformed adapter
+            // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                let expected_a = entry.rank * d_in;
+                let expected_b = d_out * entry.rank;
+                if entry.a.len() != expected_a {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} A slice length {} \
+                         does not match rank*d_in={}*{}={expected_a}",
+                        entry.a.len(),
+                        entry.rank,
+                        d_in,
+                    )));
+                }
+                if entry.b.len() != expected_b {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: entry {idx} B slice length {} \
+                         does not match d_out*rank={}*{}={expected_b}",
+                        entry.b.len(),
+                        d_out,
+                        entry.rank,
+                    )));
+                }
+            }
+
+            let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: rank_total * d_in overflowed usize".into(),
+                )
+            })?;
+            let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "blend_lora_layer_data: d_out * rank_total overflowed usize".into(),
+                )
+            })?;
 
             // A_blend: vertical stack of A matrices.
-            let mut a_blend: Vec<f32> = Vec::with_capacity(rank_total * d_in);
+            let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
             for (layer, _) in &entries {
                 a_blend.extend_from_slice(&layer.a);
             }
 
             // B_blend: horizontal concat of weight-scaled B column blocks.
             // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
-            let mut b_blend = vec![0.0f32; d_out * rank_total];
+            let mut b_blend = vec![0.0f32; b_buf_len];
             let mut col_offset = 0usize;
             for (layer, eff_weight) in &entries {
                 let r_e = layer.rank;
@@ -5985,8 +6043,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// # Arguments
         ///
         /// * `adapter_weights` — slices of `(Vec<LoraLayerData>, mixture_weight)`.
-        ///   Each element is one adapter's layer data paired with its weight `w_e`.
-        ///   The effective contribution of adapter `e` is `w_e * (alpha_e / rank_e)`.
+        ///   Each element is one adapter's layer data paired with its effective weight
+        ///   `w_e`.  `mixture_weight` IS the fully pre-scaled effective weight: the
+        ///   caller must fold any `alpha / rank` scaling (and the mixture fraction)
+        ///   into it before calling this function.  `blend_lora_layer_data` folds
+        ///   `w_e` directly into the B column blocks and loads the result with
+        ///   `scale = 1.0`; passing a raw mixture fraction without the `alpha/rank`
+        ///   factor will produce under-scaled output.
         /// * `prompt` — prompt text, tokenised internally.
         /// * `tokenizer` — BPE tokeniser.
         /// * `gen_cfg` — generation configuration.
@@ -19940,6 +20003,82 @@ kernel void decode_attention_reference(
             assert!(
                 max_err < 1e-5,
                 "blended delta diverges from reference sum: max_abs_diff={max_err}"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Fix 4a: summed rank exceeding MAX_BLEND_RANK_TOTAL returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_rank_exceeds_cap_returns_error() {
+            let d_in = 1usize;
+            let d_out = 1usize;
+            // rank = cap + 1; A and B are tiny (~32 KB total).
+            let rank = MAX_BLEND_RANK_TOTAL + 1;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.1f32; rank * d_in],
+                b: vec![0.1f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "summed rank exceeding cap must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Fix 4b: A slice with wrong length returns Err (fail-closed on
+        // malformed input before any allocation).
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_a_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                // A is one element short of rank * d_in.
+                a: vec![0.0f32; rank * d_in - 1],
+                b: vec![0.0f32; d_out * rank],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched A slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // Fix 4c: B slice with wrong length returns Err.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_mismatched_b_length_returns_error() {
+            let d_in = 4usize;
+            let d_out = 4usize;
+            let rank = 2usize;
+            let layer = LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![0.0f32; rank * d_in],
+                // B is one element short of d_out * rank.
+                b: vec![0.0f32; d_out * rank - 1],
+                rank,
+                d_in,
+                d_out,
+            };
+            let result = blend_lora_layer_data(&[(&[layer], 1.0)]);
+            assert!(
+                result.is_err(),
+                "mismatched B slice length must return an error"
             );
         }
     }
