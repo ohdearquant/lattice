@@ -37,6 +37,10 @@ pub use weights::ModelWeights;
 
 pub(crate) use cache::{ForwardScratch, KvCache, resize};
 pub(crate) use detokenize::decode_tokens;
+// Re-exported so that quantized CPU generate helpers (cpu_q8, cpu_f16,
+// neon_forward) can share the same typed grammar-not-set guard without
+// duplicating the predicate or the error message (#397/#398).
+pub(crate) use generation::check_grammar_not_set;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{
@@ -49,8 +53,9 @@ pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert
 
 #[cfg(test)]
 pub use detokenize::bytes_to_unicode;
-#[cfg(test)]
-pub use generation::should_stop_token;
+// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward, batch_prefill)
+// and by tests. `pub(crate)` keeps it out of the public API surface.
+pub(crate) use generation::should_stop_token;
 
 /// Exposed for consumers that need to drive a per-layer coverage check
 /// over a Qwen3.5 checkpoint without going through the model loader —

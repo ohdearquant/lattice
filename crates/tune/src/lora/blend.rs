@@ -467,7 +467,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix 4a: summed rank exceeding MAX_BLEND_RANK_TOTAL returns an error.
+    // Summed rank exceeding MAX_BLEND_RANK_TOTAL returns an error.
     // -----------------------------------------------------------------------
     #[test]
     fn blend_rank_exceeds_cap_returns_error() {
@@ -505,7 +505,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix 4b: mismatched A slice length returns an error.
+    // Mismatched A slice length returns an error.
     // -----------------------------------------------------------------------
     #[test]
     fn blend_mismatched_a_length_returns_error() {
@@ -542,7 +542,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix 4c: mismatched B slice length returns an error.
+    // Mismatched B slice length returns an error.
     // -----------------------------------------------------------------------
     #[test]
     fn blend_mismatched_b_length_returns_error() {
@@ -579,7 +579,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fix 5: alpha != rank causes scale() to be folded exactly once into B.
+    // alpha != rank causes scale() to be folded exactly once into B.
     //
     // With alpha=4, rank=2 → scale=2.0.  Blending a single adapter at
     // mixture weight w should produce: w * scale * B @ (A @ x).

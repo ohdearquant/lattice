@@ -654,7 +654,11 @@ impl<'a> MtpVerifier<'a> {
             config.head_dim,
             max_seq_len,
         );
-        let cache = crate::kv_cache::flat::FlatKVCache::new(cache_cfg);
+        // try_new re-validates all dimension products at the allocation boundary.
+        // The checked_dim calls above provide an upstream guard; try_new ensures
+        // no unchecked product reaches Vec::with_capacity even if a future
+        // refactor removes or reorders those guards.
+        let cache = crate::kv_cache::flat::FlatKVCache::try_new(cache_cfg)?;
         let scratch = MtpScratch::new(&config, max_seq_len);
 
         Ok(Self {
