@@ -25,8 +25,8 @@ use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
-    FullAttentionLayerWeights, KvCache, Qwen35Model, decode_tokens, qwen35_rms_norm, resize,
-    sample_token, should_stop_token,
+    FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, decode_tokens,
+    qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::tokenizer::common::Tokenizer;
@@ -372,6 +372,11 @@ impl Qwen35Model {
         if prompt_len == 0 {
             return Err(InferenceError::Inference("empty prompt".into()));
         }
+
+        // Grammar-constrained decoding is not wired into the batch-prefill path; reject
+        // grammar configs before any sampling to avoid silently producing unconstrained
+        // output when a caller sets gen_cfg.grammar (#397/#398).
+        check_grammar_not_set(gen_cfg)?;
 
         // Initialize states.
         let num_linear = cfg.num_linear_attention_layers();
@@ -1902,5 +1907,42 @@ mod tests {
   }
 }"#;
         BpeTokenizer::from_tokenizer_json_str(json).expect("test tokenizer parses")
+    }
+
+    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets `grammar`
+    /// with a typed `InvalidInput` error before sampling any token (#397/#398).
+    ///
+    /// Before the fix, grammar was silently ignored and unconstrained output was produced.
+    /// The guard fires before any weight access or state allocation, so a real (tiny) model
+    /// with valid weights is sufficient — the guard short-circuits before the prefill call.
+    ///
+    /// Mutation sensitivity: removing `check_grammar_not_set` causes the function to proceed
+    /// through the full prefill + decode path with the tiny weights, returning `Ok(...)`.
+    /// The `matches!(result, Err(InferenceError::InvalidInput(_)))` assert then fails.
+    #[test]
+    fn generate_with_batch_prefill_rejects_grammar_config_before_sampling() {
+        use crate::error::InferenceError;
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::sync::Arc;
+
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
+
+        let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
+        let grammar_vocab = vec![b"a".to_vec(), b"b".to_vec()];
+        let engine =
+            GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+
+        let gen_cfg = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_with_batch_prefill must fail closed with InvalidInput when grammar is \
+             set (#397/#398); got {result:?}"
+        );
     }
 }

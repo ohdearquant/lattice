@@ -6643,8 +6643,12 @@ kernel void gdn_chunk_norm_silu_c32(
                         enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                         enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                         enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                        // Grid axis = num_kv_heads: the kernel maps gid → kvh and handles
+                        // each GQA group of Q heads internally per threadgroup. Dispatching
+                        // nqh wastes (nqh - nkh) threadgroups that the kernel's early-return
+                        // guard discards; output is bit-identical but scheduling is nkh-sized.
                         enc.dispatch_thread_groups(
-                            MTLSize::new(nqh as u64, 1, 1),
+                            MTLSize::new(nkh as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
 
@@ -8485,8 +8489,10 @@ kernel void gdn_chunk_norm_silu_c32(
                                 enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                                 enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                                 enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                                // Grid axis = num_kv_heads: see fallback site above for
+                                // the invariant. Same kernel, same geometry requirement.
                                 enc.dispatch_thread_groups(
-                                    MTLSize::new(nqh as u64, 1, 1),
+                                    MTLSize::new(nkh as u64, 1, 1),
                                     MTLSize::new(256, 1, 1),
                                 );
                             }
@@ -9518,6 +9524,10 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
+
+            // Reject grammar configs before any GPU work: grammar-constrained decoding
+            // is not wired into the multimodal path.
+            super::multimodal_generate_preflight(gen_cfg)?;
 
             // Validate multimodal input
             input.validate().map_err(|e| {
@@ -19733,6 +19743,76 @@ kernel void decode_attention_reference(
             let result = quantize_row_q8_0(&vals);
             assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-free preflight helpers for the multimodal generation path.
+//
+// These functions live at module level (no cfg gate) so they compile and are
+// testable on every platform without Metal GPU hardware.
+// ---------------------------------------------------------------------------
+
+/// Validates `gen_cfg` for the multimodal generation path before any Metal
+/// device or GPU work is initiated.
+///
+/// Grammar-constrained decoding is not wired into the multimodal forward
+/// pass; this function converts a silent correctness failure (unconstrained
+/// output despite `gen_cfg.grammar` being set) into a typed `InvalidInput`
+/// error that callers can act on.
+///
+/// Compiled when Metal-GPU is enabled (the production caller lives inside
+/// `mod inner`) or during test builds so that the module-level test can
+/// exercise the guard logic on any platform without GPU hardware.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn multimodal_generate_preflight(
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+) -> Result<(), crate::error::InferenceError> {
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)
+}
+
+#[cfg(test)]
+mod multimodal_preflight_tests {
+    use super::multimodal_generate_preflight;
+    use crate::error::InferenceError;
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+    use crate::model::qwen35_config::GenerateConfig;
+    use std::sync::Arc;
+
+    /// Grammar-constrained decoding is not wired into the multimodal path; the
+    /// preflight must reject a config with `grammar` set.
+    ///
+    /// This test drives `multimodal_generate_preflight` — the exact function that
+    /// `generate_multimodal` calls as its first action — so mutating the guard
+    /// logic in that function directly fails this test.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_grammar_guard_rejects_grammar_config() {
+        let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
+        let vocab = vec![b"a".to_vec(), b"b".to_vec()];
+        let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
+
+        let cfg_with_grammar = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_grammar);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when grammar is set; got {result:?}"
+        );
+    }
+
+    /// A config with `grammar` unset must pass through the preflight without error.
+    #[test]
+    fn generate_multimodal_grammar_guard_allows_no_grammar() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "grammar = None must not trigger the preflight guard"
+        );
     }
 }
 

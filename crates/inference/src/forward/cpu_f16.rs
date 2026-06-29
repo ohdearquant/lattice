@@ -865,6 +865,12 @@ pub fn generate_f16(
         ));
     }
 
+    // Reject grammar configs before allocating any state. Grammar masking
+    // (`mask_logits` + `advance`) is not wired into this generate loop; without
+    // the guard the grammar field would be silently ignored, producing
+    // unconstrained output despite a grammar being set (#397/#398).
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+
     // Initialize states
     let num_linear = cfg.num_linear_attention_layers();
     let num_full = cfg.num_full_attention_layers();
@@ -1638,6 +1644,59 @@ mod tests {
         assert!(
             out.stopped,
             "generate_f16 must set stopped=true when the decode-loop stop fires"
+        );
+    }
+
+    /// `generate_f16` must reject a `GenerateConfig` that sets `grammar` with a
+    /// typed `InvalidInput` error before sampling any token (#397/#398).
+    ///
+    /// Before the fix, grammar was silently ignored and unconstrained output was
+    /// produced. The guard fires before any weight dereference or state allocation,
+    /// so empty weight vecs are sufficient.
+    ///
+    /// Mutation sensitivity: removing the `check_grammar_not_set` call makes the
+    /// function proceed past the guard and attempt to forward with empty weights,
+    /// producing a panic or a non-`InvalidInput` error — this assert fails either way.
+    #[test]
+    fn generate_f16_rejects_grammar_config_before_sampling() {
+        use crate::error::InferenceError;
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = F16ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let spec = GrammarSpec::Gbnf("root ::= \"t\" | \"f\"\n".to_string());
+        let grammar_vocab = vec![b"t".to_vec(), b"f".to_vec()];
+        let engine =
+            GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+
+        let gen_cfg = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = generate_f16(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_f16 must fail closed with InvalidInput when grammar is set (#397/#398); \
+             got {result:?}"
         );
     }
 }

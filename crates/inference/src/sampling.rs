@@ -91,8 +91,16 @@ impl CandidateSet {
     }
 
     /// Return the token_id of the candidate with the highest logit.
+    ///
+    /// On an all-masked compact set every logit is `f32::NEG_INFINITY`, so the
+    /// comparison loop never updates `best_id`.  The initializer must therefore
+    /// be the first candidate's `token_id` rather than the bare sentinel `0`:
+    /// after grammar or top-k compaction, token id 0 is not guaranteed to be a
+    /// member of the set, and returning it would silently emit an out-of-set
+    /// token.  `unwrap_or(0)` is safe only as a last resort for an empty set
+    /// (the full-vocab path always contains at least one candidate).
     pub fn argmax(&self) -> u32 {
-        let mut best_id = 0u32;
+        let mut best_id = self.candidates.first().map(|c| c.token_id).unwrap_or(0);
         let mut best_val = f32::NEG_INFINITY;
         for c in &self.candidates {
             if c.logit > best_val {
@@ -1139,6 +1147,35 @@ mod tests {
         let logits = vec![f32::NEG_INFINITY; 8];
         assert_eq!(argmax_f32_scalar(&logits), 0, "scalar neg-inf");
         assert_eq!(argmax_f32(&logits), 0, "dispatch neg-inf");
+    }
+
+    // ── CandidateSet::argmax correctness ─────────────────────────────────────
+
+    #[test]
+    fn test_candidateset_argmax_all_masked_returns_first_in_set_token() {
+        // After grammar or top-k masking every logit in a compacted CandidateSet
+        // can be NEG_INFINITY (the full vocabulary was masked except for these
+        // candidates, whose own scores are also suppressed).  When that happens
+        // the comparison loop never fires, so argmax must return the *first
+        // candidate's token_id* — an in-set token — not the bare sentinel 0.
+        // Token ids 7 and 9 are deliberately chosen to be non-zero; if the
+        // initializer regresses to `0u32` this test returns 0 instead of 7 and
+        // fails, catching the regression.
+        let cs = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 7,
+                logit: f32::NEG_INFINITY,
+            },
+            Candidate {
+                token_id: 9,
+                logit: f32::NEG_INFINITY,
+            },
+        ]);
+        assert_eq!(
+            cs.argmax(),
+            7,
+            "all-masked compact set must return first in-set token id"
+        );
     }
 
     #[test]
