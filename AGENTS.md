@@ -92,7 +92,7 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-inference (104K)  fann (6.5K)  transport (5.4K)   ← leaf, zero internal deps
+inference (~112K)  fann (6.5K)  transport (5.4K)   ← leaf, zero internal deps
     |                |
   embed (12K)    tune (15.6K)                     ← depend on leaves only
 ```
