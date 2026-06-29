@@ -37,6 +37,10 @@ pub use weights::ModelWeights;
 
 pub(crate) use cache::{ForwardScratch, KvCache, resize};
 pub(crate) use detokenize::decode_tokens;
+// Re-exported so that quantized CPU generate helpers (cpu_q8, cpu_f16,
+// neon_forward) can share the same typed grammar-not-set guard without
+// duplicating the predicate or the error message (#397/#398).
+pub(crate) use generation::check_grammar_not_set;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

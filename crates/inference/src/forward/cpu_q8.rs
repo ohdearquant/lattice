@@ -676,6 +676,12 @@ pub fn generate_q8(
         ));
     }
 
+    // Reject grammar configs before allocating any state. Grammar masking
+    // (`mask_logits` + `advance`) is not wired into this generate loop; without
+    // the guard the grammar field would be silently ignored, producing
+    // unconstrained output despite a grammar being set (#397/#398).
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+
     // Context preflight. The RoPE cos/sin tables are indexed unchecked in
     // full_attention_step_q8 (`rope.cos_at(position * half + i)`), so a position
     // at or past the table capacity is an out-of-bounds slice access — a release
@@ -1289,6 +1295,59 @@ mod tests {
         assert!(
             msg.contains("context window"),
             "error must name the context window; got: {msg}"
+        );
+    }
+
+    /// `generate_q8` must reject a `GenerateConfig` that sets `grammar` with a
+    /// typed `InvalidInput` error before sampling any token (#397/#398).
+    ///
+    /// Before the fix, grammar was silently ignored and unconstrained output was
+    /// produced. The guard now fires before any weight dereference or state
+    /// allocation, so empty weight vecs are sufficient.
+    ///
+    /// Mutation sensitivity: removing the `check_grammar_not_set` call makes the
+    /// function proceed past the guard and attempt to forward with empty weights,
+    /// producing a panic or a non-`InvalidInput` error — this assert fails either way.
+    #[test]
+    fn generate_q8_rejects_grammar_config_before_sampling() {
+        use crate::error::InferenceError;
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = Q8ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let spec = GrammarSpec::Gbnf("root ::= \"t\" | \"f\"\n".to_string());
+        let grammar_vocab = vec![b"t".to_vec(), b"f".to_vec()];
+        let engine =
+            GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+
+        let gen_cfg = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = generate_q8(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_q8 must fail closed with InvalidInput when grammar is set (#397/#398); \
+             got {result:?}"
         );
     }
 }
