@@ -261,8 +261,22 @@ impl Qwen35Model {
     /// Returns `(cos, sin)`, each `[seq_len * rope_dim/2]` row-major with layout
     /// `table[pos * half + i]`, matching `gqa_forward_with_cache`'s expectation
     /// and the real model's `apply_partial_rope` indexing (`cos_at(pos*half+i)`).
+    ///
+    /// Errors if `seq_len > self.max_context()`. The precomputed RoPE table only
+    /// covers positions `0..max_context()`; without this guard the `cos_at`/`sin_at`
+    /// calls inside the loop would panic on an out-of-range slice index.
     #[cfg(feature = "train-backward")]
-    pub fn rope_cos_sin_tables(&self, seq_len: usize) -> (Vec<f32>, Vec<f32>) {
+    pub fn rope_cos_sin_tables(
+        &self,
+        seq_len: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), InferenceError> {
+        let max_context = self.max_context();
+        if seq_len > max_context {
+            return Err(InferenceError::Inference(format!(
+                "rope_cos_sin_tables: seq_len ({seq_len}) exceeds RoPE table capacity \
+                 ({max_context}); load the model with a larger context table",
+            )));
+        }
         let half = self.config.rope_dim() / 2;
         let mut cos_t = Vec::with_capacity(seq_len * half);
         let mut sin_t = Vec::with_capacity(seq_len * half);
@@ -272,7 +286,7 @@ impl Qwen35Model {
                 sin_t.push(self.rope.sin_at(pos * half + i));
             }
         }
-        (cos_t, sin_t)
+        Ok((cos_t, sin_t))
     }
 
     /// **Unstable**: compute strided sliding-window perplexity over `tokens`.
@@ -1008,5 +1022,93 @@ mod tests {
             msg.contains("RoPE") && msg.contains(&format!("{max_context}")),
             "error must mention the RoPE capacity; got: {msg}"
         );
+    }
+
+    // ── Issue #403 preflight regression tests ──────────────────────────────────
+    //
+    // Mutation contract: each test below MUST FAIL when its corresponding guard is
+    // removed (i.e. when the `if prompt_ids.len() > max_context` / `if seq_len >
+    // max_context` branch is deleted). Reverting that guard leaves the underlying
+    // `forward_step` / `cos_at` / `sin_at` calls able to index the RoPE table out
+    // of range, which panics in release — the test would then panic instead of
+    // asserting `is_err()`.
+
+    #[test]
+    fn forward_prompt_debug_rejects_over_capacity_prompt() {
+        // Mutation contract: removing the `if prompt_ids.len() > max_context` guard
+        // in debug.rs causes this test to panic (out-of-bounds RoPE index) instead
+        // of asserting the Err variant. The panic changes the test result from PASS
+        // to FAIL (with a panic message, not an assertion failure).
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xD3B0_6403);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xD3B0_6403);
+        // One token past the RoPE table boundary.
+        let prompt_ids: Vec<u32> = (1u32..=4).cycle().take(max_context + 1).collect();
+        let err = model
+            .forward_prompt_debug(&prompt_ids)
+            .expect_err("prompt_ids.len() > max_context must return Err, not panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("RoPE table capacity") && msg.contains(&format!("{max_context}")),
+            "error must name the RoPE table capacity limit; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn forward_prompt_debug_rejects_empty_prompt() {
+        let cfg = test_config();
+        let model = build_model(cfg, 0xE850_0403);
+        let err = model
+            .forward_prompt_debug(&[])
+            .expect_err("empty prompt_ids must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty"),
+            "error message must mention empty; got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "train-backward")]
+    #[test]
+    fn rope_cos_sin_tables_rejects_over_capacity_seq_len() {
+        // Mutation contract: removing the `if seq_len > max_context` guard in the
+        // `rope_cos_sin_tables` body causes this test to panic (out-of-bounds slice
+        // index inside the `cos_at`/`sin_at` loop) instead of asserting the Err
+        // variant. The panic changes the test result from PASS to FAIL.
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xC0FE_0403);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xC0FE_0403);
+        let err = model
+            .rope_cos_sin_tables(max_context + 1)
+            .expect_err("seq_len > max_context must return Err, not panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("RoPE table capacity") && msg.contains(&format!("{max_context}")),
+            "error must name the RoPE table capacity limit; got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "train-backward")]
+    #[test]
+    fn rope_cos_sin_tables_accepts_exact_capacity() {
+        // Exactly at the boundary must succeed (seq_len == max_context is valid).
+        let cfg = test_config();
+        let max_context = {
+            let model = build_model(cfg.clone(), 0xC0FE_1403);
+            model.max_context()
+        };
+        let model = build_model(cfg, 0xC0FE_1403);
+        let result = model.rope_cos_sin_tables(max_context);
+        assert!(result.is_ok(), "seq_len == max_context must succeed");
+        let (cos, sin) = result.unwrap();
+        let half = model.config.rope_dim() / 2;
+        assert_eq!(cos.len(), max_context * half);
+        assert_eq!(sin.len(), max_context * half);
     }
 }

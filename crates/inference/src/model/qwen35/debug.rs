@@ -4,6 +4,7 @@ use super::norm::qwen35_rms_norm;
 use super::weights::{AttentionWeights, FeedForwardWeights};
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
+use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
 
 impl Qwen35Model {
@@ -143,8 +144,26 @@ impl Qwen35Model {
     }
 
     /// **Unstable**: debug prompt forward pass returning final logits.
-    pub fn forward_prompt_debug(&self, prompt_ids: &[u32]) -> Vec<f32> {
+    ///
+    /// Errors if `prompt_ids` is empty or if `prompt_ids.len() > self.max_context()`.
+    /// The precomputed RoPE table only covers positions `0..max_context()`; without
+    /// this guard a long prompt would panic on an out-of-range slice index.
+    pub fn forward_prompt_debug(&self, prompt_ids: &[u32]) -> Result<Vec<f32>, InferenceError> {
         let cfg = &self.config;
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::Inference(
+                "forward_prompt_debug: prompt_ids must not be empty".into(),
+            ));
+        }
+        let max_context = self.max_context();
+        if prompt_ids.len() > max_context {
+            return Err(InferenceError::Inference(format!(
+                "forward_prompt_debug: prompt_ids.len() ({}) exceeds RoPE table capacity ({}); \
+                 load the model with a larger context table or use a shorter prompt",
+                prompt_ids.len(),
+                max_context,
+            )));
+        }
         let _hidden = cfg.hidden_size;
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
@@ -160,7 +179,7 @@ impl Qwen35Model {
                 kv_cache.seq_len += 1;
             }
         }
-        scratch.logits[..cfg.vocab_size].to_vec()
+        Ok(scratch.logits[..cfg.vocab_size].to_vec())
     }
 }
 

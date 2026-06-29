@@ -70,7 +70,9 @@ fn main() {
         }
     }
 
-    let (cos, sin) = model.rope_cos_sin_tables(seq_len);
+    let (cos, sin) = model
+        .rope_cos_sin_tables(seq_len)
+        .unwrap_or_else(|e| panic!("rope_cos_sin_tables: {e}"));
 
     let (mat_out, _cache) = gqa_forward_with_cache(
         &normed,

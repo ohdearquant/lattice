@@ -519,7 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for s in &train_samples {
         let (h_in, _real_out) = model.capture_attn_io(&s.tokens, LAYER)?;
         let seq_len = s.tokens.len();
-        let (cos, sin) = model.rope_cos_sin_tables(seq_len);
+        let (cos, sin) = model.rope_cos_sin_tables(seq_len)?;
         let n_comp = seq_len - s.completion_start;
         total_positions += n_comp;
         caches.push(L23Cache {
