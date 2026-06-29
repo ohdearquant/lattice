@@ -50,12 +50,19 @@ pub struct Q8Matrix {
 /// - `scale[i] = max(abs(row)) / 127.0`
 /// - if the row is all zeros, `scale[i] = 1.0`
 /// - `q[i, j] = clamp(round(w[i, j] / scale[i]), -128, 127)`
-pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Q8Matrix {
-    assert_eq!(
-        w.len(),
-        rows * cols,
-        "matrix length does not match rows * cols"
-    );
+///
+/// Returns `Err(InvalidInput)` if any source row contains `NaN` or `±inf`.
+/// A non-finite source value produces a non-finite scale (`inf / 127 = inf`),
+/// which then turns every matmul output for that output channel into `NaN`
+/// (`0 * inf`). Rejecting here attributes the error to the bad source weight
+/// rather than to a downstream numerical guard.
+pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, InferenceError> {
+    if w.len() != rows * cols {
+        return Err(InferenceError::InvalidInput(format!(
+            "matrix length {} does not match rows({rows}) * cols({cols})",
+            w.len()
+        )));
+    }
 
     let mut data = Vec::with_capacity(w.len());
     let mut scales = Vec::with_capacity(rows);
@@ -74,6 +81,16 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Q8Matrix {
         }
 
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+
+        // A NaN or ±inf in the source row yields a non-finite scale.
+        // Reject here so downstream matmuls never receive a non-finite scale.
+        if !scale.is_finite() {
+            return Err(InferenceError::InvalidInput(format!(
+                "Q8 weight row {row_idx} has non-finite scale ({scale}); \
+                 source row contains NaN or ±inf"
+            )));
+        }
+
         scales.push(scale);
 
         for &v in row {
@@ -82,12 +99,12 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Q8Matrix {
         }
     }
 
-    Q8Matrix {
+    Ok(Q8Matrix {
         data,
         scales,
         rows,
         cols,
-    }
+    })
 }
 
 /// **Unstable**: quantized matmul_bt kernel; tile size and dispatch strategy may change.
@@ -297,7 +314,7 @@ pub(crate) fn quantize_model_weights(
                     Q8AttentionWeights::Linear(quantize_gdn_weights(gdn)?)
                 }
                 AttentionWeights::Full(full) => {
-                    Q8AttentionWeights::Full(quantize_full_attn_weights(full, cfg))
+                    Q8AttentionWeights::Full(quantize_full_attn_weights(full, cfg)?)
                 }
             };
             let q8_common = quantize_common_weights(common)?;
@@ -361,18 +378,24 @@ pub fn quantize_gdn_weights(
         )));
     }
 
+    let in_proj_qkv = quantize_matrix(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols)?;
+    let in_proj_z = quantize_matrix(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols)?;
+    let in_proj_b = quantize_matrix(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols)?;
+    let in_proj_a = quantize_matrix(&w.in_proj_a, w.in_proj_a_rows, w.in_proj_a_cols)?;
+    let out_proj = quantize_matrix(&w.out_proj, w.out_proj_rows, w.out_proj_cols)?;
+
     Ok(Q8GatedDeltaNetWeights {
-        in_proj_qkv: quantize_matrix(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols),
-        in_proj_z: quantize_matrix(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols),
-        in_proj_b: quantize_matrix(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols),
-        in_proj_a: quantize_matrix(&w.in_proj_a, w.in_proj_a_rows, w.in_proj_a_cols),
+        in_proj_qkv,
+        in_proj_z,
+        in_proj_b,
+        in_proj_a,
         a_log: w.a_log.clone(),
         dt_bias: w.dt_bias.clone(),
         conv1d_weight: w.conv1d_weight.clone(),
         conv_dim: w.conv_dim,
         kernel_size: w.kernel_size,
         norm_weight: w.norm_weight.clone(),
-        out_proj: quantize_matrix(&w.out_proj, w.out_proj_rows, w.out_proj_cols),
+        out_proj,
     })
 }
 
@@ -380,21 +403,28 @@ pub fn quantize_gdn_weights(
 ///
 /// The original full-attention weight struct does not carry explicit row/column metadata,
 /// so the matrix shapes are inferred from the config's attention topology.
+///
+/// Returns `Err(InvalidInput)` if any weight matrix contains `NaN` or `±inf` values.
 pub(crate) fn quantize_full_attn_weights(
     w: &FullAttentionLayerWeights,
     cfg: &Qwen35Config,
-) -> Q8FullAttentionLayerWeights {
+) -> Result<Q8FullAttentionLayerWeights, InferenceError> {
     let ((q_rows, hidden), (kv_rows, _), (_, _), (o_rows, o_cols)) =
         infer_full_attention_shapes(w, cfg);
 
-    Q8FullAttentionLayerWeights {
-        q_proj: quantize_matrix(&w.q_proj, q_rows, hidden),
-        k_proj: quantize_matrix(&w.k_proj, kv_rows, hidden),
-        v_proj: quantize_matrix(&w.v_proj, kv_rows, hidden),
-        o_proj: quantize_matrix(&w.o_proj, o_rows, o_cols),
+    let q_proj = quantize_matrix(&w.q_proj, q_rows, hidden)?;
+    let k_proj = quantize_matrix(&w.k_proj, kv_rows, hidden)?;
+    let v_proj = quantize_matrix(&w.v_proj, kv_rows, hidden)?;
+    let o_proj = quantize_matrix(&w.o_proj, o_rows, o_cols)?;
+
+    Ok(Q8FullAttentionLayerWeights {
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
         q_norm: w.q_norm.clone(),
         k_norm: w.k_norm.clone(),
-    }
+    })
 }
 
 /// Quantize the common per-layer MLP weights into their Q8 representation (dense only).
@@ -412,12 +442,16 @@ pub(crate) fn quantize_common_weights(
     let hidden = w.input_layernorm.len();
     let ((gate_rows, _), (up_rows, _), (down_rows, down_cols)) = infer_dense_shapes(dense, hidden);
 
+    let gate_proj = quantize_matrix(&dense.gate_proj, gate_rows, hidden)?;
+    let up_proj = quantize_matrix(&dense.up_proj, up_rows, hidden)?;
+    let down_proj = quantize_matrix(&dense.down_proj, down_rows, down_cols)?;
+
     Ok(Q8CommonLayerWeights {
         input_layernorm: w.input_layernorm.clone(),
         post_attention_layernorm: w.post_attention_layernorm.clone(),
-        gate_proj: quantize_matrix(&dense.gate_proj, gate_rows, hidden),
-        up_proj: quantize_matrix(&dense.up_proj, up_rows, hidden),
-        down_proj: quantize_matrix(&dense.down_proj, down_rows, down_cols),
+        gate_proj,
+        up_proj,
+        down_proj,
     })
 }
 
@@ -602,7 +636,7 @@ mod tests {
             0.0, 0.0, 0.0, 1.0, // row 3
         ];
 
-        let q = quantize_matrix(&w, rows, cols);
+        let q = quantize_matrix(&w, rows, cols).unwrap();
         let dq = dequantize_matrix(&q);
 
         assert_eq!(q.rows, rows);
@@ -683,7 +717,7 @@ mod tests {
             w.push(uniform_signed(&mut seed) * 0.03);
         }
 
-        let q = quantize_matrix(&w, rows, cols);
+        let q = quantize_matrix(&w, rows, cols).unwrap();
         let dq = dequantize_matrix(&q);
 
         let mut max_abs_err = 0.0f32;
@@ -724,7 +758,7 @@ mod tests {
             }
         }
 
-        let b_q = quantize_matrix(&b, n, k);
+        let b_q = quantize_matrix(&b, n, k).unwrap();
 
         let mut c_f32 = vec![0.0f32; m * n];
         let mut c_q8 = vec![0.0f32; m * n];
@@ -762,7 +796,7 @@ mod tests {
             -2.54, 0.0, 1.28, // row 1, scale = 0.02, q = [-127, 0, 64]
         ];
 
-        let q = quantize_matrix(&b, 2, 3);
+        let q = quantize_matrix(&b, 2, 3).unwrap();
         assert!(approx_eq(q.scales[0], 0.01, 1e-8));
         assert!(approx_eq(q.scales[1], 0.02, 1e-8));
         assert_eq!(&q.data[0..3], &[127i8, -64i8, 0i8]);
@@ -786,7 +820,7 @@ mod tests {
             0.0, 0.0, 0.0, 0.0, // zero row
             0.5, -0.5, 0.25, -0.25,
         ];
-        let q = quantize_matrix(&b, 2, 4);
+        let q = quantize_matrix(&b, 2, 4).unwrap();
 
         assert!(approx_eq(q.scales[0], 1.0, 1e-8));
         assert_eq!(&q.data[0..4], &[0i8, 0i8, 0i8, 0i8]);
@@ -805,7 +839,7 @@ mod tests {
             1.27, -0.63, 0.0, // max abs = 1.27 -> scale = 0.01
             -2.54, 2.0, 0.0, // max abs = 2.54 -> scale = 0.02
         ];
-        let q = quantize_matrix(&w, 2, 3);
+        let q = quantize_matrix(&w, 2, 3).unwrap();
 
         assert!(approx_eq(q.scales[0], 0.01, 1e-8));
         assert!(approx_eq(q.scales[1], 0.02, 1e-8));
@@ -838,7 +872,7 @@ mod tests {
             }
         }
 
-        let q = quantize_matrix(&w, rows, cols);
+        let q = quantize_matrix(&w, rows, cols).unwrap();
 
         assert_eq!(q.rows, rows);
         assert_eq!(q.cols, cols);
@@ -908,6 +942,61 @@ mod tests {
             matches!(result, Err(InferenceError::UnsupportedModel(_))),
             "expected Err(UnsupportedModel), got: {result:?}"
         );
+    }
+
+    /// `quantize_matrix` must reject a weight matrix whose source row contains
+    /// `+inf` or `NaN`. Such a row produces `scale = inf / 127 = inf`, which then
+    /// poisons every matmul output for that channel via `0 * inf = NaN`.
+    ///
+    /// Mutation check: removing the `!scale.is_finite()` guard in `quantize_matrix`
+    /// causes this call to return `Ok` instead of `Err`, failing `expect_err`.
+    #[test]
+    fn test_quantize_matrix_rejects_nonfinite_source_row() {
+        // Row 0 is finite; row 1 contains +inf → scale for row 1 = inf / 127 = inf.
+        let w = vec![
+            1.0,
+            2.0,
+            3.0, // row 0: finite, scale ≈ 3/127
+            1.0,
+            f32::INFINITY,
+            0.0, // row 1: +inf → scale = inf
+        ];
+        match quantize_matrix(&w, 2, 3) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("non-finite"),
+                    "error must describe the non-finite scale; got: {msg}"
+                );
+                assert!(
+                    msg.contains("1"),
+                    "error must identify the offending row index; got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput for non-finite scale, got: {e}"),
+            Ok(_) => panic!("expected Err for non-finite source row, got Ok"),
+        }
+    }
+
+    /// `quantize_gdn_weights` propagates the non-finite-scale error from
+    /// `quantize_matrix`. A single `+inf` value in `in_proj_qkv` is enough.
+    ///
+    /// Mutation check: removing the `!scale.is_finite()` guard in `quantize_matrix`
+    /// causes this to return `Ok`, failing `expect_err`.
+    #[test]
+    fn test_quantize_gdn_weights_rejects_nonfinite_scale() {
+        let mut w = valid_gdn_weights(3, 8);
+        // row 0 of in_proj_qkv gets max_abs = +inf → scale = +inf / 127 = +inf
+        w.in_proj_qkv[0] = f32::INFINITY;
+        match quantize_gdn_weights(&w) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("non-finite"),
+                    "error must describe the non-finite scale; got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput for non-finite scale, got: {e}"),
+            Ok(_) => panic!("expected Err for non-finite source weight, got Ok"),
+        }
     }
 
     #[test]

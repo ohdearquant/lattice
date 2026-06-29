@@ -49,7 +49,7 @@ pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert
 
 #[cfg(test)]
 pub use detokenize::bytes_to_unicode;
-#[cfg(test)]
+// Needed by the Q8 generate path (cpu_q8.rs) as well as by tests.
 pub use generation::should_stop_token;
 
 /// Exposed for consumers that need to drive a per-layer coverage check
