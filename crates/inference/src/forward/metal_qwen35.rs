@@ -6628,8 +6628,12 @@ kernel void gdn_chunk_norm_silu_c32(
                         enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                         enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                         enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                        // Grid axis = num_kv_heads: the kernel maps gid → kvh and handles
+                        // each GQA group of Q heads internally per threadgroup. Dispatching
+                        // nqh wastes (nqh - nkh) threadgroups that the kernel's early-return
+                        // guard discards; output is bit-identical but scheduling is nkh-sized.
                         enc.dispatch_thread_groups(
-                            MTLSize::new(nqh as u64, 1, 1),
+                            MTLSize::new(nkh as u64, 1, 1),
                             MTLSize::new(256, 1, 1),
                         );
 
@@ -8470,8 +8474,10 @@ kernel void gdn_chunk_norm_silu_c32(
                                 enc.set_bytes(8, 4, &qd as *const u32 as *const _);
                                 enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
                                 enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                                // Grid axis = num_kv_heads: see fallback site above for
+                                // the invariant. Same kernel, same geometry requirement.
                                 enc.dispatch_thread_groups(
-                                    MTLSize::new(nqh as u64, 1, 1),
+                                    MTLSize::new(nkh as u64, 1, 1),
                                     MTLSize::new(256, 1, 1),
                                 );
                             }
