@@ -9504,6 +9504,10 @@ kernel void gdn_chunk_norm_silu_c32(
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
+            // Reject grammar configs before any GPU work: grammar-constrained decoding
+            // is not wired into the multimodal path.
+            super::multimodal_generate_preflight(gen_cfg)?;
+
             // Validate multimodal input
             input.validate().map_err(|e| {
                 InferenceError::InvalidInput(format!("MultimodalInput validation failed: {e}"))
@@ -9540,11 +9544,6 @@ kernel void gdn_chunk_norm_silu_c32(
                     total_len, self.session.kv_cache.max_cache_len
                 )));
             }
-
-            // Grammar-constrained decoding is not wired into the multimodal path; reject
-            // grammar configs before any sampling to avoid silently producing unconstrained
-            // output when a caller sets gen_cfg.grammar (#397/#398).
-            crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
 
             // Reset recurrent state for a clean generation.
             self.reset_state();
@@ -19668,47 +19667,76 @@ kernel void decode_attention_reference(
                 max_diff(&chunked_a, &serial_a)
             );
         }
+    }
+}
 
-        /// `generate_multimodal` must reject a `GenerateConfig` that sets `grammar`
-        /// with a typed `InvalidInput` error before any sampling (#397/#398).
-        ///
-        /// Full end-to-end test of the call site requires GPU hardware (creating a
-        /// `MetalQwen35State` triggers Metal device allocation). This test validates
-        /// the grammar-guard helper — `check_grammar_not_set` — directly; the same
-        /// helper is called at the entry of `generate_multimodal` via
-        /// `crate::model::qwen35::check_grammar_not_set(gen_cfg)?`.
-        ///
-        /// Mutation sensitivity: the guard helper returns `InvalidInput` when grammar
-        /// is set. Removing the call from `generate_multimodal` leaves this test
-        /// passing (it tests the helper, not the call site), but the production path
-        /// then silently ignores grammar — this test documents the contract so a
-        /// reviewer can verify the call site is present.
-        #[test]
-        fn generate_multimodal_grammar_guard_rejects_grammar_config() {
-            use crate::error::InferenceError;
-            use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35::check_grammar_not_set;
-            use crate::model::qwen35_config::GenerateConfig;
-            use std::sync::Arc;
+// ---------------------------------------------------------------------------
+// GPU-free preflight helpers for the multimodal generation path.
+//
+// These functions live at module level (no cfg gate) so they compile and are
+// testable on every platform without Metal GPU hardware.
+// ---------------------------------------------------------------------------
 
-            let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
-            let grammar_vocab = vec![b"a".to_vec(), b"b".to_vec()];
-            let engine =
-                GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
+/// Validates `gen_cfg` for the multimodal generation path before any Metal
+/// device or GPU work is initiated.
+///
+/// Grammar-constrained decoding is not wired into the multimodal forward
+/// pass; this function converts a silent correctness failure (unconstrained
+/// output despite `gen_cfg.grammar` being set) into a typed `InvalidInput`
+/// error that callers can act on.
+///
+/// Compiled when Metal-GPU is enabled (the production caller lives inside
+/// `mod inner`) or during test builds so that the module-level test can
+/// exercise the guard logic on any platform without GPU hardware.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn multimodal_generate_preflight(
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+) -> Result<(), crate::error::InferenceError> {
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)
+}
 
-            let gen_cfg = GenerateConfig {
-                grammar: Some(Arc::new(engine)),
-                ..Default::default()
-            };
+#[cfg(test)]
+mod multimodal_preflight_tests {
+    use super::multimodal_generate_preflight;
+    use crate::error::InferenceError;
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+    use crate::model::qwen35_config::GenerateConfig;
+    use std::sync::Arc;
 
-            // `check_grammar_not_set` is the guard used by `generate_multimodal` (#397/#398).
-            let result = check_grammar_not_set(&gen_cfg);
-            assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
-                "grammar guard must return InvalidInput when grammar is set (#397/#398); \
-                 got {result:?}"
-            );
-        }
+    /// Grammar-constrained decoding is not wired into the multimodal path; the
+    /// preflight must reject a config with `grammar` set.
+    ///
+    /// This test drives `multimodal_generate_preflight` — the exact function that
+    /// `generate_multimodal` calls as its first action — so mutating the guard
+    /// logic in that function directly fails this test.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_grammar_guard_rejects_grammar_config() {
+        let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
+        let vocab = vec![b"a".to_vec(), b"b".to_vec()];
+        let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
+
+        let cfg_with_grammar = GenerateConfig {
+            grammar: Some(Arc::new(engine)),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_grammar);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when grammar is set; got {result:?}"
+        );
+    }
+
+    /// A config with `grammar` unset must pass through the preflight without error.
+    #[test]
+    fn generate_multimodal_grammar_guard_allows_no_grammar() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "grammar = None must not trigger the preflight guard"
+        );
     }
 }
 
