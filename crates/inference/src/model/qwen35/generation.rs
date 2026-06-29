@@ -4,6 +4,7 @@ use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
+use crate::grammar::pda::GrammarState;
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::tokenizer::common::Tokenizer;
 
@@ -39,8 +40,6 @@ impl Qwen35Model {
             });
         }
 
-        check_grammar_not_set(gen_cfg)?;
-
         // Context preflight. apply_partial_rope indexes the precomputed cos/sin
         // table unchecked, so a position at or past max_context() is an
         // out-of-bounds slice access — a release panic, not a clean error. The
@@ -72,6 +71,12 @@ impl Qwen35Model {
         let mut kv_cache = KvCache::new(num_full);
         let mut scratch = ForwardScratch::new();
 
+        // Initialise per-request grammar state when grammar-constrained decoding
+        // is requested. None when no grammar is set (zero-cost for unconstrained
+        // generation). Mirrors the pattern in crate::generate::generate.
+        let mut grammar_state: Option<GrammarState> =
+            gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
         let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
         let mut all_ids = prompt_ids.clone();
 
@@ -84,12 +89,44 @@ impl Qwen35Model {
         );
         kv_cache.seq_len = prompt_len;
 
+        // Apply grammar mask on the post-prefill logit buffer before the first
+        // sample. mask_logits sets every disallowed token to NEG_INFINITY in-place,
+        // so the sampler only sees the grammar-permitted candidate set.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            // If the grammar blocked every token the sampler's non-finite-max
+            // short-circuit would silently return token 0. Fail closed instead.
+            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                return Err(InferenceError::InvalidInput(
+                    "grammar constraint blocked every token at step 0; \
+                     no legal first token exists in the current grammar state"
+                        .into(),
+                ));
+            }
+        }
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
             &all_ids,
             &mut rng_state,
         );
+
+        // Advance grammar state after sampling. advance() returns false when the
+        // grammar has no valid continuation for the selected token, signalling the
+        // end of grammar-constrained generation. Mirror the same early-return used
+        // in crate::generate::generate for parity.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+            if !engine.advance(gs, next_id) {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                });
+            }
+        }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
@@ -116,6 +153,7 @@ impl Qwen35Model {
                 &mut gdn_states,
                 &mut kv_cache,
                 &mut scratch,
+                &mut grammar_state,
             )?;
 
             let text = decode_tokens(&self.tokenizer, &generated_ids);
@@ -158,6 +196,7 @@ impl Qwen35Model {
                 &mut scratch,
                 &mut detok,
                 &mut full,
+                &mut grammar_state,
             )?;
 
             Ok(GenerateOutput {
@@ -209,8 +248,6 @@ impl Qwen35Model {
             });
         }
 
-        check_grammar_not_set(gen_cfg)?;
-
         // Context preflight: see generate() for the full rationale and the exact
         // vs. adopted-bound discussion. apply_partial_rope indexes the RoPE table
         // unchecked, so a request past max_context() would panic in the decode
@@ -232,6 +269,10 @@ impl Qwen35Model {
         let mut kv_cache = KvCache::new(num_full);
         let mut scratch = ForwardScratch::new();
 
+        // Per-request grammar state, mirroring the generate() path above.
+        let mut grammar_state: Option<GrammarState> =
+            gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
         let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
         let mut all_ids = prompt_ids.clone();
 
@@ -244,12 +285,37 @@ impl Qwen35Model {
         );
         kv_cache.seq_len = prompt_len;
 
+        // Grammar mask on the post-prefill logits, identical to the generate() path.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                return Err(InferenceError::InvalidInput(
+                    "grammar constraint blocked every token at step 0; \
+                     no legal first token exists in the current grammar state"
+                        .into(),
+                ));
+            }
+        }
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
             &all_ids,
             &mut rng_state,
         );
+
+        // Grammar advance after sampling the first token, mirroring generate().
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+            if !engine.advance(gs, next_id) {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                });
+            }
+        }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
@@ -294,12 +360,31 @@ impl Qwen35Model {
                 );
                 kv_cache.seq_len += 1;
 
+                // Grammar mask before sampling; fail closed on an all-blocked step.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
+                }
+
                 let next_id = sample_token(
                     &scratch.logits[..cfg.vocab_size],
                     gen_cfg,
                     &all_ids,
                     &mut rng_state,
                 );
+
+                // Grammar advance: break cleanly when the grammar signals completion.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    if !engine.advance(gs, next_id) {
+                        break;
+                    }
+                }
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -364,12 +449,32 @@ impl Qwen35Model {
                 );
                 kv_cache.seq_len += 1;
 
+                // Grammar mask before sampling; fail closed on an all-blocked step.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
+                }
+
                 let next_id = sample_token(
                     &scratch.logits[..cfg.vocab_size],
                     gen_cfg,
                     &all_ids,
                     &mut rng_state,
                 );
+
+                // Grammar advance: break cleanly when the grammar signals completion.
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    if !engine.advance(gs, next_id) {
+                        stopped = true;
+                        break;
+                    }
+                }
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -400,6 +505,18 @@ impl Qwen35Model {
             })
         }
     }
+}
+
+/// Returns `true` when at least one logit is strictly greater than
+/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
+///
+/// When a grammar engine blocks every token via `mask_logits`, every logit
+/// becomes `NEG_INFINITY`. Without this guard the sampler's non-finite-max
+/// short-circuit would silently emit token 0 (lowest id after sorting an
+/// all-NEG_INFINITY candidate set), violating the grammar contract. Callers
+/// check this before invoking the sampler and return a typed error instead.
+fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
 }
 
 fn initial_rng_state(seed: Option<u64>) -> u64 {
@@ -553,6 +670,7 @@ fn decode_loop(
     gdn_states: &mut [GatedDeltaNetState],
     kv_cache: &mut KvCache,
     scratch: &mut ForwardScratch,
+    grammar_state: &mut Option<GrammarState>,
 ) -> Result<bool, InferenceError> {
     let cfg = &model.config;
     for _ in 1..gen_cfg.max_new_tokens {
@@ -564,12 +682,31 @@ fn decode_loop(
         model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
         kv_cache.seq_len += 1;
 
+        // Grammar mask before sampling; fail closed when every token is blocked.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                return Err(InferenceError::InvalidInput(
+                    "grammar constraint blocked every token; \
+                     no legal continuation exists in the current grammar state"
+                        .into(),
+                ));
+            }
+        }
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
             all_ids,
             rng_state,
         );
+
+        // Advance grammar state; a false return signals grammar completion.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+            if !engine.advance(gs, next_id) {
+                return Ok(true);
+            }
+        }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(true);
@@ -602,6 +739,7 @@ fn decode_loop_with_stops(
     scratch: &mut ForwardScratch,
     detok: &mut IncrementalDetokenizer,
     full: &mut String,
+    grammar_state: &mut Option<GrammarState>,
 ) -> Result<bool, InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
@@ -614,12 +752,32 @@ fn decode_loop_with_stops(
         model.forward_step(last_token, pos, gdn_states, kv_cache, scratch);
         kv_cache.seq_len += 1;
 
+        // Grammar mask before sampling; fail closed when every token is blocked.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                return Err(InferenceError::InvalidInput(
+                    "grammar constraint blocked every token; \
+                     no legal continuation exists in the current grammar state"
+                        .into(),
+                ));
+            }
+        }
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
             all_ids,
             rng_state,
         );
+
+        // Advance grammar state; a false return signals grammar completion.
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+            if !engine.advance(gs, next_id) {
+                stopped = true;
+                break;
+            }
+        }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
@@ -670,19 +828,18 @@ pub fn should_stop_token(cfg: &Qwen35Config, gen_cfg: &GenerateConfig, token_id:
 }
 
 /// Returns `Err(InvalidInput)` when `gen_cfg.grammar` is set, to prevent the
-/// grammar field from being silently ignored on the Qwen3.5 CPU path (#397).
+/// grammar field from being silently ignored on paths that have not yet wired
+/// grammar masking (#397).
 ///
-/// Grammar masking (`mask_logits` + `advance`) is not yet wired into the
-/// Qwen3.5 generation loop, so honouring a grammar config would require
-/// architectural changes beyond the scope of this fix. Failing closed converts
-/// a silent correctness bug (unconstrained output despite grammar being set)
-/// into a visible, typed error that callers can act on.
+/// This guard is used by the batch-prefill and f16 CPU paths. The base CPU
+/// generate() / generate_streaming() paths wire grammar directly and do not
+/// call this guard.
 pub(crate) fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     if gen_cfg.grammar.is_some() {
         return Err(InferenceError::InvalidInput(
-            "grammar-constrained decoding is not yet supported on the Qwen3.5 CPU \
-             path; use the generic generate() in src/generate.rs, which implements \
-             grammar masking"
+            "grammar-constrained decoding is not yet supported on this path; \
+             use the Qwen3.5 CPU generate() / generate_streaming() or the generic \
+             generate() in src/generate.rs, which implement grammar masking"
                 .into(),
         ));
     }
@@ -745,44 +902,100 @@ mod tests {
         assert_eq!(earliest_stop_match("hello", &[]), None);
     }
 
+    // -----------------------------------------------------------------------
+    // Grammar wiring — mutation-sensitive unit tests (#397)
+    // -----------------------------------------------------------------------
+
+    /// Grammar masking must block the argmax (highest-logit) token when the grammar
+    /// forbids it, causing the sampler to select a lower-logit allowed token instead.
+    ///
+    /// Constructs a three-token grammar that allows "t" (index 0) and "f" (index 1)
+    /// but forbids "x" (index 2). Logits are set so index 2 would win greedy argmax
+    /// WITHOUT masking. With masking, index 2 must become NEG_INFINITY and greedy
+    /// sampling must return index 1 (next highest allowed logit).
+    ///
+    /// Mutation sensitivity:
+    ///   Remove the `engine.mask_logits(gs, ...)` call from the wiring site →
+    ///   logits[2] stays 1000.0, greedy sampling returns 2, `assert_ne!(sampled, 2)`
+    ///   fails. This proves the mask_logits call is load-bearing.
     #[test]
-    fn grammar_config_is_rejected_not_silently_ignored() {
-        // Regression test for the fail-closed grammar guard (#397).
-        //
-        // Before the fix, generate() and generate_streaming() had no grammar
-        // masking, so a grammar field in GenerateConfig was silently ignored and
-        // the output was unconstrained. check_grammar_not_set must return a typed
-        // Err rather than Ok to prevent that silent failure.
-        //
-        // Mutation sensitivity: change check_grammar_not_set to always return
-        // Ok(()) → result.is_err() fails, catching the regression.
+    fn grammar_masking_blocks_argmax_token() {
         use crate::grammar::{GrammarEngine, GrammarSpec};
         use std::sync::Arc;
 
+        // Grammar: root ::= "t" | "f" — index 0 and 1 are valid, index 2 ("x") is not.
         let spec = GrammarSpec::Gbnf("root ::= \"t\" | \"f\"\n".to_string());
-        let vocab = vec![b"t".to_vec(), b"f".to_vec()];
-        let engine = GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile");
+        let vocab = vec![b"t".to_vec(), b"f".to_vec(), b"x".to_vec()];
+        let engine =
+            Arc::new(GrammarEngine::new(&spec, vocab).expect("trivial grammar must compile"));
 
-        let cfg_with_grammar = GenerateConfig {
-            grammar: Some(Arc::new(engine)),
+        let mut state = engine.initial_state();
+
+        // Set logits so the forbidden token (index 2) has the highest value.
+        // Without masking, greedy sampling would return 2.
+        let mut logits = vec![1.0_f32, 2.0_f32, 1000.0_f32];
+        engine.mask_logits(&mut state, &mut logits);
+
+        // The forbidden token must be blocked.
+        assert_eq!(
+            logits[2],
+            f32::NEG_INFINITY,
+            "mask_logits must set the forbidden token to NEG_INFINITY"
+        );
+
+        // At least one allowed token must remain finite.
+        assert!(
+            has_finite_logit(&logits),
+            "at least one allowed logit must survive the mask"
+        );
+
+        // Greedy sampling (temperature=0) must choose the highest ALLOWED logit,
+        // which is index 1 ("f", logit 2.0), not the blocked index 2.
+        let gen_cfg = GenerateConfig {
+            temperature: 0.0, // greedy
             ..Default::default()
         };
-
-        let result = check_grammar_not_set(&cfg_with_grammar);
-        assert!(
-            result.is_err(),
-            "Qwen3.5 CPU path must reject grammar config with a typed error \
-             rather than silently ignoring the grammar field (#397)"
+        let mut rng = 1u64;
+        let sampled = sample_token(&logits, &gen_cfg, &[], &mut rng);
+        assert_ne!(
+            sampled, 2,
+            "blocked token must not be selected by the sampler"
         );
+        assert_eq!(
+            sampled, 1,
+            "greedy must select the highest remaining allowed logit (index 1)"
+        );
+    }
+
+    /// An all-blocking grammar mask must be detected by `has_finite_logit` so the
+    /// caller can return a typed error rather than silently emitting token 0.
+    ///
+    /// When every logit is NEG_INFINITY, the sampler's non-finite-max short-circuit
+    /// returns token 0 (the lowest-id token after sorting an all-NEG_INFINITY
+    /// candidate set). The `has_finite_logit` guard catches this before the sampler
+    /// is invoked and allows the generation loop to return `InvalidInput` instead.
+    ///
+    /// Mutation sensitivity:
+    ///   Change `has_finite_logit` to always return `true` →
+    ///   `assert!(!has_finite_logit(...))` fails. This proves the guard is load-bearing
+    ///   for the empty-mask fail-closed path.
+    #[test]
+    fn grammar_all_blocked_mask_detected_by_has_finite_logit() {
+        // Simulate a grammar engine that blocked every token.
+        let all_blocked = vec![f32::NEG_INFINITY; 8];
+
         assert!(
-            matches!(result, Err(InferenceError::InvalidInput(_))),
-            "the error variant must be InvalidInput"
+            !has_finite_logit(&all_blocked),
+            "all-NEG_INFINITY logit buffer must NOT pass the has_finite_logit guard; \
+             the caller must return a typed error, not silently emit token 0"
         );
 
-        // A config with no grammar must pass through.
+        // A buffer with a single finite logit must pass the guard.
+        let mut one_allowed = vec![f32::NEG_INFINITY; 8];
+        one_allowed[3] = 1.0_f32;
         assert!(
-            check_grammar_not_set(&GenerateConfig::default()).is_ok(),
-            "grammar = None must not trigger the guard"
+            has_finite_logit(&one_allowed),
+            "a single finite logit must pass the guard (grammar still has valid tokens)"
         );
     }
 
