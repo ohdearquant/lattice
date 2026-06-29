@@ -262,12 +262,50 @@ fn check_alloc_capacity(
     // Guard the fused QKV projection width (sizes qkv_buf). q_dim and kv_dim are
     // already validated above; this guards the final addition so a huge q_dim
     // combined with a non-trivial kv_dim cannot wrap the sum.
-    kv_dim
+    let qkv_dim = kv_dim
         .checked_mul(2)
         .and_then(|two_kv| q_dim.checked_add(two_kv))
         .ok_or_else(|| {
             InferenceError::InvalidInput("q_dim + 2*kv_dim (qkv_dim) overflows usize".into())
         })?;
+    // Guard every activation buffer that ForwardScratch::ensure_capacity sizes as
+    // `seq_len_cap * DIM`. The invariant seq_len_cap <= effective_cap holds because
+    // check_kv_cache_capacity rejects any cap smaller than prompt_len, and
+    // ensure_capacity is called with at most prompt_len (prefill) or 1 (decode).
+    // Guarding effective_cap * DIM up-front prevents any grow() call from wrapping
+    // usize and silently undersizing a buffer before the first prefill write.
+    //
+    // Buffers covered and their per-token coefficients:
+    //   hidden, residual, ffn_out  — hidden_size
+    //   qkv_buf                    — qkv_dim  (= q_dim + 2*kv_dim)
+    //   q_buf, attn_out            — q_dim    (= num_attention_heads * head_dim)
+    //   k_buf, v_buf               — kv_dim   (= num_key_value_heads * head_dim)
+    //   gate_up_buf                — 2 * intermediate_size
+    //   gate_buf, up_buf           — intermediate_size
+    let inter = cfg.intermediate_size;
+    effective_cap.checked_mul(cfg.hidden_size).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * hidden_size overflows usize".into())
+    })?;
+    effective_cap.checked_mul(qkv_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * qkv_dim overflows usize".into())
+    })?;
+    effective_cap.checked_mul(q_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * q_dim overflows usize".into())
+    })?;
+    effective_cap.checked_mul(kv_dim).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * kv_dim overflows usize".into())
+    })?;
+    inter
+        .checked_mul(2)
+        .and_then(|two_inter| effective_cap.checked_mul(two_inter))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "effective_cap * 2 * intermediate_size overflows usize".into(),
+            )
+        })?;
+    effective_cap.checked_mul(inter).ok_or_else(|| {
+        InferenceError::InvalidInput("effective_cap * intermediate_size overflows usize".into())
+    })?;
     // Per-position element coefficients that scale with the cache length:
     //   KV cache (K+V across all layers): 2 * num_layers * kv_dim
     //   dequant scratch (cached_k_f32 + cached_v_f32): 2 * kv_dim
@@ -1571,5 +1609,64 @@ mod tests {
         assert_eq!(effective(Some(30)), 30, "cap < max_seq -> respected");
         assert_eq!(effective(Some(0)), 1, "cap=0 -> clamped to 1");
         assert_eq!(effective(Some(1)), 1, "cap=1 -> 1 (minimum)");
+    }
+
+    /// check_alloc_capacity rejects a config where every standalone dimension
+    /// product (kv_dim, q_dim, qkv_dim) fits in usize, but
+    /// effective_cap * qkv_dim wraps on 64-bit targets.
+    ///
+    /// Config: num_key_value_heads=1, head_dim=4 → kv_dim=4 (standalone guard passes).
+    ///         num_attention_heads=1000, head_dim=4 → q_dim=4000 (standalone guard passes).
+    ///         qkv_dim = 4000 + 2*4 = 4008 (addition guard passes).
+    ///         hidden_size=1, intermediate_size=1 (all other per-token coefficients are 1).
+    ///         effective_cap chosen so that effective_cap * 4008 > usize::MAX but
+    ///         the pre-existing coeff guard (effective_cap * ~1016) does not overflow,
+    ///         meaning only the new effective_cap * qkv_dim compound guard catches it.
+    ///
+    /// Mutation-sensitivity contract:
+    ///   Remove the `effective_cap.checked_mul(qkv_dim)` guard line: the function
+    ///   advances past it, the remaining guards (hidden_size=1, q_dim=4000,
+    ///   kv_dim=4, 2*inter=2, inter=1, coeff≈1016) all pass within usize on 64-bit,
+    ///   and the function returns Ok — causing `unwrap_err()` to panic and the test
+    ///   to fail. This confirms the guard is load-bearing for this defect class.
+    #[test]
+    fn check_alloc_capacity_rejects_seq_scaled_qkv_overflow() {
+        let cfg = QwenConfig {
+            vocab_size: 1,
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1000,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            intermediate_size: 1,
+            max_position_embeddings: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        // On 64-bit: usize::MAX / 4008 < effective_cap, so effective_cap * 4008 overflows.
+        // usize::MAX / 1016 > effective_cap, so the prior coeff guard would pass.
+        let effective_cap = 4_602_481_056_314_759usize;
+        let err = check_alloc_capacity(&cfg, 1, effective_cap).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput on seq-scaled qkv overflow, got {err:?}"
+        );
+    }
+
+    /// A realistic model config with a modest context cap must not be falsely
+    /// rejected by the new effective_cap * DIM compound guards.
+    #[test]
+    fn check_alloc_capacity_accepts_realistic_scratch_dims() {
+        // Qwen3-Embedding-0.6B dimensions: hidden=1024, heads=16/8, head_dim=128,
+        // intermediate=3072 — representative of deployed model shapes.
+        let cfg = QwenConfig::qwen3_embedding_0_6b();
+        assert!(
+            check_alloc_capacity(&cfg, cfg.num_hidden_layers, 4_096).is_ok(),
+            "4K-token cap rejected"
+        );
+        assert!(
+            check_alloc_capacity(&cfg, cfg.num_hidden_layers, 32_768).is_ok(),
+            "32K-token cap rejected"
+        );
     }
 }
