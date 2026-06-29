@@ -26,7 +26,7 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, Qwen35Model, decode_tokens, qwen35_rms_norm, resize,
-    sample_token,
+    sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::tokenizer::common::Tokenizer;
@@ -404,7 +404,7 @@ impl Qwen35Model {
         // Sample from the final prefill logits.
         let next_id = sample_token(&logits[..cfg.vocab_size], gen_cfg, &all_ids, &mut rng_state);
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
                 text: String::new(),
                 token_ids: vec![],
@@ -441,7 +441,7 @@ impl Qwen35Model {
                 &mut rng_state,
             );
 
-            if next_id == cfg.eos_token_id {
+            if should_stop_token(cfg, gen_cfg, next_id) {
                 stopped = true;
                 break;
             }
@@ -1722,6 +1722,68 @@ mod tests {
         x ^= x << 17;
         *state = x;
         (x >> 32) as u32
+    }
+
+    /// Build a zero-layer Qwen35Model for generate_with_batch_prefill unit tests.
+    ///
+    /// All-zero embed_tokens → logits all 0 → greedy picks token 0.
+    /// eos_token_id=96 (vocab-1) so token 0 is NOT eos, making stop_token_ids=[0]
+    /// detectable as a distinct stop path.
+    fn zero_layer_batch_prefill_fixture() -> Qwen35Model {
+        let cfg = make_test_config(64, 128, 97, 0);
+        // make_test_config sets eos_token_id = vocab_size-1 = 96 ≠ 0 ✓
+
+        let rope_dim = cfg.rope_dim();
+        let rope_max = cfg.max_position_embeddings.min(8192);
+        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+
+        Qwen35Model {
+            config: cfg.clone(),
+            weights: ModelWeights {
+                // All zeros → logits all 0 → greedy always picks token 0.
+                embed_tokens: vec![0.0f32; cfg.vocab_size * cfg.hidden_size],
+                lm_head: None,
+                final_norm: vec![0.0f32; cfg.hidden_size],
+                layers: vec![],
+            },
+            tokenizer: dummy_tokenizer(),
+            rope,
+            lora: Box::new(crate::lora_hook::NoopLoraHook),
+        }
+    }
+
+    /// `generate_with_batch_prefill` must stop on a token in `stop_token_ids`
+    /// even when that token differs from `eos_token_id`.
+    ///
+    /// Setup: all-zero weights → greedy sampling always picks token 0.
+    /// Config has eos_token_id=96 (not 0) and stop_token_ids=[0].
+    /// With the fix the first sampled token (0) hits the stop list and the
+    /// function returns 0 generated tokens.
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` in either check causes `0 == 96` to be false,
+    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_with_batch_prefill_honors_stop_token_ids() {
+        let model = zero_layer_batch_prefill_fixture();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (96)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = model
+            .generate_with_batch_prefill("a", &gen_cfg)
+            .expect("generate_with_batch_prefill must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "generate_with_batch_prefill must stop immediately when the first \
+             greedy token (0) is in stop_token_ids — got {} generated tokens instead",
+            out.generated_tokens
+        );
     }
 
     /// Minimal byte-level BPE tokenizer parsed from a string — no temp file, no

@@ -49,8 +49,9 @@ pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert
 
 #[cfg(test)]
 pub use detokenize::bytes_to_unicode;
-// Needed by the Q8 generate path (cpu_q8.rs) as well as by tests.
-pub use generation::should_stop_token;
+// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward, batch_prefill)
+// and by tests. `pub(crate)` keeps it out of the public API surface.
+pub(crate) use generation::should_stop_token;
 
 /// Exposed for consumers that need to drive a per-layer coverage check
 /// over a Qwen3.5 checkpoint without going through the model loader —

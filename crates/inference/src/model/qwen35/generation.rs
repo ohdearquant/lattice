@@ -661,7 +661,15 @@ pub(crate) fn earliest_stop_match(haystack: &str, stops: &[String]) -> Option<us
 }
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
-pub fn should_stop_token(cfg: &Qwen35Config, gen_cfg: &GenerateConfig, token_id: u32) -> bool {
+///
+/// `pub(crate)` — all callers (Q8, F16, NEON, batch-prefill generate paths) live
+/// within this crate. Keeping the function crate-private avoids leaking a
+/// low-level sampling helper as part of the public API.
+pub(crate) fn should_stop_token(
+    cfg: &Qwen35Config,
+    gen_cfg: &GenerateConfig,
+    token_id: u32,
+) -> bool {
     token_id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&token_id)
 }
 

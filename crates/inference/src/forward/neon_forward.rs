@@ -23,7 +23,7 @@ use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, ModelWeights, decode_tokens, qwen35_rms_norm, resize,
-    sample_token,
+    sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
@@ -944,7 +944,7 @@ pub fn generate_q8_neon(
         &mut rng_state,
     );
 
-    if next_id == cfg.eos_token_id {
+    if should_stop_token(cfg, gen_cfg, next_id) {
         return Ok(GenerateOutput {
             text: String::new(),
             token_ids: vec![],
@@ -984,7 +984,7 @@ pub fn generate_q8_neon(
             &mut rng_state,
         );
 
-        if next_id == cfg.eos_token_id {
+        if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
             break;
         }
@@ -2418,6 +2418,98 @@ mod tests {
         assert!(
             msg.contains("context window"),
             "error should mention context window, got: {msg}"
+        );
+    }
+
+    /// `generate_q8_neon` must stop on a token in `stop_token_ids` even when
+    /// that token differs from `eos_token_id`.
+    ///
+    /// Setup: hidden=64 (must be multiple of 32 for Q8_0), vocab=64, all-zero
+    /// weights → logits all 0 → greedy always picks token 0.
+    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0].
+    ///
+    /// Mutation check: reverting `should_stop_token` back to
+    /// `next_id == cfg.eos_token_id` in either check causes `0 == 5` to be false,
+    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    #[test]
+    fn test_generate_q8_neon_honors_stop_token_ids() {
+        use std::collections::HashMap;
+
+        // Q8_0 requires hidden % 32 == 0; use 64.
+        let hidden = 64usize;
+        let vocab = 64usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 64,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 64,
+            linear_value_head_dim: 64,
+            linear_conv_kernel_dim: 64,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            // eos is 5 so token 0 is NOT eos — stop_token_ids=[0] is the
+            // distinct stop path we are testing.
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // All-zero packed weights: scale=0, all i8=0 → logits all 0 → greedy picks 0.
+        let model = Q8NeonModel {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            lm_head_packed: zero_packed(vocab, hidden),
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+
+        // rope_dim = head_dim * partial_rotary_factor = 64 * 0.5 = 32 (multiple of 32 ✓)
+        let rope = RopeTable::new(32, 64, 10_000.0);
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![("h".to_string(), "e".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (5)
+            temperature: 0.0,        // greedy: all-zero logits always yield token 0
+            ..Default::default()
+        };
+
+        let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "h", &gen_cfg)
+            .expect("generate_q8_neon must succeed with valid stop_token_ids");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "generate_q8_neon must stop immediately when the first greedy token (0) \
+             is in stop_token_ids — got {} generated tokens instead",
+            out.generated_tokens
         );
     }
 }

@@ -74,6 +74,17 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
 
         let mut max_abs = 0.0f32;
         for &v in row {
+            // IEEE 754: `NaN > x` is FALSE for any x, so a NaN value would
+            // silently leave max_abs unchanged. The scale then stays finite,
+            // and the NaN element is quantized to 0 via Rust's saturating
+            // f32-as-i8 cast — wrong data, no error. Reject the row here so
+            // the error points at the source weight, not a downstream matmul.
+            if !v.is_finite() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "Q8 weight row {row_idx} contains a non-finite value ({v}); \
+                     source weights must be finite"
+                )));
+            }
             let abs_v = v.abs();
             if abs_v > max_abs {
                 max_abs = abs_v;
@@ -82,8 +93,8 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
 
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
 
-        // A NaN or ±inf in the source row yields a non-finite scale.
-        // Reject here so downstream matmuls never receive a non-finite scale.
+        // Defensive guard: the loop above already rejects NaN/±inf inputs,
+        // so a non-finite scale here would indicate an internal logic error.
         if !scale.is_finite() {
             return Err(InferenceError::InvalidInput(format!(
                 "Q8 weight row {row_idx} has non-finite scale ({scale}); \
@@ -974,6 +985,45 @@ mod tests {
             }
             Err(e) => panic!("expected InvalidInput for non-finite scale, got: {e}"),
             Ok(_) => panic!("expected Err for non-finite source row, got Ok"),
+        }
+    }
+
+    /// `quantize_matrix` must reject a weight matrix that contains `NaN`.
+    ///
+    /// Unlike `±inf`, NaN does NOT propagate through the `> max_abs` comparison
+    /// in IEEE 754 — `NaN > max_abs` evaluates to `false` — so a NaN value
+    /// never updates `max_abs`.  The scale then stays finite and the NaN element
+    /// is silently quantized to 0 via Rust's saturating `f32 as i8` cast.
+    ///
+    /// Mutation check: removing the `!v.is_finite()` loop guard inside
+    /// `quantize_matrix` makes this test return `Ok` (NaN quietly becomes 0)
+    /// instead of `Err`, failing the `expect_err`-style match.
+    #[test]
+    fn test_quantize_matrix_rejects_nan_input() {
+        // Row 0 is finite; row 1 contains NaN in lane 1.
+        // Without the loop guard the NaN never updates max_abs, the scale is
+        // finite, and the result is Ok (NaN → 0).  With the guard it is Err.
+        let w = vec![
+            1.0,
+            2.0,
+            3.0, // row 0: finite
+            1.0,
+            f32::NAN,
+            0.0, // row 1: NaN lane
+        ];
+        match quantize_matrix(&w, 2, 3) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("non-finite"),
+                    "error must describe the non-finite value; got: {msg}"
+                );
+                assert!(
+                    msg.contains("1"),
+                    "error must identify the offending row index; got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput for NaN input, got: {e}"),
+            Ok(_) => panic!("expected Err for NaN input, got Ok"),
         }
     }
 

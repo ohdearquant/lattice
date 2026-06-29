@@ -760,9 +760,15 @@ pub fn generate_q8(
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
-        let last_token = *all_ids
-            .last()
-            .expect("invariant: prompt or previous sample populated all_ids");
+        // all_ids is seeded by the prompt before the loop, and the decode loop
+        // only continues when the previous sample pushed a new id, so the
+        // invariant `all_ids.is_empty() == false` should always hold here.
+        // Return an error rather than panicking so library callers can handle it.
+        let Some(&last_token) = all_ids.last() else {
+            return Err(crate::error::InferenceError::Inference(
+                "empty generation state".into(),
+            ));
+        };
 
         forward_step_q8(
             weights,
