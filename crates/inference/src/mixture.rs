@@ -52,6 +52,21 @@ pub enum RouterError {
         /// Received size
         got: usize,
     },
+
+    /// `k` exceeds the number of adapters the gate can actually score.
+    ///
+    /// This happens when the gate network has fewer outputs than `available`
+    /// adapters and `k` is larger than that narrower output count.
+    #[error(
+        "router: k={k} exceeds usable adapter count {usable} \
+         (gate produced fewer scores than adapters)"
+    )]
+    GateTooNarrow {
+        /// Requested top-k
+        k: usize,
+        /// Usable count: `min(available.len(), gate.num_outputs())`
+        usable: usize,
+    },
 }
 
 /// Routes a context vector to a top-k subset of available adapters with
@@ -129,26 +144,32 @@ impl AdapterRouter {
         // Run gate network: returns a score per output unit.
         let scores = self.gate.forward(context_vector)?;
 
-        // Top-k by score, descending.  Only the first `available.len()` outputs
-        // are meaningful; ignore extra outputs if the network is wider.
+        // Only the first `available.len()` outputs are meaningful; ignore extra
+        // outputs if the network is wider than the current adapter pool.
         let n = available.len().min(scores.len());
+
+        // Fail closed: if the gate has fewer outputs than adapters AND k exceeds
+        // those usable outputs, returning an error beats a panic inside
+        // select_nth_unstable (which would fire with "index out of bounds").
+        if k > n {
+            return Err(RouterError::GateTooNarrow { k, usable: n });
+        }
+
         let mut indexed: Vec<(usize, f32)> = scores[..n].iter().copied().enumerate().collect();
-        // Partial-sort: move the top-k elements to the front.
+        // Partial-sort in O(n) average: top-k elements land in indexed[..k].
         indexed.select_nth_unstable_by(k - 1, |a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Sort the selected prefix by score descending for deterministic output.
+        // We work directly on (orig_index, score) pairs so duplicate adapter IDs
+        // cannot confuse a position() lookup.
+        indexed[..k].sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let weight = 1.0 / k as f32;
-        let mut selected: Vec<(AdapterId, f32)> = indexed[..k]
+        let selected: Vec<(AdapterId, f32)> = indexed[..k]
             .iter()
             .map(|(idx, _)| (available[*idx].clone(), weight))
             .collect();
-        // Sort by descending score for deterministic output ordering.
-        selected.sort_by(|a, b| {
-            let sa = scores[available.iter().position(|x| x == &a.0).unwrap_or(0)];
-            let sb = scores[available.iter().position(|x| x == &b.0).unwrap_or(0)];
-            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         Ok(selected)
     }
@@ -233,5 +254,19 @@ mod tests {
         let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
         // supply 3 floats instead of 4
         assert!(router.route(&[1.0, 2.0, 3.0], &available, 1).is_err());
+    }
+
+    #[test]
+    fn route_narrow_gate_returns_err() {
+        // Gate has only 3 outputs; available has 5 adapters.
+        // k=4 exceeds the 3 usable outputs → must return GateTooNarrow, not panic.
+        let mut router = make_router(2, 3);
+        let available: Vec<AdapterId> = (0..5).map(|i| format!("a{i}")).collect();
+        let ctx = vec![1.0f32; 2];
+        let result = router.route(&ctx, &available, 4);
+        assert!(
+            matches!(result, Err(RouterError::GateTooNarrow { k: 4, usable: 3 })),
+            "expected GateTooNarrow {{k:4, usable:3}}, got {result:?}"
+        );
     }
 }
