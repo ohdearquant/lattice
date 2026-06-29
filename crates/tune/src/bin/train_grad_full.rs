@@ -76,6 +76,7 @@ Options:
   --max-train   <N>      Training samples cap (default: 3)
   --max-valid   <N>      Held-out valid.jsonl samples for eval, 0=off (default: 16)
   --log-every   <N>      Print NLL every N steps (default: 5)
+  --save        <PATH>   Save trained adapter as a PEFT safetensors file (requires --features safetensors)
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
   -h, --help             Print this help"
@@ -280,8 +281,8 @@ struct SeqCtx {
 }
 
 enum MixerCache {
-    Gqa(AttnCache),
-    Gdn(GdnSaved),
+    Gqa(Box<AttnCache>),
+    Gdn(Box<GdnSaved>),
 }
 
 /// Saved forward activations for one materialised layer.
@@ -387,7 +388,7 @@ fn forward_full(
                     &ctx.sin,
                     d.eps,
                 );
-                (out, MixerCache::Gqa(cache))
+                (out, MixerCache::Gqa(Box::new(cache)))
             }
             MixerKind::Gdn => {
                 let mut saved = GdnSaved::new(
@@ -411,7 +412,7 @@ fn forward_full(
                     &mut saved,
                     &mut out,
                 );
-                (out, MixerCache::Gdn(saved))
+                (out, MixerCache::Gdn(Box::new(saved)))
             }
         };
 
@@ -740,6 +741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd_eps: f32 = parse_arg(&args, "--fd-eps")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4e-3);
+    let save_path = parse_arg(&args, "--save");
 
     if first_layer > TOP_LAYER {
         return Err(format!("--first-layer {first_layer} must be <= {TOP_LAYER}").into());
@@ -1232,5 +1234,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             final_nll - base_nll
         ),
     }
+
+    if let Some(ref path) = save_path {
+        #[cfg(feature = "safetensors")]
+        {
+            use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
+            use std::collections::HashMap;
+            let mut adapter_layers = HashMap::new();
+            for (slot, &li) in slot_layers.iter().enumerate() {
+                adapter_layers.insert(
+                    (li, "q_proj".to_string()),
+                    LoraLayer {
+                        a: loras[slot].a_q.clone(),
+                        b: loras[slot].b_q.clone(),
+                        d_in: dims.hidden,
+                        d_out: 2 * dims.q_dim,
+                        rank,
+                    },
+                );
+                adapter_layers.insert(
+                    (li, "v_proj".to_string()),
+                    LoraLayer {
+                        a: loras[slot].a_v.clone(),
+                        b: loras[slot].b_v.clone(),
+                        d_in: dims.hidden,
+                        d_out: dims.kv_dim,
+                        rank,
+                    },
+                );
+            }
+            let config = LoraConfig {
+                rank,
+                alpha,
+                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            };
+            let adapter = LoraAdapter::new(config, adapter_layers);
+            adapter
+                .save_safetensors(std::path::Path::new(path))
+                .map_err(|e| format!("save adapter: {e}"))?;
+            println!("saved adapter ({num_slots} GQA slots, rank {rank}) → {path}");
+        }
+        #[cfg(not(feature = "safetensors"))]
+        {
+            let _ = path;
+            return Err("--save requires the safetensors feature (--features safetensors)".into());
+        }
+    }
+
     Ok(())
 }

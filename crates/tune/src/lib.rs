@@ -178,6 +178,10 @@ pub use train::{
 pub use train::{GpuTrainer, GpuTrainerBuilder};
 
 // LoRA re-exports
+#[cfg(all(feature = "safetensors", feature = "serde"))]
+pub use lora::LoadedAdapter;
+#[cfg(feature = "serde")]
+pub use lora::{AdapterId, LoraManifest, ManifestEntry};
 pub use lora::{LoraAdapter, LoraConfig, LoraLayer, blend_lora_adapters};
 
 // Registry re-exports
