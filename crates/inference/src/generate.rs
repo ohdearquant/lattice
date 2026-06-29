@@ -356,7 +356,7 @@ pub fn generate(
     // panic in Vec::with_capacity (capacity * 4 bytes > isize::MAX). effective_cap
     // is already validated allocation-safe by check_alloc_capacity above.
     let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens.min(effective_cap));
-    let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size])?;
+    let first_token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
     generated_ids.push(first_token);
 
     // Advance grammar state after sampling.
@@ -403,7 +403,7 @@ pub fn generate(
                 engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
             }
 
-            let token = sampler.sample(&scratch.logits[..cfg.vocab_size])?;
+            let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
             // Advance grammar state after sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
                 if !engine.advance(gs, token) {

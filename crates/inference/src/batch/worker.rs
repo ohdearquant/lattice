@@ -389,12 +389,7 @@ impl BatchWorker {
                     let Some(sampler) = self.samplers.get_mut(&seq_id) else {
                         continue;
                     };
-                    // An all-masked logit vector (grammar-blocked or corrupt) carries no
-                    // valid draw; skip this sequence step rather than emitting token 0.
-                    match sampler.sample(&logits) {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    }
+                    sampler.sample(&logits)
                 };
                 let done = self
                     .seq_manager
@@ -449,12 +444,7 @@ impl BatchWorker {
                 let Some(sampler) = self.samplers.get_mut(&seq_id) else {
                     continue;
                 };
-                // An all-masked logit vector (grammar-blocked or corrupt) carries no
-                // valid draw; skip this sequence step rather than emitting token 0.
-                match sampler.sample(&logits) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                }
+                sampler.sample(&logits)
             };
 
             let done = self

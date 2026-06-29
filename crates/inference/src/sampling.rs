@@ -92,27 +92,23 @@ impl CandidateSet {
 
     /// Return the token_id of the candidate with the highest logit.
     ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::InferenceError::InvalidInput`] when the candidate set is
-    /// empty or every logit equals [`f32::NEG_INFINITY`] (a fully masked set).  Both cases
-    /// have no meaningful argmax — returning a hardcoded 0 would emit a token that is not
-    /// necessarily a member of the candidate set, violating the fail-closed contract shared
-    /// by the softmax path.
-    pub fn argmax(&self) -> Result<u32, crate::error::InferenceError> {
+    /// On an all-masked compact set every logit is `f32::NEG_INFINITY`, so the
+    /// comparison loop never updates `best_id`.  The initializer must therefore
+    /// be the first candidate's `token_id` rather than the bare sentinel `0`:
+    /// after grammar or top-k compaction, token id 0 is not guaranteed to be a
+    /// member of the set, and returning it would silently emit an out-of-set
+    /// token.  `unwrap_or(0)` is safe only as a last resort for an empty set
+    /// (the full-vocab path always contains at least one candidate).
+    pub fn argmax(&self) -> u32 {
+        let mut best_id = self.candidates.first().map(|c| c.token_id).unwrap_or(0);
         let mut best_val = f32::NEG_INFINITY;
-        let mut best_id = None;
         for c in &self.candidates {
             if c.logit > best_val {
                 best_val = c.logit;
-                best_id = Some(c.token_id);
+                best_id = c.token_id;
             }
         }
-        best_id.ok_or_else(|| {
-            crate::error::InferenceError::InvalidInput(
-                "argmax on an empty or all-masked (-inf) candidate set".into(),
-            )
-        })
+        best_id
     }
 
     /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
@@ -125,22 +121,12 @@ impl CandidateSet {
     /// `sample_top_p` could still return a non-argmax token. Instead collapse the set to a
     /// one-hot on the argmax — the same hard-argmax route the main `Sampler` takes for a
     /// degenerate temperature (see `temperature_degenerate`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::InferenceError::InvalidInput`] when the temperature is
-    /// degenerate (tiny-finite) and the candidate set is empty or fully masked.  The
-    /// `t -> 0+` limit is `argmax`, but argmax is undefined over an all-masked set —
-    /// propagating the error is the fail-closed equivalent of the softmax guard.
-    pub fn apply_temperature(
-        &mut self,
-        temperature: f32,
-    ) -> Result<(), crate::error::InferenceError> {
+    pub fn apply_temperature(&mut self, temperature: f32) {
         if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
-            return Ok(());
+            return;
         }
         if temperature_degenerate(temperature) {
-            let best = self.argmax()?;
+            let best = self.argmax();
             for c in &mut self.candidates {
                 c.logit = if c.token_id == best {
                     0.0
@@ -148,13 +134,12 @@ impl CandidateSet {
                     f32::NEG_INFINITY
                 };
             }
-            return Ok(());
+            return;
         }
         let inv = 1.0 / temperature;
         for c in &mut self.candidates {
             c.logit *= inv;
         }
-        Ok(())
     }
 
     /// Keep only the top-`k` candidates by logit (O(n) partial select).
@@ -167,51 +152,13 @@ impl CandidateSet {
         self.candidates.truncate(k);
     }
 
-    /// Returns `true` when every logit in the set is `-inf` or NaN, i.e. no
-    /// candidate carries a valid probability mass.  A `+inf` logit is NOT masked:
-    /// `c.logit > f32::NEG_INFINITY` is `true` for any finite value or `+inf` and
-    /// `false` for `-inf` and NaN, so a `+inf` candidate escapes this predicate.
-    ///
-    /// Used by both `sample_top_p` and `Sampler::sample` to share the fail-closed
-    /// guard without duplicating the predicate (#451, shared-guard-public-boundary).
-    fn all_masked(&self) -> bool {
-        !self.candidates.iter().any(|c| c.logit > f32::NEG_INFINITY)
-    }
-
     /// Sort descending, apply softmax, optionally truncate with top-p nucleus
     /// filtering, renormalise, and return a weighted-random sample.
     ///
     /// `r` must be a uniform f32 in [0, 1).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::InferenceError::InvalidInput`] when the candidate set is
-    /// empty, or when every logit is [`f32::NEG_INFINITY`] or NaN (a fully masked set).
-    /// Both cases carry no valid sampling distribution — returning an arbitrary candidate
-    /// would violate the fail-closed contract shared with `argmax` (#405).
-    /// A set containing at least one [`f32::INFINITY`] logit is NOT fully masked; the
-    /// `+inf` token is a well-defined winner and is handled by the inner softmax guard.
-    pub fn sample_top_p(
-        &mut self,
-        top_p: f32,
-        r: f32,
-    ) -> Result<u32, crate::error::InferenceError> {
-        if self.candidates.is_empty() {
-            return Err(crate::error::InferenceError::InvalidInput(
-                "sample_top_p on an empty candidate set".into(),
-            ));
-        }
-        // Reject a fully-masked set where every logit is -inf or NaN.  The inner
-        // `sample_top_p_with_scratch` guard (`!max_logit.is_finite()`) catches both
-        // -inf and +inf and returns `candidates[0].token_id`; for -inf that token is
-        // arbitrary and may not be a valid member of a grammar-compacted set.
-        if self.all_masked() {
-            return Err(crate::error::InferenceError::InvalidInput(
-                "sample_top_p on a fully-masked (all -inf or NaN) candidate set".into(),
-            ));
-        }
+    pub fn sample_top_p(&mut self, top_p: f32, r: f32) -> u32 {
         let mut probs = Vec::new();
-        Ok(self.sample_top_p_with_scratch(top_p, r, &mut probs))
+        self.sample_top_p_with_scratch(top_p, r, &mut probs)
     }
 
     /// Same as `sample_top_p` but reuses the caller's probability buffer to avoid allocation.
@@ -395,14 +342,7 @@ impl Sampler {
     ///
     /// `logits` is the raw output from the model's final linear layer,
     /// shape `[vocab_size]`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::InferenceError::InvalidInput`] when every logit is
-    /// [`f32::NEG_INFINITY`] or NaN (a fully masked set with no valid draw).  This
-    /// mirrors the guard in [`CandidateSet::sample_top_p`] — both delegate to
-    /// [`CandidateSet::all_masked`] so the predicate is defined in one place (#451).
-    pub fn sample(&mut self, logits: &[f32]) -> Result<u32, crate::error::InferenceError> {
+    pub fn sample(&mut self, logits: &[f32]) -> u32 {
         // Greedy fast path: skip the full-vocab clone when argmax is not penalized.
         // A repetition penalty >= 1.0 only lowers penalized tokens, so argmax(raw) ==
         // argmax(penalized) whenever the raw argmax token is not in recent_tokens. In the
@@ -432,7 +372,7 @@ impl Sampler {
             let penalty_inactive = penalty == 1.0 || !penalty.is_finite() || penalty <= 0.0;
             if penalty_inactive || (penalty > 1.0 && !self.recent_tokens.contains(&raw_best)) {
                 self.push_token(raw_best);
-                return Ok(raw_best);
+                return raw_best;
             }
             // raw argmax would change once the penalty is applied — clone + re-scan.
             self.logit_scratch.clear();
@@ -441,7 +381,7 @@ impl Sampler {
             self.apply_penalty_to_logit_scratch(penalty);
             let token = argmax_f32(&self.logit_scratch);
             self.push_token(token);
-            return Ok(token);
+            return token;
         }
 
         // Non-greedy path: clone logits for in-place penalty + fused top-k.
@@ -471,24 +411,11 @@ impl Sampler {
         let mut cs = CandidateSet {
             candidates: std::mem::take(&mut self.candidate_scratch),
         };
-
-        // Mirror the all-masked guard from CandidateSet::sample_top_p (#451).
-        // sample_top_p_with_scratch returns candidates[0].token_id when max_logit
-        // is not finite, which for an all-(-inf) set is an arbitrary token — not a
-        // fail-closed response. The public guard lives on sample_top_p, but this
-        // path calls the private scratch variant directly, bypassing it.
-        if cs.all_masked() {
-            self.candidate_scratch = cs.candidates; // restore scratch capacity before returning
-            return Err(crate::error::InferenceError::InvalidInput(
-                "sample on a fully-masked (all -inf or NaN) logit vector".into(),
-            ));
-        }
-
         let r = self.rng.next_f32();
         let token = cs.sample_top_p_with_scratch(self.config.top_p, r, &mut self.prob_scratch);
         self.candidate_scratch = cs.candidates; // restore scratch capacity
         self.push_token(token);
-        Ok(token)
+        token
     }
 
     fn push_token(&mut self, token: u32) {
@@ -868,7 +795,7 @@ mod tests {
         let config = SamplingConfig::greedy();
         let mut sampler = Sampler::new(config);
         let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-        assert_eq!(sampler.sample(&logits).unwrap(), 3);
+        assert_eq!(sampler.sample(&logits), 3);
     }
 
     #[test]
@@ -879,7 +806,7 @@ mod tests {
         };
         let mut sampler = Sampler::new(config);
         let logits = vec![1.0, 5.0, 2.0];
-        assert_eq!(sampler.sample(&logits).unwrap(), 1);
+        assert_eq!(sampler.sample(&logits), 1);
     }
 
     #[test]
@@ -898,7 +825,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits).unwrap(),
+                sampler.sample(&logits),
                 1,
                 "temperature {bad} must fall back to argmax, not collapse to token 0"
             );
@@ -922,7 +849,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits).unwrap(),
+                sampler.sample(&logits),
                 1,
                 "tiny temperature {tiny} must fall back to argmax, not collapse to token 0"
             );
@@ -981,7 +908,7 @@ mod tests {
             };
             let mut sampler = Sampler::new(config).with_seed(7);
             assert_eq!(
-                sampler.sample(&logits).unwrap(),
+                sampler.sample(&logits),
                 1,
                 "residual-band temperature {band} must fall back to argmax, not collapse"
             );
@@ -1000,14 +927,14 @@ mod tests {
             -2.0_f32,
         ] {
             let mut cs = CandidateSet::from_full_logits(&[1.0, 5.0, 3.0]);
-            cs.apply_temperature(bad).unwrap();
+            cs.apply_temperature(bad);
             let logits: Vec<f32> = cs.candidates.iter().map(|c| c.logit).collect();
             assert_eq!(
                 logits,
                 vec![1.0, 5.0, 3.0],
                 "temperature {bad} must be a no-op, leaving logits finite and unscaled"
             );
-            assert_eq!(cs.argmax().unwrap(), 1);
+            assert_eq!(cs.argmax(), 1);
         }
     }
 
@@ -1019,10 +946,10 @@ mod tests {
         // tie-breaks on ascending token_id and `sample_top_p` returns token 0 instead
         // of the argmax (token 1).
         let mut cs = CandidateSet::from_full_logits(&[10.0, 11.0]);
-        cs.apply_temperature(1e-45).unwrap();
+        cs.apply_temperature(1e-45);
         // top_p = 1.0 (no nucleus truncation) + r = 0.0 => pure argmax selection.
         assert_eq!(
-            cs.sample_top_p(1.0, 0.0).unwrap(),
+            cs.sample_top_p(1.0, 0.0),
             1,
             "tiny positive temperature must resolve to the argmax (greedy), not token 0"
         );
@@ -1036,9 +963,9 @@ mod tests {
         // leave these two near 50/50, so `sample_top_p(1.0, 0.75)` could draw token 0;
         // the one-hot collapse makes the argmax (token 1) the only reachable draw.
         let mut cs = CandidateSet::from_full_logits(&[0.0, f32::from_bits(1)]);
-        cs.apply_temperature(1e-45).unwrap();
+        cs.apply_temperature(1e-45);
         assert_eq!(
-            cs.sample_top_p(1.0, 0.75).unwrap(),
+            cs.sample_top_p(1.0, 0.75),
             1,
             "degenerate temperature must be hard-greedy even for adjacent logits"
         );
@@ -1057,7 +984,7 @@ mod tests {
         let logits = vec![0.0, 10.0, 0.0, 9.0, 0.0];
         let mut counts = [0u32; 5];
         for _ in 0..100 {
-            let tok = sampler.sample(&logits).unwrap();
+            let tok = sampler.sample(&logits);
             counts[tok as usize] += 1;
         }
         // Only tokens 1 and 3 should appear
@@ -1080,11 +1007,11 @@ mod tests {
         let logits = vec![0.0, 5.0, 4.9]; // token 1 is best
 
         // First sample: picks 1 (highest)
-        let first = sampler.sample(&logits).unwrap();
+        let first = sampler.sample(&logits);
         assert_eq!(first, 1);
 
         // Second sample: token 1 is penalized, should pick 2
-        let second = sampler.sample(&logits).unwrap();
+        let second = sampler.sample(&logits);
         assert_eq!(second, 2);
     }
 
@@ -1103,12 +1030,12 @@ mod tests {
         let mut sampler = Sampler::new(config);
 
         // Step 1: token 1 is the clear argmax; becomes a recent token.
-        assert_eq!(sampler.sample(&[0.0, 10.0]).unwrap(), 1);
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
 
         // Step 2: raw argmax is token 0 (5.0) and is NOT recent, but recent token
         // 1 is boosted to 4.0 / 0.5 = 8.0 > 5.0, so the penalized argmax is token
         // 1. Before the fix the fast path returned the raw argmax token 0.
-        assert_eq!(sampler.sample(&[5.0, 4.0]).unwrap(), 1);
+        assert_eq!(sampler.sample(&[5.0, 4.0]), 1);
     }
 
     /// The documented always-safe case the conservative gate leaves to the re-scan:
@@ -1126,11 +1053,11 @@ mod tests {
         let mut sampler = Sampler::new(config);
 
         // Step 1: token 1 is the clear argmax; becomes a recent token.
-        assert_eq!(sampler.sample(&[0.0, 10.0]).unwrap(), 1);
+        assert_eq!(sampler.sample(&[0.0, 10.0]), 1);
 
         // Step 2: raw argmax is token 1 (6.0) and IS recent. Boosting it to
         // 6.0 / 0.5 = 12.0 keeps it above token 0's 5.0, so it stays the argmax.
-        assert_eq!(sampler.sample(&[5.0, 6.0]).unwrap(), 1);
+        assert_eq!(sampler.sample(&[5.0, 6.0]), 1);
     }
 
     #[test]
@@ -1146,7 +1073,7 @@ mod tests {
         let logits = vec![10.0, 1.0, 1.0, 1.0, 1.0];
         let mut counts = [0u32; 5];
         for _ in 0..100 {
-            counts[sampler.sample(&logits).unwrap() as usize] += 1;
+            counts[sampler.sample(&logits) as usize] += 1;
         }
         // Token 0 should get almost all samples (its probability >> 0.5)
         assert!(counts[0] > 90);
@@ -1156,7 +1083,7 @@ mod tests {
     fn test_sampler_reset() {
         let config = SamplingConfig::greedy();
         let mut sampler = Sampler::new(config);
-        sampler.sample(&[1.0, 2.0, 3.0]).unwrap();
+        sampler.sample(&[1.0, 2.0, 3.0]);
         assert!(!sampler.recent_tokens.is_empty());
         sampler.reset();
         assert!(sampler.recent_tokens.is_empty());
@@ -1220,6 +1147,35 @@ mod tests {
         let logits = vec![f32::NEG_INFINITY; 8];
         assert_eq!(argmax_f32_scalar(&logits), 0, "scalar neg-inf");
         assert_eq!(argmax_f32(&logits), 0, "dispatch neg-inf");
+    }
+
+    // ── CandidateSet::argmax correctness ─────────────────────────────────────
+
+    #[test]
+    fn test_candidateset_argmax_all_masked_returns_first_in_set_token() {
+        // After grammar or top-k masking every logit in a compacted CandidateSet
+        // can be NEG_INFINITY (the full vocabulary was masked except for these
+        // candidates, whose own scores are also suppressed).  When that happens
+        // the comparison loop never fires, so argmax must return the *first
+        // candidate's token_id* — an in-set token — not the bare sentinel 0.
+        // Token ids 7 and 9 are deliberately chosen to be non-zero; if the
+        // initializer regresses to `0u32` this test returns 0 instead of 7 and
+        // fails, catching the regression.
+        let cs = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 7,
+                logit: f32::NEG_INFINITY,
+            },
+            Candidate {
+                token_id: 9,
+                logit: f32::NEG_INFINITY,
+            },
+        ]);
+        assert_eq!(
+            cs.argmax(),
+            7,
+            "all-masked compact set must return first in-set token id"
+        );
     }
 
     #[test]
@@ -1388,7 +1344,7 @@ mod tests {
             },
         ]);
         // r in the middle of the distribution; pre-fix this returns last() = 1.
-        let token = cs.sample_top_p(1.0, 0.5).unwrap();
+        let token = cs.sample_top_p(1.0, 0.5);
         assert_eq!(
             token, 0,
             "tail-NaN poisons the softmax sum; must fall back to argmax (token 0), not last()"
@@ -1424,24 +1380,24 @@ mod tests {
         };
 
         for &r in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
-            let baseline = make().sample_top_p(1.0, r).unwrap();
+            let baseline = make().sample_top_p(1.0, r);
             assert_eq!(
-                make().sample_top_p(f32::NAN, r).unwrap(),
+                make().sample_top_p(f32::NAN, r),
                 baseline,
                 "NaN top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(1.5, r).unwrap(),
+                make().sample_top_p(1.5, r),
                 baseline,
                 ">1 top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(f32::INFINITY, r).unwrap(),
+                make().sample_top_p(f32::INFINITY, r),
                 baseline,
                 "+Inf top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(-0.5, r).unwrap(),
+                make().sample_top_p(-0.5, r),
                 0,
                 "negative top_p must collapse to greedy argmax at r={r}"
             );
@@ -1628,7 +1584,7 @@ mod tests {
         let logits = vec![1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let mut counts = [0u32; 8];
         for _ in 0..400 {
-            counts[sampler.sample(&logits).unwrap() as usize] += 1;
+            counts[sampler.sample(&logits) as usize] += 1;
         }
         let nonzero = counts.iter().filter(|&&c| c > 0).count();
         assert!(
@@ -1703,13 +1659,13 @@ mod tests {
         })
         .with_seed(1);
         // Step 1: token 1 is the clear argmax; recent_tokens -> [1].
-        assert_eq!(s.sample(&[0.0, 10.0, 0.0]).unwrap(), 1);
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
         // Step 2: token 1 penalized once (10/2 = 5) still wins; recent_tokens -> [1, 1].
-        assert_eq!(s.sample(&[0.0, 10.0, 0.0]).unwrap(), 1);
+        assert_eq!(s.sample(&[0.0, 10.0, 0.0]), 1);
         // Step 3: token 1 penalized ONCE (10/2 = 5) must beat token 2 (logit 3).
         // The per-occurrence bug penalizes twice (10/2/2 = 2.5) and wrongly picks token 2.
         assert_eq!(
-            s.sample(&[0.0, 10.0, 3.0]).unwrap(),
+            s.sample(&[0.0, 10.0, 3.0]),
             1,
             "duplicate history id must be penalized once, not per occurrence"
         );
@@ -1759,7 +1715,7 @@ mod tests {
         // Seed token 1 as a prompt token.
         sampler.seed_history(&[1u32]);
         // logits: token 1 = 10.0 wins raw, but 10.0/2.0 = 5.0 < token 0's 6.0 after penalty.
-        let token = sampler.sample(&[6.0, 10.0]).unwrap();
+        let token = sampler.sample(&[6.0, 10.0]);
         assert_eq!(
             token, 0,
             "token 1 was seeded in history; penalty 2.0 reduces its adjusted logit \
@@ -1793,7 +1749,7 @@ mod tests {
         // With old 64-cap restored in push_token: token 1 was evicted from the window →
         // raw_best (token 1) is no longer in history so the greedy shortcut returns it
         // un-penalized → token 1 wins.
-        let token = sampler.sample(&[6.0, 10.0]).unwrap();
+        let token = sampler.sample(&[6.0, 10.0]);
         assert_eq!(
             token, 0,
             "token 1 at position 0 in a 65-entry history must still be penalized; \
@@ -1820,178 +1776,12 @@ mod tests {
         sampler.seed_history(&[1, 1, 1, 1]);
         // Once penalized: 10.0/2.0 = 5.0 > 4.9 → token 1 wins (correct).
         // Per-occurrence (penalty^4): 10.0/16.0 = 0.625 < 4.9 → token 0 wins (wrong).
-        let token = sampler.sample(&[4.9, 10.0]).unwrap();
+        let token = sampler.sample(&[4.9, 10.0]);
         assert_eq!(
             token, 1,
             "token 1 repeated 4× must be penalized once (5.0 > 4.9, token 1 wins); \
              per-occurrence compounding yields 0.625 and wrongly selects token 0 \
              (mutation: replace HashSet dedup with per-occurrence penalty)"
-        );
-    }
-
-    // ── H5: CandidateSet fail-closed regression tests (#405) ─────────────────
-    //
-    // Before the fix, `argmax` initialised `best_id = 0u32` and returned it
-    // unconditionally, so an empty or all-NEG_INFINITY candidate set silently
-    // emitted token 0 even when token 0 was not in the set (e.g. after
-    // grammar-mask compaction or retain_top_k).  The tests below FAIL on the
-    // pre-fix code path and PASS after the fix — they are the mutation-sensitive
-    // gate for #405.
-
-    #[test]
-    fn test_candidateset_argmax_empty_returns_err() {
-        // Pre-fix: best_id stayed 0u32 (the initialiser) → returned unconditionally.
-        // Token 0 is not a member of an empty set → out-of-set emission.
-        let cs = CandidateSet::from_candidates(vec![]);
-        assert!(
-            cs.argmax().is_err(),
-            "argmax on an empty set must be Err, not the initialiser token 0"
-        );
-    }
-
-    #[test]
-    fn test_candidateset_argmax_all_masked_returns_err() {
-        // Every logit is NEG_INFINITY — no candidate beats the sentinel, so
-        // best_id must stay None and propagate InvalidInput.  Pre-fix, best_id
-        // stayed 0u32 and was returned, emitting token 0 even though neither
-        // token 5 nor token 10 is token 0.
-        let cs = CandidateSet::from_candidates(vec![
-            Candidate {
-                token_id: 5,
-                logit: f32::NEG_INFINITY,
-            },
-            Candidate {
-                token_id: 10,
-                logit: f32::NEG_INFINITY,
-            },
-        ]);
-        assert!(
-            cs.argmax().is_err(),
-            "argmax on an all-masked set must be Err, not the initialiser token 0"
-        );
-    }
-
-    #[test]
-    fn test_candidateset_sample_top_p_empty_returns_err() {
-        // sample_top_p delegates to the private scratch path which returns 0 on
-        // an empty slice — the public method must intercept before that.
-        let mut cs = CandidateSet::from_candidates(vec![]);
-        assert!(
-            cs.sample_top_p(1.0, 0.5).is_err(),
-            "sample_top_p on an empty candidate set must be Err"
-        );
-    }
-
-    /// Mutation-sensitive guard for the all-masked `sample_top_p` fix (#405 / F1).
-    ///
-    /// Without the `any(|c| c.logit > f32::NEG_INFINITY)` guard in `sample_top_p`,
-    /// the call falls through to `sample_top_p_with_scratch`.  There, `max_logit`
-    /// is `-inf` (not finite), so the inner guard returns `candidates[0].token_id`
-    /// (token 5) wrapped in `Ok` — this test would then receive `Ok(5)` and the
-    /// `is_err()` assertion would fail, making reversion detectable.
-    ///
-    /// The token ids (5, 10) are deliberately non-zero to distinguish the guard's
-    /// output from an accidental token-0 emission.
-    #[test]
-    fn test_candidateset_sample_top_p_all_masked_returns_err() {
-        let mut cs = CandidateSet::from_candidates(vec![
-            Candidate {
-                token_id: 5,
-                logit: f32::NEG_INFINITY,
-            },
-            Candidate {
-                token_id: 10,
-                logit: f32::NEG_INFINITY,
-            },
-        ]);
-        assert!(
-            cs.sample_top_p(1.0, 0.5).is_err(),
-            "sample_top_p on a fully-masked (all -inf) set must be Err, not Ok(candidates[0])"
-        );
-    }
-
-    #[test]
-    fn test_candidateset_apply_temperature_degenerate_all_masked_returns_err() {
-        // Degenerate temperature → hard-argmax limit, but argmax over an
-        // all-masked set is undefined.  Pre-fix: argmax returned 0 and
-        // apply_temperature silently collapsed the set to a one-hot on token 0
-        // (which may not even be a member).  Post-fix: error propagates.
-        let mut cs = CandidateSet::from_candidates(vec![Candidate {
-            token_id: 7,
-            logit: f32::NEG_INFINITY,
-        }]);
-        assert!(
-            cs.apply_temperature(1e-45).is_err(),
-            "degenerate temperature on an all-masked set must be Err"
-        );
-    }
-
-    // ── H5b: Sampler::sample fail-closed regression tests (#451) ─────────────
-    //
-    // Before the fix, the non-greedy path in Sampler::sample called
-    // sample_top_p_with_scratch directly, bypassing the all-masked guard that
-    // lives on the public CandidateSet::sample_top_p.  sample_top_p_with_scratch
-    // reaches its inner `!max_logit.is_finite()` branch for an all-(-inf) set
-    // and returns candidates[0].token_id — token 0 — rather than an error.
-    //
-    // These tests FAIL on the pre-fix path (returns Ok(0)) and PASS after the
-    // fix (returns Err).  They are the mutation-sensitive gate for #451.
-
-    /// Non-greedy all-masked: the shared-guard-public-boundary fix.
-    ///
-    /// Mutation-sensitive: remove the `cs.all_masked()` guard in Sampler::sample
-    /// and this test receives `Ok(0)` from the inner scratch path, causing the
-    /// `is_err()` assertion to fail.  The token ids in the vocab are default
-    /// (0-indexed), so token 0 is the incorrect-but-undetectable sentinel the
-    /// pre-fix code emitted — making the non-zero expectation in the mixed-set
-    /// companion test the cleaner reversion detector.
-    #[test]
-    fn test_sampler_sample_all_neg_inf_non_greedy_returns_err() {
-        // Non-greedy config: temperature=1.0 keeps temperature_degenerate false,
-        // top_k > 1 prevents the greedy shortcut, so the non-greedy path executes.
-        let config = SamplingConfig {
-            temperature: 1.0,
-            top_k: 50,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-        };
-        let mut sampler = Sampler::new(config).with_seed(0);
-        let all_neg_inf = vec![f32::NEG_INFINITY; 8];
-        assert!(
-            sampler.sample(&all_neg_inf).is_err(),
-            "Sampler::sample on an all-(-inf) logit vector must be Err, not Ok(token 0) \
-             (mutation: remove the cs.all_masked() guard added for #451)"
-        );
-    }
-
-    /// Mixed set (one finite, rest -inf): the guard must NOT fire.
-    ///
-    /// Mutation-sensitive: an overly-broad guard that rejects any set containing
-    /// a -inf candidate would cause this to return Err instead of Ok(3), failing
-    /// the unwrap and producing a panic.
-    #[test]
-    fn test_sampler_sample_mixed_finite_and_neg_inf_samples_finite_token() {
-        let config = SamplingConfig {
-            temperature: 1.0,
-            top_k: 0, // disabled — keep all candidates
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-        };
-        let mut sampler = Sampler::new(config).with_seed(0);
-        // Token 3 is the only candidate with a finite logit; the guard must pass
-        // and sample_top_p_with_scratch must return it (softmax collapses to one-hot).
-        let logits = vec![
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            f32::NEG_INFINITY,
-            5.0_f32,
-            f32::NEG_INFINITY,
-        ];
-        let token = sampler.sample(&logits).unwrap();
-        assert_eq!(
-            token, 3,
-            "a mixed set with one finite logit must sample that token, not Err \
-             (mutation: broaden the guard to reject any -inf candidate)"
         );
     }
 }

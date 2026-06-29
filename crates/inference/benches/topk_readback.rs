@@ -1591,7 +1591,7 @@ fn bench_candidate_sampler(c: &mut Criterion) {
                     || candidates.clone(),
                     |cands| {
                         let mut cs = CandidateSet::from_candidates(cands);
-                        black_box(cs.sample_top_p(0.9, 0.5).unwrap())
+                        black_box(cs.sample_top_p(0.9, 0.5))
                     },
                     criterion::BatchSize::SmallInput,
                 );
