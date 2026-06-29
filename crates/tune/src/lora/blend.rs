@@ -1,0 +1,400 @@
+//! Weighted blending of multiple LoRA adapters into a single rank-Σr adapter.
+//!
+//! # Why blend instead of loading multiple adapters
+//!
+//! The Metal inference path holds exactly one `Option<MetalLoraAdapter>` slot.
+//! Rather than adding a Metal kernel that dispatches across N adapters,
+//! we pre-blend on the CPU once per request: the result is a standard single
+//! adapter loaded through the existing single-slot path with no kernel changes.
+//!
+//! # Blend math (exact, not approximate)
+//!
+//! For adapter `e` with effective scale `s_e = alpha_e / rank_e` and mixture
+//! weight `w_e`:
+//!
+//! ```text
+//! Δ_e x = s_e · B_e @ (A_e @ x)
+//! blend  = Σ_e  w_e · Δ_e x
+//!        = B_blend @ (A_blend @ x)
+//! ```
+//!
+//! where
+//! - `A_blend = vconcat[A_1; …; A_N]`          shape `(Σr_e) × d_in`
+//! - `B_blend = hconcat[(w_1·s_1)·B_1 | …]`    shape `d_out × (Σr_e)`
+//!
+//! The `w_e · s_e` coefficient is folded into the B column block so the
+//! blended adapter's effective scale is exactly **1.0** (`alpha = rank_total`).
+
+use crate::error::{Result, TuneError};
+use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
+use std::collections::HashMap;
+
+/// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
+///
+/// Each adapter in `adapters` contributes to the blended result with its
+/// corresponding weight `w_e`.  The per-adapter `alpha/rank` scale is folded
+/// into the B column block, so the returned adapter's effective scale is 1.0
+/// (i.e., `LoraConfig { alpha: rank_total, rank: rank_total }`).
+///
+/// # Target-module semantics
+///
+/// For each `(layer_idx, module)` pair that appears in **any** of the input
+/// adapters, a blended layer is produced.  An adapter that does not cover a
+/// given pair contributes zero (it is simply absent from the vertical/horizontal
+/// concatenation for that pair).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `adapters` is empty
+/// - Any weight is not finite
+/// - Two adapters share a `(layer_idx, module)` pair but disagree on `d_in` or `d_out`
+pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapter> {
+    if adapters.is_empty() {
+        return Err(TuneError::Validation(
+            "blend_lora_adapters: adapters slice must not be empty".into(),
+        ));
+    }
+
+    for (idx, (_, w)) in adapters.iter().enumerate() {
+        if !w.is_finite() {
+            return Err(TuneError::Validation(format!(
+                "blend_lora_adapters: weight at index {idx} is not finite ({w})"
+            )));
+        }
+    }
+
+    // Collect the union of all (layer_idx, module) keys, grouped by key.
+    // Value: list of (LoraLayer ref, effective_weight = w_e * s_e).
+    let mut grouped: HashMap<(usize, String), Vec<(&LoraLayer, f32)>> = HashMap::new();
+    for (adapter, weight) in adapters {
+        let s_e = adapter.config.scale();
+        let eff = weight * s_e;
+        for ((layer_idx, module), layer) in &adapter.layers {
+            grouped
+                .entry((*layer_idx, module.clone()))
+                .or_default()
+                .push((layer, eff));
+        }
+    }
+
+    // Blend each (layer_idx, module) group independently.
+    let mut blended_layers: HashMap<(usize, String), LoraLayer> = HashMap::new();
+    for ((layer_idx, module), entries) in &grouped {
+        let blended = blend_layer_entries(entries, &(layer_idx, module))?;
+        blended_layers.insert((*layer_idx, module.clone()), blended);
+    }
+
+    // Collect total rank and target modules for the blended config.
+    // We set alpha = rank so scale() == 1.0 — weights+scale already folded into B.
+    let total_rank: usize = blended_layers.values().map(|l| l.rank).max().unwrap_or(0);
+    let target_modules: Vec<String> = {
+        let mut mods: Vec<String> = grouped
+            .keys()
+            .map(|(_, m)| m.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        mods.sort();
+        mods
+    };
+
+    let config = LoraConfig {
+        rank: total_rank,
+        alpha: total_rank as f32,
+        target_modules,
+    };
+
+    Ok(LoraAdapter::new(config, blended_layers))
+}
+
+/// Blend multiple `(LoraLayer, effective_weight)` entries for a single
+/// `(layer_idx, module)` projection into one higher-rank layer.
+///
+/// `effective_weight = mixture_weight * (alpha / rank)` has already been
+/// computed by the caller so this function is pure linear algebra.
+fn blend_layer_entries(
+    entries: &[(&LoraLayer, f32)],
+    key: &(&usize, &String),
+) -> Result<LoraLayer> {
+    debug_assert!(!entries.is_empty());
+
+    let (first_layer, _) = entries[0];
+    let d_in = first_layer.d_in;
+    let d_out = first_layer.d_out;
+
+    // Validate that all entries share the same projection shape.
+    for (idx, (layer, _)) in entries.iter().enumerate() {
+        if layer.d_in != d_in || layer.d_out != d_out {
+            return Err(TuneError::Validation(format!(
+                "blend_lora_adapters: layer {} module '{}' has mismatched dimensions \
+                 (entry 0: d_in={d_in}, d_out={d_out}; entry {idx}: d_in={}, d_out={})",
+                key.0, key.1, layer.d_in, layer.d_out
+            )));
+        }
+    }
+
+    let rank_total: usize = entries.iter().map(|(l, _)| l.rank).sum();
+
+    // A_blend: vertical stack of A blocks.
+    // Layout: rows [0..r_1] from adapter 1, then [r_1..r_1+r_2] from adapter 2, …
+    // Each row has `d_in` elements.
+    let mut a_blend = Vec::with_capacity(rank_total * d_in);
+    for (layer, _) in entries {
+        a_blend.extend_from_slice(&layer.a);
+    }
+
+    // B_blend: horizontal concatenation of scaled B column blocks.
+    // B is stored row-major (d_out × rank), so row r is `b[r*rank..(r+1)*rank]`.
+    // After blending, row r of B_blend is:
+    //   [eff_1 * B_1[r, :] | eff_2 * B_2[r, :] | …]
+    let mut b_blend = vec![0.0f32; d_out * rank_total];
+    let mut col_offset = 0usize;
+    for (layer, eff_weight) in entries {
+        let r_e = layer.rank;
+        for row in 0..d_out {
+            let dst_start = row * rank_total + col_offset;
+            let src_start = row * r_e;
+            for c in 0..r_e {
+                b_blend[dst_start + c] = eff_weight * layer.b[src_start + c];
+            }
+        }
+        col_offset += r_e;
+    }
+
+    Ok(LoraLayer {
+        a: a_blend,
+        b: b_blend,
+        d_in,
+        d_out,
+        rank: rank_total,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Build a minimal single-layer adapter with a random-ish A and B.
+    fn make_adapter(rank: usize, d_in: usize, d_out: usize, seed: f32) -> LoraAdapter {
+        let a: Vec<f32> = (0..rank * d_in).map(|i| (i as f32 + seed) * 0.1).collect();
+        let b: Vec<f32> = (0..d_out * rank)
+            .map(|i| (i as f32 + seed) * 0.05)
+            .collect();
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".to_string()),
+            LoraLayer {
+                a,
+                b,
+                d_in,
+                d_out,
+                rank,
+            },
+        );
+        LoraAdapter::new(
+            LoraConfig {
+                rank,
+                alpha: rank as f32, // scale = 1.0
+                target_modules: vec!["q_proj".into()],
+            },
+            layers,
+        )
+    }
+
+    // Apply a LoraAdapter to x and return the delta (excludes base output).
+    fn lora_delta(adapter: &LoraAdapter, x: &[f32]) -> Vec<f32> {
+        let (_, layer) = adapter.layers.iter().next().unwrap();
+        let scale = adapter.config.scale();
+        let rank = layer.rank;
+        let d_in = layer.d_in;
+        let d_out = layer.d_out;
+
+        // intermediate = A @ x
+        let mut inter = vec![0.0f32; rank];
+        for r in 0..rank {
+            inter[r] = (0..d_in).map(|c| layer.a[r * d_in + c] * x[c]).sum();
+        }
+
+        // delta = scale * B @ inter
+        let mut delta = vec![0.0f32; d_out];
+        for row in 0..d_out {
+            delta[row] = scale
+                * (0..rank)
+                    .map(|c| layer.b[row * rank + c] * inter[c])
+                    .sum::<f32>();
+        }
+        delta
+    }
+
+    // Apply a LoraLayer (with explicit scale) to x and return the delta.
+    fn layer_delta(layer: &LoraLayer, scale: f32, x: &[f32]) -> Vec<f32> {
+        let rank = layer.rank;
+        let d_in = layer.d_in;
+        let d_out = layer.d_out;
+
+        let mut inter = vec![0.0f32; rank];
+        for r in 0..rank {
+            inter[r] = (0..d_in).map(|c| layer.a[r * d_in + c] * x[c]).sum();
+        }
+
+        let mut delta = vec![0.0f32; d_out];
+        for row in 0..d_out {
+            delta[row] = scale
+                * (0..rank)
+                    .map(|c| layer.b[row * rank + c] * inter[c])
+                    .sum::<f32>();
+        }
+        delta
+    }
+
+    // -----------------------------------------------------------------------
+    // Required assertion 1: single adapter at weight 1.0 is numerically
+    // identical to that adapter (max-diff 0.0 or < 1e-6).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_single_adapter_identity() {
+        let rank = 2;
+        let d_in = 4;
+        let d_out = 4;
+        let adapter = make_adapter(rank, d_in, d_out, 1.0);
+
+        let blended = blend_lora_adapters(&[(&adapter, 1.0)]).unwrap();
+
+        // Generate a test input vector.
+        let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32).collect();
+
+        let delta_orig = lora_delta(&adapter, &x);
+        // Blended adapter has scale=1.0 (alpha=rank_total).
+        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        let delta_blend = layer_delta(blended_layer, blended.config.scale(), &x);
+
+        let max_diff = delta_orig
+            .iter()
+            .zip(&delta_blend)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-6,
+            "single-adapter blend should be identical to original; max-diff={max_diff}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Required assertion 2: blend of two adapters equals explicit sum.
+    // w1·Δ1(x) + w2·Δ2(x) matches the blended adapter's output (max-diff < 1e-5).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_two_adapters_equals_sum() {
+        let rank = 3;
+        let d_in = 5;
+        let d_out = 6;
+        let w1 = 0.4f32;
+        let w2 = 0.6f32;
+
+        let adapter1 = make_adapter(rank, d_in, d_out, 0.0);
+        let adapter2 = make_adapter(rank, d_in, d_out, 10.0);
+
+        let blended = blend_lora_adapters(&[(&adapter1, w1), (&adapter2, w2)]).unwrap();
+
+        let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32 * 0.5).collect();
+
+        let d1 = lora_delta(&adapter1, &x);
+        let d2 = lora_delta(&adapter2, &x);
+        // Expected: w1*Δ1 + w2*Δ2
+        let expected: Vec<f32> = d1.iter().zip(&d2).map(|(a, b)| w1 * a + w2 * b).collect();
+
+        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+
+        let max_diff = expected
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            max_diff < 1e-5,
+            "blend of two adapters must equal w1·Δ1+w2·Δ2; max-diff={max_diff}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Required assertion 3: rank of blended adapter equals Σr_e.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_rank_equals_sum_of_ranks() {
+        let adapter1 = make_adapter(1, 4, 4, 0.0);
+        let adapter2 = make_adapter(2, 4, 4, 5.0);
+
+        let blended = blend_lora_adapters(&[(&adapter1, 0.5), (&adapter2, 0.5)]).unwrap();
+
+        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        assert_eq!(
+            blended_layer.rank,
+            1 + 2,
+            "blended rank must equal sum of individual ranks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case: empty adapters slice returns an error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_empty_returns_error() {
+        let result: Result<LoraAdapter> = blend_lora_adapters(&[]);
+        assert!(result.is_err(), "empty adapters should return an error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case: non-finite weight returns an error.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_non_finite_weight_returns_error() {
+        let adapter = make_adapter(1, 4, 4, 0.0);
+        let result = blend_lora_adapters(&[(&adapter, f32::NAN)]);
+        assert!(result.is_err(), "NaN weight should return an error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case: adapters with different ranks blend correctly.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_asymmetric_ranks() {
+        let r1 = 1;
+        let r2 = 4;
+        let d_in = 3;
+        let d_out = 3;
+        let w1 = 0.3f32;
+        let w2 = 0.7f32;
+
+        let adapter1 = make_adapter(r1, d_in, d_out, 1.0);
+        let adapter2 = make_adapter(r2, d_in, d_out, 2.0);
+
+        let blended = blend_lora_adapters(&[(&adapter1, w1), (&adapter2, w2)]).unwrap();
+        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+
+        assert_eq!(blended_layer.rank, r1 + r2);
+
+        let x: Vec<f32> = (0..d_in).map(|i| (i as f32) + 1.0).collect();
+        let expected_d1 = lora_delta(&adapter1, &x);
+        let expected_d2 = lora_delta(&adapter2, &x);
+        let expected: Vec<f32> = expected_d1
+            .iter()
+            .zip(&expected_d2)
+            .map(|(a, b)| w1 * a + w2 * b)
+            .collect();
+
+        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+
+        let max_diff = expected
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        assert!(max_diff < 1e-5, "asymmetric-rank blend max-diff={max_diff}");
+    }
+}
