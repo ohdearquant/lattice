@@ -8,6 +8,15 @@ use crate::error::{Result, TuneError};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Maximum on-disk size of the manifest JSON file, in bytes (64 MiB).
+///
+/// A manifest is a small governance document (typically a few kilobytes). The
+/// adapter-file cap is 10 GiB, but that ceiling is inappropriate here: a file
+/// that large would be materialised entirely before parsing — an allocation-DoS
+/// regardless of legitimacy. 64 MiB is orders of magnitude larger than any real
+/// manifest while still blocking a trivially-oversized attacker-supplied path.
+const MAX_MANIFEST_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Opaque adapter identifier (arbitrary string; a UUID is conventional).
 pub type AdapterId = String;
 
@@ -79,8 +88,35 @@ impl LoraManifest {
     }
 
     /// Load from a file path.
+    ///
+    /// Reads the file with a hard cap of [`MAX_MANIFEST_SIZE`] bytes to prevent
+    /// allocation-DoS from an attacker-supplied or symlinked giant path.
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read_to_string(path).map_err(TuneError::Io)?;
+        use std::io::Read;
+        // Fast-path: stat before open (cheap; avoids opening a known-huge file).
+        let file_size = std::fs::metadata(path).map_err(TuneError::Io)?.len();
+        if file_size > MAX_MANIFEST_SIZE {
+            return Err(TuneError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "manifest file is {file_size} bytes, exceeds maximum of {MAX_MANIFEST_SIZE} bytes"
+                ),
+            )));
+        }
+        // Bounded read: +1 sentinel detects a file that grew after the stat.
+        let f = std::fs::File::open(path).map_err(TuneError::Io)?;
+        let mut buf = Vec::new();
+        f.take(MAX_MANIFEST_SIZE + 1)
+            .read_to_end(&mut buf)
+            .map_err(TuneError::Io)?;
+        if buf.len() as u64 > MAX_MANIFEST_SIZE {
+            return Err(TuneError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("manifest file exceeds maximum of {MAX_MANIFEST_SIZE} bytes at read time"),
+            )));
+        }
+        let data = String::from_utf8(buf)
+            .map_err(|e| TuneError::Validation(format!("manifest file is not valid UTF-8: {e}")))?;
         Self::from_json(&data)
     }
 
@@ -208,5 +244,33 @@ mod tests {
         let m = LoraManifest::default();
         assert_eq!(m.version, 1);
         assert!(m.adapters.is_empty());
+    }
+
+    /// Mutation-sensitive: an over-cap manifest is rejected before parsing.
+    /// Removing the size guard in `load` lets the read proceed, and the file
+    /// (all NUL bytes) then fails to parse with a different error — so this
+    /// assertion on "exceeds maximum" fails when the guard is absent.
+    #[test]
+    fn load_rejects_oversized_manifest() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big_manifest.json");
+
+        // Produce a file whose stat length is MAX_MANIFEST_SIZE + 1 without
+        // writing 64 MiB: seek past the cap and write one byte. On every major
+        // filesystem this yields a sparse file (one real disk sector) whose
+        // reported length crosses the cap, exercising the guard cheaply.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            use std::io::Seek;
+            f.seek(std::io::SeekFrom::Start(MAX_MANIFEST_SIZE)).unwrap();
+            f.write_all(b"x").unwrap();
+        }
+
+        let err = LoraManifest::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("exceeds maximum"),
+            "expected the size guard to fire; got: {err}"
+        );
     }
 }

@@ -414,17 +414,26 @@ pub(crate) const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Read a file into memory after rejecting it if it exceeds `max_bytes`.
 ///
-/// The size is checked with a metadata stat *before* the file is read, so an
-/// oversized file is refused without allocating for its contents. This is the
-/// single guarded entry point for loading adapter bytes from disk; both the
-/// path-based [`load_peft_safetensors`] and the manifest-driven loader call it,
-/// so the size bound cannot be bypassed by a second reader.
+/// Two-layer defence against oversized reads:
+///
+/// 1. **Fast-path stat**: `metadata().len()` checked before the file is opened.
+///    A known-huge file is refused without any allocation.
+/// 2. **Bounded read**: `File::open` + `.take(max_bytes + 1)` enforces the cap
+///    at read time. The `+1` sentinel detects a file that grew between the stat
+///    and the open (TOCTOU window), because an exactly-at-cap file reads fully
+///    while any larger file produces `buf.len() > max_bytes` after the read.
+///
+/// This is the single guarded entry point for loading adapter bytes from disk;
+/// both the path-based [`load_peft_safetensors`] and the manifest-driven loader
+/// route through here, so the size bound cannot be bypassed by a second reader.
 ///
 /// # Errors
 ///
 /// Returns an error if the file metadata cannot be read, the file is larger
 /// than `max_bytes`, or the read itself fails.
 pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TuneError> {
+    // Fast-path: stat before open. A known-oversized file is refused without
+    // allocating for its contents (defence-in-depth — the read is also bounded).
     let file_size = std::fs::metadata(path)
         .map_err(|e| {
             TuneError::Io(std::io::Error::new(
@@ -442,12 +451,33 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
             ),
         )));
     }
-    std::fs::read(path).map_err(|e| {
+    // Bounded read: take max_bytes + 1 bytes so a file that grew after the
+    // stat is still caught. If buf.len() exceeds max_bytes at read time, the
+    // file is rejected even though the stat passed.
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| {
+        TuneError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to open LoRA adapter from {}: {e}", path.display()),
+        ))
+    })?;
+    let mut buf = Vec::new();
+    f.take(max_bytes + 1).read_to_end(&mut buf).map_err(|e| {
         TuneError::Io(std::io::Error::new(
             e.kind(),
             format!("failed to read LoRA adapter from {}: {e}", path.display()),
         ))
-    })
+    })?;
+    if buf.len() as u64 > max_bytes {
+        return Err(TuneError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "LoRA file {} exceeds maximum of {max_bytes} bytes at read time (grew after stat)",
+                path.display()
+            ),
+        )));
+    }
+    Ok(buf)
 }
 
 /// Load a LoRA adapter from a PEFT-format safetensors file.

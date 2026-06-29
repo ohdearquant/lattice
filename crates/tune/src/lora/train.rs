@@ -19,6 +19,25 @@ use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
 const TOP_LAYER: usize = 23;
 
+/// Upper bound on LoRA rank accepted by [`train_micro_lora`].
+///
+/// Practical LoRA ranks are 4–64; 512 is a generous safety valve that blocks
+/// accidental overflow in buffer-size products (`rank * hidden`) while still
+/// accommodating any foreseeable use case.
+const MAX_LORA_RANK: usize = 512;
+
+/// Upper bound on training steps accepted by [`train_micro_lora`].
+///
+/// 100 000 steps is well above any micro-LoRA use case and prevents an
+/// accidentally large caller-supplied value from locking the process for hours.
+const MAX_TRAIN_STEPS: usize = 100_000;
+
+/// Upper bound on `max_seq_len` accepted by [`train_micro_lora`].
+///
+/// 8 192 tokens is a generous ceiling for a micro-training helper; the actual
+/// model context window is the binding constraint at runtime.
+const MAX_TRAIN_SEQ_LEN: usize = 8_192;
+
 /// A single training example: tokenized text plus the index at which the
 /// completion (supervised signal) begins.
 pub struct TrainingPair {
@@ -59,6 +78,88 @@ impl Default for MicroLoraConfig {
     }
 }
 
+/// Validate all caller-supplied inputs for [`train_micro_lora`].
+///
+/// Extracted so the validation logic can be tested without a real model
+/// checkpoint. `vocab_size` comes from `model.config().vocab_size`.
+///
+/// Returns `Err(TuneError::Validation)` on the first anomaly found.
+pub(crate) fn validate_micro_lora_inputs(
+    vocab_size: usize,
+    pairs: &[TrainingPair],
+    config: &MicroLoraConfig,
+) -> Result<()> {
+    if pairs.is_empty() {
+        return Err(TuneError::Validation(
+            "train_micro_lora requires at least one training pair".to_string(),
+        ));
+    }
+    if config.rank == 0 {
+        return Err(TuneError::Validation(
+            "train_micro_lora: rank must be > 0".to_string(),
+        ));
+    }
+    if config.rank > MAX_LORA_RANK {
+        return Err(TuneError::Validation(format!(
+            "train_micro_lora: rank {} exceeds maximum {}",
+            config.rank, MAX_LORA_RANK
+        )));
+    }
+    if config.steps > MAX_TRAIN_STEPS {
+        return Err(TuneError::Validation(format!(
+            "train_micro_lora: steps {} exceeds maximum {}",
+            config.steps, MAX_TRAIN_STEPS
+        )));
+    }
+    if config.max_seq_len > MAX_TRAIN_SEQ_LEN {
+        return Err(TuneError::Validation(format!(
+            "train_micro_lora: max_seq_len {} exceeds maximum {}",
+            config.max_seq_len, MAX_TRAIN_SEQ_LEN
+        )));
+    }
+    for (pair_idx, pair) in pairs.iter().enumerate() {
+        if pair.tokens.len() < 2 {
+            return Err(TuneError::Validation(format!(
+                "train_micro_lora: pair {pair_idx} has {} tokens (minimum 2)",
+                pair.tokens.len()
+            )));
+        }
+        if pair.tokens.len() > config.max_seq_len {
+            return Err(TuneError::Validation(format!(
+                "train_micro_lora: pair {pair_idx} has {} tokens, exceeding max_seq_len {}",
+                pair.tokens.len(),
+                config.max_seq_len
+            )));
+        }
+        // completion_start == 0 causes (completion_start - 1) to underflow in
+        // forward_full's range `(completion_start - 1)..seq_len - 1`.
+        if pair.completion_start == 0 {
+            return Err(TuneError::Validation(format!(
+                "train_micro_lora: pair {pair_idx} completion_start is 0 — must be >= 1"
+            )));
+        }
+        // completion_start >= tokens.len() means no completion positions exist;
+        // `tokens[t + 1]` at t = completion_start - 1 would be out of bounds.
+        if pair.completion_start >= pair.tokens.len() {
+            return Err(TuneError::Validation(format!(
+                "train_micro_lora: pair {pair_idx} completion_start {} >= tokens.len() {}",
+                pair.completion_start,
+                pair.tokens.len()
+            )));
+        }
+        // Out-of-vocab IDs panic at `logits[target as usize]` in forward_full.
+        for (tok_idx, &tok) in pair.tokens.iter().enumerate() {
+            if tok as usize >= vocab_size {
+                return Err(TuneError::Validation(format!(
+                    "train_micro_lora: pair {pair_idx} token[{tok_idx}]={tok} \
+                     is out of vocabulary (vocab_size={vocab_size})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Train a LoRA adapter with exact CPU gradients over the provided pairs.
 ///
 /// Returns a [`LoraAdapter`] covering `q_proj` and `v_proj` in every GQA layer
@@ -69,19 +170,31 @@ impl Default for MicroLoraConfig {
 ///
 /// Returns an error if:
 /// - `pairs` is empty.
-/// - Any pair exceeds `config.max_seq_len`.
+/// - Any pair has fewer than 2 tokens or exceeds `config.max_seq_len`.
+/// - Any pair has `completion_start == 0` or `>= tokens.len()`.
+/// - Any token ID is `>= vocab_size` (would panic on logit indexing).
+/// - `config.rank == 0` or exceeds [`MAX_LORA_RANK`].
+/// - `config.steps` exceeds [`MAX_TRAIN_STEPS`].
+/// - `config.max_seq_len` exceeds [`MAX_TRAIN_SEQ_LEN`].
+/// - Buffer-size arithmetic overflows (rank × hidden, etc.).
 /// - The model architecture contains unexpected layer types.
 /// - The frozen-prefix capture fails.
+///
+/// # Implementation note
+///
+/// This function mirrors `train_grad_full`'s CPU forward/backward + Adam loop
+/// (verified line-equivalent; intentionally duplicated because the binary's
+/// private helpers are not importable from library code). A follow-up will
+/// extract the shared tape into a library-private module.
 pub fn train_micro_lora(
     model: &Qwen35Model,
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
 ) -> Result<LoraAdapter> {
-    if pairs.is_empty() {
-        return Err(TuneError::Validation(
-            "train_micro_lora requires at least one training pair".to_string(),
-        ));
-    }
+    // Validate all caller-supplied inputs before any model access or allocation.
+    // The extracted helper is separately testable without a real checkpoint.
+    let vocab_size = model.config().vocab_size;
+    validate_micro_lora_inputs(vocab_size, pairs, config)?;
 
     let cfg = model.config().clone();
     let dims = Dims {
@@ -167,15 +280,9 @@ pub fn train_micro_lora(
     }
 
     // Capture the frozen-prefix output (h_in entering first_layer) and RoPE tables.
+    // All pair bounds are already validated above before model access.
     let mut caches: Vec<SeqCtx> = Vec::with_capacity(pairs.len());
     for pair in pairs {
-        if pair.tokens.len() > config.max_seq_len {
-            return Err(TuneError::Validation(format!(
-                "training pair has {} tokens, exceeding max_seq_len {}",
-                pair.tokens.len(),
-                config.max_seq_len
-            )));
-        }
         let (h_in, _) = model
             .capture_attn_io(&pair.tokens, first_layer)
             .map_err(|e| TuneError::Validation(e.to_string()))?;
@@ -191,16 +298,48 @@ pub fn train_micro_lora(
         });
     }
 
+    // Checked buffer sizes: verify each rank × dimension product before
+    // allocating. These can only overflow with adversarial config values (rank
+    // is already capped at MAX_LORA_RANK), but we guard explicitly so a future
+    // caller cannot reach a capacity-overflow abort.
+    let a_q_len = rank.checked_mul(dims.hidden).ok_or_else(|| {
+        TuneError::Validation(format!(
+            "rank({rank}) * hidden_size({}) overflows buffer size",
+            dims.hidden
+        ))
+    })?;
+    let b_q_len = (2usize)
+        .checked_mul(dims.q_dim)
+        .and_then(|n| n.checked_mul(rank))
+        .ok_or_else(|| {
+            TuneError::Validation(format!(
+                "2 * q_dim({}) * rank({rank}) overflows buffer size",
+                dims.q_dim
+            ))
+        })?;
+    let a_v_len = rank.checked_mul(dims.hidden).ok_or_else(|| {
+        TuneError::Validation(format!(
+            "rank({rank}) * hidden_size({}) overflows buffer size",
+            dims.hidden
+        ))
+    })?;
+    let b_v_len = dims.kv_dim.checked_mul(rank).ok_or_else(|| {
+        TuneError::Validation(format!(
+            "kv_dim({}) * rank({rank}) overflows buffer size",
+            dims.kv_dim
+        ))
+    })?;
+
     // Init LoRA: A ~ U(-1/sqrt(hidden), +1/sqrt(hidden)), B = 0.
     // Matches mlx_lm LoRALinear init for on-par convergence.
     let init_amp = 1.0 / (dims.hidden as f32).sqrt();
     let mut rng = 0xFEED_FACEu64;
     let mut loras: Vec<LoraParams> = (0..num_slots)
         .map(|_| LoraParams {
-            a_q: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_q: vec![0.0; 2 * dims.q_dim * rank],
-            a_v: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_v: vec![0.0; dims.kv_dim * rank],
+            a_q: rand_fill(&mut rng, a_q_len, init_amp),
+            b_q: vec![0.0; b_q_len],
+            a_v: rand_fill(&mut rng, a_v_len, init_amp),
+            b_v: vec![0.0; b_v_len],
         })
         .collect();
 
@@ -297,7 +436,11 @@ pub fn train_micro_lora(
     Ok(LoraAdapter::new(lora_config, adapter_layers))
 }
 
-// ─── Private types mirroring train_grad_full.rs ──────────────────────────────
+// ─── Private types duplicated from train_grad_full.rs ────────────────────────
+// The binary's helpers are private and cannot be imported from library code, so
+// the forward/backward/Adam paths are reproduced here verbatim (line-equivalent
+// to train_grad_full.rs as of this commit). Extract to a shared module when that
+// refactor lands.
 
 #[derive(Clone, Copy)]
 struct Dims {
@@ -381,13 +524,45 @@ struct LoraParams {
 }
 
 impl LoraParams {
-    fn zeros(rank: usize, d: &Dims) -> Self {
-        Self {
-            a_q: vec![0.0; rank * d.hidden],
-            b_q: vec![0.0; 2 * d.q_dim * rank],
-            a_v: vec![0.0; rank * d.hidden],
-            b_v: vec![0.0; d.kv_dim * rank],
-        }
+    /// Allocate zero-initialised gradient accumulators with checked arithmetic.
+    ///
+    /// By the time this is called, `rank` has already been validated against
+    /// `MAX_LORA_RANK` in the public API. The checked products here guard against
+    /// future callers bypassing that validation or pathological dimension values.
+    fn zeros(rank: usize, d: &Dims) -> Result<Self> {
+        let a_q_len = rank.checked_mul(d.hidden).ok_or_else(|| {
+            TuneError::Validation(format!(
+                "rank({rank}) * hidden({}) overflows gradient buffer size",
+                d.hidden
+            ))
+        })?;
+        let b_q_len = (2usize)
+            .checked_mul(d.q_dim)
+            .and_then(|n| n.checked_mul(rank))
+            .ok_or_else(|| {
+                TuneError::Validation(format!(
+                    "2 * q_dim({}) * rank({rank}) overflows gradient buffer size",
+                    d.q_dim
+                ))
+            })?;
+        let a_v_len = rank.checked_mul(d.hidden).ok_or_else(|| {
+            TuneError::Validation(format!(
+                "rank({rank}) * hidden({}) overflows gradient buffer size",
+                d.hidden
+            ))
+        })?;
+        let b_v_len = d.kv_dim.checked_mul(rank).ok_or_else(|| {
+            TuneError::Validation(format!(
+                "kv_dim({}) * rank({rank}) overflows gradient buffer size",
+                d.kv_dim
+            ))
+        })?;
+        Ok(Self {
+            a_q: vec![0.0; a_q_len],
+            b_q: vec![0.0; b_q_len],
+            a_v: vec![0.0; a_v_len],
+            b_v: vec![0.0; b_v_len],
+        })
     }
 }
 
@@ -625,7 +800,9 @@ fn nll_and_grads(
     let hidden = d.hidden;
     let seq = fwd.h_final.len() / hidden;
     let n_comp = fwd.positions.len().max(1) as f32;
-    let mut grads: Vec<Grads> = (0..num_slots).map(|_| LoraParams::zeros(rank, d)).collect();
+    let mut grads: Vec<Grads> = (0..num_slots)
+        .map(|_| LoraParams::zeros(rank, d))
+        .collect::<Result<Vec<_>>>()?;
 
     // Head + CE backward.
     let mut d_h = vec![0.0f32; seq * hidden];
@@ -793,5 +970,122 @@ mod tests {
     fn placeholder_requires_real_model() {
         // Intentionally empty: a real model checkpoint is required to exercise
         // train_micro_lora. Populate this when running integration tests locally.
+    }
+
+    // ─── FIX 4: validate_micro_lora_inputs — no checkpoint required ─────────────
+    //
+    // All tests below call `validate_micro_lora_inputs` directly so they can run
+    // without a real Qwen35Model checkpoint. Each test pins one guard; reverting
+    // that guard from train.rs causes the corresponding test to fail.
+
+    fn pair(tokens: Vec<u32>, completion_start: usize) -> TrainingPair {
+        TrainingPair {
+            tokens,
+            completion_start,
+        }
+    }
+
+    fn default_cfg() -> MicroLoraConfig {
+        MicroLoraConfig {
+            rank: 4,
+            alpha: 8.0,
+            first_layer: 19,
+            steps: 10,
+            learning_rate: 1e-3,
+            max_seq_len: 64,
+        }
+    }
+
+    /// Mutation-sensitive: if the `pairs.is_empty()` guard is removed, this fails.
+    #[test]
+    fn validation_rejects_empty_pairs() {
+        let err = validate_micro_lora_inputs(1000, &[], &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at least one"),
+            "expected empty-pairs rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if the `tokens.len() < 2` guard is removed, this fails.
+    #[test]
+    fn validation_rejects_pair_with_one_token() {
+        let pairs = [pair(vec![1], 0)];
+        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("minimum 2"),
+            "expected short-tokens rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if the `completion_start == 0` guard is removed, the
+    /// range `(completion_start - 1)..seq_len - 1` underflows to a huge integer
+    /// and panics in forward_full — so this test must keep the guard in place.
+    #[test]
+    fn validation_rejects_completion_start_zero() {
+        // Two tokens required to pass the length check first.
+        let pairs = [pair(vec![1, 2], 0)];
+        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("completion_start is 0"),
+            "expected start==0 rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if `completion_start >= tokens.len()` guard is removed,
+    /// `tokens[t + 1]` at `t = completion_start - 1 = len - 1` is out-of-bounds.
+    #[test]
+    fn validation_rejects_completion_start_at_len() {
+        let pairs = [pair(vec![1, 2, 3], 3)]; // completion_start == tokens.len()
+        let err = validate_micro_lora_inputs(1000, &pairs, &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("completion_start") && err.contains(">="),
+            "expected out-of-range start rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if the `tok >= vocab_size` guard is removed, the
+    /// forward pass panics at `logits[target as usize]`.
+    #[test]
+    fn validation_rejects_out_of_vocab_token() {
+        // vocab_size = 100; token 200 is out of range.
+        let pairs = [pair(vec![0, 200, 1], 1)];
+        let err = validate_micro_lora_inputs(100, &pairs, &default_cfg())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("out of vocabulary"),
+            "expected out-of-vocab rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: if `rank == 0` guard is removed, buffer products yield
+    /// zero-length Vecs and forward_full divides by zero in `scale = alpha / rank`.
+    #[test]
+    fn validation_rejects_rank_zero() {
+        let pairs = [pair(vec![1, 2], 1)];
+        let mut cfg = default_cfg();
+        cfg.rank = 0;
+        let err = validate_micro_lora_inputs(1000, &pairs, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("rank must be > 0"),
+            "expected rank-zero rejection; got: {err}"
+        );
+    }
+
+    /// Confirm that valid inputs pass without error.
+    #[test]
+    fn validation_accepts_valid_inputs() {
+        let pairs = [pair(vec![1, 2, 3], 1)];
+        validate_micro_lora_inputs(1000, &pairs, &default_cfg()).unwrap();
     }
 }

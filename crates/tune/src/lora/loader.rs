@@ -58,10 +58,35 @@ pub fn load_adapters_from_manifest(
         &lattice_inference::model::qwen35_config::Qwen35Config,
     >,
 ) -> Result<Vec<LoadedAdapter>> {
+    // Pre-scan: verify ALL entries are Approved before touching any file or
+    // allocating the output buffer. A quarantined/revoked entry anywhere in the
+    // manifest must prevent all file IO — not just its own entry — so an attacker
+    // cannot hide a bad entry after good ones and have the good files read first.
+    for entry in &manifest.adapters {
+        match entry.status {
+            AdapterStatus::Quarantined => {
+                return Err(TuneError::Validation(format!(
+                    "adapter '{}' is quarantined — refusing to load",
+                    entry.id
+                )));
+            }
+            AdapterStatus::Revoked => {
+                return Err(TuneError::Validation(format!(
+                    "adapter '{}' is revoked — refusing to load",
+                    entry.id
+                )));
+            }
+            AdapterStatus::Approved => {}
+        }
+    }
+
+    // Allocate output capacity only after the prescan confirms all entries are
+    // Approved (and the manifest size is bounded by the FIX-1a manifest cap).
     let mut out = Vec::with_capacity(manifest.adapters.len());
 
     for entry in &manifest.adapters {
-        // Check 1: Status — Quarantined and Revoked are rejected without reading files.
+        // Check 1: Status — defence-in-depth after the prescan above; can only
+        // fire if the manifest is mutated between the prescan and this loop.
         match entry.status {
             AdapterStatus::Quarantined => {
                 return Err(TuneError::Validation(format!(
@@ -78,13 +103,59 @@ pub fn load_adapters_from_manifest(
             AdapterStatus::Approved => {}
         }
 
-        // Check 2: Resolve URI against base_dir (relative) or use as-is (absolute).
+        // Check 2: Resolve URI and enforce path confinement.
+        // Absolute URIs are rejected because a manifest is an attacker-influenced
+        // governance input; an absolute URI could reach any file on the filesystem.
+        // `..` components escape base_dir even with a relative path.
+        // Canonicalization catches symlinks that point outside base_dir.
         let full_path = {
             let p = Path::new(&entry.uri);
             if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                base_dir.join(p)
+                return Err(TuneError::Validation(format!(
+                    "adapter '{}': URI '{}' is absolute — only relative paths are permitted",
+                    entry.id, entry.uri
+                )));
+            }
+            for component in p.components() {
+                if component == std::path::Component::ParentDir {
+                    return Err(TuneError::Validation(format!(
+                        "adapter '{}': URI '{}' contains '..' — path traversal is not permitted",
+                        entry.id, entry.uri
+                    )));
+                }
+            }
+            let joined = base_dir.join(p);
+            // Canonicalize to catch symlink escapes. If the target does not yet
+            // exist, canonicalize fails; pass the non-canonical joined path so
+            // Check 3 reports the expected "file not found" error.
+            let canonical_base = std::fs::canonicalize(base_dir).map_err(|e| {
+                TuneError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "adapter '{}': failed to canonicalize base_dir '{}': {e}",
+                        entry.id,
+                        base_dir.display()
+                    ),
+                ))
+            })?;
+            match std::fs::canonicalize(&joined) {
+                Ok(canonical_joined) => {
+                    if !canonical_joined.starts_with(&canonical_base) {
+                        return Err(TuneError::Validation(format!(
+                            "adapter '{}': resolved path '{}' escapes base directory '{}'",
+                            entry.id,
+                            canonical_joined.display(),
+                            canonical_base.display()
+                        )));
+                    }
+                    canonical_joined
+                }
+                Err(_) => {
+                    // File does not exist; pass through to Check 3 for the
+                    // standard "not found" error rather than a confusing
+                    // canonicalize failure.
+                    joined
+                }
             }
         };
 
@@ -137,6 +208,13 @@ pub fn load_adapters_from_manifest(
         }
 
         // Check 7: Alpha must match within f32 round-trip tolerance.
+        // When an adapter file omits explicit alpha metadata, the parser
+        // synthesises `alpha = rank` (scale = 1.0). That synthesised value is
+        // still compared here against `entry.alpha`, so a manifest that declares
+        // a non-rank alpha (e.g. alpha=64, rank=16) correctly rejects an adapter
+        // whose header omits alpha — the synthesised 16 ≠ declared 64. The
+        // synthesis fallback therefore cannot smuggle a mismatched alpha past the
+        // governed loader.
         if (adapter.config.alpha - entry.alpha).abs() > 1e-4 {
             return Err(TuneError::Validation(format!(
                 "alpha mismatch for '{}': manifest says {}, file has {}",
@@ -546,5 +624,179 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    /// FIX-2 mutation-sensitive: a revoked entry that appears AFTER an approved
+    /// entry must cause rejection WITHOUT reading the approved entry's file.
+    /// The approved entry's URI points at a path that does not exist, so if the
+    /// prescan were removed the loader would attempt to read it and return a
+    /// different (IO/NotFound) error. The prescan fires first — the error must
+    /// contain "revoked", not "not found" or "does not exist".
+    #[test]
+    fn loader_prescan_rejects_revoked_without_reading_approved_file() {
+        let dir = tempdir().unwrap();
+        let mut manifest = LoraManifest::new();
+
+        // approved-A: file intentionally missing — if reached, the error would
+        // say "does not exist", not "revoked".
+        manifest.adapters.push(make_entry(
+            "approved-a",
+            "approved_a_does_not_exist.safetensors",
+            "dummy",
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        ));
+        // revoked-B appears after approved-A; prescan must reject before IO.
+        manifest.adapters.push(make_entry(
+            "revoked-b",
+            "revoked_b.safetensors",
+            "dummy",
+            4,
+            8.0,
+            AdapterStatus::Revoked,
+            vec!["q_proj".to_string()],
+        ));
+
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("revoked"),
+            "expected prescan 'revoked' rejection, not an IO error; got: {msg}"
+        );
+        assert!(
+            !msg.contains("does not exist"),
+            "prescan fired too late — loader touched approved-A's (nonexistent) file; got: {msg}"
+        );
+    }
+
+    /// FIX-3: absolute URIs must be rejected.
+    #[test]
+    fn loader_rejects_absolute_uri() {
+        let dir = tempdir().unwrap();
+        let mut manifest = LoraManifest::new();
+        manifest.adapters.push(make_entry(
+            "abs-adapter",
+            "/etc/passwd",
+            "dummy",
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        ));
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("absolute"),
+            "expected 'absolute' rejection; got: {msg}"
+        );
+    }
+
+    /// FIX-3: URIs containing `..` must be rejected.
+    #[test]
+    fn loader_rejects_dotdot_uri() {
+        let dir = tempdir().unwrap();
+        let mut manifest = LoraManifest::new();
+        manifest.adapters.push(make_entry(
+            "traversal-adapter",
+            "../escape/adapter.safetensors",
+            "dummy",
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        ));
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("..") || msg.contains("traversal") || msg.contains("permitted"),
+            "expected path-traversal rejection; got: {msg}"
+        );
+    }
+
+    /// D4 (alpha synthesis): an adapter whose header omits alpha metadata
+    /// synthesises alpha = rank. The governed loader must reject it when the
+    /// manifest declares a different alpha. This test proves the alpha-agreement
+    /// check in Check 7 is not bypassed by the synthesis fallback.
+    ///
+    /// Mutation-sensitive: removing the Check 7 alpha comparison makes this test
+    /// pass (wrong), so the test fails when the guard is absent.
+    #[test]
+    fn loader_alpha_synthesis_mismatch_is_rejected() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("no_alpha_meta.safetensors");
+
+        // Write an adapter with rank=16 but NO `alpha` key in the header.
+        // The loader's safetensors parser will synthesise alpha = rank = 16.
+        use safetensors::Dtype;
+        use safetensors::tensor::{TensorView, serialize};
+        use std::collections::HashMap;
+
+        let rank: usize = 16;
+        let d_in: usize = 4;
+        let d_out: usize = 4;
+        let a_bytes = vec![0u8; rank * d_in * 4];
+        let b_bytes = vec![0u8; d_out * rank * 4];
+        let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+        tensors.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![rank, d_in], &a_bytes).unwrap(),
+        );
+        tensors.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![d_out, rank], &b_bytes).unwrap(),
+        );
+        // Deliberately omit `alpha` from metadata so synthesis fires.
+        let mut meta: HashMap<String, String> = HashMap::new();
+        meta.insert("rank".to_string(), rank.to_string());
+        meta.insert("target_modules".to_string(), "q_proj".to_string());
+        let file_bytes = serialize(&tensors, &Some(meta)).unwrap();
+        std::fs::write(&file_path, &file_bytes).unwrap();
+
+        let sha = sha256_hash(&file_bytes);
+
+        // Manifest declares alpha=64, but the file synthesises alpha=16 — mismatch.
+        let mut manifest = LoraManifest::new();
+        manifest.adapters.push(make_entry(
+            "alpha-mismatch",
+            "no_alpha_meta.safetensors",
+            &sha,
+            rank,
+            64.0, // declared alpha != synthesised 16
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        ));
+
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("alpha mismatch"),
+            "expected alpha mismatch rejection; got: {msg}"
+        );
     }
 }
