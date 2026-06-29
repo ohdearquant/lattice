@@ -379,9 +379,13 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // Grammar advance: break cleanly when the grammar signals completion.
+                // Grammar advance: a false return signals grammar completion.
+                // Set stopped=true before breaking so the caller sees a
+                // grammar-terminal stop as stopped=true, matching decode_loop's
+                // `return Ok(true)` parity (non-streaming reference behavior).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
+                        stopped = true;
                         break;
                     }
                 }
@@ -831,9 +835,19 @@ pub fn should_stop_token(cfg: &Qwen35Config, gen_cfg: &GenerateConfig, token_id:
 /// grammar field from being silently ignored on paths that have not yet wired
 /// grammar masking (#397).
 ///
-/// This guard is used by the batch-prefill and f16 CPU paths. The base CPU
-/// generate() / generate_streaming() paths wire grammar directly and do not
-/// call this guard.
+/// Grammar masking (`mask_logits` + `advance`) requires a per-step wiring loop
+/// inside each generate path. The following paths have not yet been wired and
+/// delegate to this guard to fail closed rather than silently producing
+/// unconstrained output when a caller sets `gen_cfg.grammar`:
+///
+/// - `generate_q8` (`forward/cpu_q8.rs`)
+/// - `generate_f16` (`forward/cpu_f16.rs`)
+/// - `generate_q8_neon` (`forward/neon_forward.rs`)
+/// - `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`)
+/// - `multimodal_generate_preflight` (`forward/metal_qwen35.rs`)
+///
+/// The base CPU `generate()` / `generate_streaming()` paths in this module wire
+/// grammar directly and therefore do not call this guard.
 pub(crate) fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     if gen_cfg.grammar.is_some() {
         return Err(InferenceError::InvalidInput(
@@ -996,6 +1010,221 @@ mod tests {
         assert!(
             has_finite_logit(&one_allowed),
             "a single finite logit must pass the guard (grammar still has valid tokens)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Grammar wiring — end-to-end production-seam test (#397)
+    // -----------------------------------------------------------------------
+
+    /// Proves that `generate()` calls `mask_logits` at the post-prefill wiring
+    /// site — i.e., the production call is real, not just the primitive tested
+    /// by `grammar_masking_blocks_argmax_token`.
+    ///
+    /// Strategy: build a minimal synthetic model (4 layers, 64-dim hidden,
+    /// 97-token vocab), then construct a grammar engine whose vocabulary table
+    /// is 97 empty byte sequences. `VocabPartition::build` automatically rejects
+    /// empty entries (they can never advance the PDA), so the precomputed bitmask
+    /// for the initial state is all-zeros: `mask_logits` sets every one of the 97
+    /// logit positions to `NEG_INFINITY`. `has_finite_logit` then fires the
+    /// fail-closed guard inside `generate()`, which returns `Err(InvalidInput)`.
+    ///
+    /// Coverage: the post-prefill masking site in `generate()` (the
+    /// `engine.mask_logits` call just before the first `sample_token`). The
+    /// decode-loop wiring sites — inside `decode_loop` and the inline streaming
+    /// loops — are reached only for tokens 2+ and are not separately covered
+    /// here; they would require additional forward-step iterations that cannot be
+    /// isolated without a controllable-output model.
+    ///
+    /// Mutation sensitivity: removing `engine.mask_logits(gs, ...)` from the
+    /// post-prefill site leaves logits at their raw (finite) model values.
+    /// `has_finite_logit` then returns `true`, no error is returned, and this
+    /// test's `assert!(result.is_err())` fails — proving the call is load-bearing.
+    ///
+    /// The model-building helpers below mirror `lora_serving::build_model` in
+    /// tests.rs; they are duplicated here to keep generation.rs self-contained
+    /// without a cross-module test-support coupling.
+    #[test]
+    fn grammar_wiring_mask_logits_called_in_generate() {
+        use crate::attention::gdn::GatedDeltaNetWeights;
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use crate::lora_hook::NoopLoraHook;
+        use crate::model::qwen35::{
+            AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
+            FullAttentionLayerWeights, ModelWeights,
+        };
+        use crate::model::qwen35_config::{LayerType, compute_layer_types};
+        use crate::rope::RopeTable;
+        use crate::tokenizer::bpe::BpeTokenizer;
+        use std::sync::Arc;
+
+        // Tiny 4-layer hybrid config (3 linear + 1 full), vocab_size must match
+        // the grammar engine entry count so mask_logits covers all 97 logits.
+        const H: usize = 64;
+        const VOCAB: usize = 97;
+        const I: usize = 128;
+        const NUM_LAYERS: usize = 4;
+        const FULL_INTERVAL: usize = 4;
+        const HEAD_DIM: usize = 16;
+        const LINEAR_KH: usize = 4;
+        const KERNEL: usize = 4;
+
+        let cfg = Qwen35Config {
+            hidden_size: H,
+            num_hidden_layers: NUM_LAYERS,
+            vocab_size: VOCAB,
+            intermediate_size: I,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: HEAD_DIM,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            rope_parameters: None,
+            linear_num_key_heads: LINEAR_KH,
+            linear_num_value_heads: Some(LINEAR_KH),
+            linear_key_head_dim: HEAD_DIM,
+            linear_value_head_dim: HEAD_DIM,
+            linear_conv_kernel_dim: KERNEL,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: FULL_INTERVAL,
+            layer_types: compute_layer_types(NUM_LAYERS, FULL_INTERVAL),
+            layer_mask: vec![true; NUM_LAYERS],
+            eos_token_id: (VOCAB - 1) as u32,
+            max_position_embeddings: 1024,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        // Deterministic xorshift for reproducible synthetic weights.
+        fn rand_vec(rng: &mut u64, len: usize) -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 7;
+                    *rng ^= *rng << 17;
+                    ((*rng >> 32) as u32 as f32 / u32::MAX as f32 * 2.0 - 1.0) * 0.02
+                })
+                .collect()
+        }
+        let mut rng = 0xA55E_u64 | 1;
+
+        let qkv_dim = cfg.linear_qkv_dim();
+        let out_dim = cfg.linear_output_dim();
+        let q_dim = cfg.full_q_dim();
+        let kv_dim = cfg.full_kv_dim();
+
+        // layer_types = [Linear, Linear, Linear, Full] for interval=4.
+        let mut layers = Vec::with_capacity(NUM_LAYERS);
+        for lt in &cfg.layer_types {
+            let common = CommonLayerWeights {
+                input_layernorm: rand_vec(&mut rng, H),
+                post_attention_layernorm: rand_vec(&mut rng, H),
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: rand_vec(&mut rng, I * H),
+                    up_proj: rand_vec(&mut rng, I * H),
+                    down_proj: rand_vec(&mut rng, H * I),
+                }),
+            };
+            let attn = match lt {
+                LayerType::LinearAttention => AttentionWeights::Linear(GatedDeltaNetWeights {
+                    in_proj_qkv: rand_vec(&mut rng, qkv_dim * H),
+                    in_proj_qkv_rows: qkv_dim,
+                    in_proj_qkv_cols: H,
+                    in_proj_z: rand_vec(&mut rng, out_dim * H),
+                    in_proj_z_rows: out_dim,
+                    in_proj_z_cols: H,
+                    in_proj_b: rand_vec(&mut rng, LINEAR_KH * H),
+                    in_proj_b_rows: LINEAR_KH,
+                    in_proj_b_cols: H,
+                    in_proj_a: rand_vec(&mut rng, LINEAR_KH * H),
+                    in_proj_a_rows: LINEAR_KH,
+                    in_proj_a_cols: H,
+                    a_log: rand_vec(&mut rng, LINEAR_KH),
+                    dt_bias: rand_vec(&mut rng, LINEAR_KH),
+                    conv1d_weight: rand_vec(&mut rng, qkv_dim * KERNEL),
+                    conv_dim: qkv_dim,
+                    kernel_size: KERNEL,
+                    norm_weight: rand_vec(&mut rng, out_dim),
+                    out_proj: rand_vec(&mut rng, H * out_dim),
+                    out_proj_rows: H,
+                    out_proj_cols: out_dim,
+                }),
+                LayerType::FullAttention => AttentionWeights::Full(FullAttentionLayerWeights {
+                    q_proj: rand_vec(&mut rng, 2 * q_dim * H),
+                    k_proj: rand_vec(&mut rng, kv_dim * H),
+                    v_proj: rand_vec(&mut rng, kv_dim * H),
+                    o_proj: rand_vec(&mut rng, H * q_dim),
+                    q_norm: rand_vec(&mut rng, HEAD_DIM),
+                    k_norm: rand_vec(&mut rng, HEAD_DIM),
+                }),
+            };
+            layers.push((attn, common));
+        }
+
+        // Minimal 7-token BPE tokenizer: "a" (id 1) serves as the one-token
+        // prompt. The grammar fires before EOS (id 96) is ever needed.
+        let tok_json = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
+}"#;
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
+
+        let rope = RopeTable::new(
+            cfg.rope_dim(),
+            cfg.max_position_embeddings.min(8192),
+            cfg.rope_theta,
+        );
+
+        let model = Qwen35Model {
+            config: cfg.clone(),
+            weights: ModelWeights {
+                embed_tokens: rand_vec(&mut rng, VOCAB * H),
+                lm_head: None,
+                final_norm: rand_vec(&mut rng, H),
+                layers,
+            },
+            tokenizer,
+            rope,
+            lora: Box::new(NoopLoraHook),
+        };
+
+        // Grammar engine with VOCAB empty byte sequences. VocabPartition::build
+        // skips empty entries, so the precomputed bitmask for the initial state is
+        // all-zeros: mask_logits sets all VOCAB logits to NEG_INFINITY.
+        let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; VOCAB];
+        let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+        let engine = Arc::new(
+            GrammarEngine::new(&spec, vocab_bytes).expect("grammar engine builds with empty vocab"),
+        );
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            grammar: Some(engine),
+            ..Default::default()
+        };
+
+        // The all-blocking grammar must trigger has_finite_logit inside generate()
+        // and return Err(InvalidInput). Any other outcome is a wiring failure.
+        let result = model.generate("a", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "grammar blocking every token must return Err(InvalidInput); got {result:?}"
         );
     }
 
