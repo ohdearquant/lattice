@@ -9357,7 +9357,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 );
             }
 
-            let next_id = if use_compact {
+            let next_id_result = if use_compact {
                 sample_from_candidates(
                     &self.session.compact_result,
                     gen_cfg,
@@ -9366,6 +9366,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 )
             } else {
                 sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
+            };
+            // All candidates masked (grammar or repetition penalty): stop rather
+            // than emitting a token outside the candidate set (#405).
+            let next_id = match next_id_result {
+                Ok(id) => id,
+                Err(_) => {
+                    return GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                    };
+                }
             };
 
             // Advance grammar state after sampling the prefill token.
@@ -9431,7 +9445,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         engine.mask_logits(gs, &mut step_logits);
                     }
 
-                    if use_compact {
+                    let result = if use_compact {
                         sample_from_candidates(
                             &self.session.compact_result,
                             gen_cfg,
@@ -9440,6 +9454,11 @@ kernel void gdn_chunk_norm_silu_c32(
                         )
                     } else {
                         sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                    };
+                    // All candidates masked: stop rather than emitting an out-of-set token (#405).
+                    match result {
+                        Ok(id) => id,
+                        Err(_) => break,
                     }
                 };
 
@@ -9685,7 +9704,7 @@ kernel void gdn_chunk_norm_silu_c32(
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
             let mut stopped = false;
-            let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
+            let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state)?;
             if is_stop(first_id) {
                 stopped = true;
             } else {
@@ -9706,7 +9725,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 let step_logits = self.forward_step(last_token, pos);
                 pos += 1;
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)?;
                 if is_stop(next_id) {
                     stopped = true;
                     break;
@@ -12919,7 +12938,7 @@ kernel void gdn_chunk_norm_silu_c32(
         cfg: &GenerateConfig,
         previous_ids: &[u32],
         rng_state: &mut u64,
-    ) -> u32 {
+    ) -> Result<u32, crate::error::InferenceError> {
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_candidates(candidates.to_vec());
 
@@ -12931,7 +12950,7 @@ kernel void gdn_chunk_norm_silu_c32(
         if crate::sampling::temperature_degenerate(cfg.temperature) {
             return cs.argmax();
         }
-        cs.apply_temperature(cfg.temperature);
+        cs.apply_temperature(cfg.temperature)?;
 
         let raw = xorshift64(rng_state);
         // #351: `(raw as f64 / u64::MAX as f64) as f32` rounds up to exactly 1.0
@@ -12964,7 +12983,7 @@ kernel void gdn_chunk_norm_silu_c32(
         cfg: &GenerateConfig,
         previous_ids: &[u32],
         rng_state: &mut u64,
-    ) -> u32 {
+    ) -> Result<u32, crate::error::InferenceError> {
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_full_logits(logits);
         cs.apply_repetition_penalty(previous_ids, cfg.repetition_penalty);
@@ -12973,7 +12992,7 @@ kernel void gdn_chunk_norm_silu_c32(
         if crate::sampling::temperature_degenerate(cfg.temperature) {
             return cs.argmax();
         }
-        cs.apply_temperature(cfg.temperature);
+        cs.apply_temperature(cfg.temperature)?;
         cs.retain_top_k(cfg.top_k);
         // #351: see sample_from_candidates — avoid the r == 1.0 worst-token bug
         // by routing through the canonical [0, 1) helper (provably < 1.0).
@@ -13183,7 +13202,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 engine.mask_logits(gs, &mut prefill_logits);
             }
 
-            let next_id = if use_compact {
+            let next_id_result = if use_compact {
                 sample_from_candidates(
                     &self.session.compact_result,
                     gen_cfg,
@@ -13192,6 +13211,19 @@ kernel void gdn_chunk_norm_silu_c32(
                 )
             } else {
                 sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
+            };
+            // All candidates masked: stop rather than emitting an out-of-set token (#405).
+            let next_id = match next_id_result {
+                Ok(id) => id,
+                Err(_) => {
+                    return GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                    };
+                }
             };
 
             // Advance grammar state after sampling the prefill token.
@@ -13267,7 +13299,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     engine.mask_logits(gs, &mut step_logits);
                 }
 
-                let next_id = if use_compact {
+                let next_id_result = if use_compact {
                     sample_from_candidates(
                         &self.session.compact_result,
                         gen_cfg,
@@ -13276,6 +13308,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     )
                 } else {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                };
+                // All candidates masked: stop rather than emitting an out-of-set token (#405).
+                let next_id = match next_id_result {
+                    Ok(id) => id,
+                    Err(_) => break,
                 };
 
                 // Advance grammar state after sampling.

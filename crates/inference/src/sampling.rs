@@ -91,16 +91,28 @@ impl CandidateSet {
     }
 
     /// Return the token_id of the candidate with the highest logit.
-    pub fn argmax(&self) -> u32 {
-        let mut best_id = 0u32;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::InferenceError::InvalidInput`] when the candidate set is
+    /// empty or every logit equals [`f32::NEG_INFINITY`] (a fully masked set).  Both cases
+    /// have no meaningful argmax — returning a hardcoded 0 would emit a token that is not
+    /// necessarily a member of the candidate set, violating the fail-closed contract shared
+    /// by the softmax path.
+    pub fn argmax(&self) -> Result<u32, crate::error::InferenceError> {
         let mut best_val = f32::NEG_INFINITY;
+        let mut best_id = None;
         for c in &self.candidates {
             if c.logit > best_val {
                 best_val = c.logit;
-                best_id = c.token_id;
+                best_id = Some(c.token_id);
             }
         }
-        best_id
+        best_id.ok_or_else(|| {
+            crate::error::InferenceError::InvalidInput(
+                "argmax on an empty or all-masked (-inf) candidate set".into(),
+            )
+        })
     }
 
     /// Scale logits by `1 / temperature`.  No-op when temperature is 1.0,
@@ -113,12 +125,22 @@ impl CandidateSet {
     /// `sample_top_p` could still return a non-argmax token. Instead collapse the set to a
     /// one-hot on the argmax — the same hard-argmax route the main `Sampler` takes for a
     /// degenerate temperature (see `temperature_degenerate`).
-    pub fn apply_temperature(&mut self, temperature: f32) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::InferenceError::InvalidInput`] when the temperature is
+    /// degenerate (tiny-finite) and the candidate set is empty or fully masked.  The
+    /// `t -> 0+` limit is `argmax`, but argmax is undefined over an all-masked set —
+    /// propagating the error is the fail-closed equivalent of the softmax guard.
+    pub fn apply_temperature(
+        &mut self,
+        temperature: f32,
+    ) -> Result<(), crate::error::InferenceError> {
         if !temperature.is_finite() || temperature <= 0.0 || temperature == 1.0 {
-            return;
+            return Ok(());
         }
         if temperature_degenerate(temperature) {
-            let best = self.argmax();
+            let best = self.argmax()?;
             for c in &mut self.candidates {
                 c.logit = if c.token_id == best {
                     0.0
@@ -126,12 +148,13 @@ impl CandidateSet {
                     f32::NEG_INFINITY
                 };
             }
-            return;
+            return Ok(());
         }
         let inv = 1.0 / temperature;
         for c in &mut self.candidates {
             c.logit *= inv;
         }
+        Ok(())
     }
 
     /// Keep only the top-`k` candidates by logit (O(n) partial select).
@@ -148,9 +171,25 @@ impl CandidateSet {
     /// filtering, renormalise, and return a weighted-random sample.
     ///
     /// `r` must be a uniform f32 in [0, 1).
-    pub fn sample_top_p(&mut self, top_p: f32, r: f32) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::InferenceError::InvalidInput`] when the candidate set is
+    /// empty.  A non-empty all-[`f32::NEG_INFINITY`] set is handled gracefully: after
+    /// sorting, the first candidate (arbitrary tie-break) is returned because the softmax
+    /// sum is zero — this avoids emitting an out-of-set token.
+    pub fn sample_top_p(
+        &mut self,
+        top_p: f32,
+        r: f32,
+    ) -> Result<u32, crate::error::InferenceError> {
+        if self.candidates.is_empty() {
+            return Err(crate::error::InferenceError::InvalidInput(
+                "sample_top_p on an empty candidate set".into(),
+            ));
+        }
         let mut probs = Vec::new();
-        self.sample_top_p_with_scratch(top_p, r, &mut probs)
+        Ok(self.sample_top_p_with_scratch(top_p, r, &mut probs))
     }
 
     /// Same as `sample_top_p` but reuses the caller's probability buffer to avoid allocation.
@@ -919,14 +958,14 @@ mod tests {
             -2.0_f32,
         ] {
             let mut cs = CandidateSet::from_full_logits(&[1.0, 5.0, 3.0]);
-            cs.apply_temperature(bad);
+            cs.apply_temperature(bad).unwrap();
             let logits: Vec<f32> = cs.candidates.iter().map(|c| c.logit).collect();
             assert_eq!(
                 logits,
                 vec![1.0, 5.0, 3.0],
                 "temperature {bad} must be a no-op, leaving logits finite and unscaled"
             );
-            assert_eq!(cs.argmax(), 1);
+            assert_eq!(cs.argmax().unwrap(), 1);
         }
     }
 
@@ -938,10 +977,10 @@ mod tests {
         // tie-breaks on ascending token_id and `sample_top_p` returns token 0 instead
         // of the argmax (token 1).
         let mut cs = CandidateSet::from_full_logits(&[10.0, 11.0]);
-        cs.apply_temperature(1e-45);
+        cs.apply_temperature(1e-45).unwrap();
         // top_p = 1.0 (no nucleus truncation) + r = 0.0 => pure argmax selection.
         assert_eq!(
-            cs.sample_top_p(1.0, 0.0),
+            cs.sample_top_p(1.0, 0.0).unwrap(),
             1,
             "tiny positive temperature must resolve to the argmax (greedy), not token 0"
         );
@@ -955,9 +994,9 @@ mod tests {
         // leave these two near 50/50, so `sample_top_p(1.0, 0.75)` could draw token 0;
         // the one-hot collapse makes the argmax (token 1) the only reachable draw.
         let mut cs = CandidateSet::from_full_logits(&[0.0, f32::from_bits(1)]);
-        cs.apply_temperature(1e-45);
+        cs.apply_temperature(1e-45).unwrap();
         assert_eq!(
-            cs.sample_top_p(1.0, 0.75),
+            cs.sample_top_p(1.0, 0.75).unwrap(),
             1,
             "degenerate temperature must be hard-greedy even for adjacent logits"
         );
@@ -1307,7 +1346,7 @@ mod tests {
             },
         ]);
         // r in the middle of the distribution; pre-fix this returns last() = 1.
-        let token = cs.sample_top_p(1.0, 0.5);
+        let token = cs.sample_top_p(1.0, 0.5).unwrap();
         assert_eq!(
             token, 0,
             "tail-NaN poisons the softmax sum; must fall back to argmax (token 0), not last()"
@@ -1343,24 +1382,24 @@ mod tests {
         };
 
         for &r in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
-            let baseline = make().sample_top_p(1.0, r);
+            let baseline = make().sample_top_p(1.0, r).unwrap();
             assert_eq!(
-                make().sample_top_p(f32::NAN, r),
+                make().sample_top_p(f32::NAN, r).unwrap(),
                 baseline,
                 "NaN top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(1.5, r),
+                make().sample_top_p(1.5, r).unwrap(),
                 baseline,
                 ">1 top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(f32::INFINITY, r),
+                make().sample_top_p(f32::INFINITY, r).unwrap(),
                 baseline,
                 "+Inf top_p must behave as top_p == 1.0 at r={r}"
             );
             assert_eq!(
-                make().sample_top_p(-0.5, r),
+                make().sample_top_p(-0.5, r).unwrap(),
                 0,
                 "negative top_p must collapse to greedy argmax at r={r}"
             );
@@ -1745,6 +1784,75 @@ mod tests {
             "token 1 repeated 4× must be penalized once (5.0 > 4.9, token 1 wins); \
              per-occurrence compounding yields 0.625 and wrongly selects token 0 \
              (mutation: replace HashSet dedup with per-occurrence penalty)"
+        );
+    }
+
+    // ── H5: CandidateSet fail-closed regression tests (#405) ─────────────────
+    //
+    // Before the fix, `argmax` initialised `best_id = 0u32` and returned it
+    // unconditionally, so an empty or all-NEG_INFINITY candidate set silently
+    // emitted token 0 even when token 0 was not in the set (e.g. after
+    // grammar-mask compaction or retain_top_k).  The tests below FAIL on the
+    // pre-fix code path and PASS after the fix — they are the mutation-sensitive
+    // gate for #405.
+
+    #[test]
+    fn test_candidateset_argmax_empty_returns_err() {
+        // Pre-fix: best_id stayed 0u32 (the initialiser) → returned unconditionally.
+        // Token 0 is not a member of an empty set → out-of-set emission.
+        let cs = CandidateSet::from_candidates(vec![]);
+        assert!(
+            cs.argmax().is_err(),
+            "argmax on an empty set must be Err, not the initialiser token 0"
+        );
+    }
+
+    #[test]
+    fn test_candidateset_argmax_all_masked_returns_err() {
+        // Every logit is NEG_INFINITY — no candidate beats the sentinel, so
+        // best_id must stay None and propagate InvalidInput.  Pre-fix, best_id
+        // stayed 0u32 and was returned, emitting token 0 even though neither
+        // token 5 nor token 10 is token 0.
+        let cs = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 5,
+                logit: f32::NEG_INFINITY,
+            },
+            Candidate {
+                token_id: 10,
+                logit: f32::NEG_INFINITY,
+            },
+        ]);
+        assert!(
+            cs.argmax().is_err(),
+            "argmax on an all-masked set must be Err, not the initialiser token 0"
+        );
+    }
+
+    #[test]
+    fn test_candidateset_sample_top_p_empty_returns_err() {
+        // sample_top_p delegates to the private scratch path which returns 0 on
+        // an empty slice — the public method must intercept before that.
+        let mut cs = CandidateSet::from_candidates(vec![]);
+        assert!(
+            cs.sample_top_p(1.0, 0.5).is_err(),
+            "sample_top_p on an empty candidate set must be Err"
+        );
+    }
+
+    #[test]
+    fn test_candidateset_apply_temperature_degenerate_all_masked_returns_err() {
+        // Degenerate temperature → hard-argmax limit, but argmax over an
+        // all-masked set is undefined.  Pre-fix: argmax returned 0 and
+        // apply_temperature silently collapsed the set to a one-hot on token 0
+        // (which may not even be a member).  Post-fix: error propagates.
+        let mut cs = CandidateSet::from_candidates(vec![Candidate {
+            token_id: 7,
+            logit: f32::NEG_INFINITY,
+        }]);
+        assert!(
+            cs.apply_temperature(1e-45).is_err(),
+            "degenerate temperature on an all-masked set must be Err"
         );
     }
 }
