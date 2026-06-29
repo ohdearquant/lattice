@@ -43,6 +43,7 @@ pub mod grammar;
 pub mod kv_cache;
 pub mod lora_hook;
 pub mod metrics;
+pub mod mixture;
 pub mod pool;
 pub mod pruning;
 pub mod quant;

@@ -4252,6 +4252,116 @@ kernel void gdn_chunk_norm_silu_c32(
         pub d_out: usize,
     }
 
+    /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
+    /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
+    ///
+    /// # Blend math
+    ///
+    /// For adapter `e` with layer data `L_e` and mixture weight `w_e`, the
+    /// effective delta is `w_e · B_e @ (A_e @ x)` (the `alpha/rank` scale is
+    /// NOT present in `LoraLayerData` — it is passed separately as `scale` to
+    /// `load_lora_adapter`; here `w_e` IS that effective scale).
+    ///
+    /// The blended matrices are:
+    /// - `A_blend = vconcat[A_1; …; A_N]`       shape `(Σrank_e) × d_in`
+    /// - `B_blend = hconcat[w_1·B_1 | …]`       shape `d_out × (Σrank_e)`
+    ///
+    /// The resulting layer set should be loaded with `scale = 1.0` because
+    /// the per-adapter weights are already folded into the B blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `inputs` is empty
+    /// - Any weight is not finite
+    /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
+    pub fn blend_lora_layer_data(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        if inputs.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "blend_lora_layer_data: inputs must not be empty".into(),
+            ));
+        }
+
+        for (idx, (_, w)) in inputs.iter().enumerate() {
+            if !w.is_finite() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
+                )));
+            }
+        }
+
+        // Group by (layer_idx, module): collect refs to layer data and effective weights.
+        let mut grouped: HashMap<(usize, String), Vec<(&LoraLayerData, f32)>> = HashMap::new();
+        for (layers, weight) in inputs {
+            for layer in *layers {
+                grouped
+                    .entry((layer.layer_idx, layer.module.clone()))
+                    .or_default()
+                    .push((layer, *weight));
+            }
+        }
+
+        let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
+        for ((layer_idx, module), entries) in grouped {
+            let (first, _) = entries[0];
+            let d_in = first.d_in;
+            let d_out = first.d_out;
+
+            // Validate dimension consistency across adapters for this projection.
+            for (idx, (entry, _)) in entries.iter().enumerate() {
+                if entry.d_in != d_in || entry.d_out != d_out {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
+                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
+                         entry {idx}: d_in={}, d_out={})",
+                        entry.d_in, entry.d_out
+                    )));
+                }
+            }
+
+            let rank_total: usize = entries.iter().map(|(l, _)| l.rank).sum();
+
+            // A_blend: vertical stack of A matrices.
+            let mut a_blend: Vec<f32> = Vec::with_capacity(rank_total * d_in);
+            for (layer, _) in &entries {
+                a_blend.extend_from_slice(&layer.a);
+            }
+
+            // B_blend: horizontal concat of weight-scaled B column blocks.
+            // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
+            let mut b_blend = vec![0.0f32; d_out * rank_total];
+            let mut col_offset = 0usize;
+            for (layer, eff_weight) in &entries {
+                let r_e = layer.rank;
+                for row in 0..d_out {
+                    let dst = row * rank_total + col_offset;
+                    let src = row * r_e;
+                    for c in 0..r_e {
+                        b_blend[dst + c] = eff_weight * layer.b[src + c];
+                    }
+                }
+                col_offset += r_e;
+            }
+
+            result.push(LoraLayerData {
+                layer_idx,
+                module,
+                a: a_blend,
+                b: b_blend,
+                rank: rank_total,
+                d_in,
+                d_out,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// **Unstable**: Metal GPU forward pass for Qwen3.5/3.6; kernel set and weight layout evolving.
     ///
     /// Backward-compatible convenience wrapper bundling one `MetalQwen35Engine` (immutable
@@ -5860,6 +5970,66 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Returns true if a LoRA adapter is currently loaded.
         pub fn has_lora_adapter(&self) -> bool {
             self.lora.is_some()
+        }
+
+        /// Blend multiple LoRA adapter layer sets into one rank-Σr layer set, then
+        /// generate text through the existing single-adapter path.
+        ///
+        /// # Why blend instead of dispatching N adapters
+        ///
+        /// The Metal forward path holds exactly one `Option<MetalLoraAdapter>` slot.
+        /// Rather than changing that kernel contract, we pre-blend on the CPU once
+        /// at request start: the result is a valid single adapter loaded through the
+        /// unchanged `load_lora_adapter` path.
+        ///
+        /// # Arguments
+        ///
+        /// * `adapter_weights` — slices of `(Vec<LoraLayerData>, mixture_weight)`.
+        ///   Each element is one adapter's layer data paired with its weight `w_e`.
+        ///   The effective contribution of adapter `e` is `w_e * (alpha_e / rank_e)`.
+        /// * `prompt` — prompt text, tokenised internally.
+        /// * `tokenizer` — BPE tokeniser.
+        /// * `gen_cfg` — generation configuration.
+        ///
+        /// The adapter is unloaded after generation so the slot is free for the next
+        /// request.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if blending fails (e.g. dimension mismatch across
+        /// adapters for the same projection) or if adapter loading fails.
+        pub fn generate_with_lora_mixture(
+            &mut self,
+            adapter_weights: &[(&[LoraLayerData], f32)],
+            prompt: &str,
+            tokenizer: &crate::tokenizer::BpeTokenizer,
+            gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+        ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError>
+        {
+            if adapter_weights.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(
+                    "generate_with_lora_mixture: adapter_weights must not be empty".into(),
+                ));
+            }
+
+            // Unload any previously loaded adapter so the slot is free.
+            self.unload_lora_adapter();
+
+            // Blend on the CPU. The per-adapter scale (alpha/rank) and mixture weight
+            // are folded into the B column blocks; the resulting blended adapter uses
+            // an effective scale of 1.0.
+            let blended = blend_lora_layer_data(adapter_weights)?;
+
+            // The blended adapter has weights-already-scaled; pass scale=1.0.
+            self.load_lora_adapter(blended, 1.0, None)?;
+
+            let output = self.generate(prompt, tokenizer, gen_cfg);
+
+            // Always unload after the request so the slot does not leak into the
+            // next call on this state object.
+            self.unload_lora_adapter();
+
+            Ok(output)
         }
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
@@ -19768,7 +19938,7 @@ pub fn mtp_greedy_round(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, format_chat_template,
+    LoraLayerData, MetalQwen35State, blend_lora_layer_data, format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
@@ -19782,6 +19952,19 @@ pub struct LoraLayerData {
     pub rank: usize,
     pub d_in: usize,
     pub d_out: usize,
+}
+
+/// Stub: blend_lora_layer_data is only meaningful on macOS + metal-gpu.
+///
+/// Always returns `Err` on other platforms so callers fail at runtime rather
+/// than silently producing wrong results.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+pub fn blend_lora_layer_data(
+    _inputs: &[(&[LoraLayerData], f32)],
+) -> Result<Vec<LoraLayerData>, crate::error::InferenceError> {
+    Err(crate::error::InferenceError::Inference(
+        "blend_lora_layer_data requires macOS + metal-gpu feature".into(),
+    ))
 }
 
 /// **Unstable**: Metal Qwen3.5 forward state; stub on non-macOS; full impl behind metal-gpu feature.

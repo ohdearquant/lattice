@@ -43,6 +43,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lattice-fann = { version = "0.4.0", path = "../fann" }
 
 [[bin]]
 name = "lattice"
@@ -65,6 +66,11 @@ required-features = ["f16", "metal-gpu"]
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
+required-features = ["f16", "metal-gpu"]
+
+[[bin]]
+name = "bench_lora_mixture"
+path = "src/bin/bench_lora_mixture.rs"
 required-features = ["f16", "metal-gpu"]
 
 [[bin]]
