@@ -98,7 +98,13 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
 /// `sampling::argmax_f32_scalar`, the Metal greedy path, and `torch.argmax` all
 /// return the *first* occurrence (#280). This mirrors them exactly: strict `>`
 /// from `NEG_INFINITY` skips `NaN` (a `NaN` comparison is always false) and
-/// returns 0 on empty / all-`NaN` input.
+/// returns 0 on empty / all-`NaN` / fully-masked (all-`NEG_INFINITY`) input.
+///
+/// Returning index 0 on such a degenerate distribution is the intentional
+/// fail-closed behavior, not an accident of the loop: it is the dense-array
+/// form of the engine-wide first-in-set contract, so a fully-masked
+/// distribution yields the first in-vocabulary token deterministically and
+/// never panics.
 fn greedy_token(adjusted: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;
