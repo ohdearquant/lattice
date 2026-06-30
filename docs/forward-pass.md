@@ -55,7 +55,8 @@ pre-attention RMSNorm.
 ### 8. Pre-attention norm — `crate::model::qwen35::norm::qwen35_rms_norm`
 
 `qwen35_rms_norm` is a shifted RMSNorm: it computes
-`inv_rms * (1.0 + gamma)` per element, where `gamma` is the learned weight.
+`x * inv_rms * (1.0 + gamma)` per element, where `x` is the input activation
+and `gamma` is the learned weight.
 
 ### 9. Attention dispatch — `crate::model::qwen35::Qwen35Model::run_attention_layer`
 
@@ -85,8 +86,11 @@ For full-attention layers:
 
 ### 12. Q/K/V projection — `crate::model::qwen35::Qwen35Model::project_qkv`
 
-`project_qkv` runs three independent matmuls to produce Q, K, V and applies
-per-head Q/K RMSNorm to each resulting head vector.
+`project_qkv` runs three matmuls. Because `attn_output_gate` is enabled, the
+Q projection weight is `[2*q_dim, hidden]`: it produces both `Q` and the output
+gate `Z` in a single matmul, which `split_q_and_gate` deinterleaves. The other
+two matmuls produce K and V. Per-head Q/K RMSNorm is applied to each resulting
+head vector; `gate_Z` is applied later as the sigmoid output gate.
 
 ### 13. Attention context — `crate::model::qwen35::Qwen35Model::compute_attention_context`
 
@@ -151,9 +155,10 @@ It applies, in order:
 
 1. Repetition penalty on the logit of recently generated tokens.
 2. Greedy fallback when temperature is zero or degenerate.
-3. Top-k filtering (retains the k highest logits).
-4. Softmax followed by top-p (nucleus) filtering.
-5. Draws a token from the resulting distribution.
+3. Temperature scaling of the logits (skipped when temperature is 1.0).
+4. Top-k filtering (retains the k highest logits).
+5. Softmax followed by top-p (nucleus) filtering.
+6. Draws a token from the resulting distribution.
 
 The drawn token id is appended to the generated sequence and becomes the
 input to the next `forward_step` call.
