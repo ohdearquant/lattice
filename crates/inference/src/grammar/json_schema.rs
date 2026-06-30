@@ -85,6 +85,15 @@ const MAX_STRING_LITERALS: usize = 4096;
 // DoS bound: cap the total encoded byte length across all literals in a single trie.
 const MAX_STRING_LITERAL_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on `prefixItems` (tuple) positional schemas a single array node
+/// may declare, bounding compile work and grammar rule count against adversarial
+/// schemas. `compile_array` emits one named rule and one `compile_schema`
+/// recursive call per positional item, so an unguarded `prefixItems` array with
+/// no `maxItems` check drives unbounded allocation and recursion from untrusted
+/// schema input (issue #474). Matches `MAX_ARRAY_CARDINALITY` so all per-item
+/// cardinality boundaries stay consistent.
+const MAX_PREFIX_ITEMS: usize = 4096;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -805,6 +814,18 @@ impl<'a> CompileCtx<'a> {
 
                 let p = prefix_schemas.len();
 
+                // DoS bound (issue #474): an unbounded `prefixItems` array with no
+                // `maxItems` check drives one `compile_schema` call and one named
+                // rule per positional entry, making allocation and recursion work
+                // proportional to the attacker-controlled array length. Reject
+                // before Vec::with_capacity so no per-item allocation occurs for
+                // over-cap inputs.
+                if p > MAX_PREFIX_ITEMS {
+                    return Err(SchemaError(format!(
+                        "prefixItems length ({p}) exceeds the supported limit ({MAX_PREFIX_ITEMS})"
+                    )));
+                }
+
                 // Cardinality validation against the fixed prefix length.
                 if let Some(m) = max_items {
                     if m < p {
@@ -1138,6 +1159,19 @@ impl<'a> CompileCtx<'a> {
                 // diverges at its first byte, so the no-rewind single-stack PDA
                 // always picks the correct alternative at sym_pos == 0 without
                 // needing to backtrack across a shared prefix (e.g. ["foo","food"]).
+
+                // DoS bound (issue #474): reject oversized enum arrays before the
+                // byte pre-pass loop and before Vec::with_capacity so that an
+                // attacker cannot force ~N small allocations by sending just under
+                // the byte budget with a large count. The byte-budget pre-pass
+                // iterates over `str_values`, so this guard also bounds that loop.
+                if str_values.len() > MAX_STRING_LITERALS {
+                    return Err(SchemaError(format!(
+                        "string enum literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+                        str_values.len()
+                    )));
+                }
+
                 // DoS bound: check the total encoded byte budget before
                 // allocating the full seqs Vec so that an over-budget input
                 // under the count cap cannot force a large transient copy.
@@ -2940,5 +2974,81 @@ mod tests {
         assert!(accepts(&g, b"\"alpha\""));
         assert!(accepts(&g, b"\"beta\""));
         assert!(rejects(&g, b"\"delta\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #474 — early cardinality caps before untrusted-size allocations
+    // -----------------------------------------------------------------------
+
+    /// Early string-enum count guard (issue #474, compile_string_type path):
+    /// a `{"type":"string","enum":[...]}` with more than MAX_STRING_LITERALS
+    /// DISTINCT one-character members whose total encoded bytes stay under
+    /// MAX_STRING_LITERAL_BYTES must be rejected by the EARLY guard inserted
+    /// before the byte pre-pass, not by the late guard in compile_trie_literals.
+    ///
+    /// Mutation pin: the early guard fires with "string enum literal count" in
+    /// the message. Reverting the early guard lets the byte pre-pass and
+    /// Vec::with_capacity run to completion, after which the late
+    /// compile_trie_literals guard fires with "string literal count" — a
+    /// different message — so the assertion below fails.
+    #[test]
+    fn string_enum_count_cap_early_guard_fires_before_alloc() {
+        // Build MAX_STRING_LITERALS + 1 distinct single-character strings.
+        // There are only 128 ASCII printable values, so we use two-char strings
+        // to stay distinct. Total encoded bytes ≈ (MAX_STRING_LITERALS + 1) * 4
+        // (each "XY" encodes as 4 bytes including quotes, minus 1 for the
+        // pre-pass formula) — well under the 1 MiB byte budget.
+        let over = MAX_STRING_LITERALS + 1;
+        let values: String = (0..over)
+            .map(|i| format!("\"x{i:04}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"type\":\"string\",\"enum\":[{values}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v)
+            .expect_err("string enum over MAX_STRING_LITERALS must be rejected before allocation");
+        assert!(
+            err.0.contains("string enum literal count"),
+            "early guard must fire with 'string enum literal count', got: {}",
+            err.0
+        );
+    }
+
+    /// prefixItems length cap (issue #474): a tuple array schema whose
+    /// `prefixItems` array has more than MAX_PREFIX_ITEMS entries and no
+    /// `maxItems` is rejected at the parse boundary before Vec::with_capacity
+    /// and before any positional compile_schema call. Mutation pin: reverting
+    /// the cap causes compile to either return Ok (memory exhausted silently) or
+    /// OOM; the expect_err assertion fails.
+    #[test]
+    fn prefix_items_count_cap_rejects() {
+        // Build MAX_PREFIX_ITEMS + 1 trivial positional schemas.
+        let over = MAX_PREFIX_ITEMS + 1;
+        let items: String = (0..over)
+            .map(|_| r#"{"type":"string"}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"type\":\"array\",\"prefixItems\":[{items}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v)
+            .expect_err("prefixItems over MAX_PREFIX_ITEMS with no maxItems must be rejected");
+        assert!(
+            err.0.contains("prefixItems length"),
+            "expected a prefixItems-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Happy path: a small prefixItems tuple (well under the cap) compiles and
+    /// accepts the correct value. Ensures the new cap does not reject valid schemas.
+    #[test]
+    fn prefix_items_small_tuple_compiles() {
+        let schema = r#"{"type":"array","prefixItems":[{"type":"integer"},{"type":"string"}]}"#;
+        let v: Value = serde_json::from_str(schema).unwrap();
+        let g = compile(&v).expect("small prefixItems tuple must compile");
+        assert!(
+            accepts(&g, b"[1,\"hi\"]"),
+            "a valid tuple value must be accepted"
+        );
     }
 }
