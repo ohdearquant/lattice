@@ -4,7 +4,7 @@
 **Date**: 2026-06-30
 **Scope**: `docs/adr/` (65 numbered ADRs + `INDEX.md`)
 
-Source ref: `origin/main` at `4772d5b` via `/Users/lion/khive-work/worktrees/docs-adr-alignment`.
+Source ref: `origin/main` at `4772d5b`.
 
 Inventory basis: `../explorer/adr-inventory.md` listed 65 markdown files under `docs/adr/` on `origin/main`: 64 numbered ADRs plus `INDEX.md`. This change adds ADR-065 (the companion methodology ADR), bringing committed HEAD to 65 numbered ADRs plus `INDEX.md`. Statuses below are classified from source evidence or concrete source gaps, not ADR prose alone. If an ADR makes no current code-checkable claim beyond an implemented path, it is marked `current` with the relevant source path.
 
