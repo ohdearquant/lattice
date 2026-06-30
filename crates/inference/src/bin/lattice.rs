@@ -119,9 +119,13 @@ mod serve {
         Json, Router,
         extract::{DefaultBodyLimit, State},
         http::StatusCode,
-        response::{IntoResponse, Response},
+        response::{
+            IntoResponse, Response,
+            sse::{Event, KeepAlive, Sse},
+        },
         routing::{get, post},
     };
+    use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -331,6 +335,58 @@ mod serve {
     }
 
     // -----------------------------------------------------------------------
+    // SSE streaming types
+    // -----------------------------------------------------------------------
+
+    /// Internal channel message type for the streaming generation path.
+    ///
+    /// `spawn_blocking` runs the sync `generate_streaming` call on a blocking
+    /// thread and sends incremental deltas through an unbounded channel.  The
+    /// async SSE handler reads from the other end and maps these messages to
+    /// OpenAI `chat.completion.chunk` events.
+    pub enum StreamMsg {
+        /// One incremental text delta from the model.
+        Delta(String),
+        /// Generation finished normally; carries the OpenAI finish reason.
+        Done { finish_reason: &'static str },
+        /// Generation failed (invariant violation or engine error).
+        Failed,
+    }
+
+    /// Top-level chunk object serialised into each `data:` SSE event.
+    #[derive(Serialize)]
+    pub struct ChatCompletionChunk {
+        pub id: String,
+        pub object: &'static str,
+        pub created: u64,
+        pub model: String,
+        pub choices: Vec<ChunkChoice>,
+    }
+
+    #[derive(Serialize)]
+    pub struct ChunkChoice {
+        pub index: usize,
+        pub delta: ChunkDelta,
+        /// Null while streaming, set on the final choice.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub finish_reason: Option<&'static str>,
+    }
+
+    /// The `delta` field of a streaming chunk.
+    ///
+    /// Exactly one of `role` / `content` is set per chunk:
+    /// - First chunk: `role = "assistant"`, no content.
+    /// - Subsequent content chunks: `content = <text>`, no role.
+    /// - Final finish chunk: both absent (empty delta `{}`).
+    #[derive(Serialize)]
+    pub struct ChunkDelta {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub role: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub content: Option<String>,
+    }
+
+    // -----------------------------------------------------------------------
     // Validation helpers — pure functions, no model required, easily tested
     // -----------------------------------------------------------------------
 
@@ -463,13 +519,10 @@ mod serve {
     }
 
     /// Reject OpenAI fields that are parsed but not yet implemented.
+    ///
+    /// Note: `stream=true` is now handled by the streaming path in `chat_completions`
+    /// and is intentionally NOT rejected here.
     fn reject_unsupported(req: &ChatCompletionRequest) -> Result<(), ApiError> {
-        if req.stream.unwrap_or(false) {
-            return Err(ApiError::BadRequest {
-                message: "stream=true is not supported by this server".to_string(),
-                code: "unsupported_feature",
-            });
-        }
         if req.tools.is_some() || req.tool_choice.is_some() {
             return Err(ApiError::BadRequest {
                 message: "tools and tool_choice are not supported by this server".to_string(),
@@ -603,7 +656,7 @@ mod serve {
     pub async fn chat_completions(
         State(state): State<AppState>,
         result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
-    ) -> Result<Json<ChatCompletionResponse>, ApiError> {
+    ) -> Result<Response, ApiError> {
         // Surface JSON extraction failures as structured 400 responses.
         // Log the raw parser message server-side; never forward it to clients.
         let Json(req) = result.map_err(|rejection| {
@@ -692,63 +745,225 @@ mod serve {
 
         let model = Arc::clone(&state.model);
 
-        // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
-        let output = tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
-            .await
-            .map_err(|e| {
-                eprintln!("task join error: {e}");
-                ApiError::Internal {
-                    message: "inference failed".to_string(),
-                }
-            })?
-            .map_err(|e| {
-                eprintln!("generation error: {e}");
-                ApiError::Internal {
-                    message: "inference failed".to_string(),
-                }
-            })?;
-
-        // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
-        // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
-        // Log and return 500 if the invariant is violated.
-        if output.generated_tokens > max_tokens {
-            eprintln!(
-                "generation invariant violation: generated_tokens={} max_tokens={}",
-                output.generated_tokens, max_tokens
-            );
-            return Err(ApiError::Internal {
-                message: "inference failed".to_string(),
-            });
-        }
-        let finish_reason = finish_reason_for(&output);
-
+        // Compute shared response metadata before branching on stream flag.
         let created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
+        let response_id = format!("chatcmpl-{created}-{seq}");
 
-        let response = ChatCompletionResponse {
-            id: format!("chatcmpl-{created}-{seq}"),
-            object: "chat.completion".to_string(),
-            created,
-            model: state.model_id.clone(),
-            choices: vec![Choice {
-                index: 0,
-                message: ResponseMessage {
-                    role: "assistant".to_string(),
-                    content: output.text.clone(),
+        if req.stream == Some(true) {
+            // --- Streaming path ---
+            //
+            // `generate_streaming` is a synchronous blocking function.  We run it
+            // on the blocking thread pool and feed incremental deltas into an
+            // unbounded MPSC channel.  The async SSE handler drains the channel
+            // and converts each message to an OpenAI `chat.completion.chunk` event.
+            // An unbounded channel is acceptable here because the channel depth is
+            // bounded by `max_tokens` (capped at `max_tokens_cap`): the producer
+            // sends at most one `Delta` per generated token and generation halts at
+            // the cap, so the worst-case buffer is a few thousand short strings —
+            // the same order the non-streaming path already holds as one buffered
+            // string. There is no true backpressure (an unbounded send never
+            // blocks); if the client disconnects mid-stream the producer keeps
+            // generating to the cap and the ignored send errors drain harmlessly.
+            // Per-token backpressure / disconnect-cancellation is a future refinement.
+            let (tx, rx) = futures::channel::mpsc::unbounded::<StreamMsg>();
+
+            let stream_id = response_id.clone();
+            let stream_model = state.model_id.clone();
+
+            tokio::task::spawn_blocking(move || {
+                let tx_delta = tx.clone();
+                let result = model.generate_streaming(&prompt, &gen_cfg, |delta| {
+                    // Send each incremental text delta; ignore if the receiver
+                    // dropped (client disconnected).
+                    let _ = tx_delta.unbounded_send(StreamMsg::Delta(delta.to_string()));
+                });
+                match result {
+                    Ok(output) => {
+                        // Mirror the same finish-reason logic used by the
+                        // non-streaming path via the shared helper.
+                        if output.generated_tokens > max_tokens {
+                            eprintln!(
+                                "generation invariant violation: generated_tokens={} max_tokens={}",
+                                output.generated_tokens, max_tokens
+                            );
+                            let _ = tx.unbounded_send(StreamMsg::Failed);
+                        } else {
+                            let finish_reason = finish_reason_for(&output);
+                            let _ = tx.unbounded_send(StreamMsg::Done { finish_reason });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("generation error (streaming): {e}");
+                        let _ = tx.unbounded_send(StreamMsg::Failed);
+                    }
+                }
+            });
+
+            // Build the SSE stream.
+            //
+            // Event order (OpenAI spec):
+            //   1. Role chunk: `delta: {"role":"assistant"}`, finish_reason absent.
+            //   2. One content chunk per Delta: `delta: {"content":"..."}`, finish_reason absent.
+            //   3. Finish chunk: `delta: {}`, finish_reason set.
+            //   4. Literal `data: [DONE]` sentinel.
+            let role_chunk = {
+                let chunk = ChatCompletionChunk {
+                    id: stream_id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: stream_model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta {
+                            role: Some("assistant"),
+                            content: None,
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                Ok::<Event, std::convert::Infallible>(Event::default().data(data))
+            };
+
+            // Map each StreamMsg from the channel into one or two SSE events.
+            let body_stream = rx.flat_map(move |msg| {
+                let id = stream_id.clone();
+                let mdl = stream_model.clone();
+                match msg {
+                    StreamMsg::Delta(text) => {
+                        let chunk = ChatCompletionChunk {
+                            id,
+                            object: "chat.completion.chunk",
+                            created,
+                            model: mdl,
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: Some(text),
+                                },
+                                finish_reason: None,
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let events: Vec<Result<Event, std::convert::Infallible>> =
+                            vec![Ok(Event::default().data(data))];
+                        futures::stream::iter(events)
+                    }
+                    StreamMsg::Done { finish_reason } => {
+                        let chunk = ChatCompletionChunk {
+                            id,
+                            object: "chat.completion.chunk",
+                            created,
+                            model: mdl,
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: None,
+                                },
+                                finish_reason: Some(finish_reason),
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let events: Vec<Result<Event, std::convert::Infallible>> = vec![
+                            Ok(Event::default().data(data)),
+                            Ok(Event::default().data("[DONE]")),
+                        ];
+                        futures::stream::iter(events)
+                    }
+                    StreamMsg::Failed => {
+                        // Emit a finish chunk with reason "stop" so the client
+                        // receives a well-formed termination, then the [DONE]
+                        // sentinel.  The error was already logged in the producer.
+                        let chunk = ChatCompletionChunk {
+                            id,
+                            object: "chat.completion.chunk",
+                            created,
+                            model: mdl,
+                            choices: vec![ChunkChoice {
+                                index: 0,
+                                delta: ChunkDelta {
+                                    role: None,
+                                    content: None,
+                                },
+                                finish_reason: Some("stop"),
+                            }],
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        let events: Vec<Result<Event, std::convert::Infallible>> = vec![
+                            Ok(Event::default().data(data)),
+                            Ok(Event::default().data("[DONE]")),
+                        ];
+                        futures::stream::iter(events)
+                    }
+                }
+            });
+
+            let sse_stream = futures::stream::once(async move { role_chunk }).chain(body_stream);
+
+            Ok(Sse::new(sse_stream)
+                .keep_alive(KeepAlive::default())
+                .into_response())
+        } else {
+            // --- Non-streaming path (byte-identical to the original) ---
+            //
+            // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
+            let output = tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
+                .await
+                .map_err(|e| {
+                    eprintln!("task join error: {e}");
+                    ApiError::Internal {
+                        message: "inference failed".to_string(),
+                    }
+                })?
+                .map_err(|e| {
+                    eprintln!("generation error: {e}");
+                    ApiError::Internal {
+                        message: "inference failed".to_string(),
+                    }
+                })?;
+
+            // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
+            // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
+            // Log and return 500 if the invariant is violated.
+            if output.generated_tokens > max_tokens {
+                eprintln!(
+                    "generation invariant violation: generated_tokens={} max_tokens={}",
+                    output.generated_tokens, max_tokens
+                );
+                return Err(ApiError::Internal {
+                    message: "inference failed".to_string(),
+                });
+            }
+            let finish_reason = finish_reason_for(&output);
+
+            let response = ChatCompletionResponse {
+                id: response_id,
+                object: "chat.completion".to_string(),
+                created,
+                model: state.model_id.clone(),
+                choices: vec![Choice {
+                    index: 0,
+                    message: ResponseMessage {
+                        role: "assistant".to_string(),
+                        content: output.text.clone(),
+                    },
+                    finish_reason: finish_reason.to_string(),
+                }],
+                usage: Usage {
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.generated_tokens,
+                    total_tokens: output.prompt_tokens + output.generated_tokens,
                 },
-                finish_reason: finish_reason.to_string(),
-            }],
-            usage: Usage {
-                prompt_tokens: output.prompt_tokens,
-                completion_tokens: output.generated_tokens,
-                total_tokens: output.prompt_tokens + output.generated_tokens,
-            },
-        };
+            };
 
-        Ok(Json(response))
+            Ok(Json(response).into_response())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1020,7 +1235,9 @@ mod serve {
         }
 
         #[test]
-        fn reject_unsupported_stream_true() {
+        fn reject_unsupported_stream_true_ok() {
+            // stream=true is now handled by the streaming path and must NOT be
+            // rejected by reject_unsupported.
             let req = ChatCompletionRequest {
                 model: "m".to_string(),
                 messages: vec![],
@@ -1037,14 +1254,71 @@ mod serve {
                 logprobs: None,
                 n: None,
             };
-            let err = reject_unsupported(&req).unwrap_err();
-            assert!(matches!(
-                err,
-                ApiError::BadRequest {
-                    code: "unsupported_feature",
-                    ..
-                }
-            ));
+            assert!(reject_unsupported(&req).is_ok());
+        }
+
+        // -----------------------------------------------------------------------
+        // ChatCompletionChunk serialization
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn chunk_content_delta_serializes_correctly() {
+            let chunk = ChatCompletionChunk {
+                id: "chatcmpl-1-0".to_string(),
+                object: "chat.completion.chunk",
+                created: 1_000_000,
+                model: "test-model".to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: Some("Hello".to_string()),
+                    },
+                    finish_reason: None,
+                }],
+            };
+            let json = serde_json::to_string(&chunk).unwrap();
+            assert!(
+                json.contains("\"object\":\"chat.completion.chunk\""),
+                "must contain object field"
+            );
+            assert!(
+                json.contains("\"delta\":{\"content\":\"Hello\"}"),
+                "delta must contain only content when role is None"
+            );
+            // finish_reason must be absent (not null) when None
+            assert!(
+                !json.contains("finish_reason"),
+                "finish_reason must be omitted when None"
+            );
+        }
+
+        #[test]
+        fn chunk_finish_delta_serializes_correctly() {
+            let chunk = ChatCompletionChunk {
+                id: "chatcmpl-1-0".to_string(),
+                object: "chat.completion.chunk",
+                created: 1_000_000,
+                model: "test-model".to_string(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: Some("stop"),
+                }],
+            };
+            let json = serde_json::to_string(&chunk).unwrap();
+            assert!(
+                json.contains("\"finish_reason\":\"stop\""),
+                "finish chunk must include finish_reason"
+            );
+            // delta should be empty object since both role and content are None
+            assert!(
+                json.contains("\"delta\":{}"),
+                "finish chunk delta must be empty object"
+            );
         }
 
         #[test]
