@@ -13847,6 +13847,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 return None;
             }
 
+            // Fail-loud (#418): a speculation feature must never silently disable itself.
+            // When the operator explicitly requests MTP via the env var but a weight file
+            // is missing (the shipped Q4 checkpoint stores the 8 MTP projections as `.q4`
+            // while this loader reads `.f16`), warn and name the file instead of returning
+            // `None` into a silent no-op that decodes at the plain baseline.
+            let want_mtp = std::env::var_os("LATTICE_MTP").is_some();
+
             let f16p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "f16");
 
             // Helper: load an f16 file as a f32 Metal buffer (for norm gammas / biases
@@ -13854,6 +13861,14 @@ kernel void gdn_chunk_norm_silu_c32(
             let load_f16_buf_as_f32 = |name: &str, label: &str| -> Option<Buffer> {
                 let path = f16p(name);
                 if !path.exists() {
+                    if want_mtp {
+                        eprintln!(
+                            "[mtp] WARNING: LATTICE_MTP is set but MTP weight file is \
+                             missing: {} — MTP speculation DISABLED, decoding at the plain \
+                             baseline (see issue #418).",
+                            path.display()
+                        );
+                    }
                     return None;
                 }
                 let (vals, _) = load_f16_tensor_file(&path).ok()?;
@@ -13867,6 +13882,14 @@ kernel void gdn_chunk_norm_silu_c32(
             let load_f16_buf_as_half = |name: &str, label: &str| -> Option<Buffer> {
                 let path = f16p(name);
                 if !path.exists() {
+                    if want_mtp {
+                        eprintln!(
+                            "[mtp] WARNING: LATTICE_MTP is set but MTP weight file is \
+                             missing: {} — MTP speculation DISABLED, decoding at the plain \
+                             baseline (see issue #418).",
+                            path.display()
+                        );
+                    }
                     return None;
                 }
                 let (vals, _) = load_f16_tensor_file(&path).ok()?;
