@@ -25,7 +25,7 @@
 //! use lattice_inference::batch::worker::PagedKVCacheConfigExt;
 //!
 //! let kv_config = PagedKVCacheConfig { /* ... */ };
-//! let mut worker = BatchWorker::new(
+//! let mut worker = BatchWorker::try_new(
 //!     BatchConfig::default(),
 //!     kv_config,
 //!     s_floats_per_slot,

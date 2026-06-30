@@ -24,6 +24,7 @@ use crate::batch::scheduler::{FifoScheduler, Scheduler};
 use crate::batch::sequence::{
     AdapterKey, FinishReason, SeqId, Sequence, SequenceManager, SequenceState,
 };
+use crate::error::InferenceError;
 use crate::kv_cache::{PagePool, PagedKVCacheConfig};
 use crate::sampling::{Sampler, SamplingConfig};
 
@@ -244,6 +245,35 @@ impl BatchWorker {
             eos_token_id,
             output_buffer: VecDeque::new(),
         }
+    }
+
+    /// Fallible constructor — returns `InvalidInput` on overflow rather than
+    /// panicking or silently allocating a wrong-sized pool.
+    pub fn try_new(
+        config: BatchConfig,
+        kv_pool_config: PagedKVCacheConfig,
+        s_floats_per_slot: usize,
+        conv_floats_per_slot: usize,
+        eos_token_id: Option<u32>,
+    ) -> Result<Self, InferenceError> {
+        let floats_per_page = kv_pool_config.try_floats_per_page_pub()?;
+        let kv_pool = PagePool::try_new(kv_pool_config.max_pages, floats_per_page)?;
+        let gdn_pool = GdnStatePool::new(
+            config.max_batch_size,
+            s_floats_per_slot,
+            conv_floats_per_slot,
+        );
+        let scheduler = FifoScheduler::new(config.clone());
+        Ok(Self {
+            config,
+            seq_manager: SequenceManager::new(),
+            gdn_pool,
+            kv_pool,
+            scheduler,
+            samplers: HashMap::new(),
+            eos_token_id,
+            output_buffer: VecDeque::new(),
+        })
     }
 
     /// Submit a new inference request.
@@ -521,11 +551,16 @@ impl BatchWorker {
 /// trait provides the equivalent calculation for the worker.
 pub trait PagedKVCacheConfigExt {
     fn floats_per_page_pub(&self) -> usize;
+    fn try_floats_per_page_pub(&self) -> Result<usize, InferenceError>;
 }
 
 impl PagedKVCacheConfigExt for crate::kv_cache::PagedKVCacheConfig {
     fn floats_per_page_pub(&self) -> usize {
         self.num_layers * 2 * self.page_size * self.kv_dim()
+    }
+
+    fn try_floats_per_page_pub(&self) -> Result<usize, InferenceError> {
+        self.try_floats_per_page()
     }
 }
 
@@ -554,13 +589,14 @@ mod tests {
             chunk_size: 8,
             prefill_reserve_pages: 2,
         };
-        BatchWorker::new(
+        BatchWorker::try_new(
             config,
             test_kv_config(),
             16,      // s_floats_per_slot (tiny for tests)
             8,       // conv_floats_per_slot
             Some(2), // eos = token 2
         )
+        .expect("valid test worker config must succeed")
     }
 
     fn dummy_logits(winner: u32, vocab: usize) -> Vec<f32> {
@@ -760,7 +796,7 @@ mod tests {
 
     #[test]
     fn step_chunked_prefill_multiple_chunks() {
-        let mut worker = BatchWorker::new(
+        let mut worker = BatchWorker::try_new(
             BatchConfig {
                 max_batch_size: 4,
                 max_seq_len: 128,
@@ -771,7 +807,8 @@ mod tests {
             16,
             8,
             Some(99), // eos = 99
-        );
+        )
+        .expect("valid chunked-prefill worker config must succeed");
         // Prompt of 7 tokens requires ceil(7/3) = 3 prefill steps.
         worker.submit(InferenceRequest {
             prompt_ids: vec![1, 2, 3, 4, 5, 6, 7],
@@ -825,5 +862,53 @@ mod tests {
         let cfg = test_kv_config(); // page=4, layers=2, kv_heads=2, head_dim=4
         // kv_dim = 2*4 = 8; floats = 2 * 2 * 4 * 8 = 128
         assert_eq!(cfg.floats_per_page_pub(), 128);
+    }
+
+    // --- Overflow hardening tests (#460) ---
+
+    #[test]
+    fn batch_worker_try_new_overflow_floats_per_page_returns_invalid_input() {
+        let config = BatchConfig {
+            max_batch_size: 1,
+            max_seq_len: 8,
+            chunk_size: 1,
+            prefill_reserve_pages: 0,
+        };
+        let kv_pool_config = PagedKVCacheConfig {
+            page_size: 8,
+            max_pages: 1,
+            num_layers: usize::MAX / 16 + 2,
+            num_kv_heads: 1,
+            head_dim: 1,
+            eviction: EvictionPolicy::None,
+        };
+        let r = BatchWorker::try_new(config, kv_pool_config, 1, 1, None);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on worker KV page overflow"
+        );
+    }
+
+    #[test]
+    fn batch_worker_try_new_overflow_page_pool_capacity_returns_invalid_input() {
+        let config = BatchConfig {
+            max_batch_size: 1,
+            max_seq_len: 8,
+            chunk_size: 1,
+            prefill_reserve_pages: 0,
+        };
+        let kv_pool_config = PagedKVCacheConfig {
+            page_size: 1,
+            max_pages: usize::MAX,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            eviction: EvictionPolicy::None,
+        };
+        let r = BatchWorker::try_new(config, kv_pool_config, 1, 1, None);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on worker PagePool capacity overflow"
+        );
     }
 }
