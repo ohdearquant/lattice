@@ -2,13 +2,22 @@
 //!
 //! Consumes a batch of [`FeedbackEvent`]s, retunes the adapter-selection gate
 //! network with a single-sample policy-gradient update (RLOO / M=1), applies
-//! the EWC++ diagonal-Fisher null-space projection for anti-forgetting, and
-//! returns the updated gate as a self-contained FANN binary blob.
+//! Fisher null-space damping for anti-forgetting (v1), and returns the updated
+//! gate as a self-contained FANN binary blob.
 //!
-//! This is the tune-side orchestration layer.  All gradient computation and
-//! Fisher accumulation live in the fann training primitives
-//! ([`RlooTrainer`], [`DiagonalFisher`]).  This module wires them with the
-//! replay buffer and persistence logic.
+//! # Anti-forgetting mechanism (v1)
+//!
+//! The shipped v1 mechanism is **Fisher null-space damping** via
+//! [`DiagonalFisher::project_delta`]: parameters with a high squared-gradient
+//! EMA (important to prior tasks) have their update scaled toward zero;
+//! parameters with near-zero importance pass through unchanged.  The anchor
+//! parameter vector is updated at the end of each refit call, but it is used
+//! only by the off-by-default penalty path — not by `project_delta`.
+//!
+//! The anchor-pullback penalty ([`DiagonalFisher::penalty_gradient`]) is a
+//! tested Phase-2 path wired to [`RouterUpdateConfig::ewc_lambda`].  It is
+//! **not** active in v1; `ewc_lambda` is validated and stored but not consumed
+//! by the current update loop.
 //!
 //! # Polarity invariant
 //!
@@ -267,9 +276,15 @@ struct ReplayEntry {
 ///
 /// Loads `gate_bytes`, validates all events against the gate's dimensions,
 /// runs `config.epochs` passes of single-sample policy-gradient updates
-/// (RLOO / M=1) over the combined `events` + replay sample, applies the
-/// EWC++ diagonal-Fisher null-space projection after each step, serialises
-/// the updated gate, and returns a [`RouterDelta`].
+/// (RLOO / M=1) over the combined `events` + replay sample, applies Fisher
+/// null-space damping after each step to protect parameters important to prior
+/// tasks, serialises the updated gate, and returns a [`RouterDelta`].
+///
+/// The v1 anti-forgetting mechanism is [`DiagonalFisher::project_delta`]:
+/// parameters with a high squared-gradient EMA are damped toward zero.  The
+/// anchor-pullback penalty (Phase-2) is wired to `config.ewc_lambda` but is
+/// **not** active in this version; the parameter is validated and stored for
+/// forward compatibility.
 ///
 /// The replay buffer and Fisher state are updated **in place**: after refit,
 /// new positive-signal events are appended to `replay` (oldest evicted if at
@@ -336,6 +351,62 @@ pub fn update_router(
                 ev.preferred_adapter_idx
             )));
         }
+        // Reward values are derived from PreferenceSignal::reward(), which always
+        // returns a finite f32; only the caller-supplied context vector needs this
+        // non-finite guard.
+        if ev.context_vector.iter().any(|&v| !v.is_finite()) {
+            return Err(TuneError::Validation(format!(
+                "event {idx}: context_vector contains a non-finite value (NaN or Inf)"
+            )));
+        }
+    }
+
+    // ── 3.5. Validate config hyperparameters ─────────────────────────────
+    if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
+        return Err(TuneError::Validation(format!(
+            "learning_rate must be finite and > 0, got {}",
+            config.learning_rate
+        )));
+    }
+    if !config.aux_loss_coeff.is_finite() || config.aux_loss_coeff < 0.0 {
+        return Err(TuneError::Validation(format!(
+            "aux_loss_coeff must be finite and >= 0, got {}",
+            config.aux_loss_coeff
+        )));
+    }
+    if !config.z_loss_coeff.is_finite() || config.z_loss_coeff < 0.0 {
+        return Err(TuneError::Validation(format!(
+            "z_loss_coeff must be finite and >= 0, got {}",
+            config.z_loss_coeff
+        )));
+    }
+    if !config.ewc_lambda.is_finite() || config.ewc_lambda < 0.0 {
+        return Err(TuneError::Validation(format!(
+            "ewc_lambda must be finite and >= 0, got {}",
+            config.ewc_lambda
+        )));
+    }
+    if !config.replay_mix_fraction.is_finite()
+        || config.replay_mix_fraction < 0.0
+        || config.replay_mix_fraction > 1.0
+    {
+        return Err(TuneError::Validation(format!(
+            "replay_mix_fraction must be finite and in [0.0, 1.0], got {}",
+            config.replay_mix_fraction
+        )));
+    }
+    if config.epochs == 0 {
+        return Err(TuneError::Validation(
+            "epochs must be > 0; a refit with zero training epochs has no effect".to_owned(),
+        ));
+    }
+    // Fisher decay must be in the open interval (0, 1) on both the empty
+    // auto-init path and the non-empty reuse path. Mirror DiagonalFisher::new.
+    if !fisher.decay.is_finite() || fisher.decay <= 0.0 || fisher.decay >= 1.0 {
+        return Err(TuneError::Validation(format!(
+            "DiagonalFisher decay must be finite and in the open interval (0, 1), got {}",
+            fisher.decay
+        )));
     }
 
     // ── 4. Initialise or validate DiagonalFisher ──────────────────────────
@@ -344,11 +415,36 @@ pub fn update_router(
         fisher.values = vec![0.0_f32; total_params];
         fisher.anchor = vec![0.0_f32; total_params];
         // `fisher.decay` remains as set by the caller.
-    } else if fisher.values.len() != total_params {
-        return Err(TuneError::Validation(format!(
-            "DiagonalFisher size {} does not match gate parameter count {total_params}",
-            fisher.values.len()
-        )));
+    } else {
+        // Non-empty Fisher: validate dimensions and numeric integrity before
+        // any mutation so we fail closed before touching the training state.
+        if fisher.values.len() != total_params {
+            return Err(TuneError::Validation(format!(
+                "DiagonalFisher size {} does not match gate parameter count {total_params}",
+                fisher.values.len()
+            )));
+        }
+        // Fisher diagonal entries are squared-gradient EMAs — they must be
+        // finite and non-negative by construction.
+        if fisher.values.iter().any(|&v| !v.is_finite() || v < 0.0) {
+            return Err(TuneError::Validation(
+                "DiagonalFisher values must all be finite and >= 0 \
+                 (Fisher diagonal entries are squared-gradient EMAs)"
+                    .to_owned(),
+            ));
+        }
+        if fisher.anchor.len() != total_params {
+            return Err(TuneError::Validation(format!(
+                "DiagonalFisher anchor length {} does not match gate parameter count \
+                 {total_params}",
+                fisher.anchor.len()
+            )));
+        }
+        if fisher.anchor.iter().any(|&v| !v.is_finite()) {
+            return Err(TuneError::Validation(
+                "DiagonalFisher anchor contains a non-finite value".to_owned(),
+            ));
+        }
     }
 
     // ── 5. Build RLOO trainer ─────────────────────────────────────────────
@@ -824,6 +920,388 @@ mod tests {
             (front.context_vector[0] - 344.0).abs() < 1e-6,
             "front entry should be the 345th inserted (index 344), got {}",
             front.context_vector[0]
+        );
+    }
+
+    // ─── FIX 1: input-validation tests ────────────────────────────────────
+
+    /// NaN learning_rate must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `!config.learning_rate.is_finite()` branch.
+    #[test]
+    fn update_router_nan_learning_rate_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            learning_rate: f32::NAN,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "NaN learning_rate must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Zero learning_rate must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `config.learning_rate <= 0.0` branch.
+    #[test]
+    fn update_router_zero_learning_rate_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            learning_rate: 0.0,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "zero learning_rate must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Negative learning_rate must return Err(TuneError::Validation).
+    ///
+    /// Mutation: invert or remove the `config.learning_rate <= 0.0` check.
+    #[test]
+    fn update_router_negative_learning_rate_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            learning_rate: -0.1,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "negative learning_rate must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// NaN aux_loss_coeff must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `!config.aux_loss_coeff.is_finite()` branch.
+    #[test]
+    fn update_router_nan_aux_loss_coeff_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            aux_loss_coeff: f32::NAN,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "NaN aux_loss_coeff must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Negative z_loss_coeff must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `config.z_loss_coeff < 0.0` branch.
+    #[test]
+    fn update_router_negative_z_loss_coeff_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            z_loss_coeff: -0.001,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "negative z_loss_coeff must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Negative ewc_lambda must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `config.ewc_lambda < 0.0` branch.
+    #[test]
+    fn update_router_negative_ewc_lambda_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            ewc_lambda: -0.1,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "negative ewc_lambda must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Infinite ewc_lambda must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `!config.ewc_lambda.is_finite()` branch.
+    #[test]
+    fn update_router_infinite_ewc_lambda_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            ewc_lambda: f32::INFINITY,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "infinite ewc_lambda must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// replay_mix_fraction > 1.0 must return Err(TuneError::Validation).
+    ///
+    /// Prior to this fix the value was silently clamped; the guard makes a bad
+    /// value loud instead.
+    ///
+    /// Mutation: remove the `config.replay_mix_fraction > 1.0` branch.
+    #[test]
+    fn update_router_replay_mix_fraction_out_of_range_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            replay_mix_fraction: 1.5,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "replay_mix_fraction > 1.0 must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// A NaN value inside an event's context_vector must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `ev.context_vector.iter().any(!is_finite)` check.
+    #[test]
+    fn update_router_nan_context_value_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = test_config();
+        let events = vec![FeedbackEvent {
+            context_vector: vec![1.0, f32::NAN, 0.5, 0.0],
+            preferred_adapter_idx: 0,
+            adapter_id: "a".into(),
+            signal: PreferenceSignal::Positive,
+        }];
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "NaN in context_vector must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// epochs == 0 must return Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `config.epochs == 0` check.
+    #[test]
+    fn update_router_zero_epochs_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+        let config = RouterUpdateConfig {
+            epochs: 0,
+            ..test_config()
+        };
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "epochs=0 must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// A non-empty DiagonalFisher with a NaN value must return Err(TuneError::Validation).
+    ///
+    /// Uses a struct literal to bypass DiagonalFisher::new() validation so the
+    /// invalid state reaches update_router's own guard.
+    ///
+    /// Mutation: remove the `!v.is_finite()` branch in the Fisher values check.
+    #[test]
+    fn update_router_fisher_nan_value_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let total_params = gate.total_params();
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut values = vec![0.0_f32; total_params];
+        values[0] = f32::NAN;
+        let mut fisher = DiagonalFisher {
+            values,
+            anchor: vec![0.0; total_params],
+            decay: 0.99,
+        };
+        let config = test_config();
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "Fisher NaN value must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// A non-empty DiagonalFisher with a negative value must return Err(TuneError::Validation).
+    ///
+    /// Fisher diagonal entries are squared-gradient EMAs and must be >= 0.
+    ///
+    /// Mutation: remove the `v < 0.0` branch in the Fisher values check.
+    #[test]
+    fn update_router_fisher_negative_value_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let total_params = gate.total_params();
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut values = vec![0.0_f32; total_params];
+        values[1] = -0.5;
+        let mut fisher = DiagonalFisher {
+            values,
+            anchor: vec![0.0; total_params],
+            decay: 0.99,
+        };
+        let config = test_config();
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "negative Fisher value must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// Fisher decay = 1.0, set via struct literal to bypass DiagonalFisher::new(),
+    /// must return Err(TuneError::Validation) even when values is empty.
+    ///
+    /// Mutation: remove the Fisher decay guard in update_router.
+    #[test]
+    fn update_router_fisher_decay_one_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher {
+            values: vec![],
+            anchor: vec![],
+            decay: 1.0,
+        };
+        let config = test_config();
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "Fisher decay=1.0 must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// A non-empty DiagonalFisher with anchor length != total_params must return
+    /// Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `fisher.anchor.len() != total_params` check.
+    #[test]
+    fn update_router_fisher_anchor_len_mismatch_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let total_params = gate.total_params();
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut fisher = DiagonalFisher {
+            values: vec![0.0; total_params],
+            anchor: vec![0.0; total_params + 3], // wrong length
+            decay: 0.99,
+        };
+        let config = test_config();
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "Fisher anchor length mismatch must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    /// A non-empty DiagonalFisher with a non-finite anchor entry must return
+    /// Err(TuneError::Validation).
+    ///
+    /// Mutation: remove the `fisher.anchor.iter().any(!is_finite)` check.
+    #[test]
+    fn update_router_fisher_nonfinite_anchor_returns_err() {
+        let gate = make_gate(4, 8, 3);
+        let total_params = gate.total_params();
+        let gate_bytes = gate.to_bytes();
+        let mut replay = ReplayBuffer::new(256);
+        let mut anchor = vec![0.0_f32; total_params];
+        anchor[2] = f32::INFINITY;
+        let mut fisher = DiagonalFisher {
+            values: vec![0.0; total_params],
+            anchor,
+            decay: 0.99,
+        };
+        let config = test_config();
+        let events = make_events(1, 0, PreferenceSignal::Positive, 4);
+        let result = update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config);
+        assert!(
+            matches!(result, Err(TuneError::Validation(_))),
+            "non-finite Fisher anchor must return TuneError::Validation, got {result:?}"
+        );
+    }
+
+    // ─── ewc_lambda Phase-2 boundary test ─────────────────────────────────
+
+    /// Two runs identical in every respect except ewc_lambda must produce
+    /// byte-identical RouterDelta::network_bytes.
+    ///
+    /// This pins the Phase-2 boundary: v1 uses project_delta (Fisher
+    /// null-space damping), which does not read ewc_lambda.  The test fails
+    /// the moment someone wires ewc_lambda into the update path without
+    /// revisiting the design.
+    ///
+    /// Mutation: multiply the projected delta by `config.ewc_lambda` inside
+    /// one_gradient_step — the two outputs will diverge.
+    #[test]
+    fn ewc_lambda_is_inert_in_projection_path() {
+        let gate_bytes = make_gate(4, 8, 3).to_bytes();
+        let events = make_events(3, 1, PreferenceSignal::Positive, 4);
+
+        let run = |ewc_lambda: f32| -> Vec<u8> {
+            let mut replay = ReplayBuffer::new(256);
+            let mut fisher = DiagonalFisher::new(0, 0.99).unwrap();
+            let config = RouterUpdateConfig {
+                ewc_lambda,
+                ..test_config()
+            };
+            update_router(&gate_bytes, &events, &mut replay, &mut fisher, &config)
+                .expect("update_router must succeed on valid input")
+                .network_bytes
+        };
+
+        let bytes_zero = run(0.0);
+        let bytes_half = run(0.5);
+        assert_eq!(
+            bytes_zero, bytes_half,
+            "ewc_lambda must not affect network_bytes in the v1 projection path"
         );
     }
 }
