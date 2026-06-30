@@ -1148,6 +1148,19 @@ impl<'a> CompileCtx<'a> {
     /// Compile `"type": "string"` potentially with an `enum` constraint.
     fn compile_string_type(&mut self, schema: &Value) -> Result<Vec<Alt>, SchemaError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            // DoS bound (issue #474): reject oversized enum arrays by their RAW
+            // cardinality before any narrowing happens below. A sibling `const`
+            // (next) can shrink the surviving set to a single value, so a guard
+            // placed AFTER that narrowing would never see the true input size.
+            // Checking `values.len()` here, before the filter_map/collect and
+            // before the const retain, bounds every downstream allocation sized
+            // by this array regardless of how far the const narrows it.
+            if values.len() > MAX_STRING_LITERALS {
+                return Err(SchemaError(format!(
+                    "string enum literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+                    values.len()
+                )));
+            }
             let mut str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
             // A sibling `const` is a single-value enum, so the string language is
             // the intersection `{const} ∩ enum`. Narrow to the const when it is a
@@ -1186,18 +1199,6 @@ impl<'a> CompileCtx<'a> {
                 // diverges at its first byte, so the no-rewind single-stack PDA
                 // always picks the correct alternative at sym_pos == 0 without
                 // needing to backtrack across a shared prefix (e.g. ["foo","food"]).
-
-                // DoS bound (issue #474): reject oversized enum arrays before the
-                // byte pre-pass loop and before Vec::with_capacity so that an
-                // attacker cannot force ~N small allocations by sending just under
-                // the byte budget with a large count. The byte-budget pre-pass
-                // iterates over `str_values`, so this guard also bounds that loop.
-                if str_values.len() > MAX_STRING_LITERALS {
-                    return Err(SchemaError(format!(
-                        "string enum literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
-                        str_values.len()
-                    )));
-                }
 
                 // DoS bound: check the total encoded byte budget before
                 // allocating the full seqs Vec so that an over-budget input
@@ -1641,6 +1642,18 @@ fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
     // reached only for mixed-type or non-string enum values (e.g., const
     // arrays containing integers or null), whose first bytes are distinct in
     // the common case.
+    //
+    // DoS bound (issue #474): reject by raw cardinality before allocating one
+    // `Alt` per member below. This is the same sibling-allocation pattern as
+    // the string-enum and anyOf paths, applied to the non-string branch: a
+    // mixed or non-string `enum` still reaches a per-member materialization
+    // step that must be bounded up front, not after the Vec is built.
+    if values.len() > MAX_STRING_LITERALS {
+        return Err(SchemaError(format!(
+            "enum value count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+            values.len()
+        )));
+    }
     let alts = values
         .iter()
         .map(json_value_to_alt)
@@ -1701,6 +1714,20 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
     };
     let const_val = obj.get("const");
     let enum_arr = obj.get("enum").and_then(Value::as_array);
+    // DoS bound (issue #474): reject by raw JSON cardinality before either match
+    // arm below can reach a step sized by this array — the const-narrowing
+    // `.any()` scan in the `(Some(c), _)` arm, or the filter_map/to_string
+    // deep-copy in the `(None, Some(arr))` arm. A sibling `const` narrows which
+    // VALUES survive but never shrinks the RAW array itself, so checking
+    // `arr.len()` here, ahead of the match, bounds both arms uniformly.
+    if let Some(arr) = enum_arr
+        && arr.len() > MAX_STRING_LITERALS
+    {
+        return Err(SchemaError(format!(
+            "anyOf string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+            arr.len()
+        )));
+    }
     match (const_val, enum_arr) {
         (Some(c), enum_opt) => {
             // `const` is a single-value enum. The language is the intersection of
@@ -1723,17 +1750,6 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
             })
         }
         (None, Some(arr)) => {
-            // DoS bound (issue #478): reject by raw JSON cardinality before the
-            // filter_map/to_string pass below, which deep-copies every member
-            // into an owned `String`. Without this, a single anyOf/oneOf branch
-            // with an enormous `enum` forces a content-proportional allocation
-            // before compile_any_of's per-extend count guard ever sees a result.
-            if arr.len() > MAX_STRING_LITERALS {
-                return Err(SchemaError(format!(
-                    "anyOf string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
-                    arr.len()
-                )));
-            }
             if type_is_string {
                 // `type:"string"` kills every non-string member; the language is
                 // exactly the string members (possibly empty = dead branch).
@@ -3242,6 +3258,97 @@ mod tests {
         assert!(
             err.0.contains("object required count"),
             "expected the pre-collect required-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #474 (follow-up) — raw enum cardinality must dominate
+    // const-narrowing and non-string materialization, not just the
+    // already-guarded plain-enum paths above.
+    // -----------------------------------------------------------------------
+
+    /// A sibling `const` narrows the surviving string set to a single value,
+    /// but the RAW enum array is still attacker-controlled cardinality. The
+    /// guard inside `compile_string_type` must fire on `values.len()` before
+    /// the const retain runs, not on the post-retain `str_values.len()` (which
+    /// would always be 0 or 1 once narrowed, and so could never trip).
+    ///
+    /// Mutation pin: fires with "string enum literal count". Reverting the
+    /// raw-cardinality guard (restoring a check placed after the const
+    /// narrowing) lets this schema compile successfully instead of being
+    /// rejected, because the narrowed set is always under the cap.
+    #[test]
+    fn string_const_plus_oversized_enum_rejected_by_raw_guard() {
+        let over = MAX_STRING_LITERALS + 1;
+        let values: String = (0..over)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"type\":\"string\",\"const\":\"v0\",\"enum\":[{values}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err(
+            "a const that narrows the enum to one survivor must not bypass the raw cardinality cap",
+        );
+        assert!(
+            err.0.contains("string enum literal count"),
+            "expected the string-enum literal-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Same const-narrowing bypass as above, but inside an `anyOf` branch,
+    /// exercising the `string_class_of` `(Some(c), Some(arr))` arm rather than
+    /// `compile_string_type`. Before the fix this arm scanned
+    /// `arr.iter().any(...)` for the const-membership check without ever
+    /// bounding `arr.len()`, while the sibling `(None, Some(arr))` arm was
+    /// already guarded.
+    ///
+    /// Mutation pin: fires with "anyOf string literal count". Reverting the
+    /// guard hoisted ahead of the `match (const_val, enum_arr)` dispatch lets
+    /// this schema compile successfully instead of being rejected.
+    #[test]
+    fn anyof_string_const_plus_oversized_enum_rejected() {
+        let over = MAX_STRING_LITERALS + 1;
+        let values: String = (0..over)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json =
+            format!("{{\"anyOf\":[{{\"type\":\"string\",\"const\":\"v0\",\"enum\":[{values}]}}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err(
+            "an anyOf branch's const-narrowed enum must not bypass the raw cardinality cap",
+        );
+        assert!(
+            err.0.contains("anyOf string literal count"),
+            "expected the anyOf string-literal cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// A mixed/non-string `enum` (no `type:"string"`, not all-string members)
+    /// is routed to `compile_enum`, which allocates one `Alt` per member via
+    /// `.map(json_value_to_alt).collect()`. That allocation was previously
+    /// unbounded: only the all-string fast path (`compile_string_type`) had a
+    /// cardinality guard.
+    ///
+    /// Mutation pin: fires with "enum value count". Reverting the guard added
+    /// at the top of `compile_enum` lets this schema compile successfully
+    /// instead of being rejected.
+    #[test]
+    fn non_string_enum_cardinality_capped() {
+        let over = MAX_STRING_LITERALS + 1;
+        let values: String = (0..over)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"enum\":[{values}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("a non-string enum over the cap must be rejected");
+        assert!(
+            err.0.contains("enum value count"),
+            "expected the enum-value-count cap error, got: {}",
             err.0
         );
     }
