@@ -701,7 +701,9 @@ mod tests {
         cfg.layer_mask = vec![true; cfg.num_hidden_layers];
         cfg.tie_word_embeddings = tied;
         cfg.rms_norm_eps = 1e-6;
-        cfg.partial_rotary_factor = 0.25;
+        // head_dim (4) * partial_rotary_factor must derive an even rope_dim >= 2
+        // (Qwen35Config parse guard, #401); 4 * 0.5 = 2.
+        cfg.partial_rotary_factor = 0.5;
         cfg.rope_theta = 1_000_000.0;
         cfg.max_position_embeddings = 1024;
         cfg.eos_token_id = 3;
