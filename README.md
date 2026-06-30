@@ -120,7 +120,7 @@ and can be used standalone.
 
 ```toml
 [dependencies]
-lattice-embed = "0.3"
+lattice-embed = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
