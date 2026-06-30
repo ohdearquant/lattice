@@ -1,3 +1,4 @@
+//! Tile constants and tiled transposed-B matmul helpers.
 // ===================================================================
 // Cache-blocked (tiled) matrix multiplication: C = A @ B^T
 // ===================================================================

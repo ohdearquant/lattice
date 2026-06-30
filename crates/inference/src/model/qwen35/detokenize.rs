@@ -1,3 +1,4 @@
+//! Qwen3.5 byte-decoder construction, token-byte appending, token decoding, incremental detokenization, and byte-to-Unicode mapping.
 use crate::tokenizer::bpe::BpeTokenizer;
 use std::collections::HashMap;
 

@@ -1,3 +1,4 @@
+//! WGSL shader source constants for matmul, RMSNorm, copy, add, and related GPU kernels.
 pub(super) const MATMUL_BT_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read> A: array<f32>;
 @group(0) @binding(1) var<storage, read> B: array<f32>;

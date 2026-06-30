@@ -1,3 +1,4 @@
+//! GPU utility helpers for RoPE table building, byte counts, `usize` to `u32` conversion, and ceiling division.
 use super::api::checked_mul;
 use super::api::{GpuForwardError, Result};
 

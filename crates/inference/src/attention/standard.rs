@@ -1,3 +1,4 @@
+//! Standard attention buffers, multi-head attention, and in-place attention helpers.
 use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
 use crate::lora_hook::LoraHook;
 use crate::weights::TransformerLayerWeights;

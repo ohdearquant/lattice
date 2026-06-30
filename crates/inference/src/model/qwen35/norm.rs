@@ -1,3 +1,4 @@
+//! Shifted RMSNorm implementation used by the Qwen3.5 forward path.
 /// Qwen3.5 uses a shifted RMSNorm: `x * rsqrt(mean(x²) + eps) * (1 + gamma)`.
 /// Empirically verified by PPL — plain `gamma` (the standard convention used
 /// by Qwen3/Llama and MLX `nn.RMSNorm`) produces nonsense logits on this

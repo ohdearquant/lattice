@@ -1,3 +1,4 @@
+//! Model-file ensure/download flow, canonical model names, checksum verification, and download helper.
 use crate::error::InferenceError;
 use std::path::{Path, PathBuf};
 

@@ -1,3 +1,4 @@
+//! GPU-vs-CPU tiny-model tests and CPU reference helpers.
 use super::*;
 
 #[test]

@@ -1,3 +1,4 @@
+//! Accelerate-backed and fallback SGEMM helpers for transposed-B and non-transposed matrix multiplies.
 // ===================================================================
 // Apple Accelerate framework BLAS binding (macOS only)
 // ===================================================================

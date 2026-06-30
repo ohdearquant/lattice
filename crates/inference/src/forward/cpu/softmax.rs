@@ -1,3 +1,4 @@
+//! Softmax attention helpers and fast exponential approximation.
 // ===================================================================
 // Softmax over attention scores — with SIMD fast path
 // ===================================================================

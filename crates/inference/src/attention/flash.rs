@@ -1,3 +1,4 @@
+//! Tiled attention configuration and scratch-buffer support for tiled attention kernels.
 use crate::attention::AttentionBuffers;
 use crate::forward::cpu::{add_bias, matmul_bt};
 use crate::weights::TransformerLayerWeights;

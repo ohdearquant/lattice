@@ -1,3 +1,4 @@
+//! CPU elementwise kernels for RMSNorm, SiLU, elementwise multiply, and scalar variants.
 // ===================================================================
 // Elementwise operations — RMS norm, SiLU, element-wise mul — with SIMD fast paths
 // ===================================================================

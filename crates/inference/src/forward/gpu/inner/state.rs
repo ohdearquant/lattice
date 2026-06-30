@@ -1,3 +1,4 @@
+//! GPU model state, forward entry, and embedding helper.
 use std::sync::{Arc, Mutex, atomic::Ordering, mpsc};
 
 use super::api::checked_mul;

@@ -1,3 +1,4 @@
+//! Qwen3.5 generation, streaming generation, prefill/decode loops, stop-streamer utilities, and stop-token helpers.
 use super::cache::{ForwardScratch, KvCache};
 use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;

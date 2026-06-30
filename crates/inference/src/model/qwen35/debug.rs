@@ -1,3 +1,4 @@
+//! Qwen3.5 debug methods and debug statistics.
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use super::norm::qwen35_rms_norm;

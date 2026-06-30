@@ -1,3 +1,4 @@
+//! Qwen3.5 model type, safetensors loader, accessors, LoRA setter, train-backward weight accessors, and layer weight statistics.
 use super::loading::{load_weights, validate_required_tensor_names};
 use super::weights::{AttentionWeights, FeedForwardWeights, ModelWeights};
 use crate::error::InferenceError;

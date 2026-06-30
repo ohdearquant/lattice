@@ -1,3 +1,4 @@
+//! Tokenizer module index and re-exports for WordPiece, BPE, common tokenizer types/loaders, and SentencePiece.
 pub mod bpe;
 pub mod common;
 pub mod sentencepiece;

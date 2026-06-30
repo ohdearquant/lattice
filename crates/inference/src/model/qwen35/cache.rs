@@ -1,3 +1,4 @@
+//! Qwen3.5 KV cache, forward scratch, and scratch resize helper.
 use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use crate::model::qwen35_config::Qwen35Config;
 

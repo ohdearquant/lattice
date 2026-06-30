@@ -1,3 +1,4 @@
+//! Qwen3.5 full-attention, common, dense, attention, model, and MoE weight structs plus `ModelWeights::logits_weight`.
 use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::error::InferenceError;
 

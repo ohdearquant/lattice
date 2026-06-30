@@ -1,3 +1,4 @@
+//! Runtime SIMD configuration and accessor.
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy)]

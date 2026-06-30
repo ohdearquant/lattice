@@ -1,3 +1,4 @@
+//! Qwen3.5 MoE FFN step, router probabilities, top-k selection, selected-weight renormalization, routed expert accumulation, and shared expert application.
 use super::cache::ForwardScratch;
 use super::weights::MoeLayerWeights;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};

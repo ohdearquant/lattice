@@ -1,3 +1,4 @@
+//! Qwen3.5 tensor-name requirements, validation, owned tensor loaders, layer-specific weight loaders, and `load_weights`.
 use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, ModelWeights, MoeLayerWeights, MoeRouter, RoutedExperts,
