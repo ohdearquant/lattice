@@ -47,6 +47,9 @@ pub mod router_update;
 mod safetensors;
 #[cfg(feature = "train-backward")]
 pub mod train;
+#[cfg(feature = "train-backward")]
+#[doc(hidden)]
+pub mod train_core;
 
 pub use apply::apply_lora;
 pub use blend::blend_lora_adapters;
