@@ -192,6 +192,24 @@ impl PagePool {
                 "page pool byte size ({byte_len}) exceeds isize::MAX — allocation would panic"
             )));
         }
+        // `free_list` is a sibling allocation drawn from the same `max_pages`
+        // cardinality as `data`, but sized in `usize` elements (8 bytes each)
+        // rather than floats. When `floats_per_page` is 0, `len`/`byte_len`
+        // above are 0 and pass trivially even for a huge `max_pages`, so this
+        // allocation needs its own byte-layout guard to fail closed instead of
+        // panicking ("capacity overflow") inside `.collect()`.
+        let free_list_bytes = max_pages
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "max_pages ({max_pages}) * size_of::<usize>() overflows usize"
+                ))
+            })?;
+        if free_list_bytes > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "free-list allocation ({free_list_bytes} bytes) exceeds isize::MAX — allocation would panic"
+            )));
+        }
         let data = vec![0.0f32; len];
         let free_list: Vec<usize> = (0..max_pages).rev().collect();
         Ok(Self {
@@ -1466,6 +1484,22 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput when byte size exceeds isize::MAX, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn page_pool_try_new_free_list_capacity_bound_returns_invalid_input() {
+        // `floats_per_page = 0` makes `len = max_pages * 0 = 0`, so the `data`
+        // guard above (byte_len = 0) passes trivially regardless of how huge
+        // `max_pages` is. This test pins the *sibling* `free_list` guard,
+        // which must independently catch a `max_pages` whose `usize`-element
+        // (8 bytes each) byte layout exceeds `isize::MAX` even when the
+        // `data` allocation is empty.
+        let max_pages = (isize::MAX as usize / std::mem::size_of::<usize>()) + 1;
+        let r = PagePool::try_new(max_pages, 0);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput when free_list byte size exceeds isize::MAX, got {r:?}"
         );
     }
 
