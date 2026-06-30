@@ -217,33 +217,41 @@ fn compute_max_seq(prompt_len: usize, max_new_tokens: usize) -> Result<usize, In
     })
 }
 
-/// Reject a request whose prompt plus generation would index the RoPE table past
-/// its precomputed capacity, turning a latent release panic into a clean
+/// Effective generation ceiling for a request: the caller's opt-in
+/// `kv_cache_capacity` clamped to `[1, max_seq]` (issue #12), or `max_seq` when
+/// uncapped. This is the length the KV cache is sized to and the count at which
+/// the decode loop stops (`cache.is_full()`), so it — not the raw
+/// `prompt_len + max_new_tokens` — bounds both the largest allocation and the
+/// largest applied RoPE position. Factored out so the call site and the
+/// preflight tests share one definition of the cap (issue #467).
+fn compute_effective_cap(max_seq: usize, kv_cache_capacity: Option<usize>) -> usize {
+    kv_cache_capacity
+        .map(|c| c.max(1).min(max_seq))
+        .unwrap_or(max_seq)
+}
+
+/// Reject a request whose effective sequence length would index the RoPE table
+/// past its precomputed capacity, turning a latent release panic into a clean
 /// `InvalidInput` (issue #467).
 ///
-/// `RopeTable::apply` (rope.rs) indexes its precomputed cos/sin rows unchecked
-/// (only a `debug_assert`), so applying RoPE at any position `>= max_context` is
-/// an out-of-bounds slice access — a bare panic in release builds, not a
-/// caller-visible error. Prefill uses positions `0..prompt_len` and the decode
-/// loop reaches at most `prompt_len + max_new_tokens - 2`, so rejecting when
-/// `prompt_len + max_new_tokens > max_context` keeps every applied position
-/// strictly inside the table. The bound is conservative by one position (it also
-/// rejects the exact-fit edge request) and mirrors the Qwen3.5 context preflight
-/// in `model/qwen35/generation.rs`.
+/// `effective_cap` is the prompt-plus-generation length after any
+/// `kv_cache_capacity` cap (see [`generate`]), and it bounds the largest RoPE
+/// position the run applies: prefill uses positions `0..prompt_len`, and the
+/// decode loop advances one position per step but breaks on `cache.is_full()`,
+/// so no applied position reaches `effective_cap`. `RopeTable::apply` (rope.rs)
+/// indexes its precomputed cos/sin rows unchecked (only a `debug_assert`), so an
+/// `effective_cap` past `max_context` is an out-of-bounds slice access — a bare
+/// panic in release builds, not a caller-visible error.
 ///
-/// Independent of the KV/alloc guards ([`compute_max_seq`],
-/// [`check_alloc_capacity`]), which size the cache rather than bound the RoPE
-/// position. `saturating_add` avoids a `usize` wrap on a pathological
-/// `max_new_tokens`; the wrapped-but-still-huge case is additionally caught by
-/// [`compute_max_seq`] below.
-fn check_context_window(
-    prompt_len: usize,
-    max_new_tokens: usize,
-    max_context: usize,
-) -> Result<(), InferenceError> {
-    if prompt_len.saturating_add(max_new_tokens) > max_context {
+/// Checking `effective_cap` rather than the raw `prompt_len + max_new_tokens` is
+/// what lets a `kv_cache_capacity`-capped request — whose raw sum may exceed the
+/// window but whose capped reach does not — correctly succeed. Mirrors the
+/// Qwen3.5 / NEON / Q8 context preflights and shares their "context window"
+/// wording.
+fn check_context_window(effective_cap: usize, max_context: usize) -> Result<(), InferenceError> {
+    if effective_cap > max_context {
         return Err(InferenceError::InvalidInput(format!(
-            "prompt ({prompt_len} tokens) + max_new_tokens ({max_new_tokens}) exceeds \
+            "effective context length ({effective_cap}) exceeds \
              the model context window ({max_context})"
         )));
     }
@@ -416,24 +424,20 @@ pub fn generate(
         });
     }
 
-    // Context preflight: reject before any allocation if the request would drive
-    // RoPE past its precomputed table. The KV/alloc guards below size the cache,
-    // not the position index, so this is a distinct bound (see check_context_window).
-    check_context_window(
-        prompt_len,
-        config.max_new_tokens,
-        model.rope().max_positions(),
-    )?;
-
     // 2. Initialize KV cache and scratch (allocate once per request)
     let max_seq = compute_max_seq(prompt_len, config.max_new_tokens)?;
     // Effective cache capacity: honour the caller's opt-in cap (issue #12).
     // Clamped to [1, max_seq] so over-large caps and zero are both safe.
-    let effective_cap = config
-        .kv_cache_capacity
-        .map(|c| c.max(1).min(max_seq))
-        .unwrap_or(max_seq);
+    let effective_cap = compute_effective_cap(max_seq, config.kv_cache_capacity);
     check_kv_cache_capacity(config.kv_cache_capacity, effective_cap, prompt_len)?;
+    // Context preflight: effective_cap (prompt + generation, after any
+    // kv_cache_capacity cap) bounds the largest RoPE position the run applies —
+    // the decode loop advances one position per step but breaks on
+    // cache.is_full(), and the cache holds effective_cap tokens. Checking
+    // effective_cap rather than the raw prompt_len + max_new_tokens is what lets a
+    // capped request whose raw sum exceeds the window but whose capped reach does
+    // not still succeed. (issue #467)
+    check_context_window(effective_cap, model.rope().max_positions())?;
     check_alloc_capacity(cfg, cfg.num_hidden_layers, effective_cap)?;
     let cache_cfg = FlatKVCacheConfig::for_qwen3(
         cfg.num_hidden_layers,
@@ -1282,19 +1286,17 @@ mod tests {
         assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
-    /// `check_context_window` must reject a request that would drive RoPE past the
-    /// precomputed table — the public `generate` entry point would otherwise panic
-    /// in release on the unchecked cos/sin index inside `RopeTable::apply`
-    /// (issue #467). The message must contain "context window" (the shared wording
-    /// of the Qwen3.5 / NEON / Q8 context preflights) so the abuse-path family stays
-    /// greppable.
+    /// `check_context_window` must reject an effective sequence length that would
+    /// drive RoPE past the precomputed table — the public `generate` entry point
+    /// would otherwise panic in release on the unchecked cos/sin index inside
+    /// `RopeTable::apply` (issue #467). The message must contain "context window"
+    /// (the shared wording of the Qwen3.5 / NEON / Q8 context preflights) so the
+    /// abuse-path family stays greppable.
     ///
-    /// Mutation check: deleting the guard returns `Ok(())`, failing `expect_err`;
-    /// reverting `saturating_add` to `+` wraps `100 + usize::MAX` to `99 <= 4096`
-    /// (release) or panics on overflow (debug), either way failing the test.
+    /// Mutation check: deleting the guard returns `Ok(())`, failing `expect_err`.
     #[test]
     fn test_check_context_window_over_capacity_is_error_not_panic() {
-        let err = check_context_window(100, usize::MAX, 4096)
+        let err = check_context_window(usize::MAX, 4096)
             .expect_err("over-capacity request must be rejected, not admitted to a panic");
         let msg = format!("{err}");
         assert!(
@@ -1304,22 +1306,59 @@ mod tests {
         assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
-    /// The guard is exact at the capacity boundary: a request summing to exactly
-    /// `max_context` is accepted (the largest request the conservative bound
-    /// admits), one token past it is rejected.
+    /// The guard is exact at the capacity boundary: an effective length equal to
+    /// `max_context` is accepted (a full-window sequence uses positions
+    /// `0..max_context`), one past it is rejected.
     ///
-    /// Mutation check: `>` → `>=` rejects the exact-fit request and fails the first
-    /// assertion; `>` → `<` (or removing the guard) admits the over-capacity request
+    /// Mutation check: `>` → `>=` rejects the exact-fit length and fails the first
+    /// assertion; `>` → `<` (or removing the guard) admits the over-capacity length
     /// and fails the second.
     #[test]
     fn test_check_context_window_boundary() {
         assert!(
-            check_context_window(4000, 96, 4096).is_ok(),
-            "prompt+max_new == max_context must be accepted"
+            check_context_window(4096, 4096).is_ok(),
+            "effective length == max_context must be accepted"
         );
         assert!(
-            check_context_window(4000, 97, 4096).is_err(),
-            "prompt+max_new == max_context + 1 must be rejected"
+            check_context_window(4097, 4096).is_err(),
+            "effective length == max_context + 1 must be rejected"
+        );
+    }
+
+    /// A request whose raw `prompt_len + max_new_tokens` exceeds the context window
+    /// but whose `kv_cache_capacity` caps the effective sequence to within the table
+    /// must be ACCEPTED — the decode loop breaks on `cache.is_full()`, so the capped
+    /// run never applies RoPE past `effective_cap - 1`. Guarding the raw sum (the
+    /// pre-fix #467 form) would wrongly reject it.
+    ///
+    /// This composes the two real helpers the call site uses in sequence —
+    /// `compute_effective_cap` then `check_context_window` — so it pins the
+    /// integration, not just the guard in isolation (review finding #2).
+    ///
+    /// Mutation check: making `compute_effective_cap` ignore its cap argument (so it
+    /// returns `max_seq` — the pre-fix #467 behaviour of guarding the raw sum) makes
+    /// the first assertion fail, because the over-window raw sum is then rejected.
+    /// The second assertion establishes the premise: the raw sum genuinely exceeds
+    /// the window, so applying the cap is load-bearing, not vacuous.
+    #[test]
+    fn test_check_context_window_respects_kv_cache_cap() {
+        let prompt_len = 4000usize;
+        let max_new_tokens = 10_000usize;
+        let max_context = 4096usize;
+        let kv_cache_capacity = Some(4096usize);
+
+        let max_seq = compute_max_seq(prompt_len, max_new_tokens).expect("no overflow");
+        let effective_cap = compute_effective_cap(max_seq, kv_cache_capacity);
+
+        // The capped effective sequence fits the table → accepted.
+        assert!(
+            check_context_window(effective_cap, max_context).is_ok(),
+            "kv_cache_capacity-capped request within the window must be accepted"
+        );
+        // Guarding the raw uncapped sum (the #467 cap-interaction bug) would reject it.
+        assert!(
+            check_context_window(max_seq, max_context).is_err(),
+            "the raw uncapped sum exceeds the window (guarding it would over-reject)"
         );
     }
 
@@ -1739,14 +1778,12 @@ mod tests {
     #[test]
     fn kv_cache_capacity_clamp_above_max_seq() {
         // A cap larger than max_seq must not panic; it is silently clamped.
-        // We exercise the clamping formula directly without calling generate().
+        // Exercises the real `compute_effective_cap` helper that generate() calls.
         let prompt_len = 10usize;
         let max_new_tokens = 50usize;
-        let max_seq = prompt_len + max_new_tokens; // 60
+        let max_seq = compute_max_seq(prompt_len, max_new_tokens).expect("no overflow"); // 60
 
-        // Simulate the clamping logic from generate()
-        let effective =
-            |cap: Option<usize>| -> usize { cap.map(|c| c.max(1).min(max_seq)).unwrap_or(max_seq) };
+        let effective = |cap: Option<usize>| compute_effective_cap(max_seq, cap);
 
         assert_eq!(effective(None), 60, "None -> full max_seq");
         assert_eq!(
