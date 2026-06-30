@@ -31,7 +31,7 @@
 
 use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
 /// materialize.
@@ -244,80 +244,77 @@ impl<'a> CompileCtx<'a> {
             .or_else(|| schema.get("oneOf"))
             .and_then(Value::as_array)
         {
-            let mut all_alts: Vec<Alt> = Vec::new();
+            // The no-rewind PDA commits to an alternative once it consumes a
+            // byte (the #353/#380 consumed-guard), so every branch that can
+            // begin with `"` competes for the single opening quote: once one of
+            // them consumes it, the siblings become unreachable. Every JSON
+            // string shares that opening `"`, so listing string-valued branches
+            // separately strands all but the first (issue #310 — the
+            // over-rejection regression fixed here). Collapse the whole
+            // string-valued class into ONE branch with a single `"` entry:
+            //
+            //   * any broad string (`{"type":"string"}`; also `pattern` /
+            //     `minLength`, which this compiler does not enforce and so
+            //     widens to any string) makes the class the `json_string` rule.
+            //     It subsumes every string literal, so a valid string is never
+            //     rejected and the literals need no separate branch.
+            //   * otherwise the string literals (`const` / all-string `enum`)
+            //     become a single trie so each diverges inside the quoted region
+            //     instead of competing at the shared opening quote.
+            //
+            // Non-string branches (numbers, booleans, null, objects, arrays)
+            // never begin with `"`, so they follow the string entry in their
+            // original relative order and stay reachable: a non-`"` input
+            // diverges from the string entry at sym_pos == 0 and the PDA falls
+            // through. A non-string sibling that could ITSELF begin with `"` (a
+            // `$ref`, nested `anyOf`, untyped or mixed-type schema) is left among
+            // them; the string entry shadows its quoted inputs, which
+            // `json_string` / the literal trie already decide correctly. The
+            // residual narrowing for such a sibling matches the pre-existing
+            // numeric-enum limitation below and never over-accepts.
+            let mut broad_string = false;
+            let mut literals: Vec<String> = Vec::new();
+            let mut other_subs: Vec<&Value> = Vec::new();
             for sub in any_of {
-                let sub_alts = self.compile_schema(sub, _path)?;
-                all_alts.extend(sub_alts);
+                match string_class_of(sub) {
+                    Some(StrClass::Broad) => broad_string = true,
+                    Some(StrClass::Literals(values)) => literals.extend(values),
+                    None => other_subs.push(sub),
+                }
             }
 
-            // A fully-quoted string-literal alternative is one whose every
-            // symbol is a Terminal, opening and closing with `"` (e.g. a string
-            // `const`). Two or more such alternatives may share a byte prefix
-            // and be over-rejected by the no-rewind PDA, so we factor them into
-            // a trie where every branch diverges at sym_pos == 0.
-            //
-            // The trie alternative begins with `"`, and is only safe to hoist
-            // ahead of the others when NONE of them can also begin with `"`:
-            // the no-rewind PDA cannot fall through to a later sibling once the
-            // trie consumes the opening quote. A broad `{"type":"string"}`
-            // branch compiles to `[NonTerminal(json_string)]`, whose FIRST set
-            // contains `"`, so in its presence we keep the original flat order
-            // (the broad branch already subsumes the string consts).
-            //
-            // Scope: quoted string literals only.  Non-string literal alts
-            // (numbers, booleans, null) have distinct first bytes and are left
-            // flat.  Numeric enums with a shared prefix (e.g. `const 1` /
-            // `const 10`) are an unquoted narrower residual that requires the
-            // delimiter from the surrounding grammar context to disambiguate and
-            // cannot be fixed locally by a trie.
-            let is_string_lit = |alt: &Alt| {
-                alt.len() >= 2
-                    && matches!(alt.first(), Some(Symbol::Terminal(b'"')))
-                    && matches!(alt.last(), Some(Symbol::Terminal(b'"')))
-                    && alt.iter().all(|sym| matches!(sym, Symbol::Terminal(_)))
-            };
-            let lit_count = all_alts.iter().filter(|alt| is_string_lit(alt)).count();
-            let mut memo: HashMap<usize, bool> = HashMap::new();
-            let mut on_stack: HashSet<usize> = HashSet::new();
-            let other_can_start_with_quote =
-                all_alts
-                    .iter()
-                    .filter(|alt| !is_string_lit(alt))
-                    .any(|alt| {
-                        alt.first().is_some_and(|first| {
-                            first_byte_can_be_quote(&self.builder, first, &mut memo, &mut on_stack)
-                        })
-                    });
-
-            if lit_count >= 2 && !other_can_start_with_quote {
-                let (string_lit_alts, other_alts): (Vec<Alt>, Vec<Alt>) =
-                    all_alts.into_iter().partition(|alt| is_string_lit(alt));
-                // Full quoted JSON strings are inherently prefix-free once their
-                // closing `"` is included — no extra terminator needed here.
-                let seqs: Vec<Vec<u8>> = string_lit_alts
-                    .into_iter()
-                    .map(|alt| {
-                        alt.into_iter()
-                            .filter_map(|sym| {
-                                if let Symbol::Terminal(b) = sym {
-                                    Some(b)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
+            let mut merged: Vec<Alt> = Vec::new();
+            if broad_string {
+                match self.builder.rule_id("json_string") {
+                    Some(id) => merged.push(vec![Symbol::NonTerminal(id)]),
+                    None => merged.push(vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]),
+                }
+            } else if !literals.is_empty() {
+                // Distinct JSON strings are prefix-free once the closing `"` is
+                // part of each leaf, so every literal diverges within the trie.
+                literals.sort();
+                literals.dedup();
+                let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
+                for s in &literals {
+                    let json_repr = serde_json::to_string(s).map_err(|e| {
+                        SchemaError(format!("cannot JSON-encode string value: {e}"))
+                    })?;
+                    // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
+                    let inner = &json_repr[1..json_repr.len() - 1];
+                    let mut seq: Vec<u8> = inner.bytes().collect();
+                    seq.push(b'"');
+                    seqs.push(seq);
+                }
                 let trie_root_id = self.compile_trie_literals(&seqs)?;
-                let mut combined = vec![vec![Symbol::NonTerminal(trie_root_id)]];
-                combined.extend(other_alts);
-                return Ok(combined);
+                merged.push(vec![
+                    Symbol::Terminal(b'"'),
+                    Symbol::NonTerminal(trie_root_id),
+                ]);
             }
-
-            // Not trie-eligible (fewer than two shared string literals, or a
-            // sibling can also begin with `"`): keep the alternatives in their
-            // original schema order so a broad string branch stays reachable.
-            return Ok(all_alts);
+            for sub in other_subs {
+                merged.extend(self.compile_schema(sub, _path)?);
+            }
+            return Ok(merged);
         }
 
         // Dispatch on `type`
@@ -1477,55 +1474,6 @@ fn build_trie_node(
 /// the surrounding context resolves them.  Until then, `enum [1, 10]` remains
 /// a narrower known limitation: `10` is over-rejected by the no-rewind PDA
 /// (the same safe direction as before).
-/// Whether any value matched by `sym` can begin with a `"` byte (its FIRST set
-/// contains the opening quote of a JSON string).
-///
-/// Used by the `anyOf`/`oneOf` handler to decide whether a shared-prefix
-/// string-literal trie can be safely hoisted ahead of the other alternatives.
-/// The no-rewind PDA commits to an alternative once it consumes a byte, so a
-/// trie placed before a sibling that also begins with `"` (e.g. a broad
-/// `{"type":"string"}` branch, which compiles to `[NonTerminal(json_string)]`)
-/// would make that sibling unreachable. When this returns true for any such
-/// sibling, the caller keeps the alternatives flat in their original order.
-///
-/// Sound in the safe direction: an unknown rule or a reference cycle yields
-/// `true` (suppress the trie), which can only cost the optimization, never
-/// reintroduce over-rejection. Memoized per rule id for linear time over the
-/// rule graph (the compiler is reachable from untrusted schemas).
-fn first_byte_can_be_quote(
-    builder: &GrammarBuilder,
-    sym: &Symbol,
-    memo: &mut HashMap<usize, bool>,
-    on_stack: &mut HashSet<usize>,
-) -> bool {
-    match sym {
-        Symbol::Terminal(b) => *b == b'"',
-        // `AnyByte` (GBNF `.`) matches any byte, `"` included.
-        Symbol::AnyByte => true,
-        Symbol::NonTerminal(id) => {
-            if let Some(&cached) = memo.get(id) {
-                return cached;
-            }
-            if !on_stack.insert(*id) {
-                // Active cycle: assume reachable (conservative) without caching,
-                // since the exact value is still being computed up the stack.
-                return true;
-            }
-            let result = match builder.rule_alts(*id) {
-                Some(alts) => alts.iter().any(|alt| {
-                    alt.first().is_some_and(|first| {
-                        first_byte_can_be_quote(builder, first, memo, on_stack)
-                    })
-                }),
-                None => true,
-            };
-            on_stack.remove(id);
-            memo.insert(*id, result);
-            result
-        }
-    }
-}
-
 fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
     // All-string enums are handled upstream via compile_string_type, which
     // trie-compiles the alternatives to avoid PDA ambiguity.  This path is
@@ -1542,6 +1490,50 @@ fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
 /// Compile a `const` schema (a single fixed JSON value).
 fn compile_const(v: &Value) -> Result<Vec<Alt>, SchemaError> {
     Ok(vec![json_value_to_alt(v)?])
+}
+
+/// How an `anyOf`/`oneOf` sub-schema matches strings, for collapsing the
+/// string-valued ambiguity class into a single `"` entry (see the `anyOf`
+/// handler). A sub-schema that is not a string-valued class — a number,
+/// boolean, null, object, array, or a schema whose string matching cannot be
+/// reduced to a broad string or a fixed literal set (mixed `enum`, `$ref`,
+/// nested `anyOf`, untyped) — classifies as `None`.
+enum StrClass {
+    /// Any JSON string (`{"type":"string"}`). `pattern` / `minLength` are not
+    /// enforced by this compiler, so such a schema widens to any string — the
+    /// same `json_string` rule `compile_string_type` emits for it standalone.
+    Broad,
+    /// A fixed set of string values (a string `const` or an all-string `enum`).
+    Literals(Vec<String>),
+}
+
+/// Classify a raw `anyOf`/`oneOf` sub-schema for string-class merging.
+fn string_class_of(sub: &Value) -> Option<StrClass> {
+    let obj = sub.as_object()?;
+    if let Some(Value::String(s)) = obj.get("const") {
+        return Some(StrClass::Literals(vec![s.clone()]));
+    }
+    let ty = obj.get("type").and_then(Value::as_str);
+    if let Some(arr) = obj.get("enum").and_then(Value::as_array) {
+        // An all-string `enum` is a literal set only when the (optional) `type`
+        // does not contradict it. A mixed enum may match non-string values too,
+        // so it stays unclassified and the caller keeps it as an "other" branch.
+        if (ty == Some("string") || ty.is_none())
+            && !arr.is_empty()
+            && arr.iter().all(Value::is_string)
+        {
+            let values = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            return Some(StrClass::Literals(values));
+        }
+        return None;
+    }
+    if ty == Some("string") {
+        return Some(StrClass::Broad);
+    }
+    None
 }
 
 /// Convert a concrete JSON value to a grammar alternative (sequence of terminal bytes).
@@ -1821,11 +1813,12 @@ mod tests {
 
     /// Regression: a broad `{"type":"string"}` branch alongside shared-prefix
     /// string consts must stay reachable. The broad branch compiles to
-    /// `[NonTerminal(json_string)]`, whose FIRST set contains `"`; hoisting a
-    /// const trie ahead of it made the no-rewind PDA consume the opening quote
-    /// and then fail to fall through, wrongly rejecting an arbitrary string such
-    /// as `"zzz"`. Mutation guard: removing the FIRST-set guard reintroduces the
-    /// over-rejection and fails this test.
+    /// `[NonTerminal(json_string)]`, whose FIRST set contains `"`; #471's
+    /// unconditional const-trie hoist made the no-rewind PDA consume the opening
+    /// quote and then fail to fall through, wrongly rejecting an arbitrary string
+    /// such as `"zzz"`. A present broad string collapses the whole string class
+    /// to `json_string`, which subsumes the consts. Mutation guard: reverting to
+    /// the unconditional hoist reintroduces the over-rejection and fails here.
     #[test]
     fn anyof_broad_string_with_shared_prefix_consts() {
         let g = compile_ok(r#"{"anyOf":[{"type":"string"},{"const":"abc"},{"const":"abd"}]}"#);
@@ -1840,9 +1833,9 @@ mod tests {
 
     /// A non-string sibling that cannot begin with `"` (here `integer`) does not
     /// block the shared-prefix trie: `"abc"`/`"abd"` are disambiguated by the
-    /// trie and the integer branch remains reachable. Mutation guard against
-    /// over-correcting the FIRST-set guard to disable the trie whenever any
-    /// non-literal sibling is present — the flat fallback over-rejects `"abd"`.
+    /// combined trie and the integer branch stays reachable (a non-`"` input
+    /// diverges from the trie at sym_pos == 0). Mutation guard: emitting the
+    /// branches flat instead of one trie over-rejects `"abd"`.
     #[test]
     fn anyof_shared_prefix_consts_with_integer() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"integer"}]}"#);
@@ -1855,6 +1848,78 @@ mod tests {
             accepts(&g, b"123"),
             "the integer branch must remain reachable"
         );
+        assert!(
+            rejects(&g, b"\"abe\""),
+            "a non-member string must be rejected"
+        );
+    }
+
+    /// Broad string LAST (issue #310 / PR #472): the broad `{"type":"string"}`
+    /// is listed AFTER the shared-prefix consts, so schema order cannot be
+    /// relied on to keep it reachable. Classifying the whole string class up
+    /// front and collapsing it to `json_string` makes position irrelevant — an
+    /// arbitrary string that diverges from the consts (`"abe"`) is still
+    /// accepted. Mutation guard: an order-sensitive fix (hoisting the const trie
+    /// whenever the broad branch is not first) over-rejects `"abe"` here.
+    #[test]
+    fn anyof_broad_string_after_consts() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"string"}]}"#);
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "broad string (listed last) must accept a string that diverges from the consts"
+        );
+        assert!(accepts(&g, b"\"zzz\""), "arbitrary string must be accepted");
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(accepts(&g, b"\"abd\""), "\"abd\" must be accepted");
+        assert!(rejects(&g, b"123"), "a non-string must still be rejected");
+    }
+
+    /// A narrower string sibling — a string `enum` rather than a broad string —
+    /// alongside shared-prefix consts (issue #310 / PR #472). With no broad
+    /// branch present, every string literal (the two consts and the two enum
+    /// members) is unioned into ONE trie, so all four diverge inside the quoted
+    /// region and stay reachable. Mutation guard: keeping the branches flat (or
+    /// hoisting only the consts) over-rejects `"abd"`; widening the class to
+    /// `json_string` would over-accept `"abg"`.
+    #[test]
+    fn anyof_narrower_string_enum_sibling() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"string","enum":["abe","abf"]}]}"#,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" must be accepted");
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "const \"abd\" must be accepted via the combined trie"
+        );
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "enum member \"abe\" must be accepted"
+        );
+        assert!(
+            accepts(&g, b"\"abf\""),
+            "enum member \"abf\" must be accepted"
+        );
+        assert!(
+            rejects(&g, b"\"abg\""),
+            "a string in no branch must be rejected (no over-accept)"
+        );
+    }
+
+    /// A non-string `enum` sibling (`[1, 2]`) must classify as a non-string
+    /// branch, not fold into the string literal trie (issue #310 / PR #472).
+    /// The consts form the trie; the numeric enum stays reachable because it
+    /// cannot begin with `"`. Mutation guard: misclassifying the numeric enum as
+    /// a string literal set drops the `1`/`2` branch; keeping the branches flat
+    /// over-rejects `"abd"`.
+    #[test]
+    fn anyof_numeric_enum_sibling() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"enum":[1,2]}]}"#);
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "\"abd\" must be accepted via the trie"
+        );
+        assert!(accepts(&g, b"1"), "numeric enum member 1 must be reachable");
+        assert!(accepts(&g, b"2"), "numeric enum member 2 must be reachable");
         assert!(
             rejects(&g, b"\"abe\""),
             "a non-member string must be rejected"
