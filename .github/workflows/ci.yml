@@ -170,13 +170,14 @@ jobs:
           command: check advisories
 
   # Observation job: rustdoc build and intra-doc link lint.
-  # NON-BLOCKING — continue-on-error: true. Do NOT add to required-status checks.
-  # Surfaces doc-build failures and broken intra-doc links (a verified absent gap)
-  # without wedging merges during the initial observation period.
+  # NON-BLOCKING. The lint STEP carries continue-on-error: true, so the job
+  # concludes success and the commit status stays green while the lint still runs
+  # and surfaces findings in the step log. A job-level continue-on-error does NOT
+  # neutralize a job's check-run conclusion, so it cannot keep the commit status
+  # green (this is why every commit went red). Do NOT add to required-status checks.
   rustdoc-lint:
     name: rustdoc-lint (informational)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -187,6 +188,7 @@ jobs:
           shared-key: rustdoc-lint
           cache-on-failure: true
       - name: cargo doc — broken-intra-doc-links and doc warnings (informational)
+        continue-on-error: true
         env:
           RUSTDOCFLAGS: >-
             -D warnings
@@ -195,13 +197,15 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   # Observation job: unwrap/expect usage in workspace library targets.
-  # NON-BLOCKING — continue-on-error: true. Do NOT add to required-status checks.
-  # Surfaces panic-safety debt in library code (a verified absent gap) without
-  # changing merge behavior. Expected to show existing debt on first run.
+  # NON-BLOCKING. The lint STEP carries continue-on-error: true, so the job
+  # concludes success and the commit status stays green while the lint still
+  # surfaces panic-safety debt in the step log. A job-level continue-on-error does
+  # NOT neutralize a job's check-run conclusion, so it cannot keep the commit
+  # status green. Do NOT add to required-status checks. Expected to show existing
+  # debt in the logs.
   unwrap-in-lib-lint:
     name: unwrap-in-lib-lint (informational)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -214,4 +218,5 @@ jobs:
           shared-key: unwrap-in-lib-lint
           cache-on-failure: true
       - name: clippy — unwrap/expect in library targets (informational)
+        continue-on-error: true
         run: cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::expect_used
