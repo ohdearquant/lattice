@@ -26,7 +26,7 @@ train-backward = ["dep:lattice-inference", "lattice-inference/train-backward", "
 sqlite = ["dep:rusqlite", "serde"]
 
 [dependencies]
-lattice-fann = { version = "0.4.1", path = "../fann" }
+lattice-fann = { version = "0.4.2", path = "../fann" }
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -47,7 +47,7 @@ safetensors = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 
 # Inference hook and training backward pass (optional — for LoRA adapter injection and gradients)
-lattice-inference = { version = "0.4.1", path = "../inference", optional = true, features = ["f16"] }
+lattice-inference = { version = "0.4.2", path = "../inference", optional = true, features = ["f16"] }
 
 [[bin]]
 name = "generate_lora"
