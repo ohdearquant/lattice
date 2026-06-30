@@ -72,6 +72,15 @@ const MAX_SCHEMA_DEPTH: usize = 512;
 /// two boundaries stay consistent.
 const MAX_OBJECT_PROPERTIES: usize = 4096;
 
+/// Maximum trie recursion depth when compiling shared-prefix string-literal
+/// alternations (`build_trie_node`). With single-child compression the trie
+/// only recurses through the prefix SHARED by two or more members, so reaching
+/// this bound requires two enum/const members that share an identical prefix
+/// this many bytes long, which no realistic schema does. The cap keeps compile
+/// recursion well below the stack limit and fails closed with a `SchemaError`
+/// instead of aborting the process, mirroring `MAX_OBJECT_PROPERTIES`.
+const MAX_TRIE_DEPTH: usize = 1024;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -240,7 +249,54 @@ impl<'a> CompileCtx<'a> {
                 let sub_alts = self.compile_schema(sub, _path)?;
                 all_alts.extend(sub_alts);
             }
-            return Ok(all_alts);
+
+            // Partition: separate fully-quoted string-literal alternatives
+            // (every symbol is Terminal, first byte is `"`, last byte is `"`)
+            // from all other alternatives.  Two or more such alternatives may
+            // share a byte prefix and be over-rejected by the no-rewind PDA.
+            // Build a trie over them so every branch diverges at sym_pos == 0.
+            //
+            // Scope: quoted string literals only.  Non-string literal alts
+            // (numbers, booleans, null) have distinct first bytes in practice
+            // and are left flat.  Numeric enums with a shared prefix (e.g.
+            // `const 1` / `const 10`) are an unquoted narrower residual that
+            // requires the delimiter from the surrounding grammar context to
+            // disambiguate and cannot be fixed locally by a trie.
+            let (string_lit_alts, other_alts): (Vec<Alt>, Vec<Alt>) =
+                all_alts.into_iter().partition(|alt| {
+                    alt.len() >= 2
+                        && matches!(alt.first(), Some(Symbol::Terminal(b'"')))
+                        && matches!(alt.last(), Some(Symbol::Terminal(b'"')))
+                        && alt.iter().all(|sym| matches!(sym, Symbol::Terminal(_)))
+                });
+
+            if string_lit_alts.len() >= 2 {
+                // Full quoted JSON strings are inherently prefix-free once their
+                // closing `"` is included — no extra terminator needed here.
+                let seqs: Vec<Vec<u8>> = string_lit_alts
+                    .into_iter()
+                    .map(|alt| {
+                        alt.into_iter()
+                            .filter_map(|sym| {
+                                if let Symbol::Terminal(b) = sym {
+                                    Some(b)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let trie_root_id = self.compile_trie_literals(&seqs)?;
+                let mut combined = vec![vec![Symbol::NonTerminal(trie_root_id)]];
+                combined.extend(other_alts);
+                return Ok(combined);
+            }
+
+            // Fewer than 2 string-literal alts: flatten as before (no trie needed).
+            let mut combined = string_lit_alts;
+            combined.extend(other_alts);
+            return Ok(combined);
         }
 
         // Dispatch on `type`
@@ -987,27 +1043,35 @@ impl<'a> CompileCtx<'a> {
                 // (issue #310 #4). User `$defs` rules live in a separate `def_*`
                 // namespace (see `compile_ref`), so a user-named definition can
                 // never collide with these `str_enum_*` helpers in either order.
-                let choices_name = format!("str_enum_{}", self.enum_counter);
-                self.enum_counter += 1;
-                let choices_id = self.builder.reserve(&choices_name);
                 // issue #310 finding #7: JSON-encode each string value so that
                 // special characters (e.g. `"`, `\`) are properly escaped in the
                 // grammar, matching what valid JSON actually contains.
                 // serde_json::to_string produces `"value"` with surrounding quotes;
                 // strip them and emit the inner escaped bytes.
-                let mut choice_alts: Vec<Alt> = Vec::with_capacity(str_values.len());
+                //
+                // The closing `"` is appended to each inner-byte sequence before
+                // building the trie, making every sequence prefix-free (two distinct
+                // JSON strings can never have one as a proper prefix of the other
+                // once the closing `"` is included).  The trie ensures every branch
+                // diverges at its first byte, so the no-rewind single-stack PDA
+                // always picks the correct alternative at sym_pos == 0 without
+                // needing to backtrack across a shared prefix (e.g. ["foo","food"]).
+                let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(str_values.len());
                 for s in &str_values {
                     let json_repr = serde_json::to_string(s)
                         .map_err(|e| SchemaError(format!("cannot JSON-encode enum value: {e}")))?;
                     // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
                     let inner = &json_repr[1..json_repr.len() - 1];
-                    choice_alts.push(inner.bytes().map(Symbol::Terminal).collect());
+                    let mut seq: Vec<u8> = inner.bytes().collect();
+                    // Append the closing `"` as a prefix-free terminator.
+                    seq.push(b'"');
+                    seqs.push(seq);
                 }
-                self.builder.set_alts(choices_id, choice_alts);
+                let trie_root_id = self.compile_trie_literals(&seqs)?;
+                // Opening `"` factored out; closing `"` is inside the trie leaves.
                 return Ok(vec![vec![
                     Symbol::Terminal(b'"'),
-                    Symbol::NonTerminal(choices_id),
-                    Symbol::Terminal(b'"'),
+                    Symbol::NonTerminal(trie_root_id),
                 ]]);
             }
         }
@@ -1046,6 +1110,23 @@ impl<'a> CompileCtx<'a> {
             Symbol::Terminal(b']'),
         ]);
         alts
+    }
+
+    /// Compile a set of prefix-free byte sequences into a trie of grammar
+    /// rules. Consumes exactly one `self.enum_counter` slot (the value `n`) and
+    /// reserves one builder rule per trie node: `str_enum_{n}` for the root and
+    /// `str_enum_{n}_{k}` for each inner node.
+    ///
+    /// Callers must ensure the sequences are prefix-free.  For
+    /// `compile_string_type` this is achieved by appending the closing `"`
+    /// byte to each inner-byte sequence before calling.  For the
+    /// `anyOf`/`oneOf` handler the full-quoted JSON representations are
+    /// inherently prefix-free for distinct string values.
+    fn compile_trie_literals(&mut self, seqs: &[Vec<u8>]) -> Result<usize, SchemaError> {
+        let n = self.enum_counter;
+        self.enum_counter += 1;
+        let mut node_counter = 0usize;
+        build_trie_node(&mut self.builder, seqs, n, &mut node_counter, 0)
     }
 
     fn resolve_pending(&self) -> Result<(), SchemaError> {
@@ -1258,19 +1339,129 @@ fn empty_object_as_alt_with_ws(ws_id: usize) -> Alt {
     ]
 }
 
+// ---------------------------------------------------------------------------
+// Trie compiler for shared-prefix literal alternatives
+// ---------------------------------------------------------------------------
+
+/// Build one node of a literal trie into `builder`.
+///
+/// Each node groups its input sequences by first byte. A group becomes one
+/// alternative: `[Terminal(byte)]` when every member ends here (leaf); a flat
+/// `[Terminal(byte), Terminal(b0), Terminal(b1), ...]` when exactly one member
+/// continues (single-child compression, the whole remaining tail emitted inline
+/// instead of recursing); or `[Terminal(byte), NonTerminal(child)]` when two or
+/// more members continue with distinct bytes (inner). Because every group's
+/// alternatives diverge on their FIRST byte, the no-rewind single-stack PDA
+/// picks the correct branch at `sym_pos == 0` without ever needing to backtrack.
+///
+/// Single-child compression bounds recursion depth by the longest SHARED prefix
+/// rather than the longest member, so one long literal compiles to a single flat
+/// alternative (matching the pre-trie encoding) and a member's length never
+/// drives recursion. `depth` carries the current nesting level so the
+/// shared-prefix recursion fails closed at `MAX_TRIE_DEPTH` instead of
+/// overflowing the stack.
+///
+/// Callers guarantee the sequences are prefix-free (no sequence is a proper
+/// prefix of another), so within any group either ALL tails are empty (leaf) or
+/// ALL are non-empty (compressed or inner); mixed groups are impossible.
+///
+/// Rule-naming convention: `node_counter == 0` → root → `str_enum_{n}`;
+/// subsequent inner nodes → `str_enum_{n}_{k}`.
+fn build_trie_node(
+    builder: &mut GrammarBuilder,
+    seqs: &[Vec<u8>],
+    enum_n: usize,
+    node_counter: &mut usize,
+    depth: usize,
+) -> Result<usize, SchemaError> {
+    // Fail closed rather than overflow the stack. With single-child compression
+    // below, recursion descends one level only per byte of a prefix SHARED by
+    // two or more members, so this bound is unreachable for realistic schemas
+    // and trips only on an adversarial set sharing an absurdly long prefix.
+    if depth >= MAX_TRIE_DEPTH {
+        return Err(SchemaError(format!(
+            "enum/const shared-prefix nesting exceeds the supported depth ({MAX_TRIE_DEPTH})"
+        )));
+    }
+
+    let k = *node_counter;
+    *node_counter += 1;
+    let rule_name = if k == 0 {
+        format!("str_enum_{enum_n}")
+    } else {
+        format!("str_enum_{enum_n}_{k}")
+    };
+    let id = builder.reserve(&rule_name);
+
+    // Group sequences by first byte (stable insertion order).
+    let mut groups: Vec<(u8, Vec<Vec<u8>>)> = Vec::new();
+    for seq in seqs {
+        let Some((&first, tail)) = seq.split_first() else {
+            return Err(SchemaError(
+                "trie: empty literal sequence (prefix-free invariant violated)".into(),
+            ));
+        };
+        match groups.iter_mut().find(|(b, _)| *b == first) {
+            Some(entry) => entry.1.push(tail.to_vec()),
+            None => groups.push((first, vec![tail.to_vec()])),
+        }
+    }
+
+    let mut alts: Vec<Alt> = Vec::with_capacity(groups.len());
+    for (byte, tails) in groups {
+        if tails.iter().all(Vec::is_empty) {
+            // Leaf: every member ends at this byte (exact duplicates collapse).
+            alts.push(vec![Symbol::Terminal(byte)]);
+        } else if tails.len() == 1 {
+            // Single continuation: emit the whole remaining tail flat instead of
+            // recursing, so recursion depth tracks the longest SHARED prefix,
+            // not member length. A lone long literal becomes one flat
+            // alternative and cannot drive deep recursion or per-byte rule blowup.
+            let tail = &tails[0];
+            let mut alt = Vec::with_capacity(tail.len() + 1);
+            alt.push(Symbol::Terminal(byte));
+            alt.extend(tail.iter().map(|&b| Symbol::Terminal(b)));
+            alts.push(alt);
+        } else {
+            // Two or more continuations share this byte: recurse one level.
+            let child_id = build_trie_node(builder, &tails, enum_n, node_counter, depth + 1)?;
+            alts.push(vec![Symbol::Terminal(byte), Symbol::NonTerminal(child_id)]);
+        }
+    }
+
+    builder.set_alts(id, alts);
+    Ok(id)
+}
+
 /// Compile an `enum` schema (values can be any JSON type).
 ///
 /// When all enum values are JSON strings, the opening and closing `"`
-/// delimiters are factored out into the calling context.  This avoids
-/// alternative ambiguity when multiple string values share the `"` prefix.
+/// delimiters are factored out into the calling context and the alternatives
+/// are trie-compiled so every branch diverges on its first byte.  This
+/// avoids alternative ambiguity when multiple string values share a prefix.
+///
 /// For mixed-type or non-string enums the naive per-value serialisation is
-/// used; those values have distinct first bytes and are unambiguous.
+/// used; those values have distinct first bytes in the common case and are
+/// unambiguous.
+///
+/// # Residual limitation — unquoted numeric enums with a shared prefix
+///
+/// Integer or float enum members such as `[1, 10]` serialise to `1` and `10`
+/// in the byte stream.  `1` IS a prefix of `10`, but there is no in-rule
+/// terminator byte to make them prefix-free: the disambiguator is the
+/// following delimiter character (`]`, `,`, `}`) which belongs to the
+/// SURROUNDING grammar context, not to this rule.  The compile-time trie fix
+/// therefore does not apply here.  A complete fix requires parallel active
+/// stacks or an NFA-based matcher that can hold both possibilities open until
+/// the surrounding context resolves them.  Until then, `enum [1, 10]` remains
+/// a narrower known limitation: `10` is over-rejected by the no-rewind PDA
+/// (the same safe direction as before).
 fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
-    // Check if all values are strings.
     // All-string enums are handled upstream via compile_string_type, which
-    // factors the `"` delimiters to avoid PDA ambiguity.  This path is
+    // trie-compiles the alternatives to avoid PDA ambiguity.  This path is
     // reached only for mixed-type or non-string enum values (e.g., const
-    // arrays containing integers or null), whose first bytes are distinct.
+    // arrays containing integers or null), whose first bytes are distinct in
+    // the common case.
     let alts = values
         .iter()
         .map(json_value_to_alt)
@@ -1511,21 +1702,172 @@ mod tests {
         assert!(rejects(&g, b"[1,2,]"));
     }
 
+    // -----------------------------------------------------------------------
+    // Trie-compiled shared-prefix literal alternatives (issue #XXX)
+    //
+    // The single-stack no-rewind PDA can only switch alternatives at sym_pos==0.
+    // A flat encoding of ["foo","food"] commits to "foo" and cannot backtrack
+    // when it then sees "d" — "food" is over-rejected. The fix compiles string
+    // enum / anyOf-const alternatives into a trie so that every branch diverges
+    // on its first byte (the closing `"` is pulled into the trie leaves to make
+    // sequences prefix-free).
+    // -----------------------------------------------------------------------
+
+    /// string enum ["foo","food"]: both accepted; "foe"/"fooo"/"fo" rejected.
     #[test]
-    fn shared_prefix_enum_known_limitation() {
-        // KNOWN LIMITATION (pre-existing, not introduced by the #353 guard):
-        // the no-rewind byte matcher cannot parse shared-prefix sibling
-        // alternatives. For `enum ["foo","food"]` the first member commits the
-        // shared `foo` prefix, so the longer sibling `food` is over-REJECTED.
-        // This is the SAFE direction for constrained decoding (the model just
-        // cannot emit one valid member); over-acceptance would be the dangerous
-        // direction. The first member still accepts. This test documents the
-        // behavior so a future ambiguity-preserving matcher (trie/NFA or
-        // parallel stacks) has a regression anchor; it is verified identical on
-        // origin/main (the byte-consumption guard neither causes nor fixes it).
+    fn string_enum_shared_prefix_foo_food() {
+        let g = compile_ok(r#"{"type":"string","enum":["foo","food"]}"#);
+        assert!(accepts(&g, b"\"foo\""), "\"foo\" must be accepted");
+        assert!(accepts(&g, b"\"food\""), "\"food\" must be accepted");
+        assert!(rejects(&g, b"\"foe\""), "\"foe\" must be rejected");
+        assert!(rejects(&g, b"\"fooo\""), "\"fooo\" must be rejected");
+        assert!(rejects(&g, b"\"fo\""), "\"fo\" must be rejected");
+    }
+
+    /// Bare enum WITHOUT `"type":"string"` must also route through the trie via
+    /// the all-strings predicate in `compile_schema_inner`'s enum branch
+    /// (`type_is_string || all_strings`), NOT the flat `compile_enum` path —
+    /// otherwise shared-prefix members are over-rejected again. This is the
+    /// exact schema the prior known-limitation test used; it locks the routing
+    /// so a future narrowing to `type_is_string` only cannot silently regress.
+    #[test]
+    fn string_enum_bare_no_type_shared_prefix() {
         let g = compile_ok(r#"{"enum":["foo","food"]}"#);
-        assert!(accepts(&g, b"\"foo\""));
-        assert!(rejects(&g, b"\"food\""));
+        assert!(accepts(&g, b"\"foo\""), "\"foo\" must be accepted");
+        assert!(accepts(&g, b"\"food\""), "\"food\" must be accepted");
+        assert!(rejects(&g, b"\"foe\""), "\"foe\" must be rejected");
+    }
+
+    /// anyOf[const "abc", const "abd"]: both accepted; "abe" rejected.
+    #[test]
+    fn anyof_const_shared_prefix_abc_abd() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(accepts(&g, b"\"abd\""), "\"abd\" must be accepted");
+        assert!(rejects(&g, b"\"abe\""), "\"abe\" must be rejected");
+        assert!(rejects(&g, b"\"ab\""), "\"ab\" must be rejected");
+        assert!(rejects(&g, b"\"abcd\""), "\"abcd\" must be rejected");
+    }
+
+    /// Three-way shared prefix ["foo","food","foot"]: all three accepted.
+    #[test]
+    fn string_enum_three_way_shared_prefix() {
+        let g = compile_ok(r#"{"type":"string","enum":["foo","food","foot"]}"#);
+        assert!(accepts(&g, b"\"foo\""), "\"foo\" must be accepted");
+        assert!(accepts(&g, b"\"food\""), "\"food\" must be accepted");
+        assert!(accepts(&g, b"\"foot\""), "\"foot\" must be accepted");
+        assert!(rejects(&g, b"\"fooz\""), "\"fooz\" must be rejected");
+        assert!(rejects(&g, b"\"fo\""), "\"fo\" must be rejected");
+    }
+
+    /// Prefix pair ["a","ab"]: both accepted (quoted → prefix-free).
+    #[test]
+    fn string_enum_prefix_pair_a_ab() {
+        let g = compile_ok(r#"{"type":"string","enum":["a","ab"]}"#);
+        assert!(accepts(&g, b"\"a\""), "\"a\" must be accepted");
+        assert!(accepts(&g, b"\"ab\""), "\"ab\" must be accepted");
+        assert!(rejects(&g, b"\"abc\""), "\"abc\" must be rejected");
+        assert!(rejects(&g, b"\"b\""), "\"b\" must be rejected");
+    }
+
+    /// Escaped values: schema `["a\\b","a\\c"]` (string values `a\b` and `a\c`,
+    /// each containing a literal backslash) share the JSON-encoded byte prefix
+    /// `a\\`; the trie must diverge at byte `b` vs `c`.
+    ///
+    /// The JSON encoding of the literal-backslash string `a\b` is `"a\\b"`,
+    /// whose byte stream is [34,97,92,92,98,34].  In a Rust byte literal that
+    /// is `b"\"a\\\\b\""` (four backslash chars → two bytes of 0x5C).
+    #[test]
+    fn string_enum_escaped_values() {
+        // Schema: string values a\b and a\c (literal backslash in each).
+        // Their JSON encodings "a\\b" and "a\\c" share the byte prefix
+        // [97, 92, 92] = 'a', '\', '\' and diverge at 'b' vs 'c'.
+        let g = compile_ok(r#"{"type":"string","enum":["a\\b","a\\c"]}"#);
+        // JSON "a\\b" = bytes [34,97,92,92,98,34] = Rust b"\"a\\\\b\""
+        assert!(
+            accepts(&g, b"\"a\\\\b\""),
+            "literal-backslash value a\\b must be accepted"
+        );
+        assert!(
+            accepts(&g, b"\"a\\\\c\""),
+            "literal-backslash value a\\c must be accepted"
+        );
+        assert!(
+            rejects(&g, b"\"a\\\\d\""),
+            "a\\d (not in enum) must be rejected"
+        );
+        assert!(
+            rejects(&g, b"\"a\""),
+            "bare a (no backslash) must be rejected"
+        );
+    }
+
+    /// Single-value enum ["solo"]: accepted normally; no regression.
+    #[test]
+    fn string_enum_single_value() {
+        let g = compile_ok(r#"{"type":"string","enum":["solo"]}"#);
+        assert!(accepts(&g, b"\"solo\""), "\"solo\" must be accepted");
+        assert!(rejects(&g, b"\"sol\""), "prefix \"sol\" must be rejected");
+        assert!(
+            rejects(&g, b"\"soloo\""),
+            "extension \"soloo\" must be rejected"
+        );
+    }
+
+    /// Disjoint ["cat","dog"]: distinct first bytes; both accepted.
+    #[test]
+    fn string_enum_disjoint() {
+        let g = compile_ok(r#"{"type":"string","enum":["cat","dog"]}"#);
+        assert!(accepts(&g, b"\"cat\""), "\"cat\" must be accepted");
+        assert!(accepts(&g, b"\"dog\""), "\"dog\" must be accepted");
+        assert!(rejects(&g, b"\"cot\""), "\"cot\" must be rejected");
+        assert!(rejects(&g, b"\"dig\""), "\"dig\" must be rejected");
+    }
+
+    /// Mixed anyOf[const "abc", {"type":"object"}]: the string "abc" and any
+    /// valid object are both accepted; non-member strings are rejected.
+    #[test]
+    fn anyof_mixed_string_const_and_object() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"const":"abc"},{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}]}"#,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const string must be accepted");
+        assert!(accepts(&g, b"{\"x\":1}"), "valid object must be accepted");
+        assert!(
+            rejects(&g, b"\"abd\""),
+            "non-member string must be rejected"
+        );
+    }
+
+    /// A single long enum string compiles flat (no per-byte recursion) and
+    /// accepts itself. Regression guard for `build_trie_node` single-child
+    /// compression: once a member stops sharing a prefix it is emitted flat, so
+    /// member length never drives recursion depth. Reverting the compression
+    /// recurses 20_000 deep and aborts the test binary on a stack overflow.
+    #[test]
+    fn string_enum_long_single_value_compiles() {
+        let val = "a".repeat(20_000);
+        let g = compile_ok(&format!(r#"{{"type":"string","enum":["{val}"]}}"#));
+        let mut input = vec![b'"'];
+        input.extend(std::iter::repeat_n(b'a', 20_000));
+        input.push(b'"');
+        assert!(accepts(&g, &input), "the long enum value must be accepted");
+        assert!(rejects(&g, b"\"a\""), "a shorter prefix must be rejected");
+    }
+
+    /// Two members sharing a prefix longer than `MAX_TRIE_DEPTH` fail closed
+    /// with a `SchemaError` naming the depth bound, rather than overflowing the
+    /// stack. Locks the defense-in-depth recursion cap.
+    #[test]
+    fn string_enum_pathological_shared_prefix_fails_closed() {
+        let pfx = "a".repeat(MAX_TRIE_DEPTH + 50);
+        let schema = format!(r#"{{"enum":["{pfx}b","{pfx}c"]}}"#);
+        let v: Value = serde_json::from_str(&schema).unwrap();
+        let err = compile(&v).expect_err("an absurd shared prefix must be rejected, not crash");
+        assert!(
+            err.0.contains("depth"),
+            "error should name the depth limit, got: {err:?}"
+        );
     }
 
     #[test]
