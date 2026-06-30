@@ -94,6 +94,9 @@ const MAX_STRING_LITERAL_BYTES: usize = 1024 * 1024;
 /// cardinality boundaries stay consistent.
 const MAX_PREFIX_ITEMS: usize = 4096;
 
+// DoS bound: cap the number of anyOf/oneOf branches a single schema node may declare (issue #474).
+const MAX_ANYOF_BRANCHES: usize = 4096;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -268,8 +271,20 @@ impl<'a> CompileCtx<'a> {
         any_of: &'a [Value],
         path: &[&str],
     ) -> Result<Vec<Alt>, SchemaError> {
+        // DoS bound (issue #474, finding 2): reject by raw branch count
+        // before the classification loop below can push an unbounded number
+        // of entries into `other_subs` (each later driving one recursive
+        // `compile_schema` call). anyOf/oneOf branch count is otherwise the
+        // only cardinality dimension this file never caps.
+        if any_of.len() > MAX_ANYOF_BRANCHES {
+            return Err(SchemaError(format!(
+                "anyOf/oneOf branch count ({}) exceeds the supported limit ({MAX_ANYOF_BRANCHES})",
+                any_of.len()
+            )));
+        }
         let mut broad_string = false;
         let mut literals: Vec<String> = Vec::new();
+        let mut byte_total: usize = 0;
         let mut other_subs: Vec<&'a Value> = Vec::new();
         for sub in any_of {
             match string_class_of(sub)? {
@@ -284,6 +299,28 @@ impl<'a> CompileCtx<'a> {
                         return Err(SchemaError(format!(
                             "anyOf string literal count ({total}) exceeds the supported limit ({MAX_STRING_LITERALS})"
                         )));
+                    }
+                    // DoS bound (issue #474, finding 4): accumulate the byte
+                    // budget incrementally as each branch's literals are
+                    // folded in, not only after the loop ends. The count cap
+                    // above bounds how many literals there are but not their
+                    // size, so up to MAX_STRING_LITERALS branches each
+                    // contributing one oversized literal could otherwise
+                    // balloon `literals` well past MAX_STRING_LITERAL_BYTES
+                    // before a post-loop check ever ran. Checked pre-dedup:
+                    // conservative early rejection is acceptable for a DoS
+                    // guard. saturating_add prevents an overflow in the
+                    // running sum from wrapping past the cap.
+                    for s in &values {
+                        let json_repr = serde_json::to_string(s).map_err(|e| {
+                            SchemaError(format!("cannot JSON-encode string value: {e}"))
+                        })?;
+                        byte_total = byte_total.saturating_add(json_repr.len() - 1);
+                        if byte_total > MAX_STRING_LITERAL_BYTES {
+                            return Err(SchemaError(format!(
+                                "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                            )));
+                        }
                     }
                     literals.extend(values);
                 }
@@ -309,25 +346,13 @@ impl<'a> CompileCtx<'a> {
                     literals.len()
                 )));
             }
-            // Distinct JSON strings are prefix-free once the closing `"` is part
-            // of each leaf, so every literal diverges within the trie.
+            // Distinct JSON strings are prefix-free once the closing `"` is
+            // part of each leaf, so every literal diverges within the trie.
+            // The byte budget was already enforced incrementally above as
+            // `literals` was built, so no further pre-allocation check is
+            // needed here.
             literals.sort();
             literals.dedup();
-            // DoS bound: check the total encoded byte budget before allocating
-            // the full seqs Vec so that an over-budget input under the count cap
-            // cannot force a large transient copy. saturating_add prevents an
-            // integer overflow in the running sum from wrapping past the cap.
-            let mut pre_byte_total: usize = 0;
-            for s in &literals {
-                let json_repr = serde_json::to_string(s)
-                    .map_err(|e| SchemaError(format!("cannot JSON-encode string value: {e}")))?;
-                pre_byte_total = pre_byte_total.saturating_add(json_repr.len() - 1);
-                if pre_byte_total > MAX_STRING_LITERAL_BYTES {
-                    return Err(SchemaError(format!(
-                        "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
-                    )));
-                }
-            }
             let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
             for s in &literals {
                 let json_repr = serde_json::to_string(s)
@@ -1653,6 +1678,27 @@ fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
             "enum value count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
             values.len()
         )));
+    }
+    // DoS bound (issue #474, finding 3): check the total encoded byte budget
+    // before allocating one `Alt` (a `Vec<Symbol>` sized by the value's JSON
+    // byte length) per member below. The count cap above bounds how many
+    // members there are but not how large each one is, so a handful of
+    // oversized values under MAX_STRING_LITERALS can still drive an
+    // unbounded allocation in the map/collect that follows.
+    // `compile_string_type` enforces the analogous budget for the all-string
+    // path; this mirrors it for the mixed/non-string path it does not cover.
+    // saturating_add prevents an overflow in the running sum from wrapping
+    // past the cap.
+    let mut pre_byte_total: usize = 0;
+    for v in values {
+        let json_repr = serde_json::to_string(v)
+            .map_err(|e| SchemaError(format!("cannot JSON-encode enum value: {e}")))?;
+        pre_byte_total = pre_byte_total.saturating_add(json_repr.len());
+        if pre_byte_total > MAX_STRING_LITERAL_BYTES {
+            return Err(SchemaError(format!(
+                "enum value encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+            )));
+        }
     }
     let alts = values
         .iter()
@@ -3118,6 +3164,14 @@ mod tests {
     /// loop, not by the post-loop backstop or the late compile_trie_literals
     /// guard.
     ///
+    /// Each branch folds 2 literals (a 2-member untyped string `enum`, not a
+    /// single `const`) so the BRANCH count stays well under
+    /// MAX_ANYOF_BRANCHES (issue #474 finding 2) while the aggregated LITERAL
+    /// count still exceeds MAX_STRING_LITERALS — isolating the per-extend
+    /// literal guard from the unrelated branch-count guard, which would
+    /// otherwise fire first on a one-literal-per-branch construction sized to
+    /// `MAX_STRING_LITERALS + 1` branches.
+    ///
     /// Mutation pin: the early guard fires with "anyOf string literal count"
     /// in the message. Reverting it lets `literals` accumulate unchecked
     /// through the loop; the post-loop backstop then fires with the
@@ -3125,9 +3179,9 @@ mod tests {
     /// assertion below fails.
     #[test]
     fn anyof_string_literal_count_cap_early_guard_fires_before_alloc() {
-        let over = MAX_STRING_LITERALS + 1;
-        let branches: String = (0..over)
-            .map(|i| format!("{{\"const\":\"c{i}\"}}"))
+        let branch_count = (MAX_STRING_LITERALS / 2) + 2;
+        let branches: String = (0..branch_count)
+            .map(|i| format!("{{\"enum\":[\"c{i}a\",\"c{i}b\"]}}"))
             .collect::<Vec<_>>()
             .join(",");
         let schema_json = format!("{{\"anyOf\":[{branches}]}}");
@@ -3349,6 +3403,103 @@ mod tests {
         assert!(
             err.0.contains("enum value count"),
             "expected the enum-value-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #474 (round-4 follow-up) — anyOf branch-count cap and byte
+    // budgets that were checked late (or not at all) before this round.
+    // -----------------------------------------------------------------------
+
+    /// anyOf/oneOf branch-count cap (issue #474, finding 2): a schema whose
+    /// `anyOf` array declares more than MAX_ANYOF_BRANCHES entries is
+    /// rejected at the top of `compile_any_of`, before the classification
+    /// loop runs. anyOf/oneOf branch count was the one cardinality dimension
+    /// this file never bounded.
+    ///
+    /// Mutation pin: fires with "anyOf/oneOf branch count". Reverting the
+    /// guard lets `compile_any_of` push one `other_subs` entry (and later one
+    /// recursive `compile_schema` call) per branch with no upper bound, so
+    /// compile returns `Ok` instead of `Err` and the assertion below fails.
+    #[test]
+    fn anyof_branch_count_capped() {
+        let over = MAX_ANYOF_BRANCHES + 1;
+        let branches: String = (0..over)
+            .map(|_| r#"{"type":"boolean"}"#.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{branches}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("anyOf branch count over the cap must be rejected");
+        assert!(
+            err.0.contains("anyOf/oneOf branch count"),
+            "expected the anyOf branch-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Mixed-enum byte-budget cap (issue #474, finding 3): a non-string enum
+    /// (one oversized string member plus a non-string member, so `type` is
+    /// absent and members are not all-string, routing to `compile_enum`
+    /// rather than `compile_string_type`) whose encoded bytes exceed
+    /// MAX_STRING_LITERAL_BYTES is rejected before the per-member
+    /// `json_value_to_alt` allocation.
+    ///
+    /// Mutation pin: fires with "enum value encoded byte length". Reverting
+    /// the byte-budget guard added in `compile_enum` lets the map/collect
+    /// over `values` run to completion (only 2 members, far under the count
+    /// cap), so compile returns `Ok` instead of `Err` and the assertion below
+    /// fails.
+    #[test]
+    fn mixed_enum_byte_budget_capped() {
+        // One member well over the 1 MiB byte budget by itself, plus a
+        // non-string member so this enum is not all-string and is routed to
+        // compile_enum (not compile_string_type's own byte guard).
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 16);
+        let schema_json = format!("{{\"enum\":[\"{huge}\",1]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("mixed enum over the byte budget must be rejected");
+        assert!(
+            err.0.contains("enum value encoded byte length"),
+            "expected the enum byte-budget cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// anyOf const cumulative byte-budget cap (issue #474, finding 4): an
+    /// `anyOf` whose individual `const` branches are each modest but whose
+    /// COMBINED encoded bytes exceed MAX_STRING_LITERAL_BYTES — while the
+    /// branch COUNT (3) stays far under MAX_STRING_LITERALS — is rejected by
+    /// the incremental byte-budget guard inside `compile_any_of`'s
+    /// classification loop, not only by the late backstop in
+    /// `compile_trie_literals`.
+    ///
+    /// Mutation pin: the incremental guard's message has no number between
+    /// "byte length" and "exceeds" ("string literal encoded byte length
+    /// exceeds the supported limit"); the late `compile_trie_literals`
+    /// backstop's message embeds the computed total in between ("byte length
+    /// (N) exceeds"). Reverting the incremental guard still leaves the late
+    /// backstop to reject (since dedup does not shrink 3 distinct large
+    /// strings), but with the DIFFERENT embedded-number message, so the exact
+    /// substring assertion below fails.
+    #[test]
+    fn anyof_const_cumulative_bytes_capped() {
+        // Each branch is ~400 KiB alone; three of them sum past 1 MiB while
+        // the branch count (3) stays far under MAX_STRING_LITERALS.
+        let chunk = "a".repeat(400 * 1024);
+        let branches: String = (0..3)
+            .map(|i| format!(r#"{{"const":"{chunk}{i}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{branches}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v)
+            .expect_err("anyOf consts whose cumulative bytes exceed the budget must be rejected");
+        assert!(
+            err.0
+                .contains("string literal encoded byte length exceeds the supported limit"),
+            "expected the incremental anyOf byte-budget cap error, got: {}",
             err.0
         );
     }
