@@ -156,7 +156,7 @@ fn build_caches(
     for s in samples {
         let (h_in, _real_out) = model.capture_attn_io(&s.tokens, first_layer)?;
         let seq_len = s.tokens.len();
-        let (cos, sin) = model.rope_cos_sin_tables(seq_len);
+        let (cos, sin) = model.rope_cos_sin_tables(seq_len)?;
         total_positions += seq_len - s.completion_start;
         caches.push(SeqCtx {
             h_in,

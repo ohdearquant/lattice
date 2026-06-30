@@ -80,7 +80,9 @@ fn main() {
 
     // Full prompt
     println!("\n--- Full prompt forward pass ---");
-    let logits = model.forward_prompt_debug(&prompt_ids);
+    let logits = model
+        .forward_prompt_debug(&prompt_ids)
+        .expect("forward_prompt_debug failed");
     let logit_mean: f32 = logits.iter().sum::<f32>() / logits.len() as f32;
     let logit_std: f32 =
         (logits.iter().map(|x| (x - logit_mean).powi(2)).sum::<f32>() / logits.len() as f32).sqrt();

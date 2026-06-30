@@ -377,6 +377,18 @@ impl Qwen35Model {
         // grammar configs before any sampling to avoid silently producing unconstrained
         // output when a caller sets gen_cfg.grammar (#397/#398).
         check_grammar_not_set(gen_cfg)?;
+        // Context preflight. apply_partial_rope indexes the precomputed cos/sin table
+        // without bounds checks, so a position at or past max_context() is an out-of-bounds
+        // slice access — a release panic, not a clean error. Mirror the same total-token
+        // policy as generate() and the HTTP server: prompt_len + max_new_tokens <= max_context.
+        let max_context = self.max_context();
+        if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+                 model context window ({max_context})",
+                gen_cfg.max_new_tokens
+            )));
+        }
 
         // Initialize states.
         let num_linear = cfg.num_linear_attention_layers();
@@ -1194,6 +1206,39 @@ mod tests {
 
         assert!(
             matches!(err, InferenceError::UnsupportedModel(msg) if msg == "MoE batch prefill is not yet implemented")
+        );
+    }
+
+    // ── Issue #403 preflight regression test ───────────────────────────────────
+    //
+    // Mutation contract: removing the `if prompt_len.saturating_add(gen_cfg.max_new_tokens)
+    // > max_context` guard added for #403 lets this test run a forward pass. Without the
+    // guard the call fails either by returning Ok — when generation stops before the RoPE
+    // boundary, tripping the `expect_err` below — or by an out-of-bounds RoPE panic if
+    // decode reaches the boundary. Either outcome changes the test result from PASS to FAIL.
+
+    #[test]
+    fn test_generate_with_batch_prefill_rejects_over_context_request() {
+        // Mutation contract: deleting the context preflight added for #403 makes this
+        // test fail either by returning Ok (generation stops before the RoPE boundary,
+        // so the `expect_err` below trips) or by an out-of-bounds RoPE panic if decode
+        // reaches the boundary. Either outcome changes the test result from PASS to FAIL.
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg, 0xC0D0_0403);
+        let max_context = model.max_context(); // 1024 from tiny_test_config()
+
+        // Single-token prompt ("a") plus max_new_tokens that overflows the window.
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: max_context, // 1 + 1024 = 1025 > 1024
+            ..GenerateConfig::default()
+        };
+        let err = model
+            .generate_with_batch_prefill("a", &gen_cfg)
+            .expect_err("prompt_len + max_new_tokens > max_context must return Err, not panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window") && msg.contains(&format!("{max_context}")),
+            "error must name the context window limit; got: {msg}"
         );
     }
 
