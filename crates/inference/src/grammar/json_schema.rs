@@ -277,10 +277,34 @@ impl<'a> CompileCtx<'a> {
                 None => merged.push(vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]),
             }
         } else if !literals.is_empty() {
+            // DoS bound: reject before dedup so that a schema with more than
+            // MAX_STRING_LITERALS duplicate branches cannot bypass the count cap
+            // by relying on deduplication to shrink the set below the limit.
+            if literals.len() > MAX_STRING_LITERALS {
+                return Err(SchemaError(format!(
+                    "string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+                    literals.len()
+                )));
+            }
             // Distinct JSON strings are prefix-free once the closing `"` is part
             // of each leaf, so every literal diverges within the trie.
             literals.sort();
             literals.dedup();
+            // DoS bound: check the total encoded byte budget before allocating
+            // the full seqs Vec so that an over-budget input under the count cap
+            // cannot force a large transient copy. saturating_add prevents an
+            // integer overflow in the running sum from wrapping past the cap.
+            let mut pre_byte_total: usize = 0;
+            for s in &literals {
+                let json_repr = serde_json::to_string(s)
+                    .map_err(|e| SchemaError(format!("cannot JSON-encode string value: {e}")))?;
+                pre_byte_total = pre_byte_total.saturating_add(json_repr.len() - 1);
+                if pre_byte_total > MAX_STRING_LITERAL_BYTES {
+                    return Err(SchemaError(format!(
+                        "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                    )));
+                }
+            }
             let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
             for s in &literals {
                 let json_repr = serde_json::to_string(s)
@@ -1114,6 +1138,25 @@ impl<'a> CompileCtx<'a> {
                 // diverges at its first byte, so the no-rewind single-stack PDA
                 // always picks the correct alternative at sym_pos == 0 without
                 // needing to backtrack across a shared prefix (e.g. ["foo","food"]).
+                // DoS bound: check the total encoded byte budget before
+                // allocating the full seqs Vec so that an over-budget input
+                // under the count cap cannot force a large transient copy.
+                // serde_json::to_string(s) returns `"<escaped>"` (len = encoded
+                // content + 2 quotes); we strip the opening quote and keep the
+                // closing `"` terminator, so each sequence contributes
+                // json_repr.len() - 1 bytes. saturating_add prevents an overflow
+                // in the running sum from wrapping past the cap.
+                let mut pre_byte_total: usize = 0;
+                for s in &str_values {
+                    let json_repr = serde_json::to_string(s)
+                        .map_err(|e| SchemaError(format!("cannot JSON-encode enum value: {e}")))?;
+                    pre_byte_total = pre_byte_total.saturating_add(json_repr.len() - 1);
+                    if pre_byte_total > MAX_STRING_LITERAL_BYTES {
+                        return Err(SchemaError(format!(
+                            "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                        )));
+                    }
+                }
                 let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(str_values.len());
                 for s in &str_values {
                     let json_repr = serde_json::to_string(s)
@@ -2858,6 +2901,31 @@ mod tests {
         assert!(
             err.0.contains("exceeds the supported limit"),
             "expected a byte-budget cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Raw-count cap fires before dedup in anyOf: a schema whose anyOf branches
+    /// contain more than MAX_STRING_LITERALS entries — even when all entries are
+    /// duplicates of a single value — is rejected before deduplication shrinks
+    /// the set below the limit. Fails (compile returns Ok) when the raw-count
+    /// guard added before sort/dedup in compile_any_of is reverted (MIN-2).
+    #[test]
+    fn string_literal_count_cap_any_of_duplicates_rejected_before_dedup() {
+        // All branches are the same const; after dedup only 1 remains, which is
+        // far under MAX_STRING_LITERALS. The raw count (MAX_STRING_LITERALS + 1)
+        // must still be rejected because the cap fires before dedup.
+        let branches: String = (0..=MAX_STRING_LITERALS)
+            .map(|_| r#"{"const":"dup"}"#.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{branches}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v)
+            .expect_err("anyOf with duplicate branches exceeding raw count cap must be rejected");
+        assert!(
+            err.0.contains("exceeds the supported limit"),
+            "expected a literal-count cap error, got: {}",
             err.0
         );
     }
