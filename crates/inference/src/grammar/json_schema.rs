@@ -1072,7 +1072,18 @@ impl<'a> CompileCtx<'a> {
     /// Compile `"type": "string"` potentially with an `enum` constraint.
     fn compile_string_type(&mut self, schema: &Value) -> Result<Vec<Alt>, SchemaError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            let str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+            let mut str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+            // A sibling `const` is a single-value enum, so the string language is
+            // the intersection `{const} ∩ enum`. Narrow to the const when it is a
+            // string; a non-string const is unsatisfiable under `type:"string"`,
+            // emptying the set. (`compile_schema_inner` dispatches `enum` before
+            // `const`, so without this the const would be silently ignored.)
+            if let Some(c) = schema.get("const") {
+                match c.as_str() {
+                    Some(cs) => str_values.retain(|s| *s == cs),
+                    None => str_values.clear(),
+                }
+            }
             if !str_values.is_empty() {
                 // Factor the common `'"'` prefix and `'"'` suffix into a
                 // wrapper so that string enum alternatives are disambiguated
@@ -1117,8 +1128,13 @@ impl<'a> CompileCtx<'a> {
                     Symbol::NonTerminal(trie_root_id),
                 ]]);
             }
+            // No surviving string member — a non-string `enum`, or a `const`
+            // that conflicts with every member — so the language is empty. Emit
+            // no alternative; falling through to `json_string` below would
+            // over-accept arbitrary strings (issue #472).
+            return Ok(Vec::new());
         }
-        // Default: any JSON string via built-in rule.
+        // Default: any JSON string via built-in rule (no `enum` constraint).
         if let Some(id) = self.builder.rule_id("json_string") {
             Ok(vec![vec![Symbol::NonTerminal(id)]])
         } else {
@@ -1519,67 +1535,101 @@ fn compile_const(v: &Value) -> Result<Vec<Alt>, SchemaError> {
 
 /// How an `anyOf`/`oneOf` sub-schema matches strings, for collapsing the
 /// string-valued ambiguity class into a single `"` entry (see the `anyOf`
-/// handler). A sub-schema that is not a string-valued class — a number,
-/// boolean, null, object, array, or a schema whose string matching cannot be
-/// reduced to a broad string or a fixed literal set (an UNTYPED mixed `enum`,
-/// a `$ref`, a nested `anyOf`, an untyped `{}`, or a `{"type":["string",...]}`
-/// union) — classifies as `None`. A `{"type":"string","enum":[...]}` whose enum
-/// mixes string and non-string members IS reducible: `type:"string"` kills the
-/// non-string members, leaving the string members as the exact literal set.
+/// handler). `type`, `const`, and `enum` are conjunctive assertions, so a
+/// sub-schema's string language is the INTERSECTION of the constraints it
+/// states. A schema that may also accept a non-string value, or whose string
+/// language is not reducible to a broad string or a fixed literal set (a `$ref`,
+/// a nested `anyOf`, an untyped `{}`, a `{"type":["string",...]}` union, or an
+/// untyped mixed `enum`) classifies as `None` and stays an "other" branch.
 enum StrClass {
-    /// Any JSON string (`{"type":"string"}`). `pattern` / `minLength` are not
-    /// enforced by this compiler, so such a schema widens to any string — the
-    /// same `json_string` rule `compile_string_type` emits for it standalone.
+    /// Any JSON string (`{"type":"string"}` with no value constraint).
+    /// `pattern` / `minLength` are not enforced by this compiler, so such a
+    /// schema widens to any string — the same `json_string` rule
+    /// `compile_string_type` emits for it standalone.
     Broad,
-    /// A fixed set of string values (a string `const` or an all-string `enum`).
+    /// A fixed set of string values (a string `const`, an all-string `enum`, or
+    /// a `{"type":"string","enum":[...]}` intersected down to its string
+    /// members). An EMPTY set is a dead branch — `const`/`enum` conflict, or a
+    /// `type:"string"` enum with no string member — whose language is empty, so
+    /// it contributes nothing to the union (it must NOT widen to any string).
     Literals(Vec<String>),
 }
 
 /// Classify a raw `anyOf`/`oneOf` sub-schema for string-class merging.
+///
+/// `type`, `const`, and `enum` are conjunctive assertions, so the branch's
+/// string language is their INTERSECTION — this models that intersection rather
+/// than taking the first keyword seen. A branch that may accept a non-string
+/// value, or whose string language is not reducible to a broad string or a
+/// fixed literal set, returns `None` and stays an "other". A dead branch (empty
+/// intersection, e.g. `const`/`enum` conflict or a `type:"string"` enum with no
+/// string member) returns `Literals(vec![])` so it contributes nothing — it
+/// must NOT fall through to `None`, which would let the standalone path widen it
+/// to any string.
 fn string_class_of(sub: &Value) -> Option<StrClass> {
     let obj = sub.as_object()?;
-    if let Some(Value::String(s)) = obj.get("const") {
-        return Some(StrClass::Literals(vec![s.clone()]));
-    }
-    let ty = obj.get("type").and_then(Value::as_str);
-    if let Some(arr) = obj.get("enum").and_then(Value::as_array) {
-        if arr.is_empty() {
-            return None;
-        }
-        if ty == Some("string") {
-            // `type:"string"` makes every non-string enum member unsatisfiable
-            // (instance must satisfy the type AND equal an enum member), so the
-            // branch's language is exactly the enum's string members. Fold them;
-            // the dead non-string members are dropped without changing the
-            // language. With no string member the branch accepts nothing — leave
-            // it as an "other" so the standalone path emits that empty language
-            // rather than this fold emitting an empty trie.
-            let values: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            if values.is_empty() {
-                return None;
+    // `type` gate: only an absent type or exactly `"string"` keeps the branch a
+    // pure string class. A scalar non-string type, or a `type` array (for which
+    // `as_str()` is `None` on a non-string `Value`), means the branch may accept
+    // a non-string value, so it cannot fold into the string entry.
+    let type_is_string = match obj.get("type") {
+        None => false,
+        Some(Value::String(s)) if s == "string" => true,
+        _ => return None,
+    };
+    let const_val = obj.get("const");
+    let enum_arr = obj.get("enum").and_then(Value::as_array);
+    match (const_val, enum_arr) {
+        (Some(c), enum_opt) => {
+            // `const` is a single-value enum. The language is the intersection of
+            // {const}, the `enum` (when present), and the type.
+            let Some(cs) = c.as_str() else {
+                // Non-string const: with `type:"string"` nothing satisfies both
+                // (dead branch); with no type the branch accepts that non-string
+                // value, which this string fold cannot represent.
+                return if type_is_string {
+                    Some(StrClass::Literals(Vec::new()))
+                } else {
+                    None
+                };
+            };
+            // String const: fold it only if a present `enum` also contains it; a
+            // conflicting `enum` makes the intersection empty (dead branch).
+            match enum_opt {
+                Some(arr) if !arr.iter().any(|v| v == c) => Some(StrClass::Literals(Vec::new())),
+                _ => Some(StrClass::Literals(vec![cs.to_string()])),
             }
-            return Some(StrClass::Literals(values));
         }
-        if ty.is_none() && arr.iter().all(Value::is_string) {
-            // No `type` constraint: a non-string member is itself a satisfiable
-            // value the branch accepts, so only an all-string enum is a pure
-            // literal set. A mixed untyped enum keeps its non-string members and
-            // stays an "other" branch (folding would drop those acceptances).
-            let values = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
-            return Some(StrClass::Literals(values));
+        (None, Some(arr)) => {
+            if type_is_string {
+                // `type:"string"` kills every non-string member; the language is
+                // exactly the string members (possibly empty = dead branch).
+                Some(StrClass::Literals(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ))
+            } else if !arr.is_empty() && arr.iter().all(Value::is_string) {
+                // Untyped all-string enum: a pure literal set.
+                Some(StrClass::Literals(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ))
+            } else {
+                // Untyped mixed or empty enum: non-string members stay reachable
+                // as an "other" branch (folding would drop those acceptances).
+                None
+            }
         }
-        return None;
+        (None, None) => {
+            if type_is_string {
+                Some(StrClass::Broad)
+            } else {
+                None
+            }
+        }
     }
-    if ty == Some("string") {
-        return Some(StrClass::Broad);
-    }
-    None
 }
 
 /// Convert a concrete JSON value to a grammar alternative (sequence of terminal bytes).
@@ -1998,6 +2048,126 @@ mod tests {
         assert!(
             rejects(&g, b"1"),
             "the integer enum member is unsatisfiable under type:string"
+        );
+    }
+
+    /// A `{"type":"string","enum":[1,2]}` branch is unsatisfiable: an instance
+    /// must be a string AND equal a numeric enum member, so it accepts no string.
+    /// `string_class_of` must classify it as the empty literal set (a dead
+    /// branch), NOT `None` — `None` routes it through `compile_string_type`'s
+    /// `json_string` fallback and over-accepts arbitrary strings (issue #472
+    /// codex round-4 blocker 2). Mutation guard: returning `None` accepts "zzz".
+    #[test]
+    fn anyof_typed_enum_no_string_members_rejected() {
+        let g = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[1,2]}]}"#);
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "the unsatisfiable type:string + numeric-enum branch must not widen to any-string"
+        );
+    }
+
+    /// `const` and `enum` are conjunctive, so `{"type":"string","const":"x","enum":["y"]}`
+    /// accepts no value (nothing equals both "x" and "y"). `string_class_of` must
+    /// fold the const only when a present enum contains it, classifying this
+    /// conflicting branch as the empty literal set (issue #472 codex round-4
+    /// blocker 1). Mutation guard: folding the const before checking the enum
+    /// accepts "x"; folding the enum before checking the const accepts "y".
+    #[test]
+    fn anyof_const_conflicting_enum_rejected() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"type":"integer"},{"type":"string","const":"x","enum":["y"]}]}"#,
+        );
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            rejects(&g, b"\"x\""),
+            "const \"x\" conflicts with enum [\"y\"] — empty intersection, reject"
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "enum member \"y\" conflicts with const \"x\" — empty intersection, reject"
+        );
+    }
+
+    /// `{"type":"string","const":"x","enum":["x","y"]}`: the const narrows the
+    /// enum to the intersection {"x"}, so only "x" is accepted, NOT "y" (issue
+    /// #472 codex round-4). Mutation guard: ignoring the const and folding the
+    /// whole enum accepts "y".
+    #[test]
+    fn anyof_const_compatible_enum_folds_to_const() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"type":"integer"},{"type":"string","const":"x","enum":["x","y"]}]}"#,
+        );
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            accepts(&g, b"\"x\""),
+            "const \"x\" is in the enum — accepted"
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "\"y\" is in the enum but excluded by const \"x\" — reject"
+        );
+    }
+
+    /// Standalone `{"type":"string","enum":[1,2]}` is unsatisfiable;
+    /// `compile_string_type` must emit the empty language, not the `json_string`
+    /// fallback (issue #472 blocker 2, standalone path). Mutation guard: the
+    /// `json_string` fallback accepts "zzz".
+    #[test]
+    fn standalone_typed_enum_no_string_members_rejects_all() {
+        let g = compile_ok(r#"{"type":"string","enum":[1,2]}"#);
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "no string satisfies type:string + enum [1,2]"
+        );
+        assert!(rejects(&g, b"1"), "the numeric member is not a string");
+    }
+
+    /// Standalone const/enum intersection through `compile_string_type`, which
+    /// `compile_schema_inner` reaches via the `enum` dispatch — without the
+    /// intersection a sibling `const` would be silently ignored (issue #472
+    /// blocker 1, standalone path). Mutation guard: dropping the const-narrowing
+    /// accepts "y" in both cases.
+    #[test]
+    fn standalone_string_const_enum_intersection() {
+        let conflict = compile_ok(r#"{"type":"string","const":"x","enum":["y"]}"#);
+        assert!(
+            rejects(&conflict, b"\"x\""),
+            "const conflicts with enum — reject \"x\""
+        );
+        assert!(
+            rejects(&conflict, b"\"y\""),
+            "const conflicts with enum — reject \"y\""
+        );
+        let compatible = compile_ok(r#"{"type":"string","const":"x","enum":["x","y"]}"#);
+        assert!(
+            accepts(&compatible, b"\"x\""),
+            "const \"x\" is in the enum — accept"
+        );
+        assert!(
+            rejects(&compatible, b"\"y\""),
+            "\"y\" excluded by const \"x\" — reject"
+        );
+    }
+
+    /// Edge cases for typed string enums: an empty `enum` is the empty language
+    /// (reject all), and a duplicate member folds to a single trie path without
+    /// error (issue #472 codex round-4 next-round focus).
+    #[test]
+    fn typed_string_enum_empty_and_duplicate_members() {
+        let empty = compile_ok(r#"{"type":"string","enum":[]}"#);
+        assert!(rejects(&empty, b"\"zzz\""), "empty enum accepts nothing");
+        let dups = compile_ok(r#"{"type":"string","enum":["dup","dup"]}"#);
+        assert!(
+            accepts(&dups, b"\"dup\""),
+            "a duplicated member still accepts once"
+        );
+        assert!(rejects(&dups, b"\"other\""), "no over-accept from dedup");
+        let in_anyof = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[]}]}"#);
+        assert!(accepts(&in_anyof, b"7"), "integer branch reachable");
+        assert!(
+            rejects(&in_anyof, b"\"zzz\""),
+            "empty typed enum contributes no string"
         );
     }
 
