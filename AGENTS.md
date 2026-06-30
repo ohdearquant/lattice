@@ -28,7 +28,7 @@ Pure Rust inference engine. Apache-2.0. github.com/ohdearquant/lattice
 - Do not use `unwrap()` or `expect()` in library code. Tests and examples only.
 - Do not add upward dependencies (embed cannot depend on tune, inference cannot depend on embed).
 - Do not push directly to `main`. All changes go through feature branch → PR → review → merge.
-- Internal path dependencies must include a version for crates.io: `lattice-foo = { version = "0.1.0", path = "../foo" }`.
+- Internal path dependencies must include a version for crates.io: `lattice-foo = { version = "0.4.2", path = "../foo" }`.
 
 ```rust
 // === BAD — unwrap in library code ===
@@ -92,9 +92,9 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-inference (~112K)  fann (6.5K)  transport (5.4K)   ← leaf, zero internal deps
+inference (~118K)  fann (7.7K)  transport (5.4K)   ← leaf, zero internal deps
     |                |
-  embed (12K)    tune (15.6K)                     ← depend on leaves only
+  embed (12K)    tune (20K)                       ← depend on leaves only
 ```
 
 ### lattice-inference — Transformer kernel
@@ -243,7 +243,7 @@ make bench-gate                          # compare against perf-baselines branch
 
 ## ADRs
 
-63 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
+64 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
 
 Write when: new model, SIMD dispatch change, weight format change, new backend, public API change.
 

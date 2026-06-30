@@ -190,7 +190,7 @@ let output = network.forward_async(&input).await?;
 Requires the `parallel` feature to compile.
 
 ```rust
-// This example requires: lattice-fann = { version = "0.1", features = ["parallel"] }
+// This example requires: lattice-fann = { version = "0.4.2", features = ["parallel"] }
 use lattice_fann::{NetworkBuilder, Activation};
 
 let network = NetworkBuilder::new()
@@ -252,9 +252,9 @@ Format specification:
 
 ```toml
 [dependencies]
-lattice-fann = { version = "0.1" }                         # Default (std + simd)
-lattice-fann = { version = "0.1", features = ["parallel"] } # Parallel inference
-lattice-fann = { version = "0.1", features = ["gpu"] }      # GPU acceleration
+lattice-fann = { version = "0.4.2" }                         # Default (std + simd)
+lattice-fann = { version = "0.4.2", features = ["parallel"] } # Parallel inference
+lattice-fann = { version = "0.4.2", features = ["gpu"] }      # GPU acceleration
 ```
 
 ## Performance

@@ -96,7 +96,7 @@ provide for this model family:
 | Q4 + LoRA hot-swap (no reload) | yes | no | no |
 | Pure Rust, zero Python or framework | yes | no | no |
 
-PPL parity confirmed: Lattice 20.60, MLX 20.67 on wikitext-2 (2048 tokens). Reproduce:
+PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4 19.27, q4-QuaRot 19.95 (2048 tokens); MLX q8 15.82, q4 18.18 (2041 tokens). Reproduce:
 `./scripts/bench_context_scaling.sh`
 
 ---
