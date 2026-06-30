@@ -553,6 +553,7 @@ impl<'a> CompileCtx<'a> {
                     let key_str: &str = key.as_str();
                     let is_req = required.contains(&key_str);
 
+                    guard_literal_bytes(key_str)?;
                     // key_bytes: raw bytes of the JSON-encoded key string.
                     // Used to inline the key as terminals in started=true tail
                     // rules so trailing-comma over-acceptance is prevented for a
@@ -1792,25 +1793,34 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
             // conflicting `enum` makes the intersection empty (dead branch).
             Ok(match enum_opt {
                 Some(arr) if !arr.iter().any(|v| v == c) => Some(StrClass::Literals(Vec::new())),
-                _ => Some(StrClass::Literals(vec![cs.to_string()])),
+                _ => {
+                    guard_literal_bytes(cs)?;
+                    Some(StrClass::Literals(vec![cs.to_string()]))
+                }
             })
         }
         (None, Some(arr)) => {
             if type_is_string {
                 // `type:"string"` kills every non-string member; the language is
                 // exactly the string members (possibly empty = dead branch).
-                Ok(Some(StrClass::Literals(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect(),
-                )))
+                let mut lits = Vec::new();
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        guard_literal_bytes(s)?;
+                        lits.push(s.to_string());
+                    }
+                }
+                Ok(Some(StrClass::Literals(lits)))
             } else if !arr.is_empty() && arr.iter().all(Value::is_string) {
                 // Untyped all-string enum: a pure literal set.
-                Ok(Some(StrClass::Literals(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect(),
-                )))
+                let mut lits = Vec::new();
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        guard_literal_bytes(s)?;
+                        lits.push(s.to_string());
+                    }
+                }
+                Ok(Some(StrClass::Literals(lits)))
             } else {
                 // Untyped mixed or empty enum: non-string members stay reachable
                 // as an "other" branch (folding would drop those acceptances).
@@ -1825,10 +1835,25 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
     }
 }
 
+/// Reject a single JSON literal whose byte length exceeds the per-literal cap
+/// before it is copied or expanded into grammar symbols. Bounds the
+/// single-oversized-literal allocation uniformly across the const / enum-member
+/// / object-key paths (issue #474).
+fn guard_literal_bytes(s: &str) -> Result<(), SchemaError> {
+    if s.len() > MAX_STRING_LITERAL_BYTES {
+        return Err(SchemaError(format!(
+            "string literal byte length ({}) exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})",
+            s.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Convert a concrete JSON value to a grammar alternative (sequence of terminal bytes).
 fn json_value_to_alt(v: &Value) -> Result<Alt, SchemaError> {
     let json_str = serde_json::to_string(v)
         .map_err(|e| SchemaError(format!("cannot serialize enum value: {e}")))?;
+    guard_literal_bytes(&json_str)?;
     Ok(json_str.bytes().map(Symbol::Terminal).collect())
 }
 
@@ -1839,6 +1864,7 @@ fn json_value_to_alt(v: &Value) -> Result<Alt, SchemaError> {
 fn json_string_literal(key: &str) -> Result<Alt, SchemaError> {
     let json_repr = serde_json::to_string(key)
         .map_err(|e| SchemaError(format!("cannot JSON-encode property key: {e}")))?;
+    guard_literal_bytes(&json_repr)?;
     // json_repr includes surrounding `"` quotes; emit them as terminals directly.
     Ok(json_repr.bytes().map(Symbol::Terminal).collect())
 }
@@ -3500,6 +3526,105 @@ mod tests {
             err.0
                 .contains("string literal encoded byte length exceeds the supported limit"),
             "expected the incremental anyOf byte-budget cap error, got: {}",
+            err.0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #474 (round-6 follow-up) — single-oversized-literal byte cap.
+    // Rounds 1-5 capped cardinality (many literals); this closes the
+    // distinct sub-class where ONE literal's own byte length exceeds
+    // MAX_STRING_LITERAL_BYTES before any prior guard sees it.
+    // -----------------------------------------------------------------------
+
+    /// Top-level const byte cap (issue #474, round 6): a top-level `const`
+    /// whose byte length exceeds MAX_STRING_LITERAL_BYTES is rejected by the
+    /// `guard_literal_bytes` check in `json_value_to_alt`, which has no other
+    /// byte guard upstream of it.
+    ///
+    /// Mutation pin: fires with "byte length". Reverting the guard in
+    /// `json_value_to_alt` lets `serde_json::to_string` and the per-byte
+    /// `Symbol::Terminal` collect run to completion, so compile returns `Ok`
+    /// instead of `Err` and the assertion below fails.
+    #[test]
+    fn const_literal_byte_capped() {
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let schema_json = format!("{{\"const\":\"{huge}\"}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("a const literal over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Object property key byte cap (issue #474, round 6): an object property
+    /// whose KEY (not value) exceeds MAX_STRING_LITERAL_BYTES is rejected by
+    /// the `guard_literal_bytes` checks in `compile_object` (raw key) and
+    /// `json_string_literal` (JSON-encoded key), before the key reaches the
+    /// `into_bytes` alloc or the per-byte `Symbol::Terminal` expansion.
+    ///
+    /// Mutation pin: fires with "byte length". Reverting BOTH guards lets the
+    /// key flow through unbounded, so compile returns `Ok` instead of `Err`
+    /// and the assertion below fails. (Reverting only one guard leaves the
+    /// other as a backstop — the pair is what this test pins.)
+    #[test]
+    fn object_key_byte_capped() {
+        let huge_key = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let schema_json = format!(
+            "{{\"type\":\"object\",\"properties\":{{\"{huge_key}\":{{\"type\":\"integer\"}}}}}}"
+        );
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("an object key over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// anyOf const single-byte cap (issue #474, round 6): an `anyOf` branch
+    /// with a single oversized `const` is rejected by the `guard_literal_bytes`
+    /// check in `string_class_of`'s const arm.
+    ///
+    /// Backstopped: the round-5 incremental byte-budget guard inside
+    /// `compile_any_of`'s classification loop (Fix 4) also catches this input,
+    /// so this test stays green even if the round-6 guard alone is reverted.
+    /// It is defense-in-depth for the transient ~1x copy at the exact line
+    /// codex named, not independently mutation-sensitive — see
+    /// `object_key_byte_capped` / `const_literal_byte_capped` for the
+    /// mutation-pinned guards.
+    #[test]
+    fn anyof_const_single_byte_capped() {
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let schema_json = format!("{{\"anyOf\":[{{\"const\":\"{huge}\"}}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("an anyOf const over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// anyOf enum member single-byte cap (issue #474, round 6): an `anyOf`
+    /// branch with a single oversized `enum` member is rejected by the
+    /// `guard_literal_bytes` checks in `string_class_of`'s enum arms.
+    ///
+    /// Backstopped: same as `anyof_const_single_byte_capped` — the round-5
+    /// incremental byte-budget guard in `compile_any_of` also catches this
+    /// input, so this test is defense-in-depth, not independently
+    /// mutation-sensitive.
+    #[test]
+    fn anyof_enum_member_byte_capped() {
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let schema_json = format!("{{\"anyOf\":[{{\"enum\":[\"{huge}\"]}}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("an anyOf enum member over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
             err.0
         );
     }
