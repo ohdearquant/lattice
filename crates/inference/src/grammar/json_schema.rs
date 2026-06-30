@@ -80,6 +80,10 @@ const MAX_OBJECT_PROPERTIES: usize = 4096;
 /// recursion well below the stack limit and fails closed with a `SchemaError`
 /// instead of aborting the process, mirroring `MAX_OBJECT_PROPERTIES`.
 const MAX_TRIE_DEPTH: usize = 1024;
+// DoS bound: cap the number of distinct string literals a single trie may hold.
+const MAX_STRING_LITERALS: usize = 4096;
+// DoS bound: cap the total encoded byte length across all literals in a single trie.
+const MAX_STRING_LITERAL_BYTES: usize = 1024 * 1024;
 
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
@@ -1182,6 +1186,18 @@ impl<'a> CompileCtx<'a> {
     /// `anyOf`/`oneOf` handler the full-quoted JSON representations are
     /// inherently prefix-free for distinct string values.
     fn compile_trie_literals(&mut self, seqs: &[Vec<u8>]) -> Result<usize, SchemaError> {
+        if seqs.len() > MAX_STRING_LITERALS {
+            return Err(SchemaError(format!(
+                "string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+                seqs.len()
+            )));
+        }
+        let total_encoded_bytes: usize = seqs.iter().map(Vec::len).sum();
+        if total_encoded_bytes > MAX_STRING_LITERAL_BYTES {
+            return Err(SchemaError(format!(
+                "string literal encoded byte length ({total_encoded_bytes}) exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+            )));
+        }
         let n = self.enum_counter;
         self.enum_counter += 1;
         let mut node_counter = 0usize;
@@ -2784,5 +2800,77 @@ mod tests {
             "empty object (all optional) must accept"
         );
         assert!(accepts(&g, b"{\"p0\":1}"), "single property must accept");
+    }
+
+    /// Literal-count cap via typed string-enum: a schema whose enum members
+    /// exceed MAX_STRING_LITERALS is rejected at the parse boundary with a
+    /// SchemaError naming the count limit. Fails (compile returns Ok) when the
+    /// count guard in compile_trie_literals is reverted.
+    #[test]
+    fn string_literal_count_cap_typed_enum_rejects() {
+        let values: String = (0..=MAX_STRING_LITERALS)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"type\":\"string\",\"enum\":[{values}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-cap string enum must be rejected");
+        assert!(
+            err.0.contains("exceeds the supported limit"),
+            "expected a literal-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Literal-count cap via anyOf const set: the same count guard fires when
+    /// an anyOf schema aggregates more than MAX_STRING_LITERALS string consts.
+    /// Proves the shared compile_trie_literals chokepoint is inherited by the
+    /// anyOf/oneOf entry point, not just compile_string_type.
+    #[test]
+    fn string_literal_count_cap_any_of_const_rejects() {
+        let branches: String = (0..=MAX_STRING_LITERALS)
+            .map(|i| format!("{{\"const\":\"c{i}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{branches}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-cap anyOf const set must be rejected");
+        assert!(
+            err.0.contains("exceeds the supported limit"),
+            "expected a literal-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Byte-budget cap: a schema whose literals' total encoded bytes exceed 1 MiB
+    /// (but whose count is under MAX_STRING_LITERALS) is rejected at the parse
+    /// boundary. Fails (compile returns Ok) when the byte-budget guard in
+    /// compile_trie_literals is reverted.
+    #[test]
+    fn string_literal_byte_budget_cap_rejects() {
+        // Build 2 strings each slightly over 512 KiB so together they clear 1 MiB
+        // while staying well under the 4096 count cap.
+        let long_val = "a".repeat(600 * 1024);
+        let values = format!("\"{long_val}\",\"{long_val}b\"");
+        let schema_json = format!("{{\"type\":\"string\",\"enum\":[{values}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-byte-budget string enum must be rejected");
+        assert!(
+            err.0.contains("exceeds the supported limit"),
+            "expected a byte-budget cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Happy path: a small string literal set (well under both caps) compiles
+    /// successfully. Ensures the new guards do not reject valid schemas.
+    #[test]
+    fn string_literal_small_set_compiles() {
+        let schema = r#"{"type":"string","enum":["alpha","beta","gamma"]}"#;
+        let v: Value = serde_json::from_str(schema).unwrap();
+        let g = compile(&v).expect("small string enum must compile");
+        assert!(accepts(&g, b"\"alpha\""));
+        assert!(accepts(&g, b"\"beta\""));
+        assert!(rejects(&g, b"\"delta\""));
     }
 }
