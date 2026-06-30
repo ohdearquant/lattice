@@ -175,6 +175,16 @@ impl PagePool {
                 "max_pages ({max_pages}) * floats_per_page ({floats_per_page}) overflows usize"
             ))
         })?;
+        // `vec![0.0f32; len]` allocates `len * size_of::<f32>()` bytes; a length
+        // that fits usize can still overflow the byte layout. Guard it here so
+        // the fallible path fails closed instead of panicking ("capacity
+        // overflow") inside `vec!`.
+        len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "page pool byte size ({len} * {}) overflows usize",
+                std::mem::size_of::<f32>()
+            ))
+        })?;
         let data = vec![0.0f32; len];
         let free_list: Vec<usize> = (0..max_pages).rev().collect();
         Ok(Self {
@@ -1346,6 +1356,19 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput on page-pool capacity overflow, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn page_pool_try_new_overflow_bytes_returns_invalid_input() {
+        // Element count (1 * usize::MAX/2) fits usize, but the f32 byte layout
+        // (len * 4) overflows. The fallible constructor must fail closed rather
+        // than panic with "capacity overflow" inside `vec!`. This is the gap
+        // `BatchWorker::try_new` inherits via `PagePool::try_new`.
+        let r = PagePool::try_new(1, usize::MAX / 2);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on page-pool byte overflow, got {r:?}"
         );
     }
 
