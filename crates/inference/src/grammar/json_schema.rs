@@ -210,6 +210,95 @@ impl<'a> CompileCtx<'a> {
         result
     }
 
+    /// Lower an `anyOf` / `oneOf` to a list of alternatives.
+    ///
+    /// The no-rewind PDA commits to an alternative once it consumes a byte (the
+    /// #353/#380 consumed-guard), so every branch that can begin with `"`
+    /// competes for the single opening quote: once one of them consumes it, the
+    /// siblings become unreachable. Every JSON string shares that opening `"`,
+    /// so listing string-valued branches separately strands all but the first
+    /// (issue #310 — the over-rejection regression fixed here). Collapse the
+    /// whole string-valued class into ONE branch with a single `"` entry:
+    ///
+    ///   * any broad string (`{"type":"string"}`; also `pattern` / `minLength`,
+    ///     which this compiler does not enforce and so widens to any string)
+    ///     makes the class the `json_string` rule. It subsumes every string
+    ///     literal, so a valid string is never rejected and the literals need no
+    ///     separate branch.
+    ///   * otherwise the string literals (`const` / all-string `enum`) become a
+    ///     single trie so each diverges inside the quoted region instead of
+    ///     competing at the shared opening quote.
+    ///
+    /// Non-string branches (numbers, booleans, null, objects, arrays) never
+    /// begin with `"`, so they follow the string entry in their original
+    /// relative order and stay reachable: a non-`"` input diverges from the
+    /// string entry at sym_pos == 0 and the PDA falls through.
+    ///
+    /// LIMITATION (pre-existing; `origin/main` rejects the same inputs): a
+    /// sibling whose language includes strings but is NOT folded into the string
+    /// entry — a `$ref` to a string rule, a nested `anyOf`, an untyped `{}`, a
+    /// `{"type":["string",...]}` union, or an untyped mixed `enum` — has its
+    /// quoted inputs shadowed by the hoisted entry once the entry consumes the
+    /// opening `"`, so those strings are over-rejected (issue #473).
+    /// `string_class_of` folds every shape it can prove reduces to a fixed string
+    /// set (`const`, all-string `enum`, and `{"type":"string","enum":[...]}`
+    /// whose `type` makes the non-string members dead), leaving only siblings
+    /// that genuinely need parallel-stack matching. The merge can only narrow
+    /// such a sibling, never widen it — it never over-accepts.
+    ///
+    /// Kept `#[inline(never)]` and out of `compile_schema_inner` so these locals
+    /// do not enlarge that function's per-recursion stack frame (see the call
+    /// site: a deep `$ref` chain must hit the depth guard, not the native stack).
+    #[inline(never)]
+    fn compile_any_of(
+        &mut self,
+        any_of: &'a [Value],
+        path: &[&str],
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let mut broad_string = false;
+        let mut literals: Vec<String> = Vec::new();
+        let mut other_subs: Vec<&'a Value> = Vec::new();
+        for sub in any_of {
+            match string_class_of(sub) {
+                Some(StrClass::Broad) => broad_string = true,
+                Some(StrClass::Literals(values)) => literals.extend(values),
+                None => other_subs.push(sub),
+            }
+        }
+
+        let mut merged: Vec<Alt> = Vec::new();
+        if broad_string {
+            match self.builder.rule_id("json_string") {
+                Some(id) => merged.push(vec![Symbol::NonTerminal(id)]),
+                None => merged.push(vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]),
+            }
+        } else if !literals.is_empty() {
+            // Distinct JSON strings are prefix-free once the closing `"` is part
+            // of each leaf, so every literal diverges within the trie.
+            literals.sort();
+            literals.dedup();
+            let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
+            for s in &literals {
+                let json_repr = serde_json::to_string(s)
+                    .map_err(|e| SchemaError(format!("cannot JSON-encode string value: {e}")))?;
+                // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
+                let inner = &json_repr[1..json_repr.len() - 1];
+                let mut seq: Vec<u8> = inner.bytes().collect();
+                seq.push(b'"');
+                seqs.push(seq);
+            }
+            let trie_root_id = self.compile_trie_literals(&seqs)?;
+            merged.push(vec![
+                Symbol::Terminal(b'"'),
+                Symbol::NonTerminal(trie_root_id),
+            ]);
+        }
+        for sub in other_subs {
+            merged.extend(self.compile_schema(sub, path)?);
+        }
+        Ok(merged)
+    }
+
     fn compile_schema_inner(
         &mut self,
         schema: &'a Value,
@@ -238,65 +327,19 @@ impl<'a> CompileCtx<'a> {
             return compile_const(v);
         }
 
-        // Handle `anyOf` / `oneOf`
+        // Handle `anyOf` / `oneOf`. The body lives in a separate, non-inlined
+        // method (see `compile_any_of`) so its locals do not enlarge this
+        // function's stack frame: a deep `$ref` chain re-enters
+        // `compile_schema_inner` at every link, and the depth guard (#343) must
+        // reject at MAX_SCHEMA_DEPTH before the native stack overflows. Folding
+        // the anyOf locals in here regressed that headroom (a 2000-link chain
+        // overflowed instead of returning the depth error).
         if let Some(any_of) = schema
             .get("anyOf")
             .or_else(|| schema.get("oneOf"))
             .and_then(Value::as_array)
         {
-            let mut all_alts: Vec<Alt> = Vec::new();
-            for sub in any_of {
-                let sub_alts = self.compile_schema(sub, _path)?;
-                all_alts.extend(sub_alts);
-            }
-
-            // Partition: separate fully-quoted string-literal alternatives
-            // (every symbol is Terminal, first byte is `"`, last byte is `"`)
-            // from all other alternatives.  Two or more such alternatives may
-            // share a byte prefix and be over-rejected by the no-rewind PDA.
-            // Build a trie over them so every branch diverges at sym_pos == 0.
-            //
-            // Scope: quoted string literals only.  Non-string literal alts
-            // (numbers, booleans, null) have distinct first bytes in practice
-            // and are left flat.  Numeric enums with a shared prefix (e.g.
-            // `const 1` / `const 10`) are an unquoted narrower residual that
-            // requires the delimiter from the surrounding grammar context to
-            // disambiguate and cannot be fixed locally by a trie.
-            let (string_lit_alts, other_alts): (Vec<Alt>, Vec<Alt>) =
-                all_alts.into_iter().partition(|alt| {
-                    alt.len() >= 2
-                        && matches!(alt.first(), Some(Symbol::Terminal(b'"')))
-                        && matches!(alt.last(), Some(Symbol::Terminal(b'"')))
-                        && alt.iter().all(|sym| matches!(sym, Symbol::Terminal(_)))
-                });
-
-            if string_lit_alts.len() >= 2 {
-                // Full quoted JSON strings are inherently prefix-free once their
-                // closing `"` is included — no extra terminator needed here.
-                let seqs: Vec<Vec<u8>> = string_lit_alts
-                    .into_iter()
-                    .map(|alt| {
-                        alt.into_iter()
-                            .filter_map(|sym| {
-                                if let Symbol::Terminal(b) = sym {
-                                    Some(b)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                let trie_root_id = self.compile_trie_literals(&seqs)?;
-                let mut combined = vec![vec![Symbol::NonTerminal(trie_root_id)]];
-                combined.extend(other_alts);
-                return Ok(combined);
-            }
-
-            // Fewer than 2 string-literal alts: flatten as before (no trie needed).
-            let mut combined = string_lit_alts;
-            combined.extend(other_alts);
-            return Ok(combined);
+            return self.compile_any_of(any_of, _path);
         }
 
         // Dispatch on `type`
@@ -1029,7 +1072,18 @@ impl<'a> CompileCtx<'a> {
     /// Compile `"type": "string"` potentially with an `enum` constraint.
     fn compile_string_type(&mut self, schema: &Value) -> Result<Vec<Alt>, SchemaError> {
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-            let str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+            let mut str_values: Vec<&str> = values.iter().filter_map(|v| v.as_str()).collect();
+            // A sibling `const` is a single-value enum, so the string language is
+            // the intersection `{const} ∩ enum`. Narrow to the const when it is a
+            // string; a non-string const is unsatisfiable under `type:"string"`,
+            // emptying the set. (`compile_schema_inner` dispatches `enum` before
+            // `const`, so without this the const would be silently ignored.)
+            if let Some(c) = schema.get("const") {
+                match c.as_str() {
+                    Some(cs) => str_values.retain(|s| *s == cs),
+                    None => str_values.clear(),
+                }
+            }
             if !str_values.is_empty() {
                 // Factor the common `'"'` prefix and `'"'` suffix into a
                 // wrapper so that string enum alternatives are disambiguated
@@ -1074,8 +1128,13 @@ impl<'a> CompileCtx<'a> {
                     Symbol::NonTerminal(trie_root_id),
                 ]]);
             }
+            // No surviving string member — a non-string `enum`, or a `const`
+            // that conflicts with every member — so the language is empty. Emit
+            // no alternative; falling through to `json_string` below would
+            // over-accept arbitrary strings (issue #472).
+            return Ok(Vec::new());
         }
-        // Default: any JSON string via built-in rule.
+        // Default: any JSON string via built-in rule (no `enum` constraint).
         if let Some(id) = self.builder.rule_id("json_string") {
             Ok(vec![vec![Symbol::NonTerminal(id)]])
         } else {
@@ -1474,6 +1533,105 @@ fn compile_const(v: &Value) -> Result<Vec<Alt>, SchemaError> {
     Ok(vec![json_value_to_alt(v)?])
 }
 
+/// How an `anyOf`/`oneOf` sub-schema matches strings, for collapsing the
+/// string-valued ambiguity class into a single `"` entry (see the `anyOf`
+/// handler). `type`, `const`, and `enum` are conjunctive assertions, so a
+/// sub-schema's string language is the INTERSECTION of the constraints it
+/// states. A schema that may also accept a non-string value, or whose string
+/// language is not reducible to a broad string or a fixed literal set (a `$ref`,
+/// a nested `anyOf`, an untyped `{}`, a `{"type":["string",...]}` union, or an
+/// untyped mixed `enum`) classifies as `None` and stays an "other" branch.
+enum StrClass {
+    /// Any JSON string (`{"type":"string"}` with no value constraint).
+    /// `pattern` / `minLength` are not enforced by this compiler, so such a
+    /// schema widens to any string — the same `json_string` rule
+    /// `compile_string_type` emits for it standalone.
+    Broad,
+    /// A fixed set of string values (a string `const`, an all-string `enum`, or
+    /// a `{"type":"string","enum":[...]}` intersected down to its string
+    /// members). An EMPTY set is a dead branch — `const`/`enum` conflict, or a
+    /// `type:"string"` enum with no string member — whose language is empty, so
+    /// it contributes nothing to the union (it must NOT widen to any string).
+    Literals(Vec<String>),
+}
+
+/// Classify a raw `anyOf`/`oneOf` sub-schema for string-class merging.
+///
+/// `type`, `const`, and `enum` are conjunctive assertions, so the branch's
+/// string language is their INTERSECTION — this models that intersection rather
+/// than taking the first keyword seen. A branch that may accept a non-string
+/// value, or whose string language is not reducible to a broad string or a
+/// fixed literal set, returns `None` and stays an "other". A dead branch (empty
+/// intersection, e.g. `const`/`enum` conflict or a `type:"string"` enum with no
+/// string member) returns `Literals(vec![])` so it contributes nothing — it
+/// must NOT fall through to `None`, which would let the standalone path widen it
+/// to any string.
+fn string_class_of(sub: &Value) -> Option<StrClass> {
+    let obj = sub.as_object()?;
+    // `type` gate: only an absent type or exactly `"string"` keeps the branch a
+    // pure string class. A scalar non-string type, or a `type` array (for which
+    // `as_str()` is `None` on a non-string `Value`), means the branch may accept
+    // a non-string value, so it cannot fold into the string entry.
+    let type_is_string = match obj.get("type") {
+        None => false,
+        Some(Value::String(s)) if s == "string" => true,
+        _ => return None,
+    };
+    let const_val = obj.get("const");
+    let enum_arr = obj.get("enum").and_then(Value::as_array);
+    match (const_val, enum_arr) {
+        (Some(c), enum_opt) => {
+            // `const` is a single-value enum. The language is the intersection of
+            // {const}, the `enum` (when present), and the type.
+            let Some(cs) = c.as_str() else {
+                // Non-string const: with `type:"string"` nothing satisfies both
+                // (dead branch); with no type the branch accepts that non-string
+                // value, which this string fold cannot represent.
+                return if type_is_string {
+                    Some(StrClass::Literals(Vec::new()))
+                } else {
+                    None
+                };
+            };
+            // String const: fold it only if a present `enum` also contains it; a
+            // conflicting `enum` makes the intersection empty (dead branch).
+            match enum_opt {
+                Some(arr) if !arr.iter().any(|v| v == c) => Some(StrClass::Literals(Vec::new())),
+                _ => Some(StrClass::Literals(vec![cs.to_string()])),
+            }
+        }
+        (None, Some(arr)) => {
+            if type_is_string {
+                // `type:"string"` kills every non-string member; the language is
+                // exactly the string members (possibly empty = dead branch).
+                Some(StrClass::Literals(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ))
+            } else if !arr.is_empty() && arr.iter().all(Value::is_string) {
+                // Untyped all-string enum: a pure literal set.
+                Some(StrClass::Literals(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect(),
+                ))
+            } else {
+                // Untyped mixed or empty enum: non-string members stay reachable
+                // as an "other" branch (folding would drop those acceptances).
+                None
+            }
+        }
+        (None, None) => {
+            if type_is_string {
+                Some(StrClass::Broad)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Convert a concrete JSON value to a grammar alternative (sequence of terminal bytes).
 fn json_value_to_alt(v: &Value) -> Result<Alt, SchemaError> {
     let json_str = serde_json::to_string(v)
@@ -1747,6 +1905,318 @@ mod tests {
         assert!(rejects(&g, b"\"abe\""), "\"abe\" must be rejected");
         assert!(rejects(&g, b"\"ab\""), "\"ab\" must be rejected");
         assert!(rejects(&g, b"\"abcd\""), "\"abcd\" must be rejected");
+    }
+
+    /// Regression: a broad `{"type":"string"}` branch alongside shared-prefix
+    /// string consts must stay reachable. The broad branch compiles to
+    /// `[NonTerminal(json_string)]`, whose FIRST set contains `"`; #471's
+    /// unconditional const-trie hoist made the no-rewind PDA consume the opening
+    /// quote and then fail to fall through, wrongly rejecting an arbitrary string
+    /// such as `"zzz"`. A present broad string collapses the whole string class
+    /// to `json_string`, which subsumes the consts. Mutation guard: reverting to
+    /// the unconditional hoist reintroduces the over-rejection and fails here.
+    #[test]
+    fn anyof_broad_string_with_shared_prefix_consts() {
+        let g = compile_ok(r#"{"anyOf":[{"type":"string"},{"const":"abc"},{"const":"abd"}]}"#);
+        assert!(
+            accepts(&g, b"\"zzz\""),
+            "broad string branch must accept an arbitrary string"
+        );
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(accepts(&g, b"\"abd\""), "\"abd\" must be accepted");
+        assert!(rejects(&g, b"123"), "a non-string must still be rejected");
+    }
+
+    /// A non-string sibling that cannot begin with `"` (here `integer`) does not
+    /// block the shared-prefix trie: `"abc"`/`"abd"` are disambiguated by the
+    /// combined trie and the integer branch stays reachable (a non-`"` input
+    /// diverges from the trie at sym_pos == 0). Mutation guard: emitting the
+    /// branches flat instead of one trie over-rejects `"abd"`.
+    #[test]
+    fn anyof_shared_prefix_consts_with_integer() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"integer"}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "\"abd\" must be accepted via the trie"
+        );
+        assert!(
+            accepts(&g, b"123"),
+            "the integer branch must remain reachable"
+        );
+        assert!(
+            rejects(&g, b"\"abe\""),
+            "a non-member string must be rejected"
+        );
+    }
+
+    /// Broad string LAST (issue #310 / PR #472): the broad `{"type":"string"}`
+    /// is listed AFTER the shared-prefix consts, so schema order cannot be
+    /// relied on to keep it reachable. Classifying the whole string class up
+    /// front and collapsing it to `json_string` makes position irrelevant — an
+    /// arbitrary string that diverges from the consts (`"abe"`) is still
+    /// accepted. Mutation guard: an order-sensitive fix (hoisting the const trie
+    /// whenever the broad branch is not first) over-rejects `"abe"` here.
+    #[test]
+    fn anyof_broad_string_after_consts() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"string"}]}"#);
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "broad string (listed last) must accept a string that diverges from the consts"
+        );
+        assert!(accepts(&g, b"\"zzz\""), "arbitrary string must be accepted");
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(accepts(&g, b"\"abd\""), "\"abd\" must be accepted");
+        assert!(rejects(&g, b"123"), "a non-string must still be rejected");
+    }
+
+    /// A narrower string sibling — a string `enum` rather than a broad string —
+    /// alongside shared-prefix consts (issue #310 / PR #472). With no broad
+    /// branch present, every string literal (the two consts and the two enum
+    /// members) is unioned into ONE trie, so all four diverge inside the quoted
+    /// region and stay reachable. Mutation guard: keeping the branches flat (or
+    /// hoisting only the consts) over-rejects `"abd"`; widening the class to
+    /// `json_string` would over-accept `"abg"`.
+    #[test]
+    fn anyof_narrower_string_enum_sibling() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"string","enum":["abe","abf"]}]}"#,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" must be accepted");
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "const \"abd\" must be accepted via the combined trie"
+        );
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "enum member \"abe\" must be accepted"
+        );
+        assert!(
+            accepts(&g, b"\"abf\""),
+            "enum member \"abf\" must be accepted"
+        );
+        assert!(
+            rejects(&g, b"\"abg\""),
+            "a string in no branch must be rejected (no over-accept)"
+        );
+    }
+
+    /// A non-string `enum` sibling (`[1, 2]`) must classify as a non-string
+    /// branch, not fold into the string literal trie (issue #310 / PR #472).
+    /// The consts form the trie; the numeric enum stays reachable because it
+    /// cannot begin with `"`. Mutation guard: misclassifying the numeric enum as
+    /// a string literal set drops the `1`/`2` branch; keeping the branches flat
+    /// over-rejects `"abd"`.
+    #[test]
+    fn anyof_numeric_enum_sibling() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"enum":[1,2]}]}"#);
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "\"abd\" must be accepted via the trie"
+        );
+        assert!(accepts(&g, b"1"), "numeric enum member 1 must be reachable");
+        assert!(accepts(&g, b"2"), "numeric enum member 2 must be reachable");
+        assert!(
+            rejects(&g, b"\"abe\""),
+            "a non-member string must be rejected"
+        );
+    }
+
+    /// A typed mixed `enum` sibling `{"type":"string","enum":["abe",1]}`: the
+    /// `type:"string"` makes the integer member unsatisfiable, so the branch's
+    /// language is exactly {"abe"} and `string_class_of` folds it into the
+    /// literal trie (issue #310 / PR #472, codex round-3 offered fix). The trie
+    /// then accepts both the const "abc" and the folded "abe". Mutation guard:
+    /// dropping the typed-mixed fold (classifying the enum as an "other") strands
+    /// "abe" behind the const trie and over-rejects it.
+    #[test]
+    fn anyof_typed_mixed_enum_folded() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"type":"string","enum":["abe",1]}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" must be accepted");
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "the type:string enum's string member \"abe\" must be folded and accepted"
+        );
+        assert!(
+            rejects(&g, b"\"abd\""),
+            "a string in no branch must be rejected (no over-accept)"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "the dead integer member must not widen the branch to any-string"
+        );
+        assert!(
+            rejects(&g, b"1"),
+            "the integer enum member is unsatisfiable under type:string"
+        );
+    }
+
+    /// A `{"type":"string","enum":[1,2]}` branch is unsatisfiable: an instance
+    /// must be a string AND equal a numeric enum member, so it accepts no string.
+    /// `string_class_of` must classify it as the empty literal set (a dead
+    /// branch), NOT `None` — `None` routes it through `compile_string_type`'s
+    /// `json_string` fallback and over-accepts arbitrary strings (issue #472
+    /// codex round-4 blocker 2). Mutation guard: returning `None` accepts "zzz".
+    #[test]
+    fn anyof_typed_enum_no_string_members_rejected() {
+        let g = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[1,2]}]}"#);
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "the unsatisfiable type:string + numeric-enum branch must not widen to any-string"
+        );
+    }
+
+    /// `const` and `enum` are conjunctive, so `{"type":"string","const":"x","enum":["y"]}`
+    /// accepts no value (nothing equals both "x" and "y"). `string_class_of` must
+    /// fold the const only when a present enum contains it, classifying this
+    /// conflicting branch as the empty literal set (issue #472 codex round-4
+    /// blocker 1). Mutation guard: folding the const before checking the enum
+    /// accepts "x"; folding the enum before checking the const accepts "y".
+    #[test]
+    fn anyof_const_conflicting_enum_rejected() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"type":"integer"},{"type":"string","const":"x","enum":["y"]}]}"#,
+        );
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            rejects(&g, b"\"x\""),
+            "const \"x\" conflicts with enum [\"y\"] — empty intersection, reject"
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "enum member \"y\" conflicts with const \"x\" — empty intersection, reject"
+        );
+    }
+
+    /// `{"type":"string","const":"x","enum":["x","y"]}`: the const narrows the
+    /// enum to the intersection {"x"}, so only "x" is accepted, NOT "y" (issue
+    /// #472 codex round-4). Mutation guard: ignoring the const and folding the
+    /// whole enum accepts "y".
+    #[test]
+    fn anyof_const_compatible_enum_folds_to_const() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"type":"integer"},{"type":"string","const":"x","enum":["x","y"]}]}"#,
+        );
+        assert!(accepts(&g, b"7"), "the integer branch must stay reachable");
+        assert!(
+            accepts(&g, b"\"x\""),
+            "const \"x\" is in the enum — accepted"
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "\"y\" is in the enum but excluded by const \"x\" — reject"
+        );
+    }
+
+    /// Standalone `{"type":"string","enum":[1,2]}` is unsatisfiable;
+    /// `compile_string_type` must emit the empty language, not the `json_string`
+    /// fallback (issue #472 blocker 2, standalone path). Mutation guard: the
+    /// `json_string` fallback accepts "zzz".
+    #[test]
+    fn standalone_typed_enum_no_string_members_rejects_all() {
+        let g = compile_ok(r#"{"type":"string","enum":[1,2]}"#);
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "no string satisfies type:string + enum [1,2]"
+        );
+        assert!(rejects(&g, b"1"), "the numeric member is not a string");
+    }
+
+    /// Standalone const/enum intersection through `compile_string_type`, which
+    /// `compile_schema_inner` reaches via the `enum` dispatch — without the
+    /// intersection a sibling `const` would be silently ignored (issue #472
+    /// blocker 1, standalone path). Mutation guard: dropping the const-narrowing
+    /// accepts "y" in both cases.
+    #[test]
+    fn standalone_string_const_enum_intersection() {
+        let conflict = compile_ok(r#"{"type":"string","const":"x","enum":["y"]}"#);
+        assert!(
+            rejects(&conflict, b"\"x\""),
+            "const conflicts with enum — reject \"x\""
+        );
+        assert!(
+            rejects(&conflict, b"\"y\""),
+            "const conflicts with enum — reject \"y\""
+        );
+        let compatible = compile_ok(r#"{"type":"string","const":"x","enum":["x","y"]}"#);
+        assert!(
+            accepts(&compatible, b"\"x\""),
+            "const \"x\" is in the enum — accept"
+        );
+        assert!(
+            rejects(&compatible, b"\"y\""),
+            "\"y\" excluded by const \"x\" — reject"
+        );
+    }
+
+    /// Edge cases for typed string enums: an empty `enum` is the empty language
+    /// (reject all), and a duplicate member folds to a single trie path without
+    /// error (issue #472 codex round-4 next-round focus).
+    #[test]
+    fn typed_string_enum_empty_and_duplicate_members() {
+        let empty = compile_ok(r#"{"type":"string","enum":[]}"#);
+        assert!(rejects(&empty, b"\"zzz\""), "empty enum accepts nothing");
+        let dups = compile_ok(r#"{"type":"string","enum":["dup","dup"]}"#);
+        assert!(
+            accepts(&dups, b"\"dup\""),
+            "a duplicated member still accepts once"
+        );
+        assert!(rejects(&dups, b"\"other\""), "no over-accept from dedup");
+        let in_anyof = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[]}]}"#);
+        assert!(accepts(&in_anyof, b"7"), "integer branch reachable");
+        assert!(
+            rejects(&in_anyof, b"\"zzz\""),
+            "empty typed enum contributes no string"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION (issue #473): a `$ref` to a broad-string rule listed
+    /// beside string consts has its quoted inputs shadowed by the hoisted const
+    /// trie — the no-rewind PDA commits to the trie once it consumes the opening
+    /// `"`. "zzz" is valid via `#/$defs/S` but rejected. This matches
+    /// `origin/main` exactly (verified by reverting the compiler and re-probing)
+    /// and is NOT a regression; the fix needs parallel-stack matching (#473).
+    /// This test pins the current behavior so a future engine change flips it
+    /// intentionally rather than silently.
+    #[test]
+    fn anyof_ref_to_broad_string_shadowed_known_limitation() {
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"type":"string"}},"anyOf":[{"const":"abc"},{"const":"abd"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(accepts(&g, b"\"abd\""), "const \"abd\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "KNOWN LIMITATION #473: $ref->string sibling shadowed by the const trie"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION (issue #473): a nested `anyOf` containing a broad
+    /// string classifies as an "other" sibling (string_class_of does not recurse
+    /// into nested anyOf), so its quoted inputs are shadowed by the hoisted const
+    /// trie. Matches `origin/main`; pins current behavior pending #473.
+    #[test]
+    fn anyof_nested_anyof_string_shadowed_known_limitation() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"anyOf":[{"type":"string"}]}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "KNOWN LIMITATION #473: nested-anyOf string shadowed by the const trie"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION (issue #473): an untyped `{}` sibling accepts any
+    /// JSON value, but its string inputs are shadowed by the hoisted const trie.
+    /// Matches `origin/main`; pins current behavior pending #473.
+    #[test]
+    fn anyof_untyped_sibling_shadowed_known_limitation() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "KNOWN LIMITATION #473: untyped empty-schema string inputs shadowed by the const trie"
+        );
     }
 
     /// Three-way shared prefix ["foo","food","foot"]: all three accepted.
