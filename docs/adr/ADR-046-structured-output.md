@@ -4,6 +4,10 @@
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
+## Implementation status as of 2026-06-30
+
+The grammar engine and JSON Schema compiler are implemented under `crates/inference/src/grammar/`. The compiler now has fail-closed compile-time caps for array cardinality, schema depth, object property count, trie depth, and precomputed grammar states. The current `lattice_serve` request shape does **not** expose OpenAI `response_format`; its generation config sets `grammar: None`, so serve-side structured output remains unshipped even though the grammar module exists.
+
 ## Context
 
 Agent and tool-call workflows require the model to emit syntactically valid output (JSON schema,

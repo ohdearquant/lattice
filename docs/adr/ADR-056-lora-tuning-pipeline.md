@@ -723,13 +723,8 @@ changes require a new ADR.
 - Hu et al. 2021 — "LoRA: Low-Rank Adaptation of Large Language Models" — https://arxiv.org/abs/2106.09685
 - Dettmers et al. 2023 — "QLoRA: Efficient Finetuning of Quantized LLMs" — https://arxiv.org/abs/2305.14314
 
-## Implementation status (2026-06-24)
+## Implementation status as of 2026-06-30
 
-The `LoraTrainLoop` struct and the `train/lora/` directory proposed in this ADR were never
-created. Real backward-pass LoRA training shipped via a different code path:
-`crates/tune/src/bin/train_grad_full.rs` is the training binary, and backward pass primitives
-live under `crates/tune/src/` (lora/, train/ sub-directories). The
-`crates/inference/src/backward/` module (attention_gqa.rs, gradcheck.rs, ops.rs, tape.rs)
-holds the autograd tape. Anyone extending LoRA training should start from
-`crates/tune/src/bin/train_grad_full.rs` and `crates/tune/src/lora/online.rs`, not from
-the `LoraTrainLoop` / `train/lora/` paths described in this ADR's architecture section.
+The `LoraTrainLoop` struct and the `train/lora/` directory proposed in this ADR were never created. Real backward-pass LoRA training shipped via a different code path: `crates/tune/src/bin/train_grad_full.rs` is the full training binary, and backward-pass primitives live under `crates/tune/src/` plus the autograd tape in `crates/inference/src/backward/`. A bounded governed micro-trainer also shipped as `train_micro_lora` in `crates/tune/src/lora/train.rs`; it validates rank, step count, sequence length, layer bounds, token ids, and pair shapes before training.
+
+Anyone extending LoRA training should start from `crates/tune/src/bin/train_grad_full.rs`, `crates/tune/src/lora/train.rs`, and `crates/tune/src/lora/online.rs`, not from the `LoraTrainLoop` / `train/lora/` paths described in this ADR's architecture section. The ADR design remains a proposed full-pipeline shape; shipped code is partial and path-divergent.
