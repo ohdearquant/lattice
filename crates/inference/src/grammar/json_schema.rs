@@ -1849,6 +1849,31 @@ fn guard_literal_bytes(s: &str) -> Result<(), SchemaError> {
     Ok(())
 }
 
+/// Reject any individual string anywhere in the schema whose byte length
+/// exceeds the per-literal cap before compilation begins, so no downstream
+/// const / enum-member / object-key / $defs-name / $ref path can serialize,
+/// copy, or expand an oversized literal. A single entry-point pass bounds the
+/// whole schema uniformly (issue #474).
+fn guard_schema_string_bytes(v: &Value) -> Result<(), SchemaError> {
+    match v {
+        Value::String(s) => guard_literal_bytes(s),
+        Value::Array(items) => {
+            for item in items {
+                guard_schema_string_bytes(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, val) in map {
+                guard_literal_bytes(key)?;
+                guard_schema_string_bytes(val)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Convert a concrete JSON value to a grammar alternative (sequence of terminal bytes).
 fn json_value_to_alt(v: &Value) -> Result<Alt, SchemaError> {
     let json_str = serde_json::to_string(v)
@@ -1884,6 +1909,7 @@ fn extract_ref_name(ref_str: &str) -> Result<&str, SchemaError> {
 ///
 /// This is the primary entry point used by `GrammarEngine::new`.
 pub fn compile(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
+    guard_schema_string_bytes(schema)?;
     compile_json_schema(schema)
 }
 
@@ -3472,11 +3498,17 @@ mod tests {
     /// MAX_STRING_LITERAL_BYTES is rejected before the per-member
     /// `json_value_to_alt` allocation.
     ///
-    /// Mutation pin: fires with "enum value encoded byte length". Reverting
-    /// the byte-budget guard added in `compile_enum` lets the map/collect
-    /// over `values` run to completion (only 2 members, far under the count
-    /// cap), so compile returns `Ok` instead of `Err` and the assertion below
-    /// fails.
+    /// Backstopped: the schema-wide `guard_schema_string_bytes` pass at the
+    /// top of `compile` now dominates and rejects this input before
+    /// `compile_enum`'s own byte-budget guard runs, so this test is
+    /// defense-in-depth for `compile_enum`'s guard, not independently
+    /// mutation-sensitive to it — see `schema_defs_name_byte_capped` for the
+    /// guard pinned to the entry-point pass.
+    ///
+    /// Mutation pin: fires with "byte length" (a substring common to both the
+    /// entry-point guard's message and `compile_enum`'s own "enum value
+    /// encoded byte length" message, so this assertion holds regardless of
+    /// which guard catches it).
     #[test]
     fn mixed_enum_byte_budget_capped() {
         // One member well over the 1 MiB byte budget by itself, plus a
@@ -3487,8 +3519,8 @@ mod tests {
         let v: Value = serde_json::from_str(&schema_json).unwrap();
         let err = compile(&v).expect_err("mixed enum over the byte budget must be rejected");
         assert!(
-            err.0.contains("enum value encoded byte length"),
-            "expected the enum byte-budget cap error, got: {}",
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
             err.0
         );
     }
@@ -3622,6 +3654,41 @@ mod tests {
         let schema_json = format!("{{\"anyOf\":[{{\"enum\":[\"{huge}\"]}}]}}");
         let v: Value = serde_json::from_str(&schema_json).unwrap();
         let err = compile(&v).expect_err("an anyOf enum member over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #474 (entry-point convergent fix) — validate every schema string
+    // once at `compile`, before any per-site guard runs. Closes sibling sites
+    // (e.g. a `$defs` name) that have no per-site byte guard of their own.
+    // -----------------------------------------------------------------------
+
+    /// `$defs` name byte cap (issue #474): a `$defs` map whose KEY (the
+    /// definition name itself, not a `properties` key) exceeds
+    /// MAX_STRING_LITERAL_BYTES is rejected by the schema-wide
+    /// `guard_schema_string_bytes` pass at the top of `compile`. Unlike a
+    /// `properties` key (`object_key_byte_capped`), a `$defs` name has no
+    /// per-site guard: `CompileCtx::new` clones it into the `defs` map
+    /// unchecked, and nothing in this schema references it via `$ref`, so no
+    /// downstream lookup ever sees it either.
+    ///
+    /// Mutation pin: fires with "byte length". Reverting the
+    /// `guard_schema_string_bytes` call in `compile` removes the only guard
+    /// that ever inspects this key, so compile returns `Ok` instead of `Err`
+    /// and the assertion below fails.
+    #[test]
+    fn schema_defs_name_byte_capped() {
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let mut defs = serde_json::Map::new();
+        defs.insert(huge, serde_json::json!({"type": "integer"}));
+        let mut root = serde_json::Map::new();
+        root.insert("$defs".to_string(), Value::Object(defs));
+        let v = Value::Object(root);
+        let err = compile(&v).expect_err("a $defs name over the byte cap must be rejected");
         assert!(
             err.0.contains("byte length"),
             "expected the byte-length cap error, got: {}",
