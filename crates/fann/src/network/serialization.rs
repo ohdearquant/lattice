@@ -118,12 +118,16 @@ impl Network {
 
         // Helper to read bytes
         let read_bytes = |pos: &mut usize, n: usize| -> FannResult<&[u8]> {
-            if *pos + n > bytes.len() {
+            // Compute the remaining budget by subtraction, never `*pos + n`, so a
+            // hostile byte count near usize::MAX cannot overflow the bounds check
+            // itself. `*pos` is always <= bytes.len() (every read advances pos only
+            // after validating), so the subtraction is exact and `*pos + n` below
+            // is safe once `n <= available` is established.
+            let available = bytes.len().saturating_sub(*pos);
+            if n > available {
                 return Err(FannError::InvalidBuilder(format!(
-                    "Truncated data at offset {}: expected {} bytes, {} available",
+                    "Truncated data at offset {}: expected {n} bytes, {available} available",
                     *pos,
-                    n,
-                    bytes.len() - *pos
                 )));
             }
             let slice = &bytes[*pos..*pos + n];
@@ -236,8 +240,14 @@ impl Network {
                 })
                 .collect();
 
-            // Read biases
-            let bias_bytes = read_bytes(&mut pos, num_outputs * 4)?;
+            // Read biases; checked arithmetic for the same parser-boundary
+            // reason as the weight byte count above.
+            let bias_byte_count = num_outputs.checked_mul(4).ok_or_else(|| {
+                FannError::InvalidBuilder(format!(
+                    "layer {layer_idx}: bias byte count overflows ({num_outputs} * 4)"
+                ))
+            })?;
+            let bias_bytes = read_bytes(&mut pos, bias_byte_count)?;
             let biases: Vec<f32> = bias_bytes
                 .chunks_exact(4)
                 .map(|chunk| {
@@ -439,6 +449,35 @@ mod tests {
         assert!(
             matches!(result, Err(FannError::InvalidBuilder(_))),
             "weight byte count overflow must return InvalidBuilder, got {result:?}"
+        );
+    }
+
+    /// A header whose weight byte count is a valid usize *near* usize::MAX (so
+    /// checked_mul(4) returns Some, not None) must still return Err, not panic:
+    /// read_bytes must reject it without computing `*pos + n`.
+    ///
+    /// num_inputs = 2^31-1, num_outputs = 2^31+1 → weight_count = 2^62-1
+    /// (checked_mul succeeds); weight_byte_count = 2^64-4 = usize::MAX-3
+    /// (checked_mul(4) succeeds). read_bytes(pos=21, usize::MAX-3) overflows
+    /// `*pos + n` in the unguarded form; the checked-available form returns Err.
+    /// Companion to from_bytes_weight_byte_count_overflow_returns_err, which
+    /// covers checked_mul(4) == None.
+    ///
+    /// Mutation that defeats this test: revert read_bytes to `if *pos + n > bytes.len()`.
+    #[test]
+    fn from_bytes_read_bytes_pos_plus_n_overflow_returns_err() {
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
+        bytes.extend_from_slice(&2_147_483_647_u32.to_le_bytes()); // num_inputs = 2^31-1
+        bytes.extend_from_slice(&2_147_483_649_u32.to_le_bytes()); // num_outputs = 2^31+1
+        bytes.push(0); // activation=Linear
+        // 21 bytes; weight_byte_count = usize::MAX-3 fits, so read_bytes is asked
+        // for usize::MAX-3 bytes at pos=21 — `*pos + n` would overflow unguarded.
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "near-usize::MAX weight byte count must return InvalidBuilder, got {result:?}"
         );
     }
 }

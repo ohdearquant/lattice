@@ -145,7 +145,8 @@ pub struct RouterUpdateConfig {
     /// Fraction of the replay buffer to include in each refit epoch.
     ///
     /// `0.0` disables replay; `1.0` includes all buffered events.
-    /// Clamped to `[0.0, 1.0]` at use time.
+    /// Must be finite and within `[0.0, 1.0]`; `update_router` rejects
+    /// values outside that range with `TuneError::Validation`.
     pub replay_mix_fraction: f32,
 }
 
