@@ -31,7 +31,7 @@
 
 use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
 /// materialize.
@@ -250,27 +250,48 @@ impl<'a> CompileCtx<'a> {
                 all_alts.extend(sub_alts);
             }
 
-            // Partition: separate fully-quoted string-literal alternatives
-            // (every symbol is Terminal, first byte is `"`, last byte is `"`)
-            // from all other alternatives.  Two or more such alternatives may
-            // share a byte prefix and be over-rejected by the no-rewind PDA.
-            // Build a trie over them so every branch diverges at sym_pos == 0.
+            // A fully-quoted string-literal alternative is one whose every
+            // symbol is a Terminal, opening and closing with `"` (e.g. a string
+            // `const`). Two or more such alternatives may share a byte prefix
+            // and be over-rejected by the no-rewind PDA, so we factor them into
+            // a trie where every branch diverges at sym_pos == 0.
+            //
+            // The trie alternative begins with `"`, and is only safe to hoist
+            // ahead of the others when NONE of them can also begin with `"`:
+            // the no-rewind PDA cannot fall through to a later sibling once the
+            // trie consumes the opening quote. A broad `{"type":"string"}`
+            // branch compiles to `[NonTerminal(json_string)]`, whose FIRST set
+            // contains `"`, so in its presence we keep the original flat order
+            // (the broad branch already subsumes the string consts).
             //
             // Scope: quoted string literals only.  Non-string literal alts
-            // (numbers, booleans, null) have distinct first bytes in practice
-            // and are left flat.  Numeric enums with a shared prefix (e.g.
-            // `const 1` / `const 10`) are an unquoted narrower residual that
-            // requires the delimiter from the surrounding grammar context to
-            // disambiguate and cannot be fixed locally by a trie.
-            let (string_lit_alts, other_alts): (Vec<Alt>, Vec<Alt>) =
-                all_alts.into_iter().partition(|alt| {
-                    alt.len() >= 2
-                        && matches!(alt.first(), Some(Symbol::Terminal(b'"')))
-                        && matches!(alt.last(), Some(Symbol::Terminal(b'"')))
-                        && alt.iter().all(|sym| matches!(sym, Symbol::Terminal(_)))
-                });
+            // (numbers, booleans, null) have distinct first bytes and are left
+            // flat.  Numeric enums with a shared prefix (e.g. `const 1` /
+            // `const 10`) are an unquoted narrower residual that requires the
+            // delimiter from the surrounding grammar context to disambiguate and
+            // cannot be fixed locally by a trie.
+            let is_string_lit = |alt: &Alt| {
+                alt.len() >= 2
+                    && matches!(alt.first(), Some(Symbol::Terminal(b'"')))
+                    && matches!(alt.last(), Some(Symbol::Terminal(b'"')))
+                    && alt.iter().all(|sym| matches!(sym, Symbol::Terminal(_)))
+            };
+            let lit_count = all_alts.iter().filter(|alt| is_string_lit(alt)).count();
+            let mut memo: HashMap<usize, bool> = HashMap::new();
+            let mut on_stack: HashSet<usize> = HashSet::new();
+            let other_can_start_with_quote =
+                all_alts
+                    .iter()
+                    .filter(|alt| !is_string_lit(alt))
+                    .any(|alt| {
+                        alt.first().is_some_and(|first| {
+                            first_byte_can_be_quote(&self.builder, first, &mut memo, &mut on_stack)
+                        })
+                    });
 
-            if string_lit_alts.len() >= 2 {
+            if lit_count >= 2 && !other_can_start_with_quote {
+                let (string_lit_alts, other_alts): (Vec<Alt>, Vec<Alt>) =
+                    all_alts.into_iter().partition(|alt| is_string_lit(alt));
                 // Full quoted JSON strings are inherently prefix-free once their
                 // closing `"` is included — no extra terminator needed here.
                 let seqs: Vec<Vec<u8>> = string_lit_alts
@@ -293,10 +314,10 @@ impl<'a> CompileCtx<'a> {
                 return Ok(combined);
             }
 
-            // Fewer than 2 string-literal alts: flatten as before (no trie needed).
-            let mut combined = string_lit_alts;
-            combined.extend(other_alts);
-            return Ok(combined);
+            // Not trie-eligible (fewer than two shared string literals, or a
+            // sibling can also begin with `"`): keep the alternatives in their
+            // original schema order so a broad string branch stays reachable.
+            return Ok(all_alts);
         }
 
         // Dispatch on `type`
@@ -1456,6 +1477,55 @@ fn build_trie_node(
 /// the surrounding context resolves them.  Until then, `enum [1, 10]` remains
 /// a narrower known limitation: `10` is over-rejected by the no-rewind PDA
 /// (the same safe direction as before).
+/// Whether any value matched by `sym` can begin with a `"` byte (its FIRST set
+/// contains the opening quote of a JSON string).
+///
+/// Used by the `anyOf`/`oneOf` handler to decide whether a shared-prefix
+/// string-literal trie can be safely hoisted ahead of the other alternatives.
+/// The no-rewind PDA commits to an alternative once it consumes a byte, so a
+/// trie placed before a sibling that also begins with `"` (e.g. a broad
+/// `{"type":"string"}` branch, which compiles to `[NonTerminal(json_string)]`)
+/// would make that sibling unreachable. When this returns true for any such
+/// sibling, the caller keeps the alternatives flat in their original order.
+///
+/// Sound in the safe direction: an unknown rule or a reference cycle yields
+/// `true` (suppress the trie), which can only cost the optimization, never
+/// reintroduce over-rejection. Memoized per rule id for linear time over the
+/// rule graph (the compiler is reachable from untrusted schemas).
+fn first_byte_can_be_quote(
+    builder: &GrammarBuilder,
+    sym: &Symbol,
+    memo: &mut HashMap<usize, bool>,
+    on_stack: &mut HashSet<usize>,
+) -> bool {
+    match sym {
+        Symbol::Terminal(b) => *b == b'"',
+        // `AnyByte` (GBNF `.`) matches any byte, `"` included.
+        Symbol::AnyByte => true,
+        Symbol::NonTerminal(id) => {
+            if let Some(&cached) = memo.get(id) {
+                return cached;
+            }
+            if !on_stack.insert(*id) {
+                // Active cycle: assume reachable (conservative) without caching,
+                // since the exact value is still being computed up the stack.
+                return true;
+            }
+            let result = match builder.rule_alts(*id) {
+                Some(alts) => alts.iter().any(|alt| {
+                    alt.first().is_some_and(|first| {
+                        first_byte_can_be_quote(builder, first, memo, on_stack)
+                    })
+                }),
+                None => true,
+            };
+            on_stack.remove(id);
+            memo.insert(*id, result);
+            result
+        }
+    }
+}
+
 fn compile_enum(values: &[Value]) -> Result<Vec<Alt>, SchemaError> {
     // All-string enums are handled upstream via compile_string_type, which
     // trie-compiles the alternatives to avoid PDA ambiguity.  This path is
@@ -1747,6 +1817,48 @@ mod tests {
         assert!(rejects(&g, b"\"abe\""), "\"abe\" must be rejected");
         assert!(rejects(&g, b"\"ab\""), "\"ab\" must be rejected");
         assert!(rejects(&g, b"\"abcd\""), "\"abcd\" must be rejected");
+    }
+
+    /// Regression: a broad `{"type":"string"}` branch alongside shared-prefix
+    /// string consts must stay reachable. The broad branch compiles to
+    /// `[NonTerminal(json_string)]`, whose FIRST set contains `"`; hoisting a
+    /// const trie ahead of it made the no-rewind PDA consume the opening quote
+    /// and then fail to fall through, wrongly rejecting an arbitrary string such
+    /// as `"zzz"`. Mutation guard: removing the FIRST-set guard reintroduces the
+    /// over-rejection and fails this test.
+    #[test]
+    fn anyof_broad_string_with_shared_prefix_consts() {
+        let g = compile_ok(r#"{"anyOf":[{"type":"string"},{"const":"abc"},{"const":"abd"}]}"#);
+        assert!(
+            accepts(&g, b"\"zzz\""),
+            "broad string branch must accept an arbitrary string"
+        );
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(accepts(&g, b"\"abd\""), "\"abd\" must be accepted");
+        assert!(rejects(&g, b"123"), "a non-string must still be rejected");
+    }
+
+    /// A non-string sibling that cannot begin with `"` (here `integer`) does not
+    /// block the shared-prefix trie: `"abc"`/`"abd"` are disambiguated by the
+    /// trie and the integer branch remains reachable. Mutation guard against
+    /// over-correcting the FIRST-set guard to disable the trie whenever any
+    /// non-literal sibling is present — the flat fallback over-rejects `"abd"`.
+    #[test]
+    fn anyof_shared_prefix_consts_with_integer() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"const":"abd"},{"type":"integer"}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "\"abc\" must be accepted");
+        assert!(
+            accepts(&g, b"\"abd\""),
+            "\"abd\" must be accepted via the trie"
+        );
+        assert!(
+            accepts(&g, b"123"),
+            "the integer branch must remain reachable"
+        );
+        assert!(
+            rejects(&g, b"\"abe\""),
+            "a non-member string must be rejected"
+        );
     }
 
     /// Three-way shared prefix ["foo","food","foot"]: all three accepted.

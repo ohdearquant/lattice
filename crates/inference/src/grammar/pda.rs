@@ -612,6 +612,16 @@ impl GrammarBuilder {
         self.name_to_id.get(name).copied()
     }
 
+    /// Read-only view of a reserved rule's alternatives.
+    ///
+    /// Used by the JSON-schema compiler's `anyOf`/`oneOf` FIRST-set guard to
+    /// decide whether a shared-prefix string-literal trie can be hoisted ahead
+    /// of the other alternatives. Pure introspection: it neither mutates the
+    /// builder nor participates in PDA simulation.
+    pub fn rule_alts(&self, id: usize) -> Option<&[Alt]> {
+        self.rules.get(id).map(|rule| rule.alts.as_slice())
+    }
+
     /// Consume the builder and produce a `CompiledGrammar`.
     ///
     /// Panics if the root rule (index 0, name "root") has no alternatives.
