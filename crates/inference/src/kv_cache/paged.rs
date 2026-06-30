@@ -179,12 +179,19 @@ impl PagePool {
         // that fits usize can still overflow the byte layout. Guard it here so
         // the fallible path fails closed instead of panicking ("capacity
         // overflow") inside `vec!`.
-        len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        let byte_len = len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
             InferenceError::InvalidInput(format!(
                 "page pool byte size ({len} * {}) overflows usize",
                 std::mem::size_of::<f32>()
             ))
         })?;
+        // Rust Vec panics when the byte allocation exceeds `isize::MAX`; a usize
+        // product that fits can still cross this tighter bound.
+        if byte_len > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "page pool byte size ({byte_len}) exceeds isize::MAX — allocation would panic"
+            )));
+        }
         let data = vec![0.0f32; len];
         let free_list: Vec<usize> = (0..max_pages).rev().collect();
         Ok(Self {
@@ -382,6 +389,47 @@ impl PagedKVCache {
         let fpp = config.try_floats_per_page()?;
         let _total_bytes = config.try_total_bytes()?;
         let pool = PagePool::try_new(config.max_pages, fpp)?;
+
+        // When a prefix cache is present, validate that its page geometry cannot
+        // produce a panicking allocation on the hot promote/restore path.
+        if let Some(ref cache_arc) = prefix_cache {
+            let guard = cache_arc
+                .lock()
+                .map_err(|_| InferenceError::PrefixCache("prefix cache lock poisoned".into()))?;
+            let pc = guard.config();
+            let kv_dim = config
+                .num_kv_heads
+                .checked_mul(config.head_dim)
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "num_kv_heads ({}) * head_dim ({}) overflows usize",
+                        config.num_kv_heads, config.head_dim
+                    ))
+                })?;
+            let floats = config
+                .num_layers
+                .checked_mul(2)
+                .and_then(|n| n.checked_mul(pc.prefix_page_size))
+                .and_then(|n| n.checked_mul(kv_dim))
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "prefix page float count (num_layers={} * 2 * prefix_page_size={} * kv_dim={kv_dim}) overflows usize",
+                        config.num_layers, pc.prefix_page_size
+                    ))
+                })?;
+            // Catch the isize::MAX bound that Rust Vec enforces at allocation.
+            let prefix_page_bytes = floats
+                .checked_mul(std::mem::size_of::<f32>())
+                .filter(|&b| b <= isize::MAX as usize)
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "prefix page byte size ({floats} * {}) exceeds isize::MAX",
+                        std::mem::size_of::<f32>()
+                    ))
+                })?;
+            let _ = prefix_page_bytes;
+        }
+
         let table = PageTable::new(config.page_size);
         Ok(Self {
             pool,
@@ -575,7 +623,30 @@ impl PagedKVCache {
         let prefix_len = self.seq_len();
         let prefix_page_count = PrefixEntry::pages_for_tokens(prefix_len, prefix_page_size);
         let kv_dim = self.config.kv_dim();
-        let floats_per_prefix_page = self.config.num_layers * 2 * prefix_page_size * kv_dim;
+        let floats_per_prefix_page = self
+            .config
+            .num_layers
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(prefix_page_size))
+            .and_then(|n| n.checked_mul(kv_dim))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "prefix page float count (num_layers={} * 2 * prefix_page_size={prefix_page_size} * kv_dim={kv_dim}) overflows usize",
+                    self.config.num_layers
+                ))
+            })?;
+        // Guard the byte size; a usize-valid count can still exceed isize::MAX
+        // and panic inside `vec!`.
+        let prefix_page_bytes = floats_per_prefix_page
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|&b| b <= isize::MAX as usize)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "prefix page byte size ({floats_per_prefix_page} * {}) exceeds isize::MAX",
+                    std::mem::size_of::<f32>()
+                ))
+            })?;
+        let _ = prefix_page_bytes; // size validated; the vec! uses float count below
         let mut pages = Vec::with_capacity(prefix_page_count);
 
         for prefix_page_idx in 0..prefix_page_count {
@@ -1378,5 +1449,51 @@ mod tests {
         let cache = PagedKVCache::try_new(config).expect("valid config must succeed");
         assert_eq!(cache.seq_len(), 0);
         assert_eq!(cache.free_pages(), 2);
+    }
+
+    // --- isize::MAX boundary tests (Fix 1 / Fix 3) ---
+
+    #[test]
+    fn page_pool_try_new_isize_max_byte_bound_returns_invalid_input() {
+        // Element count fits usize (1 * (isize::MAX/4 + 1)), but the byte size
+        // (floats * 4) exceeds isize::MAX. The guard added in Fix 1 must catch
+        // this; without it the vec! macro panics with "capacity overflow".
+        let floats_per_page = (isize::MAX as usize / std::mem::size_of::<f32>()) + 1;
+        let r = PagePool::try_new(1, floats_per_page);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput when byte size exceeds isize::MAX, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn try_with_prefix_cache_oversized_prefix_geometry_returns_invalid_input() {
+        // Construct a prefix cache whose prefix_page_size produces a per-page
+        // float count such that floats * 4 > isize::MAX. The Fix 3 construction
+        // guard must catch this before any allocation is attempted.
+        let kv_dim = 1usize; // num_kv_heads=1, head_dim=1 → kv_dim=1
+        // num_layers=1, 2, prefix_page_size=X, kv_dim=1 → floats = 2*X
+        // We want 2*X > isize::MAX/4, so X > isize::MAX/8.
+        let bad_prefix_page_size = (isize::MAX as usize / (2 * std::mem::size_of::<f32>())) + 1;
+        let prefix_cache = Arc::new(Mutex::new(PrefixPageCache::new(PrefixPageCacheConfig {
+            capacity: 1,
+            prefix_page_size: bad_prefix_page_size,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: kv_dim,
+        })));
+        let config = PagedKVCacheConfig {
+            page_size: 4,
+            max_pages: 1,
+            num_layers: 1,
+            num_kv_heads: 1,
+            head_dim: kv_dim,
+            eviction: EvictionPolicy::None,
+        };
+        let r = PagedKVCache::try_with_prefix_cache(config, Some(prefix_cache));
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput on oversized prefix geometry, got {r:?}"
+        );
     }
 }

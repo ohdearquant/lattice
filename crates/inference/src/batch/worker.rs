@@ -79,6 +79,56 @@ impl GdnStatePool {
         }
     }
 
+    /// Fallible constructor — returns `InvalidInput` on overflow rather than
+    /// panicking or silently allocating a wrong-sized pool.
+    pub fn try_new(
+        capacity: usize,
+        s_floats_per_slot: usize,
+        conv_floats_per_slot: usize,
+    ) -> Result<Self, InferenceError> {
+        // Guard each per-slot allocation and the free_slots Vec independently;
+        // they are separate allocations and each must not exceed isize::MAX bytes.
+        let s_bytes = s_floats_per_slot
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "s_floats_per_slot ({s_floats_per_slot}) * size_of::<f32>() overflows usize"
+                ))
+            })?;
+        // Rust Vec panics when the byte allocation exceeds `isize::MAX`.
+        if s_bytes > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "s_floats_per_slot byte size ({s_bytes}) exceeds isize::MAX — allocation would panic"
+            )));
+        }
+        let conv_bytes = conv_floats_per_slot
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "conv_floats_per_slot ({conv_floats_per_slot}) * size_of::<f32>() overflows usize"
+                ))
+            })?;
+        if conv_bytes > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "conv_floats_per_slot byte size ({conv_bytes}) exceeds isize::MAX — allocation would panic"
+            )));
+        }
+        // `free_slots` is a `VecDeque<usize>` of length `capacity`.
+        let slots_bytes = capacity
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "capacity ({capacity}) * size_of::<usize>() overflows usize"
+                ))
+            })?;
+        if slots_bytes > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "capacity ({capacity}) slot-index allocation ({slots_bytes} bytes) exceeds isize::MAX"
+            )));
+        }
+        Ok(Self::new(capacity, s_floats_per_slot, conv_floats_per_slot))
+    }
+
     /// Allocate a slot for a sequence. Returns `None` when the pool is full.
     pub fn alloc(&mut self, seq_id: SeqId) -> Option<usize> {
         let slot = self.free_slots.pop_front()?;
@@ -258,11 +308,11 @@ impl BatchWorker {
     ) -> Result<Self, InferenceError> {
         let floats_per_page = kv_pool_config.try_floats_per_page_pub()?;
         let kv_pool = PagePool::try_new(kv_pool_config.max_pages, floats_per_page)?;
-        let gdn_pool = GdnStatePool::new(
+        let gdn_pool = GdnStatePool::try_new(
             config.max_batch_size,
             s_floats_per_slot,
             conv_floats_per_slot,
-        );
+        )?;
         let scheduler = FifoScheduler::new(config.clone());
         Ok(Self {
             config,
@@ -909,6 +959,21 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput on worker PagePool capacity overflow"
+        );
+    }
+
+    // --- GdnStatePool isize::MAX boundary test (Fix 2) ---
+
+    #[test]
+    fn gdn_state_pool_try_new_isize_max_byte_bound_returns_invalid_input() {
+        // s_floats_per_slot such that s_floats * 4 > isize::MAX; element count
+        // itself fits usize. The GdnStatePool::try_new guard must catch this
+        // before any Vec is allocated; without it vec![0.0f32; s_floats] panics.
+        let s_floats = (isize::MAX as usize / std::mem::size_of::<f32>()) + 1;
+        let r = GdnStatePool::try_new(1, s_floats, 1);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput when s_floats byte size exceeds isize::MAX, got {r:?}"
         );
     }
 }
