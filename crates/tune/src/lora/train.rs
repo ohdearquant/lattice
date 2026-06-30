@@ -312,7 +312,9 @@ pub fn train_micro_lora(
             .capture_attn_io(&pair.tokens, first_layer)
             .map_err(|e| TuneError::Validation(e.to_string()))?;
         let seq_len = pair.tokens.len();
-        let (cos, sin) = model.rope_cos_sin_tables(seq_len);
+        let (cos, sin) = model
+            .rope_cos_sin_tables(seq_len)
+            .map_err(|e| TuneError::Validation(e.to_string()))?;
         caches.push(SeqCtx {
             h_in,
             cos,
