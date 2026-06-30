@@ -37,7 +37,6 @@ clap = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
-futures = { workspace = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 sha2 = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
