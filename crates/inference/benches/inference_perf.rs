@@ -280,7 +280,8 @@ fn paged_config(seq_capacity: usize, num_layers: usize) -> PagedKVCacheConfig {
 fn prefilled_cache_1layer(seq_len: usize) -> PagedKVCache {
     let k_tok = rand_f32_vec(KV_DIM, 0xBBBB_0001);
     let v_tok = rand_f32_vec(KV_DIM, 0xBBBB_0002);
-    let mut cache = PagedKVCache::new(paged_config(seq_len, 1));
+    let mut cache = PagedKVCache::try_new(paged_config(seq_len, 1))
+        .expect("valid paged bench config must succeed");
     for _ in 0..seq_len {
         cache.append_kv_layer(0, &k_tok, &v_tok);
         cache.advance();
