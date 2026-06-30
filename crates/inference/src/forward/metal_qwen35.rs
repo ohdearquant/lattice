@@ -9632,6 +9632,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
             }
 
+            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+            // so we never emit a token the caller did not ask for. Mirrors the CPU
+            // generate() guard (model::qwen35::generation) and generate_streaming below.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                };
+            }
+
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len) and panic the
             // caller thread. Return a clean empty completion instead. Mirrors the
@@ -13533,6 +13547,21 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
             }
 
+            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+            // so we never emit a token the caller did not ask for, and on_token is never
+            // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
+            // and the generate() guard above.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                };
+            }
+
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len), panicking and
             // killing this GPU worker thread — a persistent DoS for every later
@@ -13779,6 +13808,12 @@ kernel void gdn_chunk_norm_silu_c32(
             if !stopped_by_caller {
                 let tail = detok.finish();
                 if !tail.is_empty() {
+                    // This flush emits the residual incomplete-UTF-8 bytes of the
+                    // already-generated final token, not a new generation step —
+                    // generation has already terminated for the stop_reason decided
+                    // above. A late cancel here (return value intentionally unused)
+                    // does not change why generation stopped, so treating it as
+                    // Interrupt would misattribute the stop cause to this flush.
                     on_token(&tail, last_pushed_id);
                 }
             }
@@ -19099,6 +19134,120 @@ kernel void decode_attention_reference(
                 Some(StopReason::Interrupt),
                 "callback returning false must report Interrupt, got {:?}",
                 out.stop_reason
+            );
+        }
+
+        /// `generate`'s `max_new_tokens == 0` guard must return before the prefill
+        /// token is ever pushed into the output, matching the CPU `generate()`
+        /// contract (model::qwen35::generation): zero tokens, `StopReason::Length`.
+        ///
+        /// Mutation sensitivity: without the guard, `generate` samples the prefill
+        /// token from `prefill_logits` and pushes it into `generated_ids` before the
+        /// (empty, since `1..0` has no elements) decode loop runs, so
+        /// `generated_tokens` would be 1 instead of 0. `eos_token_id` is pushed out
+        /// of the reachable vocab range so this holds regardless of which token
+        /// greedy sampling picks at prefill.
+        #[test]
+        fn metal_generate_zero_budget_reports_length() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let out = state.generate("a", &tokenizer, &gen_cfg);
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "max_new_tokens == 0 must report Length, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "max_new_tokens == 0 must produce no tokens, got {}",
+                out.generated_tokens
+            );
+        }
+
+        /// `generate_streaming`'s `max_new_tokens == 0` guard must return before the
+        /// prefill token is sampled, pushed, or streamed, matching the CPU
+        /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
+        /// `StopReason::Length`, and `on_token` never invoked.
+        ///
+        /// Mutation sensitivity: without the guard, `generate_streaming` samples the
+        /// prefill token, pushes it into `generated_ids`, and feeds its delta to
+        /// `on_token` before the (empty, since `decode_cap(None, 0) == 0` makes
+        /// `1..0` have no elements) decode loop runs, so `generated_tokens` would be
+        /// 1 and the callback would fire at least once instead of staying silent.
+        #[test]
+        fn metal_generate_streaming_zero_budget_reports_length() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut calls = 0u32;
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                calls += 1;
+                true
+            });
+
+            assert_eq!(
+                calls, 0,
+                "max_new_tokens == 0 must never invoke on_token, got {calls} call(s)"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "max_new_tokens == 0 must report Length, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "max_new_tokens == 0 must produce no tokens, got {}",
+                out.generated_tokens
             );
         }
 
