@@ -217,6 +217,39 @@ fn compute_max_seq(prompt_len: usize, max_new_tokens: usize) -> Result<usize, In
     })
 }
 
+/// Reject a request whose prompt plus generation would index the RoPE table past
+/// its precomputed capacity, turning a latent release panic into a clean
+/// `InvalidInput` (issue #467).
+///
+/// `RopeTable::apply` (rope.rs) indexes its precomputed cos/sin rows unchecked
+/// (only a `debug_assert`), so applying RoPE at any position `>= max_context` is
+/// an out-of-bounds slice access — a bare panic in release builds, not a
+/// caller-visible error. Prefill uses positions `0..prompt_len` and the decode
+/// loop reaches at most `prompt_len + max_new_tokens - 2`, so rejecting when
+/// `prompt_len + max_new_tokens > max_context` keeps every applied position
+/// strictly inside the table. The bound is conservative by one position (it also
+/// rejects the exact-fit edge request) and mirrors the Qwen3.5 context preflight
+/// in `model/qwen35/generation.rs`.
+///
+/// Independent of the KV/alloc guards ([`compute_max_seq`],
+/// [`check_alloc_capacity`]), which size the cache rather than bound the RoPE
+/// position. `saturating_add` avoids a `usize` wrap on a pathological
+/// `max_new_tokens`; the wrapped-but-still-huge case is additionally caught by
+/// [`compute_max_seq`] below.
+fn check_context_window(
+    prompt_len: usize,
+    max_new_tokens: usize,
+    max_context: usize,
+) -> Result<(), InferenceError> {
+    if prompt_len.saturating_add(max_new_tokens) > max_context {
+        return Err(InferenceError::InvalidInput(format!(
+            "prompt ({prompt_len} tokens) + max_new_tokens ({max_new_tokens}) exceeds \
+             the model context window ({max_context})"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that the KV cache and per-token scratch sized to `effective_cap` will
 /// not overflow `usize` when their element counts are computed.
 ///
@@ -382,6 +415,15 @@ pub fn generate(
             stopped_by_eos: false,
         });
     }
+
+    // Context preflight: reject before any allocation if the request would drive
+    // RoPE past its precomputed table. The KV/alloc guards below size the cache,
+    // not the position index, so this is a distinct bound (see check_context_window).
+    check_context_window(
+        prompt_len,
+        config.max_new_tokens,
+        model.rope().max_positions(),
+    )?;
 
     // 2. Initialize KV cache and scratch (allocate once per request)
     let max_seq = compute_max_seq(prompt_len, config.max_new_tokens)?;
@@ -1238,6 +1280,47 @@ mod tests {
         assert!(matches!(err, InferenceError::InvalidInput(_)));
         let err = compute_max_seq(usize::MAX, 1).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    /// `check_context_window` must reject a request that would drive RoPE past the
+    /// precomputed table — the public `generate` entry point would otherwise panic
+    /// in release on the unchecked cos/sin index inside `RopeTable::apply`
+    /// (issue #467). The message must contain "context window" (the shared wording
+    /// of the Qwen3.5 / NEON / Q8 context preflights) so the abuse-path family stays
+    /// greppable.
+    ///
+    /// Mutation check: deleting the guard returns `Ok(())`, failing `expect_err`;
+    /// reverting `saturating_add` to `+` wraps `100 + usize::MAX` to `99 <= 4096`
+    /// (release) or panics on overflow (debug), either way failing the test.
+    #[test]
+    fn test_check_context_window_over_capacity_is_error_not_panic() {
+        let err = check_context_window(100, usize::MAX, 4096)
+            .expect_err("over-capacity request must be rejected, not admitted to a panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window"),
+            "error should mention context window, got: {msg}"
+        );
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    /// The guard is exact at the capacity boundary: a request summing to exactly
+    /// `max_context` is accepted (the largest request the conservative bound
+    /// admits), one token past it is rejected.
+    ///
+    /// Mutation check: `>` → `>=` rejects the exact-fit request and fails the first
+    /// assertion; `>` → `<` (or removing the guard) admits the over-capacity request
+    /// and fails the second.
+    #[test]
+    fn test_check_context_window_boundary() {
+        assert!(
+            check_context_window(4000, 96, 4096).is_ok(),
+            "prompt+max_new == max_context must be accepted"
+        );
+        assert!(
+            check_context_window(4000, 97, 4096).is_err(),
+            "prompt+max_new == max_context + 1 must be rejected"
+        );
     }
 
     #[test]
