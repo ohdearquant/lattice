@@ -1,3 +1,4 @@
+//! Backward primitives for cross entropy, linear VJP, LoRA VJP, RMSNorm backward, RoPE backward, and SwiGLU backward.
 // Backward pass primitives for CPU f32 training.
 // Each function computes a VJP (vector-Jacobian product) given the upstream
 // gradient and cached activations from the forward pass.

@@ -1,3 +1,4 @@
+//! Forward-cache structs and helper forwards for RMSNorm and SwiGLU.
 // Forward pass that caches all activations needed for the backward pass.
 // The scope for this milestone: only layer-23 (the last GQA layer) is trained.
 // Layers 0..23 are a frozen prefix — we run them forward and save the residual

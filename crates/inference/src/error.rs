@@ -1,3 +1,4 @@
+//! Inference error type, display/error implementations, and I/O error conversion.
 use std::fmt::{Display, Formatter};
 
 /// **Stable**: primary error type consumed by `lattice-embed`; adding new variants

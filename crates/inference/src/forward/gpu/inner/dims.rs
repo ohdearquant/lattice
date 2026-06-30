@@ -1,3 +1,4 @@
+//! GPU forward dimensions, configuration validation, and runtime feasibility validation.
 use super::api::checked_mul;
 use super::api::{GpuForwardError, GpuRuntimeConfig, Qwen3Config, Result};
 use super::params::ELEM_WG;

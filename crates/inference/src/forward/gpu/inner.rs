@@ -1,3 +1,4 @@
+//! Inner WGPU forward module index and API-type re-exports.
 mod api;
 mod bind_groups;
 mod buffers;

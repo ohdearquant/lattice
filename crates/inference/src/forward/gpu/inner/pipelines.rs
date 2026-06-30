@@ -1,3 +1,4 @@
+//! WGPU bind-group-layout and compute-pipeline creation helpers.
 use std::{borrow::Cow, num::NonZeroU64};
 
 use super::params::PARAM_SLOT_BYTES;

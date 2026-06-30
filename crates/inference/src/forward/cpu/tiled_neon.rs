@@ -1,3 +1,4 @@
+//! Unsafe NEON tiled transposed-B matmul implementation.
 // ---------------------------------------------------------------------------
 // NEON tiled matmul_bt — cache-blocked with 4×8 NEON microkernel
 // ---------------------------------------------------------------------------

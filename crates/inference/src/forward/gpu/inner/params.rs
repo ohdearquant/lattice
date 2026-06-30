@@ -1,3 +1,4 @@
+//! GPU shader/workgroup constants and parameter-slot constants.
 use std::sync::atomic::AtomicU64;
 
 use bytemuck::{Pod, Zeroable};

@@ -1,3 +1,4 @@
+//! Layer-norm dispatch and scalar layer-norm implementation.
 // ===================================================================
 // Layer normalization (in-place) — with SIMD fast path
 // ===================================================================

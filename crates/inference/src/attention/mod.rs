@@ -1,3 +1,4 @@
+//! Attention module index for `decode`, `differential`, `flash`, `flash_causal`, `gated`, `gdn`, `gdn_backward`, `gdn_fused`, `gqa`, `native_sparse`, and `standard`; re-exports the standard attention helpers.
 pub mod decode;
 pub mod differential;
 pub mod flash;

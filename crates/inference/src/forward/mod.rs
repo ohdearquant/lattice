@@ -1,3 +1,4 @@
+//! Forward-kernel module index for batch prefill, BitNet, CPU, f16 CPU, q8 CPU, GPU, Metal, and NEON paths.
 pub mod batch_prefill;
 pub mod bitnet_kernel;
 pub mod cpu;

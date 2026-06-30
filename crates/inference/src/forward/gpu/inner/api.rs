@@ -1,3 +1,4 @@
+//! GPU result/error types and Qwen3 GPU configuration and weight structs.
 use std::fmt;
 
 /// **Unstable**: GPU forward result type; error type may gain new variants.

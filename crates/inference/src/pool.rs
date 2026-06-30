@@ -1,3 +1,4 @@
+//! BERT pooling enum and mean, last-token, CLS, and L2 pooling helpers.
 use crate::forward::cpu::simd_config;
 
 /// **Stable** (provisional): pooling strategy for BERT-family encoder models.

@@ -1,3 +1,4 @@
+//! CPU kernel unit tests for matmul, tiled matmul, layer norm, `fast_tanh`, and GELU.
 use super::*;
 use approx::assert_relative_eq;
 

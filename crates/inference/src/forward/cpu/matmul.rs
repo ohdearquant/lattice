@@ -1,3 +1,4 @@
+//! General matmul helpers, preallocated matmul, transposed-B matmul, scalar fallbacks, and m=1 specialization.
 #[cfg(not(target_os = "macos"))]
 use super::simd::simd_config;
 

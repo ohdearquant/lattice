@@ -1,3 +1,4 @@
+//! CPU forward-kernel module index.
 mod activation;
 mod arch_kernels;
 mod blas;

@@ -1,3 +1,4 @@
+//! CPU activation and bias helpers, including tanh, GELU, add-bias, and fused add-bias-GELU paths.
 // ===================================================================
 // Fast tanh approximation — Pade (7,6) rational, max error < 4e-5
 // ===================================================================

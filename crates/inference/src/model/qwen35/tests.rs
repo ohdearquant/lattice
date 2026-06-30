@@ -1,3 +1,4 @@
+//! Qwen3.5 unit tests for partial RoPE, sampling, repetition penalty, detokenization, scratch temporaries, required tensor names, stop tokens, and MoE router construction.
 use super::moe::moe_ffn_step;
 use super::weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
 use super::*;

@@ -1,3 +1,4 @@
+//! GPU weight and activation buffer structs plus upload and activation-buffer creation helpers.
 use std::sync::{Arc, atomic::Ordering};
 
 use wgpu::util::DeviceExt;

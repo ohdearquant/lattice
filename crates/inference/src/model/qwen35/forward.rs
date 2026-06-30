@@ -1,3 +1,4 @@
+//! Qwen3.5 forward implementation, including `forward_step`, attention dispatch, full attention, and dense FFN paths.
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use super::moe::moe_ffn_step;

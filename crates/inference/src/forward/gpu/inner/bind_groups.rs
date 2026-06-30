@@ -1,3 +1,4 @@
+//! WGPU bind-group structs and constructors for layer and global bindings.
 use std::num::NonZeroU64;
 
 use super::api::{Qwen3Config, Result};

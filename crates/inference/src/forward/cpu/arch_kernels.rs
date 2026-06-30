@@ -1,3 +1,4 @@
+//! Unsafe architecture-specific matmul kernels for AVX2, AVX512, NEON, plus horizontal-sum support.
 // ---------------------------------------------------------------------------
 // AVX2+FMA matmul_bt — 4 accumulators × 8 lanes = 32 elements/iter
 // ---------------------------------------------------------------------------

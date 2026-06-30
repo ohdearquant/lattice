@@ -1,3 +1,4 @@
+//! Qwen3.5 token sampling, repetition penalty, greedy fallback, softmax probability build, top-p filtering, distribution draw, and RNG helper.
 use crate::model::qwen35_config::GenerateConfig;
 
 /// Sample a token from logits using temperature, top-k, top-p, and repetition penalty.

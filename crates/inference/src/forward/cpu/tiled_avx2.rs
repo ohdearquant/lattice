@@ -1,3 +1,4 @@
+//! Unsafe AVX2 tiled transposed-B matmul implementation.
 // ---------------------------------------------------------------------------
 // AVX2+FMA tiled matmul_bt — cache-blocked with 4×8 AVX2 microkernel
 // ---------------------------------------------------------------------------

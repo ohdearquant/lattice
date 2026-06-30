@@ -1,3 +1,4 @@
+//! Materialized GQA attention backward data and helpers, including `AttnCache`, `AttnGrads`, `gqa_backward`, and `gqa_forward_with_cache`.
 // Materialised causal GQA self-attention backward pass.
 // Used for gradchecking and for the backward tape through layer-23.
 //

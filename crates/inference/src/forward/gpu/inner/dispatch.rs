@@ -1,3 +1,4 @@
+//! WGPU dispatch helpers for matmul, RMSNorm, copy, add, SiLU, multiply, RoPE, attention scores, softmax, and context.
 use super::api::Result;
 use super::dims::ForwardDims;
 use super::params::{

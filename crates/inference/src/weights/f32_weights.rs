@@ -1,3 +1,4 @@
+//! Safetensors metadata and f32 weight structs, including tensor, transformer-layer, BERT, cross-encoder, safetensors-file, and Qwen layer weights.
 use crate::error::InferenceError;
 use memmap2::Mmap;
 use serde_json::Value;

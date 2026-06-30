@@ -1,3 +1,4 @@
+//! Tiny-model gradient-checking utilities, including tiny weights, tiny forward/loss helpers, and `gradcheck_lora`.
 // End-to-end gradcheck harness: tiny all-GQA 2-layer fixture,
 // hidden=64, 4 Q-heads, 1 KV-head, head_dim=16, no GDN layers.
 // Validates that the entire backward chain produces analytic grads
