@@ -3,7 +3,7 @@
 //! Provides binary serialization for efficient network storage and loading.
 
 use crate::activation::Activation;
-use crate::error::{FannError, FannResult, validate_allocation_size};
+use crate::error::{FannError, FannResult, validate_allocation_size, validate_layer_dimensions};
 use crate::layer::Layer;
 use crate::network::Network;
 
@@ -192,6 +192,14 @@ impl Network {
                 .try_into()
                 .map_err(|_| FannError::InvalidBuilder("Failed to read num_outputs".into()))?;
             let num_outputs = u32::from_le_bytes(num_outputs_bytes) as usize;
+
+            // Bounds-before-allocation: enforce the per-layer element cap on the
+            // hostile dimension fields BEFORE reading and collecting the weight and
+            // bias payloads. `Layer::with_weights` re-validates as defence in depth,
+            // but checking here keeps a large declared shape from driving a
+            // multi-hundred-MB `Vec<f32>` allocation before the cap is applied.
+            // num_inputs > 0 (enforced here) also bounds num_outputs for biases.
+            validate_layer_dimensions(num_inputs, num_outputs)?;
 
             // Read activation type
             let activation_type = read_bytes(&mut pos, 1)?[0];
@@ -426,17 +434,22 @@ mod tests {
         );
     }
 
-    /// Layer dimensions where weight_count * 4 overflows usize must return
-    /// Err(FannError::InvalidBuilder) without allocating.
+    /// A header declaring a huge weight count (num_inputs * num_outputs far
+    /// above MAX_ALLOWED_ELEMENTS) must be rejected by the early per-layer size
+    /// cap with Err(FannError::ShapeTooLarge), before any byte-count arithmetic,
+    /// read, or allocation.
     ///
-    /// On 64-bit targets, u32::MAX * u32::MAX ≈ 1.844e19 fits in usize, but
-    /// the result * 4 ≈ 7.4e19 > u64::MAX. With num_inputs=3_000_000_000 and
-    /// num_outputs=2_000_000_000: weight_count=6e18 (fits), weight_count*4=2.4e19
-    /// overflows → checked_mul(4) returns None → Err before any read_bytes call.
+    /// With num_inputs=3_000_000_000 and num_outputs=2_000_000_000 the element
+    /// count is 6e18 — a valid usize, but ~6e10x the 100M cap. validate_layer_dimensions
+    /// (run right after the dimensions are read) rejects it via validate_allocation_size.
+    /// The downstream weight_count.checked_mul(4) guard remains as defence in depth
+    /// but is unreachable for these dimensions because the cap fires first.
     ///
-    /// Mutation that defeats this test: replace checked_mul(4) with weight_count * 4.
+    /// Mutation that defeats this test: remove the early validate_layer_dimensions
+    /// call — the parser then reaches weight_count.checked_mul(4), which overflows
+    /// (6e18 * 4 = 2.4e19 > usize::MAX) and returns InvalidBuilder instead.
     #[test]
-    fn from_bytes_weight_byte_count_overflow_returns_err() {
+    fn from_bytes_huge_weight_dims_rejected_by_size_cap() {
         let mut bytes = b"FANN".to_vec();
         bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
         bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
@@ -444,40 +457,61 @@ mod tests {
         bytes.extend_from_slice(&2_000_000_000_u32.to_le_bytes()); // num_outputs
         bytes.push(0); // activation=Linear
         // 21 bytes total; the layer bounds check passes (remaining=9, max=1 layer).
-        // weight_count = 6e18 fits; weight_count*4 = 2.4e19 overflows u64 → Err.
         let result = Network::from_bytes(&bytes);
         assert!(
-            matches!(result, Err(FannError::InvalidBuilder(_))),
-            "weight byte count overflow must return InvalidBuilder, got {result:?}"
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "huge weight dims must hit the size cap before allocation, got {result:?}"
         );
     }
 
-    /// A header whose weight byte count is a valid usize *near* usize::MAX (so
-    /// checked_mul(4) returns Some, not None) must still return Err, not panic:
-    /// read_bytes must reject it without computing `*pos + n`.
+    /// A header with near-usize::MAX-product dimensions must be rejected cleanly
+    /// (Err, no panic) by the early per-layer size cap. This pins that
+    /// validate_layer_dimensions itself does not overflow/panic on extreme
+    /// dimensions: its internal checked_mul handles the 2^62-1 product, and
+    /// validate_allocation_size then rejects it with ShapeTooLarge.
     ///
-    /// num_inputs = 2^31-1, num_outputs = 2^31+1 → weight_count = 2^62-1
-    /// (checked_mul succeeds); weight_byte_count = 2^64-4 = usize::MAX-3
-    /// (checked_mul(4) succeeds). read_bytes(pos=21, usize::MAX-3) overflows
-    /// `*pos + n` in the unguarded form; the checked-available form returns Err.
-    /// Companion to from_bytes_weight_byte_count_overflow_returns_err, which
-    /// covers checked_mul(4) == None.
+    /// num_inputs = 2^31-1, num_outputs = 2^31+1 → product = 2^62-1 (a valid
+    /// usize, ~4.6e10x the 100M cap). The cap fires before the weight byte-count
+    /// arithmetic and before read_bytes is asked for the (usize::MAX-3) payload,
+    /// so the overflow-safe read_bytes guard remains as defence in depth here.
     ///
-    /// Mutation that defeats this test: revert read_bytes to `if *pos + n > bytes.len()`.
+    /// Mutation that defeats this test: remove the early validate_layer_dimensions
+    /// call — the parser then reaches read_bytes(pos=21, usize::MAX-3) and returns
+    /// a truncation InvalidBuilder instead of ShapeTooLarge.
     #[test]
-    fn from_bytes_read_bytes_pos_plus_n_overflow_returns_err() {
+    fn from_bytes_near_usize_max_dims_rejected_by_size_cap() {
         let mut bytes = b"FANN".to_vec();
         bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
         bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
         bytes.extend_from_slice(&2_147_483_647_u32.to_le_bytes()); // num_inputs = 2^31-1
         bytes.extend_from_slice(&2_147_483_649_u32.to_le_bytes()); // num_outputs = 2^31+1
         bytes.push(0); // activation=Linear
-        // 21 bytes; weight_byte_count = usize::MAX-3 fits, so read_bytes is asked
-        // for usize::MAX-3 bytes at pos=21 — `*pos + n` would overflow unguarded.
         let result = Network::from_bytes(&bytes);
         assert!(
-            matches!(result, Err(FannError::InvalidBuilder(_))),
-            "near-usize::MAX weight byte count must return InvalidBuilder, got {result:?}"
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "near-usize::MAX dims must hit the size cap before allocation, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_oversized_layer_dims_rejected_before_allocation() {
+        // A hostile header declaring more than MAX_ALLOWED_ELEMENTS weights must
+        // be rejected by the size cap BEFORE from_bytes reads or collects the
+        // weight payload. This buffer carries no weight bytes at all: if the cap
+        // were enforced only inside Layer::with_weights (after collection), the
+        // parser would first attempt the oversized weight read and return a
+        // truncation InvalidBuilder. Reverting the early validate_layer_dimensions
+        // call makes this case return InvalidBuilder instead of ShapeTooLarge.
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
+        bytes.extend_from_slice(&100_000_001_u32.to_le_bytes()); // num_inputs = MAX_ALLOWED_ELEMENTS + 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_outputs=1
+        bytes.push(0); // activation=Linear
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "oversized layer dims must hit the size cap before allocation, got {result:?}"
         );
     }
 }
