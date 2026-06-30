@@ -118,6 +118,11 @@ impl std::error::Error for SchemaError {}
 /// The schema is expected to be a JSON Schema object (an `{}` map).  Pass the
 /// full document root — `$defs` / `definitions` will be extracted automatically.
 pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
+    // Bound every schema string at the true public compilation entry: this fn is
+    // itself `pub` (a direct caller bypasses `compile`), and the $defs-name path
+    // in CompileCtx::new clones its key with no per-site byte guard, so the
+    // schema-wide cap must run here to dominate every public path (issue #474).
+    guard_schema_string_bytes(schema)?;
     let mut ctx = CompileCtx::new(schema)?;
     // Reserve "root" — may not be at index 0 because register_builtins() runs
     // first in CompileCtx::new().
@@ -1907,9 +1912,9 @@ fn extract_ref_name(ref_str: &str) -> Result<&str, SchemaError> {
 
 /// Compile a JSON Schema document into a `CompiledGrammar`.
 ///
-/// This is the primary entry point used by `GrammarEngine::new`.
+/// This is the primary entry point used by `GrammarEngine::new`. The schema-wide
+/// byte guard lives in `compile_json_schema` so it covers direct callers too.
 pub fn compile(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
-    guard_schema_string_bytes(schema)?;
     compile_json_schema(schema)
 }
 
@@ -3499,7 +3504,7 @@ mod tests {
     /// `json_value_to_alt` allocation.
     ///
     /// Backstopped: the schema-wide `guard_schema_string_bytes` pass at the
-    /// top of `compile` now dominates and rejects this input before
+    /// top of `compile_json_schema` now dominates and rejects this input before
     /// `compile_enum`'s own byte-budget guard runs, so this test is
     /// defense-in-depth for `compile_enum`'s guard, not independently
     /// mutation-sensitive to it — see `schema_defs_name_byte_capped` for the
@@ -3708,15 +3713,15 @@ mod tests {
     /// `$defs` name byte cap (issue #474): a `$defs` map whose KEY (the
     /// definition name itself, not a `properties` key) exceeds
     /// MAX_STRING_LITERAL_BYTES is rejected by the schema-wide
-    /// `guard_schema_string_bytes` pass at the top of `compile`. Unlike a
+    /// `guard_schema_string_bytes` pass at the top of `compile_json_schema`. Unlike a
     /// `properties` key (`object_key_byte_capped`), a `$defs` name has no
     /// per-site guard: `CompileCtx::new` clones it into the `defs` map
     /// unchecked, and nothing in this schema references it via `$ref`, so no
     /// downstream lookup ever sees it either.
     ///
     /// Mutation pin: fires with "byte length". Reverting the
-    /// `guard_schema_string_bytes` call in `compile` removes the only guard
-    /// that ever inspects this key, so compile returns `Ok` instead of `Err`
+    /// `guard_schema_string_bytes` call in `compile_json_schema` removes the only
+    /// guard that ever inspects this key, so compile returns `Ok` instead of `Err`
     /// and the assertion below fails.
     #[test]
     fn schema_defs_name_byte_capped() {
@@ -3727,6 +3732,33 @@ mod tests {
         root.insert("$defs".to_string(), Value::Object(defs));
         let v = Value::Object(root);
         let err = compile(&v).expect_err("a $defs name over the byte cap must be rejected");
+        assert!(
+            err.0.contains("byte length"),
+            "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// `compile_json_schema` is itself `pub`, so a direct caller bypasses the
+    /// `compile` wrapper. The schema-wide byte guard must therefore live in
+    /// `compile_json_schema`, not only in `compile`: an oversized `$defs` name
+    /// passed straight to `compile_json_schema` must still be rejected before
+    /// `CompileCtx::new` clones it into the `defs` map.
+    ///
+    /// Mutation pin: fires with "byte length". Moving the
+    /// `guard_schema_string_bytes` call back into `compile` (leaving
+    /// `compile_json_schema` unguarded) lets the oversized key reach
+    /// `CompileCtx::new`, so this direct call returns `Ok` and the assertion fails.
+    #[test]
+    fn compile_json_schema_direct_defs_name_byte_capped() {
+        let huge = "a".repeat(MAX_STRING_LITERAL_BYTES + 1);
+        let mut defs = serde_json::Map::new();
+        defs.insert(huge, serde_json::json!({"type": "integer"}));
+        let mut root = serde_json::Map::new();
+        root.insert("$defs".to_string(), Value::Object(defs));
+        let v = Value::Object(root);
+        let err = compile_json_schema(&v)
+            .expect_err("a $defs name over the byte cap must be rejected at the direct entry");
         assert!(
             err.0.contains("byte length"),
             "expected the byte-length cap error, got: {}",
