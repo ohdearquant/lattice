@@ -184,15 +184,34 @@ struct CompileCtx<'a> {
 impl<'a> CompileCtx<'a> {
     fn new(doc_root: &'a Value) -> Result<Self, SchemaError> {
         let mut defs = HashMap::new();
+        // Each definition name is individually capped by the schema-wide entry
+        // guard, but the map clones every key (`k.clone()`) and `$defs` has no
+        // cardinality cap, so many under-cap names can still retain an unbounded
+        // total. Bound the cumulative key bytes across BOTH `$defs` and
+        // `definitions`, mirroring the enum/anyOf cumulative guards (issue #474).
+        // saturating_add keeps the running sum from wrapping past the cap.
+        let mut defs_name_bytes: usize = 0;
         // Collect $defs
         if let Some(defs_map) = doc_root.get("$defs").and_then(Value::as_object) {
             for (k, v) in defs_map {
+                defs_name_bytes = defs_name_bytes.saturating_add(k.len());
+                if defs_name_bytes > MAX_STRING_LITERAL_BYTES {
+                    return Err(SchemaError(format!(
+                        "schema definition name cumulative byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                    )));
+                }
                 defs.insert(k.clone(), v);
             }
         }
         // Also accept legacy `definitions`
         if let Some(defs_map) = doc_root.get("definitions").and_then(Value::as_object) {
             for (k, v) in defs_map {
+                defs_name_bytes = defs_name_bytes.saturating_add(k.len());
+                if defs_name_bytes > MAX_STRING_LITERAL_BYTES {
+                    return Err(SchemaError(format!(
+                        "schema definition name cumulative byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                    )));
+                }
                 defs.entry(k.clone()).or_insert(v);
             }
         }
@@ -554,11 +573,25 @@ impl<'a> CompileCtx<'a> {
                 //   is_req    — whether this property appears in `required`
                 let mut props_info: Vec<(usize, usize, Vec<u8>, bool)> =
                     Vec::with_capacity(props.len());
+                // Each key is individually capped by `guard_literal_bytes` below,
+                // and `MAX_OBJECT_PROPERTIES` bounds the count, but the product
+                // (up to the count cap of near-cap keys) still feeds the per-byte
+                // `json_string_literal` Symbol expansion and the retained
+                // `key_bytes` vectors. Bound the cumulative key bytes too,
+                // mirroring the enum/anyOf cumulative guards (issue #474).
+                // saturating_add keeps the running sum from wrapping past the cap.
+                let mut key_bytes_total: usize = 0;
                 for (key, val_schema) in &props {
                     let key_str: &str = key.as_str();
                     let is_req = required.contains(&key_str);
 
                     guard_literal_bytes(key_str)?;
+                    key_bytes_total = key_bytes_total.saturating_add(key_str.len());
+                    if key_bytes_total > MAX_STRING_LITERAL_BYTES {
+                        return Err(SchemaError(format!(
+                            "object property key cumulative byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+                        )));
+                    }
                     // key_bytes: raw bytes of the JSON-encoded key string.
                     // Used to inline the key as terminals in started=true tail
                     // rules so trailing-comma over-acceptance is prevented for a
@@ -3762,6 +3795,75 @@ mod tests {
         assert!(
             err.0.contains("byte length"),
             "expected the byte-length cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// `$defs` name CUMULATIVE byte cap (issue #474, round 8): the schema-wide
+    /// entry guard is per-string, so many definition names each UNDER the
+    /// per-string cap can still sum past it while `CompileCtx::new` clones every
+    /// key into the `defs` map (and `$defs` has no cardinality cap). The
+    /// cumulative budget in `CompileCtx::new` rejects the aggregate.
+    ///
+    /// Mutation pin: fires with the distinct "schema definition name cumulative
+    /// byte length" message. Each name here is ~400 KiB (under the 1 MiB
+    /// per-string cap, so the entry guard passes each one); three of them sum
+    /// past the cap. Reverting the cumulative guard in `CompileCtx::new` lets all
+    /// three through, so compile returns `Ok` and the assertion below fails.
+    #[test]
+    fn defs_names_cumulative_bytes_capped() {
+        let chunk = "a".repeat(400 * 1024);
+        let mut defs = serde_json::Map::new();
+        for i in 0..3 {
+            defs.insert(
+                format!("{chunk}{i}"),
+                serde_json::json!({"type": "integer"}),
+            );
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("$defs".to_string(), Value::Object(defs));
+        let v = Value::Object(root);
+        let err =
+            compile(&v).expect_err("cumulative $defs name bytes over the budget must be rejected");
+        assert!(
+            err.0
+                .contains("schema definition name cumulative byte length"),
+            "expected the cumulative $defs-name cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Object property key CUMULATIVE byte cap (issue #474, round 8): the
+    /// per-key `guard_literal_bytes` cap and `MAX_OBJECT_PROPERTIES` count cap
+    /// each bound one dimension, but their product (many near-cap keys) still
+    /// drives the per-byte `json_string_literal` Symbol expansion and the
+    /// retained `key_bytes` vectors. The cumulative budget in the property loop
+    /// rejects the aggregate.
+    ///
+    /// Mutation pin: fires with the distinct "object property key cumulative
+    /// byte length" message. Each key here is ~400 KiB (under the per-string
+    /// cap, so `guard_literal_bytes` passes each one); three of them sum past
+    /// the cap. Reverting the cumulative guard in the property loop lets all
+    /// three through, so compile returns `Ok` and the assertion below fails.
+    #[test]
+    fn object_keys_cumulative_bytes_capped() {
+        let chunk = "a".repeat(400 * 1024);
+        let mut props = serde_json::Map::new();
+        for i in 0..3 {
+            props.insert(
+                format!("{chunk}{i}"),
+                serde_json::json!({"type": "integer"}),
+            );
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("type".to_string(), Value::String("object".to_string()));
+        root.insert("properties".to_string(), Value::Object(props));
+        let v = Value::Object(root);
+        let err = compile(&v)
+            .expect_err("cumulative object property key bytes over the budget must be rejected");
+        assert!(
+            err.0.contains("object property key cumulative byte length"),
+            "expected the cumulative object-key cap error, got: {}",
             err.0
         );
     }
