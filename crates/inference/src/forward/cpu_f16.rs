@@ -871,6 +871,21 @@ pub fn generate_f16(
     // unconstrained output despite a grammar being set (#397/#398).
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
 
+    // Context preflight. The RoPE cos/sin tables are indexed unchecked in
+    // forward_step_f16 (`rope.cos_at(base + i)`), so a position at or past the
+    // table capacity is an out-of-bounds slice access — a release panic, not a
+    // clean error. Mirror Qwen35Model::generate's total-token policy
+    // (prompt_len + max_new_tokens <= max_context) so direct and HTTP generation
+    // agree on when a request is too long.
+    let max_context = rope.max_positions();
+    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+             model context window ({max_context})",
+            gen_cfg.max_new_tokens
+        )));
+    }
+
     // Initialize states
     let num_linear = cfg.num_linear_attention_layers();
     let num_full = cfg.num_full_attention_layers();
@@ -1489,6 +1504,32 @@ mod tests {
         let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, merges).unwrap();
 
         (cfg, weights, rope, tokenizer)
+    }
+
+    /// `generate_f16` must reject a request whose prompt + max_new_tokens exceeds
+    /// the RoPE table capacity with a clean error, not an out-of-bounds RoPE index
+    /// (in a real model) or a runaway allocation. The preflight returns before any
+    /// forward pass, so the zero-layer fixture is sufficient. Mutation check:
+    /// removing the preflight lets the zero-layer model run the decode to
+    /// completion and return Ok (it has no RoPE-indexing attention layer), which
+    /// trips the `expect_err` below — changing the test from PASS to FAIL. Mirrors
+    /// `generate_q8`'s `test_generate_q8_rejects_context_overflow`.
+    #[test]
+    fn test_generate_f16_rejects_context_overflow() {
+        let (cfg, weights, rope, tokenizer) = zero_layer_f16_fixture();
+        let max_context = rope.max_positions(); // 64 from the fixture
+        // "hello" is >= 1 token, so prompt_len + max_context > max_context.
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: max_context,
+            ..Default::default()
+        };
+        let err = generate_f16(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
+            .expect_err("request beyond context window must error, not panic");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context window"),
+            "error must name the context window; got: {msg}"
+        );
     }
 
     /// `generate_f16` must stop on a token in `stop_token_ids` even when that

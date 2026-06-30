@@ -1212,15 +1212,17 @@ mod tests {
     // ── Issue #403 preflight regression test ───────────────────────────────────
     //
     // Mutation contract: removing the `if prompt_len.saturating_add(gen_cfg.max_new_tokens)
-    // > max_context` guard added for #403 causes this test to attempt a forward pass
-    // whose decode loop would index the RoPE table out of range and panic in release.
-    // The panic changes the test result from PASS to FAIL.
+    // > max_context` guard added for #403 lets this test run a forward pass. Without the
+    // guard the call fails either by returning Ok — when generation stops before the RoPE
+    // boundary, tripping the `expect_err` below — or by an out-of-bounds RoPE panic if
+    // decode reaches the boundary. Either outcome changes the test result from PASS to FAIL.
 
     #[test]
     fn test_generate_with_batch_prefill_rejects_over_context_request() {
-        // Mutation contract: deleting the context preflight added for #403 causes this
-        // test to panic (out-of-bounds RoPE index during decode) instead of asserting
-        // the Err variant. The panic changes the test result from PASS to FAIL.
+        // Mutation contract: deleting the context preflight added for #403 makes this
+        // test fail either by returning Ok (generation stops before the RoPE boundary,
+        // so the `expect_err` below trips) or by an out-of-bounds RoPE panic if decode
+        // reaches the boundary. Either outcome changes the test result from PASS to FAIL.
         let cfg = tiny_test_config();
         let model = build_random_model(cfg, 0xC0D0_0403);
         let max_context = model.max_context(); // 1024 from tiny_test_config()
