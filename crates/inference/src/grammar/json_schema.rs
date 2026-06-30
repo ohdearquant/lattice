@@ -1255,6 +1255,36 @@ mod tests {
     }
 
     #[test]
+    fn any_array_rejects_trailing_comma() {
+        // An untyped array (`body ::= any tail | ε`, `tail ::= ws ',' ws any
+        // tail | ε`) must reject a trailing comma before `]`.  Previously the
+        // PDA's no-rewind parent-backtrack switched the comma-consuming `tail`
+        // frame to its `| ε` sibling AFTER the `,` byte was consumed, silently
+        // admitting invalid JSON.  The per-frame byte-consumption guard refuses
+        // that switch once a byte is committed.  Valid forms must still accept.
+        let g = compile_ok(r#"{"type":"array"}"#);
+        assert!(accepts(&g, b"[]"));
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(rejects(&g, b"[1,]"));
+        assert!(rejects(&g, b"[1,2,]"));
+        assert!(rejects(&g, b"[,]"));
+    }
+
+    #[test]
+    fn typed_array_rejects_trailing_comma() {
+        // Same trailing-comma over-acceptance via the bounded-tail rule used
+        // for typed arrays (`build_bounded_tail`).  The byte-consumption guard
+        // closes both the untyped and typed array paths at once.
+        let g = compile_ok(r#"{"type":"array","items":{"type":"integer"}}"#);
+        assert!(accepts(&g, b"[]"));
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(rejects(&g, b"[1,]"));
+        assert!(rejects(&g, b"[1,2,]"));
+    }
+
+    #[test]
     fn schema_error_display() {
         let e = SchemaError("test".to_string());
         assert!(e.to_string().contains("test"));

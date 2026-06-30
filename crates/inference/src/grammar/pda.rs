@@ -34,9 +34,13 @@
 //!
 //! ```text
 //! stack: Vec<StackFrame>
-//!   StackFrame { rule_id, alt_idx, sym_pos }
+//!   StackFrame { rule_id, alt_idx, sym_pos, consumed }
 //! partial_bytes: Vec<u8>  — bytes of current token received so far
 //! ```
+//!
+//! `consumed` records whether a byte has been consumed under a frame's current
+//! alternative; it gates backtracking so a committed frame is never switched to
+//! a sibling alternative (no input rewind). See [`StackFrame::consumed`].
 //!
 //! The automaton starts with a single frame at `(root, 0, 0)`.
 //! `advance_byte(b)` returns whether the byte `b` is accepted (the PDA can
@@ -111,6 +115,18 @@ pub struct StackFrame {
     pub alt_idx: usize,
     /// Position within the chosen alternative (0 = before the first symbol).
     pub sym_pos: usize,
+    /// `true` once any input byte has been consumed while this frame has been
+    /// at its current `alt_idx` (set for every frame on the stack on each byte
+    /// match; reset when the frame switches to a new alternative). A frame with
+    /// `consumed == true` is *committed* to its alternative: because this is a
+    /// no-rewind byte matcher, switching it to a sibling alternative would
+    /// re-interpret already-consumed bytes as if they never existed. The
+    /// backtracking logic refuses that switch, which is what closes the
+    /// trailing-comma / optional-collapse over-acceptance class (#353). Note it
+    /// tracks byte consumption, not `sym_pos`: a frame can advance `sym_pos`
+    /// past nullable nonterminals without consuming a byte, and such a frame
+    /// must still be free to switch (otherwise `[]` and similar over-reject).
+    pub consumed: bool,
 }
 
 /// Runtime state of the PDA for one decode sequence.
@@ -136,6 +152,7 @@ impl GrammarState {
                 rule_id: 0,
                 alt_idx: 0,
                 sym_pos: 0,
+                consumed: false,
             }],
             partial_token_bytes: Vec::new(),
             complete: false,
@@ -251,33 +268,33 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
         match sym {
             Symbol::Terminal(t) => {
                 if *t == b {
-                    // Match: advance position in current alternative.
+                    // Match: a byte is consumed. Mark every frame currently on
+                    // the stack as having consumed under its current alternative
+                    // — the matching frame is the top, and every frame below it
+                    // is an ancestor whose active subtree just consumed this byte
+                    // (#353). Then advance position and pop exhausted frames.
+                    mark_consumed(stack);
                     stack[frame_idx].sym_pos += 1;
-                    // Pop any exhausted frames.
                     collapse_exhausted(stack, grammar);
                     return true;
                 } else {
-                    // Byte doesn't match this terminal.
-                    // Only switch alternatives when no bytes have been consumed
-                    // in the current alternative (sym_pos == 0).  Once we have
-                    // consumed bytes under one alternative, backtracking to a
-                    // sibling alternative would create an inconsistent state
-                    // (the consumed bytes cannot be "un-consumed").
-                    if frame.sym_pos == 0 {
-                        return try_next_alt(stack, grammar, b, frame_idx);
-                    } else {
-                        // Mid-alternative mismatch: propagate to parent.
-                        if frame_idx == 0 {
-                            return false;
-                        }
-                        stack.truncate(frame_idx);
-                        let parent_idx = stack.len() - 1;
-                        return try_next_alt(stack, grammar, b, parent_idx);
-                    }
+                    // Byte doesn't match this terminal. Try this frame's next
+                    // alternative; `try_next_alt` enforces the consumed-guard:
+                    // a frame that has consumed a byte under its current
+                    // alternative is committed and cannot switch (the consumed
+                    // bytes cannot be "un-consumed" — no input rewind), while a
+                    // frame that only advanced `sym_pos` past nullable
+                    // nonterminals is still free to switch (e.g. a tail rule
+                    // reaching its `ε` alternative). This single path replaces
+                    // the old `sym_pos == 0` heuristic and closes both halves of
+                    // #353 (the trailing-comma over-acceptance and the
+                    // nullable-prefix over-rejection).
+                    return try_next_alt(stack, grammar, b, frame_idx);
                 }
             }
             Symbol::AnyByte => {
-                // AnyByte matches any single byte.
+                // AnyByte matches any single byte: a byte is consumed.
+                mark_consumed(stack);
                 stack[frame_idx].sym_pos += 1;
                 collapse_exhausted(stack, grammar);
                 return true;
@@ -295,6 +312,7 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                     rule_id: rid,
                     alt_idx: 0,
                     sym_pos: 0,
+                    consumed: false,
                 });
                 // Continue loop: now top frame is the pushed non-terminal.
             }
@@ -309,42 +327,60 @@ fn try_next_alt(
     b: u8,
     frame_idx: usize,
 ) -> bool {
+    // Consumed-guard (#353). If this frame has consumed an input byte under its
+    // current alternative it is committed: switching it to a sibling alternative
+    // — or popping it to switch an ancestor — would re-interpret the consumed
+    // bytes as if they never existed, and this byte-level matcher has no input
+    // rewind. Reject instead. Because `mark_consumed` flags every frame on the
+    // stack at each byte match, any ancestor of a committed frame is committed
+    // too, so there is no clean alternative further up to back track into; a
+    // plain rejection here is both sound and complete. This is the guard whose
+    // absence over-accepted trailing commas (`[1,]`, `{"r":1,"o1":2,}`). It
+    // tracks byte consumption, not `sym_pos`, so a frame that only advanced past
+    // nullable nonterminals (e.g. an optional `ws` before a `,`) is NOT
+    // committed and still reaches its `ε` alternative below — which is what
+    // keeps `[]`, `[5]`, and `[1,2]` accepting (the over-rejection dual).
+    if stack[frame_idx].consumed {
+        return false;
+    }
+
     let rule_id = stack[frame_idx].rule_id;
     let next_alt = stack[frame_idx].alt_idx + 1;
     let num_alts = grammar.rules[rule_id].alts.len();
 
     if next_alt >= num_alts {
-        // No more alternatives at this level.
-        // Try backtracking to the parent.
-        //
-        // KNOWN LIMITATION (not fixed here): this path can over-accept. If the
-        // parent has already consumed input bytes under its current alternative,
-        // switching the parent to a sibling alternative re-interprets the
-        // current byte as if those bytes were never consumed — this byte-level
-        // matcher has no input rewind. A correct guard needs per-frame
-        // byte-consumption tracking; a position (`sym_pos`) check is insufficient
-        // because a frame's `sym_pos` can advance past nullable nonterminals
-        // without consuming any byte (e.g. an optional numeric sign), so a naive
-        // guard over-rejects valid input like `[]`. The shared-prefix `anyOf`
-        // over-rejection is the dual of this. Tracked in #353.
+        // No more alternatives at this (uncommitted) level: pop the frame and
+        // try the parent's next alternative. Sound because this frame consumed
+        // no byte under its current alternative, so removing it un-interprets
+        // nothing.
         if frame_idx == 0 {
             return false;
         }
-        // Pop this frame, try alternatives at the parent level.
         stack.truncate(frame_idx);
-        // Retry with parent — but we need to try the parent's next alt or
-        // propagate rejection.  We do this by trying the parent's next alt.
         let parent_idx = stack.len() - 1;
         return try_next_alt(stack, grammar, b, parent_idx);
     }
 
-    // Switch to next alternative in the same rule (reset sym_pos).
+    // Switch to the next alternative in the same rule (reset position and the
+    // consumed flag — the new alternative has consumed nothing yet).
     stack[frame_idx].alt_idx = next_alt;
     stack[frame_idx].sym_pos = 0;
+    stack[frame_idx].consumed = false;
     // Truncate any frames pushed during the failed attempt.
     stack.truncate(frame_idx + 1);
     // Retry with new alt.
     try_advance_stack(stack, grammar, b)
+}
+
+/// Mark every frame currently on the stack as having consumed a byte under its
+/// current alternative. Called on each successful byte match: the matching
+/// frame is the top of the stack and every frame below it is an ancestor whose
+/// active subtree just consumed the byte, so all of them become committed to
+/// their current alternative (#353). See [`StackFrame::consumed`].
+fn mark_consumed(stack: &mut [StackFrame]) {
+    for frame in stack.iter_mut() {
+        frame.consumed = true;
+    }
 }
 
 /// Pop exhausted frames from the top of the stack after a successful byte match.
@@ -652,6 +688,69 @@ mod tests {
             }
         }
         grammar
+    }
+
+    /// Minimal grammar isolating the no-rewind trailing-comma class, free of
+    /// the JSON-schema compiler:
+    ///   root = '[' body ']'
+    ///   body = elem tail | ε
+    ///   tail = ',' elem tail | ε
+    ///   elem = 'x'
+    /// A trailing comma (`[x,]`) must reject: the `tail` frame that consumed
+    /// the `,` byte may not backtrack to its ε alternative once a byte is
+    /// committed.  The nullable `body`/`tail` ε arms must still let valid
+    /// forms through (refs #353).
+    fn comma_list_grammar() -> CompiledGrammar {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root"); // index 0
+        let body_id = b.reserve("body");
+        let tail_id = b.reserve("tail");
+        let elem_id = b.reserve("elem");
+        b.set_alts(elem_id, vec![vec![Symbol::Terminal(b'x')]]);
+        b.set_alts(
+            tail_id,
+            vec![
+                vec![
+                    Symbol::Terminal(b','),
+                    Symbol::NonTerminal(elem_id),
+                    Symbol::NonTerminal(tail_id),
+                ],
+                vec![], // epsilon
+            ],
+        );
+        b.set_alts(
+            body_id,
+            vec![
+                vec![Symbol::NonTerminal(elem_id), Symbol::NonTerminal(tail_id)],
+                vec![], // epsilon
+            ],
+        );
+        b.set_alts(
+            root_id,
+            vec![vec![
+                Symbol::Terminal(b'['),
+                Symbol::NonTerminal(body_id),
+                Symbol::Terminal(b']'),
+            ]],
+        );
+        b.build()
+    }
+
+    fn accepts_str(g: &CompiledGrammar, input: &[u8]) -> bool {
+        let state = GrammarState::initial();
+        let (result, final_state) = simulate_token(&state, g, input);
+        result == SimResult::Accept && final_state.is_complete()
+    }
+
+    #[test]
+    fn comma_list_rejects_trailing_comma() {
+        let g = comma_list_grammar();
+        assert!(accepts_str(&g, b"[]")); // nullable body reaches ε, no byte consumed
+        assert!(accepts_str(&g, b"[x]")); // clean tail reaches ε
+        assert!(accepts_str(&g, b"[x,x]")); // nested tail
+        assert!(!accepts_str(&g, b"[x,]")); // trailing comma: dirty tail must not switch to ε
+        assert!(!accepts_str(&g, b"[x,x,]")); // same, one level deeper
+        assert!(!accepts_str(&g, b"[,]")); // leading comma
     }
 
     #[test]
