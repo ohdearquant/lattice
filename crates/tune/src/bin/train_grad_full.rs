@@ -37,17 +37,13 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use lattice_inference::attention::gdn::GatedDeltaNetWeights;
-use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
-use lattice_inference::backward::attention_gqa::{AttnCache, gqa_backward, gqa_forward_with_cache};
-use lattice_inference::backward::ops::{linear_vjp, rmsnorm_backward, swiglu_backward};
-use lattice_inference::backward::tape::{rms_norm_forward, swiglu_forward};
 use lattice_inference::model::qwen35::Qwen35Model;
-use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
-
-const TOP_LAYER: usize = 23;
+use lattice_tune::lora::train_core::{
+    Dims, GdnDims, Head, LayerW, LoraParams, MixerKind, SeqCtx, TOP_LAYER, apply_adam_updates,
+    eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
+};
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
     args.iter()
@@ -168,496 +164,6 @@ fn build_caches(
         });
     }
     Ok((caches, total_positions))
-}
-
-#[derive(Clone, Copy)]
-struct Dims {
-    hidden: usize,
-    vocab: usize,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    rope_dim: usize,
-    inter: usize,
-    q_dim: usize,
-    kv_dim: usize,
-    eps: f32,
-}
-
-/// GDN config dims (shared by all GDN layers), captured once from the config.
-#[derive(Clone, Copy)]
-struct GdnDims {
-    num_kh: usize,
-    value_heads: usize,
-    key_dim: usize,
-    value_dim: usize,
-    qkv_dim: usize,
-    output_dim: usize,
-    kernel_size: usize,
-    scale: f32,
-}
-
-impl GdnDims {
-    fn from_cfg(cfg: &Qwen35Config) -> Self {
-        let key_dim = cfg.linear_key_head_dim;
-        Self {
-            num_kh: cfg.linear_num_key_heads,
-            value_heads: cfg.linear_num_value_heads(),
-            key_dim,
-            value_dim: cfg.linear_value_head_dim,
-            qkv_dim: cfg.linear_qkv_dim(),
-            output_dim: cfg.linear_output_dim(),
-            kernel_size: cfg.linear_conv_kernel_dim,
-            scale: 1.0 / (key_dim as f32).sqrt(),
-        }
-    }
-}
-
-enum MixerKind {
-    Gqa,
-    Gdn,
-}
-
-/// Borrowed frozen weights for one materialised layer (lifetime tied to &model).
-/// Norm `*_shift` fields are the `(1 + gamma)` shifted layer norms; `q_norm`/
-/// `k_norm` are raw (gqa shifts internally). `lora_slot` indexes the mutable
-/// LoRA param array for GQA layers; `None` for frozen GDN layers.
-struct LayerW<'a> {
-    kind: MixerKind,
-    // GQA mixer (valid iff kind == Gqa)
-    w_q: &'a [f32],
-    w_k: &'a [f32],
-    w_v: &'a [f32],
-    w_o: &'a [f32],
-    q_norm: &'a [f32],
-    k_norm: &'a [f32],
-    // GDN mixer (valid iff kind == Gdn)
-    gdn: Option<&'a GatedDeltaNetWeights>,
-    // common
-    pre_shift: Vec<f32>,
-    post_shift: Vec<f32>,
-    w_gate: &'a [f32],
-    w_up: &'a [f32],
-    w_down: &'a [f32],
-    lora_slot: Option<usize>,
-}
-
-struct Head<'a> {
-    lm_head: &'a [f32],
-    final_shift: &'a [f32],
-}
-
-/// Mutable LoRA factors for one GQA layer (q_proj + v_proj).
-#[derive(Clone)]
-struct LoraParams {
-    a_q: Vec<f32>,
-    b_q: Vec<f32>,
-    a_v: Vec<f32>,
-    b_v: Vec<f32>,
-}
-
-impl LoraParams {
-    fn zeros(rank: usize, d: &Dims) -> Self {
-        Self {
-            a_q: vec![0.0; rank * d.hidden],
-            b_q: vec![0.0; 2 * d.q_dim * rank],
-            a_v: vec![0.0; rank * d.hidden],
-            b_v: vec![0.0; d.kv_dim * rank],
-        }
-    }
-}
-
-/// LoRA gradients for one GQA layer (same shapes as LoraParams).
-type Grads = LoraParams;
-
-/// One sample's frozen context entering `first_layer`.
-struct SeqCtx {
-    h_in: Vec<f32>,
-    cos: Vec<f32>,
-    sin: Vec<f32>,
-    tokens: Vec<u32>,
-    completion_start: usize,
-    seq_len: usize,
-}
-
-enum MixerCache {
-    Gqa(Box<AttnCache>),
-    Gdn(Box<GdnSaved>),
-}
-
-/// Saved forward activations for one materialised layer.
-struct LayerFwd {
-    h_layer_in: Vec<f32>, // [seq*hidden] residual entering the layer (pre-norm input)
-    inv_pre: Vec<f32>,    // [seq] pre-norm inv_rms per position
-    mixer: MixerCache,
-    h_mid: Vec<f32>,         // [seq*hidden] residual after mixer (post-norm input)
-    inv_ffn: Vec<f32>,       // [seq] post-norm inv_rms per position
-    gate_pre: Vec<Vec<f32>>, // seq × [inter]
-    up_pre: Vec<Vec<f32>>,   // seq × [inter]
-}
-
-/// Per completion source-position head intermediates.
-struct HeadPos {
-    t: usize,
-    target: u32,
-    logits: Vec<f32>,
-    inv_final: f32,
-}
-
-struct FullFwd {
-    layers: Vec<LayerFwd>,
-    h_final: Vec<f32>, // [seq*hidden] residual entering the head
-    positions: Vec<HeadPos>,
-}
-
-fn lm_head_logits(lm_head: &[f32], final_normed: &[f32], hidden: usize, vocab: usize) -> Vec<f32> {
-    let mut logits = vec![0.0f32; vocab];
-    for (i, l) in logits.iter_mut().enumerate() {
-        *l = lm_head[i * hidden..(i + 1) * hidden]
-            .iter()
-            .zip(final_normed.iter())
-            .map(|(w, x)| w * x)
-            .sum();
-    }
-    logits
-}
-
-/// Shifted RMSNorm over a full sequence; returns (normed [seq*hidden], inv [seq]).
-fn rmsnorm_seq(
-    h: &[f32],
-    shift: &[f32],
-    hidden: usize,
-    seq: usize,
-    eps: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let mut normed = vec![0.0f32; seq * hidden];
-    let mut inv = vec![0.0f32; seq];
-    for t in 0..seq {
-        let (n, iv) = rms_norm_forward(&h[t * hidden..(t + 1) * hidden], shift, eps);
-        normed[t * hidden..(t + 1) * hidden].copy_from_slice(&n);
-        inv[t] = iv;
-    }
-    (normed, inv)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn forward_full(
-    ctx: &SeqCtx,
-    layers: &[LayerW],
-    loras: &[LoraParams],
-    head: &Head,
-    d: &Dims,
-    gdn_dims: &GdnDims,
-    cfg: &Qwen35Config,
-    rank: usize,
-    scale: f32,
-) -> FullFwd {
-    let hidden = d.hidden;
-    let seq = ctx.seq_len;
-    let mut h = ctx.h_in.clone();
-    let mut layers_fwd: Vec<LayerFwd> = Vec::with_capacity(layers.len());
-
-    for lw in layers {
-        let h_layer_in = h.clone();
-        let (normed_pre, inv_pre) = rmsnorm_seq(&h, &lw.pre_shift, hidden, seq, d.eps);
-
-        let (mixer_out, mixer_cache) = match lw.kind {
-            MixerKind::Gqa => {
-                let lora = &loras[lw.lora_slot.expect("GQA layer must have a LoRA slot")];
-                let (out, cache) = gqa_forward_with_cache(
-                    &normed_pre,
-                    lw.w_q,
-                    lw.w_k,
-                    lw.w_v,
-                    lw.w_o,
-                    lw.q_norm,
-                    lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
-                    seq,
-                    hidden,
-                    d.num_q_heads,
-                    d.num_kv_heads,
-                    d.head_dim,
-                    d.rope_dim,
-                    &ctx.cos,
-                    &ctx.sin,
-                    d.eps,
-                );
-                (out, MixerCache::Gqa(Box::new(cache)))
-            }
-            MixerKind::Gdn => {
-                let mut saved = GdnSaved::new(
-                    seq,
-                    gdn_dims.num_kh,
-                    gdn_dims.value_heads,
-                    gdn_dims.key_dim,
-                    gdn_dims.value_dim,
-                    hidden,
-                    gdn_dims.qkv_dim,
-                    gdn_dims.output_dim,
-                    gdn_dims.kernel_size,
-                    gdn_dims.scale,
-                    d.eps,
-                );
-                let mut out = vec![0.0f32; seq * hidden];
-                gdn_forward_save(
-                    &normed_pre,
-                    lw.gdn.expect("GDN layer must have GDN weights"),
-                    cfg,
-                    &mut saved,
-                    &mut out,
-                );
-                (out, MixerCache::Gdn(Box::new(saved)))
-            }
-        };
-
-        let mut h_mid = h_layer_in.clone();
-        for (a, b) in h_mid.iter_mut().zip(mixer_out.iter()) {
-            *a += *b;
-        }
-
-        let (normed_ffn, inv_ffn) = rmsnorm_seq(&h_mid, &lw.post_shift, hidden, seq, d.eps);
-        let mut gate_pre = Vec::with_capacity(seq);
-        let mut up_pre = Vec::with_capacity(seq);
-        let mut h_next = h_mid.clone();
-        for t in 0..seq {
-            let (ffn_out, gp, up) = swiglu_forward(
-                &normed_ffn[t * hidden..(t + 1) * hidden],
-                lw.w_gate,
-                lw.w_up,
-                lw.w_down,
-                hidden,
-                d.inter,
-            );
-            for (o, f) in h_next[t * hidden..(t + 1) * hidden]
-                .iter_mut()
-                .zip(ffn_out.iter())
-            {
-                *o += *f;
-            }
-            gate_pre.push(gp);
-            up_pre.push(up);
-        }
-
-        layers_fwd.push(LayerFwd {
-            h_layer_in,
-            inv_pre,
-            mixer: mixer_cache,
-            h_mid,
-            inv_ffn,
-            gate_pre,
-            up_pre,
-        });
-        h = h_next;
-    }
-
-    // Head at completion source positions [completion_start-1, seq-1).
-    let mut positions = Vec::new();
-    for t in (ctx.completion_start - 1)..seq - 1 {
-        let (final_normed, inv_final) =
-            rms_norm_forward(&h[t * hidden..(t + 1) * hidden], head.final_shift, d.eps);
-        let logits = lm_head_logits(head.lm_head, &final_normed, hidden, d.vocab);
-        positions.push(HeadPos {
-            t,
-            target: ctx.tokens[t + 1],
-            logits,
-            inv_final,
-        });
-    }
-
-    FullFwd {
-        layers: layers_fwd,
-        h_final: h,
-        positions,
-    }
-}
-
-/// CE NLL for one position's logits against `target` (numerically stable).
-fn position_nll(logits: &[f32], target: u32) -> f32 {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum_exp: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();
-    let log_prob = (logits[target as usize] - max) as f64 - sum_exp.ln();
-    (-log_prob) as f32
-}
-
-#[allow(clippy::too_many_arguments)]
-fn eval_chain_nll(
-    caches: &[SeqCtx],
-    layers: &[LayerW],
-    loras: &[LoraParams],
-    head: &Head,
-    d: &Dims,
-    gdn_dims: &GdnDims,
-    cfg: &Qwen35Config,
-    rank: usize,
-    scale: f32,
-) -> f32 {
-    let mut nll_sum = 0.0f64;
-    let mut n = 0usize;
-    for ctx in caches {
-        let fwd = forward_full(ctx, layers, loras, head, d, gdn_dims, cfg, rank, scale);
-        for p in &fwd.positions {
-            nll_sum += position_nll(&p.logits, p.target) as f64;
-            n += 1;
-        }
-    }
-    (nll_sum / n.max(1) as f64) as f32
-}
-
-/// Full-depth backward over one sample. Returns (nll_sum, n_comp, per-slot grads).
-#[allow(clippy::too_many_arguments)]
-fn nll_and_grads(
-    fwd: &FullFwd,
-    layers: &[LayerW],
-    loras: &[LoraParams],
-    head: &Head,
-    d: &Dims,
-    num_slots: usize,
-    rank: usize,
-    scale: f32,
-) -> (f32, usize, Vec<Grads>) {
-    let hidden = d.hidden;
-    let seq = fwd.h_final.len() / hidden;
-    let n_comp = fwd.positions.len().max(1) as f32;
-    let mut grads: Vec<Grads> = (0..num_slots).map(|_| LoraParams::zeros(rank, d)).collect();
-
-    // ---- Head + CE backward ----
-    let mut d_h = vec![0.0f32; seq * hidden];
-    let mut nll_sum = 0.0f64;
-    for p in &fwd.positions {
-        nll_sum += position_nll(&p.logits, p.target) as f64;
-        let max = p.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f32 = p.logits.iter().map(|&l| (l - max).exp()).sum();
-        let mut d_logits = vec![0.0f32; d.vocab];
-        for (v, dl) in d_logits.iter_mut().enumerate() {
-            let prob = (p.logits[v] - max).exp() / sum_exp;
-            let indicator = if v == p.target as usize { 1.0 } else { 0.0 };
-            *dl = (prob - indicator) / n_comp;
-        }
-        let d_final = linear_vjp(head.lm_head, &d_logits, hidden, d.vocab);
-        let d_h_t = rmsnorm_backward(
-            &fwd.h_final[p.t * hidden..(p.t + 1) * hidden],
-            head.final_shift,
-            p.inv_final,
-            &d_final,
-        );
-        for (j, dv) in d_h_t.iter().enumerate() {
-            d_h[p.t * hidden + j] += *dv;
-        }
-    }
-
-    // ---- Layer backward, top → first ----
-    for li in (0..layers.len()).rev() {
-        let lw = &layers[li];
-        let lf = &fwd.layers[li];
-
-        // FFN backward (all positions). h_next = h_mid + ffn_out, so the residual
-        // skip seeds d_h_mid with d_h, and the FFN path adds onto it.
-        let mut d_h_mid = d_h.clone();
-        for t in 0..seq {
-            let d_ffn_out = &d_h[t * hidden..(t + 1) * hidden];
-            let (d_normed_ffn, _dm) = swiglu_backward(
-                d_ffn_out,
-                &lf.gate_pre[t],
-                &lf.up_pre[t],
-                lw.w_down,
-                lw.w_gate,
-                lw.w_up,
-                hidden,
-                d.inter,
-            );
-            let d_hm = rmsnorm_backward(
-                &lf.h_mid[t * hidden..(t + 1) * hidden],
-                &lw.post_shift,
-                lf.inv_ffn[t],
-                &d_normed_ffn,
-            );
-            for (j, dv) in d_hm.iter().enumerate() {
-                d_h_mid[t * hidden + j] += *dv;
-            }
-        }
-
-        // Mixer backward → d_normed_pre (grad w.r.t. the pre-attn-normed input).
-        // h_mid = h_layer_in + mixer_out, so d_mixer_out = d_h_mid.
-        let d_normed_pre: Vec<f32> = match &lf.mixer {
-            MixerCache::Gqa(cache) => {
-                let slot = lw.lora_slot.expect("GQA layer must have a LoRA slot");
-                let lora = &loras[slot];
-                let g = gqa_backward(
-                    &d_h_mid,
-                    cache,
-                    lw.w_q,
-                    lw.w_k,
-                    lw.w_v,
-                    lw.w_o,
-                    lw.q_norm,
-                    lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
-                );
-                grads[slot] = Grads {
-                    a_q: g.grad_a_q,
-                    b_q: g.grad_b_q,
-                    a_v: g.grad_a_v,
-                    b_v: g.grad_b_v,
-                };
-                g.dx
-            }
-            MixerCache::Gdn(saved) => {
-                let mut dx = vec![0.0f32; seq * hidden];
-                gdn_backward(
-                    &d_h_mid,
-                    saved,
-                    lw.gdn.expect("GDN layer must have GDN weights"),
-                    &mut dx,
-                );
-                dx
-            }
-        };
-
-        // Pre-norm backward. h_mid = h_layer_in + mixer_out → the residual skip
-        // seeds d_h_layer_in with d_h_mid; the mixer+norm path adds onto it.
-        let mut d_h_new = d_h_mid;
-        for t in 0..seq {
-            let d_hl = rmsnorm_backward(
-                &lf.h_layer_in[t * hidden..(t + 1) * hidden],
-                &lw.pre_shift,
-                lf.inv_pre[t],
-                &d_normed_pre[t * hidden..(t + 1) * hidden],
-            );
-            for (j, dv) in d_hl.iter().enumerate() {
-                d_h_new[t * hidden + j] += *dv;
-            }
-        }
-        d_h = d_h_new;
-    }
-
-    (nll_sum as f32, fwd.positions.len(), grads)
-}
-
-fn shifted(gamma: &[f32]) -> Vec<f32> {
-    gamma.iter().map(|g| 1.0 + g).collect()
-}
-
-/// xorshift small-random fill in [-amp, amp].
-fn rand_fill(rng: &mut u64, n: usize, amp: f32) -> Vec<f32> {
-    (0..n)
-        .map(|_| {
-            *rng ^= *rng << 13;
-            *rng ^= *rng >> 7;
-            *rng ^= *rng << 17;
-            ((*rng >> 32) as u32 as f32 / u32::MAX as f32 * 2.0 - 1.0) * amp
-        })
-        .collect()
 }
 
 /// Indices of the `k` entries with the largest |grad| — the most informative
@@ -932,7 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (every layer's shifted norms, GQA/GDN mixer, FFN, head) against the model.
     let zero_loras: Vec<LoraParams> = (0..num_slots)
         .map(|_| LoraParams::zeros(rank, &dims))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     {
         let s0 = &train_samples[0];
         let model_nlls = model.compute_token_nlls(&s0.tokens)?;
@@ -949,7 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &cfg,
             rank,
             scale,
-        );
+        )?;
         let diff = (model_masked - chain_masked).abs();
         println!(
             "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={diff:.2e}"
@@ -978,9 +484,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let fwd = forward_full(
             &caches[0], &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        );
+        )?;
         let (_, _, analytic) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale);
+            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale)?;
 
         println!("  fd-eps center {fd_eps:.0e}  (per-entry min over 0.25/0.5/1/2x)");
         let mut worst = 0.0f64;
@@ -1057,7 +563,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             rank,
                             scale,
-                        );
+                        )?;
                         bump(&mut loras, save - e);
                         let lm = eval_chain_nll(
                             &caches[..1],
@@ -1069,7 +575,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &cfg,
                             rank,
                             scale,
-                        );
+                        )?;
                         let fd = (lp - lm) / (2.0 * e);
                         let rel = (a - fd).abs() as f64 / (a.abs().max(fd.abs()).max(1e-6)) as f64;
                         best = best.min(rel);
@@ -1120,26 +626,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut adam = AdamState::new();
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
 
-    let eval_valid = |loras: &[LoraParams]| -> Option<f32> {
-        (!valid_caches.is_empty()).then(|| {
-            eval_chain_nll(
-                &valid_caches,
-                &layers,
-                loras,
-                &head,
-                &dims,
-                &gdn_dims,
-                &cfg,
-                rank,
-                scale,
-            )
-        })
+    let eval_valid = |loras: &[LoraParams]| -> Result<Option<f32>, Box<dyn std::error::Error>> {
+        if valid_caches.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(eval_chain_nll(
+            &valid_caches,
+            &layers,
+            loras,
+            &head,
+            &dims,
+            &gdn_dims,
+            &cfg,
+            rank,
+            scale,
+        )?))
     };
 
     let base_nll = eval_chain_nll(
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    );
-    let base_valid = eval_valid(&loras);
+    )?;
+    let base_valid = eval_valid(&loras)?;
     match base_valid {
         Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
         None => println!("\n  step    0  train NLL: {base_nll:.4}"),
@@ -1150,63 +657,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = &caches[(step - 1) % caches.len()];
         let fwd = forward_full(
             ctx, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        );
+        )?;
         let (_nll, _n, grads) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale);
+            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale)?;
 
-        for slot in 0..num_slots {
-            let li = slot_layers[slot];
-            adam.step(
-                &format!("l{li}_a_q"),
-                &mut loras[slot].a_q,
-                &grads[slot].a_q,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_b_q"),
-                &mut loras[slot].b_q,
-                &grads[slot].b_q,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_a_v"),
-                &mut loras[slot].a_v,
-                &grads[slot].a_v,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-            adam.step(
-                &format!("l{li}_b_v"),
-                &mut loras[slot].b_v,
-                &grads[slot].b_v,
-                lr,
-                beta1,
-                beta2,
-                eps_adam,
-                0.0,
-                false,
-            );
-        }
+        apply_adam_updates(
+            &mut adam,
+            &mut loras,
+            &grads,
+            &slot_layers,
+            lr,
+            beta1,
+            beta2,
+            eps_adam,
+        );
 
         if step % log_every == 0 || step == steps {
             let mean_nll = eval_chain_nll(
                 &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-            );
-            match eval_valid(&loras) {
+            )?;
+            match eval_valid(&loras)? {
                 Some(v) => println!(
                     "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
                     mean_nll - base_nll
@@ -1221,9 +691,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let final_nll = eval_chain_nll(
         &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    );
+    )?;
     let secs = tstep.elapsed().as_secs_f64();
-    match (base_valid, eval_valid(&loras)) {
+    match (base_valid, eval_valid(&loras)?) {
         (Some(b), Some(f)) => println!(
             "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
             final_nll - base_nll,
