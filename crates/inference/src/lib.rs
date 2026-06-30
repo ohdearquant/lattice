@@ -51,6 +51,7 @@ pub mod quant;
 pub mod rope;
 pub mod sampling;
 pub mod speculative;
+pub mod stop_reason;
 
 #[cfg(feature = "train-backward")]
 pub mod backward;
@@ -76,6 +77,7 @@ pub use crate::model::{
     BertConfig, BertModel, CrossEncoderModel, LayerTimings, ProfileTimings, QwenConfig, QwenModel,
 };
 pub use crate::pool::BertPooling;
+pub use crate::stop_reason::StopReason;
 pub use crate::tokenizer::{
     BpeTokenizer, SentencePieceTokenizer, TokenizedInput, Tokenizer, WordPieceTokenizer,
     load_tokenizer,

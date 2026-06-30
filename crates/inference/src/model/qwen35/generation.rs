@@ -9,6 +9,7 @@ use crate::grammar::pda::GrammarState;
 use crate::model::qwen35_config::{
     GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
 };
+use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
 
 impl Qwen35Model {
@@ -40,6 +41,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
                 stopped: false,
+                stop_reason: Some(StopReason::Length),
             });
         }
 
@@ -127,6 +129,7 @@ impl Qwen35Model {
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: Some(StopReason::Grammar),
                 });
             }
         }
@@ -138,6 +141,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
                 stopped: true,
+                stop_reason: Some(StopReason::Eos),
             });
         }
 
@@ -160,7 +164,7 @@ impl Qwen35Model {
         if gen_cfg.stop_strings.is_empty() {
             // Fast path: no string-level stops. Behaviour byte-for-byte identical
             // to before this feature was added; the e2e-parity CI gate pins this.
-            let stopped = decode_loop(
+            let (stopped, loop_stop_reason) = decode_loop(
                 self,
                 gen_cfg,
                 &mut all_ids,
@@ -182,6 +186,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(loop_stop_reason),
             })
         } else {
             // String-stop path: accumulate decoded text and check after every token.
@@ -200,10 +205,11 @@ impl Qwen35Model {
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                     stopped: true,
+                    stop_reason: Some(StopReason::Eos),
                 });
             }
 
-            let stopped = decode_loop_with_stops(
+            let (stopped, loop_stop_reason) = decode_loop_with_stops(
                 self,
                 gen_cfg,
                 &mut all_ids,
@@ -225,6 +231,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(loop_stop_reason),
             })
         }
     }
@@ -265,6 +272,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
                 stopped: false,
+                stop_reason: Some(StopReason::Length),
             });
         }
 
@@ -335,6 +343,7 @@ impl Qwen35Model {
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: Some(StopReason::Grammar),
                 });
             }
         }
@@ -346,6 +355,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
                 stopped: true,
+                stop_reason: Some(StopReason::Eos),
             });
         }
 
@@ -382,6 +392,7 @@ impl Qwen35Model {
             }
 
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
             // Decode loop (mirrors decode_loop free function exactly).
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
@@ -437,6 +448,7 @@ impl Qwen35Model {
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
                         stopped = true;
+                        stop_reason = StopReason::Grammar;
                         break;
                     }
                 }
@@ -448,6 +460,7 @@ impl Qwen35Model {
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
 
@@ -484,6 +497,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             })
         } else {
             // String-stop path: use StopStreamer to hold back (max_stop - 1) bytes and
@@ -500,10 +514,12 @@ impl Qwen35Model {
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                     stopped: true,
+                    stop_reason: Some(StopReason::Eos),
                 });
             }
 
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
             // Decode loop for the string-stop path.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
@@ -557,6 +573,7 @@ impl Qwen35Model {
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
                         stopped = true;
+                        stop_reason = StopReason::Grammar;
                         break;
                     }
                 }
@@ -568,6 +585,7 @@ impl Qwen35Model {
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
 
@@ -581,6 +599,7 @@ impl Qwen35Model {
                 let delta = detok.push(&self.tokenizer, next_id);
                 if streamer.push(&delta, &mut on_token) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
 
@@ -595,7 +614,10 @@ impl Qwen35Model {
             // Natural-end flush (no-op if a stop was already hit inside the loop).
             streamer.finish(&detok.finish(), &mut on_token);
             // finish() may itself complete a stop in the tail bytes.
-            stopped |= streamer.stopped;
+            if streamer.stopped && !stopped {
+                stopped = true;
+                stop_reason = StopReason::Eos;
+            }
 
             Ok(GenerateOutput {
                 text: streamer.into_text(),
@@ -603,6 +625,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             })
         }
     }
@@ -780,7 +803,7 @@ fn decode_loop(
     grammar_state: &mut Option<GrammarState>,
     think_close_id: Option<u32>,
     thinking_closed_seed: bool,
-) -> Result<bool, InferenceError> {
+) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut thinking_closed = thinking_closed_seed;
     let mut reasoning_end_len: Option<usize> = if thinking_closed {
@@ -832,7 +855,7 @@ fn decode_loop(
         // override); a false return signals grammar completion.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
             if !engine.advance(gs, next_id) {
-                return Ok(true);
+                return Ok((true, StopReason::Grammar));
             }
         }
 
@@ -842,7 +865,7 @@ fn decode_loop(
         }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
-            return Ok(true);
+            return Ok((true, StopReason::Eos));
         }
 
         generated_ids.push(next_id);
@@ -859,7 +882,7 @@ fn decode_loop(
             }
         }
     }
-    Ok(false)
+    Ok((false, StopReason::Length))
 }
 
 /// String-stop variant of `decode_loop`. Called only when `gen_cfg.stop_strings` is non-empty.
@@ -886,9 +909,10 @@ fn decode_loop_with_stops(
     grammar_state: &mut Option<GrammarState>,
     think_close_id: Option<u32>,
     thinking_closed_seed: bool,
-) -> Result<bool, InferenceError> {
+) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
+    let mut stop_reason = StopReason::Length;
     let mut thinking_closed = thinking_closed_seed;
     let mut reasoning_end_len: Option<usize> = if thinking_closed {
         Some(generated_ids.len())
@@ -940,6 +964,7 @@ fn decode_loop_with_stops(
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
             if !engine.advance(gs, next_id) {
                 stopped = true;
+                stop_reason = StopReason::Grammar;
                 break;
             }
         }
@@ -951,6 +976,7 @@ fn decode_loop_with_stops(
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
+            stop_reason = StopReason::Eos;
             break;
         }
 
@@ -969,6 +995,7 @@ fn decode_loop_with_stops(
         if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
             full.truncate(hit);
             stopped = true;
+            stop_reason = StopReason::Eos;
             break;
         }
 
@@ -989,12 +1016,12 @@ fn decode_loop_with_stops(
             // The tail itself might complete a stop string.
             if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
                 full.truncate(hit);
-                return Ok(true);
+                return Ok((true, StopReason::Eos));
             }
         }
-        return Ok(false);
+        return Ok((false, StopReason::Length));
     }
-    Ok(true)
+    Ok((stopped, stop_reason))
 }
 
 /// Returns the smallest byte index in `haystack` at which any stop string begins,
@@ -1549,5 +1576,253 @@ mod tests {
         streamer.finish("should_not_appear", &mut |s| emitted.push(s.to_string()));
         assert_eq!(emitted.join(""), "hello");
         assert_eq!(streamer.into_text(), "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // StopReason mutation-sensitive tests (#456)
+    // -----------------------------------------------------------------------
+    //
+    // Each test exercises one specific code path that sets stop_reason and
+    // asserts the exact variant. If the wrong variant is assigned at that
+    // site, the assertion fails — proving the assignment is load-bearing.
+    //
+    // Build helper: all-zero weights → all logits == 0.0 after any forward
+    // pass → greedy sampling always picks token 0 (first-wins on equal logits).
+    // This gives deterministic sampling without relying on random-weight outputs.
+
+    fn build_tiny_zero_model() -> Qwen35Model {
+        use crate::attention::gdn::GatedDeltaNetWeights;
+        use crate::lora_hook::NoopLoraHook;
+        use crate::model::qwen35::{
+            AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
+            FullAttentionLayerWeights, ModelWeights,
+        };
+        use crate::model::qwen35_config::{LayerType, compute_layer_types};
+        use crate::rope::RopeTable;
+        use crate::tokenizer::bpe::BpeTokenizer;
+
+        const H: usize = 64;
+        const VOCAB: usize = 97;
+        const I: usize = 128;
+        const NUM_LAYERS: usize = 4;
+        const FULL_INTERVAL: usize = 4;
+        const HEAD_DIM: usize = 16;
+        const LINEAR_KH: usize = 4;
+        const KERNEL: usize = 4;
+
+        let cfg = Qwen35Config {
+            hidden_size: H,
+            num_hidden_layers: NUM_LAYERS,
+            vocab_size: VOCAB,
+            intermediate_size: I,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: HEAD_DIM,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            rope_parameters: None,
+            linear_num_key_heads: LINEAR_KH,
+            linear_num_value_heads: Some(LINEAR_KH),
+            linear_key_head_dim: HEAD_DIM,
+            linear_value_head_dim: HEAD_DIM,
+            linear_conv_kernel_dim: KERNEL,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: FULL_INTERVAL,
+            layer_types: compute_layer_types(NUM_LAYERS, FULL_INTERVAL),
+            layer_mask: vec![true; NUM_LAYERS],
+            eos_token_id: (VOCAB - 1) as u32,
+            max_position_embeddings: 1024,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let z = |len: usize| vec![0.0_f32; len];
+        let qkv_dim = cfg.linear_qkv_dim();
+        let out_dim = cfg.linear_output_dim();
+        let q_dim = cfg.full_q_dim();
+        let kv_dim = cfg.full_kv_dim();
+
+        let mut layers = Vec::with_capacity(NUM_LAYERS);
+        for lt in &cfg.layer_types {
+            let common = CommonLayerWeights {
+                input_layernorm: z(H),
+                post_attention_layernorm: z(H),
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: z(I * H),
+                    up_proj: z(I * H),
+                    down_proj: z(H * I),
+                }),
+            };
+            let attn = match lt {
+                LayerType::LinearAttention => AttentionWeights::Linear(GatedDeltaNetWeights {
+                    in_proj_qkv: z(qkv_dim * H),
+                    in_proj_qkv_rows: qkv_dim,
+                    in_proj_qkv_cols: H,
+                    in_proj_z: z(out_dim * H),
+                    in_proj_z_rows: out_dim,
+                    in_proj_z_cols: H,
+                    in_proj_b: z(LINEAR_KH * H),
+                    in_proj_b_rows: LINEAR_KH,
+                    in_proj_b_cols: H,
+                    in_proj_a: z(LINEAR_KH * H),
+                    in_proj_a_rows: LINEAR_KH,
+                    in_proj_a_cols: H,
+                    a_log: z(LINEAR_KH),
+                    dt_bias: z(LINEAR_KH),
+                    conv1d_weight: z(qkv_dim * KERNEL),
+                    conv_dim: qkv_dim,
+                    kernel_size: KERNEL,
+                    norm_weight: z(out_dim),
+                    out_proj: z(H * out_dim),
+                    out_proj_rows: H,
+                    out_proj_cols: out_dim,
+                }),
+                LayerType::FullAttention => AttentionWeights::Full(FullAttentionLayerWeights {
+                    q_proj: z(2 * q_dim * H),
+                    k_proj: z(kv_dim * H),
+                    v_proj: z(kv_dim * H),
+                    o_proj: z(H * q_dim),
+                    q_norm: z(HEAD_DIM),
+                    k_norm: z(HEAD_DIM),
+                }),
+            };
+            layers.push((attn, common));
+        }
+
+        let tok_json = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
+}"#;
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
+        let rope = RopeTable::new(
+            cfg.rope_dim(),
+            cfg.max_position_embeddings.min(8192),
+            cfg.rope_theta,
+        );
+
+        Qwen35Model {
+            config: cfg.clone(),
+            weights: ModelWeights {
+                embed_tokens: z(VOCAB * H),
+                lm_head: None,
+                final_norm: z(H),
+                layers,
+            },
+            tokenizer,
+            rope,
+            lora: Box::new(NoopLoraHook),
+        }
+    }
+
+    /// `max_new_tokens == 0` must set `stop_reason = Some(StopReason::Length)` on the
+    /// early-return path that fires before any forward pass or token sampling.
+    ///
+    /// Mutation sensitivity: changing `StopReason::Length` in the `max_new_tokens == 0`
+    /// guard to any other variant causes `assert_eq!(stop_reason, ...)` to fail.
+    #[test]
+    fn stop_reason_length_on_zero_max_tokens() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 0,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("zero-token generate must succeed");
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Length),
+            "max_new_tokens == 0 must return StopReason::Length; got {:?}",
+            result.stop_reason
+        );
+        assert_eq!(
+            result.generated_tokens, 0,
+            "zero max_new_tokens must produce no tokens"
+        );
+    }
+
+    /// First sampled token matching a `stop_token_ids` entry must set
+    /// `stop_reason = Some(StopReason::Eos)` on the early-return path.
+    ///
+    /// Zero-weight model → all logits == 0.0 → greedy picks token 0 (first-wins on ties).
+    /// `stop_token_ids = [0]` causes `should_stop_token` to fire on the first decode step.
+    ///
+    /// Mutation sensitivity: changing `StopReason::Eos` at the `should_stop_token` return
+    /// site to any other variant causes `assert_eq!(stop_reason, Some(StopReason::Eos))` to fail.
+    #[test]
+    fn stop_reason_eos_on_first_stop_token() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            stop_token_ids: vec![0], // token 0 is greedy-sampled with all-zero logits
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("eos-on-first-token generate must succeed");
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Eos),
+            "stop_token_ids match on first token must return StopReason::Eos; got {:?}",
+            result.stop_reason
+        );
+    }
+
+    /// Grammar `advance` returning `false` on the first sampled token must set
+    /// `stop_reason = Some(StopReason::Grammar)`.
+    ///
+    /// Mechanism: the grammar engine has vocab_size = 1 (["t"]). `mask_logits` blocks
+    /// token 0 ("t"); tokens 1..96 (beyond grammar vocab_size) stay at 0.0 and are
+    /// finite. Greedy picks token 1. `advance(1)`: 1 >= grammar.vocab_size (1) → `false`.
+    ///
+    /// Mutation sensitivity: changing `StopReason::Grammar` at the `advance`-returns-false
+    /// return site to any other variant causes the assertion to fail.
+    #[test]
+    fn stop_reason_grammar_on_advance_false() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::sync::Arc;
+
+        let model = build_tiny_zero_model();
+
+        // vocab = ["t"] (size 1). Grammar root ::= "x" blocks token 0 via mask;
+        // tokens 1..96 remain finite. Greedy picks token 1. advance(1): 1 >= 1 → false.
+        let spec = GrammarSpec::Gbnf("root ::= \"x\"\n".to_string());
+        let vocab = vec![b"t".to_vec()];
+        let engine =
+            Arc::new(GrammarEngine::new(&spec, vocab).expect("single-token grammar compiles"));
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            grammar: Some(engine),
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("grammar-advance-false generate must succeed");
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Grammar),
+            "grammar advance returning false must return StopReason::Grammar; got {:?}",
+            result.stop_reason
+        );
     }
 }

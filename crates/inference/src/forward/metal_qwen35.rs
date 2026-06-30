@@ -40,6 +40,7 @@ mod inner {
     use crate::model::qwen35_config::{
         GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
     };
+    use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
     use crate::weights::q4_weights::quantize_row_q4_0;
@@ -9078,6 +9079,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: Some(StopReason::Length),
                 };
             }
 
@@ -9104,6 +9106,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
                     stopped: true,
+                    stop_reason: Some(StopReason::Eos),
                 };
             }
 
@@ -9111,12 +9114,14 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut pending_token = pending_first;
             let mut metrics = MetalMtpDecodeMetrics::default();
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
 
             while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
                 if pos >= self.session.kv_cache.max_cache_len.saturating_sub(2) {
                     // Not enough room for 2 more tokens — flush pending and stop.
                     generated_ids.push(pending_token);
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
 
@@ -9224,6 +9229,9 @@ kernel void gdn_chunk_norm_silu_c32(
                         // The stop token is the last element of `tokens`; it is a real stop
                         // only if it was emitted, not clipped off by the remaining budget.
                         stopped = emit_len == tokens.len();
+                        if stopped {
+                            stop_reason = StopReason::Eos;
+                        }
                         break;
                     }
                     super::MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
@@ -9272,6 +9280,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             }
         }
 
@@ -9304,6 +9313,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: Some(StopReason::Length),
                 };
             }
 
@@ -9331,6 +9341,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 1,
                     stopped: true,
+                    stop_reason: Some(StopReason::Eos),
                 };
             }
 
@@ -9338,11 +9349,13 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut pending_token = pending_first;
             let mut metrics = SelfSpecMetrics::default();
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
 
             'round: while generated_ids.len() < gen_cfg.max_new_tokens {
                 let pos = self.session.kv_cache.seq_len;
                 if pos + SELF_SPEC_MAX_DRAFT + 1 >= self.session.kv_cache.max_cache_len {
                     generated_ids.push(pending_token);
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
 
@@ -9369,6 +9382,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                             stopped = true;
+                            stop_reason = StopReason::Eos;
                         }
                         break;
                     }
@@ -9394,6 +9408,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                             stopped = true;
+                            stop_reason = StopReason::Eos;
                         }
                         break;
                     }
@@ -9452,6 +9467,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next);
                             stopped = true;
+                            stop_reason = StopReason::Eos;
                         }
                         break;
                     }
@@ -9488,6 +9504,7 @@ kernel void gdn_chunk_norm_silu_c32(
                             // slot) terminates generation; break the outer round, not just
                             // the inner draft loop, and record the stop.
                             stopped = true;
+                            stop_reason = StopReason::Eos;
                             break 'round;
                         }
                     } else {
@@ -9507,6 +9524,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         if generated_ids.len() < gen_cfg.max_new_tokens {
                             generated_ids.push(next_token);
                             stopped = true;
+                            stop_reason = StopReason::Eos;
                         }
                         break;
                     }
@@ -9533,6 +9551,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     if generated_ids.len() < gen_cfg.max_new_tokens {
                         generated_ids.push(next_pending);
                         stopped = true;
+                        stop_reason = StopReason::Eos;
                     }
                     break;
                 }
@@ -9563,6 +9582,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             }
         }
 
@@ -9608,6 +9628,21 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: None,
+                };
+            }
+
+            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+            // so we never emit a token the caller did not ask for. Mirrors the CPU
+            // generate() guard (model::qwen35::generation) and generate_streaming below.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
                 };
             }
 
@@ -9622,6 +9657,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
+                    stop_reason: Some(StopReason::KvFull),
                 };
             }
 
@@ -9717,6 +9753,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
                         stopped: false,
+                        stop_reason: Some(StopReason::Grammar),
                     };
                 }
             }
@@ -9736,6 +9773,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
+                    stop_reason: Some(StopReason::Eos),
                 };
             }
 
@@ -9751,8 +9789,10 @@ kernel void gdn_chunk_norm_silu_c32(
 
             // Autoregressive decode
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
             for _ in 1..gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
                 let pos = self.session.kv_cache.seq_len;
@@ -9785,18 +9825,21 @@ kernel void gdn_chunk_norm_silu_c32(
                 // Advance grammar state after sampling.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
+                        stop_reason = StopReason::Grammar;
                         break;
                     }
                 }
 
                 if is_stop(next_id) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
             }
@@ -9815,6 +9858,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             }
         }
 
@@ -9873,6 +9917,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: None,
                 });
             }
 
@@ -10021,6 +10066,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: visual_tokens,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: None,
                 });
             }
 
@@ -10028,9 +10074,11 @@ kernel void gdn_chunk_norm_silu_c32(
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
             let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
             let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
             if is_stop(first_id) {
                 stopped = true;
+                stop_reason = StopReason::Eos;
             } else {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
@@ -10040,11 +10088,13 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut pos = visual_tokens + text_ids.len();
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
                 let last_token = *all_ids.last().unwrap_or(&cfg.eos_token_id);
                 if is_stop(last_token) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
                 let step_logits = self.forward_step(last_token, pos);
@@ -10052,6 +10102,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
                 generated_ids.push(next_id);
@@ -10065,6 +10116,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             })
         }
 
@@ -13491,6 +13543,22 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
+                    stop_reason: None,
+                };
+            }
+
+            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+            // so we never emit a token the caller did not ask for, and on_token is never
+            // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
+            // and the generate() guard above.
+            if gen_cfg.max_new_tokens == 0 {
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
                 };
             }
 
@@ -13509,6 +13577,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
+                    stop_reason: Some(StopReason::KvFull),
                 };
             }
 
@@ -13574,6 +13643,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
                         stopped: false, // grammar constraint, not an OpenAI stop condition
+                        stop_reason: Some(StopReason::Grammar),
                     };
                 }
             }
@@ -13593,6 +13663,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true, // EOS/stop-token hit immediately after prefill
+                    stop_reason: Some(StopReason::Eos),
                 };
             }
 
@@ -13629,16 +13700,19 @@ kernel void gdn_chunk_norm_silu_c32(
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                     stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
                 };
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
+            let mut stop_reason = StopReason::Length;
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
             for _ in 1..cap {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
                 let pos = self.session.kv_cache.seq_len;
@@ -13681,6 +13755,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     if !engine.advance(gs, next_id) {
+                        stop_reason = StopReason::Grammar;
                         break;
                     }
                 }
@@ -13692,6 +13767,7 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 if is_stop(next_id) {
                     stopped = true;
+                    stop_reason = StopReason::Eos;
                     break;
                 }
 
@@ -13706,9 +13782,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() && !on_token(&delta, next_id) {
                     stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
@@ -13730,6 +13808,12 @@ kernel void gdn_chunk_norm_silu_c32(
             if !stopped_by_caller {
                 let tail = detok.finish();
                 if !tail.is_empty() {
+                    // This flush emits the residual incomplete-UTF-8 bytes of the
+                    // already-generated final token, not a new generation step —
+                    // generation has already terminated for the stop_reason decided
+                    // above. A late cancel here (return value intentionally unused)
+                    // does not change why generation stopped, so treating it as
+                    // Interrupt would misattribute the stop cause to this flush.
                     on_token(&tail, last_pushed_id);
                 }
             }
@@ -13740,6 +13824,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
+                stop_reason: Some(stop_reason),
             }
         }
 
@@ -18916,6 +19001,256 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// Single-character vocabulary covering every id in `tiny_hybrid_fixture`'s
+        /// 32-token vocab, so any sampled id round-trips through both the BPE
+        /// encoder (for prompt text) and decoder (for streamed output) without
+        /// landing on an out-of-vocab fallback. Unlike `minimal_bpe_tokenizer`,
+        /// every entry is exactly one character: with no merge rules, `bpe_merge`
+        /// never combines characters, so only single-character vocab keys are
+        /// reachable on the encode side.
+        fn single_char_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
+            use std::collections::HashMap;
+            let mut vocab: HashMap<String, u32> = HashMap::new();
+            for i in 0u32..32 {
+                let byte = if i < 26 {
+                    b'a' + i as u8
+                } else {
+                    b'A' + (i - 26) as u8
+                };
+                vocab.insert((byte as char).to_string(), i);
+            }
+            crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                .expect("single-char vocab tokenizer build")
+        }
+
+        /// `generate`'s prompt-too-long preflight (`prompt_len > max_context()`) must
+        /// report `StopReason::KvFull` rather than the default `Length`, so callers
+        /// can distinguish "rejected for exceeding the cache" from "ran out of
+        /// generation budget".
+        #[test]
+        fn stop_reason_kv_full_on_tight_cache() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            // max_cache_len=4 is smaller than the 8-token prompt below, so the
+            // length preflight must trip before any prefill/decode work happens.
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny hybrid fixture");
+
+            let out = state.generate("abcdefgh", &tokenizer, &gen_cfg);
+
+            assert_eq!(
+                out.generated_tokens, 0,
+                "the length preflight must bail before generating any tokens"
+            );
+            assert!(
+                out.stopped,
+                "prompt-too-long preflight must report stopped=true"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::KvFull),
+                "prompt longer than max_context must report KvFull, got {:?}",
+                out.stop_reason
+            );
+        }
+
+        /// `generate_streaming` must report `StopReason::Interrupt` (not the default
+        /// `Length`) when the caller's callback returns `false` on the first
+        /// non-empty delta, and must not flush a trailing detokenizer tail after the
+        /// caller has stopped consuming the stream.
+        #[test]
+        fn stop_reason_interrupt_on_stream_callback_false() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 8,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Push eos_token_id out of the model's reachable output range (vocab_size
+            // 32) so the prefill-sampled token can never be mistaken for an
+            // immediate-EOS exit; this test only cares about the callback-interrupt
+            // path, not which token greedy sampling happens to pick.
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut calls = 0u32;
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                calls += 1;
+                assert!(
+                    !delta.is_empty(),
+                    "on_token must only be invoked with a non-empty delta"
+                );
+                false
+            });
+
+            assert_eq!(
+                calls, 1,
+                "callback must fire exactly once (the interrupting call); a second \
+                 call would mean a trailing tail flush ran after interruption"
+            );
+            assert!(
+                !out.stopped,
+                "caller-interrupted generation is not an OpenAI stop condition"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "callback returning false must report Interrupt, got {:?}",
+                out.stop_reason
+            );
+        }
+
+        /// `generate`'s `max_new_tokens == 0` guard must return before the prefill
+        /// token is ever pushed into the output, matching the CPU `generate()`
+        /// contract (model::qwen35::generation): zero tokens, `StopReason::Length`.
+        ///
+        /// Mutation sensitivity: without the guard, `generate` samples the prefill
+        /// token from `prefill_logits` and pushes it into `generated_ids` before the
+        /// (empty, since `1..0` has no elements) decode loop runs, so
+        /// `generated_tokens` would be 1 instead of 0. `eos_token_id` is pushed out
+        /// of the reachable vocab range so this holds regardless of which token
+        /// greedy sampling picks at prefill.
+        #[test]
+        fn metal_generate_zero_budget_reports_length() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let out = state.generate("a", &tokenizer, &gen_cfg);
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "max_new_tokens == 0 must report Length, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "max_new_tokens == 0 must produce no tokens, got {}",
+                out.generated_tokens
+            );
+        }
+
+        /// `generate_streaming`'s `max_new_tokens == 0` guard must return before the
+        /// prefill token is sampled, pushed, or streamed, matching the CPU
+        /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
+        /// `StopReason::Length`, and `on_token` never invoked.
+        ///
+        /// Mutation sensitivity: without the guard, `generate_streaming` samples the
+        /// prefill token, pushes it into `generated_ids`, and feeds its delta to
+        /// `on_token` before the (empty, since `decode_cap(None, 0) == 0` makes
+        /// `1..0` have no elements) decode loop runs, so `generated_tokens` would be
+        /// 1 and the callback would fire at least once instead of staying silent.
+        #[test]
+        fn metal_generate_streaming_zero_budget_reports_length() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut calls = 0u32;
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                calls += 1;
+                true
+            });
+
+            assert_eq!(
+                calls, 0,
+                "max_new_tokens == 0 must never invoke on_token, got {calls} call(s)"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "max_new_tokens == 0 must report Length, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "max_new_tokens == 0 must produce no tokens, got {}",
+                out.generated_tokens
+            );
+        }
+
         #[test]
         fn self_spec_pool_holds_one_slot_per_verify_token_plus_base() {
             let Some(_) = metal::Device::system_default() else {
@@ -20659,6 +20994,7 @@ impl MetalQwen35State {
             prompt_tokens: 0,
             generated_tokens: 0,
             stopped: false,
+            stop_reason: None,
         }
     }
 
