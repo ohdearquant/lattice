@@ -677,13 +677,8 @@ lattice_pruning.json        # method, sparsity stats
 - QuaRot (existing): `e754741e`
 - lattice-inference (existing): `6c0a97df`
 
-## Implementation status (2026-06-24)
+## Implementation status as of 2026-06-30
 
-Only the D2 ShortGPT block-influence scorer has shipped. `BlockInfluence` and
-`BlockInfluenceAccumulator` are implemented at `crates/inference/src/pruning.rs:62` and `121`.
-The `CalibrationObserver` trait (D1/P0), `Wanda` per-channel activation scorer, and `SliceGPT`
-PCA-rotation infrastructure are not present in source — `pruning.rs` module doc notes that
-`CalibrationObserver` and `ForwardCtx` hooks are "ADR-060 D1/P0 work (future PR)". Grep for
-`Wanda`, `SliceGPT`, and `CalibrationObserver` in `crates/` returns no type definitions. The
-`OrthogonalBasis` trait and `BasisKind` enum referenced in the ADR-044 Amendment are also not
-yet implemented (they are a design proposal).
+Partial shipment only. Shipped pieces are the D2-style block-influence scorer and layer-removal plumbing: `BlockInfluence`, `BlockInfluenceAccumulator`, `score_from_hidden_states`, Metal `LayerImportanceScore`, Metal `LayerPruningPlan`, `score_layer_importance`, and `Qwen35Config::apply_layer_mask`. These support scoring layer importance and applying a layer mask in memory.
+
+Still not shipped: D1 calibration observer / `ForwardCtx` hooks, the shared `LayerStats`/`CalibrationObserver` pipeline, D3 SliceGPT residual-width slicing, D4 Wanda/STADE per-channel scoring, D5 GQA head pruning, D6 SwiGLU FFN pruning, `PrunePlan` serialization, and the PPL-gated iterative pruning workflow. `CalibrationObserver` and `ForwardCtx` appear only as future-work comments; source searches for `Wanda`, `SliceGPT`, and `CalibrationObserver` find no implemented type definitions under `crates/`.

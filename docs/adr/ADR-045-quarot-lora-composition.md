@@ -216,8 +216,8 @@ When `quarot_seed` is `None` (unrotated Q4 base): skip rotation correction, uplo
 
 ### Risks
 
-1. **Adapter compatibility**: adapters trained on a different tokenizer / model revision won't match. Gate on config hash at load time.
-2. **Multi-adapter / MoLoRA**: this spec covers single-adapter injection. MoLoRA (mixture routing) is a v2 extension — the KG already has the W2-barycenter theory (`W2-Barycenter-Adapter-Blending`, `MoLoRA-W2-Covariance-Gap-Analysis`). The counter-rotation applies identically to each expert's A matrix.
+1. **Adapter compatibility**: adapters trained on a different tokenizer / model revision won't match. The governed manifest records `base_model_rev` and `tokenizer_rev`, and the loader fail-closes on status, bounded file size, SHA-256 mismatch, parse errors, rank/alpha/module/dimension validation; it does **not** yet compare base/tokenizer revisions or a config hash at load time.
+2. **Multi-adapter / MoLoRA**: a simple weighted decode-time mixture has shipped as a CPU pre-blend: `A_blend = vconcat(A_i)`, `B_blend = hconcat(w_i * B_i)`, then the existing single-adapter Metal path loads the rank-sum adapter. Learned/router mixture code is feature-gated behind `mixture`; W2-barycenter composition remains research background rather than the shipped blend path. The counter-rotation still applies to each expert's A matrix before/within composition.
 3. **Adapter rank explosion at Q4 precision**: the Q4 GEMV operates in reduced precision; the LoRA addition is f32/f16. This is actually *good* — the adapter delta is the high-precision correction on top of the quantized base. No precision loss on the personalization signal.
 4. **GDN layers**: Qwen3.5's GDN (Gated Delta Network) layers have `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`. If users target these with LoRA (uncommon but possible), the same counter-rotation logic applies — the plan already covers them.
 
@@ -257,7 +257,7 @@ Steps 1-4 complete. Prefill falls back to sequential when adapter active (no bat
 - ADR-043: LoRA serving verification (existing LoRA correctness framework)
 - KG: `LoRA-Low-Rank-Adaptation` (e916fb8b), `LoraAdapter` (2d2ee731), `LoraHook` (7668f8d9)
 - KG: `QuaRot (Ashkboos 2024)` (86ec6a4f) — now `status: implemented`
-- KG: `W2-Barycenter-Adapter-Blending` (e6a40019) — MoLoRA v2 extension
+- KG: `W2-Barycenter-Adapter-Blending` (e6a40019) — research background; shipped decode mixture uses weighted rank-sum CPU pre-blend, not W2 barycenter transport
 - Hu et al. 2021, "LoRA: Low-Rank Adaptation of Large Language Models", arXiv:2106.09685
 - Ashkboos et al. 2024, "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
 

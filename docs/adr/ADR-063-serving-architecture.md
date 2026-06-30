@@ -4,12 +4,11 @@
 **Date**: 2026-05-27
 **Crate**: lattice-inference (new `serve` module + unified binary)
 
-## Implementation status (2026-06-24)
+## Implementation status as of 2026-06-30
 
-Phase 1 batch scheduling infrastructure is implemented. `crates/inference/src/batch/` exists with
-`config.rs`, `mod.rs`, `scheduler.rs`, `sequence.rs`, and `worker.rs`. Phase 2 (HTTP server,
-OpenAI/Anthropic API compatibility, GPU worker pool) has not been built. There is no `serve` binary
-or HTTP listener in the codebase as of this date.
+Partially shipped. The dedicated `lattice_serve` binary now exists as a Metal/f16 OpenAI-compatible HTTP daemon with `/v1/chat/completions`, `/v1/models`, and `/health` routes. It owns one resident Metal worker, loads the model once, and resets Metal/KV state for each job, so warm-serve keeps weights resident while requests remain stateless. Serve-side DoS hardening clamps `reasoning_budget` and `max_tokens` to `MODEL_MAX_CONTEXT` before constructing `GenerateConfig` and before generation allocates `generated_ids`; grammar compilation also has cardinality/depth/property/state caps in the grammar module.
+
+Still not shipped from this ADR: the full unified `lattice` CLI product surface, model acquisition/registry, Anthropic `/v1/messages`, continuous batching scheduler integration, GPU worker pool, `response_format` exposure in `lattice_serve`, embeddings route, auth, metrics, and prefix/radix cache product behavior.
 **Research**: RQ-5 (`workspaces/20260527/05.md`, 1583 lines)
 **Issues**: #91 (CLI), #92 (daemon), #93 (OpenAI API), #94 (Anthropic API)
 **Depends on**: ADR-048 (Continuous Batching), ADR-046 (XGrammar Structured Output), ADR-047 (Paged KV Cache)
@@ -34,7 +33,7 @@ Lattice has zero product surface. There are 9 standalone binaries in `crates/inf
 | `qwen35_debug`     | Debug diagnostic for Qwen3.5-2B forward pass           |
 | `qwen35_generate`  | Text generation demo                                   |
 
-No unified CLI. No server. No HTTP handler. No API compatibility layer. A new user must `cargo run --release --bin chat_metal -- --model-dir /path/to/weights` to get a single chat response. There is no model acquisition, no model registry, no way to serve requests concurrently, and no way for external tools to talk to lattice over HTTP.
+At ADR authoring time there was no unified CLI, server, HTTP handler, or API compatibility layer. As of 2026-06-30, `lattice_serve` provides a Metal/f16 OpenAI-compatible HTTP daemon and `chat_metal --json --serve` provides warm resident-process request handling. The full unified CLI, model acquisition, model registry, Anthropic compatibility, concurrent scheduler integration, and broader product surface remain incomplete.
 
 ### Competitive landscape
 
@@ -50,7 +49,7 @@ Every competitor has `serve` as a first-class command:
 | **Candle**            | Rust           | Framework/library                                                                                        | CPU/CUDA/WASM       | Rust ML framework, safetensors, examples                                                                                       | More framework than polished LLM serving product                                                                                                                                                            |
 | **mistral.rs**        | Rust           | Strong: CLI run/serve, OpenAI API, quantization, Metal, multimodal, tool use, SDKs                       | Broad (CUDA+Metal)  | Nearest Rust competitor: zero-config HF loading, quantization breadth (GGUF/GPTQ/EXL2/HQQ), vision models, agent/tool features | Direct competitor; broader model+quant support. Lattice wedge: research-composable architecture (10 attn mechanisms, QuaRot, architecture search DSL), verified inference, Apple-Silicon-first optimization |
 | **Burn**              | Rust           | Framework (not LLM-serving product)                                                                      | CPU/CUDA/WASM/Metal | Type-safe Rust ML framework, auto-diff, training                                                                               | ML framework, not polished inference server; no LLM-specific serving features                                                                                                                               |
-| **lattice**           | Pure Rust      | **Currently missing**                                                                                    | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path                                 | Must add CLI/server/API immediately                                                                                                                                                                         |
+| **lattice**           | Pure Rust      | Dedicated Metal/f16 HTTP daemon shipped; unified CLI/product surface still incomplete                                            | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path                                 | Complete CLI/model registry/Anthropic/concurrency/product surface after the shipped OpenAI-compatible daemon                                                                                                  |
 
 ### Market validation for inference infrastructure
 
@@ -481,7 +480,7 @@ Responsibilities:
 
 3. **Model alias resolution**: `"model": "qwen3-0.6b-q4"` resolves through the model registry to the physical model path and metadata.
 
-4. **Response format dispatch**: `response_format: {"type": "json_object"}` activates the XGrammar engine (ADR-046) with a JSON grammar. `{"type": "json_schema", "json_schema": {...}}` converts the schema to a grammar. Unsupported features return `400 unsupported_schema_feature`.
+4. **Response format dispatch**: planned API behavior is that `response_format: {"type": "json_object"}` activates the XGrammar engine (ADR-046) with a JSON grammar, and `{"type": "json_schema", "json_schema": {...}}` converts the schema to a grammar. As of 2026-06-30, `lattice_serve` does not expose `response_format`; `build_cfg` sets `grammar: None`.
 
 ### D4: Inference scheduler
 
@@ -617,8 +616,8 @@ When `--spec ngram` or `--spec mtp` is set, the scheduler integrates with ADR-00
 | `stop`                                    | Implement. String or array of strings                                             |
 | `seed`                                    | Implement. Deterministic sampling when set                                        |
 | `response_format: {"type":"text"}`        | Default. Normal decoding                                                          |
-| `response_format: {"type":"json_object"}` | JSON grammar-constrained decoding (ADR-046)                                       |
-| `response_format: {"type":"json_schema"}` | Convert schema to grammar; `400` if unsupported features                          |
+| `response_format: {"type":"json_object"}` | Planned; grammar engine exists, but `lattice_serve` does not expose `response_format` as of 2026-06-30 |
+| `response_format: {"type":"json_schema"}` | Planned; JSON Schema compiler exists with fail-closed caps, but the serve request shape does not yet expose this field |
 | `tools`, `tool_choice`                    | Parse; v1 rejects with clear error unless model/template supports it              |
 | `logprobs`                                | Do not fake. Return `400 unsupported_feature`                                     |
 | `n > 1`                                   | Return `400` for v1                                                               |

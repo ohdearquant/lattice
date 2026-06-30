@@ -79,7 +79,7 @@ Define `LoraHook` as a **`Send + Sync` trait in `lattice-inference`** with a `No
 
 - Zero overhead in production builds with `NoopLoraHook` (no branch, no call, no memory access).
 - `platform/tune` can implement `LoraHook` with any rank decomposition without modifying the kernel.
-- Multiple adapters can be composed by chaining hooks.
+- Multiple adapters can be composed outside the hook by pre-blending compatible LoRA layer data into one rank-sum adapter before loading the existing single-adapter path; the hook itself still represents one adapter application.
 - The string-based module API is forward-compatible with new architectures.
 
 **Negative**:
