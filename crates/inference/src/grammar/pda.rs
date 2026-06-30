@@ -331,15 +331,33 @@ fn try_next_alt(
     // current alternative it is committed: switching it to a sibling alternative
     // — or popping it to switch an ancestor — would re-interpret the consumed
     // bytes as if they never existed, and this byte-level matcher has no input
-    // rewind. Reject instead. Because `mark_consumed` flags every frame on the
-    // stack at each byte match, any ancestor of a committed frame is committed
-    // too, so there is no clean alternative further up to back track into; a
-    // plain rejection here is both sound and complete. This is the guard whose
-    // absence over-accepted trailing commas (`[1,]`, `{"r":1,"o1":2,}`). It
-    // tracks byte consumption, not `sym_pos`, so a frame that only advanced past
-    // nullable nonterminals (e.g. an optional `ws` before a `,`) is NOT
-    // committed and still reaches its `ε` alternative below — which is what
-    // keeps `[]`, `[5]`, and `[1,2]` accepting (the over-rejection dual).
+    // rewind. Reject instead. `mark_consumed` flags every frame on the stack at
+    // each byte match, so any ancestor of a committed frame is committed too.
+    // This is the guard whose absence over-accepted trailing commas (`[1,]`,
+    // `{"r":1,"o1":2,}`). It tracks byte consumption, not `sym_pos`, so a frame
+    // that only advanced past nullable nonterminals (e.g. an optional `ws`
+    // before a `,`) is NOT committed and still reaches its `ε` alternative below
+    // — which is what keeps `[]`, `[5]`, and `[1,2]` accepting (the
+    // over-rejection dual).
+    //
+    // SOUNDNESS (no over-acceptance): rejecting here never admits invalid input.
+    // After a byte is consumed, escalating to an ancestor's sibling alternative
+    // could only re-interpret that already-consumed byte under a different rule;
+    // with no rewind, any acceptance it produced would be an over-accept, never
+    // a faithful parse. Refusing the switch is the correct direction.
+    //
+    // KNOWN LIMITATION (not complete; pre-existing, NOT introduced by #353): for
+    // grammars with shared-prefix sibling alternatives a faithful parse can
+    // genuinely need to switch siblings *after* consuming the shared prefix —
+    // e.g. enum `["foo","food"]`, where `"food"` requires the second member once
+    // `foo` is consumed. A no-rewind single-stack matcher cannot do this and
+    // over-REJECTS the longer member (verified byte-identical on origin/main —
+    // this guard neither causes nor fixes it). Over-rejection is the safe
+    // direction for constrained decoding (the model simply cannot emit one valid
+    // member; it never emits invalid output). Making shared-prefix alternatives
+    // complete needs ambiguity-preserving matching (a trie/NFA compiled form or
+    // parallel active stacks) and is out of scope here. See the
+    // `shared_prefix_enum_known_limitation` regression anchor in json_schema.rs.
     if stack[frame_idx].consumed {
         return false;
     }

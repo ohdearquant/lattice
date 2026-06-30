@@ -1285,6 +1285,23 @@ mod tests {
     }
 
     #[test]
+    fn shared_prefix_enum_known_limitation() {
+        // KNOWN LIMITATION (pre-existing, not introduced by the #353 guard):
+        // the no-rewind byte matcher cannot parse shared-prefix sibling
+        // alternatives. For `enum ["foo","food"]` the first member commits the
+        // shared `foo` prefix, so the longer sibling `food` is over-REJECTED.
+        // This is the SAFE direction for constrained decoding (the model just
+        // cannot emit one valid member); over-acceptance would be the dangerous
+        // direction. The first member still accepts. This test documents the
+        // behavior so a future ambiguity-preserving matcher (trie/NFA or
+        // parallel stacks) has a regression anchor; it is verified identical on
+        // origin/main (the byte-consumption guard neither causes nor fixes it).
+        let g = compile_ok(r#"{"enum":["foo","food"]}"#);
+        assert!(accepts(&g, b"\"foo\""));
+        assert!(rejects(&g, b"\"food\""));
+    }
+
+    #[test]
     fn schema_error_display() {
         let e = SchemaError("test".to_string());
         assert!(e.to_string().contains("test"));
