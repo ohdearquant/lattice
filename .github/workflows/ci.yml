@@ -121,6 +121,8 @@ jobs:
       # Run the Q4 Metal correctness tests on the Apple-silicon runner.
       # LATTICE_METAL_TEST_ENFORCE=1 makes the dispatch regression fail closed if
       # the runner ever loses its Apple7 GPU, rather than skip-passing silently.
+      - name: inference — QuaRot rotated+Q4 composed forward gate
+        run: cargo test -p lattice-inference --lib quarot_rotated_q4_forward_matches_f64_reference -- --nocapture
       - name: inference — metal-gpu Q4 tests (macOS only)
         if: runner.os == 'macOS'
         env:

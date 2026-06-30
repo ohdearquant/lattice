@@ -1492,6 +1492,194 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // QuaRot composed rotated+Q4 forward gate (Issue #320)
+    //
+    // Exercises the full composition: absorb_rotations (offline rotation
+    // absorption) → quantize_f64_to_q4 → dequantize_q4_to_f32 → matmul,
+    // and asserts correctness against an independent f64 reference that
+    // manually mirrors each step. Mutation-sensitive: perturbing the rotation
+    // dispatch (pipeline.rs:226-230), absorption helpers (rotation.rs:161-164
+    // or rotation.rs:184-192), Q4 symmetric scale (q4_weights.rs:277 or :280),
+    // or Q4 symmetric mode flag (q4_weights.rs:523) must cause failure.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn quarot_rotated_q4_forward_matches_f64_reference() {
+        use std::collections::HashMap;
+
+        use crate::quant::quarot::hadamard::RandomizedHadamard;
+        use crate::quant::quarot::pipeline::{TensorEntry, absorb_rotations};
+        use crate::quant::quarot::plan::RotationPlan;
+
+        const HIDDEN: usize = 32;
+        const Q_ROWS: usize = 2; // q_proj input-side [2, 32]
+        const O_ROWS: usize = 32; // o_proj output-side [32, 32]
+
+        let q_name = "model.language_model.layers.0.self_attn.q_proj.weight";
+        let o_name = "model.language_model.layers.0.self_attn.o_proj.weight";
+
+        fn lcg_f64(n: usize, seed: u64) -> Vec<f64> {
+            let mut state = seed;
+            (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (state >> 32) as f64 / u32::MAX as f64 * 2.0 - 1.0
+                })
+                .collect()
+        }
+
+        fn matvec(w: &[f64], rows: usize, cols: usize, x: &[f64]) -> Vec<f64> {
+            (0..rows)
+                .map(|r| {
+                    w[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(x)
+                        .map(|(a, b)| a * b)
+                        .sum()
+                })
+                .collect()
+        }
+
+        fn max_diff(a: &[f64], b: &[f64]) -> f64 {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f64, f64::max)
+        }
+
+        // Independent symmetric Q4 dequant reference: re-implements
+        // quantize_block_with_mode(symmetric=true) + dequantize_q4_to_f32
+        // so that a bug in either production function is visible as a mismatch.
+        fn ref_q4_dequant(data: &[f64]) -> Vec<f64> {
+            let mut out = Vec::with_capacity(data.len());
+            for chunk in data.chunks(32) {
+                let f32s: Vec<f32> = chunk.iter().map(|&v| v as f32).collect();
+                let abs_max = f32s.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+                let scale_f32 = if abs_max == 0.0 {
+                    1.0_f32
+                } else {
+                    abs_max / 7.0
+                };
+                let bias_f32 = -8.0_f32 * scale_f32;
+                // Round-trip through f16 storage exactly as quantize_block_with_mode does.
+                let scale_dq = q4_f16_to_f32(q4_f32_to_f16(scale_f32));
+                let bias_dq = q4_f16_to_f32(q4_f32_to_f16(bias_f32));
+                let inv_scale = 1.0 / scale_f32;
+                for &v in &f32s {
+                    let nibble = ((v * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
+                    out.push(f64::from(nibble as f32 * scale_dq + bias_dq));
+                }
+            }
+            out
+        }
+
+        let q_data_orig = lcg_f64(Q_ROWS * HIDDEN, 0x1111_1111_1111_1111);
+        let o_data_orig = lcg_f64(O_ROWS * HIDDEN, 0x2222_2222_2222_2222);
+        let x_q = lcg_f64(HIDDEN, 0x3333_3333_3333_3333);
+        let x_o = lcg_f64(HIDDEN, 0x4444_4444_4444_4444);
+
+        let rotation = RandomizedHadamard::new(0x3200_0001, HIDDEN).expect("rotation init");
+        let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+
+        // ---- Production path: absorb_rotations + quantize_f64_to_q4 + dequantize ----
+        let mut tensors: HashMap<String, TensorEntry> = HashMap::new();
+        tensors.insert(
+            q_name.to_string(),
+            TensorEntry {
+                name: q_name.to_string(),
+                shape: vec![Q_ROWS, HIDDEN],
+                data: q_data_orig.clone(),
+            },
+        );
+        tensors.insert(
+            o_name.to_string(),
+            TensorEntry {
+                name: o_name.to_string(),
+                shape: vec![O_ROWS, HIDDEN],
+                data: o_data_orig.clone(),
+            },
+        );
+
+        absorb_rotations(&mut tensors, &plan, &rotation).expect("absorb_rotations");
+
+        let q_q4 =
+            quantize_f64_to_q4(&tensors[q_name].data, &[Q_ROWS, HIDDEN]).expect("q_proj quantize");
+        let o_q4 =
+            quantize_f64_to_q4(&tensors[o_name].data, &[O_ROWS, HIDDEN]).expect("o_proj quantize");
+
+        // Shape and block-count sanity: fail loudly if the Q4 bridge is broken
+        assert_eq!(q_q4.shape, vec![Q_ROWS, HIDDEN], "q_proj shape");
+        assert_eq!(q_q4.original_len, Q_ROWS * HIDDEN, "q_proj original_len");
+        assert_eq!(q_q4.blocks.len(), Q_ROWS, "[2,32] must produce 2 Q4 blocks");
+        assert_eq!(o_q4.shape, vec![O_ROWS, HIDDEN], "o_proj shape");
+        assert_eq!(o_q4.original_len, O_ROWS * HIDDEN, "o_proj original_len");
+        assert_eq!(
+            o_q4.blocks.len(),
+            O_ROWS,
+            "[32,32] must produce 32 Q4 blocks"
+        );
+
+        let q_deq: Vec<f64> = dequantize_q4_to_f32(&q_q4)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+        let o_deq: Vec<f64> = dequantize_q4_to_f32(&o_q4)
+            .into_iter()
+            .map(f64::from)
+            .collect();
+
+        let prod_y_q = matvec(&q_deq, Q_ROWS, HIDDEN, &x_q);
+        let prod_y_o = matvec(&o_deq, O_ROWS, HIDDEN, &x_o);
+
+        // ---- Reference path: manual rotation + independent Q4 dequant ----
+
+        // Input-side: apply rotation row-by-row (mirrors absorb_input_rotation_f64)
+        let mut q_ref = q_data_orig.clone();
+        for r in 0..Q_ROWS {
+            rotation
+                .apply_f64(&mut q_ref[r * HIDDEN..(r + 1) * HIDDEN])
+                .expect("q_proj row rotation");
+        }
+
+        // Output-side: apply rotation column-by-column (mirrors absorb_output_rotation_f64)
+        let mut o_ref = o_data_orig.clone();
+        let mut col_buf = vec![0.0_f64; O_ROWS];
+        for c in 0..HIDDEN {
+            for r in 0..O_ROWS {
+                col_buf[r] = o_ref[r * HIDDEN + c];
+            }
+            rotation
+                .apply_f64(&mut col_buf)
+                .expect("o_proj col rotation");
+            for r in 0..O_ROWS {
+                o_ref[r * HIDDEN + c] = col_buf[r];
+            }
+        }
+
+        let q_ref_deq = ref_q4_dequant(&q_ref);
+        let o_ref_deq = ref_q4_dequant(&o_ref);
+
+        let ref_y_q = matvec(&q_ref_deq, Q_ROWS, HIDDEN, &x_q);
+        let ref_y_o = matvec(&o_ref_deq, O_ROWS, HIDDEN, &x_o);
+
+        // ---- Assert ----
+        let max_q = max_diff(&prod_y_q, &ref_y_q);
+        let max_o = max_diff(&prod_y_o, &ref_y_o);
+
+        eprintln!("[quarot_q4_gate] max_abs_diff q_proj={max_q:.2e} o_proj={max_o:.2e}");
+
+        assert!(
+            max_q <= 1e-5,
+            "q_proj forward max_abs_diff {max_q:.2e} > 1e-5: composed rotated+Q4 path is broken"
+        );
+        assert!(
+            max_o <= 1e-5,
+            "o_proj forward max_abs_diff {max_o:.2e} > 1e-5: composed rotated+Q4 path is broken"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "shape product")]
     fn quantize_f32_to_q4_rejects_shape_data_mismatch() {
