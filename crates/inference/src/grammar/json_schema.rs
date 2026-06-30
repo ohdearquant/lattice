@@ -58,6 +58,20 @@ const MAX_ARRAY_CARDINALITY: usize = 4096;
 /// schema chains references or nests anywhere near 512 levels.
 const MAX_SCHEMA_DEPTH: usize = 512;
 
+/// Maximum number of properties in a single object schema.
+///
+/// `build_object_tail` builds a right-nested tail chain, recursing once per
+/// property (the recursion is on property index `i`, independent of
+/// `MAX_SCHEMA_DEPTH`, which bounds only nested-schema descent). A parseable
+/// schema with an absurd number of properties therefore recurses once per
+/// property at compile time — a stack-exhaustion vector reachable from
+/// untrusted schema input at `GrammarEngine::new`, the object analogue of the
+/// `MAX_ARRAY_CARDINALITY` array vector. Constrained decoding has no real use
+/// for objects with anywhere near this many keys; reject beyond the cap at the
+/// parse boundary with a typed error. Matches `MAX_ARRAY_CARDINALITY` so the
+/// two boundaries stay consistent.
+const MAX_OBJECT_PROPERTIES: usize = 4096;
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -319,6 +333,18 @@ impl<'a> CompileCtx<'a> {
                 Ok(vec![empty_object_as_alt_with_ws(ws_id)])
             }
             Some(props) => {
+                // issue #343 analogue: cap property cardinality before
+                // materializing per-property rules. `build_object_tail` recurses
+                // once per property, so an object schema with an absurd number of
+                // keys overflows the stack at compile time. Reject at the parse
+                // boundary, mirroring the `MAX_ARRAY_CARDINALITY` guard.
+                if props.len() > MAX_OBJECT_PROPERTIES {
+                    return Err(SchemaError(format!(
+                        "object schema property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                        props.len()
+                    )));
+                }
+
                 // Unique per-object suffix so distinct object schemas sharing a
                 // property key don't alias each other's value/pair rules.
                 let obj_idx = self.object_counter;
@@ -342,9 +368,10 @@ impl<'a> CompileCtx<'a> {
                     // key_bytes: raw bytes of the JSON-encoded key string.
                     // Used to inline the key as terminals in started=true tail
                     // rules so trailing-comma over-acceptance is prevented for a
-                    // single trailing optional (the common case); ≥2 trailing
-                    // optionals remain over-accepted as a pre-existing #353 PDA
-                    // limitation. See build_object_tail for the exact boundary.
+                    // single trailing optional (the common case); the >=2
+                    // trailing-optional case is closed by the #353 per-frame
+                    // byte-consumption guard in pda::try_next_alt. See
+                    // build_object_tail for the exact boundary.
                     let key_bytes = serde_json::to_string(key_str)
                         .map_err(|e| SchemaError(format!("cannot JSON-encode property key: {e}")))?
                         .into_bytes();
@@ -461,21 +488,25 @@ impl<'a> CompileCtx<'a> {
     ///
     /// **Two or more trailing optionals** (an optional P_i followed by another
     /// optional P_j): When `}` arrives after `","` in P_i's emit alt, the mismatch
-    /// propagates to THIS rule's parent.  If the parent itself is an optional-tail
-    /// rule with a skip alt (`tail(i-1, false)`), that skip alt is tried next.  The
-    /// skip alt delegates to `tail(i, false)`, which takes its ε path and collapses
-    /// cleanly, allowing `}` to match the outer brace.  Result: `{"a":1,}` is
-    /// over-accepted for `{a:opt, b:opt}`.  This is a pre-existing consequence of
-    /// the #353 PDA limitation (the old flat-sequence grammar had the same
-    /// over-acceptance via mandatory-comma + ε opt_b).  Tracked in issue #353;
-    /// fixing it requires PDA-level changes, not grammar restructuring.
+    /// propagates to THIS rule's parent.  That parent frame has already consumed
+    /// the emitted property bytes, so the per-frame byte-consumption guard in
+    /// `pda::try_next_alt` (issue #353) refuses to switch it to its skip
+    /// alternative: a committed frame cannot be re-interpreted when there is no
+    /// input to rewind.  Result: `{"a":1,}` correctly rejects for
+    /// `{a:opt, b:opt}`.  (Before the #353 guard the parent's skip alt was
+    /// reachable despite the consumed comma, so this case was over-accepted; the
+    /// old flat-sequence grammar had the same over-acceptance via
+    /// mandatory-comma + ε opt_b.)
     ///
     /// **Interleaved optional** (an optional P_i followed by a required P_j):
     /// Both the emit path (`"," ...`) and the skip path (`tail(i+1, true)` which
     /// itself starts with `","` for the required P_j) share the `","` prefix.
-    /// The PDA commits to alt-0 and cannot backtrack → over-rejects inputs that
-    /// skip P_i.  Tracked in issue #353; the emitted CFG is correct, only the
-    /// runtime PDA is limited.
+    /// The PDA commits to alt-0 and cannot backtrack, so it over-rejects inputs
+    /// that skip P_i.  The emitted CFG is correct; this is the no-rewind
+    /// single-stack PDA's shared-prefix limitation and the safe direction for
+    /// constrained decoding (a valid member becomes unreachable, but no invalid
+    /// output is ever emitted).  A complete fix needs ambiguity-preserving
+    /// matching (a trie/NFA form or parallel active stacks), out of scope here.
     fn build_object_tail(
         &mut self,
         obj_idx: usize,
@@ -556,9 +587,10 @@ impl<'a> CompileCtx<'a> {
                 //   the #355 fix for `{r:req, o:opt}`.
                 //
                 //   If the parent is itself an optional-tail rule with a skip
-                //   alt (≥2 trailing optionals), the parent's skip alt is tried,
-                //   which can reach ε → over-accepts trailing comma.  This is
-                //   a pre-existing #353 consequence; see doc comment above.
+                //   alt (>=2 trailing optionals), the parent frame has already
+                //   consumed the emitted property bytes, so the #353 per-frame
+                //   byte-consumption guard refuses to switch it to that skip alt
+                //   and the trailing comma correctly rejects.  See doc above.
                 //
                 // "," ws "<key>" ws ":" ws val_i tail(i+1, true)
                 let mut alt: Alt = vec![Symbol::Terminal(b','), Symbol::NonTerminal(ws_id)];
@@ -1673,20 +1705,72 @@ mod tests {
         // Trailing comma boundary (see object_three_props_trailing_comma_boundary
         // for the full explanation):
         // - r only with trailing comma: correctly rejects (inline-key fix).
-        // - r+o1 with trailing comma: over-accepts because o2 skip alt is reachable.
+        // - r+o1 with trailing comma: correctly rejects. The per-frame
+        //   byte-consumption guard refuses to fall back to the o2 skip
+        //   alternative once the "," has been consumed.
         // - r+o1+o2 with trailing comma: correctly rejects (no optional remaining).
         assert!(
             rejects(&g, b"{\"r\":1,}"),
             "trailing comma after r-only must reject"
         );
-        // #353 pre-existing: trailing comma over-accepted when o2 skip alt remains.
         assert!(
-            accepts(&g, b"{\"r\":1,\"o1\":2,}"),
-            "#353 pre-existing: r+o1 trailing comma over-accepted"
+            rejects(&g, b"{\"r\":1,\"o1\":2,}"),
+            "trailing comma after r+o1 must reject (no fallback to o2 skip alt)"
         );
         assert!(
             rejects(&g, b"{\"r\":1,\"o1\":2,\"o2\":3,}"),
             "trailing comma after all three must reject"
+        );
+    }
+
+    /// Required-first re-canonicalization (issue #355 reorder).
+    ///
+    /// The compiler emits object properties in required-first order (required
+    /// properties in declaration order, then optional ones), not the
+    /// alphabetical declaration order of the source schema.  This is necessary
+    /// for PDA safety: with required properties first, the `started=false` phase
+    /// is a single-alternative chain, so the no-rewind PDA cannot commit to a
+    /// wrong key terminal (see `compile_object` and `build_object_tail`).
+    ///
+    /// Consequence: the accepted canonical key order is required-first.  An
+    /// object written in a different key order is rejected.  This is the safe
+    /// direction for constrained decoding: JSON objects are unordered (RFC 8259),
+    /// the model is guided to emit the canonical order, and no invalid output is
+    /// ever produced.  It also fixes a real over-rejection: the prior flat
+    /// grammar made comma separators mandatory around omitted optionals, so a
+    /// required-only object was rejected; required-first construction accepts it.
+    #[test]
+    fn object_required_first_reorder() {
+        // Schema declares r required; serde orders keys alphabetically
+        // (o1, o2, r), so required-first reordering moves r to the front.
+        let g = compile_ok(
+            r#"{
+                "type":"object",
+                "properties":{
+                    "o1":{"type":"integer"},
+                    "o2":{"type":"integer"},
+                    "r":{"type":"integer"}
+                },
+                "required":["r"]
+            }"#,
+        );
+        // Required-only: accepted (the #355 fix; the old flat grammar rejected
+        // this because the inter-property commas were mandatory).
+        assert!(
+            accepts(&g, b"{\"r\":1}"),
+            "required-only object must be accepted (the #355 fix)"
+        );
+        // Canonical required-first order: accepted.
+        assert!(
+            accepts(&g, b"{\"r\":1,\"o1\":2,\"o2\":3}"),
+            "required-first canonical order must be accepted"
+        );
+        // Alphabetical order (required key last): rejected. The accepted
+        // canonical order is required-first; this documents the intentional
+        // re-canonicalization (a different valid order, not a capability loss).
+        assert!(
+            rejects(&g, b"{\"o1\":2,\"o2\":3,\"r\":1}"),
+            "non-canonical (alphabetical) key order is rejected (required-first re-canonicalization)"
         );
     }
 
@@ -1749,13 +1833,16 @@ mod tests {
     }
 
     /// Two fully-optional properties — PDA boundary for trailing-comma and
-    /// skip-first (#353) behaviours.
+    /// skip-first behaviours.
     ///
-    /// Trailing comma after the first optional (`{"a":1,}`) is a pre-existing
-    /// #353 consequence: the old flat-sequence grammar also accepted it via the
-    /// mandatory-comma + ε-opt_b path.  Fixing it requires PDA changes, not
-    /// grammar restructuring.  The assertion documents actual current behaviour
-    /// so that any inadvertent change is caught.
+    /// Trailing comma after the first optional (`{"a":1,}`) now correctly
+    /// rejects: the per-frame byte-consumption guard refuses to fall back to the
+    /// second optional's skip alternative once the "," has been consumed.
+    /// Skip-first (`{"b":2}` without `a`) is over-rejected: the no-rewind
+    /// single-stack matcher cannot reach the second optional's emit branch after
+    /// committing to skip the first.  That is the safe direction for constrained
+    /// decoding, where a valid member is unreachable but no invalid output is
+    /// ever emitted.
     #[test]
     fn object_two_optional_only_pda_boundary() {
         let g = compile_ok(
@@ -1773,18 +1860,17 @@ mod tests {
             accepts(&g, b"{\"a\":1,\"b\":2}"),
             "both present must be accepted"
         );
-        // #353: PDA over-rejects skip-first ({"b":2} without a).
+        // Skip-first ({"b":2} without a) is over-rejected (the safe direction).
         assert!(
             rejects(&g, b"{\"b\":2}"),
-            "#353: PDA over-rejects skip-first optional"
+            "PDA over-rejects skip-first optional (safe direction)"
         );
-        // #353 trailing comma: {"a":1,} over-accepts because the skip alt of
-        // tail(0,false) provides an escape after tail(1,true) consumes ",".
-        // This is a pre-existing limitation from the old grammar and requires
-        // a PDA fix (#353), not a grammar change.
+        // Trailing comma {"a":1,} correctly rejects: the byte-consumption guard
+        // refuses to fall back to the second optional's skip alt once the ","
+        // has been consumed.
         assert!(
-            accepts(&g, b"{\"a\":1,}"),
-            "#353 pre-existing: trailing comma over-accepted when second optional follows"
+            rejects(&g, b"{\"a\":1,}"),
+            "trailing comma after first optional must reject (no fallback to skip alt)"
         );
         // When both properties are present the trailing comma correctly rejects
         // (no further optional to provide an escape route).
@@ -1797,13 +1883,13 @@ mod tests {
     /// Three-property schema (1 required + 2 trailing optionals) — documents
     /// trailing-comma boundary for the intermediate optional case.
     ///
-    /// `{"r":1,"o1":2,}` over-accepts because the o2 skip alt provides an
-    /// escape route after tail(o1, true) consumes the comma.  This is the same
-    /// #353 mechanism as `object_two_optional_only_pda_boundary` above.
-    /// `{"r":1,}` correctly rejects because the inline fix makes the o1 key
-    /// mismatch fire at sym_pos≥2 → propagates to the required chain (no alt)
-    /// → rejects.  And `{"r":1,"o1":2,"o2":3,}` correctly rejects because no
-    /// optional remains to provide an escape.
+    /// `{"r":1,"o1":2,}` correctly rejects: the per-frame byte-consumption guard
+    /// refuses to fall back to the o2 skip alternative once the "," has been
+    /// consumed (the same guard exercised by
+    /// `object_two_optional_only_pda_boundary` above).  `{"r":1,}` rejects
+    /// because the inline key terminal makes the o1 mismatch fire at
+    /// sym_pos >= 2, which propagates to the required chain (no alt) and rejects.
+    /// `{"r":1,"o1":2,"o2":3,}` rejects because no optional remains.
     #[test]
     fn object_three_props_trailing_comma_boundary() {
         let g = compile_ok(
@@ -1829,15 +1915,62 @@ mod tests {
             rejects(&g, b"{\"r\":1,}"),
             "trailing comma after required-only must be rejected (inline-key fix)"
         );
-        // #353 pre-existing: trailing comma after intermediate optional over-accepts.
+        // Trailing comma after intermediate optional correctly rejects.
         assert!(
-            accepts(&g, b"{\"r\":1,\"o1\":2,}"),
-            "#353 pre-existing: trailing comma over-accepted when further optional (o2) follows"
+            rejects(&g, b"{\"r\":1,\"o1\":2,}"),
+            "trailing comma after r+o1 must reject (no fallback to o2 skip alt)"
         );
         // Trailing comma after last property correctly rejects.
         assert!(
             rejects(&g, b"{\"r\":1,\"o1\":2,\"o2\":3,}"),
             "trailing comma after last property must be rejected"
         );
+    }
+
+    /// Property-count cap (DoS guard): an object schema with more than
+    /// `MAX_OBJECT_PROPERTIES` properties is rejected at the parse boundary
+    /// rather than recursing once per property in `build_object_tail` and
+    /// exhausting the stack at `GrammarEngine::new`. Mirrors the
+    /// `MAX_ARRAY_CARDINALITY` guard. The cap fires before any per-property rule
+    /// is materialized, so this test is fast and never deep-recurses; it fails
+    /// (compile returns `Ok`) when the cap check is reverted.
+    #[test]
+    fn object_property_count_cap_rejects() {
+        let over = MAX_OBJECT_PROPERTIES + 1;
+        let mut props = String::new();
+        for i in 0..over {
+            if i > 0 {
+                props.push(',');
+            }
+            props.push_str(&format!("\"p{i}\":{{\"type\":\"integer\"}}"));
+        }
+        let schema_json = format!("{{\"type\":\"object\",\"properties\":{{{props}}}}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-cap object schema must be rejected");
+        assert!(
+            err.0.contains("exceeds the supported limit"),
+            "expected a property-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// A modest object (well under the cap) compiles and accepts a valid value:
+    /// the cap does not reject ordinary schemas.
+    #[test]
+    fn object_under_property_cap_compiles() {
+        let mut props = String::new();
+        for i in 0..50 {
+            if i > 0 {
+                props.push(',');
+            }
+            props.push_str(&format!("\"p{i}\":{{\"type\":\"integer\"}}"));
+        }
+        let schema_json = format!("{{\"type\":\"object\",\"properties\":{{{props}}}}}");
+        let g = compile_ok(&schema_json);
+        assert!(
+            accepts(&g, b"{}"),
+            "empty object (all optional) must accept"
+        );
+        assert!(accepts(&g, b"{\"p0\":1}"), "single property must accept");
     }
 }
