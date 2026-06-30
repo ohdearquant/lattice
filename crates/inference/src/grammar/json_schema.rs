@@ -210,6 +210,88 @@ impl<'a> CompileCtx<'a> {
         result
     }
 
+    /// Lower an `anyOf` / `oneOf` to a list of alternatives.
+    ///
+    /// The no-rewind PDA commits to an alternative once it consumes a byte (the
+    /// #353/#380 consumed-guard), so every branch that can begin with `"`
+    /// competes for the single opening quote: once one of them consumes it, the
+    /// siblings become unreachable. Every JSON string shares that opening `"`,
+    /// so listing string-valued branches separately strands all but the first
+    /// (issue #310 — the over-rejection regression fixed here). Collapse the
+    /// whole string-valued class into ONE branch with a single `"` entry:
+    ///
+    ///   * any broad string (`{"type":"string"}`; also `pattern` / `minLength`,
+    ///     which this compiler does not enforce and so widens to any string)
+    ///     makes the class the `json_string` rule. It subsumes every string
+    ///     literal, so a valid string is never rejected and the literals need no
+    ///     separate branch.
+    ///   * otherwise the string literals (`const` / all-string `enum`) become a
+    ///     single trie so each diverges inside the quoted region instead of
+    ///     competing at the shared opening quote.
+    ///
+    /// Non-string branches (numbers, booleans, null, objects, arrays) never
+    /// begin with `"`, so they follow the string entry in their original
+    /// relative order and stay reachable: a non-`"` input diverges from the
+    /// string entry at sym_pos == 0 and the PDA falls through. A non-string
+    /// sibling that could ITSELF begin with `"` (a `$ref`, nested `anyOf`,
+    /// untyped or mixed-type schema) is left among them; the string entry
+    /// shadows its quoted inputs, which `json_string` / the literal trie already
+    /// decide correctly. The residual narrowing for such a sibling matches the
+    /// pre-existing numeric-enum limitation and never over-accepts.
+    ///
+    /// Kept `#[inline(never)]` and out of `compile_schema_inner` so these locals
+    /// do not enlarge that function's per-recursion stack frame (see the call
+    /// site: a deep `$ref` chain must hit the depth guard, not the native stack).
+    #[inline(never)]
+    fn compile_any_of(
+        &mut self,
+        any_of: &'a [Value],
+        path: &[&str],
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let mut broad_string = false;
+        let mut literals: Vec<String> = Vec::new();
+        let mut other_subs: Vec<&'a Value> = Vec::new();
+        for sub in any_of {
+            match string_class_of(sub) {
+                Some(StrClass::Broad) => broad_string = true,
+                Some(StrClass::Literals(values)) => literals.extend(values),
+                None => other_subs.push(sub),
+            }
+        }
+
+        let mut merged: Vec<Alt> = Vec::new();
+        if broad_string {
+            match self.builder.rule_id("json_string") {
+                Some(id) => merged.push(vec![Symbol::NonTerminal(id)]),
+                None => merged.push(vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]),
+            }
+        } else if !literals.is_empty() {
+            // Distinct JSON strings are prefix-free once the closing `"` is part
+            // of each leaf, so every literal diverges within the trie.
+            literals.sort();
+            literals.dedup();
+            let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
+            for s in &literals {
+                let json_repr = serde_json::to_string(s)
+                    .map_err(|e| SchemaError(format!("cannot JSON-encode string value: {e}")))?;
+                // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
+                let inner = &json_repr[1..json_repr.len() - 1];
+                let mut seq: Vec<u8> = inner.bytes().collect();
+                seq.push(b'"');
+                seqs.push(seq);
+            }
+            let trie_root_id = self.compile_trie_literals(&seqs)?;
+            merged.push(vec![
+                Symbol::Terminal(b'"'),
+                Symbol::NonTerminal(trie_root_id),
+            ]);
+        }
+        for sub in other_subs {
+            merged.extend(self.compile_schema(sub, path)?);
+        }
+        Ok(merged)
+    }
+
     fn compile_schema_inner(
         &mut self,
         schema: &'a Value,
@@ -238,83 +320,19 @@ impl<'a> CompileCtx<'a> {
             return compile_const(v);
         }
 
-        // Handle `anyOf` / `oneOf`
+        // Handle `anyOf` / `oneOf`. The body lives in a separate, non-inlined
+        // method (see `compile_any_of`) so its locals do not enlarge this
+        // function's stack frame: a deep `$ref` chain re-enters
+        // `compile_schema_inner` at every link, and the depth guard (#343) must
+        // reject at MAX_SCHEMA_DEPTH before the native stack overflows. Folding
+        // the anyOf locals in here regressed that headroom (a 2000-link chain
+        // overflowed instead of returning the depth error).
         if let Some(any_of) = schema
             .get("anyOf")
             .or_else(|| schema.get("oneOf"))
             .and_then(Value::as_array)
         {
-            // The no-rewind PDA commits to an alternative once it consumes a
-            // byte (the #353/#380 consumed-guard), so every branch that can
-            // begin with `"` competes for the single opening quote: once one of
-            // them consumes it, the siblings become unreachable. Every JSON
-            // string shares that opening `"`, so listing string-valued branches
-            // separately strands all but the first (issue #310 — the
-            // over-rejection regression fixed here). Collapse the whole
-            // string-valued class into ONE branch with a single `"` entry:
-            //
-            //   * any broad string (`{"type":"string"}`; also `pattern` /
-            //     `minLength`, which this compiler does not enforce and so
-            //     widens to any string) makes the class the `json_string` rule.
-            //     It subsumes every string literal, so a valid string is never
-            //     rejected and the literals need no separate branch.
-            //   * otherwise the string literals (`const` / all-string `enum`)
-            //     become a single trie so each diverges inside the quoted region
-            //     instead of competing at the shared opening quote.
-            //
-            // Non-string branches (numbers, booleans, null, objects, arrays)
-            // never begin with `"`, so they follow the string entry in their
-            // original relative order and stay reachable: a non-`"` input
-            // diverges from the string entry at sym_pos == 0 and the PDA falls
-            // through. A non-string sibling that could ITSELF begin with `"` (a
-            // `$ref`, nested `anyOf`, untyped or mixed-type schema) is left among
-            // them; the string entry shadows its quoted inputs, which
-            // `json_string` / the literal trie already decide correctly. The
-            // residual narrowing for such a sibling matches the pre-existing
-            // numeric-enum limitation below and never over-accepts.
-            let mut broad_string = false;
-            let mut literals: Vec<String> = Vec::new();
-            let mut other_subs: Vec<&Value> = Vec::new();
-            for sub in any_of {
-                match string_class_of(sub) {
-                    Some(StrClass::Broad) => broad_string = true,
-                    Some(StrClass::Literals(values)) => literals.extend(values),
-                    None => other_subs.push(sub),
-                }
-            }
-
-            let mut merged: Vec<Alt> = Vec::new();
-            if broad_string {
-                match self.builder.rule_id("json_string") {
-                    Some(id) => merged.push(vec![Symbol::NonTerminal(id)]),
-                    None => merged.push(vec![Symbol::Terminal(b'"'), Symbol::Terminal(b'"')]),
-                }
-            } else if !literals.is_empty() {
-                // Distinct JSON strings are prefix-free once the closing `"` is
-                // part of each leaf, so every literal diverges within the trie.
-                literals.sort();
-                literals.dedup();
-                let mut seqs: Vec<Vec<u8>> = Vec::with_capacity(literals.len());
-                for s in &literals {
-                    let json_repr = serde_json::to_string(s).map_err(|e| {
-                        SchemaError(format!("cannot JSON-encode string value: {e}"))
-                    })?;
-                    // json_repr is e.g. `"a\"b"` — strip the surrounding `"`.
-                    let inner = &json_repr[1..json_repr.len() - 1];
-                    let mut seq: Vec<u8> = inner.bytes().collect();
-                    seq.push(b'"');
-                    seqs.push(seq);
-                }
-                let trie_root_id = self.compile_trie_literals(&seqs)?;
-                merged.push(vec![
-                    Symbol::Terminal(b'"'),
-                    Symbol::NonTerminal(trie_root_id),
-                ]);
-            }
-            for sub in other_subs {
-                merged.extend(self.compile_schema(sub, _path)?);
-            }
-            return Ok(merged);
+            return self.compile_any_of(any_of, _path);
         }
 
         // Dispatch on `type`
