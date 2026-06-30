@@ -113,17 +113,22 @@ impl GdnStatePool {
                 "conv_floats_per_slot byte size ({conv_bytes}) exceeds isize::MAX — allocation would panic"
             )));
         }
-        // `free_slots` is a `VecDeque<usize>` of length `capacity`.
-        let slots_bytes = capacity
-            .checked_mul(std::mem::size_of::<usize>())
+        // Guard all three capacity-length allocations: s_matrices (Vec<Vec<f32>>),
+        // conv_buffers (Vec<Vec<f32>>), and free_slots (VecDeque<usize>).
+        // size_of::<Vec<f32>>() == 24 bytes on 64-bit, which is larger than
+        // size_of::<usize>() == 8 bytes, so a single check against the Vec<f32>
+        // element width subsumes the usize free_slots bound and both outer
+        // Vec<Vec<f32>> bounds.
+        let outer_bytes = capacity
+            .checked_mul(std::mem::size_of::<Vec<f32>>())
             .ok_or_else(|| {
                 InferenceError::InvalidInput(format!(
-                    "capacity ({capacity}) * size_of::<usize>() overflows usize"
+                    "capacity ({capacity}) * size_of::<Vec<f32>>() overflows usize"
                 ))
             })?;
-        if slots_bytes > isize::MAX as usize {
+        if outer_bytes > isize::MAX as usize {
             return Err(InferenceError::InvalidInput(format!(
-                "capacity ({capacity}) slot-index allocation ({slots_bytes} bytes) exceeds isize::MAX"
+                "capacity ({capacity}) outer-vector allocation ({outer_bytes} bytes) exceeds isize::MAX"
             )));
         }
         Ok(Self::new(capacity, s_floats_per_slot, conv_floats_per_slot))
@@ -974,6 +979,20 @@ mod tests {
         assert!(
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput when s_floats byte size exceeds isize::MAX, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn gdn_state_pool_try_new_outer_vec_capacity_bound_returns_invalid_input() {
+        // capacity * size_of::<Vec<f32>>() exceeds isize::MAX while capacity *
+        // size_of::<usize>() (the old guard width) does NOT; per-slot float
+        // counts are 0 so the s/conv guards pass. Without the outer-vector guard
+        // `new`'s collect::<Vec<Vec<f32>>>() panics with capacity overflow.
+        let capacity = (isize::MAX as usize / std::mem::size_of::<Vec<f32>>()) + 1;
+        let r = GdnStatePool::try_new(capacity, 0, 0);
+        assert!(
+            matches!(r, Err(InferenceError::InvalidInput(_))),
+            "expected InvalidInput when outer-vector byte size exceeds isize::MAX, got {r:?}"
         );
     }
 }

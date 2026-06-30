@@ -388,10 +388,12 @@ impl PagedKVCache {
         }
         let fpp = config.try_floats_per_page()?;
         let _total_bytes = config.try_total_bytes()?;
-        let pool = PagePool::try_new(config.max_pages, fpp)?;
 
         // When a prefix cache is present, validate that its page geometry cannot
-        // produce a panicking allocation on the hot promote/restore path.
+        // produce a panicking allocation on the hot promote/restore path. Run
+        // this before any allocation (including the PagePool below) so an
+        // oversized prefix config is rejected before the constructor commits
+        // to any allocation at all.
         if let Some(ref cache_arc) = prefix_cache {
             let guard = cache_arc
                 .lock()
@@ -430,6 +432,7 @@ impl PagedKVCache {
             let _ = prefix_page_bytes;
         }
 
+        let pool = PagePool::try_new(config.max_pages, fpp)?;
         let table = PageTable::new(config.page_size);
         Ok(Self {
             pool,
