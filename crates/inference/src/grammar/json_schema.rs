@@ -3525,6 +3525,44 @@ mod tests {
         );
     }
 
+    /// Mixed-enum CUMULATIVE byte-budget cap (issue #474): a mixed enum (a
+    /// trailing non-string member keeps it routed to `compile_enum` rather than
+    /// `compile_string_type`) whose individual string members are each well
+    /// under MAX_STRING_LITERAL_BYTES — so the schema-wide entry guard passes
+    /// every one — but whose COMBINED encoded bytes exceed the budget is
+    /// rejected by `compile_enum`'s incremental byte-budget guard.
+    ///
+    /// Mutation pin: asserts the incremental guard's exact "enum value encoded
+    /// byte length" message. The schema-wide `guard_schema_string_bytes` entry
+    /// pass cannot fire here (no single member exceeds the cap), so reverting
+    /// `compile_enum`'s incremental guard drops the input to the late
+    /// `compile_trie_literals` backstop, whose "string literal encoded byte
+    /// length (N)" message lacks the "enum value" substring — making this the
+    /// only test that pins the incremental enum guard specifically (its
+    /// single-oversized-member sibling `mixed_enum_byte_budget_capped` is now
+    /// dominated by the entry guard).
+    #[test]
+    fn mixed_enum_cumulative_bytes_capped() {
+        // Three ~400 KiB string members, each under the 1 MiB per-literal cap
+        // (so the entry guard passes each), summing past 1 MiB; a trailing
+        // non-string member keeps the enum mixed and routed to compile_enum.
+        let chunk = "a".repeat(400 * 1024);
+        let members: String = (0..3)
+            .map(|i| format!(r#""{chunk}{i}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"enum\":[{members},1]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v)
+            .expect_err("mixed enum whose cumulative bytes exceed the budget must be rejected");
+        assert!(
+            err.0
+                .contains("enum value encoded byte length exceeds the supported limit"),
+            "expected the incremental enum byte-budget cap error, got: {}",
+            err.0
+        );
+    }
+
     /// anyOf const cumulative byte-budget cap (issue #474, finding 4): an
     /// `anyOf` whose individual `const` branches are each modest but whose
     /// COMBINED encoded bytes exceed MAX_STRING_LITERAL_BYTES — while the
