@@ -20659,6 +20659,7 @@ impl MetalQwen35State {
             prompt_tokens: 0,
             generated_tokens: 0,
             stopped: false,
+            stop_reason: None,
         }
     }
 

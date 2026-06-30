@@ -960,6 +960,7 @@ mod serve {
                 prompt_tokens: 10,
                 generated_tokens: 64,
                 stopped: false,
+                stop_reason: Some(lattice_inference::StopReason::Length),
             };
             assert_eq!(super::finish_reason_for(&cap), "length");
 
@@ -969,6 +970,7 @@ mod serve {
                 prompt_tokens: 10,
                 generated_tokens: 3,
                 stopped: true,
+                stop_reason: Some(lattice_inference::StopReason::Eos),
             };
             assert_eq!(super::finish_reason_for(&natural), "stop");
         }
@@ -993,6 +995,7 @@ mod serve {
                 prompt_tokens: 5,
                 generated_tokens: max_tokens,
                 stopped: true,
+                stop_reason: Some(lattice_inference::StopReason::Eos),
             };
             assert_eq!(
                 super::finish_reason_for(&output),
@@ -1011,6 +1014,7 @@ mod serve {
                 prompt_tokens: 5,
                 generated_tokens: 4,
                 stopped: false,
+                stop_reason: Some(lattice_inference::StopReason::Length),
             };
             assert_eq!(super::finish_reason_for(&output), "length");
         }

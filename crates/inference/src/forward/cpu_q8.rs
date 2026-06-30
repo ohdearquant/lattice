@@ -21,6 +21,7 @@ use crate::model::qwen35::{
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
+use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
 use crate::weights::q8_weights::{
@@ -687,6 +688,7 @@ pub fn generate_q8(
             prompt_tokens: prompt_len,
             generated_tokens: 0,
             stopped: false,
+            stop_reason: Some(StopReason::Length),
         });
     }
     // Reject grammar configs before allocating any state. Grammar masking
@@ -755,6 +757,7 @@ pub fn generate_q8(
             prompt_tokens: prompt_len,
             generated_tokens: 0,
             stopped: true,
+            stop_reason: Some(StopReason::Eos),
         });
     }
 
@@ -762,6 +765,7 @@ pub fn generate_q8(
     all_ids.push(next_id);
 
     let mut stopped = false;
+    let mut stop_reason = StopReason::Length;
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
@@ -796,6 +800,7 @@ pub fn generate_q8(
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
+            stop_reason = StopReason::Eos;
             break;
         }
 
@@ -812,6 +817,7 @@ pub fn generate_q8(
         prompt_tokens: prompt_len,
         generated_tokens: generated_ids.len(),
         stopped,
+        stop_reason: Some(stop_reason),
     })
 }
 

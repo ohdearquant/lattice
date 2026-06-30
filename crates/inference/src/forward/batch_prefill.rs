@@ -29,6 +29,7 @@ use crate::model::qwen35::{
     qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
 
 /// Scratch buffers reused across batched prompt prefill.
@@ -428,6 +429,7 @@ impl Qwen35Model {
                 prompt_tokens: prompt_len,
                 generated_tokens: 0,
                 stopped: true,
+                stop_reason: Some(StopReason::Eos),
             });
         }
 
@@ -435,6 +437,7 @@ impl Qwen35Model {
         all_ids.push(next_id);
 
         let mut stopped = false;
+        let mut stop_reason = StopReason::Length;
         // Autoregressive decode is unchanged.
         for _ in 1..gen_cfg.max_new_tokens {
             let pos = kv_cache.seq_len;
@@ -460,6 +463,7 @@ impl Qwen35Model {
 
             if should_stop_token(cfg, gen_cfg, next_id) {
                 stopped = true;
+                stop_reason = StopReason::Eos;
                 break;
             }
 
@@ -475,6 +479,7 @@ impl Qwen35Model {
             prompt_tokens: prompt_len,
             generated_tokens: generated_ids.len(),
             stopped,
+            stop_reason: Some(stop_reason),
         })
     }
 

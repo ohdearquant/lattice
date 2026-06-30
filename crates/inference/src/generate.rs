@@ -19,6 +19,7 @@ use crate::grammar::GrammarEngine;
 use crate::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 use crate::model::qwen::{QwenConfig, QwenModel};
 use crate::sampling::{Sampler, SamplingConfig};
+use crate::stop_reason::StopReason;
 use std::sync::Arc;
 
 /// **Unstable**: text generation configuration; fields and defaults are
@@ -93,6 +94,9 @@ pub struct GenerateOutput {
     pub generated_tokens: usize,
     /// Whether generation stopped due to EOS token.
     pub stopped_by_eos: bool,
+    /// Why generation terminated. `Some` on every real generation exit; `None` only on
+    /// non-generation returns that have no issue-listed cause.
+    pub stop_reason: Option<StopReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +425,7 @@ pub fn generate(
             prompt_tokens: prompt_len,
             generated_tokens: 0,
             stopped_by_eos: false,
+            stop_reason: Some(StopReason::Length),
         });
     }
 
@@ -511,14 +516,17 @@ pub fn generate(
                 generated_tokens: 0,
                 token_ids: vec![],
                 stopped_by_eos: false,
+                stop_reason: Some(StopReason::Grammar),
             });
         }
     }
     generated_ids.push(first_token);
 
     let mut stopped_by_eos = false;
+    let mut stop_reason = StopReason::Length;
     if config.eos_token_id == Some(first_token) {
         stopped_by_eos = true;
+        stop_reason = StopReason::Eos;
     }
 
     // 7. Decode loop: one token at a time
@@ -526,6 +534,7 @@ pub fn generate(
         for step in 0..config.max_new_tokens.saturating_sub(1) {
             // Stop cleanly when the cache is at capacity (set by kv_cache_capacity).
             if cache.is_full() {
+                stop_reason = StopReason::KvFull;
                 break;
             }
             let pos = prompt_len + step + 1; // +1 because first token already generated
@@ -559,6 +568,7 @@ pub fn generate(
             // Advance grammar state after sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
                 if !engine.advance(gs, token) {
+                    stop_reason = StopReason::Grammar;
                     break;
                 }
             }
@@ -566,6 +576,7 @@ pub fn generate(
 
             if config.eos_token_id == Some(token) {
                 stopped_by_eos = true;
+                stop_reason = StopReason::Eos;
                 break;
             }
         }
@@ -588,6 +599,7 @@ pub fn generate(
         generated_tokens: generated_ids.len(),
         token_ids: generated_ids,
         stopped_by_eos,
+        stop_reason: Some(stop_reason),
     })
 }
 
@@ -1262,6 +1274,7 @@ mod tests {
             prompt_tokens: 5,
             generated_tokens: 3,
             stopped_by_eos: false,
+            stop_reason: Some(StopReason::Length),
         };
         assert_eq!(output.generated_tokens, 3);
         assert!(!output.stopped_by_eos);

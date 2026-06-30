@@ -9,6 +9,7 @@
 
 use crate::error::InferenceError;
 use crate::grammar::GrammarEngine;
+use crate::stop_reason::StopReason;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -771,6 +772,9 @@ pub struct GenerateOutput {
     /// stop string); false when it ended by reaching `max_new_tokens`. Serve maps
     /// this to the OpenAI `finish_reason` ("stop" vs "length").
     pub stopped: bool,
+    /// Why generation terminated. `Some` on every real generation exit; `None` only on
+    /// non-generation returns that have no issue-listed cause.
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Compute the layer type pattern: every `interval`-th layer (1-indexed) is full attention.
