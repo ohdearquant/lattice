@@ -272,9 +272,21 @@ impl<'a> CompileCtx<'a> {
         let mut literals: Vec<String> = Vec::new();
         let mut other_subs: Vec<&'a Value> = Vec::new();
         for sub in any_of {
-            match string_class_of(sub) {
+            match string_class_of(sub)? {
                 Some(StrClass::Broad) => broad_string = true,
-                Some(StrClass::Literals(values)) => literals.extend(values),
+                Some(StrClass::Literals(values)) => {
+                    // DoS bound (issue #478): reject before the extend so that
+                    // many small foldable branches cannot accumulate `literals`
+                    // past the cap via repeated `Vec::extend` growth before the
+                    // post-loop backstop below ever runs.
+                    let total = literals.len() + values.len();
+                    if total > MAX_STRING_LITERALS {
+                        return Err(SchemaError(format!(
+                            "anyOf string literal count ({total}) exceeds the supported limit ({MAX_STRING_LITERALS})"
+                        )));
+                    }
+                    literals.extend(values);
+                }
                 None => other_subs.push(sub),
             }
         }
@@ -289,6 +301,8 @@ impl<'a> CompileCtx<'a> {
             // DoS bound: reject before dedup so that a schema with more than
             // MAX_STRING_LITERALS duplicate branches cannot bypass the count cap
             // by relying on deduplication to shrink the set below the limit.
+            // Unreachable once the per-extend guard above holds the invariant,
+            // kept as a backstop mirroring compile_trie_literals' late guard.
             if literals.len() > MAX_STRING_LITERALS {
                 return Err(SchemaError(format!(
                     "string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
@@ -452,13 +466,38 @@ impl<'a> CompileCtx<'a> {
 
     /// Compile an `object` schema.
     fn compile_object(&mut self, schema: &'a Value) -> Result<Vec<Alt>, SchemaError> {
-        let properties = schema
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|m| m.iter().collect::<Vec<_>>());
-        let required: Vec<&str> = schema
-            .get("required")
-            .and_then(Value::as_array)
+        let properties_map = schema.get("properties").and_then(Value::as_object);
+        // issue #343 analogue / issue #478: cap property cardinality on the raw
+        // map BEFORE `.iter().collect::<Vec<_>>()` below, which otherwise
+        // iterates and allocates proportional to untrusted cardinality before
+        // any check runs. `build_object_tail` recurses once per property, so an
+        // object schema with an absurd number of keys overflows the stack at
+        // compile time. Reject at the parse boundary, mirroring the
+        // `MAX_ARRAY_CARDINALITY` guard.
+        if let Some(m) = properties_map {
+            if m.len() > MAX_OBJECT_PROPERTIES {
+                return Err(SchemaError(format!(
+                    "object property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                    m.len()
+                )));
+            }
+        }
+        let properties = properties_map.map(|m| m.iter().collect::<Vec<_>>());
+
+        let required_arr = schema.get("required").and_then(Value::as_array);
+        // Same DoS class: `required` cardinality is untrusted independent of
+        // `properties` (a schema can declare a huge `required` array against a
+        // tiny or empty `properties` map), and the filter_map/collect below is
+        // proportional to it — bound it before collecting too.
+        if let Some(a) = required_arr {
+            if a.len() > MAX_OBJECT_PROPERTIES {
+                return Err(SchemaError(format!(
+                    "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                    a.len()
+                )));
+            }
+        }
+        let required: Vec<&str> = required_arr
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
@@ -469,18 +508,6 @@ impl<'a> CompileCtx<'a> {
                 Ok(vec![empty_object_as_alt_with_ws(ws_id)])
             }
             Some(props) => {
-                // issue #343 analogue: cap property cardinality before
-                // materializing per-property rules. `build_object_tail` recurses
-                // once per property, so an object schema with an absurd number of
-                // keys overflows the stack at compile time. Reject at the parse
-                // boundary, mirroring the `MAX_ARRAY_CARDINALITY` guard.
-                if props.len() > MAX_OBJECT_PROPERTIES {
-                    return Err(SchemaError(format!(
-                        "object schema property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
-                        props.len()
-                    )));
-                }
-
                 // Unique per-object suffix so distinct object schemas sharing a
                 // property key don't alias each other's value/pair rules.
                 let obj_idx = self.object_counter;
@@ -1659,8 +1686,10 @@ enum StrClass {
 /// string member) returns `Literals(vec![])` so it contributes nothing — it
 /// must NOT fall through to `None`, which would let the standalone path widen it
 /// to any string.
-fn string_class_of(sub: &Value) -> Option<StrClass> {
-    let obj = sub.as_object()?;
+fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
+    let Some(obj) = sub.as_object() else {
+        return Ok(None);
+    };
     // `type` gate: only an absent type or exactly `"string"` keeps the branch a
     // pure string class. A scalar non-string type, or a `type` array (for which
     // `as_str()` is `None` on a non-string `Value`), means the branch may accept
@@ -1668,7 +1697,7 @@ fn string_class_of(sub: &Value) -> Option<StrClass> {
     let type_is_string = match obj.get("type") {
         None => false,
         Some(Value::String(s)) if s == "string" => true,
-        _ => return None,
+        _ => return Ok(None),
     };
     let const_val = obj.get("const");
     let enum_arr = obj.get("enum").and_then(Value::as_array);
@@ -1680,48 +1709,57 @@ fn string_class_of(sub: &Value) -> Option<StrClass> {
                 // Non-string const: with `type:"string"` nothing satisfies both
                 // (dead branch); with no type the branch accepts that non-string
                 // value, which this string fold cannot represent.
-                return if type_is_string {
+                return Ok(if type_is_string {
                     Some(StrClass::Literals(Vec::new()))
                 } else {
                     None
-                };
+                });
             };
             // String const: fold it only if a present `enum` also contains it; a
             // conflicting `enum` makes the intersection empty (dead branch).
-            match enum_opt {
+            Ok(match enum_opt {
                 Some(arr) if !arr.iter().any(|v| v == c) => Some(StrClass::Literals(Vec::new())),
                 _ => Some(StrClass::Literals(vec![cs.to_string()])),
-            }
+            })
         }
         (None, Some(arr)) => {
+            // DoS bound (issue #478): reject by raw JSON cardinality before the
+            // filter_map/to_string pass below, which deep-copies every member
+            // into an owned `String`. Without this, a single anyOf/oneOf branch
+            // with an enormous `enum` forces a content-proportional allocation
+            // before compile_any_of's per-extend count guard ever sees a result.
+            if arr.len() > MAX_STRING_LITERALS {
+                return Err(SchemaError(format!(
+                    "anyOf string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+                    arr.len()
+                )));
+            }
             if type_is_string {
                 // `type:"string"` kills every non-string member; the language is
                 // exactly the string members (possibly empty = dead branch).
-                Some(StrClass::Literals(
+                Ok(Some(StrClass::Literals(
                     arr.iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
                         .collect(),
-                ))
+                )))
             } else if !arr.is_empty() && arr.iter().all(Value::is_string) {
                 // Untyped all-string enum: a pure literal set.
-                Some(StrClass::Literals(
+                Ok(Some(StrClass::Literals(
                     arr.iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
                         .collect(),
-                ))
+                )))
             } else {
                 // Untyped mixed or empty enum: non-string members stay reachable
                 // as an "other" branch (folding would drop those acceptances).
-                None
+                Ok(None)
             }
         }
-        (None, None) => {
-            if type_is_string {
-                Some(StrClass::Broad)
-            } else {
-                None
-            }
-        }
+        (None, None) => Ok(if type_is_string {
+            Some(StrClass::Broad)
+        } else {
+            None
+        }),
     }
 }
 
@@ -3049,6 +3087,162 @@ mod tests {
         assert!(
             accepts(&g, b"[1,\"hi\"]"),
             "a valid tuple value must be accepted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #478 — adjacent pre-cap allocations (anyOf literal aggregation,
+    // object property/required collection)
+    // -----------------------------------------------------------------------
+
+    /// Early anyOf string-literal count guard, many-small-branches path
+    /// (issue #478): an anyOf schema whose foldable string-const branches
+    /// individually stay tiny but together exceed MAX_STRING_LITERALS must be
+    /// rejected by the per-extend guard inside compile_any_of's aggregation
+    /// loop, not by the post-loop backstop or the late compile_trie_literals
+    /// guard.
+    ///
+    /// Mutation pin: the early guard fires with "anyOf string literal count"
+    /// in the message. Reverting it lets `literals` accumulate unchecked
+    /// through the loop; the post-loop backstop then fires with the
+    /// DIFFERENT "string literal count" message (no "anyOf " prefix), so the
+    /// assertion below fails.
+    #[test]
+    fn anyof_string_literal_count_cap_early_guard_fires_before_alloc() {
+        let over = MAX_STRING_LITERALS + 1;
+        let branches: String = (0..over)
+            .map(|i| format!("{{\"const\":\"c{i}\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{branches}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err =
+            compile(&v).expect_err("anyOf branches summing past the literal cap must be rejected");
+        assert!(
+            err.0.contains("anyOf string literal count"),
+            "early per-extend guard must fire with 'anyOf string literal count', got: {}",
+            err.0
+        );
+    }
+
+    /// Early anyOf string-literal count guard, single-oversized-branch path
+    /// (issue #478): ONE anyOf branch with a `{"type":"string","enum":[...]}`
+    /// over MAX_STRING_LITERALS members must be rejected by the guard inside
+    /// `string_class_of`, before it deep-copies every member into an owned
+    /// `String`. Distinct from the many-small-branches accumulation path
+    /// above: here a single `string_class_of` call would itself materialize
+    /// the oversized Vec if unguarded, before compile_any_of's loop body ever
+    /// runs again to check the cumulative total.
+    ///
+    /// Mutation pin: fires with "anyOf string literal count". Reverting just
+    /// this guard still leaves the per-extend guard in compile_any_of, which
+    /// independently catches the returned oversized Vec on the same
+    /// iteration with the same message — so an ALL-STRING enum like this one
+    /// does not, by itself, distinguish the two guards. See
+    /// `anyof_single_branch_raw_cardinality_bypasses_filtered_count_guard`
+    /// below for a test that isolates the `string_class_of` guard alone.
+    #[test]
+    fn anyof_single_branch_string_enum_count_cap_rejects() {
+        let over = MAX_STRING_LITERALS + 1;
+        let values: String = (0..over)
+            .map(|i| format!("\"v{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!("{{\"anyOf\":[{{\"type\":\"string\",\"enum\":[{values}]}}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("oversized single anyOf branch enum must be rejected");
+        assert!(
+            err.0.contains("anyOf string literal count"),
+            "expected the anyOf string-literal cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Isolates the `string_class_of`-internal guard from compile_any_of's
+    /// per-extend guard (issue #478): a single anyOf branch declares
+    /// `{"type":"string","enum":[...]}` with over MAX_STRING_LITERALS
+    /// members, but all except ONE are non-string (integers). `type:"string"`
+    /// intersects the enum down to its string members, so the FILTERED count
+    /// compile_any_of's per-extend guard ever observes is 1 — far under the
+    /// cap. Only a guard on the RAW `arr.len()` inside `string_class_of`,
+    /// checked before the filter_map/to_string pass, can catch this: the
+    /// per-extend guard cannot, because it never sees the discarded members.
+    ///
+    /// Mutation pin: reverting the `string_class_of`-internal guard makes
+    /// this schema compile successfully (`Ok`) instead of being rejected —
+    /// a correctness gap, not just a slower rejection — because nothing else
+    /// in the call chain re-checks the raw enum cardinality of one branch.
+    #[test]
+    fn anyof_single_branch_raw_cardinality_bypasses_filtered_count_guard() {
+        let over = MAX_STRING_LITERALS + 1;
+        let mut members: Vec<String> = (0..over).map(|i| i.to_string()).collect();
+        members.push("\"only-string\"".to_string());
+        let values = members.join(",");
+        let schema_json = format!("{{\"anyOf\":[{{\"type\":\"string\",\"enum\":[{values}]}}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err(
+            "oversized raw enum cardinality must be rejected even with only 1 surviving string",
+        );
+        assert!(
+            err.0.contains("anyOf string literal count"),
+            "expected the anyOf string-literal cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// Early object-property count guard (issue #478): an object schema with
+    /// more than MAX_OBJECT_PROPERTIES properties is rejected by the guard
+    /// checked directly on the property map's `.len()` BEFORE
+    /// `.iter().collect::<Vec<_>>()`, with the "object property count"
+    /// message proving the pre-collect guard fired.
+    ///
+    /// Mutation pin: reverting the pre-collect guard removes the only
+    /// remaining property-count check in `compile_object` (the old post-collect
+    /// check was replaced, not duplicated), so compile would have to either
+    /// succeed (wrong) or fail elsewhere with a different message.
+    #[test]
+    fn object_property_count_early_guard_fires_before_collect() {
+        let over = MAX_OBJECT_PROPERTIES + 1;
+        let mut props = String::new();
+        for i in 0..over {
+            if i > 0 {
+                props.push(',');
+            }
+            props.push_str(&format!("\"p{i}\":{{\"type\":\"integer\"}}"));
+        }
+        let schema_json = format!("{{\"type\":\"object\",\"properties\":{{{props}}}}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-cap object schema must be rejected");
+        assert!(
+            err.0.contains("object property count"),
+            "expected the pre-collect object-property-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// `required` cardinality is bounded independent of `properties` (issue
+    /// #478): an object schema whose `required` array exceeds
+    /// MAX_OBJECT_PROPERTIES entries is rejected before the
+    /// filter_map/collect into `Vec<&str>`, even when `properties` itself is
+    /// tiny. Mutation pin: fires with "object required count"; reverting the
+    /// guard lets the oversized array collect unchecked (no rejection at
+    /// all, since nothing downstream re-checks `required`'s cardinality).
+    #[test]
+    fn object_required_count_cap_rejects_before_collect() {
+        let over = MAX_OBJECT_PROPERTIES + 1;
+        let required_list: String = (0..over)
+            .map(|i| format!("\"r{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema_json = format!(
+            "{{\"type\":\"object\",\"properties\":{{\"p\":{{\"type\":\"integer\"}}}},\"required\":[{required_list}]}}"
+        );
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err("over-cap required array must be rejected");
+        assert!(
+            err.0.contains("object required count"),
+            "expected the pre-collect required-count cap error, got: {}",
+            err.0
         );
     }
 }
