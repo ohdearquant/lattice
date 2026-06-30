@@ -112,8 +112,8 @@
 //!
 //! ```toml
 //! [dependencies]
-//! lattice-tune = { version = "0.3", features = ["inference-hook"] }
-//! lattice-inference = "0.3" # provides the LoraHook trait
+//! lattice-tune = { version = "0.4.2", features = ["inference-hook"] }
+//! lattice-inference = "0.4.2" # provides the LoraHook trait
 //! ```
 //!
 //! ```ignore

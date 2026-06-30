@@ -334,10 +334,10 @@ let finetuned = RegisteredModel::new("intent_classifier", "1.1.0")
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.1" }                           # Default
-lattice-tune = { version = "0.1", features = ["serde"] }     # With serialization
-lattice-tune = { version = "0.1", features = ["gpu"] }       # GPU training
-lattice-tune = { version = "0.1", features = ["safetensors"] } # Safe checkpoints
+lattice-tune = { version = "0.4.2" }                           # Default
+lattice-tune = { version = "0.4.2", features = ["serde"] }     # With serialization
+lattice-tune = { version = "0.4.2", features = ["gpu"] }       # GPU training
+lattice-tune = { version = "0.4.2", features = ["safetensors"] } # Safe checkpoints
 ```
 
 ### Injecting an adapter into `lattice-inference`
@@ -348,8 +348,8 @@ as a `Box<dyn LoraHook>`:
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.3", features = ["inference-hook"] }
-lattice-inference = "0.3" # provides the LoraHook trait
+lattice-tune = { version = "0.4.2", features = ["inference-hook"] }
+lattice-inference = "0.4.2" # provides the LoraHook trait
 ```
 
 ```rust,ignore
@@ -367,7 +367,7 @@ This crate depends on `lattice-fann` for neural network primitives.
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.1" }
+lattice-tune = { version = "0.4.2" }
 # lattice-fann is automatically included as a transitive dependency
 ```
 
