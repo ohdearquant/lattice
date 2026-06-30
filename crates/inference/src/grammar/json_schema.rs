@@ -1255,6 +1255,53 @@ mod tests {
     }
 
     #[test]
+    fn any_array_rejects_trailing_comma() {
+        // An untyped array (`body ::= any tail | ε`, `tail ::= ws ',' ws any
+        // tail | ε`) must reject a trailing comma before `]`.  Previously the
+        // PDA's no-rewind parent-backtrack switched the comma-consuming `tail`
+        // frame to its `| ε` sibling AFTER the `,` byte was consumed, silently
+        // admitting invalid JSON.  The per-frame byte-consumption guard refuses
+        // that switch once a byte is committed.  Valid forms must still accept.
+        let g = compile_ok(r#"{"type":"array"}"#);
+        assert!(accepts(&g, b"[]"));
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(rejects(&g, b"[1,]"));
+        assert!(rejects(&g, b"[1,2,]"));
+        assert!(rejects(&g, b"[,]"));
+    }
+
+    #[test]
+    fn typed_array_rejects_trailing_comma() {
+        // Same trailing-comma over-acceptance via the bounded-tail rule used
+        // for typed arrays (`build_bounded_tail`).  The byte-consumption guard
+        // closes both the untyped and typed array paths at once.
+        let g = compile_ok(r#"{"type":"array","items":{"type":"integer"}}"#);
+        assert!(accepts(&g, b"[]"));
+        assert!(accepts(&g, b"[5]"));
+        assert!(accepts(&g, b"[1,2]"));
+        assert!(rejects(&g, b"[1,]"));
+        assert!(rejects(&g, b"[1,2,]"));
+    }
+
+    #[test]
+    fn shared_prefix_enum_known_limitation() {
+        // KNOWN LIMITATION (pre-existing, not introduced by the #353 guard):
+        // the no-rewind byte matcher cannot parse shared-prefix sibling
+        // alternatives. For `enum ["foo","food"]` the first member commits the
+        // shared `foo` prefix, so the longer sibling `food` is over-REJECTED.
+        // This is the SAFE direction for constrained decoding (the model just
+        // cannot emit one valid member); over-acceptance would be the dangerous
+        // direction. The first member still accepts. This test documents the
+        // behavior so a future ambiguity-preserving matcher (trie/NFA or
+        // parallel stacks) has a regression anchor; it is verified identical on
+        // origin/main (the byte-consumption guard neither causes nor fixes it).
+        let g = compile_ok(r#"{"enum":["foo","food"]}"#);
+        assert!(accepts(&g, b"\"foo\""));
+        assert!(rejects(&g, b"\"food\""));
+    }
+
+    #[test]
     fn schema_error_display() {
         let e = SchemaError("test".to_string());
         assert!(e.to_string().contains("test"));
