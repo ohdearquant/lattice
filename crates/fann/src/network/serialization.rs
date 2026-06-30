@@ -3,7 +3,7 @@
 //! Provides binary serialization for efficient network storage and loading.
 
 use crate::activation::Activation;
-use crate::error::{FannError, FannResult};
+use crate::error::{FannError, FannResult, validate_allocation_size, validate_layer_dimensions};
 use crate::layer::Layer;
 use crate::network::Network;
 
@@ -118,12 +118,16 @@ impl Network {
 
         // Helper to read bytes
         let read_bytes = |pos: &mut usize, n: usize| -> FannResult<&[u8]> {
-            if *pos + n > bytes.len() {
+            // Compute the remaining budget by subtraction, never `*pos + n`, so a
+            // hostile byte count near usize::MAX cannot overflow the bounds check
+            // itself. `*pos` is always <= bytes.len() (every read advances pos only
+            // after validating), so the subtraction is exact and `*pos + n` below
+            // is safe once `n <= available` is established.
+            let available = bytes.len().saturating_sub(*pos);
+            if n > available {
                 return Err(FannError::InvalidBuilder(format!(
-                    "Truncated data at offset {}: expected {} bytes, {} available",
+                    "Truncated data at offset {}: expected {n} bytes, {available} available",
                     *pos,
-                    n,
-                    bytes.len() - *pos
                 )));
             }
             let slice = &bytes[*pos..*pos + n];
@@ -160,6 +164,21 @@ impl Network {
             return Err(FannError::EmptyNetwork);
         }
 
+        // Bounds-before-allocation: every layer header needs at minimum 9 bytes
+        // (num_inputs u32=4 + num_outputs u32=4 + activation u8=1). A hostile
+        // num_layers field cannot legitimately exceed what the remaining bytes
+        // can encode, so we bound it before reserving any capacity.
+        let remaining_for_layers = bytes.len().saturating_sub(pos);
+        let max_plausible_layers = remaining_for_layers / 9;
+        if num_layers > max_plausible_layers {
+            return Err(FannError::InvalidBuilder(format!(
+                "num_layers {num_layers} exceeds what the remaining {remaining_for_layers} \
+                 bytes can encode (max plausible with 9 bytes/layer: {max_plausible_layers})"
+            )));
+        }
+        // Secondary allocation-size guard for defence in depth.
+        validate_allocation_size(num_layers)?;
+
         let mut layers = Vec::with_capacity(num_layers);
 
         for layer_idx in 0..num_layers {
@@ -173,6 +192,14 @@ impl Network {
                 .try_into()
                 .map_err(|_| FannError::InvalidBuilder("Failed to read num_outputs".into()))?;
             let num_outputs = u32::from_le_bytes(num_outputs_bytes) as usize;
+
+            // Bounds-before-allocation: enforce the per-layer element cap on the
+            // hostile dimension fields BEFORE reading and collecting the weight and
+            // bias payloads. `Layer::with_weights` re-validates as defence in depth,
+            // but checking here keeps a large declared shape from driving a
+            // multi-hundred-MB `Vec<f32>` allocation before the cap is applied.
+            // num_inputs > 0 (enforced here) also bounds num_outputs for biases.
+            validate_layer_dimensions(num_inputs, num_outputs)?;
 
             // Read activation type
             let activation_type = read_bytes(&mut pos, 1)?[0];
@@ -196,9 +223,20 @@ impl Network {
                 }
             };
 
-            // Read weights
-            let weight_count = num_inputs * num_outputs;
-            let weight_bytes = read_bytes(&mut pos, weight_count * 4)?;
+            // Read weights; use checked arithmetic so hostile dimension fields
+            // produce a clean Err rather than an allocation-abort.
+            let weight_count = num_inputs.checked_mul(num_outputs).ok_or_else(|| {
+                FannError::InvalidBuilder(format!(
+                    "layer {layer_idx}: num_inputs ({num_inputs}) * num_outputs \
+                     ({num_outputs}) overflows"
+                ))
+            })?;
+            let weight_byte_count = weight_count.checked_mul(4).ok_or_else(|| {
+                FannError::InvalidBuilder(format!(
+                    "layer {layer_idx}: weight byte count overflows ({weight_count} * 4)"
+                ))
+            })?;
+            let weight_bytes = read_bytes(&mut pos, weight_byte_count)?;
             let weights: Vec<f32> = weight_bytes
                 .chunks_exact(4)
                 .map(|chunk| {
@@ -210,8 +248,14 @@ impl Network {
                 })
                 .collect();
 
-            // Read biases
-            let bias_bytes = read_bytes(&mut pos, num_outputs * 4)?;
+            // Read biases; checked arithmetic for the same parser-boundary
+            // reason as the weight byte count above.
+            let bias_byte_count = num_outputs.checked_mul(4).ok_or_else(|| {
+                FannError::InvalidBuilder(format!(
+                    "layer {layer_idx}: bias byte count overflows ({num_outputs} * 4)"
+                ))
+            })?;
+            let bias_bytes = read_bytes(&mut pos, bias_byte_count)?;
             let biases: Vec<f32> = bias_bytes
                 .chunks_exact(4)
                 .map(|chunk| {
@@ -225,6 +269,16 @@ impl Network {
 
             let layer = Layer::with_weights(num_inputs, num_outputs, weights, biases, activation)?;
             layers.push(layer);
+        }
+
+        // Reject trailing bytes — the binary format is exact; to_bytes produces
+        // no padding or footer. Extra bytes indicate a malformed or incorrect blob.
+        if pos != bytes.len() {
+            return Err(FannError::InvalidBuilder(format!(
+                "trailing bytes after parsing: consumed {pos} of {} bytes; \
+                 the format requires an exact-length blob",
+                bytes.len()
+            )));
         }
 
         Network::new(layers)
@@ -335,5 +389,129 @@ mod tests {
         for (orig, rest) in original_output.iter().zip(restored_output.iter()) {
             assert!((orig - rest).abs() < 1e-6);
         }
+    }
+
+    // ── FIX 2: bounds-before-allocation + trailing-bytes tests ──────────────
+
+    /// A header with num_layers = 0xFFFFFFFF and a short buffer must return
+    /// Err(FannError::InvalidBuilder) without attempting any large allocation.
+    ///
+    /// Mutation that defeats this test: remove the remaining-bytes bounds check
+    /// before Vec::with_capacity(num_layers).
+    #[test]
+    fn from_bytes_large_num_layers_short_buffer_returns_err() {
+        // Only 12 bytes: magic + version + num_layers=0xFFFFFFFF.
+        // remaining_for_layers = 0, max_plausible = 0 < 0xFFFFFFFF → Err.
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "large num_layers with short buffer must return InvalidBuilder, got {result:?}"
+        );
+    }
+
+    /// A valid serialized blob with one extra trailing byte must return
+    /// Err(FannError::InvalidBuilder).
+    ///
+    /// Mutation that defeats this test: remove the trailing-bytes check after
+    /// the layer loop.
+    #[test]
+    fn from_bytes_trailing_bytes_returns_err() {
+        let net = NetworkBuilder::new()
+            .input(2)
+            .hidden(4, Activation::ReLU)
+            .output(2, Activation::Linear)
+            .build()
+            .unwrap();
+        let mut bytes = net.to_bytes();
+        bytes.push(0xAB); // one trailing byte
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "trailing byte must return InvalidBuilder, got {result:?}"
+        );
+    }
+
+    /// A header declaring a huge weight count (num_inputs * num_outputs far
+    /// above MAX_ALLOWED_ELEMENTS) must be rejected by the early per-layer size
+    /// cap with Err(FannError::ShapeTooLarge), before any byte-count arithmetic,
+    /// read, or allocation.
+    ///
+    /// With num_inputs=3_000_000_000 and num_outputs=2_000_000_000 the element
+    /// count is 6e18 — a valid usize, but ~6e10x the 100M cap. validate_layer_dimensions
+    /// (run right after the dimensions are read) rejects it via validate_allocation_size.
+    /// The downstream weight_count.checked_mul(4) guard remains as defence in depth
+    /// but is unreachable for these dimensions because the cap fires first.
+    ///
+    /// Mutation that defeats this test: remove the early validate_layer_dimensions
+    /// call — the parser then reaches weight_count.checked_mul(4), which overflows
+    /// (6e18 * 4 = 2.4e19 > usize::MAX) and returns InvalidBuilder instead.
+    #[test]
+    fn from_bytes_huge_weight_dims_rejected_by_size_cap() {
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
+        bytes.extend_from_slice(&3_000_000_000_u32.to_le_bytes()); // num_inputs
+        bytes.extend_from_slice(&2_000_000_000_u32.to_le_bytes()); // num_outputs
+        bytes.push(0); // activation=Linear
+        // 21 bytes total; the layer bounds check passes (remaining=9, max=1 layer).
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "huge weight dims must hit the size cap before allocation, got {result:?}"
+        );
+    }
+
+    /// A header with near-usize::MAX-product dimensions must be rejected cleanly
+    /// (Err, no panic) by the early per-layer size cap. This pins that
+    /// validate_layer_dimensions itself does not overflow/panic on extreme
+    /// dimensions: its internal checked_mul handles the 2^62-1 product, and
+    /// validate_allocation_size then rejects it with ShapeTooLarge.
+    ///
+    /// num_inputs = 2^31-1, num_outputs = 2^31+1 → product = 2^62-1 (a valid
+    /// usize, ~4.6e10x the 100M cap). The cap fires before the weight byte-count
+    /// arithmetic and before read_bytes is asked for the (usize::MAX-3) payload,
+    /// so the overflow-safe read_bytes guard remains as defence in depth here.
+    ///
+    /// Mutation that defeats this test: remove the early validate_layer_dimensions
+    /// call — the parser then reaches read_bytes(pos=21, usize::MAX-3) and returns
+    /// a truncation InvalidBuilder instead of ShapeTooLarge.
+    #[test]
+    fn from_bytes_near_usize_max_dims_rejected_by_size_cap() {
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
+        bytes.extend_from_slice(&2_147_483_647_u32.to_le_bytes()); // num_inputs = 2^31-1
+        bytes.extend_from_slice(&2_147_483_649_u32.to_le_bytes()); // num_outputs = 2^31+1
+        bytes.push(0); // activation=Linear
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "near-usize::MAX dims must hit the size cap before allocation, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn from_bytes_oversized_layer_dims_rejected_before_allocation() {
+        // A hostile header declaring more than MAX_ALLOWED_ELEMENTS weights must
+        // be rejected by the size cap BEFORE from_bytes reads or collects the
+        // weight payload. This buffer carries no weight bytes at all: if the cap
+        // were enforced only inside Layer::with_weights (after collection), the
+        // parser would first attempt the oversized weight read and return a
+        // truncation InvalidBuilder. Reverting the early validate_layer_dimensions
+        // call makes this case return InvalidBuilder instead of ShapeTooLarge.
+        let mut bytes = b"FANN".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version=1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_layers=1
+        bytes.extend_from_slice(&100_000_001_u32.to_le_bytes()); // num_inputs = MAX_ALLOWED_ELEMENTS + 1
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // num_outputs=1
+        bytes.push(0); // activation=Linear
+        let result = Network::from_bytes(&bytes);
+        assert!(
+            matches!(result, Err(FannError::ShapeTooLarge { .. })),
+            "oversized layer dims must hit the size cap before allocation, got {result:?}"
+        );
     }
 }

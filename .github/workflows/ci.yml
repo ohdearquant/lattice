@@ -76,6 +76,13 @@ jobs:
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
+      # The `mixture` feature gates the experimental online router-refit module
+      # (crates/tune/src/lora/router_update.rs) behind lattice-fann/online-router.
+      # It is off by default, so the required `ci` job never compiles or RUNS its
+      # fail-closed validation tests (empty-feedback, wrong context-dim, replay
+      # buffer bounds). Build AND run them here so the feature cannot rot silently.
+      - name: tune — mixture (online router-refit, build + run tests)
+        run: cargo test -p lattice-tune --features mixture --lib
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
