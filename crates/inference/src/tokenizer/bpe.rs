@@ -23,7 +23,6 @@ const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreTokenizeMode {
-    ByteLevel,
     Gpt4Regex,
 }
 
@@ -184,6 +183,7 @@ impl BpeTokenizer {
             }
         }
 
+        validate_bpe_pretokenizer(&root)?;
         if detect_gpt4_regex_pretokenizer(&root) {
             tokenizer = tokenizer.with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex);
         }
@@ -281,7 +281,22 @@ impl BpeTokenizer {
             eos_id,
             add_bos: false,
             add_eos: false,
-            pre_tokenize_mode: PreTokenizeMode::ByteLevel,
+            // #330: default to the GPT-2 regex pretokenizer, not the naive
+            // `byte_level_pretokenize` heuristic. Every real GPT-2-format
+            // tokenizer HF ships (raw vocab.json+merges.txt with no
+            // tokenizer.json, or a tokenizer.json declaring
+            // `"pre_tokenizer": {"type": "ByteLevel"}`) uses the standard
+            // GPT-2 regex for word-boundary splitting: it's what the "slow"
+            // Python `GPT2Tokenizer` implements directly, and it's what the
+            // fast `ByteLevel` pre_tokenizer's `use_regex` flag defaults to
+            // (`true`) when absent, which is the case for both `gpt2` and
+            // `roberta-base` on the Hub. `from_tokenizer_json_str` below can
+            // still detect an explicit regex `Split`/`Sequence` pre_tokenizer
+            // and set this mode explicitly, but when there is no
+            // pre_tokenizer metadata to inspect at all — the case this
+            // default governs — GPT-2 regex is the correct assumption, not
+            // the hand-rolled fallback.
+            pre_tokenize_mode: PreTokenizeMode::Gpt4Regex,
             max_seq_len,
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
@@ -542,7 +557,6 @@ impl BpeTokenizer {
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
         let pieces = match self.inner.pre_tokenize_mode {
-            PreTokenizeMode::ByteLevel => byte_level_pretokenize(text),
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
         };
         for piece in pieces {
@@ -811,134 +825,6 @@ fn parse_merges_json(value: &JsonValue) -> Result<Vec<(String, String)>, Inferen
     Ok(merges)
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SegmentClass {
-    Letter,
-    Number,
-    Other,
-}
-
-fn classify_char(ch: char) -> SegmentClass {
-    if ch.is_alphabetic() {
-        SegmentClass::Letter
-    } else if ch.is_numeric() {
-        SegmentClass::Number
-    } else {
-        SegmentClass::Other
-    }
-}
-
-fn split_whitespace_run(run: &str) -> (&str, &str) {
-    if run.is_empty() {
-        return ("", "");
-    }
-    let mut last_start = 0usize;
-    for (idx, _) in run.char_indices() {
-        last_start = idx;
-    }
-    (&run[..last_start], &run[last_start..])
-}
-
-fn byte_level_pretokenize(text: &str) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < text.len() {
-        let ws_start = pos;
-        while pos < text.len() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            if !ch.is_whitespace() {
-                break;
-            }
-            pos += ch.len_utf8();
-        }
-
-        if pos >= text.len() {
-            if ws_start < pos {
-                pieces.push(text[ws_start..pos].to_string());
-            }
-            break;
-        }
-
-        let ws_run = &text[ws_start..pos];
-        let (standalone_ws, attached_ws) = split_whitespace_run(ws_run);
-        if !standalone_ws.is_empty() {
-            pieces.push(standalone_ws.to_string());
-        }
-
-        let mut segment = String::new();
-        segment.push_str(attached_ws);
-
-        let current = text[pos..]
-            .chars()
-            .next()
-            .expect("invariant: pos is inside non-empty UTF-8 text");
-        let class = if current == '\'' {
-            let next_pos = pos + current.len_utf8();
-            if next_pos < text.len() {
-                classify_char(
-                    text[next_pos..]
-                        .chars()
-                        .next()
-                        .expect("invariant: next_pos is inside non-empty UTF-8 text"),
-                )
-            } else {
-                SegmentClass::Other
-            }
-        } else {
-            classify_char(current)
-        };
-
-        if current == '\'' && class != SegmentClass::Other {
-            segment.push(current);
-            pos += current.len_utf8();
-        }
-
-        while pos < text.len() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            if ch.is_whitespace() {
-                break;
-            }
-            let ch_class = classify_char(ch);
-            if ch_class != class {
-                break;
-            }
-            segment.push(ch);
-            pos += ch.len_utf8();
-        }
-
-        if segment.is_empty() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            segment.push(ch);
-            pos += ch.len_utf8();
-            while pos < text.len() {
-                let next = text[pos..]
-                    .chars()
-                    .next()
-                    .expect("invariant: pos is inside non-empty UTF-8 text");
-                if next.is_whitespace() || classify_char(next) != SegmentClass::Other {
-                    break;
-                }
-                segment.push(next);
-                pos += next.len_utf8();
-            }
-        }
-
-        pieces.push(segment);
-    }
-
-    pieces
-}
-
 fn bytes_to_unicode() -> Vec<char> {
     let mut bs = Vec::new();
     bs.extend(33u16..=126);
@@ -998,6 +884,135 @@ fn has_regex_split(pt: &JsonValue) -> bool {
             .is_some_and(|arr| arr.iter().any(has_regex_split)),
         _ => false,
     }
+}
+
+/// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
+/// parser cannot honestly model (#330 codex round-2 finding 1).
+///
+/// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
+/// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
+/// *confirms* that default from a recognized regex `Split`/`Sequence`. That
+/// combination means an explicit-but-unrecognized `pre_tokenizer` silently
+/// falls through to the `Gpt4Regex` default rather than erroring — including
+/// `ByteLevel(use_regex=false)`, whose whole point (per HF's
+/// `tokenizers::pre_tokenizers::byte_level::ByteLevel`) is to *skip* regex
+/// splitting entirely. Splitting anyway produces silently wrong token ids
+/// (a merge that should fire across a former word boundary cannot).
+///
+/// Accept/reject matrix:
+/// - `pre_tokenizer` absent -> accept (the #330 raw-vocab default; no
+///   metadata to contradict `Gpt4Regex`).
+/// - Top-level recognized regex `Split` -> accept.
+/// - `Sequence` -> accept only if EVERY child is individually supported,
+///   walked left-to-right: a child is supported if it is itself a
+///   recognized regex `Split`, OR a bare `ByteLevel` with `use_regex`
+///   absent/`true`, OR a `ByteLevel{use_regex:false}` that is preceded
+///   (earlier in the same sequence) by a supported regex `Split` — this is
+///   the real Qwen/Qwen3-Embedding shape,
+///   `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`, because
+///   the leading `Split` already establishes the correct segmentation and
+///   the trailing `ByteLevel(use_regex:false)` is just "don't split again".
+///   Any other/unsupported sibling (e.g. `Metaspace`, `Whitespace`) rejects
+///   the whole sequence even when another child is a regex `Split` — a
+///   `Split` does not honestly dominate later pre-tokenizers (codex round-3,
+///   #330 residual finding).
+/// - Bare top-level `ByteLevel` with `use_regex` absent or `true` -> accept
+///   (HF's default `use_regex=true` is exactly what `Gpt4Regex`
+///   approximates; this is the common gpt2/roberta Hub shape).
+/// - Bare top-level `ByteLevel` with explicit `use_regex:false` -> reject
+///   (no preceding `Split` is possible at the top level to establish
+///   segmentation). `Gpt4Regex` would silently apply a split the tokenizer
+///   author explicitly disabled.
+/// - Any other/unknown `pre_tokenizer` type (`Metaspace`, `Whitespace`,
+///   `BertPreTokenizer`, ...) on a BPE model -> reject. This parser has no
+///   implementation for it; falling through to `Gpt4Regex` would silently
+///   mistokenize.
+fn validate_bpe_pretokenizer(root: &JsonValue) -> Result<(), InferenceError> {
+    let Some(pt) = root.get("pre_tokenizer") else {
+        return Ok(());
+    };
+    if is_supported_bpe_pretokenizer(pt) {
+        return Ok(());
+    }
+    Err(InferenceError::Tokenizer(format!(
+        "tokenizer.json declares an unsupported BPE pre_tokenizer \
+         configuration ({}); refusing to silently fall back to the GPT-2 \
+         regex default, which could split text the declared pre_tokenizer \
+         would not",
+        describe_pretokenizer(pt)
+    )))
+}
+
+/// Whether a single `Split`/`ByteLevel` node (never a `Sequence`) is a
+/// recognized regex-establishing split on its own, with no notion of
+/// "preceded by". Used as the base case for both the top-level check and
+/// the `Sequence` child walk below.
+fn is_regex_split_node(pt: &JsonValue) -> bool {
+    let pt_type = pt.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    pt_type == "Split" && pt.get("pattern").and_then(|p| p.get("Regex")).is_some()
+}
+
+/// Whether `pt` is one of the `pre_tokenizer` shapes this parser can
+/// honestly honor for a BPE model. See `validate_bpe_pretokenizer` for the
+/// full accept/reject matrix and rationale.
+///
+/// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
+/// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
+/// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
+/// `Gpt4Regex` (codex round-3, #330 residual finding).
+fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
+    if is_regex_split_node(pt) {
+        return true;
+    }
+    let pt_type = pt.get("type").and_then(JsonValue::as_str).unwrap_or("");
+    match pt_type {
+        "ByteLevel" => pt
+            .get("use_regex")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true),
+        "Sequence" => pt
+            .get("pretokenizers")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|arr| {
+                let mut seen_regex_split = false;
+                for child in arr {
+                    if is_regex_split_node(child) {
+                        seen_regex_split = true;
+                        continue;
+                    }
+                    let child_type = child.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                    let child_ok = if child_type == "ByteLevel" {
+                        let use_regex = child
+                            .get("use_regex")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(true);
+                        use_regex || seen_regex_split
+                    } else {
+                        false
+                    };
+                    if !child_ok {
+                        return false;
+                    }
+                }
+                true
+            }),
+        _ => false,
+    }
+}
+
+fn describe_pretokenizer(pt: &JsonValue) -> String {
+    let pt_type = pt
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<untyped>");
+    if pt_type == "ByteLevel" {
+        let use_regex = pt
+            .get("use_regex")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(true);
+        return format!("ByteLevel{{use_regex:{use_regex}}}");
+    }
+    pt_type.to_string()
 }
 
 fn gpt4_regex_pretokenize(text: &str) -> Vec<String> {
@@ -1187,9 +1202,203 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_pretokenize_preserves_prefix_space() {
-        let pieces = byte_level_pretokenize("hello world");
-        assert_eq!(pieces, vec!["hello", " world"]);
+    fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
+        // Golden pieces from HF `tokenizers.pre_tokenizers.ByteLevel(use_regex=True)`
+        // (the real, unconditional default for every GPT-2-format tokenizer HF
+        // ships — see audit_tokenizer_parity.rs::gpt2_raw_vocab_bytelevel_fallback_parity
+        // for the exact command). HF's actual ByteLevel(use_regex=True) regex is
+        // the original GPT-2 pattern `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|
+        // ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`; `gpt4_regex_pretokenize` is a
+        // Qwen/tiktoken-flavored superset (its prefix-letters branch can also
+        // admit leading punctuation), not a literal reimplementation of that
+        // pattern. The cases below are only claimed to match HF ByteLevel/GPT-2
+        // behavior for the exact inputs tested, not as a proof the two regexes
+        // are equivalent in general.
+        assert_eq!(
+            gpt4_regex_pretokenize("hello\nworld"),
+            vec!["hello", "\n", "world"]
+        );
+        assert_eq!(gpt4_regex_pretokenize("a'st"), vec!["a", "'s", "t"]);
+    }
+
+    #[test]
+    fn test_gpt2_raw_vocab_defaults_to_gpt4_regex_pretokenize() {
+        // Regression for #330: `from_vocab_and_merges` (what `from_files` and
+        // `load_tokenizer`'s file-based-probing fallback use for a raw
+        // GPT-2-format vocab.json + merges.txt with no tokenizer.json to read
+        // pre_tokenizer metadata from) must default to `Gpt4Regex`
+        // pretokenization, not the naive hand-rolled fallback that used to
+        // exist — see `test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true`
+        // above for the HF-verified golden pieces this default now produces.
+        //
+        // This is a merge-boundary discriminator: a rule merging 's'+'t' into
+        // "st" can only fire if both chars land in the SAME pretokenize piece
+        // (BPE merges never span piece boundaries). Under the correct regex
+        // split, "a'st" -> ["a", "'s", "t"]: 's' and 't' are in DIFFERENT
+        // pieces ("'s" and "t"), so the merge cannot fire and every char
+        // resolves to its own id. Under the buggy naive-fallback split,
+        // "a'st" -> ["a", "'st"]: 's' and 't' are adjacent within the same
+        // piece, so the merge DOES fire, producing a 3-id sequence instead of
+        // 4. This mirrors the real gpt2 vocab divergence verified empirically
+        // in audit_tokenizer_parity.rs (pre-fix: [64, 6, 301], HF: [64, 338, 83]).
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("'", 1), ("s", 2), ("t", 3), ("st", 4)] {
+            vocab.insert(s.to_string(), i);
+        }
+        let merges = vec![("s".to_string(), "t".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("a'st"), vec![0, 1, 2, 3]);
+    }
+
+    /// Vocab/merges for the cross-space-merge discriminator used by the
+    /// `validate_bpe_pretokenizer` fail-closed tests below (codex round-2,
+    /// #330 finding 1). Byte-level maps a literal space to `Ġ` (U+0120), so
+    /// `"a b"` byte-encodes to `"aĠb"`. Base single-byte tokens (`a`, `Ġ`,
+    /// `b`) plus staged merges `Ġ`+`b` -> `Ġb` -> (with `a`) `aĠb` let a
+    /// SINGLE merged id (2) only be reachable if "a" and " b" land in the
+    /// SAME pre-tokenize piece — i.e. no regex split at all. `Gpt4Regex`
+    /// always splits on word boundaries, so "a" and " b" land in different
+    /// pieces and the cross-space merge can never fire, giving `[0, 1]`
+    /// (the "a" and "Ġb" ids from separate pieces) instead. This is a
+    /// direct id-level proxy for the silent-wrong-ids failure mode codex's
+    /// review flagged for explicit `use_regex:false` metadata that fell
+    /// through to the `Gpt4Regex` default unchecked.
+    fn cross_space_merge_json(pre_tokenizer: &str) -> String {
+        format!(
+            r#"{{
+                "model": {{
+                    "type": "BPE",
+                    "vocab": {{"a": 0, "Ġb": 1, "aĠb": 2, "Ġ": 3, "b": 4}},
+                    "merges": ["Ġ b", "a Ġb"]
+                }},
+                "pre_tokenizer": {pre_tokenizer}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn test_bytelevel_use_regex_false_rejected_without_supporting_split() {
+        // codex round-2 (#330 finding 1, major/fail-open): a tokenizer.json
+        // that explicitly declares `ByteLevel(use_regex:false)` with no
+        // preceding regex `Split` must be REJECTED, not silently tokenized
+        // with the `Gpt4Regex` default. HF's ByteLevel `use_regex=false`
+        // means "no regex split at all" — falling back to `Gpt4Regex` would
+        // silently apply a split the tokenizer author explicitly disabled,
+        // producing wrong ids (see `cross_space_merge_json` doc comment).
+        let json = cross_space_merge_json(r#"{"type": "ByteLevel", "use_regex": false}"#);
+        let err = BpeTokenizer::from_tokenizer_json_str(&json)
+            .expect_err("ByteLevel(use_regex:false) without a supporting Split must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported BPE pre_tokenizer"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_pretokenizer_type_rejected() {
+        // codex round-2 (#330 finding 1): an unrecognized pre_tokenizer type
+        // (Metaspace, Whitespace, BertPreTokenizer, ...) on a BPE model must
+        // also fail closed rather than silently defaulting to `Gpt4Regex`.
+        let json = cross_space_merge_json(r#"{"type": "Metaspace", "replacement": "_"}"#);
+        let err = BpeTokenizer::from_tokenizer_json_str(&json)
+            .expect_err("unknown pre_tokenizer type must fail closed");
+        assert!(
+            err.to_string().contains("unsupported BPE pre_tokenizer"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bare_bytelevel_use_regex_true_or_absent_accepted() {
+        // codex round-2 (#330 finding 1): bare `ByteLevel` with `use_regex`
+        // absent or `true` is the common gpt2/roberta Hub shape and must
+        // keep working exactly as the #330 fix intended — HF's own default
+        // for `use_regex` is `true`, which is what `Gpt4Regex` approximates.
+        for pre_tokenizer in [
+            r#"{"type": "ByteLevel"}"#,
+            r#"{"type": "ByteLevel", "use_regex": true}"#,
+        ] {
+            let json = cross_space_merge_json(pre_tokenizer);
+            let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json)
+                .unwrap_or_else(|e| panic!("bare ByteLevel must be accepted: {e}"));
+            // Gpt4Regex splits "a b" into ["a", " b"]: the cross-space merge
+            // cannot fire, so it round-trips to two ids, not the merged one.
+            assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 1]);
+        }
+    }
+
+    #[test]
+    fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
+        // codex round-2 (#330 finding 1): the real Qwen/Qwen3-Embedding
+        // shape is `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`
+        // — a regex Split establishes the correct segmentation, and the
+        // trailing `ByteLevel(use_regex:false)` just means "don't split
+        // again". This must still be accepted and still dispatch to
+        // `Gpt4Regex` (the only implemented mode), matching pre-fix #519
+        // behavior for this specific shape.
+        let pre_tokenizer = r#"{
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"},
+                {"type": "ByteLevel", "use_regex": false}
+            ]
+        }"#;
+        let json = cross_space_merge_json(pre_tokenizer);
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json)
+            .unwrap_or_else(|e| panic!("Sequence[Split, ByteLevel(false)] must be accepted: {e}"));
+        assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_sequence_split_then_metaspace_rejected() {
+        // codex round-3 (#330 residual finding): before this fix,
+        // `is_supported_bpe_pretokenizer` returned `true` as soon as
+        // `has_regex_split` found ANY descendant regex `Split`, so
+        // `Sequence[Split{pattern.Regex}, Metaspace]` was wrongly accepted
+        // — the unsupported `Metaspace` sibling never got a chance to reject
+        // the sequence. A `Split` earlier in the sequence does not make an
+        // unrelated, unimplemented sibling honest to run through
+        // `Gpt4Regex`: lattice would silently tokenize with GPT-2 byte
+        // encoding while HF applies `Metaspace`, producing a completely
+        // different token alphabet (wrong ids, not a subtle drift).
+        let pre_tokenizer = r#"{
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"},
+                {"type": "Metaspace", "replacement": "_"}
+            ]
+        }"#;
+        let json = cross_space_merge_json(pre_tokenizer);
+        let err = BpeTokenizer::from_tokenizer_json_str(&json).expect_err(
+            "Sequence[Split, Metaspace] must fail closed even though Split is regex-based",
+        );
+        assert!(
+            err.to_string().contains("unsupported BPE pre_tokenizer"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sequence_split_then_whitespace_rejected() {
+        // Same class as `test_sequence_split_then_metaspace_rejected` above,
+        // with `Whitespace` (also named explicitly in codex round-2's
+        // reject list) as the unsupported sibling instead of `Metaspace`.
+        let pre_tokenizer = r#"{
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"},
+                {"type": "Whitespace"}
+            ]
+        }"#;
+        let json = cross_space_merge_json(pre_tokenizer);
+        let err = BpeTokenizer::from_tokenizer_json_str(&json).expect_err(
+            "Sequence[Split, Whitespace] must fail closed even though Split is regex-based",
+        );
+        assert!(
+            err.to_string().contains("unsupported BPE pre_tokenizer"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]

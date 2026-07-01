@@ -28,6 +28,10 @@ fn qwen_dir() -> PathBuf {
     tokenizer_fixture_root().join("qwen3-embedding-0.6b")
 }
 
+fn gpt2_raw_dir() -> PathBuf {
+    tokenizer_fixture_root().join("gpt2-raw-bytelevel")
+}
+
 struct Case {
     input: &'static str,
     expected: &'static [u32],
@@ -251,6 +255,88 @@ fn qwen3_embedding_0_6b_bpe_parity() {
                 expected: &[
                     108386, 99489, 23364, 126860, 124671, 79484, 26991, 8178, 151643,
                 ],
+            },
+        ],
+    );
+}
+
+// (#330) A raw GPT-2-format vocab.json + merges.txt directory has no
+// tokenizer.json, so `load_tokenizer` routes it through
+// `BpeTokenizer::from_files`, which has no pre_tokenizer metadata to inspect
+// and previously defaulted to the hand-rolled `byte_level_pretokenize`
+// fallback. That fallback diverges from GPT-2's actual regex-based word
+// boundaries, which is the real, unconditional default for every GPT-2-format
+// tokenizer HF ships (verified against the real `gpt2` and `roberta-base`
+// tokenizer.json files on the Hub — both specify literally
+// `"pre_tokenizer": {"type": "ByteLevel", ...}` with no `use_regex` override,
+// which defaults to `true` — and against the "slow" `GPT2Tokenizer` Python
+// implementation, which applies the identical regex directly).
+//
+// HF reference IDs collected with tokenizers==0.22.2 on 2026-07-01, loading
+// the same vocab.json/merges.txt committed in fixtures/gpt2-raw-bytelevel/:
+//   from tokenizers import Tokenizer
+//   from tokenizers.models import BPE
+//   from tokenizers.pre_tokenizers import ByteLevel
+//   tok = Tokenizer(BPE(vocab=<vocab.json>, merges=<merges.txt>, unk_token=None))
+//   tok.pre_tokenizer = ByteLevel(add_prefix_space=False, use_regex=True)
+//   tok.encode(<INPUT>, add_special_tokens=True).ids
+#[test]
+fn gpt2_raw_vocab_bytelevel_fallback_parity() {
+    let dir = gpt2_raw_dir();
+    let tok = load_tokenizer(&dir)
+        .unwrap_or_else(|e| panic!("load gpt2 raw-vocab fixture from {}: {e}", dir.display()));
+    check_parity(
+        "gpt2-raw-bytelevel (BPE, no tokenizer.json)",
+        tok.as_ref(),
+        &[
+            Case {
+                input: "Hello, world!",
+                expected: &[15496, 11, 995, 0],
+            },
+            Case {
+                input: "hello world",
+                expected: &[31373, 995],
+            },
+            // Whitespace-run boundary (#330 finding 1). Real GPT-2's merge
+            // table has no rule pairing the byte-mapped newline/tab char with
+            // a following letter, so the wrong 2-piece fallback segmentation
+            // ["hello", "\nworld"] happens to BPE-decompose to the same ids
+            // as the correct 3-piece ["hello", "\n", "world"] for THIS vocab
+            // — these cases exercise the code path but do not by themselves
+            // discriminate the bug at the id level (see bpe.rs unit test
+            // `test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true`
+            // for a piece-level (pre-BPE-merge) golden that does).
+            Case {
+                input: "hello\nworld",
+                expected: &[31373, 198, 6894],
+            },
+            Case {
+                input: "hello\tworld",
+                expected: &[31373, 197, 6894],
+            },
+            Case {
+                input: "hello  world",
+                expected: &[31373, 220, 995],
+            },
+            // Contraction boundary (#330 finding 2): the fixed HF contraction
+            // set is `'s 't 're 've 'm 'll 'd`. The prior fallback primed on
+            // `'` and swallowed the whole trailing letter run, fusing "'st"
+            // into one piece instead of splitting "'s" + "t". This DOES
+            // discriminate at the id level: pre-fix lattice returned
+            // [64, 6, 301] ("a", "'", "st") instead of HF's [64, 338, 83]
+            // ("a", "'s", "t") — verified empirically against this exact
+            // fixture before implementing the fix.
+            Case {
+                input: "a'st",
+                expected: &[64, 338, 83],
+            },
+            Case {
+                input: "wasn't",
+                expected: &[9776, 77, 470],
+            },
+            Case {
+                input: "don't wasn't I'm",
+                expected: &[9099, 470, 2492, 470, 314, 1101],
             },
         ],
     );
