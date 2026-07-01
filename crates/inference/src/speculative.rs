@@ -1427,11 +1427,10 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         }
     };
     let mut accepted_count = rs.accepted_count;
-    let mut fallback_token = if rs.had_rejection {
-        rs.bonus_token
-    } else {
-        None
-    };
+    // #389: rs.bonus_token is defined for both rejection-correction and full-accept
+    // (see rejection_sample_draft), so expose it unconditionally here — dropping it on
+    // full accept would discard a token the target already forward-passed and sampled.
+    let mut fallback_token = rs.bonus_token;
 
     // EOS truncation: stop at first EOS inside the accepted prefix.
     let mut stopped_by_eos = false;
@@ -3493,6 +3492,87 @@ mod tests {
             res.bonus_token,
             Some(2),
             "bonus from peaked target must be token 2"
+        );
+    }
+
+    /// #389 regression: `mtp_verify_draft` must expose `rs.bonus_token` as
+    /// `fallback_token` on full accept, not only on `had_rejection`. Drives the real
+    /// `mtp_verify_draft` (not the greedy `mtp_verify_precomputed_draft` helper, which
+    /// never calls `rejection_sample_draft`) so the mapping under test is exercised.
+    /// `mtp_verify_draft` seeds its RNG from the clock, so the scenario is built so the
+    /// outcome is forced regardless of the draw: the draft/target distributions at
+    /// every drafted position are bit-identical (accept_prob == 1.0 exactly), and the
+    /// bonus distribution is one-hot (probability 1.0 on a single token), so no seed
+    /// can produce a different accepted-count or bonus token.
+    #[test]
+    fn mtp_verify_draft_full_accept_exposes_bonus_token() {
+        const BONUS_TOKEN: u32 = 6;
+
+        let mut cfg = tiny_mtp_config();
+        cfg.draft_length = 2;
+        let weights = tiny_mtp_weights(&cfg);
+        let vocab = cfg.vocab_size;
+        let h = cfg.hidden_size;
+        let max_seq = 8usize;
+
+        let embed: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let current_token_id = 1u32;
+        let current_position = 0usize;
+
+        // Probe the deterministic draft tokens/logits on a throwaway verifier so the
+        // constructed target distributions can be made bit-identical to them.
+        let mut probe = MtpVerifier::new(cfg.clone(), &weights, &embed, &lm_head, max_seq).unwrap();
+        let draft = probe
+            .draft_tokens_with_logits(current_token_id, current_position, &prev_hidden, None)
+            .unwrap();
+        assert_eq!(
+            draft.tokens.len(),
+            2,
+            "draft_length=2 with no EOS must draft 2 tokens"
+        );
+
+        let mut bonus_logits = vec![f32::NEG_INFINITY; vocab];
+        bonus_logits[BONUS_TOKEN as usize] = 0.0;
+
+        let mut target = MockTargetVerifier {
+            cache_pos: current_position + 1,
+            // target_dist_for(0) == initial_target_logits (below) == draft.logits[0];
+            // target_dist_for(1) == logits_by_step[0] == draft.logits[1]: both drafted
+            // positions get p(x) == q(x) exactly, forcing acceptance regardless of seed.
+            // logits_by_step[1] (the position after the last accepted draft) is one-hot,
+            // forcing the sampled bonus to be BONUS_TOKEN regardless of seed.
+            logits_by_step: vec![draft.logits[1].clone(), bonus_logits],
+            calls: vec![],
+        };
+
+        let mut verifier = MtpVerifier::new(cfg, &weights, &embed, &lm_head, max_seq).unwrap();
+        let result = mtp_verify_draft(
+            &mut verifier,
+            current_token_id,
+            current_position,
+            &prev_hidden,
+            &draft.logits[0],
+            None,
+            &mut target,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.accepted_count, 2,
+            "both drafted tokens must be accepted"
+        );
+        assert_eq!(result.accepted_tokens, draft.tokens);
+        assert!(!result.stopped_by_eos);
+        assert_eq!(
+            result.fallback_token,
+            Some(BONUS_TOKEN),
+            "full-accept must expose the sampled bonus token as fallback_token"
         );
     }
 
