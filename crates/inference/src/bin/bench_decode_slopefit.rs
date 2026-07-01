@@ -41,6 +41,11 @@
 //!   One tagged line per measured repeat:
 //!     SLOPEFIT `ctx=<N> tokens=<actual> warmup_ms=0.0 measure_ms=<f> rep=<i>`
 //!
+//!   Plus `SLOPEFIT_META` lines carrying data the post-processor needs for its
+//!   ADR-064 TBV self-checks (KV-cache-cap corruption, token-count sanity):
+//!     `SLOPEFIT_META kv_cache_len=<N> warmup=<N> measure=<N> repeats=<N>` (once)
+//!     `SLOPEFIT_META ctx=<N> actual_prompt_tokens=<N>` (once per context)
+//!
 //!   The post-processor (`scripts/bench_decode_slopefit.py`) reads these lines
 //!   and produces the final JSON.
 
@@ -175,9 +180,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .map_err(|e| format!("Metal Q4 init: {e}"))?;
     } else {
-        let model = Qwen35Model::from_safetensors(dir).expect("load model");
+        let model = Qwen35Model::from_safetensors(dir).map_err(|e| format!("load model: {e}"))?;
         let cfg = model.config().clone();
-        metal = MetalQwen35State::new(model.weights(), &cfg, cache_len).expect("init metal");
+        metal = MetalQwen35State::new(model.weights(), &cfg, cache_len)
+            .map_err(|e| format!("init metal: {e}"))?;
     }
 
     // Greedy, stop_token_ids empty — EOS token (248044) still stops generation
@@ -207,6 +213,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         warmup_tokens.max(measure_tokens)
     );
 
+    // Emitted on stdout (not stderr) so the Python post-processor can read it
+    // through the same pipe and run the KV-cache-cap TBV self-check.
+    println!(
+        "SLOPEFIT_META kv_cache_len={cache_len} warmup={warmup_tokens} measure={measure_tokens} repeats={repeats}"
+    );
+
     for &ctx in &grid {
         // Pad prompt to approximately `ctx` tokens by repeating the base text.
         let mut prompt = String::new();
@@ -216,6 +228,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let actual_prompt_tokens = tokenizer.tokenize(&prompt).real_length;
 
         eprintln!("[slopefit] ctx={ctx} actual_prompt_tokens={actual_prompt_tokens}");
+        println!("SLOPEFIT_META ctx={ctx} actual_prompt_tokens={actual_prompt_tokens}");
 
         for rep in 0..repeats {
             // Warmup phase: unrecorded decode primes Metal pipeline caches.
