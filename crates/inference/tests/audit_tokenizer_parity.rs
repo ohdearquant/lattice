@@ -303,9 +303,9 @@ fn gpt2_raw_vocab_bytelevel_fallback_parity() {
             // ["hello", "\nworld"] happens to BPE-decompose to the same ids
             // as the correct 3-piece ["hello", "\n", "world"] for THIS vocab
             // — these cases exercise the code path but do not by themselves
-            // discriminate the bug at the id level (see bpe.rs unit tests
-            // `gpt4_regex_pretokenize_matches_hf_on_whitespace_runs` for a
-            // piece-level (pre-BPE-merge) golden that does).
+            // discriminate the bug at the id level (see bpe.rs unit test
+            // `test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true`
+            // for a piece-level (pre-BPE-merge) golden that does).
             Case {
                 input: "hello\nworld",
                 expected: &[31373, 198, 6894],
