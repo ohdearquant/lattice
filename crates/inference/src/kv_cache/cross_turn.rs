@@ -109,6 +109,13 @@ pub fn longest_common_token_prefix(a: &[u32], b: &[u32]) -> usize {
 /// exact earlier GDN checkpoint boundary present in `sparse_checkpoint_lens`
 /// (`ReplayFromCheckpoint`). Everything else falls back to `FullRefill` —
 /// decline-beats-fabricate for the token-identity invariant.
+///
+/// `ExactAppend` additionally requires a non-empty suffix
+/// (`new_prompt_ids.len() > shared`, #516 round-1 remediation D5): an
+/// exact-equal retry of the represented prompt has no divergent suffix to
+/// prefill, and the Metal integration's `forward_prefill_from` treats an
+/// empty suffix as an internal invariant violation, not a valid no-op. That
+/// case falls back to `FullRefill` here rather than surfacing as an error.
 pub fn plan_prefix_reuse(
     entry: Option<&CrossTurnPrefixEntry>,
     metadata: &CrossTurnPrefixMetadata,
@@ -137,7 +144,10 @@ pub fn plan_prefix_reuse(
         return full_refill(0, entry.represented_len);
     }
 
-    if shared == entry.represented_len && entry.gdn_snapshot_len == entry.represented_len {
+    if shared == entry.represented_len
+        && entry.gdn_snapshot_len == entry.represented_len
+        && new_prompt_ids.len() > shared
+    {
         return PrefixRestorePlan {
             mode: PrefixReuseMode::ExactAppend,
             shared_token_prefix_len: shared,
@@ -279,6 +289,26 @@ mod tests {
         assert_eq!(plan.suffix_start, 3);
         assert_eq!(plan.suffix_len, 2);
         assert_eq!(plan.old_represented_len, 3);
+    }
+
+    // #516 round-1 remediation D5 (finding 4): an exact-equal prompt retry
+    // has shared == represented_len but a zero-length suffix. Before D5 this
+    // produced `ExactAppend` with `suffix_len == 0`, which the Metal
+    // integration's `forward_prefill_from` rejects as an empty-suffix error
+    // instead of treating as a valid (degenerate) reuse. The planner must
+    // fall back to `FullRefill` instead.
+    //
+    // Mutation sensitivity: dropping the `new_prompt_ids.len() > shared`
+    // conjunct (reverting to the pre-D5 condition) makes this test fail,
+    // because the plan would again be `ExactAppend` with `suffix_len == 0`.
+    #[test]
+    fn plan_exact_equal_prompt_is_full_refill() {
+        let e = entry(vec![1, 2, 3], 3, 3);
+        let plan = plan_prefix_reuse(Some(&e), &metadata(), &[1, 2, 3], &[]);
+        assert_eq!(plan.mode, PrefixReuseMode::FullRefill);
+        assert_eq!(plan.shared_token_prefix_len, 3);
+        assert_eq!(plan.old_represented_len, 3);
+        assert_eq!(plan.suffix_len, 3);
     }
 
     #[test]
