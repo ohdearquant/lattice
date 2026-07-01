@@ -780,6 +780,17 @@ impl PagedKVCache {
     /// **Unstable**: append a single token's K and V for a specific layer.
     ///
     /// Automatically allocates new pages as needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layer`/slice-length preconditions are violated, or if
+    /// `EvictionPolicy::Lru` would need to grow the page table past
+    /// `max_pages` (i.e. the sequence has exceeded `max_tokens()`). Sliding
+    /// the window past capacity is not yet supported (see issue #337):
+    /// evicting the oldest page and re-pushing it is net-zero on
+    /// `num_pages()`, so without this guard the growth loop below would
+    /// never converge and would instead drain `lru_order` and panic on an
+    /// unrelated internal invariant a few iterations later.
     pub fn append_kv_layer(&mut self, layer: usize, k_token: &[f32], v_token: &[f32]) {
         let kv_dim = self.config.kv_dim();
         assert_eq!(k_token.len(), kv_dim);
@@ -791,6 +802,16 @@ impl PagedKVCache {
 
         // Check if we need a new page.
         let needed_pages = (pos / page_size) + 1;
+        if self.config.eviction == EvictionPolicy::Lru {
+            assert!(
+                needed_pages <= self.config.max_pages,
+                "PagedKVCache::append_kv_layer: position {pos} needs {needed_pages} pages but \
+                 max_pages is {}; EvictionPolicy::Lru does not yet support sequences beyond \
+                 max_tokens ({}) (see issue #337)",
+                self.config.max_pages,
+                self.config.max_tokens(),
+            );
+        }
         while self.table.num_pages() < needed_pages {
             let phys = self.alloc_page();
             self.table.push_page(phys);
@@ -1329,6 +1350,37 @@ mod tests {
         }
 
         // 5th token needs a new page -> should panic.
+        for layer in 0..2 {
+            cache.append_kv_layer(layer, &k, &v);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "does not yet support sequences beyond max_tokens")]
+    fn paged_lru_eviction_fails_closed_beyond_max_tokens() {
+        // Regression for #337: the growth loop evicted a page and re-pushed
+        // it (net-zero num_pages), without re-touching it in lru_order, so
+        // appending past max_tokens (max_pages * page_size) silently drained
+        // lru_order and panicked on an unrelated internal invariant ("LRU
+        // order empty but pool exhausted") a few tokens later instead of
+        // failing closed on the actual precondition.
+        let mut config = make_config(2); // 2 pages * page_size 4 = 8 max_tokens.
+        config.eviction = EvictionPolicy::Lru;
+        let kv_dim = config.kv_dim();
+        let mut cache = PagedKVCache::new(config);
+
+        let k = vec![1.0; kv_dim];
+        let v = vec![2.0; kv_dim];
+
+        // Fill exactly max_tokens (8) tokens across the 2 pages.
+        for _ in 0..8 {
+            for layer in 0..2 {
+                cache.append_kv_layer(layer, &k, &v);
+            }
+            cache.advance();
+        }
+
+        // 9th token exceeds max_tokens; Lru cannot yet slide the window.
         for layer in 0..2 {
             cache.append_kv_layer(layer, &k, &v);
         }
