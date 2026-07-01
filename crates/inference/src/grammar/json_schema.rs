@@ -274,17 +274,45 @@ impl<'a> CompileCtx<'a> {
     /// relative order and stay reachable: a non-`"` input diverges from the
     /// string entry at sym_pos == 0 and the PDA falls through.
     ///
-    /// LIMITATION (pre-existing; `origin/main` rejects the same inputs): a
-    /// sibling whose language includes strings but is NOT folded into the string
-    /// entry — a `$ref` to a string rule, a nested `anyOf`, an untyped `{}`, a
-    /// `{"type":["string",...]}` union, or an untyped mixed `enum` — has its
-    /// quoted inputs shadowed by the hoisted entry once the entry consumes the
-    /// opening `"`, so those strings are over-rejected (issue #473).
-    /// `string_class_of` folds every shape it can prove reduces to a fixed string
-    /// set (`const`, all-string `enum`, and `{"type":"string","enum":[...]}`
-    /// whose `type` makes the non-string members dead), leaving only siblings
-    /// that genuinely need parallel-stack matching. The merge can only narrow
-    /// such a sibling, never widen it — it never over-accepts.
+    /// Three more shapes fold into the same string-valued class here, beyond
+    /// what `string_class_of` alone can prove from a single sub-schema (issue
+    /// #473):
+    ///
+    ///   * a pure nested `anyOf` union — a branch that is EXACTLY
+    ///     `{"anyOf":[...]}` with no sibling key — is FLATTENED into this same
+    ///     branch list (`flatten_any_of_branches`) before classification, so a
+    ///     broad or literal string nested inside it classifies exactly like a
+    ///     top-level branch would. A nested `oneOf` is deliberately NOT
+    ///     flattened: `oneOf` is exclusive (a value matching two branches is
+    ///     rejected), a no-rewind PDA cannot enforce that exclusion, and
+    ///     merging an overlapping `oneOf` into this OR-hoist would over-accept
+    ///     the overlap — so it stays in `other_subs`, over-rejecting as
+    ///     `origin/main` does (issue #473 Tier 2);
+    ///   * a `$ref` branch's string language is recovered by
+    ///     `ref_string_contribution` (reusing the `$defs` map `compile_ref`
+    ///     uses) as the terminal target's string class intersected with the
+    ///     `const`/`enum` narrowing dropped along the chain, so a `$ref` to a
+    ///     string rule folds too — narrowed, never widened. When such a branch
+    ///     ALSO carries a string-forcing sibling (`type:"string"`, a string
+    ///     `const`, or an all-string `enum`, see `ref_sub_forces_string`) but
+    ///     its `$ref` resolves to a NON-string target, the conjunction is the
+    ///     empty language, so the branch is DROPPED entirely rather than routed
+    ///     to `other_subs` — otherwise `compile_ref` would materialize the
+    ///     sibling-dropped non-string target and over-accept it;
+    ///   * an untyped `enum` mixing string and non-string members has its
+    ///     string members folded into the literal set (`fold_string_members`)
+    ///     while the branch itself is ALSO kept in `other_subs`, so its
+    ///     non-string members (disjoint first bytes from `"`) stay reachable
+    ///     there.
+    ///
+    /// LIMITATION (pre-existing; `origin/main` rejects the same inputs): an
+    /// untyped `{}` sibling and a `{"type":["string",...]}` type-array union
+    /// still have their quoted inputs shadowed by the hoisted string entry once
+    /// it consumes the opening `"` — both accept strings AND non-strings with no
+    /// fixed literal set a compile-time fold could extract, so fixing them needs
+    /// parallel-stack / NFA matching, which the current single no-rewind PDA
+    /// does not support (issue #473). Every fold performed here can only narrow
+    /// a sibling, never widen it — it never over-accepts.
     ///
     /// Kept `#[inline(never)]` and out of `compile_schema_inner` so these locals
     /// do not enlarge that function's per-recursion stack frame (see the call
@@ -295,60 +323,89 @@ impl<'a> CompileCtx<'a> {
         any_of: &'a [Value],
         path: &[&str],
     ) -> Result<Vec<Alt>, SchemaError> {
-        // DoS bound (issue #474, finding 2): reject by raw branch count
-        // before the classification loop below can push an unbounded number
-        // of entries into `other_subs` (each later driving one recursive
-        // `compile_schema` call). anyOf/oneOf branch count is otherwise the
-        // only cardinality dimension this file never caps.
-        if any_of.len() > MAX_ANYOF_BRANCHES {
-            return Err(SchemaError(format!(
-                "anyOf/oneOf branch count ({}) exceeds the supported limit ({MAX_ANYOF_BRANCHES})",
-                any_of.len()
-            )));
-        }
+        // DoS bound (issue #474 finding 2; extended by issue #473 shape 2):
+        // reject by FLATTENED branch count before the classification loop
+        // below can push an unbounded number of entries into `other_subs`
+        // (each later driving one recursive `compile_schema` call). Bounding
+        // only the raw top-level `any_of.len()` (the prior single guard)
+        // would let a small top-level array with a wide nested pure union
+        // bypass the cap entirely, so `flatten_any_of_branches` enforces
+        // MAX_ANYOF_BRANCHES incrementally as it expands nested unions.
+        let mut flat_subs: Vec<&'a Value> = Vec::new();
+        flatten_any_of_branches(any_of, 0, &mut flat_subs)?;
+
         let mut broad_string = false;
         let mut literals: Vec<String> = Vec::new();
         let mut byte_total: usize = 0;
         let mut other_subs: Vec<&'a Value> = Vec::new();
-        for sub in any_of {
+        for sub in flat_subs.iter().copied() {
             match string_class_of(sub)? {
                 Some(StrClass::Broad) => broad_string = true,
                 Some(StrClass::Literals(values)) => {
-                    // DoS bound (issue #478): reject before the extend so that
-                    // many small foldable branches cannot accumulate `literals`
-                    // past the cap via repeated `Vec::extend` growth before the
-                    // post-loop backstop below ever runs.
-                    let total = literals.len() + values.len();
-                    if total > MAX_STRING_LITERALS {
-                        return Err(SchemaError(format!(
-                            "anyOf string literal count ({total}) exceeds the supported limit ({MAX_STRING_LITERALS})"
-                        )));
-                    }
-                    // DoS bound (issue #474, finding 4): accumulate the byte
-                    // budget incrementally as each branch's literals are
-                    // folded in, not only after the loop ends. The count cap
-                    // above bounds how many literals there are but not their
-                    // size, so up to MAX_STRING_LITERALS branches each
-                    // contributing one oversized literal could otherwise
-                    // balloon `literals` well past MAX_STRING_LITERAL_BYTES
-                    // before a post-loop check ever ran. Checked pre-dedup:
-                    // conservative early rejection is acceptable for a DoS
-                    // guard. saturating_add prevents an overflow in the
-                    // running sum from wrapping past the cap.
-                    for s in &values {
-                        let json_repr = serde_json::to_string(s).map_err(|e| {
-                            SchemaError(format!("cannot JSON-encode string value: {e}"))
-                        })?;
-                        byte_total = byte_total.saturating_add(json_repr.len() - 1);
-                        if byte_total > MAX_STRING_LITERAL_BYTES {
-                            return Err(SchemaError(format!(
-                                "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
-                            )));
-                        }
-                    }
-                    literals.extend(values);
+                    fold_literals_into(&mut literals, &mut byte_total, values)?;
                 }
-                None => other_subs.push(sub),
+                None => {
+                    if sub.get("$ref").is_some() {
+                        // Shape 1 (issue #473): a `$ref` branch. `compile_schema_inner`
+                        // resolves `$ref` first and drops sibling `const`/`enum`, so the
+                        // compiler's own language for the branch is the target's — an
+                        // over-accept vs the true `$ref` ∧ sibling conjunction.
+                        // `ref_string_contribution` recovers that conjunction (terminal
+                        // string class ∩ chain narrowing); its result is never broader
+                        // than compiling the terminal, so it can only narrow, never
+                        // over-accept.
+                        match self.ref_string_contribution(sub)? {
+                            RefStr::Broad => broad_string = true,
+                            RefStr::Literals(values) => {
+                                // A string terminal has no non-string language, so the
+                                // hoisted set fully represents the branch — it must NOT
+                                // also go to `other_subs`, where `compile_ref` would
+                                // re-add the broad, sibling-dropped target and reopen the
+                                // over-accept. An empty set is a dead branch (empty
+                                // intersection) that hoists nothing.
+                                if !values.is_empty() {
+                                    fold_literals_into(&mut literals, &mut byte_total, values)?;
+                                }
+                            }
+                            RefStr::Dead => {
+                                // A string-forcing node ANYWHERE along the `$ref` chain
+                                // (`type:"string"`, a string `const`, or an all-string
+                                // `enum`) conjoined with a non-string terminal is the
+                                // EMPTY language: no value is both a string and (e.g.) an
+                                // integer. Routing it to `other_subs` would let
+                                // `compile_ref` materialize the sibling-dropped non-string
+                                // terminal and accept, e.g., an integer the branch forbids
+                                // — a genuine over-accept that `origin/main` did NOT commit
+                                // (it rejected the number there). The forcing node may be
+                                // an intermediate `$defs` link (`{$ref: N, type:"string"}`),
+                                // not just the outer sub, so this decision is made across
+                                // the whole chain in `ref_string_contribution`. Dropping
+                                // the branch is exactly faithful.
+                            }
+                            RefStr::NotString => {
+                                // No chain node forced a string and the terminal is
+                                // non-string (or the chain was unresolvable): keep the
+                                // prior behavior and leave the branch in `other_subs` so
+                                // its non-string target stays reachable (and the pre-#473
+                                // `$ref`-not-found error still surfaces on the unresolvable
+                                // path).
+                                other_subs.push(sub);
+                            }
+                        }
+                    } else {
+                        // Shape 5 (issue #473): a non-`$ref` untyped mixed enum folds its
+                        // string members into `literals` (reachable via the hoisted trie)
+                        // while `sub` itself still goes to `other_subs`, keeping its
+                        // non-string members reachable too — folding can only ADD an
+                        // acceptance path here, so the now-redundant string alternative
+                        // left in `sub` is harmless (shadowed by the hoisted entry).
+                        let folded = fold_string_members(sub)?;
+                        if !folded.is_empty() {
+                            fold_literals_into(&mut literals, &mut byte_total, folded)?;
+                        }
+                        other_subs.push(sub);
+                    }
+                }
             }
         }
 
@@ -511,6 +568,66 @@ impl<'a> CompileCtx<'a> {
         let alts = self.compile_schema(target, &[])?;
         self.builder.set_alts(id, alts);
         Ok(vec![vec![Symbol::NonTerminal(id)]])
+    }
+
+    /// Compute the string-language contribution of a `$ref`-bearing `anyOf`
+    /// branch as the resolved terminal's string class INTERSECTED with every
+    /// `const`/`enum` narrowing dropped along the `$ref` chain (issue #473).
+    ///
+    /// `compile_schema_inner` resolves `$ref` FIRST and drops sibling keywords,
+    /// so the compiler's own language for `{"$ref":<string def>,"enum":["a"]}`
+    /// is the target's (any string) — an over-accept relative to the true
+    /// draft-2020-12 conjunction `string ∩ {"a"} = {"a"}`. Hoisting that broad
+    /// target into the shared string entry would let the union accept any
+    /// string. Instead this walks the chain (`sub` and each intermediate
+    /// `$defs` node), collects the string set any `const`/`enum` permits,
+    /// classifies the terminal, and returns the intersection. The result is
+    /// never BROADER than what the terminal alone would compile to, so it can
+    /// never over-accept relative to origin; where a narrowing applies it is
+    /// strictly more faithful.
+    ///
+    /// Returns `NotString` when the terminal may accept a non-string value AND
+    /// no node in the chain forces a string (so a genuine non-string target is
+    /// reachable), a `$ref` in the chain has an unsupported format, a definition
+    /// name is unknown, or the chain does not terminate within
+    /// `MAX_SCHEMA_DEPTH` (a cyclic `$defs` chain `A` -> `B` -> `A`) — in every
+    /// such case the caller leaves `sub` in `other_subs` to compile for real,
+    /// exactly as before this fix. Returns `Dead` when a node ANYWHERE in the
+    /// chain forces a string (`type:"string"`, a string `const`, or an
+    /// all-string `enum`, see `ref_sub_forces_string`) but the terminal is
+    /// non-string: that conjunction is the empty language, so the caller drops
+    /// the branch instead of routing it to `other_subs` where `compile_ref`
+    /// would re-materialize the (sibling-dropped) non-string target and
+    /// over-accept it. The string-forcing check spans the WHOLE chain, not just
+    /// the outer `sub`, so an intermediate `$defs` node such as
+    /// `{"$ref":<integer def>,"type":"string"}` is caught (issue #473, codex
+    /// review). This lookup never touches `self.depth` and never registers a
+    /// rule; `compile_ref` / `compile_schema` remain the authoritative recursion
+    /// guard (issue #343) for the `other_subs` path.
+    fn ref_string_contribution(&self, sub: &'a Value) -> Result<RefStr, SchemaError> {
+        let mut narrowing: Option<Vec<String>> = None;
+        let mut chain_forces_string = ref_sub_forces_string(sub);
+        intersect_narrowing(&mut narrowing, node_string_narrowing(sub)?);
+        let mut current = sub;
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            let Some(ref_str) = current.get("$ref").and_then(Value::as_str) else {
+                return Ok(combine_ref_str(
+                    string_class_of(current)?,
+                    narrowing,
+                    chain_forces_string,
+                ));
+            };
+            let Ok(name) = extract_ref_name(ref_str) else {
+                return Ok(RefStr::NotString);
+            };
+            let Some(next) = self.defs.get(name).copied() else {
+                return Ok(RefStr::NotString);
+            };
+            current = next;
+            chain_forces_string |= ref_sub_forces_string(current);
+            intersect_narrowing(&mut narrowing, node_string_narrowing(current)?);
+        }
+        Ok(RefStr::NotString)
     }
 
     /// Compile an `object` schema.
@@ -1756,9 +1873,17 @@ fn compile_const(v: &Value) -> Result<Vec<Alt>, SchemaError> {
 /// handler). `type`, `const`, and `enum` are conjunctive assertions, so a
 /// sub-schema's string language is the INTERSECTION of the constraints it
 /// states. A schema that may also accept a non-string value, or whose string
-/// language is not reducible to a broad string or a fixed literal set (a `$ref`,
-/// a nested `anyOf`, an untyped `{}`, a `{"type":["string",...]}` union, or an
-/// untyped mixed `enum`) classifies as `None` and stays an "other" branch.
+/// language is not reducible to a broad string or a fixed literal set from a
+/// SINGLE sub-schema in isolation (a `$ref`, a nested `anyOf`/`oneOf`, an
+/// untyped `{}`, a `{"type":["string",...]}` union, or an untyped mixed
+/// `enum`) classifies as `None` here and stays an "other" branch by default.
+/// `compile_any_of`'s caller loop gives three of those shapes — a `$ref`, a
+/// nested `anyOf`/`oneOf`, and an untyped mixed `enum` — a second chance to
+/// fold anyway (issue #473; see `ref_string_contribution`,
+/// `flatten_any_of_branches`, `fold_string_members`) before finally treating
+/// the branch as "other". Only a genuinely untyped `{}` and a
+/// `{"type":["string",...]}` union remain unfoldable at compile time — both
+/// need parallel-stack matching, not a literal fold.
 enum StrClass {
     /// Any JSON string (`{"type":"string"}` with no value constraint).
     /// `pattern` / `minLength` are not enforced by this compiler, so such a
@@ -1788,6 +1913,22 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
     let Some(obj) = sub.as_object() else {
         return Ok(None);
     };
+    // A `$ref` alongside `type`/`const`/`enum` is NOT the conjunctive
+    // intersection this classifier otherwise models: `compile_schema_inner`
+    // resolves `$ref` FIRST and returns before reading any sibling keyword (see
+    // `compile_ref`), so the branch's real compiled language is the resolved
+    // target's and the sibling is dropped. Folding a sibling `const`/`enum`
+    // STRING here would hoist a literal the resolved target never accepts — e.g.
+    // `{"$ref":<integer def>,"const":"y"}` compiles to `json_integer` yet the
+    // fold would make the grammar accept `"y"` (an over-accept). Return `None` so
+    // `compile_any_of` reclassifies via `ref_string_contribution`, which
+    // intersects the resolved target's string class with the `const`/`enum`
+    // narrowing dropped along the chain: a non-string target leaves the branch in
+    // `other_subs` to compile for real, and a string target hoists only the
+    // narrowed set — never widening the string entry (issue #473).
+    if obj.contains_key("$ref") {
+        return Ok(None);
+    }
     // `type` gate: only an absent type or exactly `"string"` keeps the branch a
     // pure string class. A scalar non-string type, or a `type` array (for which
     // `as_str()` is `None` on a non-string `Value`), means the branch may accept
@@ -1871,6 +2012,315 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
             None
         }),
     }
+}
+
+/// The string-language contribution of a `$ref`-bearing `anyOf` branch, as
+/// computed by `ref_string_contribution`: the resolved terminal's string class
+/// intersected with the `const`/`enum` narrowing collected along the chain
+/// (issue #473).
+enum RefStr {
+    /// The terminal may accept a non-string value and no chain node forced a
+    /// string: contribute no string hoist and leave the branch in `other_subs`
+    /// for `compile_schema` to handle (the pre-#473 behavior). Also returned for
+    /// an unresolvable/cyclic chain, so the pre-existing `$ref`-not-found error
+    /// still surfaces on that path.
+    NotString,
+    /// A chain node forces a string (`type:"string"`, a string `const`, or an
+    /// all-string `enum`) but the terminal is non-string: the conjunction is the
+    /// EMPTY language, so the caller drops the branch entirely (it contributes
+    /// nothing, and must NOT go to `other_subs` where the sibling-dropped
+    /// non-string target would be re-materialized and over-accepted).
+    Dead,
+    /// The terminal is a broad string and no `const`/`enum` narrowed it: hoist a
+    /// broad string entry, exactly as compiling the terminal would.
+    Broad,
+    /// The terminal string intersected with the chain narrowing is this fixed
+    /// set (possibly empty — a dead string branch that hoists nothing).
+    Literals(Vec<String>),
+}
+
+/// Combine a terminal's `string_class_of` result with the `const`/`enum`
+/// narrowing collected along a `$ref` chain. Intersection can only shrink the
+/// terminal's string language, so the result never over-accepts relative to
+/// compiling the terminal directly (issue #473). `chain_forces_string` is true
+/// when any node along the chain constrains the value to a string; conjoined
+/// with a non-string terminal that is the empty language (`Dead`).
+fn combine_ref_str(
+    terminal: Option<StrClass>,
+    narrowing: Option<Vec<String>>,
+    chain_forces_string: bool,
+) -> RefStr {
+    match terminal {
+        None if chain_forces_string => RefStr::Dead,
+        None => RefStr::NotString,
+        Some(StrClass::Broad) => match narrowing {
+            None => RefStr::Broad,
+            Some(set) => RefStr::Literals(set),
+        },
+        Some(StrClass::Literals(term_lits)) => match narrowing {
+            None => RefStr::Literals(term_lits),
+            Some(set) => RefStr::Literals(intersect_string_sets(&term_lits, &set)),
+        },
+    }
+}
+
+/// The set of strings a SINGLE schema node permits via its own `const`/`enum`,
+/// ignoring any `$ref` (whose target is classified separately). `None` = the
+/// node states neither `const` nor `enum`, so it imposes no string narrowing.
+/// `Some(set)` = strings are restricted to exactly `set` (the string members of
+/// the `const`/`enum`); an EMPTY `set` means the node admits no string at all (a
+/// non-string `const`, a `const`/`enum` conflict, or an enum with no string
+/// member), which makes the whole chain a dead string branch.
+fn node_string_narrowing(node: &Value) -> Result<Option<Vec<String>>, SchemaError> {
+    let Some(obj) = node.as_object() else {
+        return Ok(None);
+    };
+    let const_val = obj.get("const");
+    let enum_arr = obj.get("enum").and_then(Value::as_array);
+    // DoS bound (issue #474), mirroring `string_class_of`: reject by raw enum
+    // cardinality before the per-element scan/collect below can be sized by it.
+    if let Some(arr) = enum_arr
+        && arr.len() > MAX_STRING_LITERALS
+    {
+        return Err(SchemaError(format!(
+            "anyOf string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+            arr.len()
+        )));
+    }
+    let set: Vec<String> = match (const_val, enum_arr) {
+        (Some(c), enum_opt) => match c.as_str() {
+            // Non-string const: no string value satisfies it.
+            None => Vec::new(),
+            // String const: kept only if a present enum also contains it.
+            Some(cs) => match enum_opt {
+                Some(arr) if !arr.iter().any(|v| v == c) => Vec::new(),
+                _ => vec![cs.to_string()],
+            },
+        },
+        (None, Some(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        // No `const` and no `enum`: this node imposes no string narrowing.
+        (None, None) => return Ok(None),
+    };
+    for s in &set {
+        guard_literal_bytes(s)?;
+    }
+    Ok(Some(set))
+}
+
+/// Intersect `new` into the running narrowing accumulator. `None` in either
+/// position is the identity ("no `const`/`enum` stated"), so it never widens the
+/// accumulator; a stated set can only shrink it.
+fn intersect_narrowing(acc: &mut Option<Vec<String>>, new: Option<Vec<String>>) {
+    let Some(new_set) = new else {
+        return;
+    };
+    match acc {
+        None => *acc = Some(new_set),
+        Some(cur) => cur.retain(|s| new_set.contains(s)),
+    }
+}
+
+/// The intersection of two string sets, preserving `a`'s order.
+fn intersect_string_sets(a: &[String], b: &[String]) -> Vec<String> {
+    a.iter().filter(|s| b.contains(s)).cloned().collect()
+}
+
+/// Does this node's OWN keywords force the value to be a string?
+/// True iff the node states a string-ONLY `type` (the scalar `"string"`, or —
+/// per draft-2020-12 §6.1.1, where `type` may be an array of type names — a
+/// NON-EMPTY array whose every member is `"string"`), a string `const`, or a
+/// non-empty `enum` whose members are all strings. When such a node sits
+/// ANYWHERE on a `$ref` chain (the outer sub or an intermediate `$defs` link)
+/// whose terminal is a NON-string target, the conjunction is the empty
+/// language, so `compile_any_of` drops the branch rather than materializing the
+/// sibling-dropped non-string target (which would over-accept). A pure `$ref`,
+/// or one whose keyword admits a non-string — a numeric `const`, an all-numeric
+/// or mixed `enum`, or a `type` array that permits any non-string type
+/// (`["string","null"]`, `["integer"]`, …) — returns `false` and keeps its
+/// non-string target reachable. Those non-string-forcing cases stay in the
+/// pre-existing `$ref`-drops-siblings over-approximation (identical to
+/// `origin/main`), the same tolerated class as a dropped numeric `enum`.
+fn ref_sub_forces_string(sub: &Value) -> bool {
+    let Some(obj) = sub.as_object() else {
+        return false;
+    };
+    match obj.get("type") {
+        Some(Value::String(s)) if s == "string" => return true,
+        Some(Value::Array(arr))
+            if !arr.is_empty() && arr.iter().all(|v| v.as_str() == Some("string")) =>
+        {
+            return true;
+        }
+        _ => {}
+    }
+    if let Some(c) = obj.get("const") {
+        return c.is_string();
+    }
+    if let Some(arr) = obj.get("enum").and_then(Value::as_array) {
+        return !arr.is_empty() && arr.iter().all(Value::is_string);
+    }
+    false
+}
+
+/// Recognize a branch that is a PURE nested `anyOf` union: an object with
+/// EXACTLY one key, `anyOf`, mapping to an array. Only `anyOf` (inclusive
+/// union) is recognized, because flattening it into the parent branch list is
+/// unconditionally sound: a union of unions is the same union.
+///
+/// A nested `oneOf` is intentionally NOT recognized. `oneOf` is exclusive
+/// ("exactly one branch matches"), and merging its branches into the parent's
+/// OR-hoist silently drops that exclusion, over-accepting any input two
+/// branches share (a no-rewind PDA cannot count matches to enforce it). The
+/// safe direction is to leave every nested `oneOf` unflattened. A sibling key
+/// alongside the `anyOf` (e.g. a co-occurring `description` or `type`)
+/// likewise makes the branch not purely a union. Both non-recognized cases
+/// fall through to the pre-existing `other_subs` path unchanged, which
+/// over-rejects but never over-accepts (issue #473, shape 2).
+fn as_pure_nested_union(sub: &Value) -> Option<&[Value]> {
+    let obj = sub.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let arr = obj.get("anyOf")?;
+    arr.as_array().map(Vec::as_slice)
+}
+
+/// Flatten `any_of`'s pure nested-union branches (`as_pure_nested_union`)
+/// into `out`, so `compile_any_of`'s classification loop folds a broad or
+/// literal string nested inside `{"anyOf":[{"anyOf":[{"type":"string"}]}]}`
+/// exactly like a top-level branch (issue #473, shape 2). Non-union branches
+/// pass through unchanged.
+///
+/// Enforces `MAX_ANYOF_BRANCHES` on the FLATTENED total incrementally as
+/// `out` grows: checking only the raw top-level `any_of.len()` (the prior
+/// single guard in `compile_any_of`) would let a small top-level array with
+/// a wide nested union bypass the cap (issue #474 class). Recursion depth is
+/// bounded by `MAX_SCHEMA_DEPTH` independent of `self.depth` — this
+/// traversal walks the raw `Value` tree directly and never goes through
+/// `compile_schema`'s depth-counting wrapper, so it needs its own bound to
+/// reject a pathological `{"anyOf":[{"anyOf":[{"anyOf":[...]}]}]}` chain
+/// before the native stack overflows, mirroring why that constant exists.
+fn flatten_any_of_branches<'v>(
+    any_of: &'v [Value],
+    depth: usize,
+    out: &mut Vec<&'v Value>,
+) -> Result<(), SchemaError> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(SchemaError(format!(
+            "anyOf/oneOf nesting depth exceeds the supported depth ({MAX_SCHEMA_DEPTH})"
+        )));
+    }
+    for sub in any_of {
+        match as_pure_nested_union(sub) {
+            Some(inner) => flatten_any_of_branches(inner, depth + 1, out)?,
+            None => out.push(sub),
+        }
+        if out.len() > MAX_ANYOF_BRANCHES {
+            return Err(SchemaError(format!(
+                "anyOf/oneOf branch count ({}) exceeds the supported limit ({MAX_ANYOF_BRANCHES})",
+                out.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Fold `values` into the running `literals`/`byte_total` accumulators shared
+/// by every string-class-merging path in `compile_any_of` — a direct
+/// `StrClass::Literals` branch, a resolved `$ref` target (issue #473 shape
+/// 1), or a mixed-enum's string members (issue #473 shape 5). Enforces
+/// `MAX_STRING_LITERALS` and `MAX_STRING_LITERAL_BYTES` incrementally (issue
+/// #474/#478) so no caller path can accumulate literals past either cap by
+/// deferring to a later check.
+fn fold_literals_into(
+    literals: &mut Vec<String>,
+    byte_total: &mut usize,
+    values: Vec<String>,
+) -> Result<(), SchemaError> {
+    // DoS bound (issue #478): reject before the extend so that many small
+    // foldable sources cannot accumulate `literals` past the cap via repeated
+    // `Vec::extend` growth before the post-loop backstop in `compile_any_of`
+    // ever runs.
+    let total = literals.len() + values.len();
+    if total > MAX_STRING_LITERALS {
+        return Err(SchemaError(format!(
+            "anyOf string literal count ({total}) exceeds the supported limit ({MAX_STRING_LITERALS})"
+        )));
+    }
+    // DoS bound (issue #474, finding 4): accumulate the byte budget
+    // incrementally as each source's literals are folded in, not only after
+    // the loop ends. saturating_add prevents an overflow in the running sum
+    // from wrapping past the cap.
+    for s in &values {
+        let json_repr = serde_json::to_string(s)
+            .map_err(|e| SchemaError(format!("cannot JSON-encode string value: {e}")))?;
+        *byte_total = byte_total.saturating_add(json_repr.len() - 1);
+        if *byte_total > MAX_STRING_LITERAL_BYTES {
+            return Err(SchemaError(format!(
+                "string literal encoded byte length exceeds the supported limit ({MAX_STRING_LITERAL_BYTES})"
+            )));
+        }
+    }
+    literals.extend(values);
+    Ok(())
+}
+
+/// For a branch that `string_class_of` classifies as `None` because it is an
+/// untyped `enum` mixing string and non-string members (issue #473, shape 5),
+/// return its definitely-accepted STRING members so the caller can fold them
+/// into the hoisted string entry. The branch itself still goes to
+/// `other_subs` unchanged — its non-string members have first bytes disjoint
+/// from `"` and stay reachable there, so duplicating the strings into the
+/// trie only ADDS an acceptance path; the branch's own (now-shadowed) string
+/// alternative being redundant is harmless.
+///
+/// Returns an empty `Vec` (no fold) for anything that is not exactly this
+/// shape. `$ref`, a `type`, and a `const` key are each re-checked here even
+/// though `compile_any_of`'s only caller reaches this function solely when
+/// `string_class_of(sub)` already returned `None` for this same `sub` (which
+/// already excludes all three), so this function is correct standalone too,
+/// not just under that precondition.
+fn fold_string_members(sub: &Value) -> Result<Vec<String>, SchemaError> {
+    let Some(obj) = sub.as_object() else {
+        return Ok(Vec::new());
+    };
+    if obj.contains_key("$ref") || obj.contains_key("type") || obj.contains_key("const") {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = obj.get("enum").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    // Defensive backstop mirroring `string_class_of`'s own raw-cardinality
+    // guard, bounding this function's filter/collect below independent of
+    // the caller. Currently unreachable via `compile_any_of` (its loop always
+    // calls `string_class_of(sub)` on this same `sub` first, which already
+    // enforces this identical bound on the same array before `None` can be
+    // returned), kept in case this function is ever called from elsewhere.
+    if arr.len() > MAX_STRING_LITERALS {
+        return Err(SchemaError(format!(
+            "anyOf string literal count ({}) exceeds the supported limit ({MAX_STRING_LITERALS})",
+            arr.len()
+        )));
+    }
+    let has_string = arr.iter().any(Value::is_string);
+    let has_non_string = arr.iter().any(|v| !v.is_string());
+    if !(has_string && has_non_string) {
+        // All-string (already folded directly by `string_class_of` itself) or
+        // all-non-string (nothing to fold) — not this function's shape.
+        return Ok(Vec::new());
+    }
+    let mut lits = Vec::new();
+    for v in arr {
+        if let Some(s) = v.as_str() {
+            guard_literal_bytes(s)?;
+            lits.push(s.to_string());
+        }
+    }
+    Ok(lits)
 }
 
 /// Reject a single JSON literal whose byte length exceeds the per-literal cap
@@ -2454,44 +2904,520 @@ mod tests {
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473): a `$ref` to a broad-string rule listed
-    /// beside string consts has its quoted inputs shadowed by the hoisted const
-    /// trie — the no-rewind PDA commits to the trie once it consumes the opening
-    /// `"`. "zzz" is valid via `#/$defs/S` but rejected. This matches
-    /// `origin/main` exactly (verified by reverting the compiler and re-probing)
-    /// and is NOT a regression; the fix needs parallel-stack matching (#473).
-    /// This test pins the current behavior so a future engine change flips it
-    /// intentionally rather than silently.
+    // -----------------------------------------------------------------------
+    // Issue #473 — Tier 1 fixes: a `$ref` to a string schema, a pure nested
+    // `anyOf`/`oneOf`, and an untyped mixed `enum` now fold into the hoisted
+    // string entry instead of being shadowed by it. Tier 2 (an untyped `{}`
+    // and a `{"type":[...]}` union) remains a documented, pinned limitation
+    // — fixing it needs parallel-stack matching, not a compile-time fold.
+    // -----------------------------------------------------------------------
+
+    /// FIXED (issue #473, shape 1): a `$ref` to a broad-string rule, listed
+    /// beside string consts, previously had its quoted inputs shadowed by the
+    /// hoisted const trie (the no-rewind PDA commits to the trie once it
+    /// consumes the opening `"`). `compile_any_of` now recovers the `$ref`
+    /// branch's string language via `ref_string_contribution` (terminal string
+    /// class ∩ chain narrowing), so a `$ref`-to-broad-string sibling with no
+    /// narrowing widens the whole class to `json_string`, exactly as a literal
+    /// broad string would. This schema was previously pinned as a known
+    /// limitation; it now asserts the fix.
+    ///
+    /// Mutation guard: reverting the `$ref` reclassification in
+    /// `compile_any_of` (treating every `None` as a plain "other" branch
+    /// again) reintroduces the shadow and rejects "zzz".
     #[test]
-    fn anyof_ref_to_broad_string_shadowed_known_limitation() {
+    fn anyof_ref_to_broad_string_folds_and_accepts() {
         let g = compile_ok(
             r##"{"$defs":{"S":{"type":"string"}},"anyOf":[{"const":"abc"},{"const":"abd"},{"$ref":"#/$defs/S"}]}"##,
         );
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(accepts(&g, b"\"abd\""), "const \"abd\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "KNOWN LIMITATION #473: $ref->string sibling shadowed by the const trie"
+            accepts(&g, b"\"zzz\""),
+            "issue #473 fix: $ref->broad-string sibling must now be reachable"
+        );
+        assert!(rejects(&g, b"123"), "a non-string must still be rejected");
+    }
+
+    /// FIXED (issue #473, shape 1, narrow variant): a `$ref` to a schema that
+    /// reduces to a fixed LITERAL set (not a broad string) folds its literal
+    /// into the SAME trie as the sibling const, rather than widening to any
+    /// string. Proves the fold narrows correctly.
+    ///
+    /// Mutation guard: if the fold incorrectly treated a resolved
+    /// `StrClass::Literals` target as `Broad`, "abd" (in neither literal set)
+    /// would be wrongly accepted.
+    #[test]
+    fn anyof_ref_to_string_literal_folds_into_trie() {
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"const":"zzz"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" accepted");
+        assert!(
+            accepts(&g, b"\"zzz\""),
+            "issue #473 fix: $ref->const literal must be folded into the trie"
+        );
+        assert!(
+            rejects(&g, b"\"abd\""),
+            "a string in neither literal must be rejected (no over-accept)"
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473): a nested `anyOf` containing a broad
-    /// string classifies as an "other" sibling (string_class_of does not recurse
-    /// into nested anyOf), so its quoted inputs are shadowed by the hoisted const
-    /// trie. Matches `origin/main`; pins current behavior pending #473.
+    /// A `$ref` to a NON-string schema must stay an "other" branch, unchanged
+    /// — the design explicitly requires that a `$ref` whose target is
+    /// non-string keeps its prior behavior (issue #473). The ref'd integer
+    /// branch stays reachable and the const trie is unaffected.
+    ///
+    /// Mutation guard: if reclassification incorrectly widened a non-string
+    /// ref target to accept strings, "zzz" would be wrongly accepted here.
     #[test]
-    fn anyof_nested_anyof_string_shadowed_known_limitation() {
+    fn anyof_ref_to_non_string_stays_other() {
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N"}]}"##,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            accepts(&g, b"7"),
+            "the ref'd integer branch stays reachable"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "a non-member string must still be rejected"
+        );
+    }
+
+    /// FIXED (issue #473, chain-collect intersection): a branch that is `$ref`
+    /// to a NON-string target AND carries a STRING-FORCING sibling (a string
+    /// `const`, `type:"string"`, or an all-string `enum`) is the EMPTY language
+    /// — no value is both a string and an integer — so the branch must accept
+    /// NOTHING. `origin/main` OVER-ACCEPTED the sibling string here (it
+    /// mis-hoisted the sibling into the shared string entry, accepting "y" /
+    /// "zzz"), while rejecting the number. `ref_string_contribution` resolves
+    /// the string part to `RefStr::NotString`, and `ref_sub_forces_string`
+    /// makes `compile_any_of` DROP the branch rather than materialize the
+    /// sibling-dropped integer target.
+    ///
+    /// Mutation guard: reverting the drop (routing `RefStr::NotString` straight
+    /// to `other_subs` again) reopens a number over-accept — `7` would be
+    /// wrongly accepted on every sub-case below. Removing the string guard in
+    /// `ref_string_contribution` reopens the STRING over-accept — "y"/"zzz"
+    /// would be wrongly accepted.
+    #[test]
+    fn anyof_ref_to_non_string_with_string_forcing_sibling_drops() {
+        // string `const` sibling
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N","const":"y"}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"abc\""),
+            "the peer const \"abc\" still accepted"
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "issue #473: a string const sibling on a $ref->integer branch must not over-accept the string"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "the string ∧ integer conjunction is empty — the number must be rejected too (no over-accept)"
+        );
+
+        // `type:"string"` sibling
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N","type":"string"}]}"##,
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "type:string sibling on a $ref->integer branch must not over-accept"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "empty conjunction rejects the number too"
+        );
+
+        // all-string `enum` sibling
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N","enum":["y","z"]}]}"##,
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "all-string enum sibling on a $ref->integer branch must not over-accept"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "empty conjunction rejects the number too"
+        );
+    }
+
+    /// FIXED (issue #473, codex REJECT): the string-forcing keyword sits on an
+    /// INTERMEDIATE `$defs` node, not the outer `anyOf` sub. `S` is
+    /// `{$ref: N-integer, type/const/enum-string}`, so `S`'s language is the
+    /// empty conjunction (integer ∧ string); the outer branch `{$ref: S}` is a
+    /// PURE `$ref` with no string-forcing keyword of its own. An outer-sub-only
+    /// `ref_sub_forces_string(sub)` check misses the forcing and routes the
+    /// branch to `other_subs`, where `compile_ref` materializes `N` and
+    /// over-accepts the integer `7`. The chain-level `chain_forces_string` state
+    /// (accumulated across every walked node) classifies the branch `RefStr::Dead`
+    /// and drops it, so both the string AND `7` are rejected.
+    ///
+    /// Mutation guard: reverting to an outer-sub-only forcing check (or dropping
+    /// the `RefStr::Dead` arm to `other_subs`) reopens the number over-accept —
+    /// `7` would be wrongly accepted on every sub-case below.
+    #[test]
+    fn anyof_ref_chain_intermediate_string_forcing_node_drops() {
+        // intermediate `type:"string"`
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"$ref":"#/$defs/N","type":"string"},"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"ok\""),
+            "the peer const \"ok\" still accepted"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "issue #473: an intermediate type:string node on a $ref->integer chain must not over-accept the string"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "the intermediate string ∧ integer conjunction is empty — the number must be rejected too"
+        );
+
+        // intermediate string `const`
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"$ref":"#/$defs/N","const":"y"},"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "intermediate string const on a $ref->integer chain must not over-accept"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "empty conjunction rejects the number too"
+        );
+
+        // intermediate all-string `enum`
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"$ref":"#/$defs/N","enum":["y","z"]},"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(
+            rejects(&g, b"\"y\""),
+            "intermediate all-string enum on a $ref->integer chain must not over-accept"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "empty conjunction rejects the number too"
+        );
+    }
+
+    /// FIXED (issue #473, codex round-2 REJECT): draft-2020-12 §6.1.1 lets `type`
+    /// be an ARRAY of type names. A string-ONLY type array (`["string"]`, or any
+    /// non-empty all-`"string"` array) is string-forcing, exactly like the scalar
+    /// `type:"string"`. On a `$ref`->integer terminal — DIRECT sibling or an
+    /// intermediate `$defs` node — the conjunction is empty, so the branch must be
+    /// dropped (`RefStr::Dead`), rejecting both the string AND `7`. A `type` array
+    /// that admits any non-string type (`["string","null"]`, `["integer"]`) is
+    /// NOT string-forcing and stays in the pre-existing `$ref`-drops-siblings
+    /// approximation (verified identical to `origin/main`), so it is intentionally
+    /// not covered here.
+    ///
+    /// Mutation guard: reverting `ref_sub_forces_string` to recognize only the
+    /// scalar `type:"string"` (dropping the array arm) reopens the number
+    /// over-accept — `7` would be wrongly accepted on both sub-cases below.
+    #[test]
+    fn anyof_ref_type_array_string_only_forces_drop() {
+        // DIRECT sibling `type:["string"]`
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/N","type":["string"]}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"ok\""),
+            "the peer const \"ok\" still accepted"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "a string-only type array on a $ref->integer branch must not over-accept the string"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "the string ∧ integer conjunction is empty — the number must be rejected too"
+        );
+
+        // INTERMEDIATE `$defs` node with `type:["string"]`
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"$ref":"#/$defs/N","type":["string"]},"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "an intermediate string-only type array must not over-accept"
+        );
+        assert!(
+            rejects(&g, b"7"),
+            "empty conjunction rejects the number too"
+        );
+    }
+
+    /// A `type` array that admits a NON-string type is not string-forcing, so a
+    /// `$ref`->integer branch keeps its integer target reachable (`7` accepted),
+    /// exactly as with a numeric `enum` sibling and matching `origin/main`. This
+    /// pins `ref_sub_forces_string` to NOT over-fire on a mixed/other-type `type`
+    /// array (which would silence a legitimate integer branch).
+    ///
+    /// Mutation guard: if `ref_sub_forces_string` returned true for
+    /// `["string","integer"]` (treating any array containing `"string"` as
+    /// string-forcing), `7` would be wrongly REJECTED here.
+    #[test]
+    fn anyof_ref_type_array_with_nonstring_member_stays_reachable() {
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/N","type":["string","integer"]}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"ok\""),
+            "the peer const \"ok\" still accepted"
+        );
+        assert!(
+            accepts(&g, b"7"),
+            "a type array admitting integer is not string-forcing — the integer branch stays reachable"
+        );
+    }
+
+    /// A NON-string-forcing sibling (an all-numeric `enum`) on a `$ref`->integer
+    /// branch does NOT empty the conjunction — the number is admissible — so the
+    /// integer target stays reachable, matching `origin/main` and the
+    /// pre-existing `$ref`-drops-sibling approximation (the enum values
+    /// themselves are not enforced; the whole integer type is accepted, an
+    /// over-reject-free continuation of prior behavior). The point is that
+    /// `ref_sub_forces_string` must NOT over-fire on a numeric enum.
+    ///
+    /// Mutation guard: if `ref_sub_forces_string` returned true for an
+    /// all-numeric `enum` (dropping the branch), `7` would be wrongly REJECTED
+    /// here — a regression that silences a legitimate integer branch.
+    #[test]
+    fn anyof_ref_to_integer_with_numeric_enum_sibling_stays_reachable() {
+        let g = compile_ok(
+            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N","enum":[1,2]}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"abc\""),
+            "the peer const \"abc\" still accepted"
+        );
+        assert!(
+            accepts(&g, b"7"),
+            "a numeric-enum sibling is not string-forcing — the integer branch stays reachable"
+        );
+        assert!(
+            rejects(&g, b"\"z\""),
+            "a non-member string is still rejected"
+        );
+    }
+
+    /// FIXED (issue #473, chain-collect intersection): a DIRECT string `enum`
+    /// sibling on a branch whose `$ref` resolves to a BROAD string narrows the
+    /// branch to that enum. `compile_ref` drops the sibling `enum` (ref-first),
+    /// so `origin/main`'s branch was the broad target; the fix intersects the
+    /// terminal's broad string class with the sibling narrowing, folding exactly
+    /// `{"abc"}` into the shared trie.
+    ///
+    /// Mutation guard: dropping the sibling narrowing (returning the terminal's
+    /// broad class unintersected) would accept "zzz" — a re-widening over-accept.
+    #[test]
+    fn anyof_ref_to_broad_string_with_enum_sibling_narrows() {
+        let g = compile_ok(
+            r##"{"$defs":{"T":{"type":"string"}},"anyOf":[{"const":"foo"},{"$ref":"#/$defs/T","enum":["abc"]}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"foo\""),
+            "the peer const \"foo\" still accepted"
+        );
+        assert!(
+            accepts(&g, b"\"abc\""),
+            "issue #473: the sibling enum member is reachable (terminal-broad intersect the enum)"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "the enum-narrowed branch must reject a non-member string (no over-accept)"
+        );
+    }
+
+    /// FIXED (issue #473, chain-collect intersection): the narrowing is
+    /// collected along the WHOLE `$ref` chain, not just the direct sibling. Here
+    /// the intermediate `$defs` node `S` states `enum:["abc"]` and `$ref`s `T`
+    /// (a broad string); the outer branch `$ref`s `S`. `ref_string_contribution`
+    /// walks sub -> S -> T, intersecting `S`'s `{"abc"}` narrowing with `T`'s
+    /// broad class, folding `{"abc"}`.
+    ///
+    /// Mutation guard: if the chain walk stopped collecting narrowing at the
+    /// first hop (or reset it per hop), the intermediate `enum` would be lost and
+    /// "zzz" wrongly accepted.
+    #[test]
+    fn anyof_ref_chain_collects_intermediate_enum_narrowing() {
+        let g = compile_ok(
+            r##"{"$defs":{"S":{"$ref":"#/$defs/T","enum":["abc"]},"T":{"type":"string"}},"anyOf":[{"const":"foo"},{"$ref":"#/$defs/S"}]}"##,
+        );
+        assert!(
+            accepts(&g, b"\"foo\""),
+            "the peer const \"foo\" still accepted"
+        );
+        assert!(
+            accepts(&g, b"\"abc\""),
+            "issue #473: an enum on an intermediate chain node narrows the folded set"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "the chain-collected narrowing must reject a non-member string (no over-accept)"
+        );
+    }
+
+    /// An unresolvable `$ref` (unknown definition name) inside an `anyOf`
+    /// must still surface the pre-existing "$ref not found" compile error —
+    /// the classification-time resolution attempt (issue #473) must not
+    /// swallow or change this error, only ever supply an ADDITIONAL fold
+    /// opportunity when resolution succeeds.
+    ///
+    /// Mutation guard: if `ref_string_contribution` propagated an error instead
+    /// of returning `RefStr::NotString` on a failed lookup, this would fail with
+    /// the wrong error (or panic) instead of the expected message.
+    #[test]
+    fn anyof_ref_to_missing_def_still_errors() {
+        let schema_json = r##"{"anyOf":[{"const":"abc"},{"$ref":"#/$defs/Missing"}]}"##;
+        let v: Value = serde_json::from_str(schema_json).unwrap();
+        let err = compile(&v).expect_err("an unresolvable $ref must still fail to compile");
+        assert!(
+            err.0.contains("$ref not found"),
+            "expected the pre-existing $ref-not-found error, got: {}",
+            err.0
+        );
+    }
+
+    /// FIXED (issue #473, shape 2): a nested `anyOf` containing a broad
+    /// string (`{"anyOf":[{"anyOf":[{"type":"string"}]}]}`) previously
+    /// classified as an "other" sibling because `string_class_of` does not
+    /// recurse into nested unions, shadowing its quoted inputs behind the
+    /// hoisted const trie. `compile_any_of` now flattens a PURE nested union
+    /// (`flatten_any_of_branches`) before classification, so the inner broad
+    /// string classifies exactly like a top-level branch. Previously pinned
+    /// as a known limitation; now asserts the fix.
+    ///
+    /// Mutation guard: reverting the flatten step (classifying the raw
+    /// top-level `any_of` again) reintroduces the shadow and rejects "zzz".
+    #[test]
+    fn anyof_nested_anyof_string_folds_and_accepts() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"anyOf":[{"type":"string"}]}]}"#);
         assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
         assert!(
-            rejects(&g, b"\"zzz\""),
-            "KNOWN LIMITATION #473: nested-anyOf string shadowed by the const trie"
+            accepts(&g, b"\"zzz\""),
+            "issue #473 fix: nested-anyOf broad string must now be reachable"
         );
     }
 
-    /// DOCUMENTED LIMITATION (issue #473): an untyped `{}` sibling accepts any
-    /// JSON value, but its string inputs are shadowed by the hoisted const trie.
-    /// Matches `origin/main`; pins current behavior pending #473.
+    /// DOCUMENTED LIMITATION (issue #473, Tier 2): a nested `oneOf` is NOT
+    /// flattened, unlike a nested `anyOf`. `oneOf` is exclusive, and a
+    /// no-rewind PDA cannot enforce "exactly one branch matches", so merging
+    /// its branches into the parent's OR-hoist would over-accept any overlap
+    /// (see `anyof_nested_oneof_overlap_no_over_accept`). The conservative,
+    /// provably-safe choice leaves every nested `oneOf` unflattened, so its
+    /// broad string stays shadowed here even in this single-branch,
+    /// non-overlapping case. Matches `origin/main`; over-rejection is safe.
+    ///
+    /// Mutation guard: restoring `oneOf` to `as_pure_nested_union` flips this
+    /// to accept "zzz" and breaks the over-accept guard test below.
+    #[test]
+    fn anyof_nested_oneof_not_flattened_known_limitation() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"oneOf":[{"type":"string"}]}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "KNOWN LIMITATION #473: a nested oneOf is deliberately not flattened (XOR unenforceable)"
+        );
+    }
+
+    /// OVER-ACCEPT GUARD (issue #473) — the reason a nested `oneOf` must not be
+    /// flattened. The inner `oneOf` has TWO overlapping branches: the broad
+    /// `type:string` and `const:"zzz"` both match "zzz", so under JSON Schema
+    /// `oneOf` (exactly one) the inner union FAILS for "zzz" and the parent
+    /// `anyOf` rejects it. Flattening the `oneOf` into the parent's string
+    /// hoist would let the broad string swallow "zzz" and wrongly accept it.
+    /// `origin/main` rejects "zzz"; this must too.
+    ///
+    /// Mutation guard: restoring `oneOf` to `as_pure_nested_union` makes this
+    /// accept "zzz" (a genuine over-acceptance), failing this test.
+    #[test]
+    fn anyof_nested_oneof_overlap_no_over_accept() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"const":"abc"},{"oneOf":[{"type":"string"},{"const":"zzz"}]}]}"#,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "issue #473: overlapping nested oneOf must not over-accept the shared value \"zzz\""
+        );
+    }
+
+    /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
+    /// PURE nested union, so `flatten_any_of_branches` deliberately leaves it
+    /// unflattened (`as_pure_nested_union` only recognizes an object whose
+    /// ONLY key is `anyOf` / `oneOf`). This remains a narrower, documented
+    /// limitation: the nested broad string stays shadowed. Not flattening is
+    /// always safe (it falls through to the pre-existing `other_subs` path),
+    /// so this pins a deliberate scope boundary rather than a bug.
+    #[test]
+    fn anyof_nested_anyof_with_sibling_key_stays_unflattened() {
+        let g = compile_ok(
+            r#"{"anyOf":[{"const":"abc"},{"anyOf":[{"type":"string"}],"description":"nested"}]}"#,
+        );
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "a nested union with a sibling key is deliberately not flattened"
+        );
+    }
+
+    /// FIXED (issue #473, shape 5): an untyped `enum` mixing a string and a
+    /// non-string member (`{"enum":["abe",1]}`, no `type` keyword) previously
+    /// classified as `None` and was shadowed entirely — including its string
+    /// member "abe" — behind the hoisted const trie. `fold_string_members`
+    /// now folds "abe" into the trie while the branch stays in `other_subs`
+    /// too, keeping `1` reachable via its disjoint first byte.
+    ///
+    /// Mutation guard: reverting the shape-5 fold strands "abe" behind the
+    /// const trie (rejected); reverting keeping the branch in `other_subs`
+    /// loses reachability of `1`.
+    #[test]
+    fn anyof_untyped_mixed_enum_folds_string_member() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"enum":["abe",1]}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            accepts(&g, b"\"abe\""),
+            "issue #473 fix: untyped mixed-enum string member must now be reachable"
+        );
+        assert!(
+            accepts(&g, b"1"),
+            "the non-string enum member 1 stays reachable"
+        );
+        assert!(
+            rejects(&g, b"\"abd\""),
+            "a string in no branch must still be rejected (no over-accept)"
+        );
+    }
+
+    /// Shape 5 with MULTIPLE string members and multiple non-string members:
+    /// every string member folds into the trie, and every non-string member
+    /// stays reachable via `other_subs`.
+    #[test]
+    fn anyof_untyped_mixed_enum_multiple_members_all_reachable() {
+        let g = compile_ok(r#"{"anyOf":[{"enum":["abe","abf",1,null]}]}"#);
+        assert!(accepts(&g, b"\"abe\""), "string member \"abe\" reachable");
+        assert!(accepts(&g, b"\"abf\""), "string member \"abf\" reachable");
+        assert!(accepts(&g, b"1"), "non-string member 1 reachable");
+        assert!(accepts(&g, b"null"), "non-string member null reachable");
+        assert!(
+            rejects(&g, b"\"abg\""),
+            "a string not in the enum must be rejected (no over-accept)"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION (issue #473, Tier 2 — out of scope for this
+    /// fix): an untyped `{}` sibling accepts any JSON value, but its string
+    /// inputs are shadowed by the hoisted const trie. Matches `origin/main`;
+    /// pins current behavior pending a parallel-stack matcher.
     #[test]
     fn anyof_untyped_sibling_shadowed_known_limitation() {
         let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{}]}"#);
@@ -2499,6 +3425,96 @@ mod tests {
         assert!(
             rejects(&g, b"\"zzz\""),
             "KNOWN LIMITATION #473: untyped empty-schema string inputs shadowed by the const trie"
+        );
+    }
+
+    /// DOCUMENTED LIMITATION (issue #473, Tier 2 — out of scope for this
+    /// fix): a `{"type":["string","number"]}` sibling accepts both strings
+    /// and numbers, but this compiler does not special-case a `type` ARRAY —
+    /// `compile_schema_inner` dispatches on `Value::as_str`, which is `None`
+    /// for a JSON array (same as an absent `type`), so it falls to the
+    /// untyped `any_value_alts` path, identically to `{}` — and its STRING
+    /// inputs are shadowed by the hoisted const trie exactly like the
+    /// untyped `{}` case above. There is no fixed literal set to fold here
+    /// (the branch's string language is unbounded), so fixing this needs
+    /// parallel-stack / NFA matching, not a compile-time fold. Pins current
+    /// behavior so a future engine change flips it intentionally.
+    #[test]
+    fn anyof_mixed_type_array_sibling_shadowed_known_limitation() {
+        let g = compile_ok(r#"{"anyOf":[{"const":"abc"},{"type":["string","number"]}]}"#);
+        assert!(accepts(&g, b"\"abc\""), "const \"abc\" still accepted");
+        assert!(
+            accepts(&g, b"42"),
+            "a non-string alternative from the mixed-type branch stays reachable"
+        );
+        assert!(
+            rejects(&g, b"\"zzz\""),
+            "KNOWN LIMITATION #473: mixed-type-array sibling's string inputs shadowed by the const trie"
+        );
+    }
+
+    /// DoS bound (issue #473 extends issue #474 finding 2): a small
+    /// top-level `anyOf` (2 branches) whose SECOND branch is a nested pure
+    /// union containing MAX_ANYOF_BRANCHES sibling branches must still be
+    /// rejected by the branch-count cap — proving `flatten_any_of_branches`
+    /// enforces MAX_ANYOF_BRANCHES on the FLATTENED total, not the raw
+    /// top-level count (which is only 2 here and would sail under the cap on
+    /// its own).
+    ///
+    /// Mutation guard: fires with "anyOf/oneOf branch count". Reverting the
+    /// flatten-time incremental check (bounding only the raw top-level
+    /// count, as the pre-issue-473 code did) lets this schema compile
+    /// successfully instead of being rejected.
+    #[test]
+    fn anyof_nested_union_flatten_bypass_rejected_by_branch_cap() {
+        let over = MAX_ANYOF_BRANCHES + 1;
+        let inner_branches: String = (0..over)
+            .map(|_| r#"{"type":"boolean"}"#.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let nested_union = format!("{{\"anyOf\":[{inner_branches}]}}");
+        let schema_json = format!("{{\"anyOf\":[{{\"const\":\"abc\"}},{nested_union}]}}");
+        let v: Value = serde_json::from_str(&schema_json).unwrap();
+        let err = compile(&v).expect_err(
+            "flattened branch count over the cap must be rejected even though the raw top-level count is only 2",
+        );
+        assert!(
+            err.0.contains("anyOf/oneOf branch count"),
+            "expected the anyOf branch-count cap error, got: {}",
+            err.0
+        );
+    }
+
+    /// DoS bound (issue #473): `flatten_any_of_branches`' own recursion depth
+    /// must be capped independent of `MAX_SCHEMA_DEPTH`'s use elsewhere. A
+    /// `Value` tree is built directly here (not via `serde_json::from_str`,
+    /// so this is not confounded by serde_json's own JSON-text nesting
+    /// limit) with `MAX_SCHEMA_DEPTH + 50` nested pure `{"anyOf":[...]}`
+    /// wrappers, and must be rejected rather than overflow the native stack.
+    ///
+    /// Mutation guard: fires with "anyOf/oneOf nesting depth". Removing the
+    /// depth check inside `flatten_any_of_branches` either overflows the
+    /// stack (a process abort, not a test failure this assertion could
+    /// catch) or, if the recursion happens to survive, compiles successfully
+    /// instead of being rejected.
+    #[test]
+    fn anyof_nested_union_flatten_depth_capped() {
+        let mut inner = {
+            let mut m = serde_json::Map::new();
+            m.insert("type".to_string(), Value::String("boolean".to_string()));
+            Value::Object(m)
+        };
+        for _ in 0..(MAX_SCHEMA_DEPTH + 50) {
+            let mut m = serde_json::Map::new();
+            m.insert("anyOf".to_string(), Value::Array(vec![inner]));
+            inner = Value::Object(m);
+        }
+        let err =
+            compile(&inner).expect_err("anyOf/oneOf nesting depth over the cap must be rejected");
+        assert!(
+            err.0.contains("anyOf/oneOf nesting depth"),
+            "expected the flatten depth-cap error, got: {}",
+            err.0
         );
     }
 
