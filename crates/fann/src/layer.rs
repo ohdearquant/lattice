@@ -282,7 +282,7 @@ unsafe fn simd_dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// Memory layout:
 /// - weights: [num_outputs * num_inputs] in row-major order
-/// - biases: [num_outputs]
+/// - biases: `[num_outputs]`
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "LayerData"))]

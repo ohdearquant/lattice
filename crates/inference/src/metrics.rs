@@ -1,7 +1,7 @@
 //! Inference metrics core seed (ADR-061).
 //!
 //! Provides zero-cost-when-disabled metrics collection for forward passes.
-//! The [`OnlineSoftmaxEntropy`] accumulator computes attention entropy in O(1)
+//! The `OnlineSoftmaxEntropy` accumulator computes attention entropy in O(1)
 //! space without materializing the full probability vector.
 
 /// Controls what metrics are collected during inference.
@@ -82,7 +82,7 @@ pub struct ForwardMetrics {
 /// # Non-finite inputs
 ///
 /// All update methods require finite logits. Use [`try_update`] for recoverable
-/// error handling; [`update`] panics on non-finite input in both debug and
+/// error handling; [`update`](OnlineSoftmaxEntropy::update) panics on non-finite input in both debug and
 /// release builds (fail-fast finite precondition).
 ///
 /// [`try_update`]: OnlineSoftmaxEntropy::try_update

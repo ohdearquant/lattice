@@ -68,7 +68,7 @@ pub struct VisionWeights {
     /// Patch embedding linear projection [d_model, patch_size^2 * 3]
     pub patch_embed_weight: Vec<f32>,
     pub patch_embed_bias: Vec<f32>,
-    /// Final LayerNorm gamma/beta [d_model]
+    /// Final LayerNorm gamma/beta `[d_model]`
     pub norm_weight: Vec<f32>,
     pub norm_bias: Vec<f32>,
     /// Per-block weights, length == n_layers

@@ -49,9 +49,9 @@ struct WordPieceInner {
 /// **Unstable**: double-array trie for O(text-length) WordPiece lookup; DAT construction algorithm may change.
 #[derive(Debug, Clone)]
 pub struct DoubleArrayTrie {
-    /// base[state] + label = next_state
+    /// base`[state]` + label = next_state
     pub base: Vec<i32>,
-    /// check[next_state] == state validates the transition.
+    /// check`[next_state]` == state validates the transition.
     pub check: Vec<i32>,
     /// Accepting value for a state, or -1 when non-accepting.
     pub value: Vec<i32>,
@@ -603,9 +603,9 @@ impl WordPieceTokenizer {
         self.inner.id_to_token.get(id as usize).map(String::as_str)
     }
 
-    /// **Unstable**: [MASK] token id accessor.
+    /// **Unstable**: `[MASK]` token id accessor.
     ///
-    /// Return the [MASK] token id.
+    /// Return the `[MASK]` token id.
     pub fn mask_id(&self) -> u32 {
         self.inner.mask_id
     }

@@ -14,7 +14,7 @@
 //! 6. Evict finished sequences and return their KV pages to the pool.
 //!
 //! The actual forward pass (transformer layers, KV cache writes, logit
-//! projection) is provided by a caller-supplied [`ForwardFn`] closure, keeping
+//! projection) is provided by a caller-supplied `ForwardFn` closure, keeping
 //! this module independent of model architecture.
 
 use std::collections::{HashMap, VecDeque};
@@ -334,7 +334,7 @@ impl BatchWorker {
     /// Submit a new inference request.
     ///
     /// Returns the [`SeqId`] assigned to this request. The actual forward pass
-    /// will begin on the next call to [`step`].
+    /// will begin on the next call to `step`.
     ///
     /// Returns `None` if the request is invalid (empty prompt, exceeds
     /// `max_seq_len`).

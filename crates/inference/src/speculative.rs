@@ -16,8 +16,8 @@
 //! # Usage
 //!
 //! The module exposes two levels of API:
-//! - Low-level: [`NgramSpeculator::speculate`] + [`verify_draft`] for custom loops.
-//! - High-level: [`generate_with_speculation`] wraps any `forward_fn` closure.
+//! - Low-level: `NgramSpeculator::speculate` + `verify_draft` for custom loops.
+//! - High-level: `generate_with_speculation` wraps any `forward_fn` closure.
 
 /// **Unstable**: n-gram speculative decoding; algorithm parameters and API may change as
 /// the generation pipeline evolves.
@@ -208,11 +208,11 @@ pub struct MtpWeights {
     /// fc_weight: [hidden_size, 2 * hidden_size] — fusion projection
     pub fc_weight: Vec<f32>,
     pub layers: Vec<MtpLayerWeights>,
-    /// Final RMSNorm weight: [hidden_size]
+    /// Final RMSNorm weight: `[hidden_size]`
     pub norm_weight: Vec<f32>,
-    /// Pre-FC normalization applied to embedding: [hidden_size]
+    /// Pre-FC normalization applied to embedding: `[hidden_size]`
     pub pre_fc_norm_embedding_weight: Vec<f32>,
-    /// Pre-FC normalization applied to previous hidden: [hidden_size]
+    /// Pre-FC normalization applied to previous hidden: `[hidden_size]`
     pub pre_fc_norm_hidden_weight: Vec<f32>,
 }
 
@@ -1289,7 +1289,7 @@ pub trait MtpTargetVerifier {
     /// `Vec`. Callers must treat the returned snapshot as opaque.
     fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot;
 
-    /// Restore every GDN layer's recurrent state from a prior [`snapshot_gdn_states`] call.
+    /// Restore every GDN layer's recurrent state from a prior `snapshot_gdn_states` call.
     ///
     /// The snapshot must have been taken from the same model instance. Implementors that
     /// hold no GDN state accept an empty snapshot and do nothing.

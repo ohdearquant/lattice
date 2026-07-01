@@ -19,7 +19,7 @@
 //!
 //! The crate is organized into layers:
 //!
-//! - **Numerical foundation**: [`math`], [`logsumexp`] -- stable log-domain arithmetic
+//! - **Numerical foundation**: `math`, [`logsumexp`] -- stable log-domain arithmetic
 //! - **Cost abstraction**: [`cost`] -- cost matrix traits and implementations
 //! - **Core solvers**: [`sinkhorn`] (balanced), [`sinkhorn_log`] (epsilon-scaling),
 //!   [`unbalanced`] (KL-relaxed marginals)

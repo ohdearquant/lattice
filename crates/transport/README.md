@@ -119,3 +119,6 @@ let mut workspace = SinkhornWorkspace::new(2, 2);
 let result = solver.solve(&cost, &source, &target, &mut workspace).unwrap();
 assert!(result.converged);
 ```
+
+For debiased divergence, non-uniform marginals, and embedding-drift detection examples, see
+the `lattice-transport` section of [`docs/examples.md`](../../docs/examples.md).

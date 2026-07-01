@@ -4,7 +4,7 @@
 //! exactly once, promote it to f64 for the rotation math, fuse RMSNorm scales,
 //! apply rotation absorption, then quantize and discard. Caching the f32 or
 //! f64 expansion of a multi-gigabyte checkpoint would defeat that pipeline —
-//! so this reader allocates a fresh `Vec<f64>` per [`read_tensor_f64`] call
+//! so this reader allocates a fresh `Vec<f64>` per `read_tensor_f64` call
 //! and never caches converted bytes. Compare with
 //! [`crate::weights::f32_weights::SafetensorsFile`] which DOES cache the
 //! f32-converted form per tensor and is appropriate for inference paths

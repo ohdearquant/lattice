@@ -38,7 +38,7 @@
 //! - **Forward-equivalence assertion** with refuse-on-fail (step 3c-4).
 //! - **Binary entry point + CLI** (step 3c-5).
 //! - **MoE expert weights** — deferred to v1 per `plan.rs` §Deferred.
-//!   [`qwen35_per_layer_fusion_plan`] refuses MoE configs explicitly;
+//!   `qwen35_per_layer_fusion_plan` refuses MoE configs explicitly;
 //!   [`absorb_rotations`] would silently skip MoE expert tensors (no
 //!   matching plan rule) — which is correctness-incomplete, not just
 //!   slow, so do NOT feed an MoE config to this pipeline yet.

@@ -53,7 +53,7 @@ use crate::error::InferenceError;
 /// One Q4_0 quantization block: 32 weights packed as 4-bit unsigned integers.
 ///
 /// `scale` is stored as a raw IEEE-754 f16 bit pattern in a `u16` — the `half` crate
-/// is not a dependency of `lattice-inference`. Use [`q4_f32_to_f16`] / [`q4_f16_to_f32`].
+/// is not a dependency of `lattice-inference`. Use `q4_f32_to_f16` / `q4_f16_to_f32`.
 ///
 /// `packed` holds 32 nibbles in **sequential-pairs** layout:
 /// ```text

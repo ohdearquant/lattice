@@ -301,3 +301,37 @@ To inspect the forward pass at runtime, set a breakpoint on `forward_with_cache`
 (`generate.rs:451`). The prefill call has `seq_len = prompt_len`; each decode call has
 `seq_len = 1`. The logits for the sampled token are always in `scratch.logits[0..vocab_size]`
 after the function returns.
+
+### Qwen3.5 Generation Path
+
+The trace above covers the older Qwen3 (`crate::generate`/`crate::sampling`) decoder path. The
+newer Qwen3.5 architecture (`crate::model::qwen35`) has a separate, structurally similar trace,
+verified against `crates/inference/src/model/qwen35/` and `crates/inference/src/forward/`:
+
+```text
+local safetensors directory -> Qwen35Model::from_safetensors
+  -> required tensor validation (validate_required_tensor_names)
+  -> load_weights                                    (model/qwen35/loading.rs)
+  -> BpeTokenizer::from_tokenizer_json                (tokenizer.json)
+  -> Tokenizer::tokenize(prompt)                      (tokenizer/common.rs)
+  -> prefill_prompt                                   (forward/batch_prefill.rs)
+  -> sample_token (first generated token)             (model/qwen35/sampling.rs)
+  -> forward_step (decode loop, one call per token)   (model/qwen35/forward.rs)
+  -> sample_token (each subsequent generated token)
+```
+
+`Qwen35Model::from_safetensors` (`model/qwen35/model.rs`) resolves either `model.safetensors` or
+a sharded `model.safetensors.index.json`, validates the required tensor names against the
+config, then calls `load_weights` to materialize embedding, layer, and norm weights, and loads
+the tokenizer from `tokenizer.json`. Generation itself (`Qwen35Model::generate_with_batch_prefill`,
+`forward/batch_prefill.rs`) tokenizes the prompt with `Tokenizer::tokenize`, runs a single batched
+`prefill_prompt` pass over the whole prompt, samples the first token with `sample_token`, then
+enters a decode loop that calls the single-token `forward_step` (`model/qwen35/forward.rs`) and
+`sample_token` once per generated token.
+
+Note: the tokenizer trait method is `tokenize`, not `encode` — `encode` is a method on the
+separate `QwenModel` embedding path (`model/qwen.rs`), not on the `Tokenizer` trait used here.
+
+For a deeper, function-by-function walkthrough of this path (including the GDN/full-attention
+dispatch inside each layer), see [`docs/forward-pass.md`](forward-pass.md). For library usage of
+either path, see [`docs/inference-usage.md`](inference-usage.md).

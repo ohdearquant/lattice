@@ -196,8 +196,8 @@ impl RawExample {
     ///
     /// Applies the following sanitization:
     /// - Strips control characters (except newlines and tabs)
-    /// - Truncates individual messages to [`MAX_MESSAGE_LENGTH`]
-    /// - Truncates total prompt to [`MAX_PROMPT_LENGTH`]
+    /// - Truncates individual messages to `MAX_MESSAGE_LENGTH`
+    /// - Truncates total prompt to `MAX_PROMPT_LENGTH`
     pub fn to_prompt(&self) -> String {
         let mut prompt = String::new();
 

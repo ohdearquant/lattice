@@ -13,10 +13,10 @@
 //! - `11` = unused/reserved
 //!
 //! Within a `u8`, four weights are packed as:
-//! - bits [1:0] = weight 0
-//! - bits [3:2] = weight 1
-//! - bits [5:4] = weight 2
-//! - bits [7:6] = weight 3
+//! - bits `[1:0]` = weight 0
+//! - bits `[3:2]` = weight 1
+//! - bits `[5:4]` = weight 2
+//! - bits `[7:6]` = weight 3
 //!
 //! Each row carries a per-tensor scale `alpha = mean(|w_float|)` from the
 //! original float weights (before rounding to ternary).

@@ -4,7 +4,7 @@
 //! This lives in foundation/inference (not platform/tune) so the dependency
 //! direction stays correct: platform/tune implements this trait.
 //!
-//! The default [`NoopLoraHook`] does nothing — zero overhead when no adapter is loaded.
+//! The default `NoopLoraHook` does nothing — zero overhead when no adapter is loaded.
 
 /// **Unstable**: trait for LoRA adapter injection into linear projections.
 ///

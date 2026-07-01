@@ -1,7 +1,8 @@
 # Lattice Examples
 
-This document provides runnable examples for the three main crates in the lattice workspace:
-`lattice-embed`, `lattice-fann`, and `lattice-transport`.
+This document provides runnable examples for the main crates in the lattice workspace:
+`lattice-embed`, `lattice-fann`, `lattice-transport`, and the LoRA fine-tuning workflow in
+`lattice-tune`.
 
 All examples live in their respective crate's `examples/` directory and can be run with:
 
@@ -537,3 +538,65 @@ let report = detect_drift_records(&old_records, &new_records, &config).unwrap();
 println!("Drift magnitude: {:.4}", report.summary.drift_magnitude);
 println!("Converged: {}", report.summary.converged);
 ```
+
+---
+
+## lattice-tune
+
+`lattice-tune` provides LoRA fine-tuning for the Qwen3.5 generation model, using the
+`train_grad_full` binary (`crates/tune/src/bin/train_grad_full.rs`) for training and the
+`generate_lora` binary (`crates/tune/src/bin/generate_lora.rs`) to run generation with the
+trained adapter. Both are existing binaries in the crate — there is no separate training API to
+call directly.
+
+### Fine-tuning a Qwen3.5 LoRA adapter
+
+`train_grad_full` trains LoRA parameters over a range of Qwen3.5 layers (default: layers 19-23)
+using exact reverse-mode gradients, and can save the result as a PEFT-compatible safetensors
+adapter.
+
+Training data is JSON Lines under a data directory (default `data/lora-train`):
+
+- `train.jsonl` is required. Each line is a JSON object with `prompt` and `completion` string
+  fields; both must be non-empty.
+- `valid.jsonl` is optional. If present, it is used for held-out evaluation during training; if
+  absent or empty, held-out evaluation is skipped.
+
+```jsonl
+{"prompt":"Write a Rust function that returns true for primes.","completion":"\nfn is_prime(n: u64) -> bool { ... }"}
+```
+
+```sh
+cargo run --release -p lattice-tune --features train-backward --bin train_grad_full -- \
+  --model-dir ~/.lattice/models/qwen3.5-0.8b \
+  --data-dir data/lora-train \
+  --steps 25 \
+  --lr 1e-3 \
+  --rank 8 \
+  --alpha 16 \
+  --seq-len 64 \
+  --max-train 3 \
+  --save adapter.safetensors
+```
+
+The `train-backward` feature pulls in `lattice-inference`'s backward-pass support along with the
+`safetensors` feature needed by `--save`. The saved adapter targets the `q_proj` and `v_proj`
+projections of the trained layers and is written in PEFT safetensors format.
+
+### Running generation with the trained adapter
+
+`generate_lora` loads a Qwen3.5 model and an optional LoRA adapter, then runs ordinary
+autoregressive generation:
+
+```sh
+cargo run --release -p lattice-tune --features "safetensors,inference-hook" --bin generate_lora -- \
+  --model-dir ~/.lattice/models/qwen3.5-0.8b \
+  --lora adapter.safetensors \
+  --prompt "Write a Rust function that checks if a number is prime" \
+  --max-tokens 64
+```
+
+Internally, `generate_lora` loads the adapter with `LoraAdapter::from_safetensors`, validates it
+against the loaded model's `model.config()`, attaches it with `model.set_lora(Box::new(adapter))`,
+and prints `LoRA: ACTIVE` once an adapter is attached, before generating. Omitting `--lora` runs
+the base model unmodified.

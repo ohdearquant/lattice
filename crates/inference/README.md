@@ -50,7 +50,31 @@ These modules contain submodules (directories with their own `mod.rs`).
 
 | Module | Feature flag | Responsibility |
 |--------|-------------|----------------|
+| `mixture` | `mixture` | Adapter routing and mixture-of-LoRA support layered on top of `lora_hook`. |
 | `backward` | `train-backward` | Reverse-mode autodiff for LoRA training: `tape`, `ops`, `attention_gqa`, `gradcheck`. Submodule of `lattice-tune`'s training loop. |
+
+---
+
+## Run an Example
+
+Qwen3.5 text generation demo (`src/bin/qwen35_generate.rs`):
+
+```sh
+cargo run --release -p lattice-inference --bin qwen35_generate -- \
+  --model-dir PATH --prompt "Hello" --max-tokens 64 --seed 42
+```
+
+Qwen3 embedding benchmark (`examples/bench_embedding.rs`, registered in `Cargo.toml` as an
+`[[example]]` target — despite an outdated `--bin` reference in the file's own header comment,
+run it with `--example`):
+
+```sh
+cargo run --release -p lattice-inference --example bench_embedding --features f16
+```
+
+For the concise forward-pass trace (safetensors load → tokenize → prefill → decode-loop
+sampling), see [`docs/architecture.md` § Forward Pass Pipeline](../../docs/architecture.md#forward-pass-pipeline).
+A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 
 ---
 
