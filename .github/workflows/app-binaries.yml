@@ -1,8 +1,9 @@
 name: app-binaries
 # Regression gate: build every binary the macOS Studio app ships, each with its
 # required-features. `cargo build --workspace` skips required-features bins, so
-# this is the only CI that compiles chat_metal / eval_perplexity / train_grad_full
-# / generate_lora / embed with the features the app actually builds them with.
+# this is the only CI that compiles chat_metal / eval_perplexity / lattice_serve
+# / train_grad_full / generate_lora / embed with the features the app actually
+# builds them with.
 # See scripts/build-app-bins.sh for the rationale and the two regressions that
 # motivated it.
 #
@@ -21,6 +22,11 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-app-bins.sh'
+      - 'apps/macos/scripts/package-app.sh'
+      - '.github/workflows/app-binaries.yml'
   workflow_dispatch:
 
 permissions:
@@ -54,7 +60,10 @@ jobs:
           fi
           echo "Changed files:"
           echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^crates/|^Cargo\.(toml|lock)$|^scripts/build-app-bins\.sh$|^\.github/workflows/app-binaries\.yml$'; then
+          # here-string, not `echo | grep -q`: -q exits at first match, echo gets
+          # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
+          # would silently skip the build on large diffs (fail-open).
+          if grep -E '^crates/|^Cargo\.(toml|lock)$|^scripts/build-app-bins\.sh$|^apps/macos/scripts/package-app\.sh$|^\.github/workflows/app-binaries\.yml$' <<<"$CHANGED" >/dev/null; then
             echo "bins=true" >> "$GITHUB_OUTPUT"
             echo "→ app-binary surface changed: build REQUIRED"
           else
