@@ -4571,31 +4571,77 @@ kernel void gdn_chunk_norm_silu_c32(
         gdn_snapshot: crate::attention::gdn::GdnSnapshot,
     }
 
-    /// Worker-local map of cache slot to retained cross-turn prefix.
+    /// Worker-local, single-live-entry cross-turn prefix cache (#516 round-1
+    /// remediation, finding 1 + 5).
+    ///
+    /// Ownership invariant: at most ONE `MetalCrossTurnPrefixEntry` is ever
+    /// retained, bounded by design (never an unbounded per-slot map). The
+    /// entry is valid **iff** the live `self.session.kv_cache` rows and
+    /// `self.session.position` were left by exactly the generation call that
+    /// saved it. Any other mutation of live KV/GDN state — a different
+    /// slot's generation, the plain (non-cache-aware) generate path, a
+    /// `reset_state()` call, or a LoRA adapter load/unload — must invalidate
+    /// the entry before that mutation is allowed to proceed, because the
+    /// entry does not own private copies of the full-attention KV buffers
+    /// (see `MetalCrossTurnPrefixEntry` above): it can only ever describe
+    /// the ONE live buffer this process currently has. `get`/`take` both
+    /// enforce the slot match themselves so a caller can never accidentally
+    /// restore a different slot's entry.
     #[derive(Debug, Default)]
     struct MetalCrossTurnPrefixCache {
-        entries:
-            std::collections::HashMap<crate::kv_cache::CrossTurnSlotId, MetalCrossTurnPrefixEntry>,
+        entry: Option<MetalCrossTurnPrefixEntry>,
     }
 
     impl MetalCrossTurnPrefixCache {
+        /// Returns the retained entry only if it belongs to `slot_id`. A
+        /// different (or absent) slot is always a miss — never a partial or
+        /// stale match — so the planner falls back to `FullRefill`.
         fn get(
             &self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
         ) -> Option<&MetalCrossTurnPrefixEntry> {
-            self.entries.get(&slot_id)
+            self.entry.as_ref().filter(|e| e.generic.slot_id == slot_id)
         }
 
+        /// Replace whatever is currently retained (if anything, for any
+        /// slot) with `entry`. At most one GDN snapshot is ever alive.
         fn insert(&mut self, entry: MetalCrossTurnPrefixEntry) {
-            self.entries.insert(entry.generic.slot_id, entry);
+            self.entry = Some(entry);
+        }
+
+        /// Remove and return the retained entry iff it belongs to
+        /// `slot_id`, leaving the cache empty either way it existed for
+        /// that slot. Used by `restore_cross_turn_prefix` so an
+        /// `ExactAppend` restore consumes its GDN snapshot instead of
+        /// cloning it, and so the cache is provably empty for the
+        /// remainder of the call until a fresh save succeeds.
+        fn take(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+        ) -> Option<MetalCrossTurnPrefixEntry> {
+            if self
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generic.slot_id == slot_id)
+            {
+                self.entry.take()
+            } else {
+                None
+            }
         }
 
         fn remove(&mut self, slot_id: crate::kv_cache::CrossTurnSlotId) {
-            self.entries.remove(&slot_id);
+            if self
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generic.slot_id == slot_id)
+            {
+                self.entry = None;
+            }
         }
 
         fn clear(&mut self) {
-            self.entries.clear();
+            self.entry = None;
         }
     }
 
@@ -6246,6 +6292,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 intermediate,
                 max_rank,
             });
+            // #516 round-1 remediation D4: the cross-turn cache's adapter
+            // identity (`cross_turn_metadata`'s `adapter_id`) is a shape-based
+            // hash (max_rank/scale/projection count), not a content hash, so
+            // two different adapters with the same shape can collide on the
+            // same `AdapterId` (finding 3). The metadata hash is
+            // defense-in-depth; the unconditional clear here is the actual
+            // correctness mechanism.
+            self.cross_turn_prefix_cache.clear();
 
             Ok(())
         }
@@ -6253,6 +6307,10 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
+            // #516 round-1 remediation D4: see the matching comment in
+            // `load_lora_adapter` — any adapter identity change must
+            // invalidate the retained cross-turn entry.
+            self.cross_turn_prefix_cache.clear();
         }
 
         /// Returns true if a LoRA adapter is currently loaded.
@@ -10398,6 +10456,15 @@ kernel void gdn_chunk_norm_silu_c32(
                 pool.active_base_seq_len = None;
             }
             self.session.last_pre_final_hidden = vec![0.0f32; self.engine.config.hidden_size];
+            // #516 round-1 remediation D3: every public path that resets live
+            // KV/GDN state (plain `generate_streaming`, chat, the serve
+            // worker, and the cache-aware path's own FullRefill/error legs)
+            // routes through here, so this is the single place that must
+            // invalidate any retained cross-turn entry. A retained entry
+            // describes exactly the state this call just vacated; leaving it
+            // alive would let a later cache-aware call restore GDN state for
+            // KV rows that no longer represent it (finding 2).
+            self.cross_turn_prefix_cache.clear();
         }
 
         /// Select the GDN prefill scan at runtime: `true` = chunked-parallel (default),
@@ -15472,19 +15539,22 @@ kernel void gdn_chunk_norm_silu_c32(
 
             match plan.mode {
                 PrefixReuseMode::ExactAppend => {
-                    let snapshot = self
-                        .cross_turn_prefix_cache
-                        .get(slot_id)
-                        .ok_or_else(|| {
-                            InferenceError::PrefixCache(
-                                "restore_cross_turn_prefix: ExactAppend plan but no cached entry \
-                                 for this slot"
-                                    .into(),
-                            )
-                        })?
-                        .gdn_snapshot
-                        .clone();
-                    self.restore_gdn_states_checked(&snapshot)?;
+                    // Take (not clone): from this point on the cache is
+                    // EMPTY for this slot until a fresh save succeeds at
+                    // the end of generation. Any early return between here
+                    // and that save (error `?`, caller-interrupt) leaves
+                    // the cache empty rather than retaining a stale entry
+                    // — fail-closed by construction (#516 round-1
+                    // remediation D2). This also removes a ~19MiB GDN
+                    // snapshot clone per restore.
+                    let entry = self.cross_turn_prefix_cache.take(slot_id).ok_or_else(|| {
+                        InferenceError::PrefixCache(
+                            "restore_cross_turn_prefix: ExactAppend plan but no cached entry \
+                             for this slot"
+                                .into(),
+                        )
+                    })?;
+                    self.restore_gdn_states_checked(&entry.gdn_snapshot)?;
                     self.session.set_position(plan.reusable_len);
                     Ok(())
                 }
@@ -21763,6 +21833,312 @@ kernel void decode_attention_reference(
                 second.cache.mode,
                 crate::kv_cache::PrefixReuseMode::FullRefill,
                 "a cleared cache slot must never be treated as a valid cached entry"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // #516 round-1 remediation (codex REJECT) — regression coverage for
+        // findings 1/2/3/4. See
+        // .khive/codex_reviews/codex_review_pr516.md.
+        // -------------------------------------------------------------------
+
+        /// Finding 1 (slot isolation): a divergent-prompt call on a
+        /// different slot must evict the single retained entry (D1's
+        /// single-live-entry cache), so a later append to the ORIGINAL
+        /// slot's prefix cannot silently restore GDN state left by a
+        /// different slot's generation while attention reads whatever KV
+        /// rows the other slot's generation wrote.
+        #[test]
+        fn cross_turn_cache_slot_isolation_evicts_other_slot() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_a = crate::kv_cache::CrossTurnSlotId::new(1);
+            let slot_b = crate::kv_cache::CrossTurnSlotId::new(2);
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(11, 2);
+
+            // Save slot A.
+            let first = state
+                .generate_streaming_with_prefix_cache(slot_a, "ab", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("slot A first turn must succeed");
+            let mut conv_a = "ab".to_string();
+            conv_a.push_str(&first.output.text);
+
+            // Divergent-prompt call on slot B: under D1, `insert` replaces
+            // whatever is retained regardless of slot, so this evicts A's
+            // entry and retains B's.
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_b,
+                    "xyz",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("slot B turn must succeed");
+
+            // Append-only continuation of A's prefix, issued on slot A
+            // AFTER B evicted the single retained entry: must NOT
+            // ExactAppend (there is no A entry left to restore from).
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_a,
+                    &conv_a,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("slot A second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "slot A must not reuse GDN/KV state left by slot B's generation"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a different-slot eviction must force a FullRefill, never ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after cross-slot eviction, output must still match full re-prefill"
+            );
+        }
+
+        /// Finding 2, plain-path leg (D3): interleaving a plain
+        /// `generate_streaming` call (which goes through `reset_state`)
+        /// between two cache-aware calls must invalidate the retained
+        /// entry — the plain path overwrites live KV/GDN state without
+        /// ever calling `save_cross_turn_prefix`.
+        ///
+        /// Mutation sensitivity: reverting D3 (removing
+        /// `self.cross_turn_prefix_cache.clear()` from `reset_state`) makes
+        /// this test fail, because the stale entry would still report
+        /// `ExactAppend` against state the plain path already overwrote.
+        #[test]
+        fn cross_turn_cache_interleaved_plain_path_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(21, 2);
+
+            // Save a cross-turn entry.
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+
+            // Plain path: a different prompt, routed through `reset_state`,
+            // never touches the cross-turn cache's save path.
+            let _ = state.generate_streaming("zzzzzz", &tokenizer, &gen_cfg, |_, _| true);
+
+            // A genuine append (strictly longer than the cached entry) onto
+            // the ORIGINAL prefix through the cache-aware path again: if the
+            // stale entry survived, this satisfies D5's `len > shared` guard
+            // too (it is NOT an exact-equal retry), so it would still look
+            // like a valid ExactAppend continuation of `conversation` and
+            // this test would only be sensitive to D3, not accidentally
+            // masked by D5's separate guard.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an interleaved plain generate_streaming call must invalidate the retained entry"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after an interleaved plain-path reset, output must still match full re-prefill"
+            );
+        }
+
+        /// Finding 4 (D5): retrying the exact same prompt through the
+        /// cache-aware path must not hit the empty-suffix invariant error
+        /// in `forward_prefill_from` — the planner must fall back to
+        /// `FullRefill` when the new prompt exactly equals the entry's
+        /// represented tokens.
+        ///
+        /// Mutation sensitivity: reverting D5 (dropping the
+        /// `new_prompt_ids.len() > shared` conjunct in
+        /// `plan_prefix_reuse`) makes this test fail: the planner would
+        /// again produce `ExactAppend` with `suffix_len == 0`, and
+        /// `generate_streaming_with_prefix_cache` would return
+        /// `Err(InferenceError::PrefixCache(..))` instead of `Ok`.
+        #[test]
+        fn cross_turn_cache_exact_equal_retry_full_refills() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(5, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abc",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first call must succeed");
+
+            // The saved entry represents `prompt + generated tokens`, NOT
+            // just the original prompt (see the `represented_token_ids`
+            // construction in `generate_streaming_with_prefix_cache_inner`).
+            // To actually exercise the exact-equal boundary the second call
+            // must retry with THIS accumulated conversation — retrying with
+            // the bare "abc" prompt again would only exercise the ordinary
+            // mid-history-divergence FullRefill path (shared < represented_len),
+            // never reaching the `shared == represented_len` branch this test
+            // targets.
+            let mut conversation = "abc".to_string();
+            conversation.push_str(&first.output.text);
+
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &conversation,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("exact-equal prompt retry must not error");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an exact-equal prompt retry must plan FullRefill, not a zero-length ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state
+                    .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "exact-equal prompt retry output must match full re-prefill"
+            );
+        }
+
+        /// Finding 3 (D4): LoRA adapter load/unload must invalidate the
+        /// retained cross-turn entry. The adapter-identity hash in
+        /// `CrossTurnPrefixMetadata` is shape-based (max_rank/scale/
+        /// projection count), not content-based, so two different adapters
+        /// with the same shape can collide on the same `AdapterId` — the
+        /// unconditional clear on load/unload is the actual correctness
+        /// mechanism, not the metadata hash. Asserted directly against the
+        /// cache struct (this `mod tests` is a child module of
+        /// `metal_qwen35`, so the private `entry` field is visible here).
+        #[test]
+        fn cross_turn_cache_lora_load_unload_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(9, 2);
+
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("save call must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: a save must actually retain an entry"
+            );
+
+            // `tiny_hybrid_fixture`'s only FullAttention layer is index 3
+            // (layers 0-2 are LinearAttention/GDN); `make_valid_layer`
+            // defaults to layer_idx 0, which is only valid against the
+            // single-FullAttention-layer fixture other LoRA tests use.
+            let mut lora_layer = make_valid_layer(512, 2);
+            lora_layer.layer_idx = 3;
+            state
+                .load_lora_adapter(vec![lora_layer], 1.0, None)
+                .expect("load_lora_adapter with a valid small fixture must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "load_lora_adapter must clear the retained cross-turn entry"
+            );
+
+            // Re-save under the loaded adapter, then unload and check
+            // invalidation again.
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("save call under LoRA must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: a save under LoRA must actually retain an entry"
+            );
+
+            state.unload_lora_adapter();
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "unload_lora_adapter must clear the retained cross-turn entry"
             );
         }
     }
