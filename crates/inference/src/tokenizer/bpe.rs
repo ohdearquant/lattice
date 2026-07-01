@@ -23,7 +23,6 @@ const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreTokenizeMode {
-    ByteLevel,
     Gpt4Regex,
 }
 
@@ -281,7 +280,22 @@ impl BpeTokenizer {
             eos_id,
             add_bos: false,
             add_eos: false,
-            pre_tokenize_mode: PreTokenizeMode::ByteLevel,
+            // #330: default to the GPT-2 regex pretokenizer, not the naive
+            // `byte_level_pretokenize` heuristic. Every real GPT-2-format
+            // tokenizer HF ships (raw vocab.json+merges.txt with no
+            // tokenizer.json, or a tokenizer.json declaring
+            // `"pre_tokenizer": {"type": "ByteLevel"}`) uses the standard
+            // GPT-2 regex for word-boundary splitting: it's what the "slow"
+            // Python `GPT2Tokenizer` implements directly, and it's what the
+            // fast `ByteLevel` pre_tokenizer's `use_regex` flag defaults to
+            // (`true`) when absent, which is the case for both `gpt2` and
+            // `roberta-base` on the Hub. `from_tokenizer_json_str` below can
+            // still detect an explicit regex `Split`/`Sequence` pre_tokenizer
+            // and set this mode explicitly, but when there is no
+            // pre_tokenizer metadata to inspect at all — the case this
+            // default governs — GPT-2 regex is the correct assumption, not
+            // the hand-rolled fallback.
+            pre_tokenize_mode: PreTokenizeMode::Gpt4Regex,
             max_seq_len,
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
@@ -542,7 +556,6 @@ impl BpeTokenizer {
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
         let pieces = match self.inner.pre_tokenize_mode {
-            PreTokenizeMode::ByteLevel => byte_level_pretokenize(text),
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
         };
         for piece in pieces {
@@ -811,134 +824,6 @@ fn parse_merges_json(value: &JsonValue) -> Result<Vec<(String, String)>, Inferen
     Ok(merges)
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SegmentClass {
-    Letter,
-    Number,
-    Other,
-}
-
-fn classify_char(ch: char) -> SegmentClass {
-    if ch.is_alphabetic() {
-        SegmentClass::Letter
-    } else if ch.is_numeric() {
-        SegmentClass::Number
-    } else {
-        SegmentClass::Other
-    }
-}
-
-fn split_whitespace_run(run: &str) -> (&str, &str) {
-    if run.is_empty() {
-        return ("", "");
-    }
-    let mut last_start = 0usize;
-    for (idx, _) in run.char_indices() {
-        last_start = idx;
-    }
-    (&run[..last_start], &run[last_start..])
-}
-
-fn byte_level_pretokenize(text: &str) -> Vec<String> {
-    let mut pieces = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < text.len() {
-        let ws_start = pos;
-        while pos < text.len() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            if !ch.is_whitespace() {
-                break;
-            }
-            pos += ch.len_utf8();
-        }
-
-        if pos >= text.len() {
-            if ws_start < pos {
-                pieces.push(text[ws_start..pos].to_string());
-            }
-            break;
-        }
-
-        let ws_run = &text[ws_start..pos];
-        let (standalone_ws, attached_ws) = split_whitespace_run(ws_run);
-        if !standalone_ws.is_empty() {
-            pieces.push(standalone_ws.to_string());
-        }
-
-        let mut segment = String::new();
-        segment.push_str(attached_ws);
-
-        let current = text[pos..]
-            .chars()
-            .next()
-            .expect("invariant: pos is inside non-empty UTF-8 text");
-        let class = if current == '\'' {
-            let next_pos = pos + current.len_utf8();
-            if next_pos < text.len() {
-                classify_char(
-                    text[next_pos..]
-                        .chars()
-                        .next()
-                        .expect("invariant: next_pos is inside non-empty UTF-8 text"),
-                )
-            } else {
-                SegmentClass::Other
-            }
-        } else {
-            classify_char(current)
-        };
-
-        if current == '\'' && class != SegmentClass::Other {
-            segment.push(current);
-            pos += current.len_utf8();
-        }
-
-        while pos < text.len() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            if ch.is_whitespace() {
-                break;
-            }
-            let ch_class = classify_char(ch);
-            if ch_class != class {
-                break;
-            }
-            segment.push(ch);
-            pos += ch.len_utf8();
-        }
-
-        if segment.is_empty() {
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            segment.push(ch);
-            pos += ch.len_utf8();
-            while pos < text.len() {
-                let next = text[pos..]
-                    .chars()
-                    .next()
-                    .expect("invariant: pos is inside non-empty UTF-8 text");
-                if next.is_whitespace() || classify_char(next) != SegmentClass::Other {
-                    break;
-                }
-                segment.push(next);
-                pos += next.len_utf8();
-            }
-        }
-
-        pieces.push(segment);
-    }
-
-    pieces
-}
-
 fn bytes_to_unicode() -> Vec<char> {
     let mut bs = Vec::new();
     bs.extend(33u16..=126);
@@ -1187,9 +1072,47 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_pretokenize_preserves_prefix_space() {
-        let pieces = byte_level_pretokenize("hello world");
-        assert_eq!(pieces, vec!["hello", " world"]);
+    fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
+        // Golden pieces from HF `tokenizers.pre_tokenizers.ByteLevel(use_regex=True)`
+        // (the real, unconditional default for every GPT-2-format tokenizer HF
+        // ships — see audit_tokenizer_parity.rs::gpt2_raw_vocab_bytelevel_fallback_parity
+        // for the exact command). `use_regex=True` applies the standard GPT-2
+        // regex `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
+        // \s+(?!\S)|\s+`, which `gpt4_regex_pretokenize` implements.
+        assert_eq!(
+            gpt4_regex_pretokenize("hello\nworld"),
+            vec!["hello", "\n", "world"]
+        );
+        assert_eq!(gpt4_regex_pretokenize("a'st"), vec!["a", "'s", "t"]);
+    }
+
+    #[test]
+    fn test_gpt2_raw_vocab_defaults_to_gpt4_regex_pretokenize() {
+        // Regression for #330: `from_vocab_and_merges` (what `from_files` and
+        // `load_tokenizer`'s file-based-probing fallback use for a raw
+        // GPT-2-format vocab.json + merges.txt with no tokenizer.json to read
+        // pre_tokenizer metadata from) must default to `Gpt4Regex`
+        // pretokenization, not the naive hand-rolled fallback that used to
+        // exist — see `test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true`
+        // above for the HF-verified golden pieces this default now produces.
+        //
+        // This is a merge-boundary discriminator: a rule merging 's'+'t' into
+        // "st" can only fire if both chars land in the SAME pretokenize piece
+        // (BPE merges never span piece boundaries). Under the correct regex
+        // split, "a'st" -> ["a", "'s", "t"]: 's' and 't' are in DIFFERENT
+        // pieces ("'s" and "t"), so the merge cannot fire and every char
+        // resolves to its own id. Under the buggy naive-fallback split,
+        // "a'st" -> ["a", "'st"]: 's' and 't' are adjacent within the same
+        // piece, so the merge DOES fire, producing a 3-id sequence instead of
+        // 4. This mirrors the real gpt2 vocab divergence verified empirically
+        // in audit_tokenizer_parity.rs (pre-fix: [64, 6, 301], HF: [64, 338, 83]).
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("'", 1), ("s", 2), ("t", 3), ("st", 4)] {
+            vocab.insert(s.to_string(), i);
+        }
+        let merges = vec![("s".to_string(), "t".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("a'st"), vec![0, 1, 2, 3]);
     }
 
     #[test]
