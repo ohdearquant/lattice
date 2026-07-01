@@ -245,6 +245,51 @@ pub struct MtpMoeWeights {
     pub shared_expert_gate: Vec<f32>,   // [hidden_size]
 }
 
+/// Reject a structurally invalid `MtpConfig` before `load_from_source` loads any
+/// tensor. `MtpVerifier::new` validates these same fields, but only after the
+/// full weight load has already paid its I/O cost; this runs first so a
+/// malformed config fails fast, and is unit-testable without constructing
+/// weights, embeddings, or an lm_head.
+///
+/// Rejects:
+/// - `num_key_value_heads == 0`: `forward_one` computes
+///   `groups = num_attention_heads / num_key_value_heads` and divides by it.
+/// - `num_attention_heads % num_key_value_heads != 0`: `forward_one` then computes
+///   `kvh = qh / groups` per query head; a non-multiple ratio leaves `groups == 0`
+///   whenever `num_attention_heads < num_key_value_heads` (dividing by zero) and
+///   otherwise silently maps query heads to the wrong KV group.
+/// - `partial_rotary_factor` outside `(0.0, 1.0]` or non-finite: `rope_dim =
+///   head_dim * partial_rotary_factor` sizes `mtp_apply_partial_rope`, which
+///   indexes `head_vec[half + i]`; `rope_dim > head_dim` (factor > 1.0) reads out
+///   of the per-head slice, and `rope_dim <= 0` (factor <= 0.0 or NaN) collapses
+///   the rotary split.
+fn validate_config(config: &MtpConfig) -> Result<(), crate::error::InferenceError> {
+    use crate::error::InferenceError;
+
+    if config.num_key_value_heads == 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "MtpConfig num_key_value_heads must be > 0, got {}",
+            config.num_key_value_heads
+        )));
+    }
+    if config.num_attention_heads % config.num_key_value_heads != 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "MtpConfig num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            config.num_attention_heads, config.num_key_value_heads
+        )));
+    }
+    if !config.partial_rotary_factor.is_finite()
+        || config.partial_rotary_factor <= 0.0
+        || config.partial_rotary_factor > 1.0
+    {
+        return Err(InferenceError::InvalidInput(format!(
+            "MtpConfig partial_rotary_factor must be in (0.0, 1.0], got {}",
+            config.partial_rotary_factor
+        )));
+    }
+    Ok(())
+}
+
 impl MtpWeights {
     /// Load all MTP weights from a tensor source, validating shapes.
     pub fn load_from_source<S: crate::weights::TensorSource>(
@@ -252,6 +297,8 @@ impl MtpWeights {
         cfg: &MtpConfig,
     ) -> Result<Self, crate::error::InferenceError> {
         use crate::error::InferenceError;
+
+        validate_config(cfg)?;
 
         let hidden = cfg.hidden_size;
         let q_proj_rows = 2 * cfg.num_attention_heads * cfg.head_dim;
@@ -4127,6 +4174,104 @@ mod tests {
             format!("{err:?}").contains("overflows usize"),
             "expected dimension-product overflow rejection, got: {err:?}"
         );
+    }
+
+    // -- validate_config: load_from_source config guard (#329 F2/F3) --
+
+    /// `validate_config` rejects `num_key_value_heads == 0` before `load_from_source`
+    /// loads any tensor. Zero kv heads would divide-by-zero at
+    /// `groups = num_attention_heads / num_key_value_heads` in `forward_one` (#329 F2).
+    #[test]
+    fn validate_config_rejects_zero_kv_heads() {
+        let cfg = MtpConfig {
+            num_key_value_heads: 0,
+            ..MtpConfig::default()
+        };
+        match validate_config(&cfg) {
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("num_key_value_heads"),
+                    "error message should mention num_key_value_heads, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for num_key_value_heads == 0, got {other:?}"),
+        }
+    }
+
+    /// `validate_config` rejects a head count that is not a multiple of the kv head
+    /// count. `num_attention_heads=3, num_key_value_heads=2` gives `groups = 3/2 = 1`,
+    /// and `forward_one` would map query head 2 to `kvh = 2/1 = 2`, one past the last
+    /// kv head — silent misrouting rather than a panic, but still a geometry the
+    /// verifier cannot run correctly (#329 F2).
+    #[test]
+    fn validate_config_rejects_non_divisible_heads() {
+        let cfg = MtpConfig {
+            num_attention_heads: 3,
+            num_key_value_heads: 2,
+            ..MtpConfig::default()
+        };
+        match validate_config(&cfg) {
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("divisible"),
+                    "error message should mention divisible, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for non-divisible head counts, got {other:?}"),
+        }
+    }
+
+    /// `validate_config` rejects `partial_rotary_factor > 1.0`. A factor of 2.0 would
+    /// make `rope_dim = head_dim * 2.0 > head_dim`, and `mtp_apply_partial_rope`
+    /// indexes `head_vec[half + i]` past the end of the per-head slice (#329 F3).
+    #[test]
+    fn validate_config_rejects_partial_rotary_factor_above_one() {
+        let cfg = MtpConfig {
+            partial_rotary_factor: 2.0,
+            ..MtpConfig::default()
+        };
+        match validate_config(&cfg) {
+            Err(crate::InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("partial_rotary_factor"),
+                    "error message should mention partial_rotary_factor, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput for partial_rotary_factor > 1.0, got {other:?}"),
+        }
+    }
+
+    /// `validate_config` also rejects `partial_rotary_factor <= 0.0` and NaN, not just
+    /// the upper bound: `rope_dim = head_dim * factor` must stay positive and finite
+    /// for `mtp_apply_partial_rope`'s `half = rope_dim / 2` split to be meaningful
+    /// (#329 F3).
+    #[test]
+    fn validate_config_rejects_nonpositive_or_nan_partial_rotary_factor() {
+        for bad in [0.0f32, -1.0, f32::NAN] {
+            let cfg = MtpConfig {
+                partial_rotary_factor: bad,
+                ..MtpConfig::default()
+            };
+            match validate_config(&cfg) {
+                Err(crate::InferenceError::InvalidInput(_)) => {}
+                other => {
+                    panic!("expected InvalidInput for partial_rotary_factor = {bad}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// `validate_config` accepts a realistic Qwen3.5-shaped GQA config (8 kv heads,
+    /// partial_rotary_factor 0.25) — the guard must stay parity-neutral for real models.
+    #[test]
+    fn validate_config_accepts_qwen35_like_config() {
+        let cfg = MtpConfig {
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            partial_rotary_factor: 0.25,
+            ..MtpConfig::default()
+        };
+        assert!(validate_config(&cfg).is_ok());
     }
 
     #[test]
