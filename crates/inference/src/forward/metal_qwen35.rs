@@ -28,6 +28,11 @@
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
+    use super::GdnStateTrafficScope;
+    #[cfg(feature = "gdn-state-counters")]
+    use super::{
+        GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
+    };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     #[cfg(debug_assertions)]
@@ -4201,6 +4206,10 @@ kernel void gdn_chunk_norm_silu_c32(
         #[allow(dead_code)]
         // read by tests; written by set_position for future concurrent API
         pub(crate) position: usize,
+        /// GDN state-traffic byte counters (issue #422). `None` unless both the
+        /// `gdn-state-counters` feature and `LATTICE_GDN_STATE_COUNTERS` are set.
+        #[cfg(feature = "gdn-state-counters")]
+        pub(crate) gdn_state_traffic: Option<GdnStateTrafficCounters>,
     }
 
     impl InferenceSession {
@@ -5800,6 +5809,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 gdn_checkpoints,
                 last_pre_final_hidden: vec![0.0f32; hidden],
                 position: 0,
+                #[cfg(feature = "gdn-state-counters")]
+                gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                    Some(GdnStateTrafficCounters::new(
+                        GdnStateTrafficShape::try_from_config(cfg).map_err(|e| e.to_string())?,
+                    ))
+                } else {
+                    None
+                },
             })
         }
     }
@@ -5856,6 +5873,59 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Returns `true` if MTP weights were loaded and the session has an active MTP state.
         pub fn has_mtp(&self) -> bool {
             self.session.mtp.is_some()
+        }
+
+        /// Resets GDN state-traffic counters to zero without changing the shape.
+        ///
+        /// No-op when counters are inactive (feature off, or
+        /// `LATTICE_GDN_STATE_COUNTERS` unset at construction time).
+        #[cfg(feature = "gdn-state-counters")]
+        pub fn reset_gdn_state_traffic(&mut self) {
+            if let Some(ref mut counters) = self.session.gdn_state_traffic {
+                counters.reset();
+            }
+        }
+
+        /// Returns the current GDN state-traffic report without resetting it.
+        ///
+        /// Returns `None` when counters are inactive.
+        #[cfg(feature = "gdn-state-counters")]
+        pub fn gdn_state_traffic_report(&self) -> Option<GdnStateTrafficReport> {
+            self.session
+                .gdn_state_traffic
+                .as_ref()
+                .map(GdnStateTrafficCounters::report)
+        }
+
+        /// Returns the current GDN state-traffic report and resets the counters,
+        /// so callers can print one row per decode step without subtracting totals.
+        ///
+        /// Returns `None` when counters are inactive.
+        #[cfg(feature = "gdn-state-counters")]
+        pub fn take_gdn_state_traffic_report(&mut self) -> Option<GdnStateTrafficReport> {
+            let report = self
+                .session
+                .gdn_state_traffic
+                .as_ref()
+                .map(GdnStateTrafficCounters::report);
+            if let Some(ref mut counters) = self.session.gdn_state_traffic {
+                counters.reset();
+            }
+            report
+        }
+
+        #[cfg(feature = "gdn-state-counters")]
+        fn record_gdn_layer_access(&mut self, scope: GdnStateTrafficScope, layer_count: usize) {
+            if let Some(ref mut counters) = self.session.gdn_state_traffic {
+                counters.record_layer_access(scope, layer_count);
+            }
+        }
+
+        #[cfg(feature = "gdn-state-counters")]
+        fn record_gdn_copy(&mut self, scope: GdnStateTrafficScope, kind: GdnStateCopyKind) {
+            if let Some(ref mut counters) = self.session.gdn_state_traffic {
+                counters.record_copy(scope, kind);
+            }
         }
 
         /// Returns the expected `(d_in, d_out)` for a LoRA projection given the layer type.
@@ -6240,12 +6310,8 @@ kernel void gdn_chunk_norm_silu_c32(
         fn checkpoint_gdn_to_slot(
             &mut self,
             slot: usize,
+            _traffic_scope: GdnStateTrafficScope,
         ) -> Result<(), crate::error::InferenceError> {
-            if self.session.gdn_checkpoints.is_none() {
-                return Err(crate::error::InferenceError::Inference(
-                    "GDN checkpoint pool not initialized".into(),
-                ));
-            }
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
             let conv_sizes: Vec<u64> = self
                 .session
@@ -6259,20 +6325,28 @@ kernel void gdn_chunk_norm_silu_c32(
                 .iter()
                 .map(|b| b.length())
                 .collect();
+            // Resolve the checkpoint pool BEFORE allocating Metal command objects
+            // so an uninitialized pool returns Err without leaking an un-ended
+            // blit encoder or uncommitted command buffer on the error path.
+            let pool = self.session.gdn_checkpoints.as_ref().ok_or_else(|| {
+                crate::error::InferenceError::Inference(
+                    "GDN checkpoint pool not initialized".into(),
+                )
+            })?;
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
                 enc.copy_from_buffer(
                     &self.session.gdn_gpu_conv_bufs[i],
                     0,
-                    &self.session.gdn_checkpoints.as_ref().unwrap().conv_slots[slot][i],
+                    &pool.conv_slots[slot][i],
                     0,
                     conv_sizes[i],
                 );
                 enc.copy_from_buffer(
                     &self.session.gdn_gpu_s_matrices[i],
                     0,
-                    &self.session.gdn_checkpoints.as_ref().unwrap().s_slots[slot][i],
+                    &pool.s_slots[slot][i],
                     0,
                     s_sizes[i],
                 );
@@ -6280,11 +6354,17 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            #[cfg(feature = "gdn-state-counters")]
+            self.record_gdn_copy(_traffic_scope, GdnStateCopyKind::Snapshot);
             Ok(())
         }
 
         /// Restore live GDN conv/S buffers from the given checkpoint slot (blocking GPU blit).
-        fn restore_gdn_slot_blocking(&mut self, slot: usize) {
+        fn restore_gdn_slot_blocking(
+            &mut self,
+            slot: usize,
+            _traffic_scope: GdnStateTrafficScope,
+        ) -> Result<(), crate::error::InferenceError> {
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
             let conv_sizes: Vec<u64> = self
                 .session
@@ -6298,18 +6378,26 @@ kernel void gdn_chunk_norm_silu_c32(
                 .iter()
                 .map(|b| b.length())
                 .collect();
+            // Resolve the checkpoint pool BEFORE allocating Metal command objects
+            // so an uninitialized pool returns Err without leaking an un-ended
+            // blit encoder or uncommitted command buffer on the error path.
+            let pool = self.session.gdn_checkpoints.as_ref().ok_or_else(|| {
+                crate::error::InferenceError::Inference(
+                    "GDN checkpoint pool not initialized".into(),
+                )
+            })?;
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
                 enc.copy_from_buffer(
-                    &self.session.gdn_checkpoints.as_ref().unwrap().conv_slots[slot][i],
+                    &pool.conv_slots[slot][i],
                     0,
                     &self.session.gdn_gpu_conv_bufs[i],
                     0,
                     conv_sizes[i],
                 );
                 enc.copy_from_buffer(
-                    &self.session.gdn_checkpoints.as_ref().unwrap().s_slots[slot][i],
+                    &pool.s_slots[slot][i],
                     0,
                     &self.session.gdn_gpu_s_matrices[i],
                     0,
@@ -6319,6 +6407,9 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            #[cfg(feature = "gdn-state-counters")]
+            self.record_gdn_copy(_traffic_scope, GdnStateCopyKind::Restore);
+            Ok(())
         }
 
         /// Roll back KV cache and GDN state to `seq_len` after a speculative rejection.
@@ -6359,16 +6450,24 @@ kernel void gdn_chunk_norm_silu_c32(
             if let Some((repair_token, repair_pos)) = batch_repair {
                 // Batch verifier path: restore GDN base, then replay the first verify token so
                 // the GDN state lands at S_{repair_pos} (= state after pending_token was processed).
-                self.restore_gdn_slot_blocking(0);
+                self.restore_gdn_slot_blocking(0, GdnStateTrafficScope::MtpVerify)?;
                 // Set seq_len so forward_step_inner writes KV to the correct slot.
                 self.session.kv_cache.seq_len = repair_pos;
                 // Repair step: reprocesses pending_token, advancing GDN and capturing hidden.
+                #[cfg(feature = "gdn-state-counters")]
+                let repair_out = self.forward_step_inner_with_traffic_scope(
+                    repair_token,
+                    repair_pos,
+                    true,
+                    GdnStateTrafficScope::MtpVerify,
+                );
+                #[cfg(not(feature = "gdn-state-counters"))]
                 let repair_out = self.forward_step_inner(repair_token, repair_pos, true);
                 self.session.last_pre_final_hidden = repair_out.pre_final_hidden;
                 self.session.kv_cache.seq_len = seq_len;
             } else {
                 // Sequential verifier path: slot-based GDN restore.
-                self.restore_gdn_slot_blocking(slot);
+                self.restore_gdn_slot_blocking(slot, GdnStateTrafficScope::MtpVerify)?;
                 self.session.kv_cache.seq_len = seq_len;
             }
 
@@ -6400,12 +6499,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 p.active_base_seq_len = Some(start_pos);
                 p.mtp_base_seq_len = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
             }
-            self.checkpoint_gdn_to_slot(0)?;
+            self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
             let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
             let mut final_hidden = Vec::new();
             for (i, &token) in tokens.iter().enumerate() {
+                #[cfg(feature = "gdn-state-counters")]
+                let out = self.forward_step_inner_with_traffic_scope(
+                    token,
+                    start_pos + i,
+                    true,
+                    GdnStateTrafficScope::MtpVerify,
+                );
+                #[cfg(not(feature = "gdn-state-counters"))]
                 let out = self.forward_step_inner(token, start_pos + i, true);
-                self.checkpoint_gdn_to_slot(i + 1)?;
+                self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
                 final_hidden = out.pre_final_hidden;
             }
@@ -6469,7 +6576,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     None
                 };
             }
-            self.checkpoint_gdn_to_slot(0)?;
+            self.checkpoint_gdn_to_slot(0, GdnStateTrafficScope::MtpVerify)?;
 
             // Batch embedding: f16 → f32 for all K tokens into hidden[0..K*hidden].
             // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
@@ -6493,6 +6600,8 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut active_layer_idx = 0usize;
             let mut linear_idx = 0usize;
             let mut full_idx = 0usize;
+            #[cfg(feature = "gdn-state-counters")]
+            let mut gdn_verify_layer_dispatches = 0usize;
 
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
@@ -6678,6 +6787,10 @@ kernel void gdn_chunk_norm_silu_c32(
                                 MTLSize::new(num_vh as u64, 1, 1),
                                 MTLSize::new(32, 4, 1),
                             );
+                        }
+                        #[cfg(feature = "gdn-state-counters")]
+                        {
+                            gdn_verify_layer_dispatches += 1;
                         }
                     }
 
@@ -7098,6 +7211,11 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
+            #[cfg(feature = "gdn-state-counters")]
+            self.record_gdn_layer_access(
+                GdnStateTrafficScope::MtpVerify,
+                gdn_verify_layer_dispatches,
+            );
 
             // Advance KV cache position.
             self.session.kv_cache.seq_len = start_pos + n;
@@ -7603,7 +7721,28 @@ kernel void gdn_chunk_norm_silu_c32(
             position: usize,
             capture_hidden: bool,
         ) -> MetalStepOutput {
-            self.forward_step_inner_impl(token_id, position, capture_hidden, false)
+            self.forward_step_inner_impl(
+                token_id,
+                position,
+                capture_hidden,
+                false,
+                GdnStateTrafficScope::Decode,
+            )
+        }
+
+        /// Same as `forward_step_inner`, but attributes GDN state traffic to the
+        /// given scope instead of the `Decode` default. Used by the MTP verify and
+        /// speculative-repair paths so their state traffic is not misattributed to
+        /// (and does not double count against) normal decode.
+        #[cfg(feature = "gdn-state-counters")]
+        fn forward_step_inner_with_traffic_scope(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            capture_hidden: bool,
+            scope: GdnStateTrafficScope,
+        ) -> MetalStepOutput {
+            self.forward_step_inner_impl(token_id, position, capture_hidden, false, scope)
         }
 
         fn forward_step_inner_impl(
@@ -7612,6 +7751,7 @@ kernel void gdn_chunk_norm_silu_c32(
             position: usize,
             capture_hidden: bool,
             skip_logits_readback: bool,
+            _traffic_scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -7683,7 +7823,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     let layer_enc = layer_cmd.new_compute_command_encoder();
                     if is_linear {
                         // Mixer-only (no MLP): measures pure GDN recurrence cost.
-                        gdn_gpu_dispatches += self.encode_gdn_layer(
+                        let gdn_dispatches_this_layer = self.encode_gdn_layer(
                             layer_enc,
                             compact_idx,
                             linear_idx,
@@ -7694,6 +7834,9 @@ kernel void gdn_chunk_norm_silu_c32(
                             profiling,
                             false,
                         );
+                        gdn_gpu_dispatches += gdn_dispatches_this_layer;
+                        #[cfg(feature = "gdn-state-counters")]
+                        self.record_gdn_layer_access(_traffic_scope, gdn_dispatches_this_layer);
                         linear_idx += 1;
                         layer_enc.end_encoding();
                         let t_mixer = std::time::Instant::now();
@@ -7893,7 +8036,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     MetalLayerAttnWeights::Linear(_)
                 );
                 if is_linear {
-                    gdn_gpu_dispatches += self.encode_gdn_layer(
+                    let gdn_dispatches_this_layer = self.encode_gdn_layer(
                         enc,
                         compact_idx,
                         linear_idx,
@@ -7904,6 +8047,9 @@ kernel void gdn_chunk_norm_silu_c32(
                         profiling,
                         true,
                     );
+                    gdn_gpu_dispatches += gdn_dispatches_this_layer;
+                    #[cfg(feature = "gdn-state-counters")]
+                    self.record_gdn_layer_access(_traffic_scope, gdn_dispatches_this_layer);
                     linear_idx += 1;
                 } else {
                     self.encode_gqa_layer(
@@ -8032,7 +8178,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// directly for the argmax token ID, avoiding 993KB allocation+copy.
         fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
             let cfg = self.engine.config.clone();
-            self.forward_step_inner_impl(token_id, position, false, true);
+            self.forward_step_inner_impl(
+                token_id,
+                position,
+                false,
+                true,
+                GdnStateTrafficScope::Decode,
+            );
 
             // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
             // logits buffer is StorageModeShared — CPU can read it directly.
@@ -8108,6 +8260,8 @@ kernel void gdn_chunk_norm_silu_c32(
                         false,
                         true,
                     );
+                    #[cfg(feature = "gdn-state-counters")]
+                    self.record_gdn_layer_access(GdnStateTrafficScope::Decode, 1);
                     linear_idx += 1;
                 }
                 // GQA layers: residual stream passes through without modification.
@@ -9403,7 +9557,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 // the slot-based rollback (which expects verify_tokens_batched's slots
                 // 1..=K to be full-model forwards from this pre-draft base) would be
                 // computed against a contaminated reference.
-                if self.checkpoint_gdn_to_slot(0).is_err() {
+                if self
+                    .checkpoint_gdn_to_slot(0, GdnStateTrafficScope::Decode)
+                    .is_err()
+                {
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
@@ -9457,10 +9614,18 @@ kernel void gdn_chunk_norm_silu_c32(
                 // on top of the GDN-only draft mutations, producing slots that do NOT
                 // match the canonical "pre-draft + N full-model tokens" semantics that
                 // slot-based rollback relies on.
-                self.restore_gdn_slot_blocking(0);
+                let restore_ok = self
+                    .restore_gdn_slot_blocking(0, GdnStateTrafficScope::Decode)
+                    .is_ok();
 
                 let t_verify = std::time::Instant::now();
-                let Ok(verify_out) = self.verify_tokens_batched(&verify_input, pos) else {
+                let Ok(verify_out) = (if restore_ok {
+                    self.verify_tokens_batched(&verify_input, pos)
+                } else {
+                    Err(crate::error::InferenceError::Inference(
+                        "GDN pre-verify restore failed".into(),
+                    ))
+                }) else {
                     // Verification failed: accept pending, use draft as next pending.
                     self.session.kv_cache.seq_len = pos + 1;
                     generated_ids.push(pending_token);
@@ -14889,6 +15054,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     gdn_checkpoints,
                     last_pre_final_hidden: vec![0.0f32; hidden],
                     position: 0,
+                    #[cfg(feature = "gdn-state-counters")]
+                    gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                        Some(GdnStateTrafficCounters::new(
+                            GdnStateTrafficShape::try_from_config(cfg)
+                                .map_err(|e| e.to_string())?,
+                        ))
+                    } else {
+                        None
+                    },
                 },
                 lora: None,
                 use_gdn_chunked: !matches!(
@@ -20947,6 +21121,298 @@ pub fn mtp_greedy_round(
 }
 
 // ---------------------------------------------------------------------------
+// GDN state-traffic counters (issue #422): byte-level accounting of GDN
+// recurrent-state read/write/copy traffic per decode step and per MTP
+// verify, the measure-first prerequisite for ADR-058.
+//
+// The scope/copy-kind marker enums stay unconditional (zero-cost, no
+// dependencies) so `forward_step_inner_impl` can carry an explicit scope
+// parameter through the shared hot loop without a second, duplicated
+// implementation gated on the feature. All byte-accounting types and their
+// arithmetic are gated behind `gdn-state-counters` and live at module level
+// (no macOS/metal-gpu cfg) so the formulas are unit-testable on every
+// platform. Default builds compile out every accounting hook and stay
+// byte-identical to the pre-#422 decode path (ADR-422-1).
+// ---------------------------------------------------------------------------
+
+/// Which logical traffic bucket a GDN state access belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnStateTrafficScope {
+    /// Normal single-token decode (`forward_step`, self-spec draft/fallback).
+    Decode,
+    /// MTP target verification, including checkpoint/restore traffic.
+    MtpVerify,
+}
+
+/// Which direction a GDN state checkpoint-pool copy moved data.
+#[cfg(feature = "gdn-state-counters")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnStateCopyKind {
+    /// Live GDN buffers copied into a checkpoint slot.
+    Snapshot,
+    /// A checkpoint slot copied back into the live GDN buffers.
+    Restore,
+}
+
+/// Per-layer and aggregate GDN recurrent-state byte shape, derived from config.
+///
+/// Mirrors the buffer sizes `new_session_inner` allocates: each
+/// `gdn_gpu_conv_bufs[i]` holds `linear_qkv_dim * (linear_conv_kernel_dim - 1)`
+/// f32 values, each `gdn_gpu_s_matrices[i]` holds
+/// `linear_num_value_heads * linear_value_head_dim * linear_key_head_dim` f32 values.
+#[cfg(feature = "gdn-state-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnStateTrafficShape {
+    pub active_gdn_layers: usize,
+    pub allocated_gdn_layers: usize,
+    pub conv_bytes_per_layer: u64,
+    pub s_bytes_per_layer: u64,
+    pub per_layer_state_bytes: u64,
+    pub active_state_bytes: u64,
+    pub allocated_state_bytes: u64,
+}
+
+#[cfg(feature = "gdn-state-counters")]
+impl GdnStateTrafficShape {
+    /// Derives the GDN state byte shape from a resolved `Qwen35Config`.
+    pub fn try_from_config(
+        cfg: &crate::model::qwen35_config::Qwen35Config,
+    ) -> Result<Self, crate::error::InferenceError> {
+        fn overflow(what: &str) -> crate::error::InferenceError {
+            crate::error::InferenceError::Inference(format!("GDN state shape: {what} overflow"))
+        }
+
+        let active_gdn_layers = cfg.num_active_linear_attention_layers();
+        let allocated_gdn_layers = cfg.num_linear_attention_layers();
+
+        let conv_floats = cfg
+            .linear_qkv_dim()
+            .checked_mul(cfg.linear_conv_kernel_dim.saturating_sub(1))
+            .ok_or_else(|| overflow("conv_floats"))?;
+        let s_floats = cfg
+            .linear_num_value_heads()
+            .checked_mul(cfg.linear_value_head_dim)
+            .and_then(|v| v.checked_mul(cfg.linear_key_head_dim))
+            .ok_or_else(|| overflow("s_floats"))?;
+
+        let conv_bytes_per_layer = (conv_floats as u64)
+            .checked_mul(4)
+            .ok_or_else(|| overflow("conv_bytes_per_layer"))?;
+        let s_bytes_per_layer = (s_floats as u64)
+            .checked_mul(4)
+            .ok_or_else(|| overflow("s_bytes_per_layer"))?;
+        let per_layer_state_bytes = conv_bytes_per_layer
+            .checked_add(s_bytes_per_layer)
+            .ok_or_else(|| overflow("per_layer_state_bytes"))?;
+        let active_state_bytes = per_layer_state_bytes
+            .checked_mul(active_gdn_layers as u64)
+            .ok_or_else(|| overflow("active_state_bytes"))?;
+        let allocated_state_bytes = per_layer_state_bytes
+            .checked_mul(allocated_gdn_layers as u64)
+            .ok_or_else(|| overflow("allocated_state_bytes"))?;
+
+        Ok(Self {
+            active_gdn_layers,
+            allocated_gdn_layers,
+            conv_bytes_per_layer,
+            s_bytes_per_layer,
+            per_layer_state_bytes,
+            active_state_bytes,
+            allocated_state_bytes,
+        })
+    }
+}
+
+/// Read/write/copy byte totals for one traffic scope (decode or MTP verify).
+#[cfg(feature = "gdn-state-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnStateTrafficBucket {
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+    pub snapshot_count: u64,
+    pub restore_count: u64,
+}
+
+#[cfg(feature = "gdn-state-counters")]
+impl GdnStateTrafficBucket {
+    pub fn copy_count(&self) -> u64 {
+        self.snapshot_count.saturating_add(self.restore_count)
+    }
+}
+
+/// Full GDN state-traffic report for one session snapshot window.
+#[cfg(feature = "gdn-state-counters")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GdnStateTrafficReport {
+    pub shape: GdnStateTrafficShape,
+    pub decode: GdnStateTrafficBucket,
+    pub mtp_verify: GdnStateTrafficBucket,
+}
+
+#[cfg(feature = "gdn-state-counters")]
+impl GdnStateTrafficReport {
+    pub fn reset(&mut self) {
+        self.decode = GdnStateTrafficBucket::default();
+        self.mtp_verify = GdnStateTrafficBucket::default();
+    }
+}
+
+/// Mutable per-session GDN state-traffic accumulator.
+///
+/// Not `Clone`-cheap by design intent (it is session-owned mutable state);
+/// derives `Clone` only because `report()` snapshots are taken by value.
+///
+/// Only constructed in production from `mod inner` (macOS + `metal-gpu`); the
+/// extra `any(test, ...)` arm compiles it for the module-level unit tests on
+/// every platform without making it dead code in a `gdn-state-counters`-only,
+/// non-metal-gpu lib build (no runtime behavior implied by either arm).
+#[cfg(feature = "gdn-state-counters")]
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GdnStateTrafficCounters {
+    report: GdnStateTrafficReport,
+}
+
+#[cfg(feature = "gdn-state-counters")]
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+impl GdnStateTrafficCounters {
+    pub(crate) fn new(shape: GdnStateTrafficShape) -> Self {
+        Self {
+            report: GdnStateTrafficReport {
+                shape,
+                decode: GdnStateTrafficBucket::default(),
+                mtp_verify: GdnStateTrafficBucket::default(),
+            },
+        }
+    }
+
+    pub(crate) fn report(&self) -> GdnStateTrafficReport {
+        self.report
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.report.reset();
+    }
+
+    fn bucket_mut(&mut self, scope: GdnStateTrafficScope) -> &mut GdnStateTrafficBucket {
+        match scope {
+            GdnStateTrafficScope::Decode => &mut self.report.decode,
+            GdnStateTrafficScope::MtpVerify => &mut self.report.mtp_verify,
+        }
+    }
+
+    /// Records one logical full-state read + write for `layer_count` GDN layer
+    /// dispatches (one `encode_gdn_layer` call = one active layer accessed).
+    pub(crate) fn record_layer_access(&mut self, scope: GdnStateTrafficScope, layer_count: usize) {
+        let bytes = self
+            .report
+            .shape
+            .per_layer_state_bytes
+            .saturating_mul(layer_count as u64);
+        let bucket = self.bucket_mut(scope);
+        bucket.read_bytes = bucket.read_bytes.saturating_add(bytes);
+        bucket.write_bytes = bucket.write_bytes.saturating_add(bytes);
+    }
+
+    /// Records one checkpoint-pool copy: a full logical read of the source
+    /// side plus a full logical write of the destination side, sized to the
+    /// *allocated* (not just active) GDN layer count, since the checkpoint
+    /// blit copies every allocated layer's buffers regardless of pruning.
+    pub(crate) fn record_copy(&mut self, scope: GdnStateTrafficScope, kind: GdnStateCopyKind) {
+        let bytes = self.report.shape.allocated_state_bytes;
+        let bucket = self.bucket_mut(scope);
+        bucket.read_bytes = bucket.read_bytes.saturating_add(bytes);
+        bucket.write_bytes = bucket.write_bytes.saturating_add(bytes);
+        match kind {
+            GdnStateCopyKind::Snapshot => {
+                bucket.snapshot_count = bucket.snapshot_count.saturating_add(1)
+            }
+            GdnStateCopyKind::Restore => {
+                bucket.restore_count = bucket.restore_count.saturating_add(1)
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "gdn-state-counters"))]
+mod gdn_state_traffic_tests {
+    use super::*;
+    use crate::model::qwen35_config::Qwen35Config;
+
+    /// Mutation sensitivity: this test pins the exact byte formula for the
+    /// Qwen3.5-0.8B preset. Changing `conv_bytes_per_layer`, `s_bytes_per_layer`,
+    /// or the layer-count formulas in `try_from_config` fails this assertion.
+    #[test]
+    fn gdn_state_traffic_shape_qwen35_08b_matches_formula() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let shape = GdnStateTrafficShape::try_from_config(&cfg).expect("shape from 0.8B config");
+
+        assert_eq!(shape.conv_bytes_per_layer, 73_728);
+        assert_eq!(shape.s_bytes_per_layer, 1_048_576);
+        assert_eq!(shape.active_state_bytes, 20_201_472);
+    }
+
+    /// Pruning an active layer must shrink `active_gdn_layers` while leaving
+    /// `allocated_gdn_layers` (and therefore checkpoint-copy sizing) unchanged.
+    #[test]
+    fn gdn_state_traffic_shape_pruned_active_layers_keeps_allocated_copy_size() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        let pruned_idx = (0..cfg.num_hidden_layers)
+            .find(|&i| !cfg.is_full_attention(i))
+            .expect("0.8B preset has at least one linear-attention layer");
+        cfg.layer_mask[pruned_idx] = false;
+
+        let shape = GdnStateTrafficShape::try_from_config(&cfg).expect("shape from pruned config");
+
+        assert_eq!(shape.active_gdn_layers, 17);
+        assert_eq!(shape.allocated_gdn_layers, 18);
+        assert_ne!(shape.active_state_bytes, shape.allocated_state_bytes);
+    }
+
+    /// Mutation sensitivity: removing any of the decode layer-access, MTP
+    /// layer-access, snapshot, or restore increments changes an asserted
+    /// value. Uses `record_layer_access` (the production accounting fn
+    /// called from all decode/MTP-verify dispatch sites) with
+    /// `active_gdn_layers` so byte totals equal one full active-state pass.
+    #[test]
+    fn gdn_state_traffic_counts_decode_and_rejected_mtp_verify() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let shape = GdnStateTrafficShape::try_from_config(&cfg).expect("shape from 0.8B config");
+        let active_layers = shape.active_gdn_layers;
+        let mut counters = GdnStateTrafficCounters::new(shape);
+
+        counters.record_layer_access(GdnStateTrafficScope::Decode, active_layers);
+
+        counters.record_copy(GdnStateTrafficScope::MtpVerify, GdnStateCopyKind::Snapshot);
+        for _ in 0..2 {
+            counters.record_layer_access(GdnStateTrafficScope::MtpVerify, active_layers);
+            counters.record_copy(GdnStateTrafficScope::MtpVerify, GdnStateCopyKind::Snapshot);
+        }
+        counters.record_copy(GdnStateTrafficScope::MtpVerify, GdnStateCopyKind::Restore);
+
+        let report = counters.report();
+        assert_eq!(report.decode.read_bytes, 20_201_472);
+        assert_eq!(report.decode.write_bytes, 20_201_472);
+        assert_eq!(report.decode.copy_count(), 0);
+        assert_eq!(report.mtp_verify.snapshot_count, 3);
+        assert_eq!(report.mtp_verify.restore_count, 1);
+        assert_eq!(report.mtp_verify.read_bytes, 121_208_832);
+        assert_eq!(report.mtp_verify.write_bytes, 121_208_832);
+
+        // reset() must zero every bucket field while preserving shape — this is
+        // the accumulation-window boundary take_gdn_state_traffic_report relies
+        // on after handing back a report.
+        counters.reset();
+        let cleared = counters.report();
+        assert_eq!(cleared.decode.read_bytes, 0);
+        assert_eq!(cleared.decode.write_bytes, 0);
+        assert_eq!(cleared.mtp_verify.read_bytes, 0);
+        assert_eq!(cleared.mtp_verify.write_bytes, 0);
+        assert_eq!(cleared.mtp_verify.snapshot_count, 0);
+        assert_eq!(cleared.mtp_verify.restore_count, 0);
+        assert_eq!(cleared.shape, report.shape);
+    }
+}
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
