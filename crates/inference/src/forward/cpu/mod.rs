@@ -10,6 +10,7 @@ mod softmax;
 mod tiled;
 mod tiled_avx2;
 mod tiled_neon;
+mod w3;
 
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
 pub use norm::layer_norm;
 pub(crate) use simd::simd_config;
 pub use softmax::softmax_attention;
+pub use w3::gemv_w3_decode;
 
 #[cfg(test)]
 pub use activation::{add_bias_gelu_scalar, fast_tanh, gelu_scalar};

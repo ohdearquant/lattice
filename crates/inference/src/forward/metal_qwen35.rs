@@ -3515,6 +3515,128 @@ kernel void gdn_chunk_norm_silu_c32(
         Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
     }
 
+    /// Zero-copy-mmap-backed handle to a W3-packed dense MLP weight matrix on GPU
+    /// (issue #420). Mirrors [`Q4WeightBuf`]; additionally caches `n`/`k` so
+    /// dispatch call sites can validate GEMV dimensions without re-parsing the
+    /// `.w3` header.
+    pub(crate) struct W3WeightBuf {
+        buffer: Buffer,
+        /// Byte offset of the W3 payload (raw `[n][k/32][W3_BLOCK_SIZE]` blocks)
+        /// within `buffer`.
+        payload_offset: u64,
+        // Keeps the mmap alive as long as the Metal buffer needs the memory.
+        _mmap: Option<memmap2::Mmap>,
+        n: usize,
+        k: usize,
+    }
+
+    impl W3WeightBuf {
+        /// Byte length of the mapped `.w3` payload after `payload_offset` —
+        /// used to fail closed on a truncated/corrupt file rather than
+        /// reading past the end of the mapping during a future GEMV
+        /// dispatch.
+        fn payload_len(&self) -> u64 {
+            self.buffer.length().saturating_sub(self.payload_offset)
+        }
+    }
+
+    /// Open `path`, mmap the whole `.w3` file, and register it as a Metal no-copy
+    /// `StorageModeShared` buffer. Validates the header shape against
+    /// `expected_shape` and rejects `k == 0` or `k % W3_GROUP_SIZE != 0` —
+    /// the W3 runtime must fail closed rather than silently load a
+    /// malformed/unsupported tensor (issue #420).
+    ///
+    /// # Safety invariant
+    /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
+    /// modified while the process is running.
+    #[cfg(feature = "metal-gpu")]
+    fn mmap_w3_weight(
+        device: &Device,
+        path: &std::path::Path,
+        label: &str,
+        tensor_name: &str,
+        expected_shape: &[usize],
+    ) -> Result<W3WeightBuf, String> {
+        use crate::weights::w3_weights::{W3_BLOCK_SIZE, W3_GROUP_SIZE, read_w3_header};
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let header = read_w3_header(&file)
+            .map_err(|e| format!("failed to parse W3 header {}: {e}", path.display()))?;
+
+        if header.shape != expected_shape {
+            return Err(format!(
+                "W3 MLP runtime supports only dense MLP gate_proj/up_proj/down_proj weight \
+                 tensors with 2-D shape and K % 32 == 0; unsupported tensor {tensor_name}: \
+                 shape {:?} does not match expected {expected_shape:?} at {}. Refusing to fall \
+                 back to Q4/f16 because W3 measurement must fail closed.",
+                header.shape,
+                path.display()
+            ));
+        }
+        if header.shape.len() != 2 {
+            return Err(format!(
+                "W3 MLP runtime supports only dense MLP gate_proj/up_proj/down_proj weight \
+                 tensors with 2-D shape and K % 32 == 0; unsupported tensor {tensor_name}: \
+                 shape {:?} is not 2-D at {}. Refusing to fall back to Q4/f16 because W3 \
+                 measurement must fail closed.",
+                header.shape,
+                path.display()
+            ));
+        }
+        let n = header.shape[0];
+        let k = header.shape[1];
+        if k == 0 || k % W3_GROUP_SIZE != 0 {
+            return Err(format!(
+                "W3 MLP runtime supports only dense MLP gate_proj/up_proj/down_proj weight \
+                 tensors with 2-D shape and K % 32 == 0; unsupported tensor {tensor_name}: \
+                 k={k} is zero or not a multiple of {W3_GROUP_SIZE} at {}. Refusing to fall \
+                 back to Q4/f16 because W3 measurement must fail closed.",
+                path.display()
+            ));
+        }
+
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        assert!(
+            mmap.len() as u64 >= header.payload_offset,
+            "W3 file truncated: {} bytes < payload_offset {}",
+            mmap.len(),
+            header.payload_offset
+        );
+
+        let buf = device.new_buffer_with_bytes_no_copy(
+            mmap.as_ptr().cast(),
+            mmap.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        buf.set_label(label);
+
+        let w3_buf = W3WeightBuf {
+            buffer: buf,
+            payload_offset: header.payload_offset,
+            _mmap: Some(mmap),
+            n,
+            k,
+        };
+        let blocks_per_row = k / W3_GROUP_SIZE;
+        let expected_payload_bytes = (n * blocks_per_row * W3_BLOCK_SIZE) as u64;
+        if w3_buf.payload_len() < expected_payload_bytes {
+            return Err(format!(
+                "W3 MLP runtime supports only dense MLP gate_proj/up_proj/down_proj weight \
+                 tensors with 2-D shape and K % 32 == 0; unsupported tensor {tensor_name}: \
+                 payload is truncated ({} bytes available, {expected_payload_bytes} bytes \
+                 required for n={n} k={k}) at {}. Refusing to fall back to Q4/f16 because W3 \
+                 measurement must fail closed.",
+                w3_buf.payload_len(),
+                path.display()
+            ));
+        }
+
+        Ok(w3_buf)
+    }
+
     /// Merge two Q4 files into a single concatenated Q4 file and write it to `out_path`.
     ///
     /// Reads only the raw bytes (no deserialization) and prepends a new KHQ4 header
@@ -3681,11 +3803,26 @@ kernel void gdn_chunk_norm_silu_c32(
     }
 
     /// Per-layer FFN weights on GPU: either dense SwiGLU or MoE.
-    enum MetalFfnWeights {
-        Dense {
+    /// Dense-FFN weight variant: either Q4/Q8 (default) or W3-packed
+    /// (issue #420 MLP-only overlay — dense MLP tensors only, never MoE).
+    ///
+    /// Unlike the Q4 path, W3 gate/up are *not* fused into one buffer (the Q4
+    /// fusion is a decode-dispatch optimization; W3 has no live dispatch path
+    /// yet — see `encode_mlp_block`'s `MetalDenseFfnWeights::W3` arm).
+    enum MetalDenseFfnWeights {
+        Q4 {
             gate_up_proj: Q4WeightBuf, // [2 * intermediate, hidden] — gate || up, Q4/Q8
             down_proj: Q4WeightBuf,    // [hidden, intermediate] — Q4/Q8
         },
+        W3 {
+            gate_proj: W3WeightBuf, // [intermediate, hidden] — W3
+            up_proj: W3WeightBuf,   // [intermediate, hidden] — W3
+            down_proj: W3WeightBuf, // [hidden, intermediate] — W3
+        },
+    }
+
+    enum MetalFfnWeights {
+        Dense(MetalDenseFfnWeights),
         Moe(Box<MoeMetalBuffers>),
     }
 
@@ -5342,7 +5479,7 @@ kernel void gdn_chunk_norm_silu_c32(
                             cfg.intermediate_size * (cfg.hidden_size / 32) * block_bytes
                         );
                         debug_assert_eq!(up_bytes.len(), gate_bytes.len());
-                        MetalFfnWeights::Dense {
+                        MetalFfnWeights::Dense(MetalDenseFfnWeights::Q4 {
                             gate_up_proj: Q4WeightBuf::from_buffer(make_fused_quant_buffer(
                                 &device,
                                 &gate_bytes,
@@ -5354,7 +5491,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &d.down_proj,
                                 &format!("L{i}.down.{quant_tag}"),
                             )?),
-                        }
+                        })
                     }
                     crate::model::qwen35::FeedForwardWeights::Moe(m) => {
                         let num_exp = m.experts.num_experts;
@@ -6622,10 +6759,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
                 let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
+                    MetalFfnWeights::Dense(MetalDenseFfnWeights::Q4 {
                         gate_up_proj,
                         down_proj,
-                    } => {
+                    }) => {
                         let byte_size: u64 = match self.engine.quant_format {
                             QuantFormat::Q8_0 => {
                                 (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
@@ -6639,6 +6776,25 @@ kernel void gdn_chunk_norm_silu_c32(
                             down_proj as *const Q4WeightBuf,
                             byte_size,
                         )
+                    }
+                    MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    }) => {
+                        return Err(crate::error::InferenceError::UnsupportedModel(format!(
+                            "verify_tokens_batch_gemm: W3 MLP runtime does not support batch \
+                             verification (M>1) yet — only decode (M=1) dispatch is planned. \
+                             Refusing to fall back to Q4/f16 because that would silently change \
+                             W3 quality measurement. layer gate_proj n={} k={}, up_proj n={} k={}, \
+                             down_proj n={} k={}",
+                            gate_proj.n,
+                            gate_proj.k,
+                            up_proj.n,
+                            up_proj.k,
+                            down_proj.n,
+                            down_proj.k
+                        )));
                     }
                     MetalFfnWeights::Moe(_) => {
                         panic!(
@@ -8470,10 +8626,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 let w_in_norm = &common_w.input_layernorm as *const Buffer;
                 let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
                 let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
+                    MetalFfnWeights::Dense(MetalDenseFfnWeights::Q4 {
                         gate_up_proj,
                         down_proj,
-                    } => {
+                    }) => {
                         let byte_size: u64 = match self.engine.quant_format {
                             QuantFormat::Q8_0 => {
                                 (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
@@ -8487,6 +8643,14 @@ kernel void gdn_chunk_norm_silu_c32(
                             down_proj as *const Q4WeightBuf,
                             byte_size,
                         )
+                    }
+                    MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 { .. }) => {
+                        panic!(
+                            "forward_prefill batch GEMM: W3 MLP runtime does not support batch \
+                             prefill (M>1) yet — only decode (M=1) dispatch is planned. \
+                             Refusing to fall back to Q4/f16 because that would silently change \
+                             W3 quality measurement."
+                        );
                     }
                     MetalFfnWeights::Moe(_) => {
                         panic!(
@@ -10966,10 +11130,10 @@ kernel void gdn_chunk_norm_silu_c32(
             );
             // SAFETY: FFN weight buffers are live for the command buffer lifetime.
             match &common_w.ffn {
-                MetalFfnWeights::Dense {
+                MetalFfnWeights::Dense(MetalDenseFfnWeights::Q4 {
                     gate_up_proj,
                     down_proj,
-                } => {
+                }) => {
                     let w_gate_up = gate_up_proj as *const Q4WeightBuf;
                     let w_down = down_proj as *const Q4WeightBuf;
                     unsafe {
@@ -11021,6 +11185,23 @@ kernel void gdn_chunk_norm_silu_c32(
                         0,
                         layer_idx,
                         "down_proj",
+                    );
+                }
+                MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 { .. }) => {
+                    // No Metal W3 GEMV kernel exists yet (issue #420 scope: CPU
+                    // `gemv_w3_decode` only), and the CPU kernel cannot be
+                    // safely interleaved here — `enc` is a still-open,
+                    // uncommitted encoder, so `self.session.activations.hidden`
+                    // (written by the `dispatch_fused_residual_add_norm` call
+                    // above, in this same encoder) is not yet materialized for
+                    // a synchronous CPU read. Fail closed rather than dispatch
+                    // against stale/undefined activation data.
+                    panic!(
+                        "encode_mlp_block: W3 MLP runtime has no live decode (M=1) dispatch path \
+                         yet. Refusing to fall back to Q4/f16 because that would silently change \
+                         W3 quality measurement; see impl_notes.md for the follow-up needed \
+                         (either a Metal `gemv_w3_decode` kernel or an encoder/command-buffer \
+                         boundary refactor to allow a synchronous CPU-side GEMV here)."
                     );
                 }
                 MetalFfnWeights::Moe(moe_bufs) => {
@@ -14613,7 +14794,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         debug_assert_eq!(gate_len, cfg.intermediate_size * cfg.hidden_size);
                         debug_assert_eq!(up_len, cfg.intermediate_size * cfg.hidden_size);
                         debug_assert_eq!(up_raw.len(), gate_raw.len());
-                        MetalFfnWeights::Dense {
+                        MetalFfnWeights::Dense(MetalDenseFfnWeights::Q4 {
                             gate_up_proj: make_fused_q4_buf(
                                 &gate_raw,
                                 &up_raw,
@@ -14623,7 +14804,7 @@ kernel void gdn_chunk_norm_silu_c32(
                                 &format!("{prefix}.mlp.down_proj.weight"),
                                 &format!("L{i}.down.q4"),
                             )?,
-                        }
+                        })
                     },
                 };
 
@@ -15076,6 +15257,868 @@ kernel void gdn_chunk_norm_silu_c32(
             })
         }
 
+        /// Load a mixed W3/Q4/F16 directory produced by `quantize_w3_mlp`
+        /// (issue #420): dense MLP `gate_proj`/`up_proj`/`down_proj` weights as
+        /// W3, everything else (attention, GDN, embeddings, `lm_head`, norms) as
+        /// Q4/F16 — identical to [`Self::from_q4_dir`] for non-MLP tensors.
+        ///
+        /// Fails closed (returns `Err`, never silently substitutes Q4/f16) on:
+        /// a missing required `.w3` tensor for an active dense-MLP layer, a
+        /// stray `.q4` file for a tensor the W3 runtime must own, a `.w3`
+        /// tensor with the wrong shape, or `k == 0` / `k % 32 != 0` — see
+        /// `load_w3_buf` / `mmap_w3_weight` below.
+        pub fn from_w3_mlp_dir(
+            w3_mlp_dir: &std::path::Path,
+            tokenizer_path: &std::path::Path,
+            cfg: &Qwen35Config,
+            max_cache_len: usize,
+        ) -> Result<Self, String> {
+            use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
+
+            let device =
+                Device::system_default().ok_or_else(|| "No Metal device found".to_string())?;
+
+            tracing::info!(
+                name = device.name(),
+                "Metal GPU initialized for W3 MLP mixed direct-load forward pass"
+            );
+
+            let queue = device.new_command_queue();
+
+            // Q4 dir always uses Q4_0 format.
+            let quant_format = QuantFormat::Q4_0;
+
+            validate_flash_decode_shape(
+                cfg.head_dim,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.num_attention_heads * cfg.head_dim,
+                cfg.num_key_value_heads * cfg.head_dim,
+            )?;
+
+            // Cache-capacity validation, matching `new_session` so a
+            // `from_w3_mlp_dir` call cannot construct a runtime whose KV cap
+            // outruns the RoPE table (`partial_rope_interleaved` indexes
+            // `cos_tab` / `sin_tab` by `position`; without this guard a
+            // `--max-cache-len > max_position_embeddings` argument would
+            // race past the precomputed table at decode time).
+            if max_cache_len == 0 {
+                return Err("from_w3_mlp_dir: max_cache_len must be > 0".to_string());
+            }
+            if max_cache_len > cfg.max_position_embeddings {
+                return Err(format!(
+                    "from_w3_mlp_dir: max_cache_len {max_cache_len} exceeds max_position_embeddings {} \
+                     (the RoPE table is sized to max_position_embeddings; running past it would \
+                     produce out-of-bounds GPU reads or incorrect rotary positions)",
+                    cfg.max_position_embeddings
+                ));
+            }
+
+            // Two-way config/artifact contract for the logits head:
+            //
+            // - `tie_word_embeddings=false` (e.g., QuaRot output where
+            //   step 3c flips the flag and materializes a fused
+            //   `(1 + γ_final)` + rotation `lm_head.weight`) MUST ship
+            //   the rotated head as its own `lm_head.weight.q4`. Falling
+            //   back to `embed_tokens` here would silently feed the wrong
+            //   matrix into the final logits GEMV.
+            // - `tie_word_embeddings=true` (the legitimate "embed_tokens
+            //   IS the head" case) MUST NOT ship `lm_head.weight.q4` —
+            //   if it does, the on-disk config-flip was likely skipped
+            //   (HF Qwen3.5 stores the flag in both `text_config` and
+            //   top level; `Qwen35Config::from_config_json_str` takes
+            //   the top-level value, so a partial update can leave the
+            //   parsed flag stale). The materialized head would then be
+            //   dead weight and the runtime would silently fall back to
+            //   `embed_tokens` — exactly the contamination ADR-044
+            //   §"Step 3c contract" warns against and `quant::quarot::lm_head`
+            //   flags at the converter boundary.
+            //
+            // Both mismatches let `eval_perplexity --quarot-q4-dir`
+            // print a PPL delta and PASS/FAIL verdict on the wrong
+            // logits head, so the loader refuses both directions before
+            // any tensor I/O.
+            let lm_head_path = Self::q4_tensor_path(w3_mlp_dir, "lm_head.weight", "q4");
+            let lm_head_present = lm_head_path.exists();
+            if !cfg.tie_word_embeddings && !lm_head_present {
+                return Err(format!(
+                    "from_w3_mlp_dir: tie_word_embeddings=false but lm_head.q4 is missing at {}; \
+                     the runtime requires the materialized lm_head matrix (ADR-044 step 3c) \
+                     and must not fall back to embed_tokens, which would yield wrong logits \
+                     and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
+            }
+            if cfg.tie_word_embeddings && lm_head_present {
+                return Err(format!(
+                    "from_w3_mlp_dir: tie_word_embeddings=true but lm_head.q4 is present at {}; \
+                     the on-disk config likely missed the step-3c `tie_word_embeddings=false` \
+                     flip (HF Qwen3.5 carries the flag in both nested `text_config` and the \
+                     top level — see `Qwen35Config::from_config_json_str`). Loading would \
+                     silently ignore the materialized head and fall back to embed_tokens, \
+                     yielding wrong logits and a misleading perplexity report",
+                    lm_head_path.display()
+                ));
+            }
+
+            // Compile shaders (same as new()).
+            let opts = CompileOptions::new();
+            let library = device
+                .new_library_with_source(MSL_SOURCE, &opts)
+                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
+
+            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
+                let func = library
+                    .get_function(name, None)
+                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
+                device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
+            };
+
+            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
+                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+                // The compile/pipeline `.ok()?` chain below falls back to the
+                // naive gemm_q4 on any device where the V3.0 source fails.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
+            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
+            let pipelines = MetalQwen35Pipelines {
+                gemv_decode: make_pipeline("gemv_decode_m1")?,
+                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
+                gemv_q8: make_pipeline("gemv_q8_decode")?,
+                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
+                gemv_q4: make_pipeline("gemv_q4_decode")?,
+                gemm_q4: make_pipeline("gemm_q4")?,
+                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+                rms_norm: make_pipeline("rms_norm_qwen35")?,
+                partial_rope: make_pipeline("partial_rope_interleaved")?,
+                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
+                decode_attention: make_pipeline("decode_attention")?,
+                sigmoid_gate: make_pipeline("sigmoid_gate")?,
+                scatter_q_gate: make_pipeline("scatter_q_gate")?,
+                silu_mul: make_pipeline("silu_mul")?,
+                silu_mul_fused: make_pipeline("silu_mul_fused")?,
+                copy: make_pipeline("copy_buf")?,
+                copy_offset: make_pipeline("copy_buf_offset")?,
+                add: make_pipeline("add_buf")?,
+                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
+                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
+                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
+                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
+                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
+                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
+                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
+                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
+                gdn_recurrence_q36: library
+                    .get_function("gdn_recurrence_fused_q36", None)
+                    .ok()
+                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+                gdn_precompute_keys: library
+                    .get_function("gdn_precompute_keys", None)
+                    .ok()
+                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+                gdn_recurrence_sharded: library
+                    .get_function("gdn_recurrence_sharded", None)
+                    .ok()
+                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+                gdn_norm_silu: library
+                    .get_function("gdn_norm_silu", None)
+                    .ok()
+                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
+                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
+                add_and_copy: make_pipeline("add_and_copy")?,
+                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
+                gemm_q8: make_pipeline("gemm_q8")?,
+                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+                topk_first_pass: make_pipeline("logits_topk_first_pass")?,
+                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
+                argmax_first: make_pipeline("logits_argmax_first")?,
+                argmax_merge: make_pipeline("logits_argmax_merge")?,
+                topk_fast_first: make_pipeline("logits_topk_fast_first")?,
+                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
+                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
+                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
+                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+                lora_gemv_a: make_pipeline("lora_gemv_a")?,
+                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+                // ADR-053: MoE Metal dispatch kernels
+                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+                moe_scale_add: make_pipeline("moe_scale_add")?,
+                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+                moe_zero_buf: make_pipeline("zero_buf")?,
+                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+                partial_rope_batch: make_pipeline("partial_rope_batch")?,
+                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+                prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
+                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+                decode_attention_f16: make_pipeline("decode_attention_f16")?,
+                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+                prefill_attention_batched_f16: make_pipeline(
+                    "prefill_attention_batched_causal_f16",
+                )?,
+            };
+
+            let hidden = cfg.hidden_size;
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+            let qkv_dim = cfg.linear_qkv_dim();
+            let output_dim = cfg.linear_output_dim();
+            let inter = cfg.intermediate_size;
+
+            // ----------------------------------------------------------------
+            // Phase timers — measures I/O and Metal buffer creation costs.
+            // ----------------------------------------------------------------
+            let t_total = std::time::Instant::now();
+            let mut dur_a = std::time::Duration::ZERO; // Phase A: qkvz I/O + Metal copies
+            let dur_b_cell = std::cell::Cell::new(std::time::Duration::ZERO); // Phase B: F16 loads
+            let dur_c_cell = std::cell::Cell::new(std::time::Duration::ZERO); // Phase C: mmap Q4
+
+            // ----------------------------------------------------------------
+            // Helper: mmap a Q4 file and create a Metal no-copy buffer.
+            // Zero CPU copies — GPU pages fault lazily from mmap'd file.
+            // ----------------------------------------------------------------
+            let load_q4_buf = |name: &str, label: &str| -> Result<Q4WeightBuf, String> {
+                let t = std::time::Instant::now();
+                let path = Self::q4_tensor_path(w3_mlp_dir, name, "q4");
+                let result = mmap_q4_weight(&device, &path, label);
+                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                result
+            };
+
+            // ----------------------------------------------------------------
+            // Helper: load an F16 file, convert to f32, create a Metal f32 buffer.
+            // ----------------------------------------------------------------
+            let load_f16_buf_f32 = |name: &str, label: &str| -> Result<Buffer, String> {
+                let t = std::time::Instant::now();
+                let path = Self::q4_tensor_path(w3_mlp_dir, name, "f16");
+                let (values, _shape) = load_f16_tensor_file(&path)
+                    .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
+                let buf = make_buffer(&device, &values, label);
+                dur_b_cell.set(dur_b_cell.get() + t.elapsed());
+                Ok(buf)
+            };
+
+            // ----------------------------------------------------------------
+            // Helper: fail-closed load of a dense MLP `.w3` tensor.
+            //
+            // Refuses (rather than silently falling back to Q4/f16) when:
+            //   - a stray `.q4` file exists for a tensor the W3 runtime must
+            //     own (would silently reintroduce Q4 precision into a W3
+            //     measurement);
+            //   - the required `.w3` file is missing;
+            //   - the `.w3` header shape doesn't match `expected_shape`, or
+            //     `k == 0` / `k % W3_GROUP_SIZE != 0` (checked inside
+            //     `mmap_w3_weight`).
+            // ----------------------------------------------------------------
+            let load_w3_buf = |name: &str,
+                               label: &str,
+                               expected_shape: &[usize]|
+             -> Result<W3WeightBuf, String> {
+                let stray_q4_path = Self::q4_tensor_path(w3_mlp_dir, name, "q4");
+                if stray_q4_path.exists() {
+                    return Err(format!(
+                        "W3 MLP runtime missing required .w3 tensor {name}: found a stray {} \
+                         instead, which the W3 runtime must own; refusing to fall back to Q4/f16 \
+                         because that would silently change W3 quality measurement",
+                        stray_q4_path.display()
+                    ));
+                }
+                let path = Self::q4_tensor_path(w3_mlp_dir, name, "w3");
+                if !path.exists() {
+                    return Err(format!(
+                        "W3 MLP runtime missing required .w3 tensor {name} at {}; refusing to \
+                         fall back to q4/f16 because that would silently change W3 quality \
+                         measurement",
+                        path.display()
+                    ));
+                }
+                let t = std::time::Instant::now();
+                let result = mmap_w3_weight(&device, &path, label, name, expected_shape);
+                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                result
+            };
+
+            // ----------------------------------------------------------------
+            // H3: Merge-on-first-load for in_proj_qkvz.
+            // On first load, concatenate qkv+z payloads into a single merged .q4 file
+            // so that subsequent loads can use zero-copy mmap (like all other Q4 weights).
+            // Merged filename encodes source sizes → stale cache auto-invalidated on model update.
+            // Falls back to CPU concat if model dir is read-only.
+            // Metal buffer creation stays on the main thread (Metal is not thread-safe).
+            // ----------------------------------------------------------------
+            let t_a_io = std::time::Instant::now();
+            let mut qkvz_merge_map: std::collections::HashMap<usize, Option<std::path::PathBuf>> = {
+                use rayon::prelude::*;
+                let pairs: Vec<Result<(usize, Option<std::path::PathBuf>), String>> =
+                    (0..cfg.num_hidden_layers)
+                        .into_par_iter()
+                        .filter(|&i| cfg.is_layer_active(i) && !cfg.is_full_attention(i))
+                        .map(|i| {
+                            let prefix = format!("model.language_model.layers.{i}");
+                            let qkv_p = Self::q4_tensor_path(
+                                w3_mlp_dir,
+                                &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                                "q4",
+                            );
+                            let z_p = Self::q4_tensor_path(
+                                w3_mlp_dir,
+                                &format!("{prefix}.linear_attn.in_proj_z.weight"),
+                                "q4",
+                            );
+                            let qkv_size = std::fs::metadata(&qkv_p)
+                                .map_err(|e| format!("metadata {}: {e}", qkv_p.display()))?.len();
+                            let z_size = std::fs::metadata(&z_p)
+                                .map_err(|e| format!("metadata {}: {e}", z_p.display()))?.len();
+                            // Filename encodes source sizes for cache-invalidation.
+                            let merged_path = w3_mlp_dir.join(
+                                format!("merged_qkvz_{i}_{qkv_size}_{z_size}.q4")
+                            );
+                            // Expected size: 36-byte header (ndim=2, payload_offset=36)
+                            // + qkv payload + z payload.  All source weight files are 2D
+                            // so payload_offset=36 for each.
+                            let expected_size = 36u64 + (qkv_size - 36) + (z_size - 36);
+                            let is_valid = std::fs::metadata(&merged_path)
+                                .ok()
+                                .map(|m| m.len() == expected_size)
+                                .unwrap_or(false);
+                            if !is_valid {
+                                let _ = std::fs::remove_file(&merged_path);
+                                if let Err(e) = write_merged_qkvz(&qkv_p, &z_p, &merged_path) {
+                                    eprintln!("[load] merge-on-first-load failed layer {i}: {e}; using CPU fallback");
+                                    return Ok((i, None));
+                                }
+                            }
+                            Ok((i, Some(merged_path)))
+                        })
+                        .collect();
+                pairs.into_iter().collect::<Result<_, _>>()?
+            };
+            dur_a += t_a_io.elapsed();
+
+            // ----------------------------------------------------------------
+            // Per-layer weights
+            // ----------------------------------------------------------------
+            let mut layer_weights: Vec<(MetalLayerAttnWeights, MetalCommonLayerWeights)> =
+                Vec::with_capacity(cfg.num_active_layers());
+
+            for i in 0..cfg.num_hidden_layers {
+                if !cfg.is_layer_active(i) {
+                    tracing::debug!(layer = i, "skipping pruned layer weight loading");
+                    continue;
+                }
+                let prefix = format!("model.language_model.layers.{i}");
+
+                // Common layer weights
+                let common = MetalCommonLayerWeights {
+                    input_layernorm: load_f16_buf_f32(
+                        &format!("{prefix}.input_layernorm.weight"),
+                        &format!("L{i}.in_norm"),
+                    )?,
+                    post_attention_layernorm: load_f16_buf_f32(
+                        &format!("{prefix}.post_attention_layernorm.weight"),
+                        &format!("L{i}.post_norm"),
+                    )?,
+                    ffn: {
+                        let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+                        let up_name = format!("{prefix}.mlp.up_proj.weight");
+                        let down_name = format!("{prefix}.mlp.down_proj.weight");
+                        MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 {
+                            gate_proj: load_w3_buf(
+                                &gate_name,
+                                &format!("L{i}.gate.w3"),
+                                &[cfg.intermediate_size, cfg.hidden_size],
+                            )?,
+                            up_proj: load_w3_buf(
+                                &up_name,
+                                &format!("L{i}.up.w3"),
+                                &[cfg.intermediate_size, cfg.hidden_size],
+                            )?,
+                            down_proj: load_w3_buf(
+                                &down_name,
+                                &format!("L{i}.down.w3"),
+                                &[cfg.hidden_size, cfg.intermediate_size],
+                            )?,
+                        })
+                    },
+                };
+
+                let attn = if cfg.is_full_attention(i) {
+                    MetalLayerAttnWeights::Full(MetalFullLayerWeights {
+                        q_proj: load_q4_buf(
+                            &format!("{prefix}.self_attn.q_proj.weight"),
+                            &format!("L{i}.full.q.q4"),
+                        )?,
+                        k_proj: load_q4_buf(
+                            &format!("{prefix}.self_attn.k_proj.weight"),
+                            &format!("L{i}.full.k.q4"),
+                        )?,
+                        v_proj: load_q4_buf(
+                            &format!("{prefix}.self_attn.v_proj.weight"),
+                            &format!("L{i}.full.v.q4"),
+                        )?,
+                        o_proj: load_q4_buf(
+                            &format!("{prefix}.self_attn.o_proj.weight"),
+                            &format!("L{i}.full.o.q4"),
+                        )?,
+                        // q_norm and k_norm are norm.weight → stored as .f16
+                        q_norm: load_f16_buf_f32(
+                            &format!("{prefix}.self_attn.q_norm.weight"),
+                            &format!("L{i}.full.q_norm"),
+                        )?,
+                        k_norm: load_f16_buf_f32(
+                            &format!("{prefix}.self_attn.k_norm.weight"),
+                            &format!("L{i}.full.k_norm"),
+                        )?,
+                    })
+                } else {
+                    // in_proj_b and in_proj_a are quantized on disk (ends_with _proj_b.weight /
+                    // _proj_a.weight → Q4), but in new() they become f16 Metal buffers for the
+                    // CPU GDN recurrence path.  Load Q4 → dequantize → f16 Metal buffer.
+                    let load_q4_as_f16_buf = |name: &str, label: &str| -> Result<Buffer, String> {
+                        let t = std::time::Instant::now();
+                        let path = Self::q4_tensor_path(w3_mlp_dir, name, "q4");
+                        let tensor = load_q4_file(&path).map_err(|e| {
+                            format!("failed to load Q4 file {}: {e}", path.display())
+                        })?;
+                        let buf = Self::make_buffer_f16_from_q4(&device, &tensor, label);
+                        dur_b_cell.set(dur_b_cell.get() + t.elapsed());
+                        Ok(buf)
+                    };
+
+                    MetalLayerAttnWeights::Linear(MetalGdnLayerWeights {
+                        in_proj_qkv: load_q4_buf(
+                            &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                            &format!("L{i}.gdn.qkv.q4"),
+                        )?,
+                        in_proj_z: load_q4_buf(
+                            &format!("{prefix}.linear_attn.in_proj_z.weight"),
+                            &format!("L{i}.gdn.z.q4"),
+                        )?,
+                        in_proj_qkvz: {
+                            let t_qkvz = std::time::Instant::now();
+                            let r = match qkvz_merge_map.remove(&i) {
+                                Some(Some(merged_path)) => mmap_q4_weight(
+                                    &device,
+                                    &merged_path,
+                                    &format!("L{i}.gdn.qkvz.q4"),
+                                )?,
+                                _ => {
+                                    // Fallback: model dir is read-only — CPU concat path
+                                    let pfx = format!("model.language_model.layers.{i}");
+                                    let qkv_p = Self::q4_tensor_path(
+                                        w3_mlp_dir,
+                                        &format!("{pfx}.linear_attn.in_proj_qkv.weight"),
+                                        "q4",
+                                    );
+                                    let z_p = Self::q4_tensor_path(
+                                        w3_mlp_dir,
+                                        &format!("{pfx}.linear_attn.in_proj_z.weight"),
+                                        "q4",
+                                    );
+                                    let (mut raw, _) = Self::load_q4_raw_bytes(&qkv_p)?;
+                                    let (z_raw, _) = Self::load_q4_raw_bytes(&z_p)?;
+                                    raw.extend_from_slice(&z_raw);
+                                    Q4WeightBuf::from_buffer(Self::make_buffer_from_q4_raw(
+                                        &device,
+                                        &raw,
+                                        &format!("L{i}.gdn.qkvz.q4"),
+                                    ))
+                                }
+                            };
+                            dur_a += t_qkvz.elapsed();
+                            r
+                        },
+                        // in_proj_b and in_proj_a: Q4 on disk, but stored as f16 Metal buffers
+                        in_proj_b: load_q4_as_f16_buf(
+                            &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                            &format!("L{i}.gdn.b.f16"),
+                        )?,
+                        in_proj_a: load_q4_as_f16_buf(
+                            &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                            &format!("L{i}.gdn.a.f16"),
+                        )?,
+                        // Small scalars: f32 Metal buffers (CPU-read in GDN recurrence)
+                        a_log: load_f16_buf_f32(
+                            &format!("{prefix}.linear_attn.A_log"),
+                            &format!("L{i}.gdn.a_log"),
+                        )?,
+                        dt_bias: load_f16_buf_f32(
+                            &format!("{prefix}.linear_attn.dt_bias"),
+                            &format!("L{i}.gdn.dt_bias"),
+                        )?,
+                        conv1d_weight: load_f16_buf_f32(
+                            &format!("{prefix}.linear_attn.conv1d.weight"),
+                            &format!("L{i}.gdn.conv1d"),
+                        )?,
+                        norm_weight: load_f16_buf_f32(
+                            &format!("{prefix}.linear_attn.norm.weight"),
+                            &format!("L{i}.gdn.norm"),
+                        )?,
+                        out_proj: load_q4_buf(
+                            &format!("{prefix}.linear_attn.out_proj.weight"),
+                            &format!("L{i}.gdn.out.q4"),
+                        )?,
+                    })
+                };
+
+                layer_weights.push((attn, common));
+            }
+
+            let t_d = std::time::Instant::now();
+
+            // ----------------------------------------------------------------
+            // embed_tokens: Q4 on disk.
+            //   - embed_tokens (f16 buf): for CPU embedding lookup
+            //   - embed_tokens_q8 (Q4 buf): for logits GEMV on GPU
+            // ----------------------------------------------------------------
+            let embed_name = "model.language_model.embed_tokens.weight";
+            let embed_path = Self::q4_tensor_path(w3_mlp_dir, embed_name, "q4");
+            let embed_tensor = load_q4_file(&embed_path)
+                .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
+            // f16 buffer for CPU embedding lookup
+            let embed_tokens =
+                Self::make_buffer_f16_from_q4(&device, &embed_tensor, "embed_tokens.f16");
+            // Q4 buffer for GPU logits GEMV — mmap no-copy
+            let embed_q4_path = Self::q4_tensor_path(w3_mlp_dir, embed_name, "q4");
+            let embed_tokens_q8 = mmap_q4_weight(&device, &embed_q4_path, "embed_tokens.q4")?;
+
+            // ----------------------------------------------------------------
+            // final_norm: stored as .f16 (it's a norm.weight tensor)
+            // ----------------------------------------------------------------
+            let final_norm = load_f16_buf_f32("model.language_model.norm.weight", "final_norm")?;
+
+            // ----------------------------------------------------------------
+            // lm_head: only present when tie_word_embeddings = false.
+            //
+            // Step-4b loader contract: when `!cfg.tie_word_embeddings` we
+            // require `lm_head.weight.q4` on disk — the early-return guard
+            // at the top of `from_w3_mlp_dir` already rejected the missing-file
+            // case, so this branch only sees a path that exists. We load
+            // it into the `embed_tokens_q8` slot because that buffer is
+            // what the runtime's logits GEMV indexes; the field is shared
+            // between tied (embed_tokens IS the head) and untied
+            // (separate fused-and-rotated head) artifacts.
+            // ----------------------------------------------------------------
+            let embed_tokens_q8 = if !cfg.tie_word_embeddings {
+                let lm_head_path = Self::q4_tensor_path(w3_mlp_dir, "lm_head.weight", "q4");
+                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
+            } else {
+                embed_tokens_q8
+            };
+
+            // ----------------------------------------------------------------
+            // RoPE tables (same as new())
+            // ----------------------------------------------------------------
+            let rope_dim = cfg.rope_dim();
+            let rope_max = cfg.max_position_embeddings.min(max_cache_len + 64);
+            let (cos_data, sin_data) = build_rope_interleaved(rope_dim, rope_max, cfg.rope_theta);
+            let rope_cos = make_buffer(&device, &cos_data, "rope_cos");
+            let rope_sin = make_buffer(&device, &sin_data, "rope_sin");
+
+            // ----------------------------------------------------------------
+            // Activation buffers (same as new())
+            // ----------------------------------------------------------------
+            let max_prefill = max_cache_len.min(512);
+            let bp = max_prefill;
+            let activations = MetalQwen35Activations {
+                hidden: make_zero_buffer(&device, bp * hidden, "act_hidden"),
+                residual: make_zero_buffer(&device, bp * hidden, "act_residual"),
+                attn_out: make_zero_buffer(&device, bp * q_dim.max(hidden), "act_attn_out"),
+                q: make_zero_buffer(&device, bp * 2 * q_dim, "act_q_interleaved"),
+                q_separated: make_zero_buffer(&device, bp * q_dim, "act_q"),
+                gate_z: make_zero_buffer(&device, bp * q_dim, "act_gate_z"),
+                k: make_zero_buffer(&device, bp * kv_dim, "act_k"),
+                v: make_zero_buffer(&device, bp * kv_dim, "act_v"),
+                gate: make_zero_buffer(&device, bp * 2 * inter, "act_gate"),
+                up: make_zero_buffer(&device, bp * inter, "act_up"),
+                ffn_out: make_zero_buffer(&device, bp * hidden, "act_ffn_out"),
+                gdn_qkv: make_zero_buffer(&device, bp * qkv_dim, "act_gdn_qkv"),
+                gdn_z: make_zero_buffer(&device, bp * output_dim, "act_gdn_z"),
+                gdn_qkvz: make_zero_buffer(&device, qkv_dim + output_dim, "act_gdn_qkvz"),
+                gdn_key_scratch: make_zero_buffer(
+                    &device,
+                    cfg.linear_num_key_heads * (2 * cfg.linear_key_head_dim + 1)
+                        + cfg.linear_num_value_heads() * 2,
+                    "act_gdn_key_scratch",
+                ),
+                gdn_raw_out: make_zero_buffer(&device, output_dim, "act_gdn_raw_out"),
+                gdn_chunk: {
+                    let num_chunks = bp.div_ceil(GDN_CHUNK_SIZE);
+                    let num_vh = cfg.linear_num_value_heads();
+                    let kd = cfg.linear_key_head_dim;
+                    let vd = cfg.linear_value_head_dim;
+                    let chunk_rows = num_chunks * num_vh * GDN_CHUNK_SIZE;
+                    let c2 = num_chunks * num_vh * GDN_CHUNK_SIZE * GDN_CHUNK_SIZE;
+                    GdnChunkScratch {
+                        q: make_zero_buffer(&device, chunk_rows * kd, "gdn_chunk_q"),
+                        k: make_zero_buffer(&device, chunk_rows * kd, "gdn_chunk_k"),
+                        v: make_zero_buffer(&device, chunk_rows * vd, "gdn_chunk_v"),
+                        beta_log_alpha: make_zero_buffer(&device, chunk_rows * 2, "gdn_chunk_bla"),
+                        gamma: make_zero_buffer(&device, chunk_rows, "gdn_chunk_gamma"),
+                        gamma_end: make_zero_buffer(
+                            &device,
+                            num_chunks * num_vh,
+                            "gdn_chunk_gamma_end",
+                        ),
+                        kkt: make_zero_buffer(&device, c2, "gdn_chunk_kkt"),
+                        qk_l: make_zero_buffer(&device, c2, "gdn_chunk_qkl"),
+                        w: make_zero_buffer(&device, chunk_rows * kd, "gdn_chunk_w"),
+                        u: make_zero_buffer(&device, chunk_rows * vd, "gdn_chunk_u"),
+                        r: make_zero_buffer(&device, chunk_rows * vd, "gdn_chunk_r"),
+                        k_right: make_zero_buffer(&device, chunk_rows * kd, "gdn_chunk_k_right"),
+                        raw_out: make_zero_buffer(&device, bp * output_dim, "gdn_chunk_raw_out"),
+                    }
+                },
+                logits: make_zero_buffer(&device, cfg.vocab_size, "act_logits"),
+                topk_scratch_a: {
+                    let groups = cfg.vocab_size.div_ceil(1024);
+                    make_zero_byte_buffer(&device, groups * 256 * 8, "topk_scratch_a")
+                },
+                topk_scratch_b: {
+                    let groups = cfg.vocab_size.div_ceil(1024);
+                    make_zero_byte_buffer(&device, groups * 256 * 8, "topk_scratch_b")
+                },
+                attn_partials: {
+                    let max_partitions = max_cache_len.div_ceil(1024);
+                    let stride = cfg.head_dim + 2;
+                    make_zero_buffer(
+                        &device,
+                        max_partitions * cfg.num_attention_heads * stride,
+                        "attn_partials",
+                    )
+                },
+                pre_final_hidden: make_zero_buffer(&device, hidden, "act_pre_final_hidden"),
+                verify_logits: make_zero_buffer(
+                    &device,
+                    MTP_VERIFY_MAX_TOKENS * cfg.vocab_size,
+                    "act_verify_logits",
+                ),
+            };
+
+            // ----------------------------------------------------------------
+            // GDN recurrent states (same as new())
+            // ----------------------------------------------------------------
+            let num_linear = cfg.num_active_linear_attention_layers();
+            let num_full = cfg.num_active_full_attention_layers();
+            let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+                .map(|_| GatedDeltaNetState::new(cfg))
+                .collect();
+            let gdn_scratch = GatedDeltaNetFusedScratch::default();
+
+            let num_value_heads = cfg.linear_num_value_heads();
+            let key_dim = cfg.linear_key_head_dim;
+            let value_dim = cfg.linear_value_head_dim;
+            let qkv_dim = cfg.linear_qkv_dim();
+            let buf_len = cfg.linear_conv_kernel_dim.saturating_sub(1);
+            let gdn_gpu_conv_bufs: Vec<Buffer> = (0..num_linear)
+                .map(|i| make_zero_buffer(&device, qkv_dim * buf_len, &format!("gdn_conv_{i}")))
+                .collect();
+            let gdn_gpu_s_matrices: Vec<Buffer> = (0..num_linear)
+                .map(|i| {
+                    make_zero_buffer(
+                        &device,
+                        num_value_heads * value_dim * key_dim,
+                        &format!("gdn_s_{i}"),
+                    )
+                })
+                .collect();
+            let gdn_gpu_conv_out = make_zero_buffer(&device, qkv_dim, "gdn_conv_out");
+
+            let use_kv_f16 = matches!(
+                std::env::var("LATTICE_KV_F16").as_deref(),
+                Ok("1") | Ok("true")
+            );
+            let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len, use_kv_f16);
+
+            let dur_d = t_d.elapsed();
+            eprintln!(
+                "[load-timer] Phase A (qkvz parallel I/O + Metal copy): {:.3}s",
+                dur_a.as_secs_f64()
+            );
+            eprintln!(
+                "[load-timer] Phase B (F16 buffer loads): {:.3}s",
+                dur_b_cell.get().as_secs_f64()
+            );
+            eprintln!(
+                "[load-timer] Phase C (mmap Q4 weight loads): {:.3}s",
+                dur_c_cell.get().as_secs_f64()
+            );
+            eprintln!(
+                "[load-timer] Phase D (embed/rope/activations/GDN): {:.3}s",
+                dur_d.as_secs_f64()
+            );
+            eprintln!(
+                "[load-timer] Total: {:.3}s",
+                t_total.elapsed().as_secs_f64()
+            );
+
+            // tokenizer_path is accepted but not stored — tokenizer is loaded by the caller.
+            let _ = tokenizer_path;
+
+            // Load MTP weights (cache+activations go into session, not engine).
+            let mtp_requested = std::env::var_os("LATTICE_MTP").is_some();
+            let MtpQ4LoadResult {
+                weights: mtp_weights_opt,
+                first_missing_file: mtp_missing_file,
+            } = Self::load_mtp_q4_weights(w3_mlp_dir, cfg, &device);
+            if let Some(message) = super::mtp_missing_weights_warning(
+                mtp_requested,
+                mtp_weights_opt.is_some(),
+                mtp_missing_file.as_deref(),
+            ) {
+                tracing::warn!("{}", message);
+            }
+            let mtp_session = mtp_weights_opt.as_ref().map(|_| {
+                let cache = MetalMtpCache {
+                    k_buf: make_zero_buffer(&device, max_cache_len * kv_dim, "mtp.kv_k"),
+                    v_buf: make_zero_buffer(&device, max_cache_len * kv_dim, "mtp.kv_v"),
+                    seq_len: 0,
+                    max_cache_len,
+                };
+                let mtp_activations = MetalMtpActivations {
+                    fused: make_zero_buffer(&device, 2 * hidden, "mtp.act_fused"),
+                    hidden: make_zero_buffer(&device, hidden, "mtp.act_hidden"),
+                    residual: make_zero_buffer(&device, hidden, "mtp.act_residual"),
+                    q: make_zero_buffer(&device, 2 * q_dim, "mtp.act_q"),
+                    q_separated: make_zero_buffer(&device, q_dim, "mtp.act_q_sep"),
+                    gate_z: make_zero_buffer(&device, q_dim, "mtp.act_gate_z"),
+                    k: make_zero_buffer(&device, kv_dim, "mtp.act_k"),
+                    v: make_zero_buffer(&device, kv_dim, "mtp.act_v"),
+                    attn_out: make_zero_buffer(&device, q_dim.max(hidden), "mtp.act_attn_out"),
+                    gate: make_zero_buffer(&device, inter, "mtp.act_gate"),
+                    up: make_zero_buffer(&device, inter, "mtp.act_up"),
+                    ffn_out: make_zero_buffer(&device, hidden, "mtp.act_ffn_out"),
+                    logits: make_zero_buffer(&device, cfg.vocab_size, "mtp.act_logits"),
+                };
+                MetalMtpSession {
+                    cache,
+                    activations: mtp_activations,
+                }
+            });
+            let need_checkpoints =
+                mtp_weights_opt.is_some() || std::env::var_os("LATTICE_SELF_SPEC").is_some();
+            // Self-spec verifies `[pending_token] ++ draft_tokens` = `1 + SELF_SPEC_MAX_DRAFT`
+            // tokens through `verify_tokens_batched`; pool size must cover one slot per token
+            // plus the pre-verify base slot.
+            let checkpoint_max_tokens = if mtp_weights_opt.is_some() {
+                MTP_VERIFY_MAX_TOKENS.max(1 + SELF_SPEC_MAX_DRAFT)
+            } else {
+                1 + SELF_SPEC_MAX_DRAFT
+            };
+            let gdn_checkpoints = if need_checkpoints {
+                Some(MetalGdnCheckpointPool::new(
+                    &device,
+                    checkpoint_max_tokens,
+                    &gdn_gpu_conv_bufs,
+                    &gdn_gpu_s_matrices,
+                ))
+            } else {
+                None
+            };
+
+            let quarot_rotation = if mtp_weights_opt.is_some() {
+                // ADR-051 contract: `quarot_seed` lives in `quantize_index.json`. Fall back
+                // to the legacy `config.json` field (`quarot_rotation_seed`) for
+                // backwards compatibility with artifacts produced before the contract was
+                // formalized.
+                let index_seed = Self::read_quarot_seed_from_index(w3_mlp_dir);
+                let seed_opt = index_seed.or(cfg.quarot_rotation_seed);
+                match seed_opt {
+                    Some(seed) => Some(
+                        crate::quant::quarot::hadamard::RandomizedHadamard::new(seed, hidden)
+                            .map_err(|e| {
+                                format!(
+                                    "from_w3_mlp_dir: failed to build QuaRot rotation \
+                                         (seed={seed}, hidden={hidden}): {e}"
+                                )
+                            })?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            Ok(Self {
+                engine: MetalQwen35Engine {
+                    device,
+                    queue,
+                    pipelines,
+                    layer_weights,
+                    embed_tokens,
+                    embed_tokens_q8,
+                    final_norm,
+                    rope_cos,
+                    rope_sin,
+                    config: cfg.clone(),
+                    quant_format,
+                    mtp_weights: mtp_weights_opt,
+                    quarot_rotation,
+                },
+                session: InferenceSession {
+                    activations,
+                    gdn_states,
+                    gdn_scratch,
+                    gdn_gpu_conv_bufs,
+                    gdn_gpu_s_matrices,
+                    gdn_gpu_conv_out,
+                    kv_cache,
+                    max_prefill,
+                    compact_topk: 0,
+                    compact_route: GpuTopkRoute::CpuFallback,
+                    compact_result: Vec::new(),
+                    mtp: mtp_session,
+                    gdn_checkpoints,
+                    last_pre_final_hidden: vec![0.0f32; hidden],
+                    position: 0,
+                    #[cfg(feature = "gdn-state-counters")]
+                    gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
+                        Some(GdnStateTrafficCounters::new(
+                            GdnStateTrafficShape::try_from_config(cfg)
+                                .map_err(|e| e.to_string())?
+                                .with_allocated_layers(num_linear),
+                        ))
+                    } else {
+                        None
+                    },
+                },
+                lora: None,
+                use_gdn_chunked: !matches!(
+                    std::env::var("LATTICE_GDN_CHUNKED").as_deref(),
+                    Ok("0") | Ok("false")
+                ),
+                use_kv_f16,
+            })
+        }
+
         /// **Unstable**: streaming chat completion; callback signature may change.
         ///
         /// Streaming chat completion with token-by-token callback.
@@ -15304,6 +16347,162 @@ kernel void gdn_chunk_norm_silu_c32(
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
         use crate::model::qwen35_config::LayerType;
+
+        // ---------------------------------------------------------------
+        // W3 loader fail-closed tests (issue #420 tester deliverable).
+        //
+        // `mmap_w3_weight` is the single gate that decides whether a `.w3`
+        // tensor is trusted for the W3 runtime path. These tests exercise it
+        // directly (bypassing the full `from_w3_mlp_dir` model-load flow,
+        // which needs a complete config/tokenizer fixture) to prove it
+        // refuses malformed/unsupported input with a clear error instead of
+        // silently falling back to a different precision.
+        // ---------------------------------------------------------------
+
+        fn write_synthetic_w3_file(
+            dir: &std::path::Path,
+            file_name: &str,
+            shape: &[usize],
+        ) -> std::path::PathBuf {
+            use crate::weights::w3_weights::quantize_f32_to_w3;
+            let numel: usize = shape.iter().product();
+            let data: Vec<f32> = (0..numel).map(|i| (i as f32 % 7.0) - 3.0).collect();
+            let tensor = quantize_f32_to_w3(&data, shape).expect("synthetic tensor quantizes");
+            let path = dir.join(file_name);
+            crate::weights::w3_weights::save_w3_file(&path, &tensor)
+                .expect("synthetic w3 file saves");
+            path
+        }
+
+        #[test]
+        fn mmap_w3_weight_rejects_shape_mismatch() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            // File actually holds [2, 32]; loader expects [4, 32] (as if the
+            // config said a different intermediate_size).
+            let path = write_synthetic_w3_file(tmp.path(), "gate_proj.w3", &[2, 32]);
+
+            let Err(err) = mmap_w3_weight(
+                &device,
+                &path,
+                "gate_proj",
+                "mlp.gate_proj.weight",
+                &[4, 32],
+            ) else {
+                panic!("shape mismatch must be rejected, not silently accepted");
+            };
+            assert!(
+                err.contains("unsupported tensor") && err.contains("Refusing to fall back"),
+                "error must be the canonical fail-closed message; got: {err}"
+            );
+        }
+
+        #[test]
+        fn mmap_w3_weight_rejects_k_not_multiple_of_group_size() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            // k=33 is not a multiple of W3_GROUP_SIZE (32).
+            let path = write_synthetic_w3_file(tmp.path(), "down_proj.w3", &[1, 33]);
+
+            let Err(err) = mmap_w3_weight(
+                &device,
+                &path,
+                "down_proj",
+                "mlp.down_proj.weight",
+                &[1, 33],
+            ) else {
+                panic!("k % 32 != 0 must be rejected, not silently padded/truncated");
+            };
+            assert!(
+                err.contains("multiple") || err.contains("k="),
+                "error must name the bad k; got: {err}"
+            );
+            assert!(
+                err.contains("Refusing to fall back"),
+                "error must state the no-silent-fallback contract; got: {err}"
+            );
+        }
+
+        #[test]
+        fn mmap_w3_weight_rejects_missing_file() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            let missing = tmp.path().join("does_not_exist.w3");
+
+            let Err(err) =
+                mmap_w3_weight(&device, &missing, "up_proj", "mlp.up_proj.weight", &[2, 32])
+            else {
+                panic!(
+                    "a missing .w3 file must error, never silently substitute another precision"
+                );
+            };
+            assert!(
+                err.contains("failed to open") || err.contains("failed to parse"),
+                "error must explain the missing/unreadable file; got: {err}"
+            );
+        }
+
+        #[test]
+        fn mmap_w3_weight_rejects_truncated_payload() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            // [2, 32] -> 2 blocks * 16 bytes = 32 payload bytes expected.
+            let path = write_synthetic_w3_file(tmp.path(), "gate_proj_trunc.w3", &[2, 32]);
+            let full_len = std::fs::metadata(&path).unwrap().len();
+            // Truncate to header + exactly one block (16 of the 32 payload
+            // bytes) — past `payload_offset` so the mmap-length assert
+            // passes, but short of the declared payload, so this must hit
+            // the fail-closed `Err` path, not read out-of-bounds memory.
+            let truncated_len = full_len - 16;
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(truncated_len).unwrap();
+
+            let Err(err) = mmap_w3_weight(
+                &device,
+                &path,
+                "gate_proj",
+                "mlp.gate_proj.weight",
+                &[2, 32],
+            ) else {
+                panic!("a truncated .w3 payload must be rejected, not read past the mapping");
+            };
+            assert!(
+                err.contains("truncated") && err.contains("Refusing to fall back"),
+                "error must name truncation and the no-fallback contract; got: {err}"
+            );
+        }
+
+        #[test]
+        fn mmap_w3_weight_accepts_well_formed_file() {
+            // Positive control for the four rejection tests above: a
+            // correctly-shaped, non-truncated .w3 file must load successfully
+            // so the rejection tests are proven to be testing the specific
+            // defect, not a universally-broken function.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().unwrap();
+            let path = write_synthetic_w3_file(tmp.path(), "gate_proj_ok.w3", &[2, 32]);
+
+            let buf = mmap_w3_weight(
+                &device,
+                &path,
+                "gate_proj",
+                "mlp.gate_proj.weight",
+                &[2, 32],
+            )
+            .expect("well-formed W3 file with matching shape must load");
+            assert_eq!(buf.n, 2);
+            assert_eq!(buf.k, 32);
+        }
 
         #[test]
         fn test_f32_f16_roundtrip_basic() {
@@ -21513,6 +22712,17 @@ impl MetalQwen35State {
     /// **Unstable**: load Q4/F16 directly stub; always fails without metal-gpu feature.
     pub fn from_q4_dir(
         _q4_dir: &std::path::Path,
+        _tokenizer_path: &std::path::Path,
+        _cfg: &crate::model::qwen35_config::Qwen35Config,
+        _max_cache_len: usize,
+    ) -> Result<Self, String> {
+        Err("Metal GPU not available (requires macOS + metal-gpu feature)".into())
+    }
+
+    /// **Unstable**: load a mixed W3/Q4/F16 directory stub (issue #420); always
+    /// fails without metal-gpu feature.
+    pub fn from_w3_mlp_dir(
+        _w3_mlp_dir: &std::path::Path,
         _tokenizer_path: &std::path::Path,
         _cfg: &crate::model::qwen35_config::Qwen35Config,
         _max_cache_len: usize,

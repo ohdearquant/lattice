@@ -67,6 +67,10 @@ name = "quantize_q4"
 path = "src/bin/quantize_q4.rs"
 
 [[bin]]
+name = "quantize_w3_mlp"
+path = "src/bin/quantize_w3_mlp.rs"
+
+[[bin]]
 name = "chat_metal"
 path = "src/bin/chat_metal.rs"
 required-features = ["f16", "metal-gpu"]

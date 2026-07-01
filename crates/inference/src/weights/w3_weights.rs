@@ -61,14 +61,21 @@
 //! `lm_head` remain on the existing Q4/f16 path — see
 //! `.khive/reports/w3_mlp_420_design.md` §"Non-goals".
 //!
-//! ## Status (see `impl_report.md` for the authoritative done-vs-designed split)
+//! ## Status
 //!
-//! DONE: CPU pack/dequant, `.w3` file I/O, MLP tensor-name classification.
-//! DESIGNED, NOT IMPLEMENTED: `quantize_w3_mlp` converter binary, the mixed
-//! W3/Q4 Metal loader (`from_w3_mlp_dir`), and the `gemv_w3_decode` /
-//! `gemm_w3` Metal kernels. Do not wire this module into any Metal forward
-//! path until those land — there is no dispatch code yet that consumes
-//! [`W3Tensor`] or `.w3` files.
+//! DONE: CPU pack/dequant, `.w3` file I/O, MLP tensor-name classification,
+//! the `quantize_w3_mlp` converter binary
+//! ([`crate::weights::w3_mlp_convert`]), the mixed W3/Q4/F16 Metal loader
+//! (`MetalQwen35State::from_w3_mlp_dir`), and the CPU
+//! [`crate::forward::cpu::gemv_w3_decode`] kernel.
+//!
+//! NOT YET LIVE: `from_w3_mlp_dir` loads and validates W3 MLP weights, but
+//! the Metal forward-pass dispatch sites (decode, prefill, batch verify) all
+//! fail closed with a clear error for W3 layers — there is no Metal
+//! `gemv_w3_decode`/`gemm_w3` kernel yet, and the CPU kernel cannot safely be
+//! invoked mid-encoder (see `encode_mlp_block` in `metal_qwen35.rs` for the
+//! command-buffer synchronization constraint). Follow-up tracked in the
+//! issue filed against #420.
 
 // W3 quantization operates on raw byte/u16 slices; unsafe is limited to the
 // transmute-equivalent slice casts in save/load, mirroring q4_weights.rs.
@@ -347,6 +354,35 @@ pub fn quantize_bf16_to_w3(data: &[u16], shape: &[usize]) -> Result<W3Tensor, In
         let mut vals = [0.0f32; 32];
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = bf16_to_f32(v);
+        }
+        blocks.push(quantize_block_w3(&vals)?);
+    }
+
+    Ok(W3Tensor {
+        blocks,
+        shape: shape.to_vec(),
+        original_len,
+    })
+}
+
+/// Quantize an `F16` tensor (raw `u16` IEEE-754 half-precision bit patterns)
+/// into a [`W3Tensor`].
+///
+/// # Errors
+///
+/// Returns [`InferenceError::ShapeMismatch`] if `shape.iter().product() !=
+/// data.len()`, or [`InferenceError::InvalidInput`] if any F16 value decodes
+/// to a non-finite f32 (NaN or ±inf).
+pub fn quantize_f16_to_w3(data: &[u16], shape: &[usize]) -> Result<W3Tensor, InferenceError> {
+    checked_shape_matches_data_len(shape, data.len())?;
+    let original_len = data.len();
+    let n_blocks = original_len.div_ceil(W3_GROUP_SIZE);
+    let mut blocks = Vec::with_capacity(n_blocks);
+
+    for chunk in data.chunks(W3_GROUP_SIZE) {
+        let mut vals = [0.0f32; 32];
+        for (i, &v) in chunk.iter().enumerate() {
+            vals[i] = w3_f16_to_f32(v);
         }
         blocks.push(quantize_block_w3(&vals)?);
     }
@@ -835,6 +871,31 @@ mod tests {
         let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
         let result = quantize_bf16_to_w3(&data, &[3, 32]); // 96 != 64
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quantize_f16_to_w3_rejects_shape_mismatch() {
+        let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
+        let result = quantize_f16_to_w3(&data, &[3, 32]); // 96 != 64
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quantize_f16_to_w3_and_dequantize_roundtrip() {
+        // f16 bit patterns for 0.0 .. 3.0 in steps, well within f16 range.
+        let f32_vals: Vec<f32> = (0..32).map(|i| i as f32 * 7.0 / 31.0).collect();
+        let f16_vals: Vec<u16> = f32_vals.iter().map(|&v| w3_f32_to_f16(v)).collect();
+        let tensor = quantize_f16_to_w3(&f16_vals, &[32]).unwrap();
+        assert_eq!(tensor.shape, vec![32]);
+        assert_eq!(tensor.original_len, 32);
+        let out = dequantize_w3_to_f32(&tensor);
+        assert_eq!(out.len(), 32);
+        let max_err = f32_vals
+            .iter()
+            .zip(&out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err <= 0.6, "max abs error {max_err:.4} too large");
     }
 
     #[test]
