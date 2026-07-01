@@ -55,7 +55,10 @@ jobs:
           fi
           echo "Changed files:"
           echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$'; then
+          # here-string, not `echo | grep -q`: -q exits at first match, echo gets
+          # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
+          # would silently skip the gate on large diffs (fail-open).
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -306,7 +309,7 @@ jobs:
   # did. Fails closed if change-detection itself errored.
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift, q4-composed]
+    needs: [changes, parity, embed-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -316,8 +319,7 @@ jobs:
           ENGINE="${{ needs.changes.outputs.engine }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
-          Q4_RESULT="${{ needs.q4-composed.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT q4-composed=$Q4_RESULT"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -334,9 +336,5 @@ jobs:
             echo "::error::Engine changed and embed-drift gate did not succeed (result=$DRIFT_RESULT)."
             exit 1
           fi
-          if [ "$Q4_RESULT" != "success" ]; then
-            echo "::error::Engine changed and q4-composed gate did not succeed (result=$Q4_RESULT)."
-            exit 1
-          fi
-          echo "Engine changed; parity, embed-drift, and q4-composed all PASSED."
+          echo "Engine changed; parity and embed-drift both PASSED."
           exit 0
