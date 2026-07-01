@@ -55,7 +55,7 @@ jobs:
           fi
           echo "Changed files:"
           echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$'; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -128,8 +128,7 @@ jobs:
 
       # Step 5: run parity check (HF first = warm machine, then lattice)
       - name: Run e2e parity check
-        run: |
-          python3 scripts/e2e_parity_check.py | tee parity-report.md
+        run: python3 scripts/e2e_parity_check.py
         env:
           E2E_REPORT_PATH: parity-report.md
 
