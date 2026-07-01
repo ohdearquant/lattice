@@ -3779,6 +3779,11 @@ kernel void gdn_chunk_norm_silu_c32(
         norm: Buffer, // [hidden]
     }
 
+    struct MtpQ4LoadResult {
+        weights: Option<MetalMtpWeights>,
+        first_missing_file: Option<std::path::PathBuf>,
+    }
+
     pub(crate) struct MetalMtpCache {
         k_buf: Buffer,
         v_buf: Buffer,
@@ -13919,128 +13924,125 @@ kernel void gdn_chunk_norm_silu_c32(
 
         /// Load MTP weights from a Q4 directory and build `MetalMtpRuntime`.
         ///
-        /// Returns `None` if the model has no MTP layers or if any weight file is missing
-        /// (soft failure — caller falls back to non-MTP decode).
+        /// Returns no weights if the model has no MTP layers or if any weight file is
+        /// missing; in the latter case the first missing file path is carried in the
+        /// result so the caller can warn instead of silently falling back.
         fn load_mtp_q4_weights(
             q4_dir: &std::path::Path,
             cfg: &Qwen35Config,
             device: &Device,
-        ) -> Option<MetalMtpWeights> {
+        ) -> MtpQ4LoadResult {
             use crate::weights::q4_weights::load_f16_tensor_file;
 
             if cfg.mtp_num_hidden_layers == 0 {
-                return None;
+                return MtpQ4LoadResult {
+                    weights: None,
+                    first_missing_file: None,
+                };
             }
 
-            // Fail-loud (#418): a speculation feature must never silently disable itself.
-            // When the operator explicitly requests MTP via the env var but a weight file
-            // is missing (the shipped Q4 checkpoint stores the 8 MTP projections as `.q4`
-            // while this loader reads `.f16`), warn and name the file instead of returning
-            // `None` into a silent no-op that decodes at the plain baseline.
-            let want_mtp = std::env::var_os("LATTICE_MTP").is_some();
-
             let f16p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "f16");
+            // follow-up: #418's actual-load part is deferred; this loader still expects .f16 MTP files while the shipped Q4 checkpoint provides those weights as .q4.
 
             // Helper: load an f16 file as a f32 Metal buffer (for norm gammas / biases
             // consumed by RMSNorm kernels that read f32 input).
-            let load_f16_buf_as_f32 = |name: &str, label: &str| -> Option<Buffer> {
-                let path = f16p(name);
-                if !path.exists() {
-                    if want_mtp {
-                        eprintln!(
-                            "[mtp] WARNING: LATTICE_MTP is set but MTP weight file is \
-                             missing: {} — MTP speculation DISABLED, decoding at the plain \
-                             baseline (see issue #418).",
-                            path.display()
-                        );
+            let load_f16_buf_as_f32 =
+                |name: &str, label: &str| -> Result<Buffer, std::path::PathBuf> {
+                    let path = f16p(name);
+                    if !path.exists() {
+                        return Err(path);
                     }
-                    return None;
-                }
-                let (vals, _) = load_f16_tensor_file(&path).ok()?;
-                Some(make_buffer(device, &vals, label))
-            };
+                    let (vals, _) = load_f16_tensor_file(&path).map_err(|_| path.clone())?;
+                    Ok(make_buffer(device, &vals, label))
+                };
 
             // Helper: load an f16 file as a Metal half-precision (f16) buffer for use
             // by `dispatch_matmul_half` / `gemv_decode_m1`. ADR-051 Phase 1 mandates
             // f16 storage for the 8 MTP projection matrices so the runtime applies
             // counter-rotation on unquantized weights.
-            let load_f16_buf_as_half = |name: &str, label: &str| -> Option<Buffer> {
-                let path = f16p(name);
-                if !path.exists() {
-                    if want_mtp {
-                        eprintln!(
-                            "[mtp] WARNING: LATTICE_MTP is set but MTP weight file is \
-                             missing: {} — MTP speculation DISABLED, decoding at the plain \
-                             baseline (see issue #418).",
-                            path.display()
-                        );
+            let load_f16_buf_as_half =
+                |name: &str, label: &str| -> Result<Buffer, std::path::PathBuf> {
+                    let path = f16p(name);
+                    if !path.exists() {
+                        return Err(path);
                     }
-                    return None;
-                }
-                let (vals, _) = load_f16_tensor_file(&path).ok()?;
-                Some(make_buffer_f16(device, &vals, label))
-            };
+                    let (vals, _) = load_f16_tensor_file(&path).map_err(|_| path.clone())?;
+                    Ok(make_buffer_f16(device, &vals, label))
+                };
 
-            // --- Layer 0 weights (ADR-051: 8 projections as f16, 7 norms as f32) ---
-            let input_layernorm = load_f16_buf_as_f32(
-                "mtp.layers.0.input_layernorm.weight",
-                "mtp.l0.input_layernorm",
-            )?;
-            let post_attention_layernorm = load_f16_buf_as_f32(
-                "mtp.layers.0.post_attention_layernorm.weight",
-                "mtp.l0.post_attn_layernorm",
-            )?;
-            let q_proj =
-                load_f16_buf_as_half("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
-            let k_proj =
-                load_f16_buf_as_half("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
-            let v_proj =
-                load_f16_buf_as_half("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
-            let o_proj =
-                load_f16_buf_as_half("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
-            let q_norm =
-                load_f16_buf_as_f32("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
-            let k_norm =
-                load_f16_buf_as_f32("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
-            let gate_proj =
-                load_f16_buf_as_half("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
-            let up_proj =
-                load_f16_buf_as_half("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
-            let down_proj =
-                load_f16_buf_as_half("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
+            let weights = (|| -> Result<MetalMtpWeights, std::path::PathBuf> {
+                // --- Layer 0 weights (ADR-051: 8 projections as f16, 7 norms as f32) ---
+                let input_layernorm = load_f16_buf_as_f32(
+                    "mtp.layers.0.input_layernorm.weight",
+                    "mtp.l0.input_layernorm",
+                )?;
+                let post_attention_layernorm = load_f16_buf_as_f32(
+                    "mtp.layers.0.post_attention_layernorm.weight",
+                    "mtp.l0.post_attn_layernorm",
+                )?;
+                let q_proj =
+                    load_f16_buf_as_half("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
+                let k_proj =
+                    load_f16_buf_as_half("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
+                let v_proj =
+                    load_f16_buf_as_half("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
+                let o_proj =
+                    load_f16_buf_as_half("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
+                let q_norm =
+                    load_f16_buf_as_f32("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
+                let k_norm =
+                    load_f16_buf_as_f32("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
+                let gate_proj =
+                    load_f16_buf_as_half("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
+                let up_proj =
+                    load_f16_buf_as_half("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
+                let down_proj =
+                    load_f16_buf_as_half("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
 
-            // --- Top-level MTP weights ---
-            let fc = load_f16_buf_as_half("mtp.fc.weight", "mtp.fc")?;
-            let pre_fc_norm_embedding = load_f16_buf_as_f32(
-                "mtp.pre_fc_norm_embedding.weight",
-                "mtp.pre_fc_norm_embedding",
-            )?;
-            let pre_fc_norm_hidden =
-                load_f16_buf_as_f32("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden")?;
-            let norm = load_f16_buf_as_f32("mtp.norm.weight", "mtp.norm")?;
+                // --- Top-level MTP weights ---
+                let fc = load_f16_buf_as_half("mtp.fc.weight", "mtp.fc")?;
+                let pre_fc_norm_embedding = load_f16_buf_as_f32(
+                    "mtp.pre_fc_norm_embedding.weight",
+                    "mtp.pre_fc_norm_embedding",
+                )?;
+                let pre_fc_norm_hidden =
+                    load_f16_buf_as_f32("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden")?;
+                let norm = load_f16_buf_as_f32("mtp.norm.weight", "mtp.norm")?;
 
-            eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
-            Some(MetalMtpWeights {
-                fc,
-                pre_fc_norm_embedding,
-                pre_fc_norm_hidden,
-                layers: vec![MetalMtpLayerWeights {
-                    input_layernorm,
-                    post_attention_layernorm,
-                    q_proj,
-                    k_proj,
-                    v_proj,
-                    o_proj,
-                    q_norm,
-                    k_norm,
-                    mlp: MetalMtpDenseMlpWeights {
-                        gate_proj,
-                        up_proj,
-                        down_proj,
-                    },
-                }],
-                norm,
-            })
+                eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
+                Ok(MetalMtpWeights {
+                    fc,
+                    pre_fc_norm_embedding,
+                    pre_fc_norm_hidden,
+                    layers: vec![MetalMtpLayerWeights {
+                        input_layernorm,
+                        post_attention_layernorm,
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                        o_proj,
+                        q_norm,
+                        k_norm,
+                        mlp: MetalMtpDenseMlpWeights {
+                            gate_proj,
+                            up_proj,
+                            down_proj,
+                        },
+                    }],
+                    norm,
+                })
+            })();
+
+            match weights {
+                Ok(weights) => MtpQ4LoadResult {
+                    weights: Some(weights),
+                    first_missing_file: None,
+                },
+                Err(first_missing_file) => MtpQ4LoadResult {
+                    weights: None,
+                    first_missing_file: Some(first_missing_file),
+                },
+            }
         }
 
         /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
@@ -14772,7 +14774,18 @@ kernel void gdn_chunk_norm_silu_c32(
             let _ = tokenizer_path;
 
             // Load MTP weights (cache+activations go into session, not engine).
-            let mtp_weights_opt = Self::load_mtp_q4_weights(q4_dir, cfg, &device);
+            let mtp_requested = std::env::var_os("LATTICE_MTP").is_some();
+            let MtpQ4LoadResult {
+                weights: mtp_weights_opt,
+                first_missing_file: mtp_missing_file,
+            } = Self::load_mtp_q4_weights(q4_dir, cfg, &device);
+            if let Some(message) = super::mtp_missing_weights_warning(
+                mtp_requested,
+                mtp_weights_opt.is_some(),
+                mtp_missing_file.as_deref(),
+            ) {
+                tracing::warn!("{}", message);
+            }
             let mtp_session = mtp_weights_opt.as_ref().map(|_| {
                 let cache = MetalMtpCache {
                     k_buf: make_zero_buffer(&device, max_cache_len * kv_dim, "mtp.kv_k"),
@@ -20815,6 +20828,27 @@ mod multimodal_preflight_tests {
     }
 }
 
+/// Pure decision for whether to warn that MTP was requested but its weights
+/// did not load, and with which message.
+///
+/// Lives at module level (no cfg gate) so it compiles and is unit-testable on
+/// every platform without Metal GPU hardware.
+pub fn mtp_missing_weights_warning(
+    mtp_requested: bool,
+    mtp_loaded: bool,
+    missing_file: Option<&std::path::Path>,
+) -> Option<String> {
+    if !mtp_requested || mtp_loaded {
+        return None;
+    }
+
+    let missing_file = missing_file?;
+    Some(format!(
+        "LATTICE_MTP=1 requested MTP, but first required weight file is missing: {}; MTP is DISABLED, decode falls back to the plain path.",
+        missing_file.display()
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Pure, GPU-free decision logic for the greedy MTP loop.
 //
@@ -21055,6 +21089,36 @@ impl MetalQwen35State {
 //   C: reject + replacement is stop → oracle emits [..., pending, replacement];
 //      simulation must emit the same.
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod mtp_load_warning_tests {
+    use super::mtp_missing_weights_warning;
+    use std::path::Path;
+
+    #[test]
+    fn requested_missing_mtp_weights_warns_and_disables() {
+        let warning = mtp_missing_weights_warning(
+            true,
+            false,
+            Some(Path::new("mtp_layers_0_self_attn_q_proj_weight.f16")),
+        );
+
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "LATTICE_MTP=1 requested MTP, but first required weight file is missing: mtp_layers_0_self_attn_q_proj_weight.f16; MTP is DISABLED, decode falls back to the plain path."
+            )
+        );
+    }
+
+    #[test]
+    fn loaded_or_not_requested_mtp_weights_do_not_warn() {
+        let path = Some(Path::new("mtp_layers_0_self_attn_q_proj_weight.f16"));
+
+        assert_eq!(mtp_missing_weights_warning(true, true, path), None);
+        assert_eq!(mtp_missing_weights_warning(false, false, path), None);
+    }
+}
+
 #[cfg(test)]
 mod mtp_greedy_round_tests {
     use super::{MtpRoundOutcome, mtp_greedy_round};
