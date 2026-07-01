@@ -8302,7 +8302,22 @@ kernel void gdn_chunk_norm_silu_c32(
         /// GPU dispatch. The tokenizer-bounded generate path never triggers this; it
         /// can only be reached by a library consumer calling the raw entry point with
         /// an out-of-vocabulary id.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// This is a public raw-forward entry point that advances live KV/GDN
+        /// state outside the cache-aware generation family's ownership, so it
+        /// must clear any retained [`MetalCrossTurnPrefixCache`] entry before
+        /// mutating — otherwise a later `generate_streaming_with_prefix_cache`
+        /// call could restore a GDN snapshot for KV rows this call already
+        /// overwrote. Safe to call from inside the cache-aware decode loop
+        /// itself: by the time that loop reaches its own `forward_step` call,
+        /// `restore_cross_turn_prefix` has already `take()`-n (ExactAppend) or
+        /// `reset_state()` has already cleared (FullRefill) the slot's entry,
+        /// so this clear is a no-op there — the cache-aware path never has a
+        /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_step_inner(token_id, position, false).logits
         }
 
@@ -8429,7 +8444,17 @@ kernel void gdn_chunk_norm_silu_c32(
         /// runs once at the entry point before any GPU work. The tokenizer-bounded
         /// generate path never triggers this; it can only be reached by a library
         /// consumer passing raw ids with an out-of-vocabulary value.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
+        /// comment for the invariant this enforces. `generate`/`generate_streaming`/
+        /// `generate_multimodal`/`compute_token_nlls` all call this after their own
+        /// `reset_state()`, which has already cleared the cache, so this clear is a
+        /// no-op on those paths; it only matters for a consumer calling this
+        /// entry point directly against a state with a live retained entry.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_prefill_impl(token_ids, false)
         }
 
@@ -8444,7 +8469,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// # Panics
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
+        /// comment for the invariant this enforces.
         pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_prefill_impl(token_ids, true)
         }
 
@@ -15353,6 +15384,15 @@ kernel void gdn_chunk_norm_silu_c32(
         }
     }
 
+    // #516 round-2 D7: `MtpTargetVerifier` is a public trait and this impl's
+    // mutating methods (`rollback_cache_to`, `verify_tokens`) advance live
+    // KV/GDN state exactly like `forward_step`/`forward_prefill` — they are
+    // not currently wired into any live Metal generate loop (Metal MTP decode
+    // uses `mtp_greedy_round`, a self-contained mechanism; `mtp_verify_draft`
+    // is only exercised from benches today), but a consumer holding a
+    // `&mut MetalQwen35State` and `use`-ing this trait can call them directly,
+    // so they are part of the public raw-forward boundary and must clear the
+    // retained cross-turn entry before mutating, same as the inherent methods.
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
         fn cache_position(&self) -> usize {
             self.session.kv_cache.seq_len
@@ -15362,6 +15402,7 @@ kernel void gdn_chunk_norm_silu_c32(
             &mut self,
             seq_len: usize,
         ) -> Result<(), crate::error::InferenceError> {
+            self.cross_turn_prefix_cache.clear();
             self.rollback_speculative_state_to(seq_len)
         }
 
@@ -15370,6 +15411,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            self.cross_turn_prefix_cache.clear();
             let out = self.verify_tokens_batched(tokens, start_pos)?;
             Ok(out.logits)
         }
@@ -22139,6 +22181,109 @@ kernel void decode_attention_reference(
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "unload_lora_adapter must clear the retained cross-turn entry"
+            );
+        }
+
+        /// Round-2 D7 (codex blocker): a public raw-forward call
+        /// (`forward_step`) interleaved between two cache-aware calls on the
+        /// SAME slot must invalidate the retained entry, exactly like
+        /// `generate_streaming`'s `reset_state()` does for finding 2's
+        /// plain-path leg (D3, `cross_turn_cache_interleaved_plain_path_invalidates`
+        /// above) — `forward_step` mutates the same live KV/GDN buffers
+        /// without ever routing through `reset_state` or the cache's own
+        /// save path, so it is a second, independent way to leave a stale
+        /// entry pointing at overwritten state.
+        ///
+        /// Uses a strictly-longer continuation of the ORIGINAL conversation
+        /// (append one extra character) for the second call, same as D3's
+        /// test: an exact-equal retry would independently trip D5's
+        /// `FullRefill` guard (`cross_turn_cache_exact_equal_retry_full_refills`)
+        /// and mask whether D7's clear is actually doing anything.
+        ///
+        /// Mutation sensitivity: reverting D7 (removing
+        /// `self.cross_turn_prefix_cache.clear()` from `forward_step`) makes
+        /// this test fail — see the reverse-apply evidence recorded in the
+        /// PR body.
+        #[test]
+        fn cross_turn_cache_interleaved_raw_forward_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(31, 2);
+
+            // Save a cross-turn entry via the cache-aware path (slot A's
+            // only slot, since `MetalCrossTurnPrefixCache` retains at most
+            // one live entry across the whole state — see D1).
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: the first cache-aware call must actually retain an entry"
+            );
+
+            // Interleave a raw public forward call on an unrelated token
+            // stream. This is the exact stale path codex named: `forward_step`
+            // advances `self.session.kv_cache` / GDN state directly, bypassing
+            // both `reset_state()` (D3's guard) and the cache-aware save path.
+            let _ = state.forward_step(0, 0);
+
+            // The raw call must have invalidated the retained entry outright
+            // (not just left it stale) — this is what D7 adds.
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "forward_step must clear the retained cross-turn entry before mutating live state"
+            );
+
+            // Strict-append continuation of the ORIGINAL slot's conversation:
+            // if the entry had survived, this shape would still satisfy D5's
+            // `len > shared` guard and look like a valid ExactAppend, so the
+            // assertion below is genuinely exercising D7 and not being masked
+            // by D5.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an interleaved raw forward_step call must force a full refill, not a stale restore"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a raw-forward-invalidated entry must never be restored via ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after an interleaved raw forward_step call, output must still match full re-prefill"
             );
         }
     }
