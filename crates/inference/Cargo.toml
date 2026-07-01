@@ -22,6 +22,9 @@ train-backward = []
 # blend_lora_layer_data and generate_with_lora_mixture do NOT require this
 # feature — they are always available.
 mixture = ["dep:lattice-fann"]
+# GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
+# Opt-in only: the default decode path stays byte-identical when this is off.
+gdn-state-counters = []
 
 [dependencies]
 half.workspace = true
@@ -160,6 +163,10 @@ required-features = ["f16", "metal-gpu"]
 [[example]]
 name = "decode_profile"
 required-features = ["f16", "metal-gpu"]
+
+[[example]]
+name = "bench_gdn_state"
+required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
