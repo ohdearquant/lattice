@@ -263,8 +263,18 @@ fn full_attention_step_q8(
     rope: &RopeTable,
     hidden: usize,
 ) {
-    // Read input from attn_out (where caller placed it)
-    let input: Vec<f32> = scratch.attn_out[..hidden].to_vec();
+    // Read input from attn_out (where caller placed it). Scoped destructure so
+    // the `attn_out` read and `input_tmp` write borrow disjoint fields instead
+    // of aliasing through `scratch` — avoids a fresh-Vec clone (#416).
+    {
+        let ForwardScratch {
+            attn_out,
+            input_tmp,
+            ..
+        } = scratch;
+        let src = &attn_out[..hidden];
+        input_tmp[..hidden].copy_from_slice(src);
+    }
     let q_dim = cfg.full_q_dim();
     let kv_dim = cfg.full_kv_dim();
     let head_dim = cfg.head_dim;
@@ -275,40 +285,50 @@ fn full_attention_step_q8(
     // Q projection produces [Q, gate] interleaved per head:
     // view(num_heads, head_dim*2) -> chunk(2) -> Q[num_heads, head_dim], gate[num_heads, head_dim]
     let q_proj_dim = 2 * q_dim;
-    let mut q_and_gate = vec![0.0f32; q_proj_dim];
-    matmul_bt_q8(
-        &input,
-        &weights.q_proj,
-        &mut q_and_gate,
-        1,
-        hidden,
-        q_proj_dim,
-    );
-    // Scatter per-head: each head has [Q_h, gate_h] of size head_dim*2
-    let mut gate_z = vec![0.0f32; q_dim];
-    for h in 0..num_q_heads {
-        let src = h * head_dim * 2;
-        let dst = h * head_dim;
-        scratch.q_buf[dst..dst + head_dim].copy_from_slice(&q_and_gate[src..src + head_dim]);
-        gate_z[dst..dst + head_dim]
-            .copy_from_slice(&q_and_gate[src + head_dim..src + head_dim * 2]);
+    {
+        let ForwardScratch {
+            input_tmp,
+            q_and_gate,
+            ..
+        } = scratch;
+        matmul_bt_q8(
+            &input_tmp[..hidden],
+            &weights.q_proj,
+            &mut q_and_gate[..q_proj_dim],
+            1,
+            hidden,
+            q_proj_dim,
+        );
     }
-    matmul_bt_q8(
-        &input,
-        &weights.k_proj,
-        &mut scratch.k_buf[..kv_dim],
-        1,
-        hidden,
-        kv_dim,
-    );
-    matmul_bt_q8(
-        &input,
-        &weights.v_proj,
-        &mut scratch.v_buf[..kv_dim],
-        1,
-        hidden,
-        kv_dim,
-    );
+    // Scatter per-head: each head has [Q_h, gate_h] of size head_dim*2. The
+    // block above ends before this call so `split_q_and_gate` can take `&mut self`.
+    scratch.split_q_and_gate(num_q_heads, head_dim);
+    {
+        let ForwardScratch {
+            input_tmp, k_buf, ..
+        } = scratch;
+        matmul_bt_q8(
+            &input_tmp[..hidden],
+            &weights.k_proj,
+            &mut k_buf[..kv_dim],
+            1,
+            hidden,
+            kv_dim,
+        );
+    }
+    {
+        let ForwardScratch {
+            input_tmp, v_buf, ..
+        } = scratch;
+        matmul_bt_q8(
+            &input_tmp[..hidden],
+            &weights.v_proj,
+            &mut v_buf[..kv_dim],
+            1,
+            hidden,
+            kv_dim,
+        );
+    }
 
     // Per-head QK-norm (Qwen3.5 RMSNorm: 1 + gamma, f32 norms)
     for h in 0..num_q_heads {
@@ -427,9 +447,14 @@ fn full_attention_step_q8(
     }
 
     // Output gating: attn_output *= sigmoid(gate)
-    for (ctx, &gz) in scratch.context[..q_dim].iter_mut().zip(&gate_z[..q_dim]) {
-        let sig = 1.0 / (1.0 + (-gz).exp());
-        *ctx *= sig;
+    {
+        let ForwardScratch {
+            context, gate_z, ..
+        } = scratch;
+        for (ctx, &gz) in context[..q_dim].iter_mut().zip(&gate_z[..q_dim]) {
+            let sig = 1.0 / (1.0 + (-gz).exp());
+            *ctx *= sig;
+        }
     }
 
     // Output projection: context [1, q_dim] @ o_proj^T [hidden, q_dim] (Q8 weights)
@@ -460,26 +485,46 @@ fn ffn_step_q8(
 ) {
     let inter = cfg.intermediate_size;
 
-    // Read input from ffn_out (where caller placed it)
-    let input: Vec<f32> = scratch.ffn_out[..hidden].to_vec();
+    // Read input from ffn_out (where caller placed it). Scoped destructure so
+    // the `ffn_out` read and `input_tmp` write borrow disjoint fields instead
+    // of aliasing through `scratch` — avoids a fresh-Vec clone (#416).
+    {
+        let ForwardScratch {
+            ffn_out, input_tmp, ..
+        } = scratch;
+        let src = &ffn_out[..hidden];
+        input_tmp[..hidden].copy_from_slice(src);
+    }
 
     // gate = gate_proj(input), up = up_proj(input) (Q8 weights)
-    matmul_bt_q8(
-        &input,
-        &common.gate_proj,
-        &mut scratch.gate_buf[..inter],
-        1,
-        hidden,
-        inter,
-    );
-    matmul_bt_q8(
-        &input,
-        &common.up_proj,
-        &mut scratch.up_buf[..inter],
-        1,
-        hidden,
-        inter,
-    );
+    {
+        let ForwardScratch {
+            input_tmp,
+            gate_buf,
+            ..
+        } = scratch;
+        matmul_bt_q8(
+            &input_tmp[..hidden],
+            &common.gate_proj,
+            &mut gate_buf[..inter],
+            1,
+            hidden,
+            inter,
+        );
+    }
+    {
+        let ForwardScratch {
+            input_tmp, up_buf, ..
+        } = scratch;
+        matmul_bt_q8(
+            &input_tmp[..hidden],
+            &common.up_proj,
+            &mut up_buf[..inter],
+            1,
+            hidden,
+            inter,
+        );
+    }
 
     // SwiGLU: silu(gate) * up
     silu_inplace(&mut scratch.gate_buf[..inter]);
