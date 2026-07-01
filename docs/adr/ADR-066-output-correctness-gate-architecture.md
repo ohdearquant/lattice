@@ -1,6 +1,6 @@
 # ADR-066: Output-Correctness Gate Architecture
 
-- Status: Proposed (rollout items in D6 require founder sign-off per ADR-064 D7)
+- Status: Accepted (founder resolved F-1 through F-4 on 2026-07-01; dispositions recorded in D6)
 - Date: 2026-07-01
 - Depends on: ADR-064 (CI gate taxonomy), ADR-065 (feature promotion gates), ADR-063 (serving architecture)
 - Supersedes: nothing (fills the gap ADR-064's verified-absence ledger and D6 table point at)
@@ -149,6 +149,19 @@ instances of this ADR's L2/L3 layers and inherit its design rather than each re-
 | F-2 | Extend required `parity-gate` to include the Metal leg (#239) and Q4/QuaRot artifact leg (#320) once stable | Longer PR CI; macOS runner minutes |
 | F-3 | Self-hosted M2 Max runner for L3 nightly (PPL tiers, long-generation, #167 perf gates) | Hardware + maintenance; the only path to non-paravirtual Metal signal |
 | F-4 | Any change to review requirements or bypass actors (`required_approving_review_count: 0`, RepositoryRole bypass) | Governance; out of automated hands entirely |
+
+**Founder dispositions (2026-07-01, approved as recommended):**
+
+- F-1: **Approved.** `app-binaries` aggregator becomes a required context once the
+  non-required job (item 5 below) exists and is green.
+- F-2: **Approved, phased.** The Metal leg (#239) and Q4/QuaRot artifact leg (#320) land as
+  non-required jobs first; promotion to required contexts after two weeks of green runs
+  (review checkpoint 2026-07-15).
+- F-3: **Approved, schedule-only.** The self-hosted runner workflow runs on `schedule` against
+  `main` only, never on pull requests (public-repo fork-PR code execution risk). The workflow
+  ships dormant; runner registration waits on founder-designated hardware.
+- F-4: **Keep as is.** Zero required approvals and RepositoryRole bypass remain while the repo
+  is effectively solo; revisit when outside contributors arrive.
 
 **Immediately actionable without founder sign-off** (no required-context changes, no spend):
 
