@@ -5812,7 +5812,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 #[cfg(feature = "gdn-state-counters")]
                 gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
                     Some(GdnStateTrafficCounters::new(
-                        GdnStateTrafficShape::try_from_config(cfg).map_err(|e| e.to_string())?,
+                        GdnStateTrafficShape::try_from_config(cfg)
+                            .map_err(|e| e.to_string())?
+                            .with_allocated_layers(num_linear),
                     ))
                 } else {
                     None
@@ -15058,7 +15060,8 @@ kernel void gdn_chunk_norm_silu_c32(
                     gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
                         Some(GdnStateTrafficCounters::new(
                             GdnStateTrafficShape::try_from_config(cfg)
-                                .map_err(|e| e.to_string())?,
+                                .map_err(|e| e.to_string())?
+                                .with_allocated_layers(num_linear),
                         ))
                     } else {
                         None
@@ -21221,6 +21224,21 @@ impl GdnStateTrafficShape {
             allocated_state_bytes,
         })
     }
+
+    /// Re-points `allocated_gdn_layers` / `allocated_state_bytes` at the GDN
+    /// state buffers actually allocated for this session. `try_from_config`
+    /// defaults `allocated` to the architectural `num_linear_attention_layers()`
+    /// (what the f16 constructor allocates), but the Q4 constructor allocates
+    /// only `num_active_linear_attention_layers()` buffers. The checkpoint /
+    /// restore blit copies exactly the allocated buffers, so `record_copy` must
+    /// charge the real count to avoid overcounting a pruned Q4 session.
+    pub fn with_allocated_layers(mut self, allocated_gdn_layers: usize) -> Self {
+        self.allocated_gdn_layers = allocated_gdn_layers;
+        self.allocated_state_bytes = self
+            .per_layer_state_bytes
+            .saturating_mul(allocated_gdn_layers as u64);
+        self
+    }
 }
 
 /// Read/write/copy byte totals for one traffic scope (decode or MTP verify).
@@ -21352,8 +21370,12 @@ mod gdn_state_traffic_tests {
         assert_eq!(shape.active_state_bytes, 20_201_472);
     }
 
-    /// Pruning an active layer must shrink `active_gdn_layers` while leaving
-    /// `allocated_gdn_layers` (and therefore checkpoint-copy sizing) unchanged.
+    /// `try_from_config` defaults `allocated_gdn_layers` to the architectural
+    /// `num_linear_attention_layers()` (the f16 constructor's allocation), so
+    /// pruning an active layer shrinks `active_gdn_layers` while leaving the
+    /// config-level `allocated_gdn_layers` unchanged. The Q4 constructor's
+    /// smaller allocation is covered by
+    /// `gdn_state_traffic_with_allocated_layers_matches_real_buffer_count`.
     #[test]
     fn gdn_state_traffic_shape_pruned_active_layers_keeps_allocated_copy_size() {
         let mut cfg = Qwen35Config::qwen35_0_8b();
@@ -21367,6 +21389,33 @@ mod gdn_state_traffic_tests {
         assert_eq!(shape.active_gdn_layers, 17);
         assert_eq!(shape.allocated_gdn_layers, 18);
         assert_ne!(shape.active_state_bytes, shape.allocated_state_bytes);
+    }
+
+    /// The Q4 constructor allocates only `num_active_linear_attention_layers()`
+    /// GDN buffers, so its checkpoint/restore blit copies that many. Mutation
+    /// sensitivity: `with_allocated_layers` must re-point `allocated_state_bytes`
+    /// at the real buffer count so `record_copy` does not overcount a pruned Q4
+    /// session (dropping the recompute leaves the architectural 18-layer total).
+    #[test]
+    fn gdn_state_traffic_with_allocated_layers_matches_real_buffer_count() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        let pruned_idx = (0..cfg.num_hidden_layers)
+            .find(|&i| !cfg.is_full_attention(i))
+            .expect("0.8B preset has at least one linear-attention layer");
+        cfg.layer_mask[pruned_idx] = false;
+
+        let active = cfg.num_active_linear_attention_layers();
+        let shape = GdnStateTrafficShape::try_from_config(&cfg)
+            .expect("shape from pruned config")
+            .with_allocated_layers(active);
+
+        assert_eq!(active, 17);
+        assert_eq!(shape.allocated_gdn_layers, 17);
+        assert_eq!(
+            shape.allocated_state_bytes,
+            shape.per_layer_state_bytes * 17
+        );
+        assert_eq!(shape.allocated_state_bytes, shape.active_state_bytes);
     }
 
     /// Mutation sensitivity: removing any of the decode layer-access, MTP
