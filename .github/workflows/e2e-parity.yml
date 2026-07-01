@@ -148,6 +148,105 @@ jobs:
           header: e2e-parity
           path: parity-report.md
 
+  # Non-required Metal attention/KV-cache parity leg (issue #239). e2e-parity
+  # only ever exercised the CPU (qwen35_generate) path above; this job exists
+  # to prove the Metal attention/KV dispatch helpers actually ran, not just
+  # that a Metal device was present.
+  #
+  # Gotcha (do not "fix" by adding an Apple7 family check): GitHub's
+  # macos-latest runner exposes a PARAVIRTUAL Metal device. Apple7-gated
+  # kernels silently no-op there, so a naive "did it run" check can go green
+  # without exercising anything. The audited attention/KV pipelines this job
+  # targets are NOT Apple7-gated (only the optional tiled-GEMM path is), so
+  # `runs-on: macos-latest` is expected to genuinely execute them — but the
+  # gate does not trust that assumption. scripts/e2e_parity_check.py
+  # --backend metal requires the runtime LATTICE_METAL_PATH_PROOF marker
+  # (dispatch-site counters emitted by chat_metal) and FAILS CLOSED — never
+  # skip-as-green — if the marker is missing or any required counter is zero.
+  # If a future CI run proves the hosted runner cannot execute the required
+  # kernels despite this, switch only `runs-on` to
+  # `[self-hosted, macOS, ARM64, metal]` and document why.
+  #
+  # Deliberately NOT added to parity-gate.needs below: this is an informational
+  # signal only. Making it required is a founder decision (repo branch
+  # protection), out of scope for this change.
+  metal-parity:
+    name: metal attention parity (informational)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: e2e-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      - name: Install Python deps
+        run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
+
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          path = snapshot_download('Qwen/Qwen3.5-0.8B')
+          print(f'Model at: {path}')
+          "
+
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-metal-parity
+
+      - name: Build lattice Metal binary
+        run: cargo build --release --bin chat_metal -p lattice-inference --features "f16,metal-gpu"
+
+      - name: Run Metal attention/KV parity check
+        run: |
+          python3 scripts/e2e_parity_check.py --backend metal | tee metal-parity-report.md
+        env:
+          LATTICE_BIN: target/release/chat_metal
+          LATTICE_METAL_PATH_PROOF: '1'
+          E2E_MAX_TOKENS: '4'
+          E2E_REPORT_PATH: metal-parity-report.md
+
+      - name: Ensure Metal report exists
+        if: always()
+        run: |
+          test -s metal-parity-report.md || {
+            printf '## Metal Attention/KV Parity Report\n\nNo report was produced. Check job logs.\n' > metal-parity-report.md
+          }
+
+      - name: Post Metal parity report
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: e2e-metal-parity
+          path: metal-parity-report.md
+
   # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
   # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
   #

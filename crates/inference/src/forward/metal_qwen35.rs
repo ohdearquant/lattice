@@ -50,6 +50,7 @@ mod inner {
     use crate::tokenizer::common::Tokenizer;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // ---------------------------------------------------------------------------
     // MSL Compute Shaders
@@ -4530,6 +4531,19 @@ kernel void gdn_chunk_norm_silu_c32(
         /// across threads or processes. Empty by default; only populated by
         /// the `*_with_prefix_cache` entry points.
         cross_turn_prefix_cache: MetalCrossTurnPrefixCache,
+        /// Per-instance flag: whether the path-proof counters below are live.
+        /// Read once from `LATTICE_METAL_PATH_PROOF` at construction time
+        /// (same pattern as `use_kv_f16`) so every dispatch-site `fetch_add`
+        /// is a no-op — not just relaxed-but-still-paid — on the default
+        /// (disabled) path. See `PathProofCounters` for what this gates.
+        pub(crate) path_proof_enabled: bool,
+        /// Runtime path-proof counters (issue #239): prove which Metal attention/KV
+        /// dispatch helpers actually ran, so CI can fail closed on a paravirtual
+        /// runner that reports a Metal device but silently skips required kernels.
+        /// Only recorded when `path_proof_enabled` is set (opt-in, zero cost
+        /// otherwise); read via `path_proof_snapshot` and zeroed via
+        /// `reset_path_proof_counters`.
+        pub(crate) path_proof: PathProofCounters,
     }
 
     // ---------------------------------------------------------------------------
@@ -4643,6 +4657,44 @@ kernel void gdn_chunk_norm_silu_c32(
         fn clear(&mut self) {
             self.entry = None;
         }
+    }
+
+    /// Dispatch-site counters for the Metal attention/KV-cache path-proof probe.
+    ///
+    /// `&self`-compatible (interior mutability) because the dispatch helpers that
+    /// increment these run inside `&self` methods sharing one command encoder.
+    #[derive(Default)]
+    pub struct PathProofCounters {
+        pub prefill_kv_batch: AtomicU64,
+        pub prefill_attn_batched: AtomicU64,
+        pub decode_kv_copy: AtomicU64,
+        pub decode_attn_direct: AtomicU64,
+        pub decode_attn_split_partial: AtomicU64,
+        pub decode_attn_split_reduce: AtomicU64,
+    }
+
+    impl PathProofCounters {
+        fn reset(&self) {
+            self.prefill_kv_batch.store(0, Ordering::Relaxed);
+            self.prefill_attn_batched.store(0, Ordering::Relaxed);
+            self.decode_kv_copy.store(0, Ordering::Relaxed);
+            self.decode_attn_direct.store(0, Ordering::Relaxed);
+            self.decode_attn_split_partial.store(0, Ordering::Relaxed);
+            self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of [`PathProofCounters`] plus the KV-cache precision mode in effect,
+    /// suitable for formatting into the `[METAL_PATH_PROOF]` stderr marker.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PathProofSnapshot {
+        pub prefill_kv_batch: u64,
+        pub prefill_attn_batched: u64,
+        pub decode_kv_copy: u64,
+        pub decode_attn_direct: u64,
+        pub decode_attn_split_partial: u64,
+        pub decode_attn_split_reduce: u64,
+        pub kv_f16: bool,
     }
 
     // ---------------------------------------------------------------------------
@@ -5977,6 +6029,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 std::env::var("LATTICE_KV_F16").as_deref(),
                 Ok("1") | Ok("true")
             );
+            let path_proof_enabled = matches!(
+                std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                Ok("1") | Ok("true")
+            );
             // new_session reads LATTICE_KV_F16 identically, so session.kv_cache
             // and the use_kv_f16 field below agree by construction.
             let session = engine.new_session(max_cache_len)?;
@@ -5987,12 +6043,42 @@ kernel void gdn_chunk_norm_silu_c32(
                 use_gdn_chunked,
                 use_kv_f16,
                 cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled,
+                path_proof: PathProofCounters::default(),
             })
         }
 
         /// Returns `true` if MTP weights were loaded and the session has an active MTP state.
         pub fn has_mtp(&self) -> bool {
             self.session.mtp.is_some()
+        }
+
+        /// Zeroes the Metal attention/KV-cache path-proof counters (issue #239).
+        ///
+        /// Call before a one-shot `generate`/`generate_streaming` run so
+        /// [`Self::path_proof_snapshot`] afterward reflects only that run's dispatches.
+        pub fn reset_path_proof_counters(&self) {
+            self.path_proof.reset();
+        }
+
+        /// Snapshots the Metal attention/KV-cache path-proof counters (issue #239)
+        /// without resetting them, alongside the KV-cache precision mode in effect.
+        pub fn path_proof_snapshot(&self) -> PathProofSnapshot {
+            PathProofSnapshot {
+                prefill_kv_batch: self.path_proof.prefill_kv_batch.load(Ordering::Relaxed),
+                prefill_attn_batched: self.path_proof.prefill_attn_batched.load(Ordering::Relaxed),
+                decode_kv_copy: self.path_proof.decode_kv_copy.load(Ordering::Relaxed),
+                decode_attn_direct: self.path_proof.decode_attn_direct.load(Ordering::Relaxed),
+                decode_attn_split_partial: self
+                    .path_proof
+                    .decode_attn_split_partial
+                    .load(Ordering::Relaxed),
+                decode_attn_split_reduce: self
+                    .path_proof
+                    .decode_attn_split_reduce
+                    .load(Ordering::Relaxed),
+                kv_f16: self.use_kv_f16,
+            }
         }
 
         /// Resets GDN state-traffic counters to zero without changing the shape.
@@ -12731,6 +12817,9 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                self.path_proof
+                    .decode_attn_direct
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
                 // Partitioned flash decode (H3): partial kernel + reduce kernel.
                 // Split KV cache into PARTITION_TOKENS-token chunks for better occupancy.
@@ -12748,6 +12837,9 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, num_partitions as u64, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                self.path_proof
+                    .decode_attn_split_partial
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Reduce pass: one TG per KV head, combines all partitions.
                 // decode_attention_flash_reduce reads f32 attn_partials, not KV — no f16 variant.
@@ -12761,6 +12853,9 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                self.path_proof
+                    .decode_attn_split_reduce
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -12901,6 +12996,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
+            self.path_proof
+                .prefill_kv_batch
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -12952,6 +13050,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(num_kv_heads as u64, num_tokens as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
+            self.path_proof
+                .prefill_attn_batched
+                .fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
 
@@ -13210,6 +13311,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
+            self.path_proof
+                .decode_kv_copy
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         #[allow(dead_code)] // element-wise add dispatch helper; used by full_attention_layer_step_by_idx
@@ -15091,6 +15195,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 std::env::var("LATTICE_KV_F16").as_deref(),
                 Ok("1") | Ok("true")
             );
+            let path_proof_enabled = matches!(
+                std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                Ok("1") | Ok("true")
+            );
             let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
             let dur_d = t_d.elapsed();
@@ -15252,6 +15360,8 @@ kernel void gdn_chunk_norm_silu_c32(
                 ),
                 use_kv_f16,
                 cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled,
+                path_proof: PathProofCounters::default(),
             })
         }
 
@@ -17581,6 +17691,8 @@ kernel void decode_attention_reference(
                 use_gdn_chunked: true,
                 use_kv_f16: false,
                 cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
             }
         }
 
@@ -17780,6 +17892,8 @@ kernel void decode_attention_reference(
                 use_gdn_chunked: true,
                 use_kv_f16: false,
                 cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
@@ -23154,7 +23268,8 @@ mod gdn_state_traffic_tests {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, blend_lora_layer_data, format_chat_template,
+    LoraLayerData, MetalQwen35State, PathProofSnapshot, blend_lora_layer_data,
+    format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.
