@@ -10501,7 +10501,15 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Select the GDN prefill scan at runtime: `true` = chunked-parallel (default),
         /// `false` = serial per-token. Construction reads `LATTICE_GDN_CHUNKED`; this lets
         /// callers (benchmarks, A/B tests) flip the path on a live state without rebuilding.
+        ///
+        /// Flipping the mode invalidates any retained cross-turn cache entry: the two
+        /// scans are not bit-exact (measured logit drift up to ~2e-1 at chunk boundaries),
+        /// so a snapshot produced under one mode must not seed a prefix that the current
+        /// mode's full-refill reference would have prefilled differently.
         pub fn set_gdn_chunked(&mut self, enabled: bool) {
+            if self.use_gdn_chunked != enabled {
+                self.cross_turn_prefix_cache.clear();
+            }
             self.use_gdn_chunked = enabled;
         }
 
@@ -22284,6 +22292,84 @@ kernel void decode_attention_reference(
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after an interleaved raw forward_step call, output must still match full re-prefill"
+            );
+        }
+
+        /// #516 round-3 remediation: `set_gdn_chunked` swaps the GDN prefill
+        /// algorithm, and the two scans are not bit-exact (measured logit
+        /// drift up to ~2e-1 at chunk boundaries). A cache entry saved under
+        /// one mode must not seed a restore whose full-refill reference would
+        /// use the other mode. Flipping the mode must evict the retained
+        /// entry; a no-op set must NOT (so benchmarks re-asserting the current
+        /// mode keep their cache).
+        #[test]
+        fn cross_turn_cache_invalidated_by_gdn_mode_flip() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(13, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: the first cache-aware call must actually retain an entry"
+            );
+
+            // Re-asserting the CURRENT mode is a no-op and must keep the entry.
+            let current_mode = state.use_gdn_chunked;
+            state.set_gdn_chunked(current_mode);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "setting the already-active GDN mode must not evict the cache entry"
+            );
+
+            // Flipping the mode must evict it outright.
+            state.set_gdn_chunked(!current_mode);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "flipping the GDN prefill mode must clear the retained cross-turn entry"
+            );
+
+            // Strict-append continuation: if the entry had survived the flip,
+            // this shape would satisfy the ExactAppend guards, so the
+            // assertions below genuinely exercise the mode-flip eviction.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "a GDN mode flip must force a full refill, not a cross-mode restore"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "an entry saved under the other GDN prefill mode must never be restored via ExactAppend"
             );
         }
     }
