@@ -21532,6 +21532,239 @@ kernel void decode_attention_reference(
             let result = quantize_row_q8_0(&vals);
             assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
         }
+
+        // ---------------------------------------------------------------------
+        // Cross-turn KV prefix cache (#462): Metal integration tests.
+        //
+        // `single_char_vocab_tokenizer` gives a 32-token, merge-free vocab
+        // (one token per ASCII letter) so growing a conversation by string
+        // concatenation is guaranteed to grow the token sequence by an exact
+        // append — no re-tokenization boundary can shift earlier tokens,
+        // which keeps these tests focused on the cache logic itself rather
+        // than on tokenizer edge cases.
+        // ---------------------------------------------------------------------
+
+        fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
+            GenerateConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(seed),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            }
+        }
+
+        /// The correctness gate for #462: a growing multi-turn conversation run
+        /// through `generate_streaming_with_prefix_cache` on one long-lived state
+        /// must produce byte-identical token IDs, turn by turn, to running each
+        /// turn's full accumulated prompt through plain `generate_streaming` on a
+        /// fresh state (i.e. the pre-#462 "re-prefill everything every turn"
+        /// behavior). If cross-turn KV/GDN reuse ever perturbs a single sampled
+        /// token, this test goes red.
+        #[test]
+        fn cross_turn_cache_multiturn_token_identity_matches_full_reprefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Keep EOS unreachable so every turn generates its full budget,
+            // guaranteeing the conversation keeps growing turn over turn.
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut cached_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+
+            let user_turns = ["a", "bc", "d", "ef", "g"];
+            let mut conversation = String::new();
+            let mut saw_exact_append = false;
+
+            for (turn_idx, user_text) in user_turns.iter().enumerate() {
+                conversation.push_str(user_text);
+                let gen_cfg = cross_turn_test_gen_cfg(42, 3);
+
+                let mut cached_delta_calls = 0u32;
+                let cached_out = cached_state
+                    .generate_streaming_with_prefix_cache(
+                        slot_id,
+                        &conversation,
+                        &tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| {
+                            cached_delta_calls += 1;
+                            true
+                        },
+                    )
+                    .expect("cache-aware generation must not error on a valid conversation");
+
+                // Independent, from-scratch reference: a brand new state, full
+                // re-prefill of the entire accumulated conversation so far —
+                // exactly the behavior cross-turn reuse must reproduce.
+                let mut reference_state =
+                    MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+                let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
+                let reference_out = reference_state.generate_streaming(
+                    &conversation,
+                    &tokenizer,
+                    &reference_gen_cfg,
+                    |_delta, _id| true,
+                );
+
+                assert_eq!(
+                    cached_out.output.token_ids, reference_out.token_ids,
+                    "turn {turn_idx}: cache-aware token IDs must match full re-prefill \
+                     exactly (conversation so far: {conversation:?})"
+                );
+                assert_eq!(
+                    cached_out.output.text, reference_out.text,
+                    "turn {turn_idx}: cache-aware decoded text must match full re-prefill"
+                );
+                assert_eq!(
+                    cached_out.output.stop_reason, reference_out.stop_reason,
+                    "turn {turn_idx}: stop reason must match full re-prefill"
+                );
+
+                if matches!(
+                    cached_out.cache.mode,
+                    crate::kv_cache::PrefixReuseMode::ExactAppend
+                ) {
+                    saw_exact_append = true;
+                    assert!(
+                        cached_out.cache.reused_tokens > 0,
+                        "turn {turn_idx}: ExactAppend must report a nonzero reused prefix"
+                    );
+                }
+
+                // Grow the conversation with the (validated-identical) reply so
+                // the next turn's prompt is a real append onto this one.
+                conversation.push_str(&cached_out.output.text);
+            }
+
+            assert!(
+                saw_exact_append,
+                "at least one later turn must actually exercise ExactAppend reuse — \
+                 otherwise this test only proves the FullRefill fallback path works"
+            );
+        }
+
+        /// Prefix-mismatch invalidation: when the new prompt does not share the
+        /// cached entry's history at all, the planner must fall back to
+        /// `FullRefill` (never attempt to graft an unrelated suffix onto stale
+        /// KV/GDN state), and the output must still be correct.
+        #[test]
+        fn cross_turn_cache_prefix_mismatch_falls_back_to_full_refill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(7, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abc",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first turn must succeed");
+            assert_eq!(
+                first.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "an empty cache must always plan FullRefill"
+            );
+
+            // Completely different conversation: zero shared token prefix
+            // with the cached entry from "abc".
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "xyz",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("divergent-prefix turn must still succeed");
+            assert_eq!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "a prompt sharing no prefix with the cached entry must invalidate to FullRefill"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after a prefix-mismatch invalidation, output must still match full re-prefill"
+            );
+        }
+
+        /// `clear_cross_turn_prefix_cache` must force the next call to plan
+        /// `FullRefill` even when the new prompt would otherwise be a valid
+        /// `ExactAppend` continuation of the (now-cleared) entry.
+        #[test]
+        fn cross_turn_cache_clear_forces_full_refill_next_call() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(3, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+
+            state.clear_cross_turn_prefix_cache();
+
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &conversation,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("second turn after clear must succeed");
+            assert_eq!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "a cleared cache slot must never be treated as a valid cached entry"
+            );
+        }
     }
     // -----------------------------------------------------------------------
     // Blend correctness tests (inference-side LoraLayerData types)
