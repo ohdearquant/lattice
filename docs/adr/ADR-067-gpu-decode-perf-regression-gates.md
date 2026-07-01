@@ -1,4 +1,4 @@
-# ADR-066: GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max)
+# ADR-067: GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max)
 
 **Status**: Proposed
 **Date**: 2026-07-01
@@ -10,10 +10,9 @@
 > **Numbering note**: GitHub issue #167's body names this document
 > `docs/adr/ADR-064-gpu-decode-perf-regression-gates.md`. By the time this ADR was written,
 > `ADR-064` and `ADR-065` were already assigned to the CI-gate-taxonomy and feature-promotion-gate
-> ADRs (both shipped, unrelated topics). This document therefore uses the next free number on this
-> branch, **ADR-066**. A separate unmerged branch also claims `ADR-066` for a different topic
-> (output-correctness gates); whichever branch merges second will need to renumber at merge time.
-> The founder/merge-order should resolve the final number — the content here is stable regardless.
+> ADRs (both shipped, unrelated topics), and `ADR-066` (output-correctness gates, PR #517) merged
+> to main while this branch was in flight. This document therefore uses the next free number,
+> **ADR-067**. The content is unchanged by the renumber.
 
 ---
 

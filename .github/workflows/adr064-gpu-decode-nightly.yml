@@ -14,7 +14,7 @@ name: ADR-064 GPU decode perf nightly (informational)
 # Intentionally NOT a pull_request trigger: public-repo fork PRs must never be
 # able to execute code on a self-hosted runner (arbitrary-code-on-our-hardware
 # risk). Intentionally NOT in any branch-protection required-status set: this
-# gate is proposed-only per docs/adr/ADR-066-gpu-decode-perf-regression-gates.md
+# gate is proposed-only per docs/adr/ADR-067-gpu-decode-perf-regression-gates.md
 # and must not become merge-blocking without explicit founder sign-off.
 
 on:

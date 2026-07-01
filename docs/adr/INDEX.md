@@ -90,7 +90,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | ---------------------------------------- | ----------------------------------------- |
 | [058](ADR-058-cpu-perf-regression-ci.md) | CPU Performance Regression Tracking in CI |
 
-## architecture / research (ADR-059 through ADR-066) — Proposed
+## architecture / research (ADR-059 through ADR-067) — Proposed
 
 | ADR                                                | Title                                                         | Status       | Depends on   |
 | -------------------------------------------------- | ------------------------------------------------------------- | ------------ | ------------ |
@@ -101,7 +101,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [063](ADR-063-serving-architecture.md)             | Serving Architecture — CLI, HTTP, API Compat                  | Proposed     | ADR-048, 046 |
 | [064](ADR-064-ci-gate-taxonomy.md)                 | CI Gate Taxonomy and Promotion Policy                         | Proposed     | ADR-058      |
 | [065](ADR-065-feature-promotion-gates.md)          | Feature promotion gates: merge measured primitives, not ideas | Proposed     | ADR-064      |
-| [066](ADR-066-gpu-decode-perf-regression-gates.md) | GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max) | Proposed | ADR-058, 061, 064 |
+| [067](ADR-067-gpu-decode-perf-regression-gates.md) | GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max) | Proposed | ADR-058, 061, 064 |
 
 ## informational
 
