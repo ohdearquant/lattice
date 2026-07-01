@@ -42,6 +42,7 @@ build_bin -p lattice-tune      --bin train_grad_full --features train-backward
 build_bin -p lattice-tune      --bin generate_lora   --features safetensors,inference-hook
 build_bin -p lattice-inference --bin eval_perplexity --features f16,metal-gpu
 build_bin -p lattice-inference --bin chat_metal      --features f16,metal-gpu
+build_bin -p lattice-inference --bin lattice_serve   --features f16,metal-gpu
 
 # lattice-embed — `native` is a default feature, so no explicit --features.
 build_bin -p lattice-embed     --bin embed
