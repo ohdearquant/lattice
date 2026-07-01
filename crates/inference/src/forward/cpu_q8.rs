@@ -1555,4 +1555,241 @@ mod tests {
              got {result:?}"
         );
     }
+
+    /// Builds a tiny but non-degenerate 2-layer Q8 model (1 linear + 1 full-attention
+    /// layer, matching the `Q8NeonModel` fixture in `neon_forward.rs`) with deterministic
+    /// non-zero weights via an LCG, so `forward_step_q8` exercises every alloc site
+    /// touched by the `ForwardScratch` buffer-reuse change: the full-attention input
+    /// copy into `input_tmp`, the `q_and_gate` projection write, `split_q_and_gate`'s
+    /// deinterleave into `gate_z`, and the FFN input copy into `input_tmp`.
+    fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::q8_weights::quantize_matrix;
+
+        let hidden: usize = 64;
+        let vocab: usize = 128;
+        let inter: usize = 128;
+        let num_attn_heads: usize = 2;
+        let num_kv_heads: usize = 1;
+        let head_dim: usize = 32;
+        let q_dim = num_attn_heads * head_dim; // 64
+        let kv_dim = num_kv_heads * head_dim; // 32
+        let lin_key_heads: usize = 2;
+        let lin_val_heads: usize = 2;
+        let lin_key_dim: usize = 32;
+        let lin_val_dim: usize = 32;
+        let lin_qkv_dim = lin_key_heads * lin_key_dim * 2 + lin_val_heads * lin_val_dim; // 192
+        let lin_output_dim = lin_val_heads * lin_val_dim; // 64
+        let kernel_size: usize = 4;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: vocab,
+            intermediate_size: inter,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_attn_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: lin_key_heads,
+            linear_num_value_heads: Some(lin_val_heads),
+            linear_key_head_dim: lin_key_dim,
+            linear_value_head_dim: lin_val_dim,
+            linear_conv_kernel_dim: kernel_size,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 16
+        let rope = RopeTable::new(rope_dim, cfg.max_position_embeddings, cfg.rope_theta);
+
+        // Deterministic weight generator: LCG producing small non-zero floats.
+        let mut seed: u64 = 0xdead_beef_cafe_babe;
+        let mut next_weight = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
+            let floats: Vec<f32> = (0..n * k)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((seed >> 33) as f32 / u32::MAX as f32) * 0.04 - 0.02
+                })
+                .collect();
+            // LCG output is bounded -- always finite, quantization cannot fail.
+            quantize_matrix(&floats, n, k).unwrap()
+        };
+
+        let gdn_w = Q8GatedDeltaNetWeights {
+            in_proj_qkv: next_weight(lin_qkv_dim, hidden),
+            in_proj_z: next_weight(lin_output_dim, hidden),
+            in_proj_b: next_weight(lin_key_heads, hidden),
+            in_proj_a: next_weight(lin_key_heads, hidden),
+            a_log: vec![0.0f32; lin_key_heads],
+            dt_bias: vec![0.0f32; lin_key_heads],
+            conv1d_weight: vec![0.01f32; lin_qkv_dim * kernel_size],
+            conv_dim: lin_qkv_dim,
+            kernel_size,
+            norm_weight: vec![0.0f32; lin_val_dim],
+            out_proj: next_weight(hidden, lin_output_dim),
+        };
+
+        let full_w = Q8FullAttentionLayerWeights {
+            q_proj: next_weight(2 * q_dim, hidden),
+            k_proj: next_weight(kv_dim, hidden),
+            v_proj: next_weight(kv_dim, hidden),
+            o_proj: next_weight(hidden, q_dim),
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        let make_common = |seed: &mut u64| -> Q8CommonLayerWeights {
+            let mut nw = |n: usize, k: usize| -> crate::weights::q8_weights::Q8Matrix {
+                let floats: Vec<f32> = (0..n * k)
+                    .map(|_| {
+                        *seed = seed
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        ((*seed >> 33) as f32 / u32::MAX as f32) * 0.04 - 0.02
+                    })
+                    .collect();
+                quantize_matrix(&floats, n, k).unwrap()
+            };
+            Q8CommonLayerWeights {
+                input_layernorm: vec![0.0f32; hidden],
+                post_attention_layernorm: vec![0.0f32; hidden],
+                gate_proj: nw(inter, hidden),
+                up_proj: nw(inter, hidden),
+                down_proj: nw(hidden, inter),
+            }
+        };
+
+        let layers = vec![
+            (Q8AttentionWeights::Linear(gdn_w), make_common(&mut seed)),
+            (Q8AttentionWeights::Full(full_w), make_common(&mut seed)),
+        ];
+
+        let embed_tokens: Vec<f32> = (0..vocab * hidden)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((seed >> 33) as f32 / u32::MAX as f32) * 0.04 - 0.02
+            })
+            .collect();
+
+        let weights = Q8ModelWeights {
+            embed_tokens,
+            final_norm: vec![0.0f32; hidden],
+            layers,
+        };
+
+        (cfg, weights, rope)
+    }
+
+    /// End-to-end regression guard for the `ForwardScratch` buffer-reuse change in
+    /// `full_attention_step_q8` and `ffn_step_q8` (#416): decodes two real Q8 steps
+    /// (position 0, then position 1 -- first-token vs subsequent-token) and checks
+    /// that reusing the four touched scratch buffers (`input_tmp`, `q_and_gate`,
+    /// `gate_z` via `split_q_and_gate`, and `input_tmp` again for the FFN) across
+    /// calls never leaks stale data into the result.
+    ///
+    /// Design: run the same two-step decode twice, once starting from a pristine
+    /// `ForwardScratch` and once starting from a `ForwardScratch` already "dirtied"
+    /// by a prior unrelated decode (`gdn_states`/`kv_cache` are fresh each time, so
+    /// only the scratch buffers carry over). Every alloc site this change touches
+    /// writes into a scratch buffer that previously came from a freshly allocated,
+    /// often implicitly-zeroed `Vec`; a buffer-reuse bug that under- or
+    /// mis-writes a reused region would surface as `dirty != pristine` here even
+    /// though both runs use identical model weights and identical input tokens.
+    #[test]
+    fn test_forward_step_q8_decode_survives_dirty_scratch_reuse() {
+        let (cfg, weights, rope) = make_nonzero_q8_cpu_test_model();
+        let num_linear = cfg.num_linear_attention_layers();
+        let num_full = cfg.num_full_attention_layers();
+
+        let decode_two_steps = |scratch: &mut ForwardScratch| -> Vec<f32> {
+            let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+                .map(|_| GatedDeltaNetState::new(&cfg))
+                .collect();
+            let mut kv_cache = KvCache::new(num_full);
+
+            // First token: exercises `ensure_capacity`'s first-call resize path.
+            forward_step_q8(
+                &weights,
+                &cfg,
+                &rope,
+                7,
+                0,
+                &mut gdn_states,
+                &mut kv_cache,
+                scratch,
+            );
+            kv_cache.seq_len += 1;
+            // Second token: subsequent-token decode reusing the same scratch buffers.
+            forward_step_q8(
+                &weights,
+                &cfg,
+                &rope,
+                11,
+                1,
+                &mut gdn_states,
+                &mut kv_cache,
+                scratch,
+            );
+
+            scratch.logits[..16].to_vec()
+        };
+
+        let mut pristine_scratch = ForwardScratch::new();
+        let pristine = decode_two_steps(&mut pristine_scratch);
+
+        let mut dirtied_scratch = ForwardScratch::new();
+        let _ = decode_two_steps(&mut dirtied_scratch); // warm up: dirty every scratch buffer
+        let dirty = decode_two_steps(&mut dirtied_scratch); // decode again, same scratch object
+
+        assert_eq!(
+            pristine, dirty,
+            "decoding through a previously-used ForwardScratch must produce identical logits \
+             to a pristine scratch -- a buffer-reuse bug in the Q8 decode alloc sites (#416) \
+             would leak stale data here"
+        );
+
+        assert!(
+            pristine.iter().any(|&v| v.abs() > 1e-9),
+            "all 16 logits are zero -- check weight generation"
+        );
+        for (i, &v) in pristine.iter().enumerate() {
+            assert!(v.is_finite(), "logit[{i}] is not finite: {v}");
+        }
+
+        // Golden bit-identical values captured from this deterministic fixture.
+        // Regenerate by temporarily printing `pristine` if the fixture or the
+        // production Q8 decode math intentionally changes.
+        let expected: [f32; 16] = [
+            0.6030709, 0.6551996, 0.60194814, 0.64469767, 0.69641805, 0.5887781, 0.62342393,
+            0.6259914, 0.65434885, 0.74827236, 0.69311845, 0.7374152, 0.6237912, 0.65976304,
+            0.6478549, 0.68329644,
+        ];
+        for (i, (&actual, &exp)) in pristine.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() <= 1e-6,
+                "logit[{i}] mismatch: actual={actual:.8}, expected={exp:.8}"
+            );
+        }
+    }
 }
