@@ -230,6 +230,19 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
         "--prompt", prompt,
         "--max-tokens", str(max_tokens),
         "--temperature", "0.0",
+        # GenerateConfig::default() carries a production repetition_penalty of
+        # 1.1 (see qwen35_config.rs), matching chat_metal.rs's serving default.
+        # The HF reference call below passes no repetition_penalty kwarg, so
+        # transformers applies none (factor 1.0 = no-op). Left at lattice's
+        # default, the two sides sample from different distributions even at
+        # temperature=0.0 (repetition penalty is applied to logits before the
+        # greedy argmax, not after) — invisible on short prompts because few
+        # candidate tokens have already appeared, but decisive on the ~816-token
+        # long-prefill prompt: nearly the whole Python-keyword vocabulary is
+        # already in the prompt, so penalizing every previously-seen token
+        # flips the post-prefill argmax away from HF's continuation (#520).
+        # Force 1.0 here so both sides run the same greedy decision rule.
+        "--repetition-penalty", "1.0",
     ]
 
     t0 = time.time()
