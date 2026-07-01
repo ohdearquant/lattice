@@ -1,8 +1,8 @@
 # Design: Cross-Turn KV Prefix Cache for Lattice #462
 
-Date: 2026-07-01  
-Role: architect, op 4, team `lattice_kv_462`  
-Status: proposed design; interfaces below are committed for implementation unless the critic rejects them.  
+Date: 2026-07-01
+Role: architect, op 4, team `lattice_kv_462`
+Status: shipped design (round-2 remediation, 2026-07-01). Interfaces below reflect the runtime shape as merged, not the original per-slot proposal (see "Round-2 remediation" note below).
 Inputs: `../analyst/design_brief.md`, direct code scan of `/Users/lion/projects/khive/lattice-kvcache-462`.
 
 Tooling note: `li team receive -t 2d5c82e54e73 --as architect` failed because `li` is not installed. Fallback `comm.inbox()` via khive returned count 0.
@@ -181,16 +181,32 @@ struct MetalCrossTurnPrefixEntry {
 
 #[derive(Debug, Default)]
 struct MetalCrossTurnPrefixCache {
-    entries: std::collections::HashMap<CrossTurnSlotId, MetalCrossTurnPrefixEntry>,
+    entry: Option<MetalCrossTurnPrefixEntry>,
 }
 
 impl MetalCrossTurnPrefixCache {
     fn get(&self, slot_id: CrossTurnSlotId) -> Option<&MetalCrossTurnPrefixEntry>;
     fn insert(&mut self, entry: MetalCrossTurnPrefixEntry);
+    fn take(&mut self, slot_id: CrossTurnSlotId) -> Option<MetalCrossTurnPrefixEntry>;
     fn remove(&mut self, slot_id: CrossTurnSlotId);
     fn clear(&mut self);
 }
 ```
+
+**Round-2 remediation (as shipped, differs from the design above):** the runtime
+shape is `entry: Option<MetalCrossTurnPrefixEntry>` — a single live entry per
+`MetalQwen35State`, **not** a `HashMap<CrossTurnSlotId, _>`. `get`/`take`/`remove`
+all filter by `slot_id` against that one entry (a different or absent slot is
+always a miss). `insert` unconditionally **replaces** whatever is currently
+retained, for any slot — saving a new entry for slot B silently evicts slot A's
+entry. This is a deliberate, bounded-by-construction design (never an unbounded
+per-slot map): at most one ~19.3 MiB GDN snapshot is ever alive, at the cost of
+zero retention across concurrent multi-slot traffic on the same `MetalQwen35State`
+(single-slot-at-a-time is the actual v1 contract; see "Round-2 remediation" note
+under "What The Cache Retains" below). The original per-slot `HashMap` sketch
+above was rejected in round-2 remediation because it was the source of the
+round-1/round-2 unsoundness findings (stale per-slot entries surviving live
+state mutation that the map had no way to observe).
 
 Extend `MetalQwen35State`:
 
@@ -278,7 +294,13 @@ impl MetalQwen35State {
 
 ## What The Cache Retains
 
-Per `CrossTurnSlotId`:
+**Round-2 remediation (as shipped):** at most ONE entry is retained per
+`MetalQwen35State`, not one per `CrossTurnSlotId`. The fields below describe
+that single retained entry when present; it is tagged with the `slot_id` it
+was saved for, and `get`/`take`/`remove` filter on that tag, but saving a new
+entry for a different slot unconditionally evicts whatever was retained
+before, regardless of slot. The "Per `CrossTurnSlotId`" framing in the
+original design (below) described the rejected multi-slot `HashMap` shape:
 
 - `token_ids: Vec<u32>`: exact rendered prompt tokens represented by state.
 - `represented_len: usize`: authoritative number of tokens in all reusable state.
@@ -289,6 +311,17 @@ Per `CrossTurnSlotId`:
 The v1 cache must not store every token-boundary GDN snapshot. One exact latest-boundary snapshot is enough for normal append-only chat and costs about 19.3 MiB for Qwen3.5-0.8B. Every-token GDN snapshots are rejected for v1 because they are about 19.3 MiB per boundary.
 
 ## Serve/Chat Hook
+
+**Round-2 remediation (status, 2026-07-01): DEFERRED, not implemented in this PR.**
+Everything in this section — the `Job.slot_id` extension, `request_slot_id`, the
+worker loop replacement, and the `chat_metal.rs` REPL/JSON-mode wiring — is design
+intent for a follow-up PR (D6), not a shipped component of #516. This PR ships only
+the correctness substrate: `MetalCrossTurnPrefixCache`,
+`generate_streaming_with_prefix_cache`, `chat_completion_streaming_with_prefix_cache`,
+and the round-2 raw-forward invalidation boundary. `lattice_serve.rs` and
+`chat_metal.rs` do not currently call any `*_with_prefix_cache` entry point, so
+neither the serve worker nor the chat REPL opt into cross-turn reuse yet — they
+continue to use `reset_state()`/`generate_streaming` exactly as before this PR.
 
 ### `lattice_serve.rs`
 
@@ -471,7 +504,7 @@ Why this is enough:
 
 ## GDN State Decision
 
-Chosen v1 option: persist one exact GDN snapshot at the latest represented boundary per cache slot.
+Chosen v1 option (as shipped): persist one exact GDN snapshot at the latest represented boundary, for at most one live entry across the whole `MetalQwen35State` (round-2 remediation — see "What The Cache Retains"; the original design below said "per cache slot" / "per slot", implying independent retention across slots, which the shipped single-entry shape does not provide).
 
 Alternatives considered:
 
@@ -479,7 +512,7 @@ Alternatives considered:
 |---|---:|---:|---|
 | Reuse attention KV only | No | Low | Rejected. GDN state would not match full re-prefill. |
 | Snapshot every token boundary | Yes | About 19.3 MiB per boundary for 0.8B | Rejected for v1 memory cost. |
-| One latest-boundary snapshot | Yes for append-only `L == represented_len` | About 19.3 MiB per slot | Chosen v1. |
+| One latest-boundary snapshot | Yes for append-only `L == represented_len` | About 19.3 MiB, at most one snapshot alive at a time (single live entry, round-2) | Chosen v1. |
 | Sparse checkpoints + replay | Yes if replay is token-identical | `N * 19.3 MiB` plus replay | v2, optional for edited-history speedup. |
 | Replay whole shared prefix | Correct if full model replay | O(shared prefix) | Fallback only; not the feature win. |
 
@@ -559,19 +592,20 @@ sequenceDiagram
 
 ## Coupling And Testability
 
-Components:
+Components (design-time list; **items 4 and 5 are DEFERRED follow-up work, not
+shipped in #516** — see "Serve/Chat Hook" above):
 
-1. `kv_cache::cross_turn` planner,
-2. `MetalCrossTurnPrefixCache`,
-3. `MetalQwen35State` cache-aware generate/chat methods,
-4. serve worker job protocol,
-5. chat_metal REPL integration.
+1. `kv_cache::cross_turn` planner — shipped.
+2. `MetalCrossTurnPrefixCache` — shipped (as a single-live-entry `Option`, round-2 remediation).
+3. `MetalQwen35State` cache-aware generate/chat methods — shipped.
+4. serve worker job protocol — deferred (D6 follow-up).
+5. chat_metal REPL integration — deferred (D6 follow-up).
 
 Direct dependencies after design:
 
 - planner has no dependency on Metal,
 - Metal cache depends on planner and GDN snapshot type,
-- serve/chat binaries depend only on public cache-aware methods and `CrossTurnSlotId`.
+- serve/chat binaries would depend only on public cache-aware methods and `CrossTurnSlotId` once D6 lands; today neither binary references them.
 
 Estimated coupling: `|Deps|=5`, `|C|=5`, `κ=5/(5*4)=0.25`, below the 0.3 target.
 
@@ -616,7 +650,7 @@ Alternatives:
 
 1. KV-only reuse: rejected because GDN recurrent state would diverge from full re-prefill.
 2. Every-token GDN snapshots: rejected because memory cost is too high for normal contexts.
-3. Latest-boundary GDN snapshot: accepted because append-only chat is the primary serve path and one snapshot per slot is feasible.
+3. Latest-boundary GDN snapshot: accepted because append-only chat is the primary serve path and one live snapshot (the single-entry shape shipped in round-2 remediation, not one per slot) is feasible.
 4. Sparse checkpoints: deferred as v2 because it expands memory policy and replay complexity.
 
 Evidence:
