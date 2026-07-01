@@ -1590,7 +1590,22 @@ mod tests {
     // pass → greedy sampling always picks token 0 (first-wins on equal logits).
     // This gives deterministic sampling without relying on random-weight outputs.
 
+    const DEFAULT_TINY_TOK_JSON: &str = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
+}"#;
+
     fn build_tiny_zero_model() -> Qwen35Model {
+        build_tiny_zero_model_tok(DEFAULT_TINY_TOK_JSON)
+    }
+
+    fn build_tiny_zero_model_tok(tok_json: &str) -> Qwen35Model {
         use crate::attention::gdn::GatedDeltaNetWeights;
         use crate::lora_hook::NoopLoraHook;
         use crate::model::qwen35::{
@@ -1697,16 +1712,6 @@ mod tests {
             layers.push((attn, common));
         }
 
-        let tok_json = r#"{
-  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
-  "normalizer":null,
-  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
-  "post_processor":null,
-  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
-  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
-    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
-}"#;
         let tokenizer =
             BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
         let rope = RopeTable::new(
@@ -1824,5 +1829,101 @@ mod tests {
             "grammar advance returning false must return StopReason::Grammar; got {:?}",
             result.stop_reason
         );
+    }
+
+    // Same tiny zero-weight model, but the tokenizer carries `</think>` as added
+    // token id 7 so `special_token_id("</think>")` resolves and reasoning-budget
+    // forcing can fire. `special:false` still makes it queryable — any added token
+    // (regardless of the special flag) is inserted into the tokenizer's lookup.
+    fn build_tiny_thinking_model() -> Qwen35Model {
+        build_tiny_zero_model_tok(
+            r#"{
+  "version":"1.0","truncation":null,"padding":null,
+  "added_tokens":[{"id":7,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
+}"#,
+        )
+    }
+
+    /// COMBINED grammar × reasoning-budget path: when the s1 budget forces `</think>`
+    /// but the active grammar forbids that token, decoding must **fail closed** — stop
+    /// with `StopReason::Grammar` and NOT emit the forbidden `</think>`.
+    ///
+    /// This pins the load-bearing weave in `decode_loop`: grammar `advance` runs on the
+    /// budget-FORCED token (`next_id`), not the pre-force `sampled_id`. Setup: grammar
+    /// `root ::= "aa"` with a 7-entry grammar vocab (ids 0..=6); the tokenizer carries
+    /// `</think>` at id 7 (outside the grammar vocab). All-zero weights → greedy always
+    /// picks token 0's argmax after masking. Post-prefill emits one `'a'` (id 1); the
+    /// first decode-loop step has `generated_len == budget == 1`, so `force_close_think`
+    /// overrides the sampled `'a'` with `</think>` (id 7). `advance(7)`:
+    /// `7 >= grammar.vocab_size (7)` → `false` → `StopReason::Grammar`, before `</think>`
+    /// is pushed.
+    ///
+    /// Mutation sensitivity: if `advance` were called on `sampled_id` (1, grammar-legal)
+    /// instead of the forced `next_id` (7), `advance(1)` would succeed, `</think>` would
+    /// be emitted, and `token_ids` would be `[1, 7]` — failing the `token_ids == [1]`
+    /// assertion below.
+    #[test]
+    fn grammar_budget_forced_close_fails_closed() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::sync::Arc;
+
+        let model = build_tiny_thinking_model();
+        let close_id = model
+            .tokenizer
+            .special_token_id("</think>")
+            .expect("thinking model tokenizer resolves </think>");
+        assert!(
+            close_id >= 7,
+            "test assumes </think> id ({close_id}) is outside the 7-token grammar vocab"
+        );
+
+        // root ::= "aa": grammar vocab ids 0..=6 (size 7). </think> (id 7) is out of the
+        // grammar vocab, so advance(7) fail-closes.
+        let spec = GrammarSpec::Gbnf("root ::= \"aa\"\n".to_string());
+        let vocab: Vec<Vec<u8>> = vec![
+            b"<unk>".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec(),
+            b" ".to_vec(),
+        ];
+        let engine = Arc::new(GrammarEngine::new(&spec, vocab).expect("aa grammar compiles"));
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            grammar: Some(engine),
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("combined grammar+budget generate must succeed");
+
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Grammar),
+            "budget-forced </think> forbidden by grammar must stop with Grammar; got {:?}",
+            result.stop_reason
+        );
+        assert_eq!(
+            result.token_ids,
+            vec![1],
+            "fail-closed: the budget-forced </think> must NOT be emitted; only the \
+             pre-force 'a' (id 1) survives. token_ids [1, 7] means advance ran on the \
+             sampled token, not the forced token"
+        );
+        assert_eq!(result.generated_tokens, 1);
     }
 }
