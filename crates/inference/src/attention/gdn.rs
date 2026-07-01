@@ -39,10 +39,10 @@ pub struct GatedDeltaNetWeights {
     pub in_proj_a_rows: usize,
     pub in_proj_a_cols: usize,
 
-    /// Learnable log-decay: [num_heads]
+    /// Learnable log-decay: `[num_heads]`
     pub a_log: Vec<f32>,
 
-    /// Learnable time-step bias: [num_heads]
+    /// Learnable time-step bias: `[num_heads]`
     pub dt_bias: Vec<f32>,
 
     /// Depthwise conv1d weights: [qkv_dim, 1, kernel_size] stored as [qkv_dim, kernel_size]
@@ -50,7 +50,7 @@ pub struct GatedDeltaNetWeights {
     pub conv_dim: usize,
     pub kernel_size: usize,
 
-    /// Output gated RMSNorm gamma: [output_dim]
+    /// Output gated RMSNorm gamma: `[output_dim]`
     pub norm_weight: Vec<f32>,
 
     /// Output projection: [hidden_size, output_dim]
@@ -103,7 +103,7 @@ impl GatedDeltaNetState {
         (self.s_matrices.clone(), self.conv_buffer.clone())
     }
 
-    /// Restore recurrent state from a prior [`snapshot`]. The snapshot must have been taken
+    /// Restore recurrent state from a prior `snapshot`. The snapshot must have been taken
     /// from a state with the same key/value dims; in debug builds this is enforced via
     /// `debug_assert_eq!` on buffer lengths.
     pub fn restore_from(&mut self, snap: &GdnLayerSnapshot) {
@@ -175,12 +175,12 @@ fn resize_if_needed(buf: &mut Vec<f32>, needed: usize) {
 ///
 /// Process a single token through the GatedDeltaNet layer.
 ///
-/// `input`: hidden state [hidden_size]
+/// `input`: hidden state `[hidden_size]`
 /// `state`: mutable recurrent state for this layer
 /// `weights`: layer weights
 /// `cfg`: model config
 /// `scratch`: reusable scratch buffers
-/// `output`: output buffer [hidden_size], written in-place
+/// `output`: output buffer `[hidden_size]`, written in-place
 pub fn gated_delta_net_step(
     input: &[f32],
     state: &mut GatedDeltaNetState,
@@ -450,10 +450,10 @@ pub fn sigmoid(x: f32) -> f32 {
 ///
 /// Gated RMSNorm: out = z * (x / rms(x)) * gamma
 ///
-/// `x`: input [dim]
-/// `z`: output gate [dim] (NOT sigmoided — raw projection output used as gate)
-/// `gamma`: learnable scale [dim]
-/// `out`: output buffer [dim]
+/// `x`: input `[dim]`
+/// `z`: output gate `[dim]` (NOT sigmoided — raw projection output used as gate)
+/// `gamma`: learnable scale `[dim]`
+/// `out`: output buffer `[dim]`
 /// `eps`: epsilon for numerical stability
 pub fn gated_rms_norm(x: &[f32], z: &[f32], gamma: &[f32], out: &mut [f32], eps: f32) {
     let dim = x.len();

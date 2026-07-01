@@ -89,7 +89,7 @@ impl LoraManifest {
 
     /// Load from a file path.
     ///
-    /// Reads the file with a hard cap of [`MAX_MANIFEST_SIZE`] bytes to prevent
+    /// Reads the file with a hard cap of `MAX_MANIFEST_SIZE` bytes to prevent
     /// allocation-DoS from an attacker-supplied or symlinked giant path.
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;

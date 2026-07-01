@@ -46,7 +46,7 @@
 //! # Stability and known limitations
 //!
 //! Grammar-constrained generation is **BETA**. It is opt-in via
-//! [`GenerateConfig::grammar`] and disabled by default.
+//! `GenerateConfig::grammar` and disabled by default.
 //!
 //! Known issues tracked at the time of this release:
 //!

@@ -67,7 +67,7 @@ impl RopeTable {
 
     /// **Unstable**: apply RoPE in-place; called from forward kernels only.
     ///
-    /// `x` has shape [head_dim] and is modified in-place.
+    /// `x` has shape `[head_dim]` and is modified in-place.
     /// The first half_dim elements are paired with the second half_dim.
     #[inline]
     pub fn apply(&self, x: &mut [f32], position: usize) {

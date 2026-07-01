@@ -17,11 +17,8 @@
 //! # Calibration workflow
 //!
 //! For real calibration data with multiple tokens per layer, use
-//! [`BlockInfluenceAccumulator`]. Feed one token at a time via [`update`],
-//! then call [`finalize`] to get the averaged [`BlockInfluence`] score.
-//!
-//! [`update`]: BlockInfluenceAccumulator::update
-//! [`finalize`]: BlockInfluenceAccumulator::finalize
+//! `BlockInfluenceAccumulator`. Feed one token at a time via `update`,
+//! then call `finalize` to get the averaged `BlockInfluence` score.
 
 /// Cosine similarity between two vectors.
 ///

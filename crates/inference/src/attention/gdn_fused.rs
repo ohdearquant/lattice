@@ -350,12 +350,12 @@ pub fn simd_gated_rms_norm(x: &[f32], z: &[f32], gamma: &[f32], out: &mut [f32],
 /// Numerically equivalent to `gated_delta_net_step` within f32 tolerance.
 /// Fusions: conv1d+SiLU, decay+rank1 update. SIMD: L2 norm, matvec, RMS norm.
 ///
-/// `input`: hidden state [hidden_size]
+/// `input`: hidden state `[hidden_size]`
 /// `state`: mutable recurrent state for this layer
 /// `weights`: layer weights
 /// `cfg`: model config
 /// `scratch`: reusable fused scratch buffers
-/// `output`: output buffer [hidden_size], written in-place
+/// `output`: output buffer `[hidden_size]`, written in-place
 #[inline]
 pub fn gated_delta_net_step_fused(
     input: &[f32],

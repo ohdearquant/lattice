@@ -8,13 +8,13 @@
 //!
 //! # Module structure
 //!
-//! - [`config`] — [`BatchConfig`]: resource limits and scheduling parameters.
-//! - [`sequence`] — [`Sequence`], [`SequenceManager`], [`SeqId`],
-//!   [`SequenceState`], [`FinishReason`], [`AdapterKey`]: per-sequence state.
-//! - [`scheduler`] — [`Scheduler`] trait, [`FifoScheduler`],
-//!   [`SchedulerDecision`]: iteration-level batch selection.
-//! - [`worker`] — [`BatchWorker`], [`GdnStatePool`],
-//!   [`InferenceRequest`], [`InferenceToken`]: the continuous batching loop.
+//! - `config` — `BatchConfig`: resource limits and scheduling parameters.
+//! - `sequence` — `Sequence`, `SequenceManager`, `SeqId`,
+//!   `SequenceState`, `FinishReason`, `AdapterKey`: per-sequence state.
+//! - `scheduler` — `Scheduler` trait, `FifoScheduler`,
+//!   `SchedulerDecision`: iteration-level batch selection.
+//! - `worker` — `BatchWorker`, `GdnStatePool`,
+//!   `InferenceRequest`, `InferenceToken`: the continuous batching loop.
 //!
 //! # Usage sketch
 //!

@@ -27,32 +27,66 @@
 //! - [`forward`] — Compute backends (CPU, NEON, Metal GPU, batched prefill)
 
 // Grouped modules
+/// Attention kernel variants (standard, GQA, flash, GDN, sparse, differential) and the
+/// [`attention::AttentionTag`] used to dispatch between them. Called from [`forward`] and [`model`].
 pub mod attention;
+/// Compute backends: scalar CPU, NEON, Metal GPU, WGPU, Q8/f16 kernels, and batched prefill.
+/// Consumes kernels from [`attention`] and tensors from [`weights`].
 pub mod forward;
+/// Model configs and loaders (BERT, Qwen, Qwen3.5, BitNet). Each submodule owns its
+/// safetensors load path and forward-pass dispatch; see [`weights`], [`tokenizer`], and [`forward`].
 pub mod model;
+/// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
+/// [`Tokenizer`] trait, plus the [`load_tokenizer`] auto-detect helper. See [`model`].
 pub mod tokenizer;
+/// Qwen3-VL vision encoder path: patch preprocessing, ViT forward pass, and MLP merger.
+/// See [`model`] and [`weights`].
 pub mod vision;
+/// Safetensors-backed tensor storage and weight formats (f32, f16, Q8, Q4). See [`model`]
+/// and [`forward`].
 pub mod weights;
 
 // Standalone modules
+/// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
+/// and [`generate`].
 pub mod batch;
+/// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
+/// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// Generic text generation loop and cache-backed forward path. See [`sampling`],
+/// [`kv_cache`], and [`grammar`].
 pub mod generate;
+/// Grammar-constrained decoding and logit masking. See [`generate`] and [`sampling`].
 pub mod grammar;
+/// Flat and paged key/value cache implementations. See [`generate`] and [`forward`].
 pub mod kv_cache;
+/// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
+/// Inference metrics and entropy accumulation. See [`model`].
 pub mod metrics;
+/// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
+/// Requires the `mixture` feature.
 #[cfg(feature = "mixture")]
 pub mod mixture;
+/// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
+/// [`model::BertModel`] and [`model::QwenModel`].
 pub mod pool;
+/// ShortGPT-style block influence scoring. See [`model`].
 pub mod pruning;
+/// Quantization and pre-transform primitives. See [`weights`] and [`forward`].
 pub mod quant;
+/// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
+/// Sampling configuration and token selection helpers. See [`generate`] and [`speculative`].
 pub mod sampling;
+/// N-gram prompt lookup speculative decoding. See [`sampling`] and [`generate`].
 pub mod speculative;
+/// Generation stop reason taxonomy; see [`StopReason`] and [`generate`].
 pub mod stop_reason;
 
+/// Backward-pass support for training and LoRA workflows, built on [`lora_hook`] and
+/// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]
 pub mod backward;
 
@@ -72,13 +106,40 @@ pub(crate) fn default_cache_dir() -> Result<PathBuf, error::InferenceError> {
 }
 
 // Re-exports for public API backward compatibility
+/// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].
 pub use crate::error::InferenceError;
-pub use crate::model::{
-    BertConfig, BertModel, CrossEncoderModel, LayerTimings, ProfileTimings, QwenConfig, QwenModel,
-};
+/// BERT encoder configuration. See [`BertModel`] and [`model`].
+pub use crate::model::BertConfig;
+/// BERT/BGE encoder model. See [`BertConfig`], [`Tokenizer`], and [`BertPooling`].
+pub use crate::model::BertModel;
+/// BERT-style cross-encoder/reranker model. See [`BertModel`] and [`model`].
+pub use crate::model::CrossEncoderModel;
+/// Per-layer profiling data collected during Qwen embedding inference. See [`ProfileTimings`]
+/// and [`QwenModel`].
+pub use crate::model::LayerTimings;
+/// Aggregate profiling report for Qwen inference. See [`LayerTimings`] and [`QwenModel`].
+pub use crate::model::ProfileTimings;
+/// Qwen embedding model configuration. See [`QwenModel`] and [`weights`].
+pub use crate::model::QwenConfig;
+/// Qwen embedding model exposing `encode` for producing embeddings. See [`QwenConfig`],
+/// [`Tokenizer`], and [`weights`].
+pub use crate::model::QwenModel;
+/// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
 pub use crate::pool::BertPooling;
+/// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
+/// [`generate`].
 pub use crate::stop_reason::StopReason;
-pub use crate::tokenizer::{
-    BpeTokenizer, SentencePieceTokenizer, TokenizedInput, Tokenizer, WordPieceTokenizer,
-    load_tokenizer,
-};
+/// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
+pub use crate::tokenizer::BpeTokenizer;
+/// `SentencePiece` tokenizer implementation. See [`Tokenizer`] and [`TokenizedInput`].
+pub use crate::tokenizer::SentencePieceTokenizer;
+/// Padded token IDs and the real (unpadded) sequence length returned by tokenizers. See
+/// [`Tokenizer`] and [`tokenizer`].
+pub use crate::tokenizer::TokenizedInput;
+/// Object-safe tokenizer trait implemented by every tokenizer in [`tokenizer`]. See
+/// [`load_tokenizer`].
+pub use crate::tokenizer::Tokenizer;
+/// `WordPiece` tokenizer used by BERT-family models. See [`Tokenizer`] and [`BertModel`].
+pub use crate::tokenizer::WordPieceTokenizer;
+/// Model-directory tokenizer auto-loader. See [`Tokenizer`] and [`tokenizer`].
+pub use crate::tokenizer::load_tokenizer;

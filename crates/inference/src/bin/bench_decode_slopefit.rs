@@ -34,12 +34,12 @@
 //!   SLOPEFIT_WARMUP       warmup tokens per point    (default 32)
 //!   SLOPEFIT_MEASURE      measured tokens per point  (default 256)
 //!   SLOPEFIT_REPEATS      in-process repeats         (default 7)
-//!   SLOPEFIT_FULL         set to "1" to add [1024,2048,4096,8192,16384] to grid
+//!   SLOPEFIT_FULL         set to "1" to add `[1024,2048,4096,8192,16384]` to grid
 //!
 //! # Output (stdout)
 //!
 //!   One tagged line per measured repeat:
-//!     SLOPEFIT ctx=<N> tokens=<actual> warmup_ms=0.0 measure_ms=<f> rep=<i>
+//!     SLOPEFIT `ctx=<N> tokens=<actual> warmup_ms=0.0 measure_ms=<f> rep=<i>`
 //!
 //!   The post-processor (`scripts/bench_decode_slopefit.py`) reads these lines
 //!   and produces the final JSON.
