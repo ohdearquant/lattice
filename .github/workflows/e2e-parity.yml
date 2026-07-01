@@ -55,7 +55,7 @@ jobs:
           fi
           echo "Changed files:"
           echo "$CHANGED"
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$' <<<"$CHANGED" >/dev/null; then
+          if echo "$CHANGED" | grep -qE '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$'; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
