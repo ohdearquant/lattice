@@ -4271,7 +4271,12 @@ kernel void gdn_chunk_norm_silu_c32(
             return GpuTopkRoute::CpuFallback;
         }
         match top_k {
-            0 | 1 => GpuTopkRoute::BlockArgmax,
+            // top_k == 0 means top-k is DISABLED (full-distribution sampling,
+            // see `SamplingConfig`), NOT greedy: routing it to BlockArgmax
+            // would silently collapse sampling to top-1 on the opt-in path.
+            // It must fall through to CpuFallback, whose legacy route keeps
+            // the full logit distribution available to the sampler.
+            1 => GpuTopkRoute::BlockArgmax,
             8 | 16 | 40 | 64 => GpuTopkRoute::BlockTopK {
                 local_k: top_k as u32,
             },
@@ -20874,7 +20879,9 @@ kernel void decode_attention_reference(
             );
             assert_eq!(
                 choose_gpu_block_topk_route(0, 1.0, true, false),
-                GpuTopkRoute::BlockArgmax
+                GpuTopkRoute::CpuFallback,
+                "top_k=0 means top-k DISABLED (full-distribution sampling), \
+                 not greedy; BlockArgmax here would collapse sampling to top-1"
             );
             assert_eq!(
                 choose_gpu_block_topk_route(1, 1.0, true, false),
