@@ -1302,9 +1302,9 @@ pub trait MtpTargetVerifier {
 /// [`SpecRng::from_clock`] the way the lower-level [`rejection_sample_draft`] does for
 /// its own `seed=None`. `MTP_VERIFY_DEFAULT_SEED` gives `mtp_verify_draft`'s probabilistic
 /// rejection sampling a fixed, deterministic-by-design default: identical inputs always
-/// produce identical accepted tokens, matching the same reproducibility contract
-/// [`crate::sampling::Sampler::with_seed`] documents for greedy generation. This value is
-/// arbitrary (mirrors [`SpecRng::new`]'s zero-seed fallback) and carries no other meaning.
+/// produce identical accepted tokens, matching the same reproducible-sampling contract
+/// [`crate::sampling::Sampler::with_seed`] documents. This value is arbitrary (mirrors
+/// [`SpecRng::new`]'s zero-seed fallback) and carries no other meaning.
 const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 
 /// Verify a speculative MTP draft against the target model, with an explicit seed for the
@@ -1318,7 +1318,9 @@ const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 /// - `Some(seed)`: probabilistic rejection sampling draws from an RNG seeded with `seed`.
 ///   Identical inputs and the same `seed` reproduce identical accepted tokens and
 ///   fallback token across runs — thread the caller's `GenerateConfig.seed` here to match
-///   the rest of a reproducible generation run.
+///   the rest of a reproducible generation run. Note [`SpecRng::new`] maps `seed == 0` to
+///   its internal fallback constant, so `Some(0)` behaves identically to that fallback
+///   seed rather than as a distinct zero-seeded stream (reproducibility still holds).
 /// - `None`: uses [`MTP_VERIFY_DEFAULT_SEED`], a fixed deterministic default — **not**
 ///   [`SpecRng::from_clock`]. This is documented compatibility behavior for
 ///   [`mtp_verify_draft`], the reverse of the lower-level [`rejection_sample_draft`], whose
@@ -3803,122 +3805,111 @@ mod tests {
     /// #329 mutation-sensitive determinism test for `mtp_verify_draft_with_seed`. Both
     /// drafted positions have accept probability exactly 0.5 (see
     /// `probe_half_accept_prob_scenario`), so the outcome is a live RNG-driven decision, not
-    /// forced by construction. Two independent runs with the same explicit seed must produce
-    /// identical results; if the seed threading fix is reverted (the rejection-sampling call
-    /// falls back to `SpecRng::from_clock()`), the two runs draw from different clock-seeded
-    /// streams and will very likely diverge.
+    /// forced by construction. Each same-seed pair must produce identical results. A single
+    /// pair is a weak mutation detector: with 2 positions at 50/50 (rejection stops at the
+    /// first failed draw) a reverted clock-seeded path still matches by coincidence with
+    /// probability 0.5^2 + 0.25^2 + 0.25^2 = 0.375, so this runs 8 independent pairs —
+    /// a revert survives all of them with probability 0.375^8 ≈ 4e-4.
     #[test]
     fn mtp_verify_draft_with_seed_repeats_probabilistic_acceptance() {
         let max_seq = 8usize;
+
         let s1 = probe_half_accept_prob_scenario();
-        let mut target = s1.target;
-
-        let mut verifier =
-            MtpVerifier::new(s1.cfg, &s1.weights, &s1.embed, &s1.lm_head, max_seq).unwrap();
-        let first = mtp_verify_draft_with_seed(
-            &mut verifier,
-            s1.current_token_id,
-            s1.current_position,
-            &s1.prev_hidden,
-            &s1.initial_target,
-            None,
-            &mut target,
-            Some(4242),
-        )
-        .unwrap();
-
-        // Fresh verifier + fresh target cache position, same seed.
-        target.cache_pos = s1.current_position + 1;
-        target.calls.clear();
         let s2 = probe_half_accept_prob_scenario();
         assert_eq!(
             s1.draft.tokens, s2.draft.tokens,
             "probe must be deterministic"
         );
-        let mut verifier2 =
-            MtpVerifier::new(s2.cfg, &s2.weights, &s2.embed, &s2.lm_head, max_seq).unwrap();
-        let second = mtp_verify_draft_with_seed(
-            &mut verifier2,
-            s2.current_token_id,
-            s2.current_position,
-            &s2.prev_hidden,
-            &s2.initial_target,
-            None,
-            &mut target,
-            Some(4242),
-        )
-        .unwrap();
 
-        assert_eq!(
-            first.accepted_count, second.accepted_count,
-            "same seed must reproduce the same accepted_count"
-        );
-        assert_eq!(
-            first.accepted_tokens, second.accepted_tokens,
-            "same seed must reproduce the same accepted_tokens"
-        );
-        assert_eq!(
-            first.fallback_token, second.fallback_token,
-            "same seed must reproduce the same fallback_token"
-        );
+        let run_with_seed = |seed: u64| {
+            let s = probe_half_accept_prob_scenario();
+            let mut target = s.target;
+            let mut verifier =
+                MtpVerifier::new(s.cfg, &s.weights, &s.embed, &s.lm_head, max_seq).unwrap();
+            mtp_verify_draft_with_seed(
+                &mut verifier,
+                s.current_token_id,
+                s.current_position,
+                &s.prev_hidden,
+                &s.initial_target,
+                None,
+                &mut target,
+                Some(seed),
+            )
+            .unwrap()
+        };
+
+        for seed in [
+            4242u64,
+            7,
+            99,
+            314_159,
+            271_828,
+            1_000_003,
+            0xdead_beef,
+            0x853c_49e6,
+        ] {
+            let first = run_with_seed(seed);
+            let second = run_with_seed(seed);
+            assert_eq!(
+                first.accepted_count, second.accepted_count,
+                "seed {seed}: same seed must reproduce the same accepted_count"
+            );
+            assert_eq!(
+                first.accepted_tokens, second.accepted_tokens,
+                "seed {seed}: same seed must reproduce the same accepted_tokens"
+            );
+            assert_eq!(
+                first.fallback_token, second.fallback_token,
+                "seed {seed}: same seed must reproduce the same fallback_token"
+            );
+        }
     }
 
     /// #329: locks the documented `seed=None` default behavior of the compatibility shim
     /// `mtp_verify_draft` — it must be deterministic via `MTP_VERIFY_DEFAULT_SEED`, not
     /// accidentally clock-seeded. Uses the same accept_prob == 0.5 scenario as
-    /// `mtp_verify_draft_with_seed_repeats_probabilistic_acceptance` so the test actually
-    /// exercises the RNG-driven branch rather than one forced deterministic by construction.
+    /// `mtp_verify_draft_with_seed_repeats_probabilistic_acceptance`, and the same
+    /// 8-independent-pairs repetition for the same reason: one 50/50 pair matches a
+    /// reverted clock-seeded path by coincidence with probability 0.375, eight pairs
+    /// push that below 4e-4.
     #[test]
     fn mtp_verify_draft_default_seed_is_deterministic() {
         let max_seq = 8usize;
-        let s1 = probe_half_accept_prob_scenario();
-        let mut target = s1.target;
 
-        let mut verifier =
-            MtpVerifier::new(s1.cfg, &s1.weights, &s1.embed, &s1.lm_head, max_seq).unwrap();
-        let first = mtp_verify_draft(
-            &mut verifier,
-            s1.current_token_id,
-            s1.current_position,
-            &s1.prev_hidden,
-            &s1.initial_target,
-            None,
-            &mut target,
-        )
-        .unwrap();
+        let run_default = || {
+            let s = probe_half_accept_prob_scenario();
+            let mut target = s.target;
+            let mut verifier =
+                MtpVerifier::new(s.cfg, &s.weights, &s.embed, &s.lm_head, max_seq).unwrap();
+            mtp_verify_draft(
+                &mut verifier,
+                s.current_token_id,
+                s.current_position,
+                &s.prev_hidden,
+                &s.initial_target,
+                None,
+                &mut target,
+            )
+            .unwrap()
+        };
 
-        target.cache_pos = s1.current_position + 1;
-        target.calls.clear();
-        let s2 = probe_half_accept_prob_scenario();
-        assert_eq!(
-            s1.draft.tokens, s2.draft.tokens,
-            "probe must be deterministic"
-        );
-        let mut verifier2 =
-            MtpVerifier::new(s2.cfg, &s2.weights, &s2.embed, &s2.lm_head, max_seq).unwrap();
-        let second = mtp_verify_draft(
-            &mut verifier2,
-            s2.current_token_id,
-            s2.current_position,
-            &s2.prev_hidden,
-            &s2.initial_target,
-            None,
-            &mut target,
-        )
-        .unwrap();
-
-        assert_eq!(
-            first.accepted_count, second.accepted_count,
-            "default seed=None must reproduce the same accepted_count"
-        );
-        assert_eq!(
-            first.accepted_tokens, second.accepted_tokens,
-            "default seed=None must reproduce the same accepted_tokens"
-        );
-        assert_eq!(
-            first.fallback_token, second.fallback_token,
-            "default seed=None must reproduce the same fallback_token"
-        );
+        for pair in 0..8 {
+            let first = run_default();
+            let second = run_default();
+            assert_eq!(
+                first.accepted_count, second.accepted_count,
+                "pair {pair}: default seed=None must reproduce the same accepted_count"
+            );
+            assert_eq!(
+                first.accepted_tokens, second.accepted_tokens,
+                "pair {pair}: default seed=None must reproduce the same accepted_tokens"
+            );
+            assert_eq!(
+                first.fallback_token, second.fallback_token,
+                "pair {pair}: default seed=None must reproduce the same fallback_token"
+            );
+        }
     }
 
     /// #329: different explicit seeds are permitted to reach different outcomes — this test
