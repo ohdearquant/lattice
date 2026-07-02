@@ -92,9 +92,11 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-inference (~118K)  fann (7.7K)  transport (5.4K)   ← leaf, zero internal deps
-    |                |
-  embed (12K)    tune (20K)                       ← depend on leaves only
+fann (7.7K)   transport (5.4K)                    ← leaf, zero internal deps
+    |
+inference (~118K)                                 ← optional dep on fann (`mixture` feature)
+    |
+embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
 ### lattice-inference — Transformer kernel
@@ -221,6 +223,13 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 
+### CI Authoring Rules (fail-closed)
+
+- Never pipe a gating command's output (`script | tee log`): the pipe's exit status masks the script's, and the gate silently passes on failure. Write reports to a file the step uploads (for example via an env-var path) and let the command's own exit code gate.
+- A gate must prove it exercised the real path. If the code under test can silently fall back (feature gate off, capability missing, GPU unavailable), assert on an explicit marker emitted by the exercised path and fail when it is absent. A skipped gate must read as red, not green.
+- Budget required-job timeouts for the runner pool's slow tail, not the median run. A deterministic timeout-cancel on a correct job is a false red that trains people to ignore the gate.
+- Informational (non-required) legs may be red. A red informational leg means "file the engine issue it found", not "block the merge" and not "delete the leg".
+
 ## Commands
 
 ```bash
@@ -228,7 +237,7 @@ make ci              # full local CI (fmt + clippy + deno lint + test + build)
 make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
 make publish-dry     # verify crates.io packaging
-make publish         # publish (leaf crates first, sleeps for indexing)
+make publish         # publish (dependency order, sleeps for indexing)
 
 # E2E parity (HF reference vs lattice)
 make e2e-parity                          # run locally (needs torch + transformers)

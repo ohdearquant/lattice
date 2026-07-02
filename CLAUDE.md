@@ -55,6 +55,22 @@ If the gap you're investigating exceeds these bounds, the cause is structural (a
 
 **Be skeptical of comments that paraphrase config fields.** A comment that says "X uses field=true" without explaining what the field actually controls in the reference implementation is a footgun. The lattice RoPE comment said "Qwen3.5 uses mrope_interleaved=true" — technically matched config, but `mrope_interleaved` controls multimodal M-RoPE section interleaving (video/image tokens), not 1-D text RoPE pairing. The bug existed for months because nobody verified the comment against HF's `rotate_half` or MLX's `nn.RoPE`.
 
+### Triage Flaky vs Deterministic Before Filing
+
+When a test fails intermittently or fails alongside unrelated work, run the discriminating experiment before writing the issue: ONE test, solo, `--test-threads=1`, idle GPU, exact main SHA. Concurrent GPU load corrupts both timing and numerics, so a "pre-existing failure on main" verified while other GPU work runs is not verified at all.
+
+This split a two-test failure report cleanly: one test failed deterministically at every prompt length under solo idle-GPU conditions (real chunk-boundary accumulation drift, its own issue), while the other passed solo in 65 seconds (a load flake, a different issue). Filing them as one regression would have sent the fix to the wrong place.
+
+### Regression Tests Must Be Mutation-Sensitive
+
+A regression test that passes with the fix reverted is decoration. Before claiming a test guards a fix: revert the fix (reverse-apply the diff — never `git checkout` over uncommitted work), `touch` the source file so cargo actually rebuilds, and watch the test fail. Then restore the fix and watch it pass.
+
+### Grep for Sibling Invocation Paths
+
+When a harness or guard fix lands in one invocation path, grep the same file for sibling paths that construct the same operation independently: a second subprocess command builder, a second workflow step calling the same script, a reimplementation of a guarded method. Any fix expressible as "add flag X to the call" has an unguarded copy-paste sibling until proven otherwise, and the fix's own description ("mirror the CPU path") is the grep query.
+
+This class recurred three times in one week before becoming a rule — most recently a greedy-decoding sampler flag added to the CPU parity harness path while the Metal-path command builder in the same file went without it, surfacing only on that leg's first live CI run.
+
 ### E2E Parity Gate
 
 PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) and lattice on the same macOS runner, comparing greedy generation output. The reference runs first to warm the machine.
@@ -99,7 +115,7 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 ## Crate Ownership
 
-Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `tune`. Changes to `transport`, `fann`, or `inference` alone are safe — they're leaf crates.
+Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `inference` (via the optional `mixture` feature) and `tune`. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only).
 
 ## Publishing
 

@@ -30,24 +30,24 @@ library from a single window.
 
 ## Capabilities
 
-| | |
-|---|---|
-| Pure Rust compute | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA. |
-| Metal GPU backend | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform. |
-| Generation models | Qwen3.5-0.8B / 2B, Qwen3.6-35B-A3B (MoE), Qwen3.6-27B. Hybrid GatedDeltaNet + GQA architecture. |
-| Embedding models | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants. |
-| Three tokenizers | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension. |
-| Quantization | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5. |
-| LoRA | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`. |
-| HTTP API | OpenAI-compatible `/v1/chat/completions` via `lattice serve`. |
-| Safetensors native | Memory-mapped weight loading. Single-file and sharded checkpoints. |
-| KV cache | Incremental decoding with key-value caching. |
-| Speculative decoding | Draft-model acceleration on the CPU path. |
-| Grammar decoding | Constrained output via a pushdown automaton. OpenAI string-level stop sequences. |
-| MRL support | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32). |
-| LRU cache | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats. |
-| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`. |
-| Optimal transport | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`. |
+|                        |                                                                                                 |
+| ---------------------- | ----------------------------------------------------------------------------------------------- |
+| Pure Rust compute      | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                |
+| Metal GPU backend      | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.      |
+| Generation models      | Qwen3.5-0.8B / 2B, Qwen3.6-35B-A3B (MoE), Qwen3.6-27B. Hybrid GatedDeltaNet + GQA architecture. |
+| Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.  |
+| Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                          |
+| Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5.  |
+| LoRA                   | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`.  |
+| HTTP API               | OpenAI-compatible `/v1/chat/completions` via `lattice serve`.                                   |
+| Safetensors native     | Memory-mapped weight loading. Single-file and sharded checkpoints.                              |
+| KV cache               | Incremental decoding with key-value caching.                                                    |
+| Speculative decoding   | Draft-model acceleration on the CPU path.                                                       |
+| Grammar decoding       | Constrained output via a pushdown automaton. OpenAI string-level stop sequences.                |
+| MRL support            | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32).                      |
+| LRU cache              | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats.                       |
+| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`.               |
+| Optimal transport      | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`.                    |
 
 ---
 
@@ -63,7 +63,7 @@ speed you observe in an interactive chat is lower than these numbers, because it
 prefill of the whole prompt (see "Why throughput falls with context" below).
 
 | Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
-|---------|------------------------|---------------|-------------------|-------------------|
+| ------- | ---------------------- | ------------- | ----------------- | ----------------- |
 | 64 tok  | **187 tok/s**          | 93            | 265               | 2.0x              |
 | 128 tok | **171 tok/s**          | 92            | 263               | 1.9x              |
 | 256 tok | **146 tok/s**          | 88            | 260               | 1.6x              |
@@ -90,11 +90,11 @@ the same tier as Ollama. MLX decodes faster than Lattice at raw throughput. Latt
 portability (pure Rust, zero Python, zero framework) plus capabilities neither Ollama nor MLX
 provide for this model family:
 
-| Capability | Lattice | MLX | Ollama |
-|---|---|---|---|
-| QuaRot 4-bit (rotation-based quant) | yes | no | no |
-| Q4 + LoRA hot-swap (no reload) | yes | no | no |
-| Pure Rust, zero Python or framework | yes | no | no |
+| Capability                          | Lattice | MLX | Ollama |
+| ----------------------------------- | ------- | --- | ------ |
+| QuaRot 4-bit (rotation-based quant) | yes     | no  | no     |
+| Q4 + LoRA hot-swap (no reload)      | yes     | no  | no     |
+| Pure Rust, zero Python or framework | yes     | no  | no     |
 
 PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4 19.27, q4-QuaRot 19.95 (2048 tokens); MLX q8 15.82, q4 18.18 (2041 tokens). Reproduce:
 `./scripts/bench_context_scaling.sh`
@@ -103,16 +103,17 @@ PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4
 
 ## Crates
 
-| Crate | Description | crates.io |
-|-------|-------------|-----------|
-| [`lattice-embed`](crates/embed/) | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed) |
+| Crate                                    | Description                                                                                                                                                           | crates.io                                                                                                |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| [`lattice-embed`](crates/embed/)         | Embedding service: `EmbeddingService` trait, `NativeEmbeddingService`, `CachedEmbeddingService`, SIMD cosine/dot/euclidean, backfill                                  | [![](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)         |
 | [`lattice-inference`](crates/inference/) | Transformer kernel: safetensors loading, BERT/BGE/Qwen3 forward pass, three tokenizers, Metal/WGPU backends, LoRA hooks, KV cache, speculative decoding, quantization | [![](https://img.shields.io/crates/v/lattice-inference.svg)](https://crates.io/crates/lattice-inference) |
-| [`lattice-fann`](crates/fann/) | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann) |
-| [`lattice-tune`](crates/tune/) | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune) |
-| [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
+| [`lattice-fann`](crates/fann/)           | Fast neural network primitives: `NetworkBuilder`, pre-allocated layers, zero-alloc forward pass, backprop trainer                                                     | [![](https://img.shields.io/crates/v/lattice-fann.svg)](https://crates.io/crates/lattice-fann)           |
+| [`lattice-tune`](crates/tune/)           | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)           |
+| [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
 
-The three leaf crates (`inference`, `fann`, `transport`) have zero intra-workspace dependencies
-and can be used standalone.
+Two leaf crates (`fann`, `transport`) have zero intra-workspace dependencies. `inference` is
+standalone by default and pulls in `fann` only when the optional `mixture` feature is enabled.
+All three can be used on their own.
 
 ---
 
@@ -287,17 +288,17 @@ The command bar (cmd-K) runs everything from a single keyboard shortcut:
 
 ### Embedding models
 
-| Variant | HuggingFace ID | Dims | Max tokens | Auto-download |
-|---------|---------------|------|-----------|---------------|
-| `BgeSmallEnV15` | `BAAI/bge-small-en-v1.5` | 384 | 512 | yes |
-| `BgeBaseEnV15` | `BAAI/bge-base-en-v1.5` | 768 | 512 | yes |
-| `BgeLargeEnV15` | `BAAI/bge-large-en-v1.5` | 1024 | 512 | yes |
-| `MultilingualE5Small` | `intfloat/multilingual-e5-small` | 384 | 512 | yes |
-| `MultilingualE5Base` | `intfloat/multilingual-e5-base` | 768 | 512 | yes |
-| `AllMiniLmL6V2` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | 256 | yes |
-| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | 128 | yes |
-| `Qwen3Embedding0_6B` | `Qwen/Qwen3-Embedding-0.6B` | 1024 | 8192 | local dir only |
-| `Qwen3Embedding4B` | `Qwen/Qwen3-Embedding-4B` | 2560* | 8192 | local dir only |
+| Variant                             | HuggingFace ID                                                | Dims  | Max tokens | Auto-download  |
+| ----------------------------------- | ------------------------------------------------------------- | ----- | ---------- | -------------- |
+| `BgeSmallEnV15`                     | `BAAI/bge-small-en-v1.5`                                      | 384   | 512        | yes            |
+| `BgeBaseEnV15`                      | `BAAI/bge-base-en-v1.5`                                       | 768   | 512        | yes            |
+| `BgeLargeEnV15`                     | `BAAI/bge-large-en-v1.5`                                      | 1024  | 512        | yes            |
+| `MultilingualE5Small`               | `intfloat/multilingual-e5-small`                              | 384   | 512        | yes            |
+| `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               | 768   | 512        | yes            |
+| `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      | 384   | 256        | yes            |
+| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384   | 128        | yes            |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   | 1024  | 8192       | local dir only |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     | 2560* | 8192       | local dir only |
 
 *Qwen3-Embedding-4B and 0.6B support MRL truncation to any dimension >= 32.
 BGE v1.5 uses CLS pooling. E5 and MiniLM use mean pooling.
@@ -305,12 +306,12 @@ E5 `embed_passage()` applies the `"passage: "` prefix automatically.
 
 ### Generation models (local files required)
 
-| Config preset | Description |
-|---------------|-------------|
-| `Qwen35Config::qwen35_0_8b` | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental. |
-| `Qwen35Config::qwen35_2b` | 24 layers, 2048 hidden, dense FFN, tied embeddings. |
-| `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported. |
-| `Qwen35Config::qwen36_27b` | 64 layers, 5120 hidden, dense FFN. |
+| Config preset                  | Description                                                                 |
+| ------------------------------ | --------------------------------------------------------------------------- |
+| `Qwen35Config::qwen35_0_8b`    | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental. |
+| `Qwen35Config::qwen35_2b`      | 24 layers, 2048 hidden, dense FFN, tied embeddings.                         |
+| `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported.       |
+| `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN.                                          |
 
 The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA attention layers.
 Lattice is the only open-source engine that correctly runs this hybrid recurrence at Q4 on Apple Silicon.
@@ -364,10 +365,10 @@ let sims = utils::batch_cosine_similarity(&pairs);
 
 Measured performance on normalized vectors (internal benchmarks, subject to hardware):
 
-| Operation | Scalar | SIMD |
-|-----------|--------|------|
-| cosine similarity (384-dim) | ~650 ns | ~90 ns |
-| cosine similarity (768-dim) | ~1300 ns | ~180 ns |
+| Operation                    | Scalar   | SIMD    |
+| ---------------------------- | -------- | ------- |
+| cosine similarity (384-dim)  | ~650 ns  | ~90 ns  |
+| cosine similarity (768-dim)  | ~1300 ns | ~180 ns |
 | cosine similarity (1024-dim) | ~1700 ns | ~240 ns |
 
 ---
@@ -376,21 +377,21 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 
 ### lattice-embed
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `native` | yes | Pure Rust inference via `lattice-inference` |
-| `metal-gpu` | no | Metal GPU acceleration (macOS) |
-| `avx512` | no | AVX-512 SIMD kernels (requires nightly) |
+| Feature     | Default | Description                                 |
+| ----------- | ------- | ------------------------------------------- |
+| `native`    | yes     | Pure Rust inference via `lattice-inference` |
+| `metal-gpu` | no      | Metal GPU acceleration (macOS)              |
+| `avx512`    | no      | AVX-512 SIMD kernels (requires nightly)     |
 
 ### lattice-inference
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `f16` | no | Half-precision weights |
-| `metal-gpu` | no | Metal compute backend |
-| `wgpu-gpu` | no | WGPU cross-platform GPU backend |
-| `download` | yes | HuggingFace weight download with checksum verification |
-| `backfill` | no | Re-embedding coordinator (requires `rusqlite`) |
+| Feature     | Default | Description                                            |
+| ----------- | ------- | ------------------------------------------------------ |
+| `f16`       | no      | Half-precision weights                                 |
+| `metal-gpu` | no      | Metal compute backend                                  |
+| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                        |
+| `download`  | yes     | HuggingFace weight download with checksum verification |
+| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)         |
 
 ---
 
@@ -453,8 +454,9 @@ on your target hardware for representative numbers.
 
 ## Publishing
 
-Leaf crates publish first: `inference` then `fann` then `transport` (wait 30s) then `embed`
-(wait 30s) then `tune`.
+Publish order follows the internal dependency DAG (dependencies before dependents): `fann` and
+`transport` (leaves), wait 30s, then `inference` (depends on `fann`), wait 30s, then `embed`
+and `tune`.
 
 ```bash
 make publish
