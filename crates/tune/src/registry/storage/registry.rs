@@ -310,22 +310,49 @@ impl ModelRegistry {
     /// name silently bypassed the verification `load_weights_verified`
     /// performed, even though every model registered via [`Self::register`]
     /// always carries a `weights_hash`. Fail-closed discipline now applies
-    /// here too: if `model.weights_hash` is `Some`, a mismatch is a hard
-    /// `TuneError::WeightIntegrityError`, not a silent pass-through. A
-    /// model with no recorded hash at all (e.g. [`Self::register_metadata`]
-    /// with weights added out-of-band, or a legacy pre-hash record) has
-    /// nothing to check against and loads unverified — that is the only
-    /// remaining "raw" case, and it is explicit (a `None` hash on the
-    /// record), never a silent skip of a hash that *is* present.
+    /// here too: a hash mismatch is a hard
+    /// `TuneError::WeightIntegrityError`, not a silent pass-through.
+    ///
+    /// Verification is anchored to the **canonical registry record**
+    /// (resolved by `model.id` from the registry's own snapshot), never to
+    /// the caller-provided value: [`RegisteredModel`] is a plain DTO with
+    /// public `weights_path`/`weights_hash` fields, so a mutated clone
+    /// could otherwise redirect the load to a different path or "verify"
+    /// tampered bytes against a recomputed hash. A caller argument that
+    /// disagrees with the canonical record on either field is rejected
+    /// outright. A model whose *canonical* record has no hash at all
+    /// (e.g. [`Self::register_metadata`] with weights added out-of-band,
+    /// or a legacy pre-hash record) has nothing to check against and loads
+    /// unverified — that is the only remaining "raw" case, and it is
+    /// explicit (a `None` hash on the canonical record), never a silent
+    /// skip of a hash that *is* present.
     pub fn load_weights(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
-        let path = model
+        let snap = self.models.load();
+        let canonical = snap
+            .get(&model.id)
+            .ok_or_else(|| TuneError::ModelNotFound {
+                name: model.name.clone(),
+                version: model.version.clone(),
+            })?;
+
+        if model.weights_path != canonical.weights_path
+            || model.weights_hash != canonical.weights_hash
+        {
+            return Err(TuneError::Storage(format!(
+                "load_weights: model {} argument disagrees with the canonical registry \
+                 record on weights_path/weights_hash; refusing to load from a mutated clone",
+                model.id
+            )));
+        }
+
+        let path = canonical
             .weights_path
             .as_ref()
             .ok_or_else(|| TuneError::Storage("No weights path".to_string()))?;
 
         let weights = self.storage.lock().load(path)?;
 
-        if let Some(ref expected_hash) = model.weights_hash {
+        if let Some(ref expected_hash) = canonical.weights_hash {
             let actual_hash = sha256_hash(&weights);
             if &actual_hash != expected_hash {
                 return Err(TuneError::WeightIntegrityError {
@@ -352,14 +379,27 @@ impl ModelRegistry {
     ///
     /// Returns `TuneError::WeightIntegrityError` if the checksum doesn't
     /// match, or `TuneError::Storage` if no checksum is on record at all.
+    ///
+    /// Like [`Self::load_weights`], the "is a hash on record" decision is
+    /// made against the canonical registry record, not the caller's clone
+    /// (whose public `weights_hash` field could have been set to `None` or
+    /// to a recomputed hash of tampered bytes).
     pub fn load_weights_verified(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
-        if model.weights_hash.is_none() {
+        let snap = self.models.load();
+        let canonical = snap
+            .get(&model.id)
+            .ok_or_else(|| TuneError::ModelNotFound {
+                name: model.name.clone(),
+                version: model.version.clone(),
+            })?;
+        if canonical.weights_hash.is_none() {
             return Err(TuneError::Storage(format!(
                 "load_weights_verified: model {} ({} v{}) has no recorded \
                  weights_hash to verify against",
                 model.id, model.name, model.version
             )));
         }
+        drop(snap);
         self.load_weights(model)
     }
 

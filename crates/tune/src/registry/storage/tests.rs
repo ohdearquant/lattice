@@ -172,6 +172,101 @@ fn test_load_weights_rejects_tampered_bytes_on_disk() {
 }
 
 #[test]
+fn test_load_weights_rejects_mutated_clone_hash() {
+    // `RegisteredModel` is a cloned DTO with public `weights_path`/
+    // `weights_hash` fields. If verification trusted the CALLER's value, a
+    // caller could tamper weights.bin on disk, set its clone's hash to
+    // sha256(tampered bytes), and have both entry points "verify" the
+    // tampered artifact. Verification must anchor to the canonical
+    // registry record and reject a disagreeing argument outright.
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+
+    let id = registry.register(model, &weights).unwrap();
+
+    // Tamper the on-disk artifact, then forge the clone's hash to match
+    // the tampered bytes.
+    let weights_path = tmp.path().join("test/1.0.0/weights.bin");
+    let mut tampered = weights.clone();
+    tampered[0] ^= 0xFF;
+    std::fs::write(&weights_path, &tampered).unwrap();
+
+    let mut forged = registry.get_by_id(&id).unwrap();
+    forged.weights_hash = Some(sha256_hash(&tampered));
+
+    let err = registry
+        .load_weights(&forged)
+        .expect_err("load_weights must not verify against a caller-forged hash");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&forged)
+        .expect_err("load_weights_verified must not verify against a caller-forged hash");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+
+    // Blanking the clone's hash must not re-open the pre-#504 raw-load
+    // path either — the canonical record still carries a hash.
+    let mut hashless = registry.get_by_id(&id).unwrap();
+    hashless.weights_hash = None;
+    let err = registry
+        .load_weights(&hashless)
+        .expect_err("load_weights must not raw-load because a CLONE's hash was blanked");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&hashless)
+        .expect_err("load_weights_verified must not raw-load a hash-blanked clone");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+
+    // The honest canonical record still rejects the tampered disk bytes
+    // via the checksum itself.
+    let canonical = registry.get_by_id(&id).unwrap();
+    let err = registry
+        .load_weights(&canonical)
+        .expect_err("canonical record must reject tampered disk bytes");
+    assert!(
+        matches!(err, TuneError::WeightIntegrityError { .. }),
+        "expected WeightIntegrityError, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_unregistered_model() {
+    // A RegisteredModel value that was never registered (or was deleted)
+    // has no canonical record to verify against — it must not load at all.
+    let registry = ModelRegistry::in_memory();
+    let mut ghost = RegisteredModel::new("ghost", "1.0.0");
+    ghost.weights_path = Some("ghost/1.0.0/weights.bin".to_string());
+
+    let err = registry
+        .load_weights(&ghost)
+        .expect_err("load_weights must reject a model with no registry record");
+    assert!(
+        matches!(err, TuneError::ModelNotFound { .. }),
+        "expected ModelNotFound, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&ghost)
+        .expect_err("load_weights_verified must reject a model with no registry record");
+    assert!(
+        matches!(err, TuneError::ModelNotFound { .. }),
+        "expected ModelNotFound, got: {err:?}"
+    );
+}
+
+#[test]
 fn test_load_weights_rejects_truncated_file_on_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = ModelRegistry::with_path(tmp.path()).unwrap();

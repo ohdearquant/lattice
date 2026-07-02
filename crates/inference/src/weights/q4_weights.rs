@@ -1081,54 +1081,15 @@ pub(crate) fn write_merged_qkvz(
     z_path: &std::path::Path,
     out_path: &std::path::Path,
 ) -> Result<(), String> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::Write;
 
-    // Open and parse headers — then seek back to payload start for a direct byte copy.
-    let qkv_file =
-        std::fs::File::open(qkv_path).map_err(|e| format!("open {}: {e}", qkv_path.display()))?;
-    let qkv_hdr =
-        read_q4_header(&qkv_file).map_err(|e| format!("header {}: {e}", qkv_path.display()))?;
-    let mut qkv_rdr = qkv_file;
-    qkv_rdr
-        .seek(SeekFrom::Start(qkv_hdr.payload_offset))
-        .map_err(|e| format!("seek {}: {e}", qkv_path.display()))?;
-    let qkv_payload_len = std::fs::metadata(qkv_path)
-        .map_err(|e| format!("metadata {}: {e}", qkv_path.display()))?
-        .len()
-        .checked_sub(qkv_hdr.payload_offset)
-        .ok_or_else(|| {
-            format!(
-                "{}: file truncated below header (shorter than payload_offset {})",
-                qkv_path.display(),
-                qkv_hdr.payload_offset
-            )
-        })?;
-    let mut qkv_payload = Vec::with_capacity(qkv_payload_len as usize);
-    qkv_rdr
-        .read_to_end(&mut qkv_payload)
+    // Bounded reads with the same cap as the validator: a stat-then-
+    // `read_to_end` here would let a source file that grows between the
+    // metadata check and the read drive an unbounded allocation during a
+    // cache rebuild.
+    let (qkv_hdr, qkv_payload) = read_q4_payload_bounded(qkv_path, MAX_Q4_MERGE_PAYLOAD_LEN)
         .map_err(|e| format!("read {}: {e}", qkv_path.display()))?;
-
-    let z_file =
-        std::fs::File::open(z_path).map_err(|e| format!("open {}: {e}", z_path.display()))?;
-    let z_hdr = read_q4_header(&z_file).map_err(|e| format!("header {}: {e}", z_path.display()))?;
-    let mut z_rdr = z_file;
-    z_rdr
-        .seek(SeekFrom::Start(z_hdr.payload_offset))
-        .map_err(|e| format!("seek {}: {e}", z_path.display()))?;
-    let z_payload_len = std::fs::metadata(z_path)
-        .map_err(|e| format!("metadata {}: {e}", z_path.display()))?
-        .len()
-        .checked_sub(z_hdr.payload_offset)
-        .ok_or_else(|| {
-            format!(
-                "{}: file truncated below header (shorter than payload_offset {})",
-                z_path.display(),
-                z_hdr.payload_offset
-            )
-        })?;
-    let mut z_payload = Vec::with_capacity(z_payload_len as usize);
-    z_rdr
-        .read_to_end(&mut z_payload)
+    let (z_hdr, z_payload) = read_q4_payload_bounded(z_path, MAX_Q4_MERGE_PAYLOAD_LEN)
         .map_err(|e| format!("read {}: {e}", z_path.display()))?;
 
     // Merged shape: rows = qkv_rows + z_rows, cols = hidden (shared)
@@ -2483,6 +2444,34 @@ mod tests {
         assert!(
             merged_qkvz_cache_is_valid(&merged_p, expected_size, &qkv_p, &z_p),
             "freshly written merged cache must validate against its own sources"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_write_merged_qkvz_rejects_oversized_source_payload() {
+        // A source file whose payload exceeds MAX_Q4_MERGE_PAYLOAD_LEN must
+        // fail closed BEFORE any payload allocation — the rebuild path uses
+        // the same bounded reader as the validator. `set_len` produces a
+        // sparse file, so this asserts the cap without 2 GiB of disk I/O.
+        let (qkv_p, z_p, merged_p) = merge_test_paths("oversized_source");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+
+        let f = std::fs::File::options().write(true).open(&qkv_p).unwrap();
+        f.set_len(36 + MAX_Q4_MERGE_PAYLOAD_LEN + 1).unwrap();
+        drop(f);
+
+        let err = write_merged_qkvz(&qkv_p, &z_p, &merged_p)
+            .expect_err("oversized source payload must be rejected, not read to EOF");
+        assert!(
+            err.contains("payload too large"),
+            "expected a payload-cap error, got: {err}"
+        );
+        assert!(
+            !merged_p.exists(),
+            "no merged artifact may be produced from a rejected source"
         );
 
         std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
