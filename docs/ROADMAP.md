@@ -33,7 +33,8 @@ lanes below:
    streaming correctness (UTF-8 boundaries, added tokens), and Studio workflows backed by real
    engine state.
 3. **Quantization quality and coverage.** Tighter perplexity tracking, kernel coverage for
-   quantized paths, and sub-4-bit exploration (a W3 MLP-only weight path is in review).
+   quantized paths, and sub-4-bit exploration (a W3 MLP-only weight path exists as a parked
+   draft, #515).
 4. **Correctness infrastructure.** Cross-framework parity gates in CI (greedy-token agreement
    vs HF transformers), differential tests for every numeric kernel, and mutation-sensitive
    regression tests.
