@@ -886,6 +886,282 @@ pub fn load_f16_tensor_file(
 }
 
 // ---------------------------------------------------------------------------
+// Merge-on-first-load `.q4` cache (`merged_qkvz_*.q4`) — content integrity
+// ---------------------------------------------------------------------------
+//
+// `forward::metal_qwen35`'s Metal loader merges each GatedDeltaNet layer's
+// `in_proj_qkv` and `in_proj_z` Q4 tensors into one `merged_qkvz_*.q4` file on
+// first load so later loads can zero-copy mmap it like any other Q4 weight.
+// The original cache-validity check compared only the merged file's *size*
+// against the current source files' sizes (`#504`, second slice): a
+// same-size stale or bit-rotted merged artifact would load silently. The
+// functions below add a fail-closed content hash on top of that size check,
+// mirroring `model::qwen`'s embedding-cache manifest guard (#504 first
+// slice): hash the *current* source payloads and the merged file's on-disk
+// payload, and only accept the cache when they match byte-for-byte via
+// SHA-256. Any read/parse error is treated as invalid (reject, don't warn)
+// so the caller always falls back to rebuilding the merge from trusted
+// sources rather than trusting a file it could not fully verify.
+
+/// Upper bound on a single `.q4` payload this module will read fully into
+/// memory for content-integrity hashing (merge-on-first-load source
+/// fingerprinting and merged-artifact verification). Generous relative to
+/// any single per-layer GatedDeltaNet `in_proj_qkv`/`in_proj_z` tensor, while
+/// still bounding the read so a corrupted or hostile file cannot drive an
+/// unbounded allocation.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) const MAX_Q4_MERGE_PAYLOAD_LEN: u64 = 1 << 31; // 2 GiB
+
+/// Read and validate a `.q4` file's header via [`read_q4_header`], then read
+/// its payload (everything after the header) bounded by `max_len`.
+///
+/// The stat (via the header's file metadata) is only a fast-path; the read
+/// itself is bounded via `take(max_len + 1)`, so a file that grows or is
+/// swapped after the size check still cannot drive an allocation past the
+/// cap. Mirrors `model::qwen::read_embedding_cache_file_bounded`.
+///
+/// Only compiled for tests or the `metal-gpu` feature: its sole caller is
+/// the Metal merge-on-first-load `.q4` cache guard in
+/// `forward::metal_qwen35`, which itself only exists under `metal-gpu`.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn read_q4_payload_bounded(
+    path: &std::path::Path,
+    max_len: u64,
+) -> Result<(Q4FileHeader, Vec<u8>), Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let file = std::fs::File::open(path)?;
+    let header = read_q4_header(&file)?;
+    let file_len = file.metadata()?.len();
+    if file_len < header.payload_offset {
+        return Err(format!(
+            "{}: file truncated below header ({file_len} bytes < payload_offset {})",
+            path.display(),
+            header.payload_offset
+        )
+        .into());
+    }
+    let payload_len = file_len - header.payload_offset;
+    if payload_len > max_len {
+        return Err(format!(
+            "{}: payload too large: {payload_len} bytes exceeds cap of {max_len} bytes",
+            path.display()
+        )
+        .into());
+    }
+
+    let mut f = file;
+    f.seek(SeekFrom::Start(header.payload_offset))?;
+    let mut buf = Vec::new();
+    f.take(max_len.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_len {
+        return Err(format!(
+            "{}: payload too large: read exceeds cap of {max_len} bytes",
+            path.display()
+        )
+        .into());
+    }
+    Ok((header, buf))
+}
+
+/// SHA-256 of `bytes`, formatted as lowercase hex. Mirrors
+/// `model::qwen::embedding_cache_sha256_hex` / `download::sha256_hex`.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn q4_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Expected byte length of a `merged_qkvz_*.q4` file built from `qkv_file_len`
+/// and `z_file_len` (the on-disk lengths of the source `in_proj_qkv`/
+/// `in_proj_z` files): a 36-byte header (`ndim=2`, `payload_offset=36` — all
+/// source weight files are 2-D) plus both source payloads.
+///
+/// Returns `Err` instead of underflowing/panicking when a source file is
+/// smaller than its own 36-byte header (truncated/corrupt source), so a
+/// malformed source file fails closed here rather than wrapping to a bogus
+/// huge `u64` via unchecked subtraction.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn merged_qkvz_expected_size(qkv_file_len: u64, z_file_len: u64) -> Result<u64, String> {
+    const HEADER_LEN: u64 = 36;
+    let qkv_payload_len = qkv_file_len.checked_sub(HEADER_LEN).ok_or_else(|| {
+        format!("qkv source file too small: {qkv_file_len} bytes < {HEADER_LEN}-byte header")
+    })?;
+    let z_payload_len = z_file_len.checked_sub(HEADER_LEN).ok_or_else(|| {
+        format!("z source file too small: {z_file_len} bytes < {HEADER_LEN}-byte header")
+    })?;
+    Ok(HEADER_LEN + qkv_payload_len + z_payload_len)
+}
+
+/// Content fingerprint (SHA-256 hex) of the *current* `qkv_path`/`z_path`
+/// source payloads, in write order (qkv then z) — i.e. exactly the bytes
+/// [`write_merged_qkvz`] would concatenate into a fresh merged file.
+///
+/// Reads both source payloads bounded by [`MAX_Q4_MERGE_PAYLOAD_LEN`].
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn merged_qkvz_source_fingerprint(
+    qkv_path: &std::path::Path,
+    z_path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (_qkv_hdr, mut qkv_payload) = read_q4_payload_bounded(qkv_path, MAX_Q4_MERGE_PAYLOAD_LEN)?;
+    let (_z_hdr, z_payload) = read_q4_payload_bounded(z_path, MAX_Q4_MERGE_PAYLOAD_LEN)?;
+    // Concatenate in write order (qkv then z) so this hashes exactly the
+    // bytes `write_merged_qkvz` would produce as the merged payload.
+    qkv_payload.extend_from_slice(&z_payload);
+    Ok(q4_sha256_hex(&qkv_payload))
+}
+
+/// Content fingerprint (SHA-256 hex) of an existing merged file's on-disk
+/// payload. Since [`write_merged_qkvz`] writes exactly `qkv_payload ||
+/// z_payload` after its header, a valid, uncorrupted merged file's
+/// fingerprint equals [`merged_qkvz_source_fingerprint`] computed from the
+/// same source files at write time.
+///
+/// Reads the merged payload bounded by [`MAX_Q4_MERGE_PAYLOAD_LEN`].
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn merged_qkvz_file_fingerprint(
+    merged_path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (_hdr, payload) = read_q4_payload_bounded(merged_path, MAX_Q4_MERGE_PAYLOAD_LEN)?;
+    Ok(q4_sha256_hex(&payload))
+}
+
+/// Fail-closed validity check for a `merged_qkvz_*.q4` cache entry.
+///
+/// Returns `true` only when `merged_path` exists, its size matches
+/// `expected_size`, and its content fingerprint matches a fingerprint
+/// freshly derived from the *current* `qkv_path`/`z_path` source files. Any
+/// I/O error, oversized payload, or malformed header on either side is
+/// treated as invalid — this never warns-and-continues on a mismatch, it
+/// always reports "rebuild from source" via `false`, so the caller
+/// re-derives the merge from trusted inputs instead of trusting a merged
+/// artifact it could not fully verify.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn merged_qkvz_cache_is_valid(
+    merged_path: &std::path::Path,
+    expected_size: u64,
+    qkv_path: &std::path::Path,
+    z_path: &std::path::Path,
+) -> bool {
+    let Ok(metadata) = std::fs::metadata(merged_path) else {
+        return false;
+    };
+    if metadata.len() != expected_size {
+        return false;
+    }
+    let Ok(source_fp) = merged_qkvz_source_fingerprint(qkv_path, z_path) else {
+        return false;
+    };
+    let Ok(file_fp) = merged_qkvz_file_fingerprint(merged_path) else {
+        return false;
+    };
+    source_fp == file_fp
+}
+
+/// Merge two Q4 files into a single concatenated Q4 file and write it to
+/// `out_path`.
+///
+/// Reads only the raw bytes (no deserialization) and prepends a new KHQ4
+/// header reflecting the merged shape. Uses a temp-file + atomic rename so a
+/// crashed mid-write never leaves a partial file at the final path.
+///
+/// Returns `Err` if the model directory is read-only or I/O fails — callers
+/// must fall back to the CPU concat path in that case.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn write_merged_qkvz(
+    qkv_path: &std::path::Path,
+    z_path: &std::path::Path,
+    out_path: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    // Open and parse headers — then seek back to payload start for a direct byte copy.
+    let qkv_file =
+        std::fs::File::open(qkv_path).map_err(|e| format!("open {}: {e}", qkv_path.display()))?;
+    let qkv_hdr =
+        read_q4_header(&qkv_file).map_err(|e| format!("header {}: {e}", qkv_path.display()))?;
+    let mut qkv_rdr = qkv_file;
+    qkv_rdr
+        .seek(SeekFrom::Start(qkv_hdr.payload_offset))
+        .map_err(|e| format!("seek {}: {e}", qkv_path.display()))?;
+    let qkv_payload_len = std::fs::metadata(qkv_path)
+        .map_err(|e| format!("metadata {}: {e}", qkv_path.display()))?
+        .len()
+        - qkv_hdr.payload_offset;
+    let mut qkv_payload = Vec::with_capacity(qkv_payload_len as usize);
+    qkv_rdr
+        .read_to_end(&mut qkv_payload)
+        .map_err(|e| format!("read {}: {e}", qkv_path.display()))?;
+
+    let z_file =
+        std::fs::File::open(z_path).map_err(|e| format!("open {}: {e}", z_path.display()))?;
+    let z_hdr = read_q4_header(&z_file).map_err(|e| format!("header {}: {e}", z_path.display()))?;
+    let mut z_rdr = z_file;
+    z_rdr
+        .seek(SeekFrom::Start(z_hdr.payload_offset))
+        .map_err(|e| format!("seek {}: {e}", z_path.display()))?;
+    let z_payload_len = std::fs::metadata(z_path)
+        .map_err(|e| format!("metadata {}: {e}", z_path.display()))?
+        .len()
+        - z_hdr.payload_offset;
+    let mut z_payload = Vec::with_capacity(z_payload_len as usize);
+    z_rdr
+        .read_to_end(&mut z_payload)
+        .map_err(|e| format!("read {}: {e}", z_path.display()))?;
+
+    // Merged shape: rows = qkv_rows + z_rows, cols = hidden (shared)
+    let merged_rows = qkv_hdr.shape[0] + z_hdr.shape[0];
+    let cols = if qkv_hdr.shape.len() >= 2 {
+        qkv_hdr.shape[1]
+    } else {
+        1
+    };
+    let original_len = qkv_hdr.original_len + z_hdr.original_len;
+
+    // Write to a temp file then rename atomically so partial writes are never trusted.
+    let tmp = out_path.with_extension("q4.tmp");
+    let write_result = (|| -> Result<(), String> {
+        let mut f = std::io::BufWriter::new(
+            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?,
+        );
+        // KHQ4 header: magic(4) + version(4) + ndim=2(4) + shape[0](8) + shape[1](8) + original_len(8)
+        f.write_all(b"KHQ4").map_err(|e| e.to_string())?;
+        // Version 2: asymmetric Q4 blocks (20 bytes each: scale + bias + 16 nibbles).
+        f.write_all(&2u32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&2u32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(merged_rows as u64).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(cols as u64).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&(original_len as u64).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        f.write_all(&qkv_payload).map_err(|e| e.to_string())?;
+        f.write_all(&z_payload).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return write_result;
+    }
+
+    std::fs::rename(&tmp, out_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2119,5 +2395,256 @@ mod tests {
             result.is_err(),
             "+inf in weight block must be rejected with InvalidInput"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Merge-on-first-load `merged_qkvz_*.q4` cache — content-integrity guard
+    // (#504 remaining slice: "Merged-Q4 cache: compatibility check is
+    // size-only — no content integrity on the merged artifact.")
+    //
+    // Mutation sensitivity: `merged_qkvz_cache_is_valid`'s size check alone
+    // (the pre-fix behavior) would accept a same-size tampered/stale merged
+    // file. `test_merged_qkvz_cache_rejects_same_size_corrupted_payload` and
+    // `test_merged_qkvz_cache_rejects_same_size_stale_source` are the
+    // discriminating tests: reverting the fingerprint comparison back to a
+    // bare `metadata.len() == expected_size` check makes both pass
+    // incorrectly (`is_valid` would wrongly return `true`), so they fail
+    // under the reverted code. Verified manually per the task's mutation-test
+    // protocol — see the session report for the reverse-apply/touch/restore
+    // proof.
+    // -----------------------------------------------------------------------
+
+    /// Write a minimal valid 2-D `.q4` source file (`shape = [rows, cols]`,
+    /// `rows * cols` must be a multiple of 32) with content derived from
+    /// `seed` so distinct seeds produce distinct payload bytes.
+    fn write_test_q4_source(path: &std::path::Path, rows: usize, cols: usize, seed: f32) {
+        let n = rows * cols;
+        let f32_vals: Vec<f32> = (0..n).map(|i| (i as f32 + seed) % 7.0 - 3.0).collect();
+        let bf16_vals = to_bf16(&f32_vals);
+        let tensor = quantize_bf16_to_q4(&bf16_vals, &[rows, cols]).unwrap();
+        save_q4_file(path, &tensor).unwrap();
+    }
+
+    /// Build a fresh temp-dir-scoped triple of (qkv_path, z_path, merged_path)
+    /// for one test, so parallel `cargo test` runs never collide on the same
+    /// file. `qkv_seed`/`z_seed` control the source payload content.
+    fn merge_test_paths(
+        name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lattice_test_merged_qkvz_{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.join("qkv.q4"), dir.join("z.q4"), dir.join("merged.q4"))
+    }
+
+    #[test]
+    fn test_merged_qkvz_expected_size_computes_correctly() {
+        // 36-byte header each; qkv payload = 100 bytes, z payload = 40 bytes.
+        let expected = merged_qkvz_expected_size(136, 76).unwrap();
+        assert_eq!(expected, 36 + 100 + 40);
+    }
+
+    #[test]
+    fn test_merged_qkvz_expected_size_rejects_truncated_source() {
+        // A source file shorter than its own 36-byte header must fail
+        // closed (`Err`), not underflow/panic via unchecked subtraction.
+        let err = merged_qkvz_expected_size(20, 136).unwrap_err();
+        assert!(
+            err.contains("too small"),
+            "expected a too-small error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_write_merged_qkvz_then_cache_is_valid() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("valid");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len = std::fs::metadata(&z_p).unwrap().len();
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len).unwrap();
+
+        assert!(
+            merged_qkvz_cache_is_valid(&merged_p, expected_size, &qkv_p, &z_p),
+            "freshly written merged cache must validate against its own sources"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_cache_rejects_missing_file() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("missing");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len = std::fs::metadata(&z_p).unwrap().len();
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len).unwrap();
+
+        // merged_p was never written.
+        assert!(!merged_qkvz_cache_is_valid(
+            &merged_p,
+            expected_size,
+            &qkv_p,
+            &z_p
+        ));
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_cache_rejects_wrong_size() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("wrongsize");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        // Append a stray byte, making the on-disk size disagree with
+        // `expected_size`.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&merged_p)
+                .unwrap();
+            f.write_all(&[0xAA]).unwrap();
+        }
+
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len = std::fs::metadata(&z_p).unwrap().len();
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len).unwrap();
+
+        assert!(!merged_qkvz_cache_is_valid(
+            &merged_p,
+            expected_size,
+            &qkv_p,
+            &z_p
+        ));
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_cache_rejects_truncated_file() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("truncated");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        let full_len = std::fs::metadata(&merged_p).unwrap().len();
+        let bytes = std::fs::read(&merged_p).unwrap();
+        std::fs::write(&merged_p, &bytes[..bytes.len() - 10]).unwrap();
+
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len = std::fs::metadata(&z_p).unwrap().len();
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len).unwrap();
+        assert_eq!(expected_size, full_len, "sanity: source sizes unchanged");
+
+        assert!(!merged_qkvz_cache_is_valid(
+            &merged_p,
+            expected_size,
+            &qkv_p,
+            &z_p
+        ));
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_cache_rejects_same_size_corrupted_payload() {
+        // Same-size bit flip inside the merged payload — the pre-fix
+        // size-only check would accept this file unchanged. This is the
+        // mutation-sensitive case for the content-integrity fix itself.
+        let (qkv_p, z_p, merged_p) = merge_test_paths("corrupted");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len = std::fs::metadata(&z_p).unwrap().len();
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len).unwrap();
+        let full_len = std::fs::metadata(&merged_p).unwrap().len();
+        assert_eq!(
+            full_len, expected_size,
+            "sanity: size unchanged by corruption"
+        );
+
+        // Flip one byte well inside the payload region (after the 36-byte
+        // header) without changing the file's length.
+        let mut bytes = std::fs::read(&merged_p).unwrap();
+        let flip_at = bytes.len() - 5;
+        bytes[flip_at] ^= 0xFF;
+        std::fs::write(&merged_p, &bytes).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&merged_p).unwrap().len(),
+            expected_size,
+            "sanity: byte flip must not change file size"
+        );
+
+        assert!(
+            !merged_qkvz_cache_is_valid(&merged_p, expected_size, &qkv_p, &z_p),
+            "a same-size, bit-flipped merged payload must fail the content-integrity check \
+             even though the size-only check would have accepted it"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_cache_rejects_same_size_stale_source() {
+        // The z source file changes content (e.g. a re-quantize with
+        // different weights) but keeps the exact same byte length, so the
+        // merged filename (which encodes only sizes) and `expected_size`
+        // are both unchanged. The stale merged cache must still be
+        // rejected once content is checked.
+        let (qkv_p, z_p, merged_p) = merge_test_paths("stale");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        let qkv_len = std::fs::metadata(&qkv_p).unwrap().len();
+        let z_len_before = std::fs::metadata(&z_p).unwrap().len();
+
+        // Re-write z with different content but the same shape (same size).
+        write_test_q4_source(&z_p, 4, 8, 99.0);
+        let z_len_after = std::fs::metadata(&z_p).unwrap().len();
+        assert_eq!(
+            z_len_before, z_len_after,
+            "sanity: same shape must produce the same file size"
+        );
+
+        let expected_size = merged_qkvz_expected_size(qkv_len, z_len_after).unwrap();
+        assert_eq!(
+            std::fs::metadata(&merged_p).unwrap().len(),
+            expected_size,
+            "sanity: merged file size still matches (source size unchanged)"
+        );
+
+        assert!(
+            !merged_qkvz_cache_is_valid(&merged_p, expected_size, &qkv_p, &z_p),
+            "a same-size stale source must invalidate the merged cache once content is checked"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_merged_qkvz_source_fingerprint_matches_file_fingerprint_after_write() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("fingerprint");
+        write_test_q4_source(&qkv_p, 4, 8, 2.0);
+        write_test_q4_source(&z_p, 4, 8, 6.0);
+        write_merged_qkvz(&qkv_p, &z_p, &merged_p).unwrap();
+
+        let source_fp = merged_qkvz_source_fingerprint(&qkv_p, &z_p).unwrap();
+        let file_fp = merged_qkvz_file_fingerprint(&merged_p).unwrap();
+        assert_eq!(
+            source_fp, file_fp,
+            "a freshly written merged file's payload fingerprint must equal its sources' fingerprint"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
     }
 }
