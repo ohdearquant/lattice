@@ -36,10 +36,16 @@ PROMPTS: list[tuple[str, int]] = [
     ("In the year 2024, artificial intelligence", 3),
     ("def fibonacci(n):\n    if n <= 1:\n        return n\n    return", 3),
     # LONG_PROMPT: ~816 tokens (measured with Qwen/Qwen3.5-0.8B tokenizer).
-    # Must exceed max_prefill=512 so forward_prefill_impl takes the sequential
-    # per-token forward_step loop (the n > self.session.max_prefill branch in
-    # metal_qwen35.rs:forward_prefill_impl). This exercises the oversize /
-    # chunked-prefill path that upcoming PRs #188 and #189 modify.
+    # NOTE on call graph: CI builds qwen35_generate with --features f16 only,
+    # so this prompt exercises the CPU/f16 forward path — NOT the Metal
+    # chunked/oversize-prefill code in metal_qwen35.rs, which is gated behind
+    # `metal-gpu` and never compiled here. (An earlier version of this comment
+    # claimed otherwise, and that stale call-graph model misdirected the #520
+    # triage toward Metal prefill.) What the length DOES stress is the
+    # sampling decision after a long prompt history: with ~816 prompt tokens
+    # in previous_ids, a repetition-penalty mismatch between lattice and the
+    # HF reference flips the first greedy token (#520). Covering Metal
+    # chunked prefill requires a separate metal-gpu gate (see #239).
     # match_window=2: the first two generated tokens are a direct function of
     # the full 816-step prefill final-position logits. GDN recurrent state
     # drifts during decode (same reason short prompts use 3 not 15), but the
