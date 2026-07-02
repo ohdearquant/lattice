@@ -131,14 +131,81 @@ class TtftDispatchRowRegressionTest(unittest.TestCase):
             if name != "ttft_dispatch":
                 self.assertEqual(r.verdict, "PASS", f"{name}: {r.reasons}")
 
-    def test_dispatches_absolute_delta_trips_row(self):
-        baseline = _doc(_base_benches())
+    def test_dispatches_absolute_delta_below_threshold_passes_row(self):
+        baseline_benches = _base_benches()
+        baseline_benches["decode/dispatches_per_token"] = _bench(
+            250.0, 249.0, 250.0, False, "count"
+        )
+        baseline = _doc(baseline_benches)
         current_benches = _base_benches()
-        # Relative lb stays small but absolute +10 dispatch/token breach fires.
-        current_benches["decode/dispatches_per_token"] = _bench(30.5, 30.5, 30.6, False, "count")
+        # disp_abs=9.9, disp_lb=3.96% -- both comfortably under threshold.
+        current_benches["decode/dispatches_per_token"] = _bench(259.9, 259.9, 260.0, False, "count")
         current = _doc(current_benches)
         results = {r.name: r for r in gate.evaluate(current, baseline)}
-        self.assertEqual(results["ttft_dispatch"].verdict, "FAIL")
+        self.assertEqual(
+            results["ttft_dispatch"].verdict,
+            "PASS",
+            f"dispatch abs below-threshold: expected PASS below +10, got "
+            f"{results['ttft_dispatch'].verdict}: {results['ttft_dispatch'].reasons}",
+        )
+
+    def test_dispatches_absolute_delta_above_threshold_trips_abs_only(self):
+        baseline_benches = _base_benches()
+        baseline_benches["decode/dispatches_per_token"] = _bench(
+            250.0, 249.0, 250.0, False, "count"
+        )
+        baseline = _doc(baseline_benches)
+        current_benches = _base_benches()
+        # disp_abs=10.1, disp_lb=4.04% -- only the absolute sub-predicate fires.
+        current_benches["decode/dispatches_per_token"] = _bench(260.1, 260.1, 260.2, False, "count")
+        current = _doc(current_benches)
+        results = {r.name: r for r in gate.evaluate(current, baseline)}
+        row = results["ttft_dispatch"]
+        self.assertEqual(
+            row.verdict,
+            "FAIL",
+            f"dispatch abs above-threshold: expected abs_delta-only FAIL above +10, "
+            f"got {row.verdict}: {row.reasons}",
+        )
+        self.assertTrue(
+            any("abs_delta" in reason for reason in row.reasons),
+            f"dispatch abs above-threshold: expected abs_delta-only FAIL above +10, "
+            f"got {row.verdict}: {row.reasons}",
+        )
+        self.assertFalse(
+            any("lb=" in reason for reason in row.reasons),
+            f"dispatch abs above-threshold: expected abs_delta-only FAIL above +10, "
+            f"got {row.verdict}: {row.reasons}",
+        )
+
+    def test_dispatches_absolute_delta_boundary_trips_fail_closed(self):
+        baseline_benches = _base_benches()
+        baseline_benches["decode/dispatches_per_token"] = _bench(
+            250.0, 249.0, 250.0, False, "count"
+        )
+        baseline = _doc(baseline_benches)
+        current_benches = _base_benches()
+        # disp_abs=10.0 exactly at the +10 boundary, disp_lb=4.00% -- fail-closed ruling.
+        current_benches["decode/dispatches_per_token"] = _bench(260.0, 260.0, 260.1, False, "count")
+        current = _doc(current_benches)
+        results = {r.name: r for r in gate.evaluate(current, baseline)}
+        row = results["ttft_dispatch"]
+        self.assertEqual(
+            row.verdict,
+            "FAIL",
+            f"dispatch abs boundary: expected fail-closed exact +10 FAIL, "
+            f"got {row.verdict}: {row.reasons}",
+        )
+        self.assertTrue(
+            any("abs_delta=10.0000 >= 10" in reason for reason in row.reasons),
+            f"dispatch abs boundary: expected fail-closed exact +10 FAIL, "
+            f"got {row.verdict}: {row.reasons}",
+        )
+        self.assertFalse(
+            any("lb=" in reason for reason in row.reasons),
+            f"dispatch abs boundary: expected fail-closed exact +10 FAIL, "
+            f"got {row.verdict}: {row.reasons}",
+        )
 
     def test_command_buffers_ceiling_trips_row(self):
         baseline = _doc(_base_benches())

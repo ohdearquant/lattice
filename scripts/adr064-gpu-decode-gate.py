@@ -129,8 +129,8 @@ def eval_ttft_dispatch_row(current: dict[str, Any], baseline: dict[str, Any]) ->
     if disp_lb > 0.05:
         reasons.append(f"decode/dispatches_per_token lb={disp_lb:.4f} > 0.05")
     disp_abs = disp_c["ci95_low"] - disp_b["ci95_high"]
-    if disp_abs > 10:
-        reasons.append(f"decode/dispatches_per_token abs_delta={disp_abs:.4f} > 10")
+    if disp_abs >= 10:
+        reasons.append(f"decode/dispatches_per_token abs_delta={disp_abs:.4f} >= 10")
 
     cmdbuf_c = entries_c["decode/command_buffers_per_token"]
     if cmdbuf_c["ci95_low"] > 2:
