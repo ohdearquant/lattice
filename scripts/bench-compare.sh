@@ -8,6 +8,12 @@
 #   scripts/bench-compare.sh HEAD~3                  # HEAD~3 vs HEAD
 #
 # Defaults to --quick (~2 min). Use --full (~15 min) for tight confidence intervals.
+# Optional Criterion filters:
+#   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
+#   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
+# Unset filters run all groups in the default bench targets:
+#   lattice-inference: elementwise_cpu_bench
+#   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 set -euo pipefail
 
@@ -44,6 +50,8 @@ trap cleanup EXIT
 # --- Bench list (same as ADR-058 Phase 1) ---
 BENCHES_INFERENCE="elementwise_cpu_bench"
 BENCHES_EMBED="simd"
+BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
+BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 
 # --- Build + bench base ---
 echo ""
@@ -52,11 +60,11 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
   cd "$WT"
   # Only bench what exists — some benches may not exist on older refs
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
   else
     echo "  (elementwise_cpu_bench not present on $BASE_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
 )
 
 # --- Copy base criterion data to HEAD's target ---
@@ -89,18 +97,18 @@ fi
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
   else
     echo "  (elementwise_cpu_bench not present on $HEAD_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
 # --- Report ---
 echo ""
 echo "=== Full gate report ==="
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" 2>&1 || true
+  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" --baseline-name compare-base 2>&1 || true
 fi
 
 echo ""

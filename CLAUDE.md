@@ -28,6 +28,15 @@ cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"   # multiple g
 cargo bench -p lattice-inference --bench elementwise_cpu_bench      # inference CPU ops
 ```
 
+For the A/B workflow, pass the same Criterion filter through `make bench-compare`:
+
+```bash
+make bench-compare BENCH_GROUPS_INFERENCE="rms_norm|gelu"
+make bench-compare BENCH_GROUPS_EMBED="simd_dot_product|int8_raw"
+```
+
+Leaving these variables unset keeps the default `elementwise_cpu_bench` and `simd` bench targets.
+
 Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
 
 ### Differential Test First (Cross-Framework Bugs)
