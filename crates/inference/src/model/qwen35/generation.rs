@@ -386,8 +386,12 @@ impl Qwen35Model {
         if gen_cfg.stop_strings.is_empty() {
             // Fast path: no string-level stops. Behaviour byte-for-byte identical
             // to before this feature was added; the e2e-parity CI gate pins this.
+            // `text` is the caller-owned full output — the detokenizer itself only
+            // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
+            let mut text = String::new();
             let delta = detok.push(&self.tokenizer, next_id);
             if !delta.is_empty() {
+                text.push_str(&delta);
                 on_token(&delta);
             }
 
@@ -473,6 +477,7 @@ impl Qwen35Model {
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if !delta.is_empty() {
+                    text.push_str(&delta);
                     on_token(&delta);
                 }
 
@@ -488,11 +493,12 @@ impl Qwen35Model {
             // so the streamed deltas concatenate to exactly the returned text.
             let tail = detok.finish();
             if !tail.is_empty() {
+                text.push_str(&tail);
                 on_token(&tail);
             }
 
             Ok(GenerateOutput {
-                text: detok.text(),
+                text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
