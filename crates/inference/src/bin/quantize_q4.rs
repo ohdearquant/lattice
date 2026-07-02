@@ -14,7 +14,7 @@
 //! Peak ≈ (tensor_elements × 6 bytes) — 178MB BF16 + 89MB Q4 for the largest shard tensor.
 
 use lattice_inference::weights::f32_weights::parse_index;
-use lattice_inference::weights::q4_weights::{quantize_bf16_to_q4, save_q4_file};
+use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_bf16_to_q4, save_q4_file};
 use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -483,7 +483,7 @@ fn main() {
 
                 let q4 = quantize_bf16_to_q4(&bf16_vals, shape)
                     .expect("Q4 quantization failed: source weights contain non-finite values");
-                let bytes_out = (q4.blocks.len() * 18) as u64;
+                let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
                 total_bytes_out += bytes_out;
 
                 // Output file: <tensor_name_sanitized>.q4 (replace '.' and '/' with '_')
