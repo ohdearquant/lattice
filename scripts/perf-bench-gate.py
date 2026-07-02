@@ -70,25 +70,38 @@ def find_baseline_estimates(bench_dir: Path, baseline_name: str) -> Path | None:
     after the baseline: the default (unnamed) rotation uses `base/`, while a
     named baseline (`--save-baseline <name>` / `--baseline <name>`, as used by
     bench-compare.sh's `compare-base` leg) writes under `<name>/` instead —
-    `base/` is never created in that flow. Prefer the default `base/` dir
-    (covers CI's default-rotation runs), then the caller-supplied/explicit
-    baseline name, then fall back to scanning for any other sibling directory
-    that holds an estimates.json and isn't `new`/`change` (the two dirs
-    Criterion always writes for the *current* run, never the baseline).
+    `base/` is never created in that flow. Prefer the caller-supplied baseline
+    name FIRST: Criterion computed change/ against that baseline, so a stale
+    `base/` left in a dirty local tree must not shadow it (codex review of
+    PR #548 reproduced exactly that wrong-baseline report). Then try the
+    default `base/` (covers CI's default-rotation runs). As a last resort,
+    accept a sibling directory holding an estimates.json that isn't
+    `new`/`change` — but only when it is unambiguous: Criterion supports
+    multiple named baselines side by side, and guessing among several would
+    silently gate against the wrong one.
     """
-    candidates = ["base", baseline_name]
+    candidates = [baseline_name, "base"]
     for candidate in candidates:
         p = bench_dir / candidate / "estimates.json"
         if p.exists():
             return p
 
-    for child in sorted(bench_dir.iterdir()):
-        if child.name in ("new", "change"):
-            continue
-        p = child / "estimates.json"
-        if child.is_dir() and p.exists():
-            return p
-
+    fallbacks = [
+        child for child in sorted(bench_dir.iterdir())
+        if child.is_dir()
+        and child.name not in ("new", "change")
+        and (child / "estimates.json").exists()
+    ]
+    if len(fallbacks) == 1:
+        print(f"note: {bench_dir.name}: using sole sibling baseline dir "
+              f"'{fallbacks[0].name}/' (neither '{baseline_name}/' nor 'base/' found)",
+              file=sys.stderr)
+        return fallbacks[0] / "estimates.json"
+    if len(fallbacks) > 1:
+        names = ", ".join(f.name for f in fallbacks)
+        print(f"warn: {bench_dir.name}: multiple candidate baseline dirs ({names}) "
+              f"and none match '{baseline_name}/' or 'base/' — refusing to guess",
+              file=sys.stderr)
     return None
 
 
@@ -195,6 +208,9 @@ def run_selftest() -> int:
     Regression coverage for #545: a default-rotation `base/` layout, a named-baseline
     `compare-base/` layout (what bench-compare.sh actually produces), and a `change/`
     dir with no resolvable baseline at all (must WARN by bench name, not silently skip).
+    Plus the codex findings on PR #548: when BOTH base/ and the named baseline exist,
+    the named baseline must win (dirty local tree with stale base/); when multiple
+    unrelated sibling baselines exist and none match, the gate must refuse to guess.
     """
     import contextlib
     import io
@@ -222,9 +238,25 @@ def run_selftest() -> int:
                      "confidence_interval": {"lower_bound": 0.05, "upper_bound": 0.15}}
         }))
 
+        # Codex finding 1: both base/ and compare-base/ present with different
+        # values — the named baseline must win over stale base/.
+        both_dir = root / "grp_d" / "bench_both"
+        _fabricate_bench(both_dir, "compare-base", base_ns=100.0)
+        (both_dir / "base").mkdir()
+        (both_dir / "base" / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 1.0}}))  # stale decoy
+
+        # Codex finding 2: multiple unrelated sibling baselines, none matching
+        # the requested name — must skip loudly, not guess.
+        multi_dir = root / "grp_e" / "bench_multi"
+        _fabricate_bench(multi_dir, "old-run-1")
+        (multi_dir / "old-run-2").mkdir()
+        (multi_dir / "old-run-2" / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 42.0}}))
+
         change_files = find_change_files(root)
-        if len(change_files) != 3:
-            failures.append(f"expected 3 change/estimates.json, found {len(change_files)}")
+        if len(change_files) != 5:
+            failures.append(f"expected 5 change/estimates.json, found {len(change_files)}")
 
         stderr_buf = io.StringIO()
         results: dict[str, BenchResult] = {}
@@ -244,12 +276,25 @@ def run_selftest() -> int:
         if "grp_c/bench_orphan" not in stderr_text:
             failures.append("orphan bench did not emit a warning naming the bench")
 
+        both = results.get("grp_d/bench_both")
+        if both is None:
+            failures.append("both-dirs layout: bench not parsed")
+        elif both.old_ns != 100.0:
+            failures.append(f"both-dirs layout: expected named-baseline old_ns=100.0 "
+                            f"(compare-base/), got {both.old_ns} (stale base/ shadowed it)")
+
+        if "grp_e/bench_multi" in results:
+            failures.append("multi-sibling layout: gate guessed a baseline instead of refusing")
+        if "bench_multi" not in stderr_text or "refusing to guess" not in stderr_text:
+            failures.append("multi-sibling layout: no loud refusal warning emitted")
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
         print(f"SELFTEST: FAIL ({len(failures)} failure(s))")
         return 1
-    print("SELFTEST: PASS — base/ layout, compare-base/ layout, and orphan-change warn all correct")
+    print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
+          "and multi-sibling-refusal all correct")
     return 0
 
 
