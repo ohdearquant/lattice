@@ -6,7 +6,7 @@ use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 use lattice_inference::{BertModel, QwenModel};
 use std::sync::{Arc, OnceLock};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Loaded model — either BERT-family (encoder) or Qwen (decoder).
 enum LoadedModel {
@@ -257,7 +257,14 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
         Ok(n) if n > 0 => {
             info!(entries = n, path = %cache_path.display(), "loaded embedding cache")
         }
-        _ => {}
+        Ok(_) => {}
+        Err(e) => {
+            warn!(
+                path = %cache_path.display(),
+                error = %e,
+                "embedding cache failed integrity check, ignoring (will regenerate on next save)"
+            )
+        }
     }
     Ok(LoadedModel::Qwen(Arc::new(model)))
 }
