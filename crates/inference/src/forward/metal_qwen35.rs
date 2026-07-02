@@ -50,6 +50,7 @@ mod inner {
     use crate::tokenizer::common::Tokenizer;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // ---------------------------------------------------------------------------
     // MSL Compute Shaders
@@ -4760,6 +4761,174 @@ kernel void gdn_chunk_norm_silu_c32(
         /// reads are a small fraction of decode bandwidth). Set `LATTICE_KV_F16=1`
         /// or `LATTICE_KV_F16=true` at construction time to enable.
         pub(crate) use_kv_f16: bool,
+        /// Cross-turn KV/GDN prefix cache (#462). Worker-local: never shared
+        /// across threads or processes. Empty by default; only populated by
+        /// the `*_with_prefix_cache` entry points.
+        cross_turn_prefix_cache: MetalCrossTurnPrefixCache,
+        /// Per-instance flag: whether the path-proof counters below are live.
+        /// Read once from `LATTICE_METAL_PATH_PROOF` at construction time
+        /// (same pattern as `use_kv_f16`) so every dispatch-site `fetch_add`
+        /// is a no-op — not just relaxed-but-still-paid — on the default
+        /// (disabled) path. See `PathProofCounters` for what this gates.
+        pub(crate) path_proof_enabled: bool,
+        /// Runtime path-proof counters (issue #239): prove which Metal attention/KV
+        /// dispatch helpers actually ran, so CI can fail closed on a paravirtual
+        /// runner that reports a Metal device but silently skips required kernels.
+        /// Only recorded when `path_proof_enabled` is set (opt-in, zero cost
+        /// otherwise); read via `path_proof_snapshot` and zeroed via
+        /// `reset_path_proof_counters`.
+        pub(crate) path_proof: PathProofCounters,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cross-turn KV prefix cache (#462)
+    // ---------------------------------------------------------------------------
+
+    /// Per-call statistics for a cache-aware generate/chat call.
+    #[derive(Debug, Clone)]
+    pub struct CrossTurnCacheStats {
+        pub slot_id: crate::kv_cache::CrossTurnSlotId,
+        pub prompt_tokens: usize,
+        pub reused_tokens: usize,
+        pub prefetched_tokens: usize,
+        pub mode: crate::kv_cache::PrefixReuseMode,
+    }
+
+    /// [`GenerateOutput`] plus cross-turn cache stats for the call that produced it.
+    #[derive(Debug, Clone)]
+    pub struct CachedGenerateOutput {
+        pub output: GenerateOutput,
+        pub cache: CrossTurnCacheStats,
+    }
+
+    /// [`ChatCompletionOutput`] plus cross-turn cache stats for the call that produced it.
+    #[derive(Debug, Clone)]
+    pub struct CachedChatCompletionOutput {
+        pub output: ChatCompletionOutput,
+        pub cache: CrossTurnCacheStats,
+    }
+
+    /// One retained cross-turn entry: the generic (Metal-agnostic) planning
+    /// record plus the exact GDN recurrent-state snapshot taken at the same
+    /// token boundary. The live full-attention KV buffers are NOT copied here
+    /// — they stay in `self.session.kv_cache` and are only logically
+    /// truncated/advanced (see `restore_cross_turn_prefix`).
+    #[derive(Debug, Clone)]
+    struct MetalCrossTurnPrefixEntry {
+        generic: crate::kv_cache::CrossTurnPrefixEntry,
+        gdn_snapshot: crate::attention::gdn::GdnSnapshot,
+    }
+
+    /// Worker-local, single-live-entry cross-turn prefix cache (#516 round-1
+    /// remediation, finding 1 + 5).
+    ///
+    /// Ownership invariant: at most ONE `MetalCrossTurnPrefixEntry` is ever
+    /// retained, bounded by design (never an unbounded per-slot map). The
+    /// entry is valid **iff** the live `self.session.kv_cache` rows and
+    /// `self.session.position` were left by exactly the generation call that
+    /// saved it. Any other mutation of live KV/GDN state — a different
+    /// slot's generation, the plain (non-cache-aware) generate path, a
+    /// `reset_state()` call, or a LoRA adapter load/unload — must invalidate
+    /// the entry before that mutation is allowed to proceed, because the
+    /// entry does not own private copies of the full-attention KV buffers
+    /// (see `MetalCrossTurnPrefixEntry` above): it can only ever describe
+    /// the ONE live buffer this process currently has. `get`/`take` both
+    /// enforce the slot match themselves so a caller can never accidentally
+    /// restore a different slot's entry.
+    #[derive(Debug, Default)]
+    struct MetalCrossTurnPrefixCache {
+        entry: Option<MetalCrossTurnPrefixEntry>,
+    }
+
+    impl MetalCrossTurnPrefixCache {
+        /// Returns the retained entry only if it belongs to `slot_id`. A
+        /// different (or absent) slot is always a miss — never a partial or
+        /// stale match — so the planner falls back to `FullRefill`.
+        fn get(
+            &self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+        ) -> Option<&MetalCrossTurnPrefixEntry> {
+            self.entry.as_ref().filter(|e| e.generic.slot_id == slot_id)
+        }
+
+        /// Replace whatever is currently retained (if anything, for any
+        /// slot) with `entry`. At most one GDN snapshot is ever alive.
+        fn insert(&mut self, entry: MetalCrossTurnPrefixEntry) {
+            self.entry = Some(entry);
+        }
+
+        /// Remove and return the retained entry iff it belongs to
+        /// `slot_id`, leaving the cache empty either way it existed for
+        /// that slot. Used by `restore_cross_turn_prefix` so an
+        /// `ExactAppend` restore consumes its GDN snapshot instead of
+        /// cloning it, and so the cache is provably empty for the
+        /// remainder of the call until a fresh save succeeds.
+        fn take(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+        ) -> Option<MetalCrossTurnPrefixEntry> {
+            if self
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generic.slot_id == slot_id)
+            {
+                self.entry.take()
+            } else {
+                None
+            }
+        }
+
+        fn remove(&mut self, slot_id: crate::kv_cache::CrossTurnSlotId) {
+            if self
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.generic.slot_id == slot_id)
+            {
+                self.entry = None;
+            }
+        }
+
+        fn clear(&mut self) {
+            self.entry = None;
+        }
+    }
+
+    /// Dispatch-site counters for the Metal attention/KV-cache path-proof probe.
+    ///
+    /// `&self`-compatible (interior mutability) because the dispatch helpers that
+    /// increment these run inside `&self` methods sharing one command encoder.
+    #[derive(Default)]
+    pub struct PathProofCounters {
+        pub prefill_kv_batch: AtomicU64,
+        pub prefill_attn_batched: AtomicU64,
+        pub decode_kv_copy: AtomicU64,
+        pub decode_attn_direct: AtomicU64,
+        pub decode_attn_split_partial: AtomicU64,
+        pub decode_attn_split_reduce: AtomicU64,
+    }
+
+    impl PathProofCounters {
+        fn reset(&self) {
+            self.prefill_kv_batch.store(0, Ordering::Relaxed);
+            self.prefill_attn_batched.store(0, Ordering::Relaxed);
+            self.decode_kv_copy.store(0, Ordering::Relaxed);
+            self.decode_attn_direct.store(0, Ordering::Relaxed);
+            self.decode_attn_split_partial.store(0, Ordering::Relaxed);
+            self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of [`PathProofCounters`] plus the KV-cache precision mode in effect,
+    /// suitable for formatting into the `[METAL_PATH_PROOF]` stderr marker.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct PathProofSnapshot {
+        pub prefill_kv_batch: u64,
+        pub prefill_attn_batched: u64,
+        pub decode_kv_copy: u64,
+        pub decode_attn_direct: u64,
+        pub decode_attn_split_partial: u64,
+        pub decode_attn_split_reduce: u64,
+        pub kv_f16: bool,
     }
 
     // ---------------------------------------------------------------------------
@@ -6095,6 +6264,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 std::env::var("LATTICE_KV_F16").as_deref(),
                 Ok("1") | Ok("true")
             );
+            let path_proof_enabled = matches!(
+                std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                Ok("1") | Ok("true")
+            );
             // new_session reads LATTICE_KV_F16 identically, so session.kv_cache
             // and the use_kv_f16 field below agree by construction.
             let session = engine.new_session(max_cache_len)?;
@@ -6104,12 +6277,43 @@ kernel void gdn_chunk_norm_silu_c32(
                 lora: None,
                 use_gdn_chunked,
                 use_kv_f16,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled,
+                path_proof: PathProofCounters::default(),
             })
         }
 
         /// Returns `true` if MTP weights were loaded and the session has an active MTP state.
         pub fn has_mtp(&self) -> bool {
             self.session.mtp.is_some()
+        }
+
+        /// Zeroes the Metal attention/KV-cache path-proof counters (issue #239).
+        ///
+        /// Call before a one-shot `generate`/`generate_streaming` run so
+        /// [`Self::path_proof_snapshot`] afterward reflects only that run's dispatches.
+        pub fn reset_path_proof_counters(&self) {
+            self.path_proof.reset();
+        }
+
+        /// Snapshots the Metal attention/KV-cache path-proof counters (issue #239)
+        /// without resetting them, alongside the KV-cache precision mode in effect.
+        pub fn path_proof_snapshot(&self) -> PathProofSnapshot {
+            PathProofSnapshot {
+                prefill_kv_batch: self.path_proof.prefill_kv_batch.load(Ordering::Relaxed),
+                prefill_attn_batched: self.path_proof.prefill_attn_batched.load(Ordering::Relaxed),
+                decode_kv_copy: self.path_proof.decode_kv_copy.load(Ordering::Relaxed),
+                decode_attn_direct: self.path_proof.decode_attn_direct.load(Ordering::Relaxed),
+                decode_attn_split_partial: self
+                    .path_proof
+                    .decode_attn_split_partial
+                    .load(Ordering::Relaxed),
+                decode_attn_split_reduce: self
+                    .path_proof
+                    .decode_attn_split_reduce
+                    .load(Ordering::Relaxed),
+                kv_f16: self.use_kv_f16,
+            }
         }
 
         /// Resets GDN state-traffic counters to zero without changing the shape.
@@ -6409,6 +6613,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 intermediate,
                 max_rank,
             });
+            // #516 round-1 remediation D4: the cross-turn cache's adapter
+            // identity (`cross_turn_metadata`'s `adapter_id`) is a shape-based
+            // hash (max_rank/scale/projection count), not a content hash, so
+            // two different adapters with the same shape can collide on the
+            // same `AdapterId` (finding 3). The metadata hash is
+            // defense-in-depth; the unconditional clear here is the actual
+            // correctness mechanism.
+            self.cross_turn_prefix_cache.clear();
 
             Ok(())
         }
@@ -6416,6 +6628,10 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
+            // #516 round-1 remediation D4: see the matching comment in
+            // `load_lora_adapter` — any adapter identity change must
+            // invalidate the retained cross-turn entry.
+            self.cross_turn_prefix_cache.clear();
         }
 
         /// Returns true if a LoRA adapter is currently loaded.
@@ -8426,7 +8642,22 @@ kernel void gdn_chunk_norm_silu_c32(
         /// GPU dispatch. The tokenizer-bounded generate path never triggers this; it
         /// can only be reached by a library consumer calling the raw entry point with
         /// an out-of-vocabulary id.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// This is a public raw-forward entry point that advances live KV/GDN
+        /// state outside the cache-aware generation family's ownership, so it
+        /// must clear any retained [`MetalCrossTurnPrefixCache`] entry before
+        /// mutating — otherwise a later `generate_streaming_with_prefix_cache`
+        /// call could restore a GDN snapshot for KV rows this call already
+        /// overwrote. Safe to call from inside the cache-aware decode loop
+        /// itself: by the time that loop reaches its own `forward_step` call,
+        /// `restore_cross_turn_prefix` has already `take()`-n (ExactAppend) or
+        /// `reset_state()` has already cleared (FullRefill) the slot's entry,
+        /// so this clear is a no-op there — the cache-aware path never has a
+        /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_step_inner(token_id, position, false).logits
         }
 
@@ -8553,7 +8784,17 @@ kernel void gdn_chunk_norm_silu_c32(
         /// runs once at the entry point before any GPU work. The tokenizer-bounded
         /// generate path never triggers this; it can only be reached by a library
         /// consumer passing raw ids with an out-of-vocabulary value.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
+        /// comment for the invariant this enforces. `generate`/`generate_streaming`/
+        /// `generate_multimodal`/`compute_token_nlls` all call this after their own
+        /// `reset_state()`, which has already cleared the cache, so this clear is a
+        /// no-op on those paths; it only matters for a consumer calling this
+        /// entry point directly against a state with a live retained entry.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_prefill_impl(token_ids, false)
         }
 
@@ -8568,7 +8809,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// # Panics
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
+        ///
+        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        ///
+        /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
+        /// comment for the invariant this enforces.
         pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
             self.forward_prefill_impl(token_ids, true)
         }
 
@@ -10588,12 +10835,29 @@ kernel void gdn_chunk_norm_silu_c32(
                 pool.active_base_seq_len = None;
             }
             self.session.last_pre_final_hidden = vec![0.0f32; self.engine.config.hidden_size];
+            // #516 round-1 remediation D3: every public path that resets live
+            // KV/GDN state (plain `generate_streaming`, chat, the serve
+            // worker, and the cache-aware path's own FullRefill/error legs)
+            // routes through here, so this is the single place that must
+            // invalidate any retained cross-turn entry. A retained entry
+            // describes exactly the state this call just vacated; leaving it
+            // alive would let a later cache-aware call restore GDN state for
+            // KV rows that no longer represent it (finding 2).
+            self.cross_turn_prefix_cache.clear();
         }
 
         /// Select the GDN prefill scan at runtime: `true` = chunked-parallel (default),
         /// `false` = serial per-token. Construction reads `LATTICE_GDN_CHUNKED`; this lets
         /// callers (benchmarks, A/B tests) flip the path on a live state without rebuilding.
+        ///
+        /// Flipping the mode invalidates any retained cross-turn cache entry: the two
+        /// scans are not bit-exact (measured logit drift up to ~2e-1 at chunk boundaries),
+        /// so a snapshot produced under one mode must not seed a prefix that the current
+        /// mode's full-refill reference would have prefilled differently.
         pub fn set_gdn_chunked(&mut self, enabled: bool) {
+            if self.use_gdn_chunked != enabled {
+                self.cross_turn_prefix_cache.clear();
+            }
             self.use_gdn_chunked = enabled;
         }
 
@@ -12918,6 +13182,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_direct
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 // Partitioned flash decode (H3): partial kernel + reduce kernel.
                 // Split KV cache into PARTITION_TOKENS-token chunks for better occupancy.
@@ -12935,6 +13204,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, num_partitions as u64, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_split_partial
+                        .fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Reduce pass: one TG per KV head, combines all partitions.
                 // decode_attention_flash_reduce reads f32 attn_partials, not KV — no f16 variant.
@@ -12948,6 +13222,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_split_reduce
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -13088,6 +13367,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
+            if self.path_proof_enabled {
+                self.path_proof
+                    .prefill_kv_batch
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -13139,6 +13423,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(num_kv_heads as u64, num_tokens as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
+            if self.path_proof_enabled {
+                self.path_proof
+                    .prefill_attn_batched
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Ok(())
         }
 
@@ -13397,6 +13686,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
+            if self.path_proof_enabled {
+                self.path_proof
+                    .decode_kv_copy
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         #[allow(dead_code)] // element-wise add dispatch helper; used by full_attention_layer_step_by_idx
@@ -15279,6 +15573,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 std::env::var("LATTICE_KV_F16").as_deref(),
                 Ok("1") | Ok("true")
             );
+            let path_proof_enabled = matches!(
+                std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                Ok("1") | Ok("true")
+            );
             let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
             let dur_d = t_d.elapsed();
@@ -15439,6 +15737,9 @@ kernel void gdn_chunk_norm_silu_c32(
                     Ok("0") | Ok("false")
                 ),
                 use_kv_f16,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled,
+                path_proof: PathProofCounters::default(),
             })
         }
 
@@ -16442,6 +16743,15 @@ kernel void gdn_chunk_norm_silu_c32(
         }
     }
 
+    // #516 round-2 D7: `MtpTargetVerifier` is a public trait and this impl's
+    // mutating methods (`rollback_cache_to`, `verify_tokens`) advance live
+    // KV/GDN state exactly like `forward_step`/`forward_prefill` — they are
+    // not currently wired into any live Metal generate loop (Metal MTP decode
+    // uses `mtp_greedy_round`, a self-contained mechanism; `mtp_verify_draft`
+    // is only exercised from benches today), but a consumer holding a
+    // `&mut MetalQwen35State` and `use`-ing this trait can call them directly,
+    // so they are part of the public raw-forward boundary and must clear the
+    // retained cross-turn entry before mutating, same as the inherent methods.
     impl crate::speculative::MtpTargetVerifier for MetalQwen35State {
         fn cache_position(&self) -> usize {
             self.session.kv_cache.seq_len
@@ -16451,6 +16761,7 @@ kernel void gdn_chunk_norm_silu_c32(
             &mut self,
             seq_len: usize,
         ) -> Result<(), crate::error::InferenceError> {
+            self.cross_turn_prefix_cache.clear();
             self.rollback_speculative_state_to(seq_len)
         }
 
@@ -16459,6 +16770,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            self.cross_turn_prefix_cache.clear();
             let out = self.verify_tokens_batched(tokens, start_pos)?;
             Ok(out.logits)
         }
@@ -16519,6 +16831,782 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.gdn_states[i].restore_from(&(s_snap.clone(), conv_snap.clone()));
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-turn KV prefix cache: Metal-specific runtime (#462)
+    // -----------------------------------------------------------------------
+
+    impl MetalQwen35State {
+        /// Drop all retained cross-turn cache slots. Call this after any
+        /// error surfaces from a `*_with_prefix_cache` entry point (or from
+        /// the caller's own error handling) so a later turn cannot restore
+        /// from state that may no longer match the live KV/GDN buffers.
+        pub fn clear_cross_turn_prefix_cache(&mut self) {
+            self.cross_turn_prefix_cache.clear();
+        }
+
+        /// Everything that invalidates cross-turn reuse if it changes
+        /// between calls: model identity, tokenizer, adapter, RoPE/KV
+        /// layout, and chat template. Coarse-grained on purpose — a false
+        /// invalidation only costs a full re-prefill, never wrong output.
+        fn cross_turn_metadata(
+            &self,
+            tokenizer: &BpeTokenizer,
+        ) -> crate::kv_cache::CrossTurnPrefixMetadata {
+            use rustc_hash::FxHasher;
+            use std::hash::{Hash, Hasher};
+
+            let cfg = &self.engine.config;
+
+            let mut layer_hasher = FxHasher::default();
+            for lt in &cfg.layer_types {
+                (*lt as u8).hash(&mut layer_hasher);
+            }
+            let layer_pattern_hash = layer_hasher.finish();
+
+            let mut model_hasher = FxHasher::default();
+            cfg.hidden_size.hash(&mut model_hasher);
+            cfg.num_hidden_layers.hash(&mut model_hasher);
+            cfg.vocab_size.hash(&mut model_hasher);
+            cfg.rope_theta.to_bits().hash(&mut model_hasher);
+            cfg.mtp_num_hidden_layers.hash(&mut model_hasher);
+            layer_pattern_hash.hash(&mut model_hasher);
+            let model_fingerprint = model_hasher.finish();
+
+            let mut tok_hasher = FxHasher::default();
+            tokenizer.vocab_size().hash(&mut tok_hasher);
+            tokenizer
+                .special_token_id("<|im_end|>")
+                .hash(&mut tok_hasher);
+            tokenizer.special_token_id("</think>").hash(&mut tok_hasher);
+            let tokenizer_fingerprint = tok_hasher.finish();
+
+            let adapter_id = match &self.lora {
+                None => crate::kv_cache::AdapterId::BASE,
+                Some(adapter) => {
+                    let mut h = FxHasher::default();
+                    adapter.max_rank.hash(&mut h);
+                    adapter.scale.to_bits().hash(&mut h);
+                    adapter.projections.len().hash(&mut h);
+                    crate::kv_cache::AdapterId::new(h.finish())
+                }
+            };
+
+            crate::kv_cache::CrossTurnPrefixMetadata {
+                model_fingerprint,
+                tokenizer_fingerprint,
+                adapter_id,
+                vocab_size: cfg.vocab_size,
+                max_cache_len: self.session.kv_cache.max_cache_len,
+                kv_f16: self.use_kv_f16,
+                rope_theta_bits: cfg.rope_theta.to_bits(),
+                partial_rotary_factor_bits: Some(cfg.partial_rotary_factor.to_bits()),
+                layer_pattern_hash,
+                chat_template_version: 1,
+            }
+        }
+
+        /// Pure planning step: delegates to [`crate::kv_cache::plan_prefix_reuse`]
+        /// against whatever is currently cached for `slot_id`. v1 never owns
+        /// sparse GDN checkpoints, so it always plans with an empty checkpoint
+        /// set — `PrefixReuseMode::ReplayFromCheckpoint` is therefore never
+        /// produced by this call.
+        fn plan_cross_turn_reuse(
+            &self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            metadata: &crate::kv_cache::CrossTurnPrefixMetadata,
+            prompt_ids: &[u32],
+        ) -> crate::kv_cache::PrefixRestorePlan {
+            let entry = self
+                .cross_turn_prefix_cache
+                .get(slot_id)
+                .map(|e| &e.generic);
+            crate::kv_cache::plan_prefix_reuse(entry, metadata, prompt_ids, &[])
+        }
+
+        /// Restore live state to the plan's reusable boundary. Only
+        /// `ExactAppend` is implemented; `FullRefill` is handled by the
+        /// caller (`self.reset_state()`) per design.md step 5, and
+        /// `ReplayFromCheckpoint` fails closed since v1 owns no checkpoints.
+        fn restore_cross_turn_prefix(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            plan: &crate::kv_cache::PrefixRestorePlan,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            use crate::kv_cache::PrefixReuseMode;
+
+            match plan.mode {
+                PrefixReuseMode::ExactAppend => {
+                    // Take (not clone): from this point on the cache is
+                    // EMPTY for this slot until a fresh save succeeds at
+                    // the end of generation. Any early return between here
+                    // and that save (error `?`, caller-interrupt) leaves
+                    // the cache empty rather than retaining a stale entry
+                    // — fail-closed by construction (#516 round-1
+                    // remediation D2). This also removes a ~19MiB GDN
+                    // snapshot clone per restore.
+                    let entry = self.cross_turn_prefix_cache.take(slot_id).ok_or_else(|| {
+                        InferenceError::PrefixCache(
+                            "restore_cross_turn_prefix: ExactAppend plan but no cached entry \
+                             for this slot"
+                                .into(),
+                        )
+                    })?;
+                    self.restore_gdn_states_checked(&entry.gdn_snapshot)?;
+                    self.session.set_position(plan.reusable_len);
+                    Ok(())
+                }
+                PrefixReuseMode::ReplayFromCheckpoint { .. } => Err(InferenceError::PrefixCache(
+                    "restore_cross_turn_prefix: sparse GDN checkpoint replay is not implemented \
+                     in v1"
+                        .into(),
+                )),
+                PrefixReuseMode::FullRefill => {
+                    self.reset_state();
+                    Ok(())
+                }
+            }
+        }
+
+        /// Prefill `token_ids` starting at absolute position `start_pos`,
+        /// writing KV/RoPE rows and advancing GDN state from that position —
+        /// the suffix-prefill primitive the design requires. Unlike
+        /// `forward_prefill`/`forward_prefill_impl` (which always start at
+        /// position 0, including their `len == 1` fast path), every branch
+        /// here honors `start_pos`, so a single reused-prefix token forwards
+        /// at its true absolute position.
+        fn forward_prefill_from(
+            &mut self,
+            token_ids: &[u32],
+            start_pos: usize,
+            all_positions: bool,
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let vocab = self.engine.config.vocab_size;
+            for (t, &id) in token_ids.iter().enumerate() {
+                if (id as usize) >= vocab {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "forward_prefill_from: token_ids[{t}]={id} out of range: vocab_size is {vocab}"
+                    )));
+                }
+            }
+            if token_ids.is_empty() {
+                return Err(InferenceError::PrefixCache(
+                    "forward_prefill_from: cannot prefill an empty suffix without a saved \
+                     logits source"
+                        .into(),
+                ));
+            }
+            if start_pos + token_ids.len() > self.session.kv_cache.max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_prefill_from: start_pos {start_pos} + len {} exceeds max_cache_len {}",
+                    token_ids.len(),
+                    self.session.kv_cache.max_cache_len
+                )));
+            }
+            if token_ids.len() == 1 {
+                return Ok(self.forward_step(token_ids[0], start_pos));
+            }
+            if self.lora.is_some() {
+                if all_positions {
+                    return Err(InferenceError::PrefixCache(
+                        "forward_prefill_from: all-position output is not supported with an \
+                         active LoRA adapter"
+                            .into(),
+                    ));
+                }
+                let mut last_logits = Vec::new();
+                for (i, &id) in token_ids.iter().enumerate() {
+                    last_logits = self.forward_step(id, start_pos + i);
+                }
+                return Ok(last_logits);
+            }
+            let max_prefill = self.session.max_prefill;
+            if token_ids.len() <= max_prefill {
+                return Ok(self.forward_prefill_batched_chunk(token_ids, start_pos, all_positions));
+            }
+            if all_positions {
+                let mut all_logits = Vec::with_capacity(token_ids.len() * vocab);
+                let mut pos = start_pos;
+                for chunk in token_ids.chunks(max_prefill) {
+                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, pos, true));
+                    pos += chunk.len();
+                }
+                Ok(all_logits)
+            } else {
+                let mut last_logits = Vec::new();
+                let mut pos = start_pos;
+                for chunk in token_ids.chunks(max_prefill) {
+                    last_logits = self.forward_prefill_batched_chunk(chunk, pos, false);
+                    pos += chunk.len();
+                }
+                Ok(last_logits)
+            }
+        }
+
+        /// Save `represented_token_ids` as the new cross-turn entry for
+        /// `slot_id`. Requires that live KV state already represents exactly
+        /// those tokens (`kv_cache.seq_len == represented_token_ids.len()`) —
+        /// callers must prefill/restore before saving, never after a partial
+        /// or speculative step.
+        fn save_cross_turn_prefix(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            metadata: crate::kv_cache::CrossTurnPrefixMetadata,
+            represented_token_ids: Vec<u32>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let represented_len = represented_token_ids.len();
+            if represented_len != self.session.kv_cache.seq_len {
+                return Err(InferenceError::PrefixCache(format!(
+                    "save_cross_turn_prefix: represented_len {represented_len} != kv seq_len {}",
+                    self.session.kv_cache.seq_len
+                )));
+            }
+            let gdn_snapshot = self.snapshot_gdn_states_checked()?;
+            let kv = crate::kv_cache::KvPrefixHandle {
+                represented_len,
+                num_full_attention_layers: self.session.kv_cache.k_bufs.len(),
+                kv_dim: self.session.kv_cache.kv_dim,
+                max_cache_len: self.session.kv_cache.max_cache_len,
+                kv_f16: self.use_kv_f16,
+            };
+            let generic = crate::kv_cache::CrossTurnPrefixEntry {
+                slot_id,
+                metadata,
+                token_ids: represented_token_ids,
+                represented_len,
+                kv,
+                gdn_snapshot_len: represented_len,
+            };
+            self.cross_turn_prefix_cache
+                .insert(MetalCrossTurnPrefixEntry {
+                    generic,
+                    gdn_snapshot,
+                });
+            Ok(())
+        }
+
+        /// Best-effort cache save: a bookkeeping failure must not fail an
+        /// otherwise-successful generation. On failure the slot is cleared
+        /// rather than left holding a possibly-stale entry (fail-closed).
+        fn save_cross_turn_prefix_or_clear(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            metadata: crate::kv_cache::CrossTurnPrefixMetadata,
+            represented_token_ids: Vec<u32>,
+        ) {
+            if self
+                .save_cross_turn_prefix(slot_id, metadata, represented_token_ids)
+                .is_err()
+            {
+                self.cross_turn_prefix_cache.remove(slot_id);
+            }
+        }
+
+        /// [`Self::snapshot_gdn_states`] has no failure mode today, but is
+        /// wrapped in `Result` so cache callers have one fallible surface to
+        /// widen behind if that ever changes.
+        fn snapshot_gdn_states_checked(
+            &self,
+        ) -> Result<crate::attention::gdn::GdnSnapshot, crate::error::InferenceError> {
+            use crate::speculative::MtpTargetVerifier;
+            Ok(self.snapshot_gdn_states())
+        }
+
+        /// Shape-checked wrapper around [`Self::restore_gdn_states`]. The
+        /// underlying restore only asserts shapes in debug builds
+        /// (`debug_assert_eq!`); this validates explicitly in all builds and
+        /// returns `InferenceError::PrefixCache` instead of restoring
+        /// mismatched buffers or panicking.
+        fn restore_gdn_states_checked(
+            &mut self,
+            snapshot: &crate::attention::gdn::GdnSnapshot,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            use crate::speculative::MtpTargetVerifier;
+
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            if snapshot.len() != num_layers {
+                return Err(InferenceError::PrefixCache(format!(
+                    "restore_gdn_states_checked: snapshot has {} layers, expected {num_layers}",
+                    snapshot.len()
+                )));
+            }
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
+                    return Err(InferenceError::PrefixCache(format!(
+                        "restore_gdn_states_checked: layer {i} shape mismatch: conv {} != \
+                         {conv_floats} or s {} != {s_floats}",
+                        conv_snap.len(),
+                        s_snap.len()
+                    )));
+                }
+            }
+            self.restore_gdn_states(snapshot);
+            Ok(())
+        }
+
+        /// Cache-aware sibling of [`Self::generate_streaming`].
+        ///
+        /// Detects the longest shared token prefix between `slot_id`'s
+        /// cached entry and this prompt; when it is an exact, fully
+        /// represented append-only prefix (`PrefixReuseMode::ExactAppend`),
+        /// restores the GDN snapshot, sets the logical position, and
+        /// prefills only the divergent suffix via `forward_prefill_from`.
+        /// Otherwise falls back to `reset_state` + full prefill — byte-for-
+        /// byte the same path `generate_streaming` takes, so the decode loop
+        /// below is identical in both cases and produces the same generated
+        /// token IDs as the non-cached path for the same conversation
+        /// (token-identity invariant; see design.md).
+        ///
+        /// `generate_streaming` and `chat_completion_streaming` are left
+        /// untouched and never use this cache, so their behavior stays
+        /// deterministic and unaffected by any cache state.
+        pub fn generate_streaming_with_prefix_cache<F>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+        {
+            match self.generate_streaming_with_prefix_cache_inner(
+                slot_id, prompt, tokenizer, gen_cfg, on_token,
+            ) {
+                Ok(out) => Ok(out),
+                Err(e) => {
+                    // Fail-closed: state and cache may disagree after a
+                    // restore/prefill/save error, so drop both rather than
+                    // risk a later turn reusing an inconsistent boundary.
+                    self.reset_state();
+                    self.cross_turn_prefix_cache.remove(slot_id);
+                    Err(e)
+                }
+            }
+        }
+
+        fn generate_streaming_with_prefix_cache_inner<F>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut on_token: F,
+        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+        {
+            use crate::kv_cache::PrefixReuseMode;
+
+            let cfg = self.engine.config.clone();
+
+            let mut rng_state = match gen_cfg.seed {
+                Some(s) => {
+                    if s == 0 {
+                        1
+                    } else {
+                        s
+                    }
+                }
+                None => {
+                    use std::time::SystemTime;
+                    let t = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0x12345678_9abcdef0);
+                    if t == 0 { 1 } else { t }
+                }
+            };
+
+            let input = tokenizer.tokenize(prompt);
+            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+            let prompt_len = prompt_ids.len();
+
+            // These three guards are byte-for-byte the same as
+            // `generate_streaming` and run before any state mutation, so an
+            // existing cache entry (if any) is left exactly as-is.
+            if prompt_len == 0 {
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: 0,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: None,
+                    },
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: 0,
+                        reused_tokens: 0,
+                        prefetched_tokens: 0,
+                        mode: PrefixReuseMode::FullRefill,
+                    },
+                });
+            }
+            if gen_cfg.max_new_tokens == 0 {
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: Some(StopReason::Length),
+                    },
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: prompt_len,
+                        reused_tokens: 0,
+                        prefetched_tokens: 0,
+                        mode: PrefixReuseMode::FullRefill,
+                    },
+                });
+            }
+            if prompt_len > self.max_context() {
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: true,
+                        stop_reason: Some(StopReason::KvFull),
+                    },
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: prompt_len,
+                        reused_tokens: 0,
+                        prefetched_tokens: 0,
+                        mode: PrefixReuseMode::FullRefill,
+                    },
+                });
+            }
+
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+
+            match plan.mode {
+                PrefixReuseMode::ExactAppend | PrefixReuseMode::ReplayFromCheckpoint { .. } => {
+                    self.restore_cross_turn_prefix(slot_id, &plan)?;
+                }
+                PrefixReuseMode::FullRefill => self.reset_state(),
+            }
+
+            let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+            let mut all_ids = prompt_ids.clone();
+
+            let route = choose_gpu_topk_route(
+                gen_cfg.top_k,
+                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+            );
+            let use_compact = route != GpuTopkRoute::CpuFallback
+                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
+                && gen_cfg.grammar.is_none();
+            self.session.compact_route = if use_compact {
+                route
+            } else {
+                GpuTopkRoute::CpuFallback
+            };
+            if use_compact {
+                self.session.compact_topk = gen_cfg.top_k;
+            }
+
+            let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
+            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
+                tokenizer.special_token_id("</think>")
+            } else {
+                None
+            };
+            let mut thinking_closed = false;
+
+            // The one line that differs structurally from `generate_streaming`:
+            // prefill only the divergent suffix, at its true absolute position.
+            let suffix = &prompt_ids[plan.suffix_start..];
+            let mut prefill_logits = self.forward_prefill_from(suffix, plan.suffix_start, false)?;
+
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                engine.mask_logits(gs, &mut prefill_logits);
+            }
+
+            let next_id = if use_compact {
+                sample_from_candidates(
+                    &self.session.compact_result,
+                    gen_cfg,
+                    &all_ids,
+                    &mut rng_state,
+                )
+            } else {
+                sample_token(&prefill_logits, gen_cfg, &all_ids, &mut rng_state)
+            };
+
+            let cache_stats = |mode, reused, prefetched| CrossTurnCacheStats {
+                slot_id,
+                prompt_tokens: prompt_len,
+                reused_tokens: reused,
+                prefetched_tokens: prefetched,
+                mode,
+            };
+
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                if !engine.advance(gs, next_id) {
+                    let text = decode_tokens(tokenizer, &generated_ids);
+                    self.save_cross_turn_prefix_or_clear(
+                        slot_id,
+                        metadata.clone(),
+                        prompt_ids.clone(),
+                    );
+                    return Ok(CachedGenerateOutput {
+                        output: GenerateOutput {
+                            text,
+                            token_ids: generated_ids.clone(),
+                            prompt_tokens: prompt_len,
+                            generated_tokens: generated_ids.len(),
+                            stopped: false,
+                            stop_reason: Some(StopReason::Grammar),
+                        },
+                        cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                    });
+                }
+            }
+
+            let is_stop = |id: u32| -> bool {
+                id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id)
+            };
+
+            if is_stop(next_id) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), prompt_ids.clone());
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
+            }
+
+            if Some(next_id) == think_close_id {
+                thinking_closed = true;
+            }
+
+            let mut detok = IncrementalDetokenizer::new();
+            let mut reasoning_end_len: Option<usize> = None;
+            generated_ids.push(next_id);
+            all_ids.push(next_id);
+            if thinking_closed && reasoning_end_len.is_none() {
+                reasoning_end_len = Some(generated_ids.len());
+            }
+            let mut last_pushed_id = next_id;
+            let delta = detok.push(tokenizer, next_id);
+            if !delta.is_empty() && !on_token(&delta, next_id) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                // The caller cut the stream after exactly one forwarded
+                // token (the prefill sample) — state represents prompt +
+                // that one token already (forward happens on the *next*
+                // iteration in the loop below, which never runs here).
+                // Nothing further was forwarded, so do not save a cache
+                // entry claiming more than live state represents.
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: detok.text(),
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
+            }
+            let mut stopped = false;
+            let mut stopped_by_caller = false;
+            let mut stop_reason = StopReason::Length;
+
+            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            for _ in 1..cap {
+                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
+                    break;
+                }
+                let pos = self.session.kv_cache.seq_len;
+                let last_token = *all_ids
+                    .last()
+                    .expect("invariant: prompt or previous sample populated all_ids");
+                let mut step_logits = self.forward_step(last_token, pos);
+
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    engine.mask_logits(gs, &mut step_logits);
+                }
+
+                let sampled_id = if use_compact {
+                    sample_from_candidates(
+                        &self.session.compact_result,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
+                } else {
+                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                };
+
+                let next_id = force_close_think(
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    thinking_closed,
+                    generated_ids.len(),
+                    think_close_id,
+                )
+                .unwrap_or(sampled_id);
+
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    if !engine.advance(gs, next_id) {
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                }
+
+                if Some(next_id) == think_close_id {
+                    thinking_closed = true;
+                }
+
+                if is_stop(next_id) {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+
+                generated_ids.push(next_id);
+                all_ids.push(next_id);
+                if thinking_closed && reasoning_end_len.is_none() {
+                    reasoning_end_len = Some(generated_ids.len());
+                }
+                last_pushed_id = next_id;
+                let delta = detok.push(tokenizer, next_id);
+                if !delta.is_empty() && !on_token(&delta, next_id) {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
+                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
+                    break;
+                }
+                if let Some(end) = reasoning_end_len {
+                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
+                        break;
+                    }
+                }
+            }
+
+            if use_compact {
+                self.session.compact_topk = 0;
+                self.session.compact_route = GpuTopkRoute::CpuFallback;
+            }
+
+            // Every exit above leaves the last *pushed* generated token
+            // un-forwarded EXCEPT the `is_stop` break, where the stop token
+            // itself was never pushed and every element of `generated_ids`
+            // was already forwarded by the following iteration's
+            // `forward_step` call. Run one silent step so the next turn can
+            // reuse through the full assistant output (design.md step 8,
+            // "Better v1"). This must not sample or emit anything.
+            if !generated_ids.is_empty() && !stopped {
+                let seq_len = self.session.kv_cache.seq_len;
+                if seq_len < self.session.kv_cache.max_cache_len {
+                    let _ = self.forward_step(last_pushed_id, seq_len);
+                }
+                // else: KV is already full; the cache boundary stays one
+                // token short of `generated_ids` — still consistent, since
+                // KV/GDN and `represented_len` all agree at that boundary.
+            }
+
+            let represented_len = self.session.kv_cache.seq_len;
+            debug_assert!(represented_len >= prompt_len);
+            let generated_represented = represented_len - prompt_len;
+            let mut represented_token_ids = prompt_ids.clone();
+            represented_token_ids.extend_from_slice(&generated_ids[..generated_represented]);
+            self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), represented_token_ids);
+
+            if !stopped_by_caller {
+                let tail = detok.finish();
+                if !tail.is_empty() {
+                    on_token(&tail, last_pushed_id);
+                }
+            }
+            let text = detok.text();
+            Ok(CachedGenerateOutput {
+                output: GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped,
+                    stop_reason: Some(stop_reason),
+                },
+                cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+            })
+        }
+
+        /// Cache-aware sibling of [`Self::chat_completion_streaming`]: same
+        /// ChatML formatting and `<|im_end|>` stop-token handling, routed
+        /// through [`Self::generate_streaming_with_prefix_cache`] instead of
+        /// `generate_streaming`.
+        pub fn chat_completion_streaming_with_prefix_cache<F>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            messages: &[ChatMessage],
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+        ) -> Result<CachedChatCompletionOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+        {
+            let prompt = format_chat_template(messages);
+            let mut cfg = gen_cfg.clone();
+            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>") {
+                if !cfg.stop_token_ids.contains(&im_end_id) {
+                    cfg.stop_token_ids.push(im_end_id);
+                }
+            }
+            let cached = self.generate_streaming_with_prefix_cache(
+                slot_id, &prompt, tokenizer, &cfg, on_token,
+            )?;
+            let text = cached.output.text.trim_end().to_string();
+            Ok(CachedChatCompletionOutput {
+                output: ChatCompletionOutput {
+                    message: ChatMessage::assistant(text),
+                    prompt_tokens: cached.output.prompt_tokens,
+                    completion_tokens: cached.output.generated_tokens,
+                },
+                cache: cached.cache,
+            })
         }
     }
 
@@ -17999,6 +19087,9 @@ kernel void decode_attention_reference(
                 lora: None,
                 use_gdn_chunked: true,
                 use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
             }
         }
 
@@ -18197,6 +19288,9 @@ kernel void decode_attention_reference(
                 lora: None,
                 use_gdn_chunked: true,
                 use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
             };
             let _logits = state_a.forward_step(42, 0);
             let _logits = state_a.forward_step(7, 1);
@@ -22276,6 +23370,726 @@ kernel void decode_attention_reference(
             let result = quantize_row_q8_0(&vals);
             assert!(result.is_err(), "+inf in Q8_0 weight block must return Err");
         }
+
+        // ---------------------------------------------------------------------
+        // Cross-turn KV prefix cache (#462): Metal integration tests.
+        //
+        // `single_char_vocab_tokenizer` gives a 32-token, merge-free vocab
+        // (one token per ASCII letter) so growing a conversation by string
+        // concatenation is guaranteed to grow the token sequence by an exact
+        // append — no re-tokenization boundary can shift earlier tokens,
+        // which keeps these tests focused on the cache logic itself rather
+        // than on tokenizer edge cases.
+        // ---------------------------------------------------------------------
+
+        fn cross_turn_test_gen_cfg(seed: u64, max_new_tokens: usize) -> GenerateConfig {
+            GenerateConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(seed),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            }
+        }
+
+        /// The correctness gate for #462: a growing multi-turn conversation run
+        /// through `generate_streaming_with_prefix_cache` on one long-lived state
+        /// must produce byte-identical token IDs, turn by turn, to running each
+        /// turn's full accumulated prompt through plain `generate_streaming` on a
+        /// fresh state (i.e. the pre-#462 "re-prefill everything every turn"
+        /// behavior). If cross-turn KV/GDN reuse ever perturbs a single sampled
+        /// token, this test goes red.
+        #[test]
+        fn cross_turn_cache_multiturn_token_identity_matches_full_reprefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Keep EOS unreachable so every turn generates its full budget,
+            // guaranteeing the conversation keeps growing turn over turn.
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut cached_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+
+            let user_turns = ["a", "bc", "d", "ef", "g"];
+            let mut conversation = String::new();
+            let mut saw_exact_append = false;
+
+            for (turn_idx, user_text) in user_turns.iter().enumerate() {
+                conversation.push_str(user_text);
+                let gen_cfg = cross_turn_test_gen_cfg(42, 3);
+
+                let mut cached_delta_calls = 0u32;
+                let cached_out = cached_state
+                    .generate_streaming_with_prefix_cache(
+                        slot_id,
+                        &conversation,
+                        &tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| {
+                            cached_delta_calls += 1;
+                            true
+                        },
+                    )
+                    .expect("cache-aware generation must not error on a valid conversation");
+
+                // Independent, from-scratch reference: a brand new state, full
+                // re-prefill of the entire accumulated conversation so far —
+                // exactly the behavior cross-turn reuse must reproduce.
+                let mut reference_state =
+                    MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+                let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
+                let reference_out = reference_state.generate_streaming(
+                    &conversation,
+                    &tokenizer,
+                    &reference_gen_cfg,
+                    |_delta, _id| true,
+                );
+
+                assert_eq!(
+                    cached_out.output.token_ids, reference_out.token_ids,
+                    "turn {turn_idx}: cache-aware token IDs must match full re-prefill \
+                     exactly (conversation so far: {conversation:?})"
+                );
+                assert_eq!(
+                    cached_out.output.text, reference_out.text,
+                    "turn {turn_idx}: cache-aware decoded text must match full re-prefill"
+                );
+                assert_eq!(
+                    cached_out.output.stop_reason, reference_out.stop_reason,
+                    "turn {turn_idx}: stop reason must match full re-prefill"
+                );
+
+                if matches!(
+                    cached_out.cache.mode,
+                    crate::kv_cache::PrefixReuseMode::ExactAppend
+                ) {
+                    saw_exact_append = true;
+                    assert!(
+                        cached_out.cache.reused_tokens > 0,
+                        "turn {turn_idx}: ExactAppend must report a nonzero reused prefix"
+                    );
+                }
+
+                // Grow the conversation with the (validated-identical) reply so
+                // the next turn's prompt is a real append onto this one.
+                conversation.push_str(&cached_out.output.text);
+            }
+
+            assert!(
+                saw_exact_append,
+                "at least one later turn must actually exercise ExactAppend reuse — \
+                 otherwise this test only proves the FullRefill fallback path works"
+            );
+        }
+
+        /// Prefix-mismatch invalidation: when the new prompt does not share the
+        /// cached entry's history at all, the planner must fall back to
+        /// `FullRefill` (never attempt to graft an unrelated suffix onto stale
+        /// KV/GDN state), and the output must still be correct.
+        #[test]
+        fn cross_turn_cache_prefix_mismatch_falls_back_to_full_refill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(7, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abc",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first turn must succeed");
+            assert_eq!(
+                first.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "an empty cache must always plan FullRefill"
+            );
+
+            // Completely different conversation: zero shared token prefix
+            // with the cached entry from "abc".
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "xyz",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("divergent-prefix turn must still succeed");
+            assert_eq!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "a prompt sharing no prefix with the cached entry must invalidate to FullRefill"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after a prefix-mismatch invalidation, output must still match full re-prefill"
+            );
+        }
+
+        /// `clear_cross_turn_prefix_cache` must force the next call to plan
+        /// `FullRefill` even when the new prompt would otherwise be a valid
+        /// `ExactAppend` continuation of the (now-cleared) entry.
+        #[test]
+        fn cross_turn_cache_clear_forces_full_refill_next_call() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(3, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+
+            state.clear_cross_turn_prefix_cache();
+
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &conversation,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("second turn after clear must succeed");
+            assert_eq!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::FullRefill,
+                "a cleared cache slot must never be treated as a valid cached entry"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // #516 round-1 remediation (codex REJECT) — regression coverage for
+        // findings 1/2/3/4. See
+        // .khive/codex_reviews/codex_review_pr516.md.
+        // -------------------------------------------------------------------
+
+        /// Finding 1 (slot isolation): a divergent-prompt call on a
+        /// different slot must evict the single retained entry (D1's
+        /// single-live-entry cache), so a later append to the ORIGINAL
+        /// slot's prefix cannot silently restore GDN state left by a
+        /// different slot's generation while attention reads whatever KV
+        /// rows the other slot's generation wrote.
+        #[test]
+        fn cross_turn_cache_slot_isolation_evicts_other_slot() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_a = crate::kv_cache::CrossTurnSlotId::new(1);
+            let slot_b = crate::kv_cache::CrossTurnSlotId::new(2);
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(11, 2);
+
+            // Save slot A.
+            let first = state
+                .generate_streaming_with_prefix_cache(slot_a, "ab", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("slot A first turn must succeed");
+            let mut conv_a = "ab".to_string();
+            conv_a.push_str(&first.output.text);
+
+            // Divergent-prompt call on slot B: under D1, `insert` replaces
+            // whatever is retained regardless of slot, so this evicts A's
+            // entry and retains B's.
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_b,
+                    "xyz",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("slot B turn must succeed");
+
+            // Append-only continuation of A's prefix, issued on slot A
+            // AFTER B evicted the single retained entry: must NOT
+            // ExactAppend (there is no A entry left to restore from).
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_a,
+                    &conv_a,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("slot A second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "slot A must not reuse GDN/KV state left by slot B's generation"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a different-slot eviction must force a FullRefill, never ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after cross-slot eviction, output must still match full re-prefill"
+            );
+        }
+
+        /// Finding 2, plain-path leg (D3): interleaving a plain
+        /// `generate_streaming` call (which goes through `reset_state`)
+        /// between two cache-aware calls must invalidate the retained
+        /// entry — the plain path overwrites live KV/GDN state without
+        /// ever calling `save_cross_turn_prefix`.
+        ///
+        /// Mutation sensitivity: reverting D3 (removing
+        /// `self.cross_turn_prefix_cache.clear()` from `reset_state`) makes
+        /// this test fail, because the stale entry would still report
+        /// `ExactAppend` against state the plain path already overwrote.
+        #[test]
+        fn cross_turn_cache_interleaved_plain_path_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(21, 2);
+
+            // Save a cross-turn entry.
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+
+            // Plain path: a different prompt, routed through `reset_state`,
+            // never touches the cross-turn cache's save path.
+            let _ = state.generate_streaming("zzzzzz", &tokenizer, &gen_cfg, |_, _| true);
+
+            // A genuine append (strictly longer than the cached entry) onto
+            // the ORIGINAL prefix through the cache-aware path again: if the
+            // stale entry survived, this satisfies D5's `len > shared` guard
+            // too (it is NOT an exact-equal retry), so it would still look
+            // like a valid ExactAppend continuation of `conversation` and
+            // this test would only be sensitive to D3, not accidentally
+            // masked by D5's separate guard.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an interleaved plain generate_streaming call must invalidate the retained entry"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after an interleaved plain-path reset, output must still match full re-prefill"
+            );
+        }
+
+        /// Finding 4 (D5): retrying the exact same prompt through the
+        /// cache-aware path must not hit the empty-suffix invariant error
+        /// in `forward_prefill_from` — the planner must fall back to
+        /// `FullRefill` when the new prompt exactly equals the entry's
+        /// represented tokens.
+        ///
+        /// Mutation sensitivity: reverting D5 (dropping the
+        /// `new_prompt_ids.len() > shared` conjunct in
+        /// `plan_prefix_reuse`) makes this test fail: the planner would
+        /// again produce `ExactAppend` with `suffix_len == 0`, and
+        /// `generate_streaming_with_prefix_cache` would return
+        /// `Err(InferenceError::PrefixCache(..))` instead of `Ok`.
+        #[test]
+        fn cross_turn_cache_exact_equal_retry_full_refills() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(5, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abc",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("first call must succeed");
+
+            // The saved entry represents `prompt + generated tokens`, NOT
+            // just the original prompt (see the `represented_token_ids`
+            // construction in `generate_streaming_with_prefix_cache_inner`).
+            // To actually exercise the exact-equal boundary the second call
+            // must retry with THIS accumulated conversation — retrying with
+            // the bare "abc" prompt again would only exercise the ordinary
+            // mid-history-divergence FullRefill path (shared < represented_len),
+            // never reaching the `shared == represented_len` branch this test
+            // targets.
+            let mut conversation = "abc".to_string();
+            conversation.push_str(&first.output.text);
+
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &conversation,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("exact-equal prompt retry must not error");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an exact-equal prompt retry must plan FullRefill, not a zero-length ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state
+                    .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "exact-equal prompt retry output must match full re-prefill"
+            );
+        }
+
+        /// Finding 3 (D4): LoRA adapter load/unload must invalidate the
+        /// retained cross-turn entry. The adapter-identity hash in
+        /// `CrossTurnPrefixMetadata` is shape-based (max_rank/scale/
+        /// projection count), not content-based, so two different adapters
+        /// with the same shape can collide on the same `AdapterId` — the
+        /// unconditional clear on load/unload is the actual correctness
+        /// mechanism, not the metadata hash. Asserted directly against the
+        /// cache struct (this `mod tests` is a child module of
+        /// `metal_qwen35`, so the private `entry` field is visible here).
+        #[test]
+        fn cross_turn_cache_lora_load_unload_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(9, 2);
+
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("save call must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: a save must actually retain an entry"
+            );
+
+            // `tiny_hybrid_fixture`'s only FullAttention layer is index 3
+            // (layers 0-2 are LinearAttention/GDN); `make_valid_layer`
+            // defaults to layer_idx 0, which is only valid against the
+            // single-FullAttention-layer fixture other LoRA tests use.
+            let mut lora_layer = make_valid_layer(512, 2);
+            lora_layer.layer_idx = 3;
+            state
+                .load_lora_adapter(vec![lora_layer], 1.0, None)
+                .expect("load_lora_adapter with a valid small fixture must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "load_lora_adapter must clear the retained cross-turn entry"
+            );
+
+            // Re-save under the loaded adapter, then unload and check
+            // invalidation again.
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("save call under LoRA must succeed");
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: a save under LoRA must actually retain an entry"
+            );
+
+            state.unload_lora_adapter();
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "unload_lora_adapter must clear the retained cross-turn entry"
+            );
+        }
+
+        /// Round-2 D7 (codex blocker): a public raw-forward call
+        /// (`forward_step`) interleaved between two cache-aware calls on the
+        /// SAME slot must invalidate the retained entry, exactly like
+        /// `generate_streaming`'s `reset_state()` does for finding 2's
+        /// plain-path leg (D3, `cross_turn_cache_interleaved_plain_path_invalidates`
+        /// above) — `forward_step` mutates the same live KV/GDN buffers
+        /// without ever routing through `reset_state` or the cache's own
+        /// save path, so it is a second, independent way to leave a stale
+        /// entry pointing at overwritten state.
+        ///
+        /// Uses a strictly-longer continuation of the ORIGINAL conversation
+        /// (append one extra character) for the second call, same as D3's
+        /// test: an exact-equal retry would independently trip D5's
+        /// `FullRefill` guard (`cross_turn_cache_exact_equal_retry_full_refills`)
+        /// and mask whether D7's clear is actually doing anything.
+        ///
+        /// Mutation sensitivity: reverting D7 (removing
+        /// `self.cross_turn_prefix_cache.clear()` from `forward_step`) makes
+        /// this test fail — see the reverse-apply evidence recorded in the
+        /// PR body.
+        #[test]
+        fn cross_turn_cache_interleaved_raw_forward_invalidates() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(31, 2);
+
+            // Save a cross-turn entry via the cache-aware path (slot A's
+            // only slot, since `MetalCrossTurnPrefixCache` retains at most
+            // one live entry across the whole state — see D1).
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: the first cache-aware call must actually retain an entry"
+            );
+
+            // Interleave a raw public forward call on an unrelated token
+            // stream. This is the exact stale path codex named: `forward_step`
+            // advances `self.session.kv_cache` / GDN state directly, bypassing
+            // both `reset_state()` (D3's guard) and the cache-aware save path.
+            let _ = state.forward_step(0, 0);
+
+            // The raw call must have invalidated the retained entry outright
+            // (not just left it stale) — this is what D7 adds.
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "forward_step must clear the retained cross-turn entry before mutating live state"
+            );
+
+            // Strict-append continuation of the ORIGINAL slot's conversation:
+            // if the entry had survived, this shape would still satisfy D5's
+            // `len > shared` guard and look like a valid ExactAppend, so the
+            // assertion below is genuinely exercising D7 and not being masked
+            // by D5.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "an interleaved raw forward_step call must force a full refill, not a stale restore"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a raw-forward-invalidated entry must never be restored via ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            assert_eq!(
+                second.output.token_ids, reference_out.token_ids,
+                "after an interleaved raw forward_step call, output must still match full re-prefill"
+            );
+        }
+
+        /// #516 round-3 remediation: `set_gdn_chunked` swaps the GDN prefill
+        /// algorithm, and the two scans are not bit-exact (measured logit
+        /// drift up to ~2e-1 at chunk boundaries). A cache entry saved under
+        /// one mode must not seed a restore whose full-refill reference would
+        /// use the other mode. Flipping the mode must evict the retained
+        /// entry; a no-op set must NOT (so benchmarks re-asserting the current
+        /// mode keep their cache).
+        #[test]
+        fn cross_turn_cache_invalidated_by_gdn_mode_flip() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(13, 2);
+
+            let first = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware first turn must succeed");
+            let mut conversation = "ab".to_string();
+            conversation.push_str(&first.output.text);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "precondition: the first cache-aware call must actually retain an entry"
+            );
+
+            // Re-asserting the CURRENT mode is a no-op and must keep the entry.
+            let current_mode = state.use_gdn_chunked;
+            state.set_gdn_chunked(current_mode);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "setting the already-active GDN mode must not evict the cache entry"
+            );
+
+            // Flipping the mode must evict it outright.
+            state.set_gdn_chunked(!current_mode);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "flipping the GDN prefill mode must clear the retained cross-turn entry"
+            );
+
+            // Strict-append continuation: if the entry had survived the flip,
+            // this shape would satisfy the ExactAppend guards, so the
+            // assertions below genuinely exercise the mode-flip eviction.
+            let mut appended = conversation.clone();
+            appended.push('q');
+            let second = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &appended,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("cache-aware second turn must succeed");
+            assert_eq!(
+                second.cache.reused_tokens, 0,
+                "a GDN mode flip must force a full refill, not a cross-mode restore"
+            );
+            assert_ne!(
+                second.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "an entry saved under the other GDN prefill mode must never be restored via ExactAppend"
+            );
+        }
     }
     // -----------------------------------------------------------------------
     // Blend correctness tests (inference-side LoraLayerData types)
@@ -23058,7 +24872,8 @@ mod gdn_state_traffic_tests {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, blend_lora_layer_data, format_chat_template,
+    LoraLayerData, MetalQwen35State, PathProofSnapshot, blend_lora_layer_data,
+    format_chat_template,
 };
 
 // Stub for non-macOS or non-metal builds.

@@ -6,6 +6,14 @@
 /// read/write bytes and snapshot/restore counts for the decode and MTP-verify scopes,
 /// plus a cross-check against `active_gdn_layers * per_layer_state_bytes`.
 ///
+/// Each `GDN_STATE_STEP` line also reports `state_bytes_moved` (decode read + write for
+/// that step) — the MEASURED per-step recurrent-state byte traffic used by the #491
+/// bandwidth-share decision gate. The state buffers (conv cache + S matrix) are a fixed
+/// function of model config, not sequence position, so this figure is expected to be
+/// CONTEXT-INVARIANT (does not grow with context length, unlike KV-cache bytes/token).
+/// `GDN_STATE_BYTES_PER_STEP` reports the average across the measured steps plus the
+/// min/max spread, so context-invariance can be checked directly from the bench output.
+///
 /// Model format is auto-detected from the directory: `.q4` files → Q4 weights,
 /// `model.safetensors` → f16 weights.
 ///
@@ -132,6 +140,8 @@ fn run() {
     let mut total_mtp_read = 0u64;
     let mut total_mtp_write = 0u64;
     let mut total_mtp_copy = 0u64;
+    let mut min_state_bytes_moved = u64::MAX;
+    let mut max_state_bytes_moved = 0u64;
 
     for i in 0..n_steps {
         let pos = prefill_len + 3 + i;
@@ -148,13 +158,15 @@ fn run() {
         let mtp_copy_count = report.mtp_verify.copy_count();
         let ok = decode_read_bytes == expected_decode_bytes
             && decode_write_bytes == expected_decode_bytes;
+        let state_bytes_moved = decode_read_bytes + decode_write_bytes;
 
         println!(
-            "GDN_STATE_STEP step={} pos={} decode_read_bytes={} decode_write_bytes={} decode_copy_count={} mtp_read_bytes={} mtp_write_bytes={} mtp_copy_count={} expected_decode_bytes={} ok={}",
+            "GDN_STATE_STEP step={} pos={} decode_read_bytes={} decode_write_bytes={} state_bytes_moved={} decode_copy_count={} mtp_read_bytes={} mtp_write_bytes={} mtp_copy_count={} expected_decode_bytes={} ok={}",
             i + 1,
             pos,
             decode_read_bytes,
             decode_write_bytes,
+            state_bytes_moved,
             decode_copy_count,
             mtp_read_bytes,
             mtp_write_bytes,
@@ -169,6 +181,8 @@ fn run() {
         total_mtp_read += mtp_read_bytes;
         total_mtp_write += mtp_write_bytes;
         total_mtp_copy += mtp_copy_count;
+        min_state_bytes_moved = min_state_bytes_moved.min(state_bytes_moved);
+        max_state_bytes_moved = max_state_bytes_moved.max(state_bytes_moved);
     }
 
     println!(
@@ -177,5 +191,15 @@ fn run() {
 
     println!(
         "GDN_STATE_CROSSCHECK expected_per_step={expected_decode_bytes} profiler_group=gdn_mixer formula=active_gdn_layers*per_layer_state_bytes"
+    );
+
+    // MEASURED per-step state-byte traffic for the #491 bandwidth-share decision gate.
+    // avg == min == max is expected: state buffer size is fixed by config, not context
+    // length, so this figure should be context-invariant (contrast with KV bytes/token,
+    // which grows linearly with context length via `kv_bytes_per_token`).
+    let avg_state_bytes_moved = (total_decode_read + total_decode_write) / n_steps as u64;
+    println!(
+        "GDN_STATE_BYTES_PER_STEP avg={avg_state_bytes_moved} min={min_state_bytes_moved} max={max_state_bytes_moved} context_invariant={}",
+        min_state_bytes_moved == max_state_bytes_moved
     );
 }

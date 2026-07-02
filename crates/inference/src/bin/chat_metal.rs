@@ -398,10 +398,21 @@ fn emit_json_generation(
     let mut ttft_ms: f64 = 0.0;
     let t1 = std::time::Instant::now();
 
+    // Path-proof probe (issue #239): opt-in so normal Lattice Studio runs pay no
+    // cost. When enabled, zero the dispatch-site counters before this generation
+    // so the marker below reflects only this call's Metal attention/KV dispatches.
+    let path_proof_enabled = matches!(
+        std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    if path_proof_enabled {
+        metal.reset_path_proof_counters();
+    }
+
     // Capture the first write/flush failure so we can stop generation and return Err
     // rather than silently completing a run whose output was never received.
     let mut stream_err: Option<std::io::Error> = None;
-    let output = metal.generate_streaming(prompt, tokenizer, gen_cfg, |delta, _token_id| {
+    let output = metal.generate_streaming(prompt, tokenizer, gen_cfg, |delta, token_id| {
         if !first_token_emitted {
             ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
             first_token_emitted = true;
@@ -409,7 +420,7 @@ fn emit_json_generation(
         let token_json = json_escape(delta);
         let write_result = writeln!(
             stdout,
-            "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"done\":false}}"
+            "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"token_id\":{token_id},\"done\":false}}"
         )
         .and_then(|()| stdout.flush());
         if let Err(e) = write_result {
@@ -444,6 +455,24 @@ fn emit_json_generation(
         "[chat_metal] GPU Metal {model_format}{lora_tag}: {} prompt + {} gen in {}ms = {tok_s:.1} tok/s",
         output.prompt_tokens, output.generated_tokens, gen_ms
     );
+
+    // Emit the runtime path-proof marker (issue #239): CI gates on this to prove
+    // the required Metal attention/KV dispatches actually ran, rather than
+    // trusting a "Metal device present" check that a paravirtual CI runner would
+    // pass vacuously. See scripts/e2e_parity_check.py for the fail-closed parser.
+    if path_proof_enabled {
+        let s = metal.path_proof_snapshot();
+        eprintln!(
+            "[METAL_PATH_PROOF] prefill_kv_batch={} prefill_attn_batched={} decode_kv_copy={} decode_attn_direct={} decode_attn_split_partial={} decode_attn_split_reduce={} kv_f16={}",
+            s.prefill_kv_batch,
+            s.prefill_attn_batched,
+            s.decode_kv_copy,
+            s.decode_attn_direct,
+            s.decode_attn_split_partial,
+            s.decode_attn_split_reduce,
+            s.kv_f16,
+        );
+    }
 
     Ok(())
 }

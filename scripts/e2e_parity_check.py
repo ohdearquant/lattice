@@ -6,14 +6,31 @@ generation output (token IDs) and reports speed.
 
 Exit codes: 0 = pass, 1 = parity failure, 2 = setup error.
 
+Args:
+  --backend {cpu,metal}  which lattice binary/path to exercise (default: cpu).
+                          "cpu" runs qwen35_generate and parses its legacy text
+                          output. "metal" runs `chat_metal --json` and requires
+                          the LATTICE_METAL_PATH_PROOF runtime capability marker
+                          to prove the Metal attention/KV-cache dispatch helpers
+                          actually ran; a missing/invalid/zero-count marker is a
+                          gate FAILURE (never a skip), so a paravirtual runner
+                          that silently no-ops the required kernels goes red
+                          instead of green (issue #239).
+
 Env vars:
-  LATTICE_BIN       path to lattice qwen35_generate binary (default: target/release/qwen35_generate)
-  LATTICE_MODEL_DIR path to model weights (default: ~/.lattice/models/qwen3.5-0.8b)
-  HF_MODEL_ID       HuggingFace model ID (default: Qwen/Qwen3.5-0.8B)
-  E2E_MAX_TOKENS    tokens to generate per prompt (default: 15)
-  E2E_REPORT_PATH   write markdown report here (optional)
+  LATTICE_BIN             path to the lattice binary under test (default:
+                           target/release/qwen35_generate for --backend cpu,
+                           target/release/chat_metal for --backend metal)
+  LATTICE_MODEL_DIR       path to model weights (default: ~/.lattice/models/qwen3.5-0.8b)
+  HF_MODEL_ID             HuggingFace model ID (default: Qwen/Qwen3.5-0.8B)
+  E2E_MAX_TOKENS          tokens to generate per prompt (default: 15)
+  E2E_REPORT_PATH         write markdown report here (optional)
+  LATTICE_METAL_PATH_PROOF  set to "1" so chat_metal emits the
+                           `[METAL_PATH_PROOF]` stderr marker this script
+                           requires in --backend metal mode
 """
 
+import argparse
 import json
 import os
 import re
@@ -36,10 +53,16 @@ PROMPTS: list[tuple[str, int]] = [
     ("In the year 2024, artificial intelligence", 3),
     ("def fibonacci(n):\n    if n <= 1:\n        return n\n    return", 3),
     # LONG_PROMPT: ~816 tokens (measured with Qwen/Qwen3.5-0.8B tokenizer).
-    # Must exceed max_prefill=512 so forward_prefill_impl takes the sequential
-    # per-token forward_step loop (the n > self.session.max_prefill branch in
-    # metal_qwen35.rs:forward_prefill_impl). This exercises the oversize /
-    # chunked-prefill path that upcoming PRs #188 and #189 modify.
+    # NOTE on call graph: CI builds qwen35_generate with --features f16 only,
+    # so this prompt exercises the CPU/f16 forward path — NOT the Metal
+    # chunked/oversize-prefill code in metal_qwen35.rs, which is gated behind
+    # `metal-gpu` and never compiled here. (An earlier version of this comment
+    # claimed otherwise, and that stale call-graph model misdirected the #520
+    # triage toward Metal prefill.) What the length DOES stress is the
+    # sampling decision after a long prompt history: with ~816 prompt tokens
+    # in previous_ids, a repetition-penalty mismatch between lattice and the
+    # HF reference flips the first greedy token (#520). Covering Metal
+    # chunked prefill requires a separate metal-gpu gate (see #239).
     # match_window=2: the first two generated tokens are a direct function of
     # the full 816-step prefill final-position logits. GDN recurrent state
     # drifts during decode (same reason short prompts use 3 not 15), but the
@@ -165,9 +188,16 @@ PROMPTS: list[tuple[str, int]] = [
 MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
 
 HF_MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen3.5-0.8B")
+
+# LATTICE_BIN default depends on --backend (chat_metal for metal, qwen35_generate
+# for cpu), but argparse only runs inside main(). An explicit LATTICE_BIN env var
+# always wins; module import time sets a provisional cpu-shaped default so any
+# code that reads LATTICE_BIN before main() runs still gets a sane path, and
+# main() overwrites it with the backend-correct default once args are parsed.
 LATTICE_BIN = os.environ.get(
     "LATTICE_BIN", "target/release/qwen35_generate"
 )
+_LATTICE_BIN_EXPLICIT = "LATTICE_BIN" in os.environ
 MODEL_DIR = os.environ.get(
     "LATTICE_MODEL_DIR",
     os.path.expanduser("~/.lattice/models/qwen3.5-0.8b"),
@@ -230,6 +260,19 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
         "--prompt", prompt,
         "--max-tokens", str(max_tokens),
         "--temperature", "0.0",
+        # GenerateConfig::default() carries a production repetition_penalty of
+        # 1.1 (see qwen35_config.rs), matching chat_metal.rs's serving default.
+        # The HF reference call below passes no repetition_penalty kwarg, so
+        # transformers applies none (factor 1.0 = no-op). Left at lattice's
+        # default, the two sides sample from different distributions even at
+        # temperature=0.0 (repetition penalty is applied to logits before the
+        # greedy argmax, not after) — invisible on short prompts because few
+        # candidate tokens have already appeared, but decisive on the ~816-token
+        # long-prefill prompt: nearly the whole Python-keyword vocabulary is
+        # already in the prompt, so penalizing every previously-seen token
+        # flips the post-prefill argmax away from HF's continuation (#520).
+        # Force 1.0 here so both sides run the same greedy decision rule.
+        "--repetition-penalty", "1.0",
     ]
 
     t0 = time.time()
@@ -263,6 +306,166 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
     return {
         "generated_ids": gen_ids,
         "text": text,
+        "elapsed_s": elapsed,
+        "tok_per_sec": tok_per_sec,
+    }
+
+
+# Required (non-zero) path-proof counters, matching the dispatch-site instrumentation
+# in crates/inference/src/forward/metal_qwen35.rs. decode attention takes either the
+# direct kernel (short caches) or the split partial+reduce pair (long caches) — never
+# both — so that pair is an OR, everything else is a hard AND.
+_PATH_PROOF_RE = re.compile(
+    r"\[METAL_PATH_PROOF\]\s+"
+    r"prefill_kv_batch=(\d+)\s+"
+    r"prefill_attn_batched=(\d+)\s+"
+    r"decode_kv_copy=(\d+)\s+"
+    r"decode_attn_direct=(\d+)\s+"
+    r"decode_attn_split_partial=(\d+)\s+"
+    r"decode_attn_split_reduce=(\d+)\s+"
+    r"kv_f16=(true|false)"
+)
+
+
+def parse_path_proof_marker(stderr_text: str) -> dict | None:
+    """Extract the last `[METAL_PATH_PROOF]` marker from chat_metal's stderr.
+
+    Returns None if the marker is absent or malformed — callers must treat that
+    as a gate FAILURE, not a skip, per the paravirtual-runner gotcha in issue #239.
+    """
+    match = None
+    for line in stderr_text.splitlines():
+        m = _PATH_PROOF_RE.search(line)
+        if m:
+            match = m  # keep the last one, in case of retries/logging noise
+    if match is None:
+        return None
+    return {
+        "prefill_kv_batch": int(match.group(1)),
+        "prefill_attn_batched": int(match.group(2)),
+        "decode_kv_copy": int(match.group(3)),
+        "decode_attn_direct": int(match.group(4)),
+        "decode_attn_split_partial": int(match.group(5)),
+        "decode_attn_split_reduce": int(match.group(6)),
+        "kv_f16": match.group(7) == "true",
+    }
+
+
+def path_proof_covers_required_path(counters: dict) -> bool:
+    """Fail-closed check: did the required Metal attention/KV dispatches run?"""
+    if counters["prefill_kv_batch"] <= 0:
+        return False
+    if counters["prefill_attn_batched"] <= 0:
+        return False
+    if counters["decode_kv_copy"] <= 0:
+        return False
+    direct_ok = counters["decode_attn_direct"] > 0
+    split_ok = (
+        counters["decode_attn_split_partial"] > 0
+        and counters["decode_attn_split_reduce"] > 0
+    )
+    return direct_ok or split_ok
+
+
+def run_lattice_metal(prompt: str, max_tokens: int) -> dict:
+    """Run `chat_metal --json` and parse its `@@lattice` event stream.
+
+    Fails closed (returns None) if the run errors, the event stream is
+    malformed, or the `[METAL_PATH_PROOF]` marker is missing or does not cover
+    the required attention/KV-cache dispatch path — this is the mechanism that
+    makes the gate red on a paravirtual CI runner that reports a Metal device
+    but silently no-ops the required kernels (issue #239), instead of a vacuous
+    green pass.
+    """
+    cmd = [
+        LATTICE_BIN,
+        "--model-dir", MODEL_DIR,
+        "--prompt", prompt,
+        "--max-tokens", str(max_tokens),
+        "--temperature", "0.0",
+        # chat_metal's serving default is repetition_penalty 1.1, but the HF
+        # reference applies none — the same greedy-decision mismatch documented
+        # on the CPU path above (run_lattice). Force 1.0 so both sides run the
+        # same greedy rule and any remaining divergence is genuinely the
+        # engine's (e.g. the long-prefill Metal divergence, which reproduces
+        # with this flag set and with either GDN prefill mode).
+        "--repetition-penalty", "1.0",
+        "--json",
+    ]
+
+    t0 = time.time()
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        print("[lattice-metal] FAILED (timeout)", file=sys.stderr)
+        return None
+    elapsed = time.time() - t0
+
+    if result.returncode != 0:
+        print(f"[lattice-metal] FAILED (exit {result.returncode})", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        return None
+
+    gen_ids: list[int] = []
+    text_parts: list[str] = []
+    tok_per_sec = 0.0
+    saw_done = False
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("@@lattice "):
+            continue
+        payload = line[len("@@lattice "):]
+        try:
+            ev = json.loads(payload)
+        except json.JSONDecodeError as e:
+            print(f"[lattice-metal] malformed @@lattice event: {e}", file=sys.stderr)
+            print(line, file=sys.stderr)
+            return None
+        if ev.get("ev") != "gen_token":
+            continue
+        if ev.get("done"):
+            saw_done = True
+            tok_per_sec = float(ev.get("tok_s", 0.0))
+            continue
+        token_id = ev.get("token_id")
+        if not isinstance(token_id, int):
+            print(
+                f"[lattice-metal] gen_token event missing integer token_id: {ev}",
+                file=sys.stderr,
+            )
+            return None
+        gen_ids.append(token_id)
+        text_parts.append(ev.get("token", ""))
+
+    if not saw_done:
+        print("[lattice-metal] no done:true event observed in output", file=sys.stderr)
+        return None
+
+    path_proof = parse_path_proof_marker(result.stderr)
+    if path_proof is None:
+        print(
+            "[lattice-metal] LATTICE_METAL_PATH_PROOF marker missing or malformed "
+            "— failing closed (never skip-as-green)",
+            file=sys.stderr,
+        )
+        print(result.stderr, file=sys.stderr)
+        return None
+    if not path_proof_covers_required_path(path_proof):
+        print(
+            f"[lattice-metal] path-proof counters do not cover the required Metal "
+            f"attention/KV-cache dispatch path: {path_proof}",
+            file=sys.stderr,
+        )
+        return None
+
+    print(f"[lattice-metal] path-proof OK: {path_proof}", file=sys.stderr)
+
+    return {
+        "generated_ids": gen_ids,
+        "text": "".join(text_parts),
         "elapsed_s": elapsed,
         "tok_per_sec": tok_per_sec,
     }
@@ -330,6 +533,28 @@ def render_report(results: list[dict]) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--backend",
+        choices=["cpu", "metal"],
+        default="cpu",
+        help=(
+            "cpu (default): qwen35_generate, legacy text parsing. "
+            "metal: chat_metal --json, fail-closed on the LATTICE_METAL_PATH_PROOF "
+            "capability marker (issue #239)."
+        ),
+    )
+    args = parser.parse_args()
+    backend = args.backend
+
+    global LATTICE_BIN
+    if not _LATTICE_BIN_EXPLICIT:
+        LATTICE_BIN = (
+            "target/release/chat_metal"
+            if backend == "metal"
+            else "target/release/qwen35_generate"
+        )
+
     if not os.path.isfile(LATTICE_BIN):
         print(f"error: lattice binary not found at {LATTICE_BIN}", file=sys.stderr)
         return 2
@@ -352,8 +577,12 @@ def main() -> int:
         print("[hf] running reference...", file=sys.stderr)
         hf_out = run_hf_reference(prompt, MAX_TOKENS)
 
-        print("[lattice] running under test...", file=sys.stderr)
-        lat_out = run_lattice(prompt, MAX_TOKENS)
+        print(f"[lattice-{backend}] running under test...", file=sys.stderr)
+        lat_out = (
+            run_lattice_metal(prompt, MAX_TOKENS)
+            if backend == "metal"
+            else run_lattice(prompt, MAX_TOKENS)
+        )
 
         if lat_out is None:
             print("FAIL: lattice binary failed", file=sys.stderr)

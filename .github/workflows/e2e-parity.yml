@@ -55,7 +55,10 @@ jobs:
           fi
           echo "Changed files:"
           echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$'; then
+          # here-string, not `echo | grep -q`: -q exits at first match, echo gets
+          # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
+          # would silently skip the gate on large diffs (fail-open).
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -68,7 +71,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.engine == 'true'
     runs-on: macos-latest
-    timeout-minutes: 15
+    # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
+    # variance exceeds the old ~17% headroom — two consecutive timeout
+    # cancellations mid-prompt-4 on 2026-07-01 (issue #532). Now that the
+    # gate fails closed, a timeout is a hard red, so the budget must cover
+    # the slow tail of the runner pool.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -128,8 +136,7 @@ jobs:
 
       # Step 5: run parity check (HF first = warm machine, then lattice)
       - name: Run e2e parity check
-        run: |
-          python3 scripts/e2e_parity_check.py | tee parity-report.md
+        run: python3 scripts/e2e_parity_check.py
         env:
           E2E_REPORT_PATH: parity-report.md
 
@@ -140,6 +147,104 @@ jobs:
         with:
           header: e2e-parity
           path: parity-report.md
+
+  # Non-required Metal attention/KV-cache parity leg (issue #239). e2e-parity
+  # only ever exercised the CPU (qwen35_generate) path above; this job exists
+  # to prove the Metal attention/KV dispatch helpers actually ran, not just
+  # that a Metal device was present.
+  #
+  # Gotcha (do not "fix" by adding an Apple7 family check): GitHub's
+  # macos-latest runner exposes a PARAVIRTUAL Metal device. Apple7-gated
+  # kernels silently no-op there, so a naive "did it run" check can go green
+  # without exercising anything. The audited attention/KV pipelines this job
+  # targets are NOT Apple7-gated (only the optional tiled-GEMM path is), so
+  # `runs-on: macos-latest` is expected to genuinely execute them — but the
+  # gate does not trust that assumption. scripts/e2e_parity_check.py
+  # --backend metal requires the runtime LATTICE_METAL_PATH_PROOF marker
+  # (dispatch-site counters emitted by chat_metal) and FAILS CLOSED — never
+  # skip-as-green — if the marker is missing or any required counter is zero.
+  # If a future CI run proves the hosted runner cannot execute the required
+  # kernels despite this, switch only `runs-on` to
+  # `[self-hosted, macOS, ARM64, metal]` and document why.
+  #
+  # Deliberately NOT added to parity-gate.needs below: this is an informational
+  # signal only. Making it required is a founder decision (repo branch
+  # protection), out of scope for this change.
+  metal-parity:
+    name: metal attention parity (informational)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: e2e-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      - name: Install Python deps
+        run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
+
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          path = snapshot_download('Qwen/Qwen3.5-0.8B')
+          print(f'Model at: {path}')
+          "
+
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-metal-parity
+
+      - name: Build lattice Metal binary
+        run: cargo build --release --bin chat_metal -p lattice-inference --features "f16,metal-gpu"
+
+      - name: Run Metal attention/KV parity check
+        run: python3 scripts/e2e_parity_check.py --backend metal
+        env:
+          LATTICE_BIN: target/release/chat_metal
+          LATTICE_METAL_PATH_PROOF: '1'
+          E2E_MAX_TOKENS: '4'
+          E2E_REPORT_PATH: metal-parity-report.md
+
+      - name: Ensure Metal report exists
+        if: always()
+        run: |
+          test -s metal-parity-report.md || {
+            printf '## Metal Attention/KV Parity Report\n\nNo report was produced. Check job logs.\n' > metal-parity-report.md
+          }
+
+      - name: Post Metal parity report
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: e2e-metal-parity
+          path: metal-parity-report.md
 
   # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
   # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
@@ -200,6 +305,105 @@ jobs:
           LATTICE_DRIFT_GATE_ENFORCE: '1'
         run: |
           cargo test --release -p lattice-embed --test embed_drift_baseline \
+            -- --nocapture
+
+  # Composed rotated(QuaRot)+Q4 forward-path gate (issue #320). The converter's
+  # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
+  # the rotation-fusion math PRE-quantization; nothing previously exercised the
+  # runtime consumer of a QuaRot+Q4 artifact — MetalQwen35State::from_q4_dir
+  # followed by greedy decode. This job regenerates an EPHEMERAL QuaRot+Q4
+  # artifact from the real Qwen3.5-0.8B weights, then asserts exact first-8
+  # greedy token IDs per prompt against the committed frozen lattice-self golden
+  # (crates/inference/tests/fixtures/quarot_q4_composed_v1/).
+  #
+  # Tolerance is exact token-ID agreement, NOT a logit tolerance: the golden is
+  # generated FROM the Q4 artifact, so quantization error is already baked in and
+  # a 1e-5-style float tolerance would be meaningless. LATTICE_Q4_COMPOSED_GATE_ENFORCE=1
+  # makes the test fail-closed (panic, not skip) if the model/Q4 dir is missing
+  # or the build lacks macOS+metal-gpu — so a provisioning failure cannot
+  # masquerade as a green gate. This is the same fail-closed shape as embed-drift.
+  #
+  # The committed JSON golden is NEVER regenerated by CI (the regen script refuses
+  # to overwrite without --update-golden). Updating it is a reviewable source
+  # change that must carry rationale + mutation evidence.
+  #
+  # NOTE: once this job has gone green on CI once, add "q4-composed" to the
+  # repository's required status checks alongside embed-drift. That founder
+  # governance step is intentionally not automated here.
+  q4-composed:
+    name: q4 composed golden
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: q4-composed-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      # Only huggingface_hub is needed — lattice does the inference, so torch /
+      # transformers (the reference framework) are not required for this gate.
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          "
+
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: q4-composed
+
+      - name: Build QuaRot converter
+        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+
+      # Regenerate the ephemeral QuaRot+Q4 artifact (NOT committed). The frozen
+      # golden the test asserts against WAS produced from this exact conversion
+      # (same seed), so a green run proves the runtime composed path still matches.
+      - name: Generate ephemeral QuaRot Q4 artifact
+        run: |
+          target/release/quantize_quarot \
+            --model-dir ~/.lattice/models/qwen3.5-0.8b \
+            --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4" \
+            --seed 0xCAFE_BABE_DEAD_BEEF \
+            --num-probe-tokens 4
+
+      - name: Run QuaRot Q4 composed golden gate
+        env:
+          LATTICE_Q4_COMPOSED_GATE_ENFORCE: '1'
+          LATTICE_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_QUAROT_Q4_DIR: ${{ runner.temp }}/qwen3.5-0.8b-quarot-q4
+        run: |
+          cargo test --release -p lattice-inference \
+            --test quarot_q4_composed_golden \
+            --features "f16,metal-gpu" \
             -- --nocapture
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine

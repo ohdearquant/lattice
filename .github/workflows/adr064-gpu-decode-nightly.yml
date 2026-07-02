@@ -1,0 +1,68 @@
+name: ADR-064 GPU decode perf nightly (informational)
+#
+# DORMANT — this workflow is committed but INERT until a founder provisions a
+# self-hosted runner labeled [self-hosted, m2max]. No such runner exists as of
+# this commit. GitHub Actions never schedules a job onto a label set with zero
+# registered runners, so `schedule` events for this workflow will simply not
+# start any job; this is expected and intentional, not a bug.
+#
+# Once the runner exists this workflow measures decode tok/s + slope/intercept
+# on Metal (see scripts/bench_decode_slopefit.sh) and applies the ADR-064
+# gate table (scripts/adr064-gpu-decode-gate.py) against the latest
+# `m2max-metal/adr064-gpu-decode` snapshot on the perf-baselines branch.
+#
+# Intentionally NOT a pull_request trigger: public-repo fork PRs must never be
+# able to execute code on a self-hosted runner (arbitrary-code-on-our-hardware
+# risk). Intentionally NOT in any branch-protection required-status set: this
+# gate is proposed-only per docs/adr/ADR-067-gpu-decode-perf-regression-gates.md
+# and must not become merge-blocking without explicit founder sign-off.
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-decode-nightly:
+    name: gpu decode gate (m2max, informational)
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, m2max]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch perf-baselines snapshot (sparse)
+        run: |
+          git fetch --depth 1 origin perf-baselines
+          git worktree add ../perf-baselines origin/perf-baselines
+
+      - name: Run decode slope/intercept harness
+        env:
+          LATTICE_MODEL_DIR: ${{ vars.LATTICE_MODEL_DIR || '~/.lattice/models/qwen3.5-0.8b' }}
+          SLOPEFIT_FULL: '1'
+        run: |
+          mkdir -p artifacts
+          ./scripts/bench_decode_slopefit.sh --out artifacts/adr064-gpu-decode-current.json
+
+      - name: Evaluate ADR-064 gate table
+        run: |
+          python3 scripts/adr064-gpu-decode-gate.py \
+            --current artifacts/adr064-gpu-decode-current.json \
+            --baseline ../perf-baselines/m2max-metal/adr064-gpu-decode/latest.json \
+            --out artifacts/adr064-gate-report.md
+        continue-on-error: true # informational only — never blocks; see header
+
+      - name: Upload current JSON + gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adr064-gpu-decode-nightly-${{ github.run_id }}
+          path: |
+            artifacts/adr064-gpu-decode-current.json
+            artifacts/adr064-gate-report.md
+          retention-days: 90

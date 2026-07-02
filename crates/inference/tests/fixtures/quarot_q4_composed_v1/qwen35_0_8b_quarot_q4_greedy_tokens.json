@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "model_dir_default": "~/.lattice/models/qwen3.5-0.8b",
+  "artifact_kind": "lattice-self-quarot-q4-greedy-token-golden",
+  "quarot_seed": "0xCAFE_BABE_DEAD_BEEF",
+  "converter": "target/release/quantize_quarot",
+  "max_new_tokens": 8,
+  "generation": {
+    "enable_mtp": false,
+    "enable_thinking": false,
+    "repetition_penalty": 1.0,
+    "stop_token_ids": [],
+    "temperature": 0.0,
+    "top_k": 1,
+    "top_p": 1.0
+  },
+  "cases": [
+    {
+      "expected_generated_ids": [
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369
+      ],
+      "name": "short_factual",
+      "prompt": "The capital of France is"
+    },
+    {
+      "expected_generated_ids": [
+        198,
+        262,
+        413,
+        307,
+        2564,
+        220,
+        15,
+        25
+      ],
+      "name": "code",
+      "prompt": "Write a Python function that returns the nth Fibonacci number:\n\ndef fibonacci(n):"
+    },
+    {
+      "expected_generated_ids": [
+        220,
+        18,
+        15,
+        32836,
+        198,
+        15666,
+        25,
+        220
+      ],
+      "name": "structured_reasoning",
+      "prompt": "Question: A train travels 60 miles in 2 hours. What is its average speed?\nAnswer:"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 //! Qwen3.5 text generation demo.
 //!
-//! Usage: cargo run --release --bin qwen35_generate -- [--model-dir PATH] [--prompt "Hello"] [--max-tokens 64] [--seed 42]
+//! Usage: cargo run --release --bin qwen35_generate -- [--model-dir PATH] [--prompt "Hello"] [--max-tokens 64] [--seed 42] [--repetition-penalty 1.0]
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -60,6 +60,16 @@ fn main() {
     };
     if let Some(t) = temperature {
         gen_cfg.temperature = t;
+    }
+    // GenerateConfig::default() carries a production-serving repetition_penalty
+    // of 1.1 (matches chat_metal.rs's own default). A caller doing a strict
+    // greedy comparison against a reference implementation that applies no
+    // repetition penalty (e.g. HF `model.generate(do_sample=False)`) needs to
+    // override this explicitly, or "greedy" silently means two different
+    // sampling distributions. See scripts/e2e_parity_check.py, which passes
+    // --repetition-penalty 1.0 for exactly this reason.
+    if let Some(rp) = parse_arg(&args, "--repetition-penalty").and_then(|s| s.parse().ok()) {
+        gen_cfg.repetition_penalty = rp;
     }
 
     println!("Prompt: {prompt}");
