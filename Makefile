@@ -77,10 +77,12 @@ bench-decode-slopefit:
 	./scripts/bench_decode_slopefit.sh
 
 # A/B benchmark across git refs. Uses worktree for base, leaves working tree untouched.
-# Usage: make bench-compare                     (origin/main vs HEAD)
-#        make bench-compare BASE=main HEAD=pr/x (explicit refs)
+# Usage: make bench-compare                                           (origin/main vs HEAD)
+#        make bench-compare BASE=main HEAD=pr/x                       (explicit refs)
+#        make bench-compare BENCH_GROUPS_INFERENCE='rms_norm|gelu'    (Criterion filter)
+#        make bench-compare BENCH_GROUPS_EMBED='simd_dot_product'     (Criterion filter)
 bench-compare:
-	./scripts/bench-compare.sh $(or $(BASE),origin/main) $(or $(HEAD),HEAD)
+	BENCH_GROUPS_INFERENCE="$(value BENCH_GROUPS_INFERENCE)" BENCH_GROUPS_EMBED="$(value BENCH_GROUPS_EMBED)" ./scripts/bench-compare.sh $(or $(BASE),origin/main) $(or $(HEAD),HEAD)
 
 # Agentic-workload benchmark: lattice vs ollama vs MLX at 1000/2000/4000-token context.
 # Prereqs: bench_decode_ab binary built, ollama serve running, mlx_lm available.
