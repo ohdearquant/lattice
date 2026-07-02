@@ -14154,20 +14154,26 @@ kernel void gdn_chunk_norm_silu_c32(
                 reasoning_end_len = Some(generated_ids.len());
             }
             let mut last_pushed_id = next_id;
+            // `text` is the caller-owned full output — the detokenizer itself only
+            // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
+            let mut text = String::new();
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() && !on_token(&delta, next_id) {
-                if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+            if !delta.is_empty() {
+                text.push_str(&delta);
+                if !on_token(&delta, next_id) {
+                    if use_compact {
+                        self.session.compact_topk = 0;
+                        self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    }
+                    return GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false, // caller interrupted the stream, not a stop condition
+                        stop_reason: Some(StopReason::Interrupt),
+                    };
                 }
-                return GenerateOutput {
-                    text: detok.text(),
-                    token_ids: generated_ids.clone(),
-                    prompt_tokens: prompt_len,
-                    generated_tokens: generated_ids.len(),
-                    stopped: false, // caller interrupted the stream, not a stop condition
-                    stop_reason: Some(StopReason::Interrupt),
-                };
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -14246,10 +14252,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() && !on_token(&delta, next_id) {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
+                if !delta.is_empty() {
+                    text.push_str(&delta);
+                    if !on_token(&delta, next_id) {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
@@ -14280,10 +14289,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     // above. A late cancel here (return value intentionally unused)
                     // does not change why generation stopped, so treating it as
                     // Interrupt would misattribute the stop cause to this flush.
+                    text.push_str(&tail);
                     on_token(&tail, last_pushed_id);
                 }
             }
-            let text = detok.text();
             GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
@@ -16191,29 +16200,35 @@ kernel void gdn_chunk_norm_silu_c32(
                 reasoning_end_len = Some(generated_ids.len());
             }
             let mut last_pushed_id = next_id;
+            // `text` is the caller-owned full output — the detokenizer itself only
+            // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
+            let mut text = String::new();
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() && !on_token(&delta, next_id) {
-                if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+            if !delta.is_empty() {
+                text.push_str(&delta);
+                if !on_token(&delta, next_id) {
+                    if use_compact {
+                        self.session.compact_topk = 0;
+                        self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    }
+                    // The caller cut the stream after exactly one forwarded
+                    // token (the prefill sample) — state represents prompt +
+                    // that one token already (forward happens on the *next*
+                    // iteration in the loop below, which never runs here).
+                    // Nothing further was forwarded, so do not save a cache
+                    // entry claiming more than live state represents.
+                    return Ok(CachedGenerateOutput {
+                        output: GenerateOutput {
+                            text,
+                            token_ids: generated_ids.clone(),
+                            prompt_tokens: prompt_len,
+                            generated_tokens: generated_ids.len(),
+                            stopped: false,
+                            stop_reason: Some(StopReason::Interrupt),
+                        },
+                        cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                    });
                 }
-                // The caller cut the stream after exactly one forwarded
-                // token (the prefill sample) — state represents prompt +
-                // that one token already (forward happens on the *next*
-                // iteration in the loop below, which never runs here).
-                // Nothing further was forwarded, so do not save a cache
-                // entry claiming more than live state represents.
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: detok.text(),
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false,
-                        stop_reason: Some(StopReason::Interrupt),
-                    },
-                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -16279,10 +16294,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() && !on_token(&delta, next_id) {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
+                if !delta.is_empty() {
+                    text.push_str(&delta);
+                    if !on_token(&delta, next_id) {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
@@ -16327,10 +16345,10 @@ kernel void gdn_chunk_norm_silu_c32(
             if !stopped_by_caller {
                 let tail = detok.finish();
                 if !tail.is_empty() {
+                    text.push_str(&tail);
                     on_token(&tail, last_pushed_id);
                 }
             }
-            let text = detok.text();
             Ok(CachedGenerateOutput {
                 output: GenerateOutput {
                     text,
@@ -20532,6 +20550,68 @@ kernel void decode_attention_reference(
                 out.generated_tokens, 0,
                 "max_new_tokens == 0 must produce no tokens, got {}",
                 out.generated_tokens
+            );
+        }
+
+        /// Regression (review finding on the streaming-retention PR): the non-prefix
+        /// `generate_streaming` decode loop must append every non-empty delta to the
+        /// returned `GenerateOutput.text`, not just hand it to `on_token`. A prior
+        /// version of the loop body called `on_token(&delta, next_id)` without first
+        /// doing `text.push_str(&delta)`, so `out.text` silently dropped every decode
+        /// token's contribution (only the prefill token and the final incomplete-UTF-8
+        /// tail were ever appended). `single_char_vocab_tokenizer` guarantees every
+        /// token decodes to exactly one non-empty-delta character (no UTF-8 boundary
+        /// holdback), so this test exercises the loop body on every one of its
+        /// iterations rather than being satisfied by the prefill token alone.
+        #[test]
+        fn streaming_text_accumulates_every_loop_delta_not_only_prefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 5,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Push eos_token_id out of the model's reachable output range so greedy
+            // sampling cannot end the stream after the prefill token — this test
+            // needs several decode-loop iterations (not just the prefill push) to
+            // exercise the bug.
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut accumulated = String::new();
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                accumulated.push_str(delta);
+                true
+            });
+
+            assert!(
+                out.generated_tokens >= 3,
+                "test needs at least 3 generated tokens to exercise the decode loop, got {}",
+                out.generated_tokens
+            );
+            assert_eq!(
+                out.text, accumulated,
+                "GenerateOutput.text must equal the concatenation of every on_token \
+                 delta (plus the finish() tail, already included in `accumulated` via \
+                 the callback) — a mismatch means the non-prefix decode loop dropped \
+                 deltas instead of appending them to the caller-owned `text` accumulator"
             );
         }
 
