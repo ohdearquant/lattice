@@ -104,6 +104,253 @@ fn test_registry_delete() {
     assert!(registry.is_empty());
 }
 
+// ------------------------------------------------------------------
+// load_weights / load_weights_verified integrity (#504 remaining slice 3:
+// close the registry raw-load bypass — `load_weights` no longer silently
+// skips the checksum check when a hash is on record).
+// ------------------------------------------------------------------
+
+#[test]
+fn test_load_weights_verifies_when_hash_present() {
+    let registry = ModelRegistry::in_memory();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5];
+
+    let id = registry.register(model, &weights).unwrap();
+    let registered = registry.get_by_id(&id).unwrap();
+    assert!(
+        registered.weights_hash.is_some(),
+        "register() must always record a weights_hash"
+    );
+
+    // Untampered load succeeds via both entry points.
+    assert_eq!(registry.load_weights(&registered).unwrap(), weights);
+    assert_eq!(
+        registry.load_weights_verified(&registered).unwrap(),
+        weights
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_tampered_bytes_on_disk() {
+    // #504 remaining slice 3: previously `load_weights` was a pure raw
+    // read with zero checksum check — a byte flipped on disk (or a
+    // truncated file, or a full swap) would load silently. It must now
+    // be rejected via the SAME entry point a naive caller reaches for,
+    // not only via `load_weights_verified`.
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+
+    let id = registry.register(model, &weights).unwrap();
+    let registered = registry.get_by_id(&id).unwrap();
+
+    // Tamper with the on-disk weights file directly (flip one byte,
+    // same length — the size-only-adjacent failure mode).
+    let weights_path = tmp.path().join("test/1.0.0/weights.bin");
+    let mut tampered = weights.clone();
+    tampered[3] ^= 0xFF;
+    std::fs::write(&weights_path, &tampered).unwrap();
+
+    let err = registry
+        .load_weights(&registered)
+        .expect_err("load_weights must reject tampered bytes, not silently load them");
+    assert!(
+        matches!(err, TuneError::WeightIntegrityError { .. }),
+        "expected WeightIntegrityError, got: {err:?}"
+    );
+
+    // load_weights_verified must reject the same tampered artifact too.
+    let err = registry
+        .load_weights_verified(&registered)
+        .expect_err("load_weights_verified must reject tampered bytes");
+    assert!(
+        matches!(err, TuneError::WeightIntegrityError { .. }),
+        "expected WeightIntegrityError, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_mutated_clone_hash() {
+    // `RegisteredModel` is a cloned DTO with public `weights_path`/
+    // `weights_hash` fields. If verification trusted the CALLER's value, a
+    // caller could tamper weights.bin on disk, set its clone's hash to
+    // sha256(tampered bytes), and have both entry points "verify" the
+    // tampered artifact. Verification must anchor to the canonical
+    // registry record and reject a disagreeing argument outright.
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+
+    let id = registry.register(model, &weights).unwrap();
+
+    // Tamper the on-disk artifact, then forge the clone's hash to match
+    // the tampered bytes.
+    let weights_path = tmp.path().join("test/1.0.0/weights.bin");
+    let mut tampered = weights.clone();
+    tampered[0] ^= 0xFF;
+    std::fs::write(&weights_path, &tampered).unwrap();
+
+    let mut forged = registry.get_by_id(&id).unwrap();
+    forged.weights_hash = Some(sha256_hash(&tampered));
+
+    let err = registry
+        .load_weights(&forged)
+        .expect_err("load_weights must not verify against a caller-forged hash");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&forged)
+        .expect_err("load_weights_verified must not verify against a caller-forged hash");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+
+    // Blanking the clone's hash must not re-open the pre-#504 raw-load
+    // path either — the canonical record still carries a hash.
+    let mut hashless = registry.get_by_id(&id).unwrap();
+    hashless.weights_hash = None;
+    let err = registry
+        .load_weights(&hashless)
+        .expect_err("load_weights must not raw-load because a CLONE's hash was blanked");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&hashless)
+        .expect_err("load_weights_verified must not raw-load a hash-blanked clone");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+
+    // The honest canonical record still rejects the tampered disk bytes
+    // via the checksum itself.
+    let canonical = registry.get_by_id(&id).unwrap();
+    let err = registry
+        .load_weights(&canonical)
+        .expect_err("canonical record must reject tampered disk bytes");
+    assert!(
+        matches!(err, TuneError::WeightIntegrityError { .. }),
+        "expected WeightIntegrityError, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_mutated_clone_path() {
+    // Path half of the canonical-record disagreement guard. The redirected
+    // file holds byte-identical content and the clone's hash is left
+    // canonical, so if the `weights_path` predicate were removed the load
+    // would wrongly SUCCEED (canonical path + canonical hash still line
+    // up) — the hash comparison cannot mask this test.
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let id = registry.register(model, &weights).unwrap();
+
+    let canonical_file = tmp.path().join("test/1.0.0/weights.bin");
+    let alt_rel = "test/1.0.0/weights_alt.bin";
+    std::fs::copy(&canonical_file, tmp.path().join(alt_rel)).unwrap();
+
+    let mut redirected = registry.get_by_id(&id).unwrap();
+    redirected.weights_path = Some(alt_rel.to_string());
+
+    let err = registry
+        .load_weights(&redirected)
+        .expect_err("load_weights must reject a clone with a redirected weights_path");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&redirected)
+        .expect_err("load_weights_verified must reject a clone with a redirected weights_path");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_unregistered_model() {
+    // A RegisteredModel value that was never registered (or was deleted)
+    // has no canonical record to verify against — it must not load at all.
+    let registry = ModelRegistry::in_memory();
+    let mut ghost = RegisteredModel::new("ghost", "1.0.0");
+    ghost.weights_path = Some("ghost/1.0.0/weights.bin".to_string());
+
+    let err = registry
+        .load_weights(&ghost)
+        .expect_err("load_weights must reject a model with no registry record");
+    assert!(
+        matches!(err, TuneError::ModelNotFound { .. }),
+        "expected ModelNotFound, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&ghost)
+        .expect_err("load_weights_verified must reject a model with no registry record");
+    assert!(
+        matches!(err, TuneError::ModelNotFound { .. }),
+        "expected ModelNotFound, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_rejects_truncated_file_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![9u8; 64];
+
+    let id = registry.register(model, &weights).unwrap();
+    let registered = registry.get_by_id(&id).unwrap();
+
+    let weights_path = tmp.path().join("test/1.0.0/weights.bin");
+    std::fs::write(&weights_path, &weights[..32]).unwrap();
+
+    let err = registry
+        .load_weights(&registered)
+        .expect_err("load_weights must reject a truncated weights file");
+    assert!(
+        matches!(err, TuneError::WeightIntegrityError { .. }),
+        "expected WeightIntegrityError, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_load_weights_verified_rejects_missing_hash() {
+    // A model with weights on disk but no recorded hash at all (e.g.
+    // registered via `register_metadata` and given a weights_path
+    // out-of-band, or a legacy pre-hash record) has nothing to verify
+    // against. `load_weights` still loads it (there is no check to
+    // perform), but `load_weights_verified` — the entry point that
+    // promises verification — must refuse rather than silently return
+    // an unverified load.
+    let registry = ModelRegistry::in_memory();
+    let mut model = RegisteredModel::new("test", "1.0.0");
+    model.weights_path = Some("test/1.0.0/weights.bin".to_string());
+    model.weights_hash = None;
+    registry.register_metadata(model).unwrap();
+
+    let registered = registry.get("test", "1.0.0").unwrap();
+    assert!(registered.weights_hash.is_none());
+
+    let err = registry
+        .load_weights_verified(&registered)
+        .expect_err("load_weights_verified must refuse a model with no recorded hash");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected TuneError::Storage, got: {err:?}"
+    );
+}
+
 #[test]
 fn test_model_query() {
     let registry = ModelRegistry::in_memory();

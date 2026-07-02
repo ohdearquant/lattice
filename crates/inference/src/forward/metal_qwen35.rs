@@ -3516,103 +3516,6 @@ kernel void gdn_chunk_norm_silu_c32(
         Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
     }
 
-    /// Merge two Q4 files into a single concatenated Q4 file and write it to `out_path`.
-    ///
-    /// Reads only the raw bytes (no deserialization) and prepends a new KHQ4 header
-    /// reflecting the merged shape.  Uses a temp-file + atomic rename so a crashed
-    /// mid-write never leaves a partial file at the final path.
-    ///
-    /// Returns `Err` if the model directory is read-only or I/O fails — callers
-    /// must fall back to the CPU concat path in that case.
-    #[cfg(feature = "metal-gpu")]
-    fn write_merged_qkvz(
-        qkv_path: &std::path::Path,
-        z_path: &std::path::Path,
-        out_path: &std::path::Path,
-    ) -> Result<(), String> {
-        use crate::weights::q4_weights::read_q4_header;
-        use std::io::{Read, Seek, SeekFrom, Write};
-
-        // Open and parse headers — then seek back to payload start for a direct byte copy.
-        let qkv_file = std::fs::File::open(qkv_path)
-            .map_err(|e| format!("open {}: {e}", qkv_path.display()))?;
-        let qkv_hdr =
-            read_q4_header(&qkv_file).map_err(|e| format!("header {}: {e}", qkv_path.display()))?;
-        let mut qkv_rdr = qkv_file;
-        qkv_rdr
-            .seek(SeekFrom::Start(qkv_hdr.payload_offset))
-            .map_err(|e| format!("seek {}: {e}", qkv_path.display()))?;
-        let qkv_payload_len = std::fs::metadata(qkv_path)
-            .map_err(|e| format!("metadata {}: {e}", qkv_path.display()))?
-            .len()
-            - qkv_hdr.payload_offset;
-        let mut qkv_payload = Vec::with_capacity(qkv_payload_len as usize);
-        qkv_rdr
-            .read_to_end(&mut qkv_payload)
-            .map_err(|e| format!("read {}: {e}", qkv_path.display()))?;
-
-        let z_file =
-            std::fs::File::open(z_path).map_err(|e| format!("open {}: {e}", z_path.display()))?;
-        let z_hdr =
-            read_q4_header(&z_file).map_err(|e| format!("header {}: {e}", z_path.display()))?;
-        let mut z_rdr = z_file;
-        z_rdr
-            .seek(SeekFrom::Start(z_hdr.payload_offset))
-            .map_err(|e| format!("seek {}: {e}", z_path.display()))?;
-        let z_payload_len = std::fs::metadata(z_path)
-            .map_err(|e| format!("metadata {}: {e}", z_path.display()))?
-            .len()
-            - z_hdr.payload_offset;
-        let mut z_payload = Vec::with_capacity(z_payload_len as usize);
-        z_rdr
-            .read_to_end(&mut z_payload)
-            .map_err(|e| format!("read {}: {e}", z_path.display()))?;
-
-        // Merged shape: rows = qkv_rows + z_rows, cols = hidden (shared)
-        let merged_rows = qkv_hdr.shape[0] + z_hdr.shape[0];
-        let cols = if qkv_hdr.shape.len() >= 2 {
-            qkv_hdr.shape[1]
-        } else {
-            1
-        };
-        let original_len = qkv_hdr.original_len + z_hdr.original_len;
-
-        // Write to a temp file then rename atomically so partial writes are never trusted.
-        let tmp = out_path.with_extension("q4.tmp");
-        let write_result = (|| -> Result<(), String> {
-            let mut f = std::io::BufWriter::new(
-                std::fs::File::create(&tmp)
-                    .map_err(|e| format!("create {}: {e}", tmp.display()))?,
-            );
-            // KHQ4 header: magic(4) + version(4) + ndim=2(4) + shape[0](8) + shape[1](8) + original_len(8)
-            f.write_all(b"KHQ4").map_err(|e| e.to_string())?;
-            // Version 2: asymmetric Q4 blocks (20 bytes each: scale + bias + 16 nibbles).
-            f.write_all(&2u32.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&2u32.to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&(merged_rows as u64).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&(cols as u64).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&(original_len as u64).to_le_bytes())
-                .map_err(|e| e.to_string())?;
-            f.write_all(&qkv_payload).map_err(|e| e.to_string())?;
-            f.write_all(&z_payload).map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return write_result;
-        }
-
-        std::fs::rename(&tmp, out_path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("rename: {e}")
-        })
-    }
-
     /// Weights for a GatedDeltaNet (linear attention) layer on GPU.
     pub(crate) struct MetalGdnLayerWeights {
         in_proj_qkv: Q4WeightBuf,  // [qkv_dim, hidden] — Q4/Q8
@@ -14515,19 +14418,6 @@ kernel void gdn_chunk_norm_silu_c32(
             }
         }
 
-        /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
-        ///
-        /// Returns `None` when the file is absent, malformed, or lacks a `quarot_seed`
-        /// key — all three are valid "no rotation" states for backwards compatibility
-        /// with older artifacts. The caller falls back to the legacy `config.json`
-        /// field on `None`.
-        fn read_quarot_seed_from_index(q4_dir: &std::path::Path) -> Option<u64> {
-            let path = q4_dir.join("quantize_index.json");
-            let bytes = std::fs::read(&path).ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            v.get("quarot_seed").and_then(serde_json::Value::as_u64)
-        }
-
         /// Create a new [`MetalQwen35State`] by loading pre-quantized Q4/F16 files directly
         /// from a directory, without going through the full f32 weight representation.
         ///
@@ -14866,14 +14756,23 @@ kernel void gdn_chunk_norm_silu_c32(
                             // Expected size: 36-byte header (ndim=2, payload_offset=36)
                             // + qkv payload + z payload.  All source weight files are 2D
                             // so payload_offset=36 for each.
-                            let expected_size = 36u64 + (qkv_size - 36) + (z_size - 36);
-                            let is_valid = std::fs::metadata(&merged_path)
-                                .ok()
-                                .map(|m| m.len() == expected_size)
-                                .unwrap_or(false);
+                            let expected_size =
+                                crate::weights::q4_weights::merged_qkvz_expected_size(qkv_size, z_size)
+                                    .map_err(|e| format!("layer {i} merge size: {e}"))?;
+                            // Content-integrity check (#504 remaining slice 1): size alone
+                            // cannot catch a same-size stale/corrupted merged artifact, so
+                            // this also verifies the merged file's payload hash against a
+                            // hash freshly derived from the *current* qkv/z source files —
+                            // fail closed to a rebuild on any mismatch or read error.
+                            let is_valid = crate::weights::q4_weights::merged_qkvz_cache_is_valid(
+                                &merged_path,
+                                expected_size,
+                                &qkv_p,
+                                &z_p,
+                            );
                             if !is_valid {
                                 let _ = std::fs::remove_file(&merged_path);
-                                if let Err(e) = write_merged_qkvz(&qkv_p, &z_p, &merged_path) {
+                                if let Err(e) = crate::weights::q4_weights::write_merged_qkvz(&qkv_p, &z_p, &merged_path) {
                                     eprintln!("[load] merge-on-first-load failed layer {i}: {e}; using CPU fallback");
                                     return Ok((i, None));
                                 }
@@ -15312,8 +15211,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 // ADR-051 contract: `quarot_seed` lives in `quantize_index.json`. Fall back
                 // to the legacy `config.json` field (`quarot_rotation_seed`) for
                 // backwards compatibility with artifacts produced before the contract was
-                // formalized.
-                let index_seed = Self::read_quarot_seed_from_index(q4_dir);
+                // formalized. #504 remaining slice 2: a *present but malformed* index is a
+                // hard error (fail-closed) — only a genuinely absent index falls back.
+                let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
+                    .map_err(|e| format!("from_q4_dir: {e}"))?;
                 let seed_opt = index_seed.or(cfg.quarot_rotation_seed);
                 match seed_opt {
                     Some(seed) => Some(
@@ -18163,49 +18064,12 @@ kernel void decode_attention_reference(
         // -------------------------------------------------------------------
         // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
         // -------------------------------------------------------------------
-
-        #[test]
-        fn read_quarot_seed_from_index_finds_seed() {
-            // ADR-051 contract: `quantize_index.json` carries `quarot_seed`. The runtime
-            // loader's helper must extract it when present, return None when absent or the
-            // file is missing/malformed, and ignore everything else in the index.
-            let tmp = tempfile::tempdir().unwrap();
-
-            // Absent file → None.
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "missing quantize_index.json must yield None"
-            );
-
-            // File without `quarot_seed` → None.
-            std::fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "index without quarot_seed key must yield None"
-            );
-
-            // File with `quarot_seed` → Some(seed).
-            std::fs::write(
-                tmp.path().join("quantize_index.json"),
-                r#"{"quarot_seed":13258600446175248384,"tensors":[]}"#,
-            )
-            .unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                Some(13_258_600_446_175_248_384_u64),
-                "index with quarot_seed key must round-trip the u64 exactly"
-            );
-
-            // Malformed JSON → None (silent fallback, never panics).
-            std::fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "malformed index must yield None (never panic)"
-            );
-        }
+        //
+        // `read_quarot_seed_from_index` itself (the `quantize_index.json`
+        // reader) moved to `crate::quant::quarot::convert` (#504 remaining
+        // slice 2) — it is pure file-I/O with no Metal dependency, so its
+        // tests live there where they run under default (CPU-only) features
+        // instead of requiring `metal-gpu`.
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
