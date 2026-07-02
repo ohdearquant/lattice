@@ -1647,17 +1647,41 @@ fn max_embedding_cache_file_len(dimensions: usize) -> u64 {
 }
 
 /// Read an embedding cache file from disk, rejecting anything larger than
-/// `max_embedding_cache_file_len` before allocating for its contents.
+/// `max_embedding_cache_file_len`. The stat is only a fast-path; the read is
+/// itself bounded so a file that grows or is swapped between the stat and the
+/// read cannot drive an allocation past the cap.
 fn read_embedding_cache_file(path: &Path, dimensions: usize) -> std::io::Result<Vec<u8>> {
+    read_embedding_cache_file_bounded(path, max_embedding_cache_file_len(dimensions))
+}
+
+/// Read a file, enforcing `max_len` as a hard cap. The stat is only a
+/// fast-path; the read itself is bounded via `take(max_len + 1)` so a file
+/// that grows or is swapped between the stat and the read cannot drive an
+/// allocation past the cap.
+fn read_embedding_cache_file_bounded(path: &Path, max_len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    // Fast-path: stat before open. A known-oversized file is refused without
+    // allocating for its contents (defence-in-depth — the read below is also
+    // bounded, so this stat is an optimisation, not the enforcing check).
     let metadata = std::fs::metadata(path)?;
-    let max_len = max_embedding_cache_file_len(dimensions);
     if metadata.len() > max_len {
         return Err(std::io::Error::other(format!(
             "embedding cache file too large: {} bytes exceeds cap of {max_len} bytes",
             metadata.len()
         )));
     }
-    std::fs::read(path)
+    // Bounded read: take max_len + 1 bytes so a file that grew after the stat
+    // is still caught. If buf.len() exceeds max_len at read time, reject even
+    // though the stat passed.
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(max_len + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_len {
+        return Err(std::io::Error::other(format!(
+            "embedding cache file too large: read exceeds cap of {max_len} bytes"
+        )));
+    }
+    Ok(buf)
 }
 
 /// Encode the embedding cache into the raw payload record stream:
@@ -1730,11 +1754,11 @@ fn parse_embedding_cache_file(
             "embedding cache manifest header truncated".to_string(),
         ));
     }
-    let manifest_len = u32::from_le_bytes(
-        data[8..12]
-            .try_into()
-            .expect("invariant: slice of length 4 converts to [u8; 4]"),
-    );
+    // Bounds already ensured `data.len() >= 12`; copy the fixed-width field
+    // without `try_into().expect()` (AGENTS.md bars `expect` in library code).
+    let mut manifest_len_bytes = [0u8; 4];
+    manifest_len_bytes.copy_from_slice(&data[8..12]);
+    let manifest_len = u32::from_le_bytes(manifest_len_bytes);
     if manifest_len > EMBEDDING_CACHE_MANIFEST_CAP {
         return Err(InferenceError::Inference(format!(
             "embedding cache manifest length {manifest_len} exceeds cap of {EMBEDDING_CACHE_MANIFEST_CAP} bytes"
@@ -1807,16 +1831,14 @@ fn parse_embedding_cache_file(
                 "embedding cache truncated record".to_string(),
             ));
         }
-        let hash = u64::from_le_bytes(
-            payload[pos..pos + 8]
-                .try_into()
-                .expect("invariant: cache record has an 8-byte hash"),
-        );
-        let dim = u32::from_le_bytes(
-            payload[pos + 8..pos + 12]
-                .try_into()
-                .expect("invariant: cache record has a 4-byte dimension"),
-        ) as usize;
+        // The `pos + 12 > payload.len()` guard above ensures these fixed-width
+        // slices exist; copy them without `try_into().expect()`.
+        let mut hash_bytes = [0u8; 8];
+        hash_bytes.copy_from_slice(&payload[pos..pos + 8]);
+        let hash = u64::from_le_bytes(hash_bytes);
+        let mut dim_bytes = [0u8; 4];
+        dim_bytes.copy_from_slice(&payload[pos + 8..pos + 12]);
+        let dim = u32::from_le_bytes(dim_bytes) as usize;
         pos += 12;
         if dim != dimensions {
             return Err(InferenceError::Inference(format!(
@@ -1840,11 +1862,10 @@ fn parse_embedding_cache_file(
         }
         let mut floats = Vec::with_capacity(dim);
         for (float_index, chunk) in payload[pos..end].chunks_exact(4).enumerate() {
-            let f = f32::from_le_bytes(
-                chunk
-                    .try_into()
-                    .expect("invariant: chunks_exact(4) yields four-byte chunks"),
-            );
+            // `chunks_exact(4)` yields four-byte chunks; copy without `expect`.
+            let mut float_bytes = [0u8; 4];
+            float_bytes.copy_from_slice(chunk);
+            let f = f32::from_le_bytes(float_bytes);
             if !f.is_finite() {
                 return Err(InferenceError::Inference(format!(
                     "embedding cache non-finite float at record {record_index}, index {float_index}"
@@ -2461,6 +2482,32 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let data = read_embedding_cache_file(&path, 3);
         assert!(matches!(&data, Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn qwen_embedding_cache_bounded_read_rejects_oversized_file() {
+        // The read is bounded independently of the stat fast-path: a file
+        // larger than the cap is rejected rather than fully allocated. This
+        // closes the stat-to-read window (a file that grows after the stat).
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_oversized.bin");
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        let err = read_embedding_cache_file_bounded(&path, 16)
+            .expect_err("oversized file must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err}").contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_bounded_read_accepts_within_cap() {
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_within_cap.bin");
+        std::fs::write(&path, vec![7u8; 16]).unwrap();
+        let bytes =
+            read_embedding_cache_file_bounded(&path, 32).expect("file within cap must be read");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(bytes, vec![7u8; 16]);
     }
 
     #[test]
