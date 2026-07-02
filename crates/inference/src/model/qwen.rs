@@ -12,6 +12,7 @@ use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -251,6 +252,17 @@ pub struct ModelInferenceConfig {
 
     #[serde(default = "default_gpu_max_seq_len")]
     pub gpu_max_seq_len: usize,
+
+    /// Base model revision the embedding cache was produced against. Checked
+    /// at `cache_load` time so a cache built for a different model revision
+    /// fails closed instead of poisoning lookups with stale embeddings.
+    #[serde(default = "default_cache_compat_rev")]
+    pub base_model_rev: String,
+
+    /// Tokenizer revision the embedding cache was produced against, checked
+    /// the same way as `base_model_rev`.
+    #[serde(default = "default_cache_compat_rev")]
+    pub tokenizer_rev: String,
 }
 
 fn default_eos_token_id() -> u32 {
@@ -262,6 +274,9 @@ fn default_rope_table_max_seq_len() -> usize {
 fn default_gpu_max_seq_len() -> usize {
     2048
 }
+fn default_cache_compat_rev() -> String {
+    "none".to_string()
+}
 
 impl Default for ModelInferenceConfig {
     fn default() -> Self {
@@ -269,6 +284,8 @@ impl Default for ModelInferenceConfig {
             eos_token_id: default_eos_token_id(),
             rope_table_max_seq_len: default_rope_table_max_seq_len(),
             gpu_max_seq_len: default_gpu_max_seq_len(),
+            base_model_rev: default_cache_compat_rev(),
+            tokenizer_rev: default_cache_compat_rev(),
         }
     }
 }
@@ -378,6 +395,30 @@ impl ForwardBuffers {
 /// docs for the safety argument. Field order is critical: weights before backing.
 /// Maximum number of cached embeddings. 10K × 1024d × 4B = ~40MB.
 const EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Embedding cache file magic, identifying the versioned manifest format
+/// below. Distinguishes governed cache files from the pre-manifest raw
+/// record stream, which is now rejected rather than silently parsed.
+const EMBEDDING_CACHE_MAGIC: &[u8; 8] = b"LQECACHE";
+/// Current embedding cache manifest format version.
+const EMBEDDING_CACHE_VERSION: u32 = 1;
+/// Upper bound on the manifest header length, rejected before JSON parsing
+/// so a corrupt or hostile `manifest_len` cannot drive an oversized read.
+const EMBEDDING_CACHE_MANIFEST_CAP: u32 = 64 * 1024;
+
+/// Integrity and compatibility manifest embedded in the embedding cache
+/// file header, mirroring the LoRA adapter manifest pattern
+/// (`crates/tune/src/lora/manifest.rs`): a content hash plus compatibility
+/// fields checked before any cache record is trusted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmbeddingCacheManifest {
+    version: u32,
+    payload_sha256: String,
+    base_model_rev: String,
+    tokenizer_rev: String,
+    embedding_dim: usize,
+    entry_count: usize,
+}
 
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
 pub struct QwenModel {
@@ -617,75 +658,56 @@ impl QwenModel {
             .clear();
     }
 
-    /// Load embedding cache from a binary file. Format: repeated [hash:u64, dim:u32, floats:f32*dim].
+    /// Load embedding cache from a versioned binary file with an integrity
+    /// manifest. Fails closed on any magic/version/hash/compatibility
+    /// mismatch instead of loading a partial or stale cache; a missing file
+    /// is not an error since no artifact was expected to be loaded.
     pub fn cache_load(&self, path: &Path) -> Result<usize, InferenceError> {
-        let data = match std::fs::read(path) {
+        let data = match read_embedding_cache_file(path, self.dimensions()) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(InferenceError::Inference(format!("cache load: {e}"))),
         };
+        let entries = parse_embedding_cache_file(
+            &data,
+            self.dimensions(),
+            &self.inference_config.base_model_rev,
+            &self.inference_config.tokenizer_rev,
+        )?;
+
+        let count = entries.len();
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut pos = 0;
-        let mut count = 0;
-        while pos + 12 <= data.len() {
-            let hash = u64::from_le_bytes(
-                data[pos..pos + 8]
-                    .try_into()
-                    .expect("invariant: cache record has an 8-byte hash"),
-            );
-            let dim = u32::from_le_bytes(
-                data[pos + 8..pos + 12]
-                    .try_into()
-                    .expect("invariant: cache record has a 4-byte dimension"),
-            ) as usize;
-            pos += 12;
-            let Some(float_bytes) = dim.checked_mul(4) else {
-                break;
-            };
-            let Some(end) = pos.checked_add(float_bytes) else {
-                break;
-            };
-            if end > data.len() {
-                break;
-            }
-            let floats: Vec<f32> = data[pos..end]
-                .chunks_exact(4)
-                .map(|c| {
-                    f32::from_le_bytes(
-                        c.try_into()
-                            .expect("invariant: chunks_exact(4) yields four-byte chunks"),
-                    )
-                })
-                .collect();
-            pos = end;
+        for (hash, floats) in entries {
             cache.insert(hash, floats);
-            count += 1;
         }
         Ok(count)
     }
 
-    /// Save embedding cache to a binary file.
+    /// Save embedding cache to a binary file, prefixed with an integrity and
+    /// compatibility manifest (magic, version, payload SHA-256, base model
+    /// and tokenizer revisions) so `cache_load` can verify it before trust.
     pub fn cache_save(&self, path: &Path) -> Result<usize, InferenceError> {
         let cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = cache.len();
-        let mut buf = Vec::with_capacity(count * (12 + self.dimensions() * 4));
-        for (&hash, embedding) in cache.iter() {
-            buf.extend_from_slice(&hash.to_le_bytes());
-            buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
-            for &f in embedding {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
+        let payload = serialize_embedding_cache_payload(&cache);
+        let file_bytes = wrap_embedding_cache_payload(
+            payload,
+            &self.inference_config.base_model_rev,
+            &self.inference_config.tokenizer_rev,
+            self.dimensions(),
+            count,
+        )?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
         }
-        std::fs::write(path, &buf)
+        std::fs::write(path, &file_bytes)
             .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
         Ok(count)
     }
@@ -1599,6 +1621,249 @@ impl QwenModel {
     }
 }
 
+/// SHA-256 of `bytes`, formatted as lowercase hex — used for the embedding
+/// cache payload integrity field, mirroring `download::sha256_hex`.
+fn embedding_cache_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Upper bound on a well-formed embedding cache file for the given output
+/// dimension: capacity-bound payload plus the bounded manifest header.
+/// Stat-checked before reading so a corrupt or hostile file cannot drive an
+/// unbounded allocation.
+fn max_embedding_cache_file_len(dimensions: usize) -> u64 {
+    let header = 8u64 + 4; // magic + manifest_len
+    let manifest_cap = u64::from(EMBEDDING_CACHE_MANIFEST_CAP);
+    let max_payload = EMBEDDING_CACHE_CAP as u64 * (12 + dimensions as u64 * 4);
+    header + manifest_cap + max_payload
+}
+
+/// Read an embedding cache file from disk, rejecting anything larger than
+/// `max_embedding_cache_file_len` before allocating for its contents.
+fn read_embedding_cache_file(path: &Path, dimensions: usize) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    let max_len = max_embedding_cache_file_len(dimensions);
+    if metadata.len() > max_len {
+        return Err(std::io::Error::other(format!(
+            "embedding cache file too large: {} bytes exceeds cap of {max_len} bytes",
+            metadata.len()
+        )));
+    }
+    std::fs::read(path)
+}
+
+/// Encode the embedding cache into the raw payload record stream:
+/// repeated `[hash: u64 LE, dim: u32 LE, floats: f32 LE * dim]`.
+fn serialize_embedding_cache_payload(cache: &HashMap<u64, Vec<f32>>) -> Vec<u8> {
+    let payload_cap: usize = cache.values().map(|v| 12 + v.len() * 4).sum();
+    let mut buf = Vec::with_capacity(payload_cap);
+    for (&hash, embedding) in cache.iter() {
+        buf.extend_from_slice(&hash.to_le_bytes());
+        buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
+        for &f in embedding {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Wrap a raw payload record stream with the embedding cache manifest
+/// header: `[magic: 8][manifest_len: u32 LE][manifest JSON][payload]`.
+fn wrap_embedding_cache_payload(
+    payload: Vec<u8>,
+    base_model_rev: &str,
+    tokenizer_rev: &str,
+    dimensions: usize,
+    entry_count: usize,
+) -> Result<Vec<u8>, InferenceError> {
+    let manifest = EmbeddingCacheManifest {
+        version: EMBEDDING_CACHE_VERSION,
+        payload_sha256: embedding_cache_sha256_hex(&payload),
+        base_model_rev: base_model_rev.to_string(),
+        tokenizer_rev: tokenizer_rev.to_string(),
+        embedding_dim: dimensions,
+        entry_count,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| {
+        InferenceError::Inference(format!("embedding cache manifest serialize: {e}"))
+    })?;
+    if manifest_bytes.len() > EMBEDDING_CACHE_MANIFEST_CAP as usize {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest length {} exceeds cap of {EMBEDDING_CACHE_MANIFEST_CAP} bytes",
+            manifest_bytes.len()
+        )));
+    }
+    let mut file_bytes = Vec::with_capacity(8 + 4 + manifest_bytes.len() + payload.len());
+    file_bytes.extend_from_slice(EMBEDDING_CACHE_MAGIC);
+    file_bytes.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+    file_bytes.extend_from_slice(&manifest_bytes);
+    file_bytes.extend_from_slice(&payload);
+    Ok(file_bytes)
+}
+
+/// Parse and fully validate an embedding cache file: magic, version,
+/// manifest length cap, payload SHA-256, base-model/tokenizer compatibility,
+/// dimension, finiteness, and exact payload consumption. Returns `Err`
+/// before any record is trusted on the first mismatch found — the cache
+/// (`self.cache`) is only mutated by the caller after this returns `Ok`.
+fn parse_embedding_cache_file(
+    data: &[u8],
+    dimensions: usize,
+    expected_base_model_rev: &str,
+    expected_tokenizer_rev: &str,
+) -> Result<Vec<(u64, Vec<f32>)>, InferenceError> {
+    if data.len() < 8 || &data[..8] != EMBEDDING_CACHE_MAGIC {
+        return Err(InferenceError::Inference(
+            "embedding cache magic mismatch".to_string(),
+        ));
+    }
+    if data.len() < 12 {
+        return Err(InferenceError::Inference(
+            "embedding cache manifest header truncated".to_string(),
+        ));
+    }
+    let manifest_len = u32::from_le_bytes(
+        data[8..12]
+            .try_into()
+            .expect("invariant: slice of length 4 converts to [u8; 4]"),
+    );
+    if manifest_len > EMBEDDING_CACHE_MANIFEST_CAP {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest length {manifest_len} exceeds cap of {EMBEDDING_CACHE_MANIFEST_CAP} bytes"
+        )));
+    }
+    let manifest_start = 12usize;
+    let manifest_end = manifest_start + manifest_len as usize;
+    if data.len() < manifest_end {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest truncated: expected {manifest_len} bytes, found {}",
+            data.len() - manifest_start
+        )));
+    }
+    let manifest: EmbeddingCacheManifest =
+        serde_json::from_slice(&data[manifest_start..manifest_end]).map_err(|e| {
+            InferenceError::Inference(format!("embedding cache manifest parse error: {e}"))
+        })?;
+    if manifest.version != EMBEDDING_CACHE_VERSION {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache version mismatch: expected {EMBEDDING_CACHE_VERSION}, found {}",
+            manifest.version
+        )));
+    }
+
+    let payload = &data[manifest_end..];
+    let computed_sha256 = embedding_cache_sha256_hex(payload);
+    if computed_sha256 != manifest.payload_sha256 {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache payload_sha256 mismatch: expected {}, computed {computed_sha256}",
+            manifest.payload_sha256
+        )));
+    }
+    if manifest.base_model_rev != expected_base_model_rev {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache base_model_rev mismatch: expected {expected_base_model_rev}, found {}",
+            manifest.base_model_rev
+        )));
+    }
+    if manifest.tokenizer_rev != expected_tokenizer_rev {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache tokenizer_rev mismatch: expected {expected_tokenizer_rev}, found {}",
+            manifest.tokenizer_rev
+        )));
+    }
+    if manifest.embedding_dim != dimensions {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache embedding_dim mismatch: expected {dimensions}, found {}",
+            manifest.embedding_dim
+        )));
+    }
+
+    if manifest.entry_count > EMBEDDING_CACHE_CAP {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache entry_count {} exceeds cap of {EMBEDDING_CACHE_CAP}",
+            manifest.entry_count
+        )));
+    }
+    let mut entries = Vec::with_capacity(manifest.entry_count);
+    let mut pos = 0usize;
+    // Bounded by the manifest-declared entry count, not by payload length:
+    // a payload with fewer usable bytes than declared fails as a truncated
+    // record, and a payload with bytes left over after the declared entries
+    // are consumed fails as trailing bytes below — a lone `entry_count`
+    // mutation can no longer smuggle extra or missing records past the hash
+    // check, since payload_sha256 covers the payload bytes but not this
+    // count field.
+    for record_index in 0..manifest.entry_count {
+        if pos + 12 > payload.len() {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        }
+        let hash = u64::from_le_bytes(
+            payload[pos..pos + 8]
+                .try_into()
+                .expect("invariant: cache record has an 8-byte hash"),
+        );
+        let dim = u32::from_le_bytes(
+            payload[pos + 8..pos + 12]
+                .try_into()
+                .expect("invariant: cache record has a 4-byte dimension"),
+        ) as usize;
+        pos += 12;
+        if dim != dimensions {
+            return Err(InferenceError::Inference(format!(
+                "embedding cache record dimension mismatch at record {record_index}: expected {dimensions}, found {dim}"
+            )));
+        }
+        let Some(float_bytes) = dim.checked_mul(4) else {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        };
+        let Some(end) = pos.checked_add(float_bytes) else {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        };
+        if end > payload.len() {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        }
+        let mut floats = Vec::with_capacity(dim);
+        for (float_index, chunk) in payload[pos..end].chunks_exact(4).enumerate() {
+            let f = f32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .expect("invariant: chunks_exact(4) yields four-byte chunks"),
+            );
+            if !f.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "embedding cache non-finite float at record {record_index}, index {float_index}"
+                )));
+            }
+            floats.push(f);
+        }
+        pos = end;
+        entries.push((hash, floats));
+    }
+    if pos != payload.len() {
+        return Err(InferenceError::Inference(
+            "embedding cache trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(entries)
+}
+
 /// FNV-1a hash of token IDs — fast, deterministic, good distribution.
 fn hash_token_ids(ids: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -1925,16 +2190,19 @@ mod tests {
         assert_eq!(cfg.eos_token_id, 151_643);
         assert_eq!(cfg.rope_table_max_seq_len, 8192);
         assert_eq!(cfg.gpu_max_seq_len, 2048);
+        assert_eq!(cfg.base_model_rev, "none");
+        assert_eq!(cfg.tokenizer_rev, "none");
     }
 
     #[test]
     fn test_load_inference_config_from_json() {
-        let json =
-            r#"{"eos_token_id": 151645, "rope_table_max_seq_len": 32768, "gpu_max_seq_len": 4096}"#;
+        let json = r#"{"eos_token_id": 151645, "rope_table_max_seq_len": 32768, "gpu_max_seq_len": 4096, "base_model_rev": "qwen3-0.6b-rev2", "tokenizer_rev": "tok-rev3"}"#;
         let cfg: ModelInferenceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.eos_token_id, 151_645);
         assert_eq!(cfg.rope_table_max_seq_len, 32_768);
         assert_eq!(cfg.gpu_max_seq_len, 4096);
+        assert_eq!(cfg.base_model_rev, "qwen3-0.6b-rev2");
+        assert_eq!(cfg.tokenizer_rev, "tok-rev3");
     }
 
     #[test]
@@ -1967,6 +2235,8 @@ mod tests {
         assert_eq!(empty.eos_token_id, 151_643);
         assert_eq!(empty.rope_table_max_seq_len, 8192);
         assert_eq!(empty.gpu_max_seq_len, 2048);
+        assert_eq!(empty.base_model_rev, "none");
+        assert_eq!(empty.tokenizer_rev, "none");
     }
 
     #[test]
@@ -2085,5 +2355,123 @@ mod tests {
         assert_eq!(cfg.rope_table_max_seq_len, 8192);
         assert_eq!(cfg.gpu_max_seq_len, 2048);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Builds an intact, fully-wrapped embedding cache file for one record
+    /// with the given compatibility fields and floats.
+    fn build_test_embedding_cache_bytes(
+        base_model_rev: &str,
+        tokenizer_rev: &str,
+        dim: usize,
+        floats: Vec<f32>,
+    ) -> Vec<u8> {
+        let mut cache = HashMap::new();
+        cache.insert(42u64, floats);
+        let payload = serialize_embedding_cache_payload(&cache);
+        wrap_embedding_cache_payload(payload, base_model_rev, tokenizer_rev, dim, 1).unwrap()
+    }
+
+    #[test]
+    fn qwen_embedding_cache_intact_manifest_loads() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let entries = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 42);
+        assert_eq!(entries[0].1, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_corrupt_payload_byte() {
+        let mut bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let manifest_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let payload_start = 12 + manifest_len;
+        bytes[payload_start] ^= 0xFF;
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("payload_sha256 mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_base_model_rev() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-b", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("base_model_rev mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_tokenizer_rev() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-b").unwrap_err();
+        assert!(
+            format!("{err}").contains("tokenizer_rev mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_dim_even_with_valid_hash() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        // Payload SHA-256 and compat fields are untouched and would pass;
+        // only the caller-expected dimension differs from the manifest.
+        let err = parse_embedding_cache_file(&bytes, 4, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("embedding_dim mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_non_finite_payload() {
+        let bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, f32::NAN, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("non-finite float"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_trailing_payload_bytes() {
+        let mut cache = HashMap::new();
+        cache.insert(42u64, vec![1.0f32, 2.0, 3.0]);
+        let mut payload = serialize_embedding_cache_payload(&cache);
+        // Trailing bytes past the one declared record: the SHA-256 is
+        // computed over the payload including this garbage, so the hash
+        // check alone would pass — only exact-consumption validation
+        // against the manifest-declared entry count catches it.
+        payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let bytes = wrap_embedding_cache_payload(payload, "model-a", "tok-a", 3, 1).unwrap();
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("trailing bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_missing_file_returns_ok_zero() {
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_missing.bin");
+        std::fs::remove_file(&path).ok();
+        let data = read_embedding_cache_file(&path, 3);
+        assert!(matches!(&data, Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_magic() {
+        let mut bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        bytes[0] = b'X';
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("magic mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }
