@@ -221,6 +221,13 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
 
+### CI Authoring Rules (fail-closed)
+
+- Never pipe a gating command's output (`script | tee log`): the pipe's exit status masks the script's, and the gate silently passes on failure. Write reports to a file the step uploads (for example via an env-var path) and let the command's own exit code gate.
+- A gate must prove it exercised the real path. If the code under test can silently fall back (feature gate off, capability missing, GPU unavailable), assert on an explicit marker emitted by the exercised path and fail when it is absent. A skipped gate must read as red, not green.
+- Budget required-job timeouts for the runner pool's slow tail, not the median run. A deterministic timeout-cancel on a correct job is a false red that trains people to ignore the gate.
+- Informational (non-required) legs may be red. A red informational leg means "file the engine issue it found", not "block the merge" and not "delete the leg".
+
 ## Commands
 
 ```bash
