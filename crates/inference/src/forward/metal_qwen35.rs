@@ -1021,6 +1021,86 @@ kernel void gemv_q4_decode(
     }
 }
 
+// ===== W3 GEMV Decode: 3-bit x float32 with simd_sum reduction (issue #420) =====
+// W3 block: [f16 scale (2B)][f16 bias (2B)][12 bytes packed 3-bit codes] = 16 bytes
+// per 32 weights. Codes are packed LSB-first as a sequential bitstream across byte
+// boundaries (bit_offset = i*3; byte_index = bit_offset/8; shift = bit_offset%8),
+// NOT nibble-aligned like Q4 — so unlike `gemv_q4_decode`, a single block cannot be
+// split byte-wise across 4 lanes. Each lane instead owns whole blocks.
+// Dequant: w = code * scale + bias (code in 0..7); mirrors CPU `gemv_w3_decode`
+// (`forward/cpu/w3.rs`) bit-for-bit in the unpack math.
+// NR=2 output rows per threadgroup, 4 simdgroups of 32 = 128 threads.
+// Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
+kernel void gemv_w3_decode(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NSG = 4;
+    const uint W3_PACKED_BYTES = 12;
+    const uint nb = K / 32;            // number of W3 blocks per row
+    const uint row_bytes = nb * 16;    // 16 bytes per block (2B scale + 2B bias + 12B packed)
+    const uint first_row = tgpig.x * NR;
+    const uint lane = sgitg * 32 + tiisg;  // 0..127: one lane owns one whole block/iter
+
+    float sumf[NR] = {0.0f};
+
+    for (uint ib = lane; ib < nb; ib += NSG * 32) {
+        float xl[32];
+        float x_sum = 0.0f;
+        device const float* xb = x + ib * 32;
+        for (uint i = 0; i < 32; i++) {
+            xl[i] = xb[i];
+            x_sum += xb[i];
+        }
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 16);
+            float d = float(*((device const half*)base));         // scale
+            float b = float(*((device const half*)(base + 2)));   // bias
+            device const uchar* packed = base + 4;
+
+            float code_dot = 0.0f;
+            for (uint i = 0; i < 32; i++) {
+                uint bit_offset = i * 3;
+                uint byte_index = bit_offset / 8;
+                uint shift = bit_offset % 8;
+                uint lo = uint(packed[byte_index]);
+                uint hi = (byte_index + 1 < W3_PACKED_BYTES) ? uint(packed[byte_index + 1]) : 0;
+                uint word = lo | (hi << 8);
+                uint code = (word >> shift) & 0x7u;
+                code_dot += float(code) * xl[i];
+            }
+            sumf[row] += code_dot * d + x_sum * b;
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared_w3[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared_w3[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared_w3[row][0] + shared_w3[row][1] + shared_w3[row][2]
+                     + shared_w3[row][3];
+            }
+        }
+    }
+}
+
 // ===== GDN: Depthwise conv1d + SiLU =====
 // conv_buf: [conv_dim * buf_len] persistent shift register (buf_len = kernel_size - 1)
 // One thread per channel.
@@ -3538,6 +3618,20 @@ kernel void gdn_chunk_norm_silu_c32(
         fn payload_len(&self) -> u64 {
             self.buffer.length().saturating_sub(self.payload_offset)
         }
+
+        /// Wrap a normally-allocated Metal buffer (payload at offset 0),
+        /// mirroring [`Q4WeightBuf::from_buffer`]. `n`/`k` must describe the
+        /// `[n, k]` row-major layout already packed into `buffer`.
+        #[cfg(test)]
+        fn from_buffer(buffer: Buffer, n: usize, k: usize) -> Self {
+            W3WeightBuf {
+                buffer,
+                payload_offset: 0,
+                _mmap: None,
+                n,
+                k,
+            }
+        }
     }
 
     /// Open `path`, mmap the whole `.w3` file, and register it as a Metal no-copy
@@ -3807,8 +3901,10 @@ kernel void gdn_chunk_norm_silu_c32(
     /// (issue #420 MLP-only overlay — dense MLP tensors only, never MoE).
     ///
     /// Unlike the Q4 path, W3 gate/up are *not* fused into one buffer (the Q4
-    /// fusion is a decode-dispatch optimization; W3 has no live dispatch path
-    /// yet — see `encode_mlp_block`'s `MetalDenseFfnWeights::W3` arm).
+    /// fusion is a decode-dispatch optimization; W3 dispatches gate_proj and
+    /// up_proj as two `gemv_w3_decode` calls into the two halves of the
+    /// shared gate activation buffer — see `encode_mlp_block`'s
+    /// `MetalDenseFfnWeights::W3` arm and `dispatch_matmul_w3_decode`).
     enum MetalDenseFfnWeights {
         Q4 {
             gate_up_proj: Q4WeightBuf, // [2 * intermediate, hidden] — gate || up, Q4/Q8
@@ -4137,6 +4233,7 @@ kernel void gdn_chunk_norm_silu_c32(
         gemv_q4: ComputePipelineState,
         gemm_q4: ComputePipelineState,
         gemm_q4_tiled: Option<ComputePipelineState>,
+        gemv_w3: ComputePipelineState,
         conv1d_silu: ComputePipelineState,
         gdn_recurrence: ComputePipelineState,
         gdn_chunk_materialize_c32: ComputePipelineState,
@@ -5338,6 +5435,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
+                gemv_w3: make_pipeline("gemv_w3_decode")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
                 rms_norm: make_pipeline("rms_norm_qwen35")?,
                 partial_rope: make_pipeline("partial_rope_interleaved")?,
@@ -11187,21 +11285,74 @@ kernel void gdn_chunk_norm_silu_c32(
                         "down_proj",
                     );
                 }
-                MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 { .. }) => {
-                    // No Metal W3 GEMV kernel exists yet (issue #420 scope: CPU
-                    // `gemv_w3_decode` only), and the CPU kernel cannot be
-                    // safely interleaved here — `enc` is a still-open,
-                    // uncommitted encoder, so `self.session.activations.hidden`
-                    // (written by the `dispatch_fused_residual_add_norm` call
-                    // above, in this same encoder) is not yet materialized for
-                    // a synchronous CPU read. Fail closed rather than dispatch
-                    // against stale/undefined activation data.
-                    panic!(
-                        "encode_mlp_block: W3 MLP runtime has no live decode (M=1) dispatch path \
-                         yet. Refusing to fall back to Q4/f16 because that would silently change \
-                         W3 quality measurement; see impl_notes.md for the follow-up needed \
-                         (either a Metal `gemv_w3_decode` kernel or an encoder/command-buffer \
-                         boundary refactor to allow a synchronous CPU-side GEMV here)."
+                MetalFfnWeights::Dense(MetalDenseFfnWeights::W3 {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                }) => {
+                    // Metal `gemv_w3_decode` GEMV kernel (issue #420 / #530). Unlike
+                    // Q4, gate_proj/up_proj are not fused into one buffer, so they
+                    // are dispatched as two decode-only GEMVs writing into the two
+                    // halves of the shared gate activation buffer.
+                    let w_gate = gate_proj as *const W3WeightBuf;
+                    let w_up = up_proj as *const W3WeightBuf;
+                    let w_down = down_proj as *const W3WeightBuf;
+                    // SAFETY: W3 weight buffers are live for the command buffer
+                    // lifetime, mirroring the Q4 arm above.
+                    unsafe {
+                        self.dispatch_matmul_w3_decode(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_gate,
+                            &self.session.activations.gate,
+                            0,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        0,
+                        layer_idx,
+                        "gate_proj",
+                    );
+                    unsafe {
+                        self.dispatch_matmul_w3_decode(
+                            enc,
+                            &self.session.activations.hidden,
+                            &*w_up,
+                            &self.session.activations.gate,
+                            (inter * std::mem::size_of::<f32>()) as u64,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.session.activations.gate,
+                        (inter * std::mem::size_of::<f32>()) as u64,
+                        layer_idx,
+                        "up_proj",
+                    );
+                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
+                    unsafe {
+                        self.dispatch_matmul_w3_decode(
+                            enc,
+                            &self.session.activations.gate,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            0,
+                        );
+                    }
+                    self.dispatch_lora_if_active(
+                        enc,
+                        &self.session.activations.gate,
+                        0,
+                        &self.session.activations.ffn_out,
+                        0,
+                        layer_idx,
+                        "down_proj",
                     );
                 }
                 MetalFfnWeights::Moe(moe_bufs) => {
@@ -12302,6 +12453,39 @@ kernel void gdn_chunk_norm_silu_c32(
             enc.set_bytes(4, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
                 MTLSize::new(n.div_ceil(2) as u64, 1, 1), // gemv_q4_decode writes NR=2 rows/threadgroup
+                MTLSize::new(32, 4, 1),
+            );
+        }
+
+        /// W3 decode-only (M=1) GEMV dispatch (issue #420 / #530). Mirrors
+        /// `dispatch_matmul_q4`, but `n`/`k` come from `qw` itself (cached at
+        /// load time in `mmap_w3_weight`/`W3WeightBuf::from_buffer`) rather
+        /// than being passed by the caller, so a mismatched dimension can't
+        /// silently reach the kernel. `y_offset` lets the (unfused) W3
+        /// gate_proj/up_proj pair each write into their half of the shared
+        /// gate activation buffer, the way `dispatch_gemm_q4` offsets `y` for
+        /// its batched path. Only valid for the decode (M=1) shape the W3
+        /// Metal kernel supports; batch/prefill W3 dispatch fails closed
+        /// upstream in `verify_tokens_batch_gemm` / `forward_prefill_batched_chunk`
+        /// before this is ever reached.
+        fn dispatch_matmul_w3_decode(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,       // activation [1,K] float
+            qw: &W3WeightBuf, // W3 packed weights [N, K/32 * 16]; payload at qw.payload_offset
+            y: &Buffer,       // output [1,N] float
+            y_offset: u64,
+        ) {
+            let n = qw.n as u32;
+            let k = qw.k as u32;
+            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_w3);
+            enc.set_buffer(0, Some(x), 0);
+            enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
+            enc.set_buffer(2, Some(y), y_offset);
+            enc.set_bytes(3, 4, &n as *const u32 as *const _);
+            enc.set_bytes(4, 4, &k as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(n.div_ceil(2) as u64, 1, 1), // gemv_w3_decode writes NR=2 rows/threadgroup
                 MTLSize::new(32, 4, 1),
             );
         }
@@ -14570,6 +14754,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
+                gemv_w3: make_pipeline("gemv_w3_decode")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
                 rms_norm: make_pipeline("rms_norm_qwen35")?,
                 partial_rope: make_pipeline("partial_rope_interleaved")?,
@@ -15413,6 +15598,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
+                gemv_w3: make_pipeline("gemv_w3_decode")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
                 rms_norm: make_pipeline("rms_norm_qwen35")?,
                 partial_rope: make_pipeline("partial_rope_interleaved")?,
@@ -19091,6 +19277,213 @@ kernel void decode_attention_reference(
             assert!(
                 diff < 1e-3,
                 "dispatch_matmul_q4 result diverges from CPU dequant ref: max_abs_diff={diff:.4e}"
+            );
+        }
+
+        // ── W3 GEMV numeric differential + mutation gate (issue #420 / #530) ──
+
+        /// Build a random `[n, k]` W3-quantized weight matrix, upload its raw
+        /// packed payload to a Metal buffer, and return the buffer alongside
+        /// the CPU-dequantized reference. Mirrors `make_q4_weight_ref`.
+        fn make_w3_weight_ref(
+            device: &Device,
+            seed: u64,
+            n: usize,
+            k: usize,
+        ) -> (Buffer, Vec<f32>) {
+            use crate::weights::w3_weights::{
+                W3_BLOCK_SIZE, dequantize_w3_to_f32, quantize_f32_to_w3,
+            };
+            assert_eq!(k % 32, 0, "K must be divisible by 32 for W3 GEMV");
+            let mut rng = seed;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            // Generate row-major [N, K] weight matrix. K % 32 == 0 means the
+            // block-chunking below never crosses a row boundary.
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let tensor = quantize_f32_to_w3(&weights_f32, &[n, k]).expect("quantize_f32_to_w3");
+            let deq_weights = dequantize_w3_to_f32(&tensor);
+
+            let mut packed_bytes = Vec::with_capacity(tensor.blocks.len() * W3_BLOCK_SIZE);
+            for block in &tensor.blocks {
+                packed_bytes.extend_from_slice(&block.scale.to_le_bytes());
+                packed_bytes.extend_from_slice(&block.bias.to_le_bytes());
+                packed_bytes.extend_from_slice(&block.packed);
+            }
+
+            let buf = device.new_buffer_with_data(
+                packed_bytes.as_ptr() as *const _,
+                packed_bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            buf.set_label("test_qw_w3");
+            (buf, deq_weights)
+        }
+
+        /// Differential test: `dispatch_matmul_w3_decode` (Metal `gemv_w3_decode`
+        /// kernel) vs the CPU f32 reference matmul over the dequantized weights.
+        /// N=6 (not a multiple of NR=2's group count) exercises the same
+        /// under-coverage class as `dispatch_matmul_q4_writes_all_rows` — a
+        /// sentinel pre-fill catches any row the dispatch grid fails to write.
+        #[test]
+        fn dispatch_matmul_w3_decode_matches_cpu_reference() {
+            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let (n, k) = (6usize, 64usize);
+            let (qw_raw, w_deq) = make_w3_weight_ref(&device, 0x0FF0_1234_u64, n, k);
+            let qw = W3WeightBuf::from_buffer(qw_raw, n, k);
+
+            let mut xrng = 0x1234_5678_u64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| {
+                    xrng = xrng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+                })
+                .collect();
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            // Pre-fill the output with a sentinel far outside the achievable result
+            // range (|y| < K = 64 here); any row left untouched keeps it.
+            const SENTINEL: f32 = -123_456.0;
+            let y_init = vec![SENTINEL; n];
+            let y_buf = device.new_buffer_with_data(
+                y_init.as_ptr() as *const _,
+                (n * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_matmul_w3_decode(enc, &x_buf, &qw, &y_buf, 0);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // SAFETY: StorageModeShared, GPU work completed, size matches allocation.
+            let y: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n) };
+            let y_ref = cpu_matmul_ref(&x, &w_deq, 1, n, k);
+
+            for (row, &val) in y.iter().enumerate() {
+                assert!(
+                    val.to_bits() != SENTINEL.to_bits(),
+                    "row {row} of {n} never written — dispatch grid under-covers \
+                     gemv_w3_decode (NR=2 rows/group)."
+                );
+            }
+            // Round-1 CPU-vs-dequant differential bound for `gemv_w3_decode` measured
+            // max_abs_diff=2.38e-5 (forward/cpu/w3.rs). Measured Metal-vs-CPU-dequant
+            // max_abs_diff on this machine is 2.15e-6 (run with --nocapture to
+            // reproduce). The 1e-3 assert bound is deliberately looser than either
+            // measurement — matching the existing Q4 Metal differential gate's
+            // order of magnitude — since GPU accumulation order varies by hardware.
+            let diff = max_abs_diff(y, &y_ref);
+            eprintln!(
+                "dispatch_matmul_w3_decode differential: max_abs_diff={diff:.8e} (bound: 1e-3)"
+            );
+            assert!(
+                diff < 1e-3,
+                "dispatch_matmul_w3_decode result diverges from CPU dequant ref: \
+                 max_abs_diff={diff:.4e}"
+            );
+        }
+
+        /// Mutation-sensitive gate: flipping a byte inside a W3 block's packed
+        /// 3-bit codes must change the Metal kernel's output by more than the
+        /// differential bound above — proves the kernel actually reads/decodes
+        /// the packed payload rather than e.g. returning a constant or reading
+        /// only the scale/bias.
+        #[test]
+        fn dispatch_matmul_w3_decode_mutation_sensitive() {
+            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+
+            let (n, k) = (1usize, 64usize);
+            use crate::weights::w3_weights::{W3_BLOCK_SIZE, quantize_f32_to_w3};
+            let mut rng = 0x51A7_7E5E_u64;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            let tensor = quantize_f32_to_w3(&weights_f32, &[n, k]).expect("quantize_f32_to_w3");
+            let mut packed_bytes = Vec::with_capacity(tensor.blocks.len() * W3_BLOCK_SIZE);
+            for block in &tensor.blocks {
+                packed_bytes.extend_from_slice(&block.scale.to_le_bytes());
+                packed_bytes.extend_from_slice(&block.bias.to_le_bytes());
+                packed_bytes.extend_from_slice(&block.packed);
+            }
+
+            let x: Vec<f32> = (0..k).map(|_| next()).collect();
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let run = |state: &MetalQwen35State, packed: &[u8]| -> f32 {
+                let buf = device.new_buffer_with_data(
+                    packed.as_ptr() as *const _,
+                    packed.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let qw = W3WeightBuf::from_buffer(buf, n, k);
+                let y_buf = device.new_buffer_with_data(
+                    [0.0f32].as_ptr() as *const _,
+                    4,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let cmd = state.engine.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                state.dispatch_matmul_w3_decode(enc, &x_buf, &qw, &y_buf, 0);
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                // SAFETY: StorageModeShared, GPU work completed, size matches allocation.
+                unsafe { *(y_buf.contents() as *const f32) }
+            };
+
+            let y_before = run(&state, &packed_bytes);
+            // Flip one byte inside the packed codes of the first (only) block.
+            packed_bytes[4] ^= 0xff;
+            let y_after = run(&state, &packed_bytes);
+
+            let diff = (y_before - y_after).abs();
+            assert!(
+                diff > 1e-4,
+                "expected mutating packed W3 codes to change dispatch_matmul_w3_decode's \
+                 result by more than 1e-4, got diff={diff:.8}"
             );
         }
 

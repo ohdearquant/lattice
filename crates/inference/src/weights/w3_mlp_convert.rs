@@ -153,15 +153,21 @@ fn open_shard(path: &Path) -> Result<ShardData, InferenceError> {
             path.display()
         )));
     }
-    let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-    let data_offset = 8 + header_len;
-    if data_offset > mmap.len() {
-        return Err(InferenceError::InvalidSafetensors(format!(
-            "{}: header extends past end of file (header_end={data_offset}, file_len={})",
-            path.display(),
-            mmap.len()
-        )));
-    }
+    let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+    // `8 + header_len` must not overflow `usize` — a corrupt/malicious file
+    // with a huge `header_len` would otherwise panic (debug) or wrap around
+    // past the size check below (release), silently accepting a bogus offset.
+    let data_offset = usize::try_from(header_len)
+        .ok()
+        .and_then(|len| 8usize.checked_add(len))
+        .filter(|&off| off <= mmap.len())
+        .ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "{}: header extends past end of file (header_len={header_len}, file_len={})",
+                path.display(),
+                mmap.len()
+            ))
+        })?;
     let header_str = std::str::from_utf8(&mmap[8..data_offset]).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("{}: header is not UTF-8: {e}", path.display()))
     })?;
@@ -802,5 +808,64 @@ mod tests {
 
         std::fs::remove_dir_all(&model_dir).ok();
         std::fs::remove_dir_all(&output_dir).ok();
+    }
+
+    #[test]
+    fn test_open_shard_rejects_out_of_range_header_len() {
+        let path = tmp_dir("open_shard_oor").join("shard.safetensors");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // header_len points past the (tiny) actual file content.
+        let mut bytes = 1_000u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = open_shard(&path);
+        assert!(
+            result.is_err(),
+            "header_len extending past end of file must be rejected"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_open_shard_rejects_overflowing_header_len() {
+        // A corrupt file whose header_len is near u64::MAX must not panic
+        // via `8 + header_len` overflow, nor wrap around to bypass the
+        // file-length check; it must fail closed with an error.
+        let path = tmp_dir("open_shard_overflow").join("shard.safetensors");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = (u64::MAX - 4).to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = open_shard(&path);
+        assert!(
+            result.is_err(),
+            "overflowing header_len must fail closed, not panic"
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_open_shard_rejects_truncated_file_shorter_than_header_len_field() {
+        // A shard truncated to fewer than 8 bytes cannot even contain the
+        // little-endian header-length prefix. `open_shard` must reject this
+        // via the explicit `mmap.len() < 8` guard rather than panicking on
+        // the `mmap[0..8].try_into().unwrap()` a few lines below it.
+        for len in 0..8usize {
+            let path = tmp_dir(&format!("open_shard_truncated_{len}")).join("shard.safetensors");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![0xABu8; len]).unwrap();
+
+            let result = open_shard(&path);
+            assert!(
+                result.is_err(),
+                "a {len}-byte file (< 8 bytes) must be rejected, not panic"
+            );
+
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 }

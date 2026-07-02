@@ -52,8 +52,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
+    // Detect W3 dir (no model.safetensors, has .w3 files) — checked before Q4
+    // since a W3 MLP dir also ships .q4/.f16 files for the non-MLP tensors.
+    let is_w3_dir = !dir.join("model.safetensors").exists()
+        && std::fs::read_dir(dir)
+            .ok()
+            .and_then(|mut entries| {
+                entries.find(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".w3")))
+                        .unwrap_or(false)
+                })
+            })
+            .is_some();
+
     // Detect Q4 dir (no model.safetensors, has .q4 files) — same dispatch as chat_metal.
-    let is_q4_dir = !dir.join("model.safetensors").exists()
+    let is_q4_dir = !is_w3_dir
+        && !dir.join("model.safetensors").exists()
         && std::fs::read_dir(dir)
             .ok()
             .and_then(|mut entries| {
@@ -72,16 +88,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "[bench] loading {model_dir_str} ({})",
-        if is_q4_dir { "Q4" } else { "safetensors" }
+        if is_w3_dir {
+            "W3"
+        } else if is_q4_dir {
+            "Q4"
+        } else {
+            "safetensors"
+        }
     );
 
-    // Two ownership paths: Q4 owns a separately-loaded tokenizer; safetensors
+    // Three ownership paths: W3/Q4 own a separately-loaded tokenizer; safetensors
     // borrows the tokenizer from Qwen35Model. We materialize a single owned
     // BpeTokenizer either way to keep the rest of the bench branch-free.
     let mut metal: MetalQwen35State;
     let tokenizer: BpeTokenizer;
 
-    if is_q4_dir {
+    if is_w3_dir {
+        let cfg = if dir.join("config.json").exists() {
+            Qwen35Config::from_config_json(&dir.join("config.json"))
+                .map_err(|e| format!("config.json parse: {e}"))?
+        } else {
+            Qwen35Config::qwen35_0_8b()
+        };
+        metal = MetalQwen35State::from_w3_mlp_dir(
+            dir,
+            &tokenizer_dir.join("tokenizer.json"),
+            &cfg,
+            4096,
+        )
+        .map_err(|e| format!("Metal W3 init: {e}"))?;
+        tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_dir.join("tokenizer.json"))?;
+    } else if is_q4_dir {
         let cfg = if dir.join("config.json").exists() {
             Qwen35Config::from_config_json(&dir.join("config.json"))
                 .map_err(|e| format!("config.json parse: {e}"))?

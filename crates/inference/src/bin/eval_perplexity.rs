@@ -17,6 +17,13 @@
 //!   This is the ADR-044 step-4 acceptance measurement.
 //! - `--quarot-q4-dir <PATH>` alone: runs only the QuaRot-Q4 forward path
 //!   (rarely useful — typically you want the unrotated baseline alongside).
+//! - `--w3-mlp-dir <PATH>`: Metal W3 forward path via
+//!   [`MetalQwen35State::from_w3_mlp_dir`] on a mixed W3/Q4/F16 directory
+//!   produced by `bin/quantize_w3_mlp` (issue #420/#531). Mutually
+//!   exclusive with `--model-dir`, `--q4-dir`, and `--quarot-q4-dir`.
+//!
+//! Load failures (missing/corrupt artifacts) fail closed: the process exits
+//! non-zero rather than silently substituting another format.
 //!
 //! # Usage
 //!
@@ -48,6 +55,8 @@
 //!   `config.json` / `quantize_index.json` produced by `bin/quantize_q4`.
 //! - `--quarot-q4-dir <PATH>`: Metal Q4 mode on a `bin/quantize_quarot`
 //!   output directory (rotated 4-bit weights, same file layout).
+//! - `--w3-mlp-dir <PATH>`: Metal W3 mode on a `bin/quantize_w3_mlp`
+//!   output directory (mixed W3/Q4/F16 weights, dense MLP tensors in W3).
 //! - `--tokenizer-dir <PATH>`: Metal modes only. Directory containing
 //!   `tokenizer.json`. Both `quantize_q4` and `quantize_quarot` ship the
 //!   model weights but NOT the BPE tokenizer, so this typically points at
@@ -115,6 +124,7 @@ fn main() -> ExitCode {
     let mut model_dir: Option<PathBuf> = None;
     let mut q4_dir: Option<PathBuf> = None;
     let mut quarot_q4_dir: Option<PathBuf> = None;
+    let mut w3_mlp_dir: Option<PathBuf> = None;
     let mut tokenizer_dir: Option<PathBuf> = None;
     let mut corpus_file: Option<PathBuf> = None;
     let mut window: Option<usize> = None;
@@ -151,6 +161,13 @@ fn main() -> ExitCode {
                     return usage("--quarot-q4-dir requires an argument");
                 };
                 quarot_q4_dir = Some(PathBuf::from(v));
+            }
+            "--w3-mlp-dir" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--w3-mlp-dir requires an argument");
+                };
+                w3_mlp_dir = Some(PathBuf::from(v));
             }
             "--tokenizer-dir" => {
                 i += 1;
@@ -269,15 +286,22 @@ fn main() -> ExitCode {
         return usage("--corpus-file is required");
     };
 
-    let metal_paths_used = q4_dir.is_some() || quarot_q4_dir.is_some();
+    if w3_mlp_dir.is_some() && (q4_dir.is_some() || quarot_q4_dir.is_some()) {
+        return usage("--w3-mlp-dir is mutually exclusive with --q4-dir / --quarot-q4-dir");
+    }
+    let metal_paths_used = q4_dir.is_some() || quarot_q4_dir.is_some() || w3_mlp_dir.is_some();
     if model_dir.is_some() && metal_paths_used {
-        return usage("--model-dir is mutually exclusive with --q4-dir / --quarot-q4-dir");
+        return usage(
+            "--model-dir is mutually exclusive with --q4-dir / --quarot-q4-dir / --w3-mlp-dir",
+        );
     }
     if !metal_paths_used && model_dir.is_none() {
-        return usage("one of --model-dir, --q4-dir, or --quarot-q4-dir is required");
+        return usage("one of --model-dir, --q4-dir, --quarot-q4-dir, or --w3-mlp-dir is required");
     }
     if metal_paths_used && tokenizer_dir.is_none() {
-        return usage("--tokenizer-dir is required when using --q4-dir or --quarot-q4-dir");
+        return usage(
+            "--tokenizer-dir is required when using --q4-dir / --quarot-q4-dir / --w3-mlp-dir",
+        );
     }
     if random_lora_rank.is_some() && !metal_paths_used {
         return usage("--random-lora-rank requires --q4-dir or --quarot-q4-dir (Metal mode only)");
@@ -305,6 +329,9 @@ fn main() -> ExitCode {
     }
     if let Some(ref p) = quarot_q4_dir {
         eprintln!("QuaRot-Q4 dir:    {}", p.display());
+    }
+    if let Some(ref p) = w3_mlp_dir {
+        eprintln!("W3 MLP dir:       {}", p.display());
     }
     if let Some(ref p) = tokenizer_dir {
         eprintln!("Tokenizer dir:    {}", p.display());
@@ -432,6 +459,32 @@ fn main() -> ExitCode {
             lora_scale.unwrap_or(1.0),
             emit_json,
             json_label.as_deref().or(Some("quarot")),
+        ) {
+            Ok(r) => Some(r),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+
+    let _w3_report = if let Some(dir) = w3_mlp_dir.as_deref() {
+        let cfg_loaded = match load_cfg_for_q4(dir) {
+            Ok(c) => c,
+            Err(code) => return code,
+        };
+        match run_metal_w3(
+            dir,
+            &tokenizer_path,
+            &cfg_loaded,
+            resolved_max_cache_len,
+            &tokens,
+            &cfg,
+            "W3 MLP",
+            random_lora_rank,
+            quarot_seed,
+            lora_scale.unwrap_or(1.0),
+            emit_json,
+            json_label.as_deref().or(Some("w3")),
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -574,6 +627,75 @@ fn run_metal_q4(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_metal_w3(
+    w3_mlp_dir: &std::path::Path,
+    tokenizer_path: &std::path::Path,
+    cfg_loaded: &Qwen35Config,
+    max_cache_len: usize,
+    tokens: &[u32],
+    ppl_cfg: &PerplexityConfig,
+    label: &str,
+    random_lora_rank: Option<usize>,
+    quarot_seed: Option<u64>,
+    lora_scale: f32,
+    emit_json: bool,
+    json_label: Option<&str>,
+) -> Result<PerplexityReport, ExitCode> {
+    let t_load = Instant::now();
+    let mut state = match MetalQwen35State::from_w3_mlp_dir(
+        w3_mlp_dir,
+        tokenizer_path,
+        cfg_loaded,
+        max_cache_len,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "ERROR: failed to load {label} from {}: {e}",
+                w3_mlp_dir.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    eprintln!("[{label}] loaded in {}ms", t_load.elapsed().as_millis());
+
+    if let Some(rank) = random_lora_rank {
+        let layers = generate_random_lora_layers(cfg_loaded, rank, quarot_seed.unwrap_or(0));
+        let module_count = layers.len();
+        match state.load_lora_adapter(layers, lora_scale, quarot_seed) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("ERROR ({label}): failed to load random LoRA adapter: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        eprintln!(
+            "[{label}] loaded random LoRA adapter: rank={rank}, modules={module_count}, quarot_seed={quarot_seed:?}"
+        );
+    }
+
+    let t_ppl = Instant::now();
+    let report = match state.compute_perplexity(tokens, ppl_cfg) {
+        Ok(r) => r,
+        Err(InferenceError::Inference(msg)) => {
+            eprintln!("ERROR ({label}): {msg}");
+            return Err(ExitCode::FAILURE);
+        }
+        Err(e) => {
+            eprintln!("ERROR ({label}): {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let elapsed = t_ppl.elapsed();
+    print_report(label, &report, elapsed.as_secs_f64());
+    if emit_json {
+        let ev_label = json_label.unwrap_or(label);
+        emit_perplexity_event(ev_label, &report, elapsed.as_millis());
+    }
+    Ok(report)
+}
+
 fn print_report(label: &str, report: &PerplexityReport, secs: f64) {
     println!();
     println!("=== Perplexity Report ({label}) ===");
@@ -674,6 +796,16 @@ text corpus (ADR-044 step 4). Three measurement modes:
     if delta >= --delta-threshold (default 0.5 — the ADR-044 acceptance
     gate). The single-tokenizer assumption requires both Q4 dirs to come
     from the same source safetensors checkpoint.
+
+  Metal W3 (issue #420/#531):
+    --w3-mlp-dir <PATH>    bin/quantize_w3_mlp output dir (mixed W3/Q4/F16 weights;
+                           dense MLP gate/up/down projections in 3-bit). Mutually
+                           exclusive with --model-dir, --q4-dir, and --quarot-q4-dir.
+    --tokenizer-dir <PATH> Source model dir holding tokenizer.json.
+
+    Fails closed: a missing/corrupt W3 artifact (bad header, wrong shape, stray
+    .q4 file for a tensor the W3 runtime must own) is a hard error, never a
+    silent fallback to another format.
 
 required (in addition to mode flags):
   --corpus-file <PATH>     UTF-8 text file to score.

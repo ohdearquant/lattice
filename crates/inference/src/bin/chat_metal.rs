@@ -532,7 +532,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = model_dir.as_path();
 
-    let is_q4_dir = !dir.join("model.safetensors").exists()
+    // W3 is checked before Q4 since a W3 MLP dir also ships .q4/.f16 files
+    // for the non-MLP tensors (attention, GDN, embeddings, lm_head, norms).
+    let is_w3_dir = !dir.join("model.safetensors").exists()
+        && !dir.join("model.safetensors.index.json").exists()
+        && std::fs::read_dir(dir)
+            .ok()
+            .and_then(|mut entries| {
+                entries.find(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".w3")))
+                        .unwrap_or(false)
+                })
+            })
+            .is_some();
+
+    let is_q4_dir = !is_w3_dir
+        && !dir.join("model.safetensors").exists()
         && !dir.join("model.safetensors.index.json").exists()
         && std::fs::read_dir(dir)
             .ok()
@@ -564,9 +581,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Load model ───────────────────────────────────────────────────────────
 
     let mut metal;
-    let model_format; // "bf16" | "q4"
+    let model_format; // "bf16" | "q4" | "w3"
 
-    if is_q4_dir {
+    if is_w3_dir {
+        eprintln!(
+            "[chat_metal] Detected W3 MLP model directory: {}",
+            dir.display()
+        );
+        let cfg = if dir.join("config.json").exists() {
+            Qwen35Config::from_config_json(&dir.join("config.json"))
+                .map_err(|e| format!("failed to parse config.json: {e}"))?
+        } else {
+            eprintln!("[chat_metal] No config.json; using qwen36_27b preset");
+            Qwen35Config::qwen36_27b()
+        };
+        eprintln!("[chat_metal] Loading W3 MLP model...");
+        let t0 = std::time::Instant::now();
+        metal = MetalQwen35State::from_w3_mlp_dir(
+            dir,
+            &tokenizer_dir.join("tokenizer.json"),
+            &cfg,
+            4096,
+        )
+        .map_err(|e| format!("failed to initialize Metal from W3 MLP dir: {e}"))?;
+        eprintln!(
+            "[chat_metal] W3 MLP model loaded in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+        model_format = "w3";
+    } else if is_q4_dir {
         eprintln!(
             "[chat_metal] Detected Q4 model directory: {}",
             dir.display()
@@ -593,7 +636,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             && !dir.join("model.safetensors.index.json").exists()
         {
             return Err(format!(
-                "no model found at {} (expected model.safetensors or .q4 files)",
+                "no model found at {} (expected model.safetensors, .q4, or .w3 files)",
                 dir.display()
             )
             .into());
