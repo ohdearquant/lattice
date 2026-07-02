@@ -407,11 +407,13 @@ jobs:
             -- --nocapture
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
-  # did not change (nothing to verify); mirrors the parity job's verdict when it
-  # did. Fails closed if change-detection itself errored.
+  # did not change (nothing to verify); mirrors the parity, embed-drift, and
+  # q4-composed verdicts when it did. Fails closed if change-detection itself
+  # errored. metal-parity is deliberately excluded (informational — see its
+  # comment above).
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift]
+    needs: [changes, parity, embed-drift, q4-composed]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -421,7 +423,8 @@ jobs:
           ENGINE="${{ needs.changes.outputs.engine }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT"
+          Q4_RESULT="${{ needs.q4-composed.result }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT q4-composed=$Q4_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -438,5 +441,9 @@ jobs:
             echo "::error::Engine changed and embed-drift gate did not succeed (result=$DRIFT_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity and embed-drift both PASSED."
+          if [ "$Q4_RESULT" != "success" ]; then
+            echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
+            exit 1
+          fi
+          echo "Engine changed; parity, embed-drift, and q4-composed all PASSED."
           exit 0
