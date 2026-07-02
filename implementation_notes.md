@@ -1,7 +1,7 @@
 Implementation Notes
 
 - File changed: crates/inference/src/forward/metal_qwen35.rs
-- In `mmap_q4_weight`, reordered checks: parse header, `file.metadata().len()` with `map_err(|e| format!("failed to stat {}: {e}", path.display()))`, `validate_q4_header_payload_bounds` using file length, then `MmapOptions::map`.
+- In `mmap_q4_weight`, reordered operations: parse header, `file.metadata().len()` with `map_err(|e| format!("failed to stat {}: {e}", path.display()))`, `validate_q4_header_payload_bounds` using file length, then `MmapOptions::map`.
 - No signature changes; no changes to `q4_weights.rs`.
 
 Tests:
@@ -9,5 +9,5 @@ Tests:
 - Result: `3 passed; 0 failed; 0 ignored; 0 measured; 1536 filtered out`
 
 Git:
-- Commit: `7633d97f1`
-- Pushed to `origin/harden/540-q4-mmap-bounds` successfully (`c657ef0fb..7633d97f1`).
+- Commits on branch: `7633d97f1` then `94889c113`.
+- Push to `origin/harden/540-q4-mmap-bounds` succeeded for both commits (`c657ef0fb..7633d97f1` and `7633d97f1..94889c113`).
