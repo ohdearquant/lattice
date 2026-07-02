@@ -3599,20 +3599,26 @@ kernel void gdn_chunk_norm_silu_c32(
         path: &std::path::Path,
         label: &str,
     ) -> Result<Q4WeightBuf, String> {
-        use crate::weights::q4_weights::read_q4_header;
+        use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
 
         let file = std::fs::File::open(path)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         let header = read_q4_header(&file)
             .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len();
+        // Fail closed on a truncated/malformed Q4 file *before* the mmap is
+        // handed to the GPU: unlike the CPU sibling (`load_q4_file`), which
+        // fails via `read_exact` short of the block payload, this no-copy
+        // path never reads the payload itself, so a missing bounds check
+        // here would let a truncated on-disk checkpoint reach Metal dispatch
+        // and read past the end of the mapped payload.
+        validate_q4_header_payload_bounds(&header, file_len, path)
+            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
-        assert!(
-            mmap.len() as u64 >= header.payload_offset,
-            "Q4 file truncated: {} bytes < payload_offset {}",
-            mmap.len(),
-            header.payload_offset
-        );
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
@@ -18723,6 +18729,101 @@ kernel void decode_attention_reference(
             assert!(
                 msg.contains("context capacity") && msg.contains(&format!("{max_cache_len}")),
                 "error must name backend context capacity + cap; got: {msg}"
+            );
+        }
+
+        // Regression test for issue #540: the Metal no-copy mmap loader must
+        // fail closed on a truncated `.q4` block payload before the mmap is
+        // handed to Metal dispatch, mirroring the CPU sibling's
+        // `read_exact`-driven bounds discipline. Mutation check: reverting
+        // the `validate_q4_header_payload_bounds` call in `mmap_q4_weight`
+        // makes this test fail (return becomes `Ok`).
+        #[test]
+        fn mmap_q4_weight_rejects_truncated_block_payload_before_dispatch() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("truncated_payload.q4");
+            let mut file = std::fs::File::create(&path).expect("create truncated q4");
+            use std::io::Write;
+            file.write_all(b"KHQ4").expect("write magic");
+            file.write_all(&2_u32.to_le_bytes()).expect("write version");
+            file.write_all(&1_u32.to_le_bytes()).expect("write ndim");
+            file.write_all(&64_u64.to_le_bytes()).expect("write shape");
+            file.write_all(&64_u64.to_le_bytes())
+                .expect("write original_len");
+            file.flush().expect("flush q4 header");
+
+            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof");
+
+            assert!(
+                result.is_err(),
+                "mmap_q4_weight must reject a KHQ4 header whose original_len requires \
+                 40 payload bytes but whose file ends at payload_offset"
+            );
+        }
+
+        #[test]
+        fn mmap_q4_weight_rejects_payload_one_byte_short() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("one_byte_short.q4");
+            let mut file = std::fs::File::create(&path).expect("create truncated q4");
+            use std::io::Write;
+            file.write_all(b"KHQ4").expect("write magic");
+            file.write_all(&2_u32.to_le_bytes()).expect("write version");
+            file.write_all(&1_u32.to_le_bytes()).expect("write ndim");
+            file.write_all(&32_u64.to_le_bytes()).expect("write shape");
+            file.write_all(&32_u64.to_le_bytes())
+                .expect("write original_len");
+            // original_len=32 → exactly one block → 20 required payload bytes.
+            // Write only 19 to prove the off-by-one boundary is enforced.
+            file.write_all(&[0u8; 19]).expect("write short payload");
+            file.flush().expect("flush truncated payload");
+
+            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof");
+
+            assert!(
+                result.is_err(),
+                "mmap_q4_weight must reject a payload one byte short of the required \
+                 block length"
+            );
+        }
+
+        #[test]
+        fn mmap_q4_weight_accepts_fully_populated_payload() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("full_payload.q4");
+            let tensor = crate::weights::q4_weights::Q4Tensor {
+                blocks: vec![
+                    crate::weights::q4_weights::Q4Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 16],
+                    };
+                    2
+                ],
+                shape: vec![64],
+                original_len: 64,
+            };
+            crate::weights::q4_weights::save_q4_file(&path, &tensor)
+                .expect("save well-formed q4 file");
+
+            let result = mmap_q4_weight(&device, &path, "full-payload-accept");
+
+            assert!(
+                result.is_ok(),
+                "mmap_q4_weight must accept a fully populated payload: {:?}",
+                result.err()
             );
         }
 
