@@ -2012,27 +2012,30 @@ mod tests {
     }
 
     #[test]
-    fn test_f16_rejects_numel_near_usize_max() {
-        // numel = usize::MAX - 3: numel*2 does not itself wrap past u64::MAX
-        // by much (wraps to usize::MAX - 7, still far above any real
-        // file_len), so this is caught by the file_len-bound branch — same
-        // guard class as test_q4_rejects_original_len_near_usize_max above.
-        let huge = usize::MAX - 3;
+    fn test_f16_rejects_numel_whose_byte_count_exceeds_file_len() {
+        // numel = usize::MAX / 4: numel*2 does NOT overflow (≈ 2^62), so the
+        // checked_mul branch passes and rejection can only come from the
+        // file_len-bound branch of checked_alloc_bytes. This pins that branch
+        // for the f16 loader specifically — the assertion below must not
+        // accept "overflows usize", or a deleted file_len check would go
+        // unnoticed (the overflow branch is pinned separately by
+        // test_f16_rejects_numel_that_wraps_to_small_value_on_overflow).
+        let huge = usize::MAX / 4;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"KHF1");
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
         buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
         buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
-        let path = std::path::PathBuf::from("/tmp/test_f16_numel_near_usize_max.f16");
+        let path = std::path::PathBuf::from("/tmp/test_f16_numel_exceeds_file_len.f16");
         std::fs::write(&path, &buf).unwrap();
         let r = load_f16_tensor_file(&path);
         std::fs::remove_file(&path).ok();
-        let err = r.expect_err("numel near usize::MAX must be rejected, not panic/OOM");
+        let err = r.expect_err("oversized f16 numel must be rejected, not panic/OOM");
         let msg = err.to_string();
         assert!(
-            msg.contains("f16 data") || msg.contains("overflows usize"),
-            "expected the f16-data allocation guard to fire, got: {msg}"
+            msg.contains("f16 data") && msg.contains("header claims"),
+            "expected the f16-data file_len-bound guard to fire, got: {msg}"
         );
     }
 
