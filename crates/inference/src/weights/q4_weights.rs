@@ -1095,7 +1095,14 @@ pub(crate) fn write_merged_qkvz(
     let qkv_payload_len = std::fs::metadata(qkv_path)
         .map_err(|e| format!("metadata {}: {e}", qkv_path.display()))?
         .len()
-        - qkv_hdr.payload_offset;
+        .checked_sub(qkv_hdr.payload_offset)
+        .ok_or_else(|| {
+            format!(
+                "{}: file truncated below header (shorter than payload_offset {})",
+                qkv_path.display(),
+                qkv_hdr.payload_offset
+            )
+        })?;
     let mut qkv_payload = Vec::with_capacity(qkv_payload_len as usize);
     qkv_rdr
         .read_to_end(&mut qkv_payload)
@@ -1111,7 +1118,14 @@ pub(crate) fn write_merged_qkvz(
     let z_payload_len = std::fs::metadata(z_path)
         .map_err(|e| format!("metadata {}: {e}", z_path.display()))?
         .len()
-        - z_hdr.payload_offset;
+        .checked_sub(z_hdr.payload_offset)
+        .ok_or_else(|| {
+            format!(
+                "{}: file truncated below header (shorter than payload_offset {})",
+                z_path.display(),
+                z_hdr.payload_offset
+            )
+        })?;
     let mut z_payload = Vec::with_capacity(z_payload_len as usize);
     z_rdr
         .read_to_end(&mut z_payload)
