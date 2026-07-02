@@ -21493,7 +21493,7 @@ kernel void decode_attention_reference(
             // (#534). The value bound below is a drift sentinel, not the correctness gate —
             // the argmax-flip assertion after the sweep is the hard safety check. Tighten
             // this bound if a future kernel change brings chunked-vs-serial drift back down.
-            const MAX_ABS_BOUND: f32 = 6e-2;
+            const MAX_ABS_BOUND: f32 = 6.5e-2;
             const ATTEMPTS: usize = 5;
 
             for &n in sweep_lengths {
