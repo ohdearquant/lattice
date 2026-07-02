@@ -12817,9 +12817,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
-                self.path_proof
-                    .decode_attn_direct
-                    .fetch_add(1, Ordering::Relaxed);
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_direct
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 // Partitioned flash decode (H3): partial kernel + reduce kernel.
                 // Split KV cache into PARTITION_TOKENS-token chunks for better occupancy.
@@ -12837,9 +12839,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, num_partitions as u64, 1),
                     MTLSize::new(256, 1, 1),
                 );
-                self.path_proof
-                    .decode_attn_split_partial
-                    .fetch_add(1, Ordering::Relaxed);
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_split_partial
+                        .fetch_add(1, Ordering::Relaxed);
+                }
 
                 // Reduce pass: one TG per KV head, combines all partitions.
                 // decode_attention_flash_reduce reads f32 attn_partials, not KV — no f16 variant.
@@ -12853,9 +12857,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     MTLSize::new(num_kv_heads as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
-                self.path_proof
-                    .decode_attn_split_reduce
-                    .fetch_add(1, Ordering::Relaxed);
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_attn_split_reduce
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -12996,9 +13002,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
-            self.path_proof
-                .prefill_kv_batch
-                .fetch_add(1, Ordering::Relaxed);
+            if self.path_proof_enabled {
+                self.path_proof
+                    .prefill_kv_batch
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -13050,9 +13058,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(num_kv_heads as u64, num_tokens as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
-            self.path_proof
-                .prefill_attn_batched
-                .fetch_add(1, Ordering::Relaxed);
+            if self.path_proof_enabled {
+                self.path_proof
+                    .prefill_attn_batched
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Ok(())
         }
 
@@ -13311,9 +13321,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
             );
-            self.path_proof
-                .decode_kv_copy
-                .fetch_add(1, Ordering::Relaxed);
+            if self.path_proof_enabled {
+                self.path_proof
+                    .decode_kv_copy
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         #[allow(dead_code)] // element-wise add dispatch helper; used by full_attention_layer_step_by_idx
