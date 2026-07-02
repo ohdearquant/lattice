@@ -6,6 +6,8 @@ Pure Rust inference engine for transformer models on Apple Silicon, with a nativ
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
 [![CI](https://github.com/ohdearquant/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/lattice/actions)
 
+**[Quick start](#quick-start-cli)** · **[Lattice Studio](#lattice-studio-macos-app)** · **[Benchmarks](#benchmarks)** · **[Roadmap](#roadmap)**
+
 No ONNX. No Python. No CUDA. No external ML runtime. Lattice implements the full compute graph
 in Rust: weight loading, tokenization, forward pass, vector operations, quantization, and LoRA
 training. Hand-written Metal shaders accelerate inference on Apple Silicon. SIMD kernels (AVX2
@@ -24,7 +26,8 @@ the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
 **Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives the Rust engine
 via CLI subprocesses. Train LoRA adapters with a live loss oscilloscope, quantize models with
 a before/after comparison, hot-swap adapters in chat with zero reload, and manage your model
-library from a single window.
+library from a single window. To build and install it, follow the step-by-step guide in
+[`apps/macos/INSTALL.md`](apps/macos/INSTALL.md).
 
 ---
 
@@ -439,6 +442,21 @@ cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
 
 Performance depends on hardware, model size, batch size, and sequence length. Run benchmarks
 on your target hardware for representative numbers.
+
+---
+
+## Roadmap
+
+Three capability lanes are next for the engine:
+
+- **Vision tensors**: image input through the pure-Rust graph, from patch embedding through a
+  vision encoder and projector into the language model.
+- **Audio tensors**: on-device speech, starting with a mel-spectrogram frontend and audio
+  encoder for speech input; speech output follows.
+- **Gemma 4 model family**: broaden the engine beyond Qwen with a second model family.
+
+Tracking issues with first-milestone slices: see the
+[issue tracker](https://github.com/ohdearquant/lattice/issues).
 
 ---
 
