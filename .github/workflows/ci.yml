@@ -101,6 +101,14 @@ jobs:
       - name: embed — metal-gpu (macOS only)
         if: runner.os == 'macOS'
         run: cargo build -p lattice-embed --features metal-gpu
+      # The package-specific metal-gpu builds above only compile lattice-inference
+      # and lattice-embed. A workspace-level `--features metal-gpu` combination can
+      # still fail to compile (e.g. #537: a constructor left with a stale field set
+      # after a struct grew new fields) without either package leg catching it.
+      # Compile-only workspace check so that class of regression cannot hide again.
+      - name: workspace — metal-gpu check (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo check --workspace --features metal-gpu
       # The required `ci` job runs `cargo clippy --workspace` with DEFAULT
       # features only, so the entire metal-gpu surface — including the ~18K-line
       # metal_qwen35.rs — was never linted, and 34 clippy errors accumulated
