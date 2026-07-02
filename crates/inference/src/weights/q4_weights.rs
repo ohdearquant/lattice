@@ -741,6 +741,59 @@ pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std:
     })
 }
 
+/// Validate that `file_len` bytes are enough to cover the full Q4 block
+/// payload declared by `header`, without reading the payload itself.
+///
+/// [`load_q4_file`] fails closed on a truncated payload because its
+/// `read_exact` for the block bytes returns an `Err` short of `n_blocks *
+/// 20` bytes. The Metal no-copy mmap path (`forward::metal_qwen35::
+/// mmap_q4_weight`) has no `read_exact` to fail — it hands the whole mmap
+/// to the GPU — so this check is the sole gate standing between a
+/// truncated on-disk `.q4` file and a Metal dispatch reading past the end
+/// of the mapped payload.
+///
+/// Only compiled for tests or the `metal-gpu` feature: its sole caller is
+/// the Metal no-copy `.q4` loader in `forward::metal_qwen35`.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn validate_q4_header_payload_bounds(
+    header: &Q4FileHeader,
+    file_len: u64,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shape_product = header
+        .shape
+        .iter()
+        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+        .ok_or("shape dims overflow usize")?;
+    if shape_product != header.original_len {
+        return Err(format!(
+            "{}: shape product {shape_product} (shape={:?}) != original_len {}",
+            path.display(),
+            header.shape,
+            header.original_len
+        )
+        .into());
+    }
+
+    let payload_bytes = header
+        .original_len
+        .div_ceil(32)
+        .checked_mul(20)
+        .ok_or("Q4 block payload byte count overflows usize")? as u64;
+    let required_len = header
+        .payload_offset
+        .checked_add(payload_bytes)
+        .ok_or("Q4 payload end offset overflows u64")?;
+    if file_len < required_len {
+        return Err(format!(
+            "{}: file truncated below Q4 block payload ({file_len} bytes < required {required_len})",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Load a [`Q4Tensor`] from a `.q4` file written by [`save_q4_file`].
 ///
 /// # Errors
@@ -2192,6 +2245,87 @@ mod tests {
         assert!(
             r.is_err(),
             "shape product 64 != original_len 32 must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_q4_header_payload_bounds (issue #540): the Metal no-copy mmap
+    // loader has no `read_exact` to fail short on a truncated block payload
+    // the way `load_q4_file` does, so this helper is the sole fail-closed
+    // gate before a `.q4` file's mmap is handed to Metal dispatch.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_q4_header_payload_bounds_rejects_truncated_payload() {
+        // original_len=64 → 2 blocks × 20 bytes = 40 required payload bytes;
+        // file ends exactly at payload_offset (zero payload bytes present).
+        let header = Q4FileHeader {
+            shape: vec![64],
+            original_len: 64,
+            payload_offset: 28,
+        };
+        let r = validate_q4_header_payload_bounds(&header, 28, &std::path::PathBuf::from("t.q4"));
+        assert!(
+            r.is_err(),
+            "file truncated to payload_offset must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_q4_header_payload_bounds_rejects_one_byte_short() {
+        let header = Q4FileHeader {
+            shape: vec![64],
+            original_len: 64,
+            payload_offset: 28,
+        };
+        // Required length is payload_offset (28) + 40 = 68; one byte short.
+        let r = validate_q4_header_payload_bounds(&header, 67, &std::path::PathBuf::from("t.q4"));
+        assert!(r.is_err(), "payload one byte short of required must fail");
+    }
+
+    #[test]
+    fn test_validate_q4_header_payload_bounds_accepts_exact_length() {
+        let header = Q4FileHeader {
+            shape: vec![64],
+            original_len: 64,
+            payload_offset: 28,
+        };
+        let r = validate_q4_header_payload_bounds(&header, 68, &std::path::PathBuf::from("t.q4"));
+        assert!(
+            r.is_ok(),
+            "file with exactly the required payload bytes must be accepted: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_q4_header_payload_bounds_rejects_shape_mismatch() {
+        let header = Q4FileHeader {
+            shape: vec![4, 16], // product 64
+            original_len: 32,   // disagrees with shape product
+            payload_offset: 36,
+        };
+        let r =
+            validate_q4_header_payload_bounds(&header, 1_000, &std::path::PathBuf::from("t.q4"));
+        assert!(
+            r.is_err(),
+            "shape product != original_len must be rejected before a payload-length check"
+        );
+    }
+
+    #[test]
+    fn test_validate_q4_header_payload_bounds_rejects_huge_original_len_overflow() {
+        // original_len near usize::MAX must not panic on overflow in the
+        // block-count/byte-count arithmetic; it must return a clean Err.
+        let header = Q4FileHeader {
+            shape: vec![usize::MAX],
+            original_len: usize::MAX,
+            payload_offset: 28,
+        };
+        let r =
+            validate_q4_header_payload_bounds(&header, 1_000, &std::path::PathBuf::from("t.q4"));
+        assert!(
+            r.is_err(),
+            "huge original_len must be rejected, not panic on overflow"
         );
     }
 
