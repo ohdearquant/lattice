@@ -258,9 +258,12 @@ pub struct ModelInferenceConfig {
     /// fails closed instead of poisoning lookups with stale embeddings.
     ///
     /// If left unset (or explicitly `"none"`) in `inference_config.json`,
-    /// `ModelInferenceConfig::load` derives it as `sha256:<first 16 hex
-    /// chars of the SHA-256 of config.json>` so the compat check is
-    /// non-vacuous by default. An explicit non-`"none"` value in the JSON
+    /// `ModelInferenceConfig::load` derives it via `derive_base_model_rev`:
+    /// a boundary-sampled fingerprint over `config.json` plus the weight
+    /// shard filenames/lengths/boundary bytes, so two checkpoints that share
+    /// `config.json` but differ in weights (e.g. a HF re-upload with fixed
+    /// weights and unchanged config) derive distinct revisions instead of a
+    /// vacuously-matching one. An explicit non-`"none"` value in the JSON
     /// always wins over derivation.
     #[serde(default = "default_cache_compat_rev")]
     pub base_model_rev: String,
@@ -325,7 +328,7 @@ impl ModelInferenceConfig {
         // the manifest compat check in `cache_load` is non-vacuous by default
         // instead of comparing "none" == "none" on every real deployment.
         if cfg.base_model_rev == default_cache_compat_rev() {
-            if let Some(rev) = derive_cache_compat_rev(&model_dir.join("config.json")) {
+            if let Some(rev) = derive_base_model_rev(model_dir) {
                 cfg.base_model_rev = rev;
             }
         }
@@ -350,6 +353,131 @@ fn derive_cache_compat_rev(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let full_hex = embedding_cache_sha256_hex(&bytes);
     Some(format!("sha256:{}", &full_hex[..16]))
+}
+
+/// Number of bytes sampled from the head and tail of a weight shard larger
+/// than [`WEIGHT_FINGERPRINT_INLINE_CAP`] when folding it into
+/// `derive_base_model_rev`.
+const WEIGHT_FINGERPRINT_SAMPLE_LEN: u64 = 1024 * 1024; // 1 MiB
+/// Weight shards at or under this size are hashed in full; larger shards are
+/// hashed via [`WEIGHT_FINGERPRINT_SAMPLE_LEN`]-byte head/tail samples only,
+/// so `derive_base_model_rev` never reads a whole multi-GB checkpoint shard.
+const WEIGHT_FINGERPRINT_INLINE_CAP: u64 = 2 * 1024 * 1024; // 2 MiB
+
+/// Resolve the model directory's weight shard filenames for
+/// `derive_base_model_rev`, in the same precedence order the weight loader
+/// itself uses: a sharded `model.safetensors.index.json` if present (its
+/// `weight_map` values, deduplicated and lexically sorted so the fingerprint
+/// is stable regardless of key iteration order), else a single
+/// `model.safetensors` if present, else no weight files (config-only
+/// derivation).
+fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
+    let index_path = dir.join("model.safetensors.index.json");
+    if let Ok(index_bytes) = std::fs::read(&index_path) {
+        if let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes) {
+            if let Some(weight_map) = index_json.get("weight_map").and_then(|v| v.as_object()) {
+                let files: std::collections::BTreeSet<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if !files.is_empty() {
+                    return files.into_iter().collect();
+                }
+            }
+        }
+    }
+    if dir.join("model.safetensors").is_file() {
+        return vec!["model.safetensors".to_string()];
+    }
+    Vec::new()
+}
+
+/// Fold one weight shard's filename, byte length, and boundary-sampled
+/// content into `hasher`, as part of `derive_base_model_rev`. Shards at or
+/// under [`WEIGHT_FINGERPRINT_INLINE_CAP`] are hashed whole; larger shards
+/// are hashed via their first and last [`WEIGHT_FINGERPRINT_SAMPLE_LEN`]
+/// bytes only. Uses buffered/seeked reads throughout — never loads a whole
+/// multi-GB shard into memory.
+fn fold_weight_file_into_hasher(
+    hasher: &mut Sha256,
+    dir: &Path,
+    file_name: &str,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = dir.join(file_name);
+    let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
+    let len = file.get_ref().metadata()?.len();
+
+    hasher.update(file_name.as_bytes());
+    hasher.update(len.to_le_bytes());
+
+    if len <= WEIGHT_FINGERPRINT_INLINE_CAP {
+        let mut buf = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buf)?;
+        hasher.update(&buf);
+        return Ok(());
+    }
+
+    let sample_len = WEIGHT_FINGERPRINT_SAMPLE_LEN as usize;
+    let mut head = vec![0u8; sample_len];
+    file.read_exact(&mut head)?;
+    hasher.update(&head);
+
+    file.seek(SeekFrom::Start(len - WEIGHT_FINGERPRINT_SAMPLE_LEN))?;
+    let mut tail = vec![0u8; sample_len];
+    file.read_exact(&mut tail)?;
+    hasher.update(&tail);
+
+    Ok(())
+}
+
+/// Derive `base_model_rev` from `config.json` plus a boundary-sampled
+/// fingerprint of the model directory's weight files, so two checkpoints
+/// that share `config.json` (and `tokenizer.json`) but differ in weights —
+/// e.g. a HF re-upload that fixes weights but leaves config unchanged —
+/// derive distinct revisions instead of an identical one that would let a
+/// stale embedding cache pass the `cache_load` compat check.
+///
+/// This is a **boundary-sampled revision fingerprint, not an
+/// adversarial-collision-resistant content hash**: for each resolved weight
+/// shard (see [`resolve_weight_fingerprint_files`]) it folds in the shard's
+/// filename, byte length, and first/last 1 MiB of content, not every byte
+/// of every shard. It is designed to detect checkpoint revision drift,
+/// including weight-only updates, cheaply — it is not designed to resist a
+/// file crafted to preserve this fingerprint while corrupting unsampled
+/// bytes. The integrity boundary for the cache payload itself remains
+/// `payload_sha256` in the embedding cache manifest, which does hash every
+/// payload byte.
+///
+/// Returns `None` only when `config.json` itself is missing or unreadable
+/// (mirroring `derive_cache_compat_rev`), in which case the caller leaves
+/// `base_model_rev` at its existing sentinel. A read failure partway
+/// through a weight file degrades gracefully to the config-only derivation
+/// (`derive_cache_compat_rev`) rather than failing `ModelInferenceConfig`
+/// construction.
+fn derive_base_model_rev(dir: &Path) -> Option<String> {
+    let config_path = dir.join("config.json");
+    let config_bytes = std::fs::read(&config_path).ok()?;
+
+    let weight_files = resolve_weight_fingerprint_files(dir);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&config_bytes);
+
+    for file_name in &weight_files {
+        if fold_weight_file_into_hasher(&mut hasher, dir, file_name).is_err() {
+            return derive_cache_compat_rev(&config_path);
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Some(format!("sha256:{}", &hex[..16]))
 }
 
 /// Pre-allocated buffers for the forward pass, reused across calls.
@@ -447,6 +575,19 @@ const EMBEDDING_CACHE_VERSION: u32 = 1;
 /// Upper bound on the manifest header length, rejected before JSON parsing
 /// so a corrupt or hostile `manifest_len` cannot drive an oversized read.
 const EMBEDDING_CACHE_MANIFEST_CAP: u32 = 64 * 1024;
+
+/// Process-global counter folded into `cache_save`'s temp file name so two
+/// threads in the same process (e.g. two `NativeEmbeddingService` instances
+/// sharing a global cache path) never race on the same `<name>.tmp.<pid>`
+/// path — the previous PID-only name was unique across processes but not
+/// within one, letting concurrent saves overwrite or rename over each
+/// other's temp file.
+static EMBEDDING_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bound on retries when a `<name>.tmp.<pid>.<seq>` path unexpectedly
+/// already exists (e.g. a leftover from a killed process that reused a PID
+/// and hit the same sequence number). `cache_save` fails closed rather than
+/// looping forever once this many attempts collide.
+const EMBEDDING_CACHE_TMP_MAX_ATTEMPTS: u32 = 16;
 
 /// Integrity and compatibility manifest embedded in the embedding cache
 /// file header, mirroring the LoRA adapter manifest pattern
@@ -751,24 +892,7 @@ impl QwenModel {
             self.dimensions(),
             count,
         )?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
-        }
-        let mut tmp_name = path
-            .file_name()
-            .map(std::ffi::OsStr::to_os_string)
-            .unwrap_or_else(|| std::ffi::OsString::from("embedding_cache"));
-        tmp_name.push(format!(".tmp.{}", std::process::id()));
-        let tmp_path = path.with_file_name(tmp_name);
-        if let Err(e) = std::fs::write(&tmp_path, &file_bytes) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(InferenceError::Inference(format!("cache save: {e}")));
-        }
-        if let Err(e) = std::fs::rename(&tmp_path, path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(InferenceError::Inference(format!("cache save: {e}")));
-        }
+        write_embedding_cache_file_atomic(path, &file_bytes)?;
         Ok(count)
     }
 
@@ -1802,6 +1926,85 @@ fn wrap_embedding_cache_payload(
     Ok(file_bytes)
 }
 
+/// Open a temp file next to `path` under a name guaranteed unique for this
+/// call: `<path's file name>.tmp.<pid>.<seq>`, where `seq` comes from the
+/// process-global `EMBEDDING_CACHE_TMP_SEQ` counter. Opened with
+/// `File::create_new` so the open itself fails closed instead of silently
+/// truncating an existing file if the name is somehow already taken (e.g. a
+/// leftover from a killed process that reused both the PID and the
+/// in-process sequence number); on that collision, retries with the next
+/// sequence number up to `EMBEDDING_CACHE_TMP_MAX_ATTEMPTS` times.
+///
+/// This is what makes concurrent `cache_save` calls in the same process
+/// safe: the previous `<name>.tmp.<pid>` scheme was unique across processes
+/// but not within one, so two threads saving to the same shared cache path
+/// could open/write/rename over each other's temp file.
+fn open_unique_embedding_cache_tmp_file(
+    path: &Path,
+) -> Result<(std::path::PathBuf, std::fs::File), InferenceError> {
+    let base_tmp_name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("embedding_cache"));
+    let pid = std::process::id();
+
+    for _ in 0..EMBEDDING_CACHE_TMP_MAX_ATTEMPTS {
+        let seq = EMBEDDING_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = base_tmp_name.clone();
+        name.push(format!(".tmp.{pid}.{seq}"));
+        let candidate = path.with_file_name(name);
+        match std::fs::File::create_new(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(InferenceError::Inference(format!("cache save: {e}"))),
+        }
+    }
+
+    Err(InferenceError::Inference(format!(
+        "cache save: exhausted {EMBEDDING_CACHE_TMP_MAX_ATTEMPTS} unique temp file name attempts for {}",
+        path.display()
+    )))
+}
+
+/// Atomically write `file_bytes` to `path`: create the parent directory if
+/// needed, write to a call-unique temp file in the same directory (see
+/// [`open_unique_embedding_cache_tmp_file`]), then `fs::rename` it over
+/// `path` so a crash or kill mid-write cannot leave a truncated file at
+/// `path` — the fail-closed loader would otherwise reject that truncated
+/// file forever. Mirrors the temp-file + rename pattern in
+/// `forward::metal_qwen35::write_merged_qkvz`.
+///
+/// Shared by `QwenModel::cache_save` and its concurrency test so both
+/// exercise the exact same collision-safe temp-naming and write logic.
+fn write_embedding_cache_file_atomic(path: &Path, file_bytes: &[u8]) -> Result<(), InferenceError> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
+    }
+
+    let (tmp_path, mut tmp_file) = open_unique_embedding_cache_tmp_file(path)?;
+
+    if let Err(e) = tmp_file.write_all(file_bytes) {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    if let Err(e) = tmp_file.flush() {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    drop(tmp_file);
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    Ok(())
+}
+
 /// Parse and fully validate an embedding cache file: magic, version,
 /// manifest length cap, payload SHA-256, base-model/tokenizer compatibility,
 /// dimension, finiteness, and exact payload consumption. Returns `Err`
@@ -2480,6 +2683,148 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Writes `len` bytes of a deterministic (non-zero, non-repeating-run)
+    /// pattern to `path`, for `derive_base_model_rev` weight-fingerprint
+    /// tests. No real model weights needed — the derivation only samples
+    /// filename/length/boundary bytes.
+    fn write_pattern_bytes(path: &Path, len: usize) {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Flips one byte (XOR 0xFF) at `offset` in the file at `path`.
+    fn flip_byte_at(path: &Path, offset: usize) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[offset] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn derive_base_model_rev_stable_across_calls() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_stable");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        write_pattern_bytes(&tmp.join("model.safetensors"), 3 * 1024 * 1024);
+
+        let rev1 = derive_base_model_rev(&tmp);
+        let rev2 = derive_base_model_rev(&tmp);
+        assert!(rev1.is_some());
+        assert_eq!(rev1, rev2, "deriving twice on the same dir must be stable");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_first_1mib_flip() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_head_flip");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 3 * 1024 * 1024);
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&weights_path, 512 * 1024); // inside the first 1 MiB
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the first 1 MiB of a >2 MiB weight file must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_last_1mib_flip() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_tail_flip");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        let len = 3 * 1024 * 1024;
+        write_pattern_bytes(&weights_path, len);
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&weights_path, len - 512 * 1024); // inside the last 1 MiB
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the last 1 MiB of a >2 MiB weight file must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_length_change() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_len_change");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 4096);
+
+        let before = derive_base_model_rev(&tmp);
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        bytes.push(0u8);
+        std::fs::write(&weights_path, &bytes).unwrap();
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "changing the weight file length (content otherwise unchanged) must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_sharded_flip_second_shard() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_sharded");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let shard1 = tmp.join("model-00001-of-00002.safetensors");
+        let shard2 = tmp.join("model-00002-of-00002.safetensors");
+        write_pattern_bytes(&shard1, 4096);
+        write_pattern_bytes(&shard2, 4096);
+        let index_json = r#"{"weight_map": {
+            "a.weight": "model-00001-of-00002.safetensors",
+            "b.weight": "model-00002-of-00002.safetensors",
+            "c.weight": "model-00002-of-00002.safetensors"
+        }}"#;
+        std::fs::write(tmp.join("model.safetensors.index.json"), index_json).unwrap();
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&shard2, 10);
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the second (non-first-mentioned) shard must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_no_weight_files_equals_config_only() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_no_weights");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_bytes = b"{\"hidden_size\":1024}";
+        std::fs::write(tmp.join("config.json"), config_bytes).unwrap();
+
+        let rev = derive_base_model_rev(&tmp);
+        let expected = derive_cache_compat_rev(&tmp.join("config.json"));
+        assert!(rev.is_some());
+        assert_eq!(
+            rev, expected,
+            "with no weight files present, derivation must equal the config-only derivation"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn test_model_inference_config_load_malformed_json() {
         let tmp = std::env::temp_dir().join("lattice_test_malformed_cfg");
@@ -2875,8 +3220,8 @@ mod tests {
     #[test]
     fn qwen_cache_save_leaves_no_tmp_file_behind() {
         // FIX 2 regression: `cache_save` writes to a temp file and renames
-        // it over the target, so no `.tmp.<pid>` file should remain in the
-        // directory once `cache_save` returns `Ok`.
+        // it over the target, so no `.tmp.<pid>.<seq>` file should remain in
+        // the directory once `cache_save` returns `Ok`.
         let tmp = std::env::temp_dir().join("lattice_test_cache_save_no_tmp_leftover");
         // Clean up any leftovers from a prior interrupted/failed run before
         // creating, so this test's own assertions can't be polluted by them.
@@ -2903,6 +3248,169 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "temp file(s) left behind after cache_save: {leftover:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_load_rejects_stale_cache_after_weight_only_change() {
+        // FIX-A end-to-end regression: two checkpoints sharing config.json
+        // (and tokenizer.json, absent here) but differing only in weights
+        // must NOT derive the same `base_model_rev` — otherwise a cache
+        // built against the old weights would silently pass `cache_load`'s
+        // compat check against the new ones.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_rejects_weight_drift");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 4096);
+        let cache_path = tmp.join("cache.bin");
+
+        let cfg1 = ModelInferenceConfig::load(&tmp);
+        let saver = build_cache_test_model(cfg1.clone(), 3);
+        saver.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+        saver.cache_save(&cache_path).unwrap();
+
+        // Weight-only drift: config.json (and the absent tokenizer.json) are
+        // untouched, only the weight file's bytes change.
+        flip_byte_at(&weights_path, 10);
+
+        let cfg2 = ModelInferenceConfig::load(&tmp);
+        assert_ne!(
+            cfg1.base_model_rev, cfg2.base_model_rev,
+            "weight-only drift must change the derived base_model_rev"
+        );
+
+        let loader = build_cache_test_model(cfg2, 3);
+        let err = loader.cache_load(&cache_path).unwrap_err();
+        assert!(
+            format!("{err}").contains("base_model_rev"),
+            "error must name base_model_rev, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_save_sequential_calls_leave_one_final_file() {
+        // FIX-B regression: repeated `cache_save` calls in the same process
+        // (now each minting a distinct `<name>.tmp.<pid>.<seq>` name) must
+        // still converge on exactly one final file with no temp leftovers.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_sequential");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+        let model = build_cache_test_model(cfg, 3);
+        for i in 0..5u64 {
+            model
+                .cache
+                .lock()
+                .unwrap()
+                .insert(i, vec![i as f32, 0.0, 0.0]);
+            let n = model.cache_save(&path).unwrap();
+            assert_eq!(n, (i + 1) as usize);
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one final file expected, found: {entries:?}"
+        );
+        assert_eq!(
+            entries[0].file_name(),
+            std::ffi::OsString::from("cache.bin")
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_save_concurrent_saves_no_torn_output() {
+        // FIX-B regression: distinct threads in one process sharing the same
+        // final cache path must not collide on `cache_save`'s temp file name
+        // and clobber/tear each other's write. Each thread saves a
+        // DIFFERENT single-entry cache to the SAME final path; whichever
+        // thread's rename lands last must win cleanly (exactly one intact
+        // entry), never a torn or merged file.
+        //
+        // Mutation-sensitivity note (see task report): this exercises real
+        // OS thread interleaving, so it is a probabilistic guard, not a
+        // deterministic one — under the reverted PID-only naming the race
+        // window is narrow (temp file open + write + rename), so failure
+        // isn't guaranteed on every run even though the bug is real.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_concurrent");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+
+        const N: u64 = 8;
+        let candidates: Vec<(u64, Vec<f32>)> = (0..N)
+            .map(|i| (i, vec![i as f32, i as f32 + 1.0, i as f32 + 2.0]))
+            .collect();
+
+        let handles: Vec<_> = candidates
+            .clone()
+            .into_iter()
+            .map(|(key, floats)| {
+                let cfg = cfg.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let model = build_cache_test_model(cfg, 3);
+                    model.cache.lock().unwrap().insert(key, floats);
+                    model.cache_save(&path)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .expect("save thread must not panic")
+                .expect("cache_save must not error under concurrent same-path saves");
+        }
+
+        let loader = build_cache_test_model(cfg, 3);
+        let loaded = loader.cache_load(&path).unwrap();
+        assert_eq!(
+            loaded, 1,
+            "final file must contain exactly one thread's single entry, no torn/merged output"
+        );
+        {
+            let cache = loader.cache.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            let (&winning_key, winning_floats) = cache.iter().next().unwrap();
+            let expected = candidates
+                .iter()
+                .find(|(k, _)| *k == winning_key)
+                .expect("winning key must be exactly one of the 8 candidate entries");
+            assert_eq!(winning_floats, &expected.1);
+        }
+
+        let leftover: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file(s) left behind after concurrent cache_save: {leftover:?}"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
