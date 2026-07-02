@@ -243,6 +243,42 @@ fn test_load_weights_rejects_mutated_clone_hash() {
 }
 
 #[test]
+fn test_load_weights_rejects_mutated_clone_path() {
+    // Path half of the canonical-record disagreement guard. The redirected
+    // file holds byte-identical content and the clone's hash is left
+    // canonical, so if the `weights_path` predicate were removed the load
+    // would wrongly SUCCEED (canonical path + canonical hash still line
+    // up) — the hash comparison cannot mask this test.
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = ModelRegistry::with_path(tmp.path()).unwrap();
+    let model = RegisteredModel::new("test", "1.0.0");
+    let weights = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+    let id = registry.register(model, &weights).unwrap();
+
+    let canonical_file = tmp.path().join("test/1.0.0/weights.bin");
+    let alt_rel = "test/1.0.0/weights_alt.bin";
+    std::fs::copy(&canonical_file, tmp.path().join(alt_rel)).unwrap();
+
+    let mut redirected = registry.get_by_id(&id).unwrap();
+    redirected.weights_path = Some(alt_rel.to_string());
+
+    let err = registry
+        .load_weights(&redirected)
+        .expect_err("load_weights must reject a clone with a redirected weights_path");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+    let err = registry
+        .load_weights_verified(&redirected)
+        .expect_err("load_weights_verified must reject a clone with a redirected weights_path");
+    assert!(
+        matches!(err, TuneError::Storage(_)),
+        "expected canonical-record disagreement rejection, got: {err:?}"
+    );
+}
+
+#[test]
 fn test_load_weights_rejects_unregistered_model() {
     // A RegisteredModel value that was never registered (or was deleted)
     // has no canonical record to verify against — it must not load at all.
