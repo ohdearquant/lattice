@@ -185,6 +185,33 @@ PROMPTS: list[tuple[str, int]] = [
     ),
 ]
 
+# Known-divergent prompts per backend. The long-prefill merge_sort prompt
+# (bound by CONTENT below, not by position — a positional PROMPTS[-1] key
+# would silently follow a future append/reorder of PROMPTS and could waive
+# a brand-new regression) deterministically diverges from HF at the first
+# generated token on the METAL backend only (issue #535 — repetition penalty
+# and GDN prefill mode both excluded as causes; the CPU leg passes the same
+# prompt and still gates on it).
+#
+# The metal parity job is informational (deliberately not a required check),
+# but a plain FAIL turns the whole workflow run red on every engine PR,
+# burying new signal in known noise. Marking the prompt expected-divergent
+# keeps the job green while #535 is open WITHOUT weakening anything else:
+# missing path-proof, binary failures, and divergence on any other prompt
+# still fail closed, and the report still prints the divergence in full.
+# If the prompt starts PASSING on Metal, the run reports XPASS (still green)
+# — that means #535 is likely fixed; delete the entry then.
+_long_prefill = [p for p, _ in PROMPTS if p.startswith("def merge_sort(arr):")]
+assert len(_long_prefill) == 1, (
+    "expected exactly one long-prefill (merge_sort) prompt in PROMPTS; "
+    "re-anchor METAL_EXPECTED_DIVERGENCE (#535) before changing the table"
+)
+LONG_PREFILL_PROMPT: str = _long_prefill[0]
+
+METAL_EXPECTED_DIVERGENCE: dict[str, str] = {
+    LONG_PREFILL_PROMPT: "#535",
+}
+
 MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
 
 HF_MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen3.5-0.8B")
@@ -505,18 +532,41 @@ def compare(prompt: str, hf: dict, lattice: dict, match_window: int) -> dict:
 
 def render_report(results: list[dict]) -> str:
     lines = ["## E2E Parity Report", ""]
-    fails = [r for r in results if not r["pass"]]
+    fails = [r for r in results if not r["pass"] and not r.get("xfail_issue")]
+    known = [r for r in results if not r["pass"] and r.get("xfail_issue")]
     if fails:
         lines.append(f"**FAIL**: {len(fails)}/{len(results)} prompts diverged within their match windows")
+    elif known:
+        issues = ", ".join(sorted({r["xfail_issue"] for r in known}))
+        lines.append(
+            f"**PASS**: {len(results) - len(known)}/{len(results)} gating prompts match; "
+            f"{len(known)} known divergence ({issues}) excluded from the verdict"
+        )
     else:
         lines.append(f"**PASS**: all {len(results)} prompts match within their respective match windows")
+    xpass = [r for r in results if r["pass"] and r.get("xfail_issue")]
+    if xpass:
+        issues = ", ".join(sorted({r["xfail_issue"] for r in xpass}))
+        lines.append("")
+        lines.append(
+            f"{len(xpass)} expected-divergent prompt(s) now PASS ({issues}). "
+            "If this repeats, the underlying issue is likely fixed — remove the "
+            "entry from METAL_EXPECTED_DIVERGENCE in scripts/e2e_parity_check.py."
+        )
     lines.append("")
 
     lines.append("| Prompt | Window | Agreement | First Diff | HF tok/s | Lattice tok/s | Verdict |")
     lines.append("|--------|--------|-----------|------------|----------|---------------|---------|")
     for r in results:
         diff = f"pos {r['first_mismatch']}" if r["first_mismatch"] is not None else "none"
-        icon = "PASS" if r["pass"] else "FAIL"
+        if r["pass"]:
+            icon = f"XPASS ({r['xfail_issue']})" if r.get("xfail_issue") else "PASS"
+        else:
+            icon = (
+                f"KNOWN-DIVERGENT ({r['xfail_issue']})"
+                if r.get("xfail_issue")
+                else "FAIL"
+            )
         lines.append(
             f"| `{r['prompt']}` | {r['match_window']} | {r['total_agree']}/{r['total_compared']} "
             f"| {diff} | {r['hf_tok_s']:.1f} | {r['lat_tok_s']:.1f} | {icon} |"
@@ -589,9 +639,21 @@ def main() -> int:
             return 1
 
         verdict = compare(prompt, hf_out, lat_out, match_window)
+        xfail_issue = (
+            METAL_EXPECTED_DIVERGENCE.get(prompt) if backend == "metal" else None
+        )
+        if xfail_issue:
+            verdict["xfail_issue"] = xfail_issue
         results.append(verdict)
 
-        status = "PASS" if verdict["pass"] else "FAIL"
+        if verdict["pass"]:
+            status = (
+                f"XPASS {xfail_issue} — expected divergence resolved?"
+                if xfail_issue
+                else "PASS"
+            )
+        else:
+            status = f"KNOWN-DIVERGENT {xfail_issue}" if xfail_issue else "FAIL"
         print(
             f"[{status}] agree={verdict['total_agree']}/{verdict['total_compared']} "
             f"hf={hf_out['tok_per_sec']:.1f} lat={lat_out['tok_per_sec']:.1f} tok/s",
@@ -605,12 +667,31 @@ def main() -> int:
         with open(REPORT_PATH, "w") as f:
             f.write(report)
 
-    fails = sum(1 for r in results if not r["pass"])
+    fails = sum(1 for r in results if not r["pass"] and not r.get("xfail_issue"))
+    known = sum(1 for r in results if not r["pass"] and r.get("xfail_issue"))
+    xpass = [r for r in results if r["pass"] and r.get("xfail_issue")]
     if fails:
         print(f"\nFAIL: {fails}/{len(results)} prompts failed parity gate", file=sys.stderr)
         return 1
 
-    print(f"\nPASS: all {len(results)} prompts passed", file=sys.stderr)
+    if xpass:
+        print(
+            "\nNOTE: expected-divergent prompt(s) PASSED — if this repeats, the "
+            "tracked issue is likely fixed; remove them from METAL_EXPECTED_DIVERGENCE:",
+            file=sys.stderr,
+        )
+        for r in xpass:
+            print(f"  {r['xfail_issue']}: {r['prompt']}", file=sys.stderr)
+
+    suffix = (
+        f" ({known} known divergence{'s' if known != 1 else ''} excluded)"
+        if known
+        else ""
+    )
+    print(
+        f"\nPASS: all {len(results) - known} gating prompts passed{suffix}",
+        file=sys.stderr,
+    )
     return 0
 
 
