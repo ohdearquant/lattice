@@ -1387,6 +1387,48 @@ mod tests {
     }
 
     #[test]
+    fn paged_lru_overflow_leaves_live_pages_unchanged() {
+        let mut config = make_config(2); // 2 pages * page_size 4 = 8 max_tokens.
+        config.eviction = EvictionPolicy::Lru;
+        let kv_dim = config.kv_dim();
+        let max_tokens = config.max_tokens();
+        let mut cache = PagedKVCache::new(config);
+
+        for step in 0..max_tokens {
+            for layer in 0..2 {
+                let k = vec![step as f32; kv_dim];
+                let v = vec![1000.0 + step as f32; kv_dim];
+                cache.append_kv_layer(layer, &k, &v);
+            }
+            cache.advance();
+        }
+
+        let overflow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for layer in 0..2 {
+                let k = vec![999.0; kv_dim];
+                let v = vec![1999.0; kv_dim];
+                cache.append_kv_layer(layer, &k, &v);
+            }
+        }));
+        assert!(overflow.is_err(), "LRU overflow should fail closed");
+
+        assert_eq!(cache.seq_len(), max_tokens);
+        assert_eq!(cache.num_pages(), 2);
+
+        let mut k_buf = vec![0.0f32; max_tokens * kv_dim];
+        let mut v_buf = vec![0.0f32; max_tokens * kv_dim];
+        cache.gather_k(0, &mut k_buf);
+        cache.gather_v(0, &mut v_buf);
+
+        for step in 0..max_tokens {
+            for i in 0..kv_dim {
+                assert_eq!(k_buf[step * kv_dim + i], step as f32);
+                assert_eq!(v_buf[step * kv_dim + i], 1000.0 + step as f32);
+            }
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "page_size must be non-zero")]
     fn paged_zero_page_size_panics_at_construction() {
         // Regression for #244: page_size == 0 is the divisor in PageTable::resolve,
