@@ -68,7 +68,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.engine == 'true'
     runs-on: macos-latest
-    timeout-minutes: 15
+    # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
+    # variance exceeds the old ~17% headroom — two consecutive timeout
+    # cancellations mid-prompt-4 on 2026-07-01 (issue #532). Now that the
+    # gate fails closed, a timeout is a hard red, so the budget must cover
+    # the slow tail of the runner pool.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
