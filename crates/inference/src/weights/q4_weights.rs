@@ -77,6 +77,12 @@ pub struct Q4Block {
 // Compile-time size assertion — must be exactly 20 bytes (2 + 2 + 16, no padding).
 const _: () = assert!(std::mem::size_of::<Q4Block>() == 20);
 
+/// Serialized size in bytes of one [`Q4Block`] (2 scale + 2 bias + 16 packed = 20).
+///
+/// Derive block-byte accounting from this constant rather than a magic literal so
+/// it can never drift from the struct layout asserted above.
+pub const Q4_BLOCK_BYTES: usize = std::mem::size_of::<Q4Block>();
+
 /// A Q4_0 quantized tensor.
 ///
 /// Stores blocks, shape metadata, and the count of valid original weights (the last
