@@ -185,8 +185,10 @@ PROMPTS: list[tuple[str, int]] = [
     ),
 ]
 
-# Known-divergent prompts per backend. The long-prefill prompt (the LAST
-# entry in PROMPTS above) deterministically diverges from HF at the first
+# Known-divergent prompts per backend. The long-prefill merge_sort prompt
+# (bound by CONTENT below, not by position — a positional PROMPTS[-1] key
+# would silently follow a future append/reorder of PROMPTS and could waive
+# a brand-new regression) deterministically diverges from HF at the first
 # generated token on the METAL backend only (issue #535 — repetition penalty
 # and GDN prefill mode both excluded as causes; the CPU leg passes the same
 # prompt and still gates on it).
@@ -199,8 +201,15 @@ PROMPTS: list[tuple[str, int]] = [
 # still fail closed, and the report still prints the divergence in full.
 # If the prompt starts PASSING on Metal, the run reports XPASS (still green)
 # — that means #535 is likely fixed; delete the entry then.
+_long_prefill = [p for p, _ in PROMPTS if p.startswith("def merge_sort(arr):")]
+assert len(_long_prefill) == 1, (
+    "expected exactly one long-prefill (merge_sort) prompt in PROMPTS; "
+    "re-anchor METAL_EXPECTED_DIVERGENCE (#535) before changing the table"
+)
+LONG_PREFILL_PROMPT: str = _long_prefill[0]
+
 METAL_EXPECTED_DIVERGENCE: dict[str, str] = {
-    PROMPTS[-1][0]: "#535",
+    LONG_PREFILL_PROMPT: "#535",
 }
 
 MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
@@ -535,6 +544,15 @@ def render_report(results: list[dict]) -> str:
         )
     else:
         lines.append(f"**PASS**: all {len(results)} prompts match within their respective match windows")
+    xpass = [r for r in results if r["pass"] and r.get("xfail_issue")]
+    if xpass:
+        issues = ", ".join(sorted({r["xfail_issue"] for r in xpass}))
+        lines.append("")
+        lines.append(
+            f"{len(xpass)} expected-divergent prompt(s) now PASS ({issues}). "
+            "If this repeats, the underlying issue is likely fixed — remove the "
+            "entry from METAL_EXPECTED_DIVERGENCE in scripts/e2e_parity_check.py."
+        )
     lines.append("")
 
     lines.append("| Prompt | Window | Agreement | First Diff | HF tok/s | Lattice tok/s | Verdict |")
