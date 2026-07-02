@@ -16,7 +16,7 @@ wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = []
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
-download = ["dep:ureq", "dep:sha2"]
+download = ["dep:ureq"]
 train-backward = []
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # blend_lora_layer_data and generate_with_lora_mixture do NOT require this
@@ -41,7 +41,7 @@ axum = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 ureq = { version = "2", features = ["tls"], optional = true }
-sha2 = { workspace = true, optional = true }
+sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }

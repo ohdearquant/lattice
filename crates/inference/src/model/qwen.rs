@@ -12,6 +12,7 @@ use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -251,6 +252,32 @@ pub struct ModelInferenceConfig {
 
     #[serde(default = "default_gpu_max_seq_len")]
     pub gpu_max_seq_len: usize,
+
+    /// Base model revision the embedding cache was produced against. Checked
+    /// at `cache_load` time so a cache built for a different model revision
+    /// fails closed instead of poisoning lookups with stale embeddings.
+    ///
+    /// If left unset (or explicitly `"none"`) in `inference_config.json`,
+    /// `ModelInferenceConfig::load` derives it via `derive_base_model_rev`:
+    /// a boundary-sampled fingerprint over `config.json` plus the weight
+    /// shard filenames/lengths/boundary bytes, so two checkpoints that share
+    /// `config.json` but differ in weights (e.g. a HF re-upload with fixed
+    /// weights and unchanged config) derive distinct revisions instead of a
+    /// vacuously-matching one. An explicit non-`"none"` value in the JSON
+    /// always wins over derivation.
+    #[serde(default = "default_cache_compat_rev")]
+    pub base_model_rev: String,
+
+    /// Tokenizer revision the embedding cache was produced against, checked
+    /// the same way as `base_model_rev`.
+    ///
+    /// If left unset (or explicitly `"none"`) in `inference_config.json`,
+    /// `ModelInferenceConfig::load` derives it as `sha256:<first 16 hex
+    /// chars of the SHA-256 of tokenizer.json>` so the compat check is
+    /// non-vacuous by default. An explicit non-`"none"` value in the JSON
+    /// always wins over derivation.
+    #[serde(default = "default_cache_compat_rev")]
+    pub tokenizer_rev: String,
 }
 
 fn default_eos_token_id() -> u32 {
@@ -262,6 +289,9 @@ fn default_rope_table_max_seq_len() -> usize {
 fn default_gpu_max_seq_len() -> usize {
     2048
 }
+fn default_cache_compat_rev() -> String {
+    "none".to_string()
+}
 
 impl Default for ModelInferenceConfig {
     fn default() -> Self {
@@ -269,6 +299,8 @@ impl Default for ModelInferenceConfig {
             eos_token_id: default_eos_token_id(),
             rope_table_max_seq_len: default_rope_table_max_seq_len(),
             gpu_max_seq_len: default_gpu_max_seq_len(),
+            base_model_rev: default_cache_compat_rev(),
+            tokenizer_rev: default_cache_compat_rev(),
         }
     }
 }
@@ -276,7 +308,7 @@ impl Default for ModelInferenceConfig {
 impl ModelInferenceConfig {
     pub fn load(model_dir: &Path) -> Self {
         let path = model_dir.join("inference_config.json");
-        match std::fs::read_to_string(&path) {
+        let mut cfg = match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Self>(&text) {
                 Ok(cfg) => cfg,
                 Err(e) => {
@@ -289,8 +321,164 @@ impl ModelInferenceConfig {
                 }
             },
             Err(_) => Self::default(),
+        };
+
+        // An explicit value in inference_config.json always wins; only derive
+        // a real revision when the field is still at the "unset" sentinel, so
+        // the manifest compat check in `cache_load` is non-vacuous by default
+        // instead of comparing "none" == "none" on every real deployment.
+        if cfg.base_model_rev == default_cache_compat_rev() {
+            if let Some(rev) = derive_base_model_rev(model_dir) {
+                cfg.base_model_rev = rev;
+            }
+        }
+        if cfg.tokenizer_rev == default_cache_compat_rev() {
+            if let Some(rev) = derive_cache_compat_rev(&model_dir.join("tokenizer.json")) {
+                cfg.tokenizer_rev = rev;
+            }
+        }
+
+        cfg
+    }
+}
+
+/// Derive a short, stable revision tag from a file's contents:
+/// `sha256:<first 16 hex chars of the file's SHA-256>`. Used to give
+/// `base_model_rev`/`tokenizer_rev` a real, content-addressed value when
+/// `inference_config.json` does not set one explicitly. Returns `None` if the
+/// file is missing or unreadable — callers must leave the field at its
+/// existing sentinel in that case, since a missing derivation source is not a
+/// construction failure.
+fn derive_cache_compat_rev(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let full_hex = embedding_cache_sha256_hex(&bytes);
+    Some(format!("sha256:{}", &full_hex[..16]))
+}
+
+/// Number of bytes sampled from the head and tail of a weight shard larger
+/// than [`WEIGHT_FINGERPRINT_INLINE_CAP`] when folding it into
+/// `derive_base_model_rev`.
+const WEIGHT_FINGERPRINT_SAMPLE_LEN: u64 = 1024 * 1024; // 1 MiB
+/// Weight shards at or under this size are hashed in full; larger shards are
+/// hashed via [`WEIGHT_FINGERPRINT_SAMPLE_LEN`]-byte head/tail samples only,
+/// so `derive_base_model_rev` never reads a whole multi-GB checkpoint shard.
+const WEIGHT_FINGERPRINT_INLINE_CAP: u64 = 2 * 1024 * 1024; // 2 MiB
+
+/// Resolve the model directory's weight shard filenames for
+/// `derive_base_model_rev`, in the same precedence order the weight loader
+/// itself uses: a single `model.safetensors` if present — matching
+/// `QwenModel::from_directory`, which takes the single-file path first when
+/// both a single file and a sharded index exist — else a sharded
+/// `model.safetensors.index.json` if present (its `weight_map` values,
+/// deduplicated and lexically sorted so the fingerprint is stable regardless
+/// of key iteration order), else no weight files (config-only derivation).
+fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
+    if dir.join("model.safetensors").is_file() {
+        return vec!["model.safetensors".to_string()];
+    }
+    let index_path = dir.join("model.safetensors.index.json");
+    if let Ok(index_bytes) = std::fs::read(&index_path) {
+        if let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes) {
+            if let Some(weight_map) = index_json.get("weight_map").and_then(|v| v.as_object()) {
+                let files: std::collections::BTreeSet<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                if !files.is_empty() {
+                    return files.into_iter().collect();
+                }
+            }
         }
     }
+    Vec::new()
+}
+
+/// Fold one weight shard's filename, byte length, and boundary-sampled
+/// content into `hasher`, as part of `derive_base_model_rev`. Shards at or
+/// under [`WEIGHT_FINGERPRINT_INLINE_CAP`] are hashed whole; larger shards
+/// are hashed via their first and last [`WEIGHT_FINGERPRINT_SAMPLE_LEN`]
+/// bytes only. Uses buffered/seeked reads throughout — never loads a whole
+/// multi-GB shard into memory.
+fn fold_weight_file_into_hasher(
+    hasher: &mut Sha256,
+    dir: &Path,
+    file_name: &str,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = dir.join(file_name);
+    let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
+    let len = file.get_ref().metadata()?.len();
+
+    hasher.update(file_name.as_bytes());
+    hasher.update(len.to_le_bytes());
+
+    if len <= WEIGHT_FINGERPRINT_INLINE_CAP {
+        let mut buf = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buf)?;
+        hasher.update(&buf);
+        return Ok(());
+    }
+
+    let sample_len = WEIGHT_FINGERPRINT_SAMPLE_LEN as usize;
+    let mut head = vec![0u8; sample_len];
+    file.read_exact(&mut head)?;
+    hasher.update(&head);
+
+    file.seek(SeekFrom::Start(len - WEIGHT_FINGERPRINT_SAMPLE_LEN))?;
+    let mut tail = vec![0u8; sample_len];
+    file.read_exact(&mut tail)?;
+    hasher.update(&tail);
+
+    Ok(())
+}
+
+/// Derive `base_model_rev` from `config.json` plus a boundary-sampled
+/// fingerprint of the model directory's weight files, so two checkpoints
+/// that share `config.json` (and `tokenizer.json`) but differ in weights —
+/// e.g. a HF re-upload that fixes weights but leaves config unchanged —
+/// derive distinct revisions instead of an identical one that would let a
+/// stale embedding cache pass the `cache_load` compat check.
+///
+/// This is a **boundary-sampled revision fingerprint, not an
+/// adversarial-collision-resistant content hash**: for each resolved weight
+/// shard (see [`resolve_weight_fingerprint_files`]) it folds in the shard's
+/// filename, byte length, and first/last 1 MiB of content, not every byte
+/// of every shard. It is designed to detect checkpoint revision drift,
+/// including weight-only updates, cheaply — it is not designed to resist a
+/// file crafted to preserve this fingerprint while corrupting unsampled
+/// bytes. The integrity boundary for the cache payload itself remains
+/// `payload_sha256` in the embedding cache manifest, which does hash every
+/// payload byte.
+///
+/// Returns `None` only when `config.json` itself is missing or unreadable
+/// (mirroring `derive_cache_compat_rev`), in which case the caller leaves
+/// `base_model_rev` at its existing sentinel. A read failure partway
+/// through a weight file degrades gracefully to the config-only derivation
+/// (`derive_cache_compat_rev`) rather than failing `ModelInferenceConfig`
+/// construction.
+fn derive_base_model_rev(dir: &Path) -> Option<String> {
+    let config_path = dir.join("config.json");
+    let config_bytes = std::fs::read(&config_path).ok()?;
+
+    let weight_files = resolve_weight_fingerprint_files(dir);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&config_bytes);
+
+    for file_name in &weight_files {
+        if fold_weight_file_into_hasher(&mut hasher, dir, file_name).is_err() {
+            return derive_cache_compat_rev(&config_path);
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Some(format!("sha256:{}", &hex[..16]))
 }
 
 /// Pre-allocated buffers for the forward pass, reused across calls.
@@ -378,6 +566,43 @@ impl ForwardBuffers {
 /// docs for the safety argument. Field order is critical: weights before backing.
 /// Maximum number of cached embeddings. 10K × 1024d × 4B = ~40MB.
 const EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Embedding cache file magic, identifying the versioned manifest format
+/// below. Distinguishes governed cache files from the pre-manifest raw
+/// record stream, which is now rejected rather than silently parsed.
+const EMBEDDING_CACHE_MAGIC: &[u8; 8] = b"LQECACHE";
+/// Current embedding cache manifest format version.
+const EMBEDDING_CACHE_VERSION: u32 = 1;
+/// Upper bound on the manifest header length, rejected before JSON parsing
+/// so a corrupt or hostile `manifest_len` cannot drive an oversized read.
+const EMBEDDING_CACHE_MANIFEST_CAP: u32 = 64 * 1024;
+
+/// Process-global counter folded into `cache_save`'s temp file name so two
+/// threads in the same process (e.g. two `NativeEmbeddingService` instances
+/// sharing a global cache path) never race on the same `<name>.tmp.<pid>`
+/// path — the previous PID-only name was unique across processes but not
+/// within one, letting concurrent saves overwrite or rename over each
+/// other's temp file.
+static EMBEDDING_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bound on retries when a `<name>.tmp.<pid>.<seq>` path unexpectedly
+/// already exists (e.g. a leftover from a killed process that reused a PID
+/// and hit the same sequence number). `cache_save` fails closed rather than
+/// looping forever once this many attempts collide.
+const EMBEDDING_CACHE_TMP_MAX_ATTEMPTS: u32 = 16;
+
+/// Integrity and compatibility manifest embedded in the embedding cache
+/// file header, mirroring the LoRA adapter manifest pattern
+/// (`crates/tune/src/lora/manifest.rs`): a content hash plus compatibility
+/// fields checked before any cache record is trusted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmbeddingCacheManifest {
+    version: u32,
+    payload_sha256: String,
+    base_model_rev: String,
+    tokenizer_rev: String,
+    embedding_dim: usize,
+    entry_count: usize,
+}
 
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
 pub struct QwenModel {
@@ -617,76 +842,58 @@ impl QwenModel {
             .clear();
     }
 
-    /// Load embedding cache from a binary file. Format: repeated [hash:u64, dim:u32, floats:f32*dim].
+    /// Load embedding cache from a versioned binary file with an integrity
+    /// manifest. Fails closed on any magic/version/hash/compatibility
+    /// mismatch instead of loading a partial or stale cache; a missing file
+    /// is not an error since no artifact was expected to be loaded.
     pub fn cache_load(&self, path: &Path) -> Result<usize, InferenceError> {
-        let data = match std::fs::read(path) {
+        let data = match read_embedding_cache_file(path, self.dimensions()) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(InferenceError::Inference(format!("cache load: {e}"))),
         };
+        let entries = parse_embedding_cache_file(
+            &data,
+            self.dimensions(),
+            &self.inference_config.base_model_rev,
+            &self.inference_config.tokenizer_rev,
+        )?;
+
+        let count = entries.len();
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut pos = 0;
-        let mut count = 0;
-        while pos + 12 <= data.len() {
-            let hash = u64::from_le_bytes(
-                data[pos..pos + 8]
-                    .try_into()
-                    .expect("invariant: cache record has an 8-byte hash"),
-            );
-            let dim = u32::from_le_bytes(
-                data[pos + 8..pos + 12]
-                    .try_into()
-                    .expect("invariant: cache record has a 4-byte dimension"),
-            ) as usize;
-            pos += 12;
-            let Some(float_bytes) = dim.checked_mul(4) else {
-                break;
-            };
-            let Some(end) = pos.checked_add(float_bytes) else {
-                break;
-            };
-            if end > data.len() {
-                break;
-            }
-            let floats: Vec<f32> = data[pos..end]
-                .chunks_exact(4)
-                .map(|c| {
-                    f32::from_le_bytes(
-                        c.try_into()
-                            .expect("invariant: chunks_exact(4) yields four-byte chunks"),
-                    )
-                })
-                .collect();
-            pos = end;
+        for (hash, floats) in entries {
             cache.insert(hash, floats);
-            count += 1;
         }
         Ok(count)
     }
 
-    /// Save embedding cache to a binary file.
+    /// Save embedding cache to a binary file, prefixed with an integrity and
+    /// compatibility manifest (magic, version, payload SHA-256, base model
+    /// and tokenizer revisions) so `cache_load` can verify it before trust.
+    ///
+    /// Writes to a temp file in the same directory and renames it over the
+    /// target, so a crash or kill mid-write cannot leave a truncated file at
+    /// `path` — the fail-closed loader would otherwise reject that truncated
+    /// file forever. Mirrors the temp-file + rename pattern in
+    /// `forward::metal_qwen35::write_merged_qkvz`.
     pub fn cache_save(&self, path: &Path) -> Result<usize, InferenceError> {
         let cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let count = cache.len();
-        let mut buf = Vec::with_capacity(count * (12 + self.dimensions() * 4));
-        for (&hash, embedding) in cache.iter() {
-            buf.extend_from_slice(&hash.to_le_bytes());
-            buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
-            for &f in embedding {
-                buf.extend_from_slice(&f.to_le_bytes());
-            }
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(path, &buf)
-            .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
+        let payload = serialize_embedding_cache_payload(&cache);
+        let file_bytes = wrap_embedding_cache_payload(
+            payload,
+            &self.inference_config.base_model_rev,
+            &self.inference_config.tokenizer_rev,
+            self.dimensions(),
+            count,
+        )?;
+        write_embedding_cache_file_atomic(path, &file_bytes)?;
         Ok(count)
     }
 
@@ -1599,6 +1806,358 @@ impl QwenModel {
     }
 }
 
+/// SHA-256 of `bytes`, formatted as lowercase hex — used for the embedding
+/// cache payload integrity field, mirroring `download::sha256_hex`.
+fn embedding_cache_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.as_slice() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Upper bound on a well-formed embedding cache file for the given output
+/// dimension: capacity-bound payload plus the bounded manifest header.
+/// Stat-checked before reading so a corrupt or hostile file cannot drive an
+/// unbounded allocation.
+fn max_embedding_cache_file_len(dimensions: usize) -> u64 {
+    let header = 8u64 + 4; // magic + manifest_len
+    let manifest_cap = u64::from(EMBEDDING_CACHE_MANIFEST_CAP);
+    // Saturating throughout: a hostile or absurd `dimensions` must saturate
+    // to u64::MAX rather than wrap, so the cap this feeds into
+    // `read_embedding_cache_file_bounded` stays a genuine upper bound instead
+    // of wrapping around to a small value that would under-reject.
+    let record_len = (dimensions as u64).saturating_mul(4).saturating_add(12);
+    let max_payload = (EMBEDDING_CACHE_CAP as u64).saturating_mul(record_len);
+    header
+        .saturating_add(manifest_cap)
+        .saturating_add(max_payload)
+}
+
+/// Read an embedding cache file from disk, rejecting anything larger than
+/// `max_embedding_cache_file_len`. The stat is only a fast-path; the read is
+/// itself bounded so a file that grows or is swapped between the stat and the
+/// read cannot drive an allocation past the cap.
+fn read_embedding_cache_file(path: &Path, dimensions: usize) -> std::io::Result<Vec<u8>> {
+    read_embedding_cache_file_bounded(path, max_embedding_cache_file_len(dimensions))
+}
+
+/// Read a file, enforcing `max_len` as a hard cap. The stat is only a
+/// fast-path; the read itself is bounded via `take(max_len + 1)` so a file
+/// that grows or is swapped between the stat and the read cannot drive an
+/// allocation past the cap.
+fn read_embedding_cache_file_bounded(path: &Path, max_len: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    // Fast-path: stat before open. A known-oversized file is refused without
+    // allocating for its contents (defence-in-depth — the read below is also
+    // bounded, so this stat is an optimisation, not the enforcing check).
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > max_len {
+        return Err(std::io::Error::other(format!(
+            "embedding cache file too large: {} bytes exceeds cap of {max_len} bytes",
+            metadata.len()
+        )));
+    }
+    // Bounded read: take max_len + 1 bytes so a file that grew after the stat
+    // is still caught. If buf.len() exceeds max_len at read time, reject even
+    // though the stat passed. Saturating so a max_len already at u64::MAX
+    // (from a saturated `max_embedding_cache_file_len`) cannot wrap to 0 and
+    // turn the bound into an unbounded read.
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    f.take(max_len.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_len {
+        return Err(std::io::Error::other(format!(
+            "embedding cache file too large: read exceeds cap of {max_len} bytes"
+        )));
+    }
+    Ok(buf)
+}
+
+/// Encode the embedding cache into the raw payload record stream:
+/// repeated `[hash: u64 LE, dim: u32 LE, floats: f32 LE * dim]`.
+fn serialize_embedding_cache_payload(cache: &HashMap<u64, Vec<f32>>) -> Vec<u8> {
+    let payload_cap: usize = cache.values().map(|v| 12 + v.len() * 4).sum();
+    let mut buf = Vec::with_capacity(payload_cap);
+    for (&hash, embedding) in cache.iter() {
+        buf.extend_from_slice(&hash.to_le_bytes());
+        buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
+        for &f in embedding {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Wrap a raw payload record stream with the embedding cache manifest
+/// header: `[magic: 8][manifest_len: u32 LE][manifest JSON][payload]`.
+fn wrap_embedding_cache_payload(
+    payload: Vec<u8>,
+    base_model_rev: &str,
+    tokenizer_rev: &str,
+    dimensions: usize,
+    entry_count: usize,
+) -> Result<Vec<u8>, InferenceError> {
+    let manifest = EmbeddingCacheManifest {
+        version: EMBEDDING_CACHE_VERSION,
+        payload_sha256: embedding_cache_sha256_hex(&payload),
+        base_model_rev: base_model_rev.to_string(),
+        tokenizer_rev: tokenizer_rev.to_string(),
+        embedding_dim: dimensions,
+        entry_count,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| {
+        InferenceError::Inference(format!("embedding cache manifest serialize: {e}"))
+    })?;
+    if manifest_bytes.len() > EMBEDDING_CACHE_MANIFEST_CAP as usize {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest length {} exceeds cap of {EMBEDDING_CACHE_MANIFEST_CAP} bytes",
+            manifest_bytes.len()
+        )));
+    }
+    let mut file_bytes = Vec::with_capacity(8 + 4 + manifest_bytes.len() + payload.len());
+    file_bytes.extend_from_slice(EMBEDDING_CACHE_MAGIC);
+    file_bytes.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+    file_bytes.extend_from_slice(&manifest_bytes);
+    file_bytes.extend_from_slice(&payload);
+    Ok(file_bytes)
+}
+
+/// Open a temp file next to `path` under a name guaranteed unique for this
+/// call: `<path's file name>.tmp.<pid>.<seq>`, where `seq` comes from the
+/// process-global `EMBEDDING_CACHE_TMP_SEQ` counter. Opened with
+/// `File::create_new` so the open itself fails closed instead of silently
+/// truncating an existing file if the name is somehow already taken (e.g. a
+/// leftover from a killed process that reused both the PID and the
+/// in-process sequence number); on that collision, retries with the next
+/// sequence number up to `EMBEDDING_CACHE_TMP_MAX_ATTEMPTS` times.
+///
+/// This is what makes concurrent `cache_save` calls in the same process
+/// safe: the previous `<name>.tmp.<pid>` scheme was unique across processes
+/// but not within one, so two threads saving to the same shared cache path
+/// could open/write/rename over each other's temp file.
+fn open_unique_embedding_cache_tmp_file(
+    path: &Path,
+) -> Result<(std::path::PathBuf, std::fs::File), InferenceError> {
+    let base_tmp_name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("embedding_cache"));
+    let pid = std::process::id();
+
+    for _ in 0..EMBEDDING_CACHE_TMP_MAX_ATTEMPTS {
+        let seq = EMBEDDING_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut name = base_tmp_name.clone();
+        name.push(format!(".tmp.{pid}.{seq}"));
+        let candidate = path.with_file_name(name);
+        match std::fs::File::create_new(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(InferenceError::Inference(format!("cache save: {e}"))),
+        }
+    }
+
+    Err(InferenceError::Inference(format!(
+        "cache save: exhausted {EMBEDDING_CACHE_TMP_MAX_ATTEMPTS} unique temp file name attempts for {}",
+        path.display()
+    )))
+}
+
+/// Atomically write `file_bytes` to `path`: create the parent directory if
+/// needed, write to a call-unique temp file in the same directory (see
+/// [`open_unique_embedding_cache_tmp_file`]), then `fs::rename` it over
+/// `path` so a crash or kill mid-write cannot leave a truncated file at
+/// `path` — the fail-closed loader would otherwise reject that truncated
+/// file forever. Mirrors the temp-file + rename pattern in
+/// `forward::metal_qwen35::write_merged_qkvz`.
+///
+/// Shared by `QwenModel::cache_save` and its concurrency test so both
+/// exercise the exact same collision-safe temp-naming and write logic.
+fn write_embedding_cache_file_atomic(path: &Path, file_bytes: &[u8]) -> Result<(), InferenceError> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| InferenceError::Inference(format!("cache save: {e}")))?;
+    }
+
+    let (tmp_path, mut tmp_file) = open_unique_embedding_cache_tmp_file(path)?;
+
+    if let Err(e) = tmp_file.write_all(file_bytes) {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    if let Err(e) = tmp_file.flush() {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    drop(tmp_file);
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(InferenceError::Inference(format!("cache save: {e}")));
+    }
+    Ok(())
+}
+
+/// Parse and fully validate an embedding cache file: magic, version,
+/// manifest length cap, payload SHA-256, base-model/tokenizer compatibility,
+/// dimension, finiteness, and exact payload consumption. Returns `Err`
+/// before any record is trusted on the first mismatch found — the cache
+/// (`self.cache`) is only mutated by the caller after this returns `Ok`.
+fn parse_embedding_cache_file(
+    data: &[u8],
+    dimensions: usize,
+    expected_base_model_rev: &str,
+    expected_tokenizer_rev: &str,
+) -> Result<Vec<(u64, Vec<f32>)>, InferenceError> {
+    if data.len() < 8 || &data[..8] != EMBEDDING_CACHE_MAGIC {
+        return Err(InferenceError::Inference(
+            "embedding cache magic mismatch".to_string(),
+        ));
+    }
+    if data.len() < 12 {
+        return Err(InferenceError::Inference(
+            "embedding cache manifest header truncated".to_string(),
+        ));
+    }
+    // Bounds already ensured `data.len() >= 12`; copy the fixed-width field
+    // without `try_into().expect()` (AGENTS.md bars `expect` in library code).
+    let mut manifest_len_bytes = [0u8; 4];
+    manifest_len_bytes.copy_from_slice(&data[8..12]);
+    let manifest_len = u32::from_le_bytes(manifest_len_bytes);
+    if manifest_len > EMBEDDING_CACHE_MANIFEST_CAP {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest length {manifest_len} exceeds cap of {EMBEDDING_CACHE_MANIFEST_CAP} bytes"
+        )));
+    }
+    let manifest_start = 12usize;
+    let manifest_end = manifest_start + manifest_len as usize;
+    if data.len() < manifest_end {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache manifest truncated: expected {manifest_len} bytes, found {}",
+            data.len() - manifest_start
+        )));
+    }
+    let manifest: EmbeddingCacheManifest =
+        serde_json::from_slice(&data[manifest_start..manifest_end]).map_err(|e| {
+            InferenceError::Inference(format!("embedding cache manifest parse error: {e}"))
+        })?;
+    if manifest.version != EMBEDDING_CACHE_VERSION {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache version mismatch: expected {EMBEDDING_CACHE_VERSION}, found {}",
+            manifest.version
+        )));
+    }
+
+    let payload = &data[manifest_end..];
+    let computed_sha256 = embedding_cache_sha256_hex(payload);
+    if computed_sha256 != manifest.payload_sha256 {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache payload_sha256 mismatch: expected {}, computed {computed_sha256}",
+            manifest.payload_sha256
+        )));
+    }
+    if manifest.base_model_rev != expected_base_model_rev {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache base_model_rev mismatch: expected {expected_base_model_rev}, found {}",
+            manifest.base_model_rev
+        )));
+    }
+    if manifest.tokenizer_rev != expected_tokenizer_rev {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache tokenizer_rev mismatch: expected {expected_tokenizer_rev}, found {}",
+            manifest.tokenizer_rev
+        )));
+    }
+    if manifest.embedding_dim != dimensions {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache embedding_dim mismatch: expected {dimensions}, found {}",
+            manifest.embedding_dim
+        )));
+    }
+
+    if manifest.entry_count > EMBEDDING_CACHE_CAP {
+        return Err(InferenceError::Inference(format!(
+            "embedding cache entry_count {} exceeds cap of {EMBEDDING_CACHE_CAP}",
+            manifest.entry_count
+        )));
+    }
+    let mut entries = Vec::with_capacity(manifest.entry_count);
+    let mut pos = 0usize;
+    // Bounded by the manifest-declared entry count, not by payload length:
+    // a payload with fewer usable bytes than declared fails as a truncated
+    // record, and a payload with bytes left over after the declared entries
+    // are consumed fails as trailing bytes below — a lone `entry_count`
+    // mutation can no longer smuggle extra or missing records past the hash
+    // check, since payload_sha256 covers the payload bytes but not this
+    // count field.
+    for record_index in 0..manifest.entry_count {
+        if pos + 12 > payload.len() {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        }
+        // The `pos + 12 > payload.len()` guard above ensures these fixed-width
+        // slices exist; copy them without `try_into().expect()`.
+        let mut hash_bytes = [0u8; 8];
+        hash_bytes.copy_from_slice(&payload[pos..pos + 8]);
+        let hash = u64::from_le_bytes(hash_bytes);
+        let mut dim_bytes = [0u8; 4];
+        dim_bytes.copy_from_slice(&payload[pos + 8..pos + 12]);
+        let dim = u32::from_le_bytes(dim_bytes) as usize;
+        pos += 12;
+        if dim != dimensions {
+            return Err(InferenceError::Inference(format!(
+                "embedding cache record dimension mismatch at record {record_index}: expected {dimensions}, found {dim}"
+            )));
+        }
+        let Some(float_bytes) = dim.checked_mul(4) else {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        };
+        let Some(end) = pos.checked_add(float_bytes) else {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        };
+        if end > payload.len() {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        }
+        let mut floats = Vec::with_capacity(dim);
+        for (float_index, chunk) in payload[pos..end].chunks_exact(4).enumerate() {
+            // `chunks_exact(4)` yields four-byte chunks; copy without `expect`.
+            let mut float_bytes = [0u8; 4];
+            float_bytes.copy_from_slice(chunk);
+            let f = f32::from_le_bytes(float_bytes);
+            if !f.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "embedding cache non-finite float at record {record_index}, index {float_index}"
+                )));
+            }
+            floats.push(f);
+        }
+        pos = end;
+        entries.push((hash, floats));
+    }
+    if pos != payload.len() {
+        return Err(InferenceError::Inference(
+            "embedding cache trailing bytes".to_string(),
+        ));
+    }
+
+    Ok(entries)
+}
+
 /// FNV-1a hash of token IDs — fast, deterministic, good distribution.
 fn hash_token_ids(ids: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -1925,16 +2484,19 @@ mod tests {
         assert_eq!(cfg.eos_token_id, 151_643);
         assert_eq!(cfg.rope_table_max_seq_len, 8192);
         assert_eq!(cfg.gpu_max_seq_len, 2048);
+        assert_eq!(cfg.base_model_rev, "none");
+        assert_eq!(cfg.tokenizer_rev, "none");
     }
 
     #[test]
     fn test_load_inference_config_from_json() {
-        let json =
-            r#"{"eos_token_id": 151645, "rope_table_max_seq_len": 32768, "gpu_max_seq_len": 4096}"#;
+        let json = r#"{"eos_token_id": 151645, "rope_table_max_seq_len": 32768, "gpu_max_seq_len": 4096, "base_model_rev": "qwen3-0.6b-rev2", "tokenizer_rev": "tok-rev3"}"#;
         let cfg: ModelInferenceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.eos_token_id, 151_645);
         assert_eq!(cfg.rope_table_max_seq_len, 32_768);
         assert_eq!(cfg.gpu_max_seq_len, 4096);
+        assert_eq!(cfg.base_model_rev, "qwen3-0.6b-rev2");
+        assert_eq!(cfg.tokenizer_rev, "tok-rev3");
     }
 
     #[test]
@@ -1967,6 +2529,8 @@ mod tests {
         assert_eq!(empty.eos_token_id, 151_643);
         assert_eq!(empty.rope_table_max_seq_len, 8192);
         assert_eq!(empty.gpu_max_seq_len, 2048);
+        assert_eq!(empty.base_model_rev, "none");
+        assert_eq!(empty.tokenizer_rev, "none");
     }
 
     #[test]
@@ -2069,7 +2633,239 @@ mod tests {
         assert_eq!(cfg.eos_token_id, 151_643);
         assert_eq!(cfg.rope_table_max_seq_len, 8192);
         assert_eq!(cfg.gpu_max_seq_len, 2048);
+        // Neither config.json nor tokenizer.json exist in `dir` either, so
+        // derivation has no source bytes to hash: the fields must stay at
+        // their "none" sentinel rather than gain a new construction failure.
+        assert_eq!(cfg.base_model_rev, "none");
+        assert_eq!(cfg.tokenizer_rev, "none");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_model_inference_config_load_derives_cache_compat_rev() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_cache_compat_rev");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_json_bytes = b"{\"hidden_size\":1024}";
+        let tokenizer_json_bytes = b"{\"vocab\":{}}";
+        std::fs::write(tmp.join("config.json"), config_json_bytes).unwrap();
+        std::fs::write(tmp.join("tokenizer.json"), tokenizer_json_bytes).unwrap();
+
+        // No inference_config.json at all: both fields start at the "none"
+        // sentinel and must be derived from the sibling files' content hash.
+        let cfg = ModelInferenceConfig::load(&tmp);
+        let expected_base = format!(
+            "sha256:{}",
+            &embedding_cache_sha256_hex(config_json_bytes)[..16]
+        );
+        let expected_tok = format!(
+            "sha256:{}",
+            &embedding_cache_sha256_hex(tokenizer_json_bytes)[..16]
+        );
+        assert_eq!(cfg.base_model_rev, expected_base);
+        assert_eq!(cfg.tokenizer_rev, expected_tok);
+        assert!(cfg.base_model_rev.starts_with("sha256:"));
+        assert_eq!(cfg.base_model_rev.len(), "sha256:".len() + 16);
+        assert_ne!(
+            cfg.base_model_rev, cfg.tokenizer_rev,
+            "distinct source files must derive distinct revisions"
+        );
+
+        // An explicit value in inference_config.json always wins over
+        // derivation, even though config.json/tokenizer.json are present.
+        std::fs::write(
+            tmp.join("inference_config.json"),
+            r#"{"base_model_rev": "explicit-rev", "tokenizer_rev": "explicit-tok"}"#,
+        )
+        .unwrap();
+        let cfg2 = ModelInferenceConfig::load(&tmp);
+        assert_eq!(cfg2.base_model_rev, "explicit-rev");
+        assert_eq!(cfg2.tokenizer_rev, "explicit-tok");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Writes `len` bytes of a deterministic (non-zero, non-repeating-run)
+    /// pattern to `path`, for `derive_base_model_rev` weight-fingerprint
+    /// tests. No real model weights needed — the derivation only samples
+    /// filename/length/boundary bytes.
+    fn write_pattern_bytes(path: &Path, len: usize) {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Flips one byte (XOR 0xFF) at `offset` in the file at `path`.
+    fn flip_byte_at(path: &Path, offset: usize) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[offset] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn derive_base_model_rev_stable_across_calls() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_stable");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        write_pattern_bytes(&tmp.join("model.safetensors"), 3 * 1024 * 1024);
+
+        let rev1 = derive_base_model_rev(&tmp);
+        let rev2 = derive_base_model_rev(&tmp);
+        assert!(rev1.is_some());
+        assert_eq!(rev1, rev2, "deriving twice on the same dir must be stable");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_first_1mib_flip() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_head_flip");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 3 * 1024 * 1024);
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&weights_path, 512 * 1024); // inside the first 1 MiB
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the first 1 MiB of a >2 MiB weight file must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_last_1mib_flip() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_tail_flip");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        let len = 3 * 1024 * 1024;
+        write_pattern_bytes(&weights_path, len);
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&weights_path, len - 512 * 1024); // inside the last 1 MiB
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the last 1 MiB of a >2 MiB weight file must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_changes_on_length_change() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_len_change");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 4096);
+
+        let before = derive_base_model_rev(&tmp);
+        let mut bytes = std::fs::read(&weights_path).unwrap();
+        bytes.push(0u8);
+        std::fs::write(&weights_path, &bytes).unwrap();
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "changing the weight file length (content otherwise unchanged) must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_sharded_flip_second_shard() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_sharded");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let shard1 = tmp.join("model-00001-of-00002.safetensors");
+        let shard2 = tmp.join("model-00002-of-00002.safetensors");
+        write_pattern_bytes(&shard1, 4096);
+        write_pattern_bytes(&shard2, 4096);
+        let index_json = r#"{"weight_map": {
+            "a.weight": "model-00001-of-00002.safetensors",
+            "b.weight": "model-00002-of-00002.safetensors",
+            "c.weight": "model-00002-of-00002.safetensors"
+        }}"#;
+        std::fs::write(tmp.join("model.safetensors.index.json"), index_json).unwrap();
+
+        let before = derive_base_model_rev(&tmp);
+        flip_byte_at(&shard2, 10);
+        let after = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after,
+            "flipping a byte in the second (non-first-mentioned) shard must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_mixed_layout_follows_loader_precedence() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_mixed_layout");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+
+        // Both a single-file checkpoint AND a sharded index are present.
+        // `QwenModel::from_directory` loads `model.safetensors` first in
+        // this layout, so the fingerprint must track that file, not the
+        // index's shard.
+        let single_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&single_path, 4096);
+
+        let shard_path = tmp.join("model-00001-of-00001.safetensors");
+        write_pattern_bytes(&shard_path, 4096);
+        let index_json = r#"{"weight_map": {
+            "a.weight": "model-00001-of-00001.safetensors"
+        }}"#;
+        std::fs::write(tmp.join("model.safetensors.index.json"), index_json).unwrap();
+
+        let before = derive_base_model_rev(&tmp);
+
+        flip_byte_at(&single_path, 10);
+        let after_single_flip = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after_single_flip,
+            "flipping a byte in the actually-loaded model.safetensors must change the rev"
+        );
+
+        flip_byte_at(&single_path, 10); // restore
+        flip_byte_at(&shard_path, 10);
+        let after_shard_flip = derive_base_model_rev(&tmp);
+        assert_eq!(
+            before, after_shard_flip,
+            "flipping a byte in the unused index shard must NOT change the rev — the \
+             fingerprint follows the file the loader actually loads"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_no_weight_files_equals_config_only() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_no_weights");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config_bytes = b"{\"hidden_size\":1024}";
+        std::fs::write(tmp.join("config.json"), config_bytes).unwrap();
+
+        let rev = derive_base_model_rev(&tmp);
+        let expected = derive_cache_compat_rev(&tmp.join("config.json"));
+        assert!(rev.is_some());
+        assert_eq!(
+            rev, expected,
+            "with no weight files present, derivation must equal the config-only derivation"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -2084,6 +2880,582 @@ mod tests {
         );
         assert_eq!(cfg.rope_table_max_seq_len, 8192);
         assert_eq!(cfg.gpu_max_seq_len, 2048);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Builds an intact, fully-wrapped embedding cache file for one record
+    /// with the given compatibility fields and floats.
+    fn build_test_embedding_cache_bytes(
+        base_model_rev: &str,
+        tokenizer_rev: &str,
+        dim: usize,
+        floats: Vec<f32>,
+    ) -> Vec<u8> {
+        let mut cache = HashMap::new();
+        cache.insert(42u64, floats);
+        let payload = serialize_embedding_cache_payload(&cache);
+        wrap_embedding_cache_payload(payload, base_model_rev, tokenizer_rev, dim, 1).unwrap()
+    }
+
+    #[test]
+    fn qwen_embedding_cache_intact_manifest_loads() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let entries = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 42);
+        assert_eq!(entries[0].1, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_corrupt_payload_byte() {
+        let mut bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let manifest_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let payload_start = 12 + manifest_len;
+        bytes[payload_start] ^= 0xFF;
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("payload_sha256 mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_base_model_rev() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-b", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("base_model_rev mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_tokenizer_rev() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-b").unwrap_err();
+        assert!(
+            format!("{err}").contains("tokenizer_rev mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_dim_even_with_valid_hash() {
+        let bytes = build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        // Payload SHA-256 and compat fields are untouched and would pass;
+        // only the caller-expected dimension differs from the manifest.
+        let err = parse_embedding_cache_file(&bytes, 4, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("embedding_dim mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_non_finite_payload() {
+        let bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, f32::NAN, 3.0]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("non-finite float"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_trailing_payload_bytes() {
+        let mut cache = HashMap::new();
+        cache.insert(42u64, vec![1.0f32, 2.0, 3.0]);
+        let mut payload = serialize_embedding_cache_payload(&cache);
+        // Trailing bytes past the one declared record: the SHA-256 is
+        // computed over the payload including this garbage, so the hash
+        // check alone would pass — only exact-consumption validation
+        // against the manifest-declared entry count catches it.
+        payload.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let bytes = wrap_embedding_cache_payload(payload, "model-a", "tok-a", 3, 1).unwrap();
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("trailing bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_missing_file_returns_ok_zero() {
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_missing.bin");
+        std::fs::remove_file(&path).ok();
+        let data = read_embedding_cache_file(&path, 3);
+        assert!(matches!(&data, Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn qwen_embedding_cache_bounded_read_rejects_oversized_file() {
+        // The read is bounded independently of the stat fast-path: a file
+        // larger than the cap is rejected rather than fully allocated. This
+        // closes the stat-to-read window (a file that grows after the stat).
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_oversized.bin");
+        std::fs::write(&path, vec![0u8; 64]).unwrap();
+        let err = read_embedding_cache_file_bounded(&path, 16)
+            .expect_err("oversized file must be rejected");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            format!("{err}").contains("too large"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_bounded_read_accepts_within_cap() {
+        let path = std::env::temp_dir().join("lattice_test_embedding_cache_within_cap.bin");
+        std::fs::write(&path, vec![7u8; 16]).unwrap();
+        let bytes =
+            read_embedding_cache_file_bounded(&path, 32).expect("file within cap must be read");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(bytes, vec![7u8; 16]);
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_wrong_magic() {
+        let mut bytes =
+            build_test_embedding_cache_bytes("model-a", "tok-a", 3, vec![1.0, 2.0, 3.0]);
+        bytes[0] = b'X';
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("magic mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Raw `[magic][manifest_len][manifest JSON][payload]` bytes built by hand
+    /// (bypassing `wrap_embedding_cache_payload`) so a test can set manifest
+    /// fields — like `version` — that the wrapper always fills in correctly.
+    fn build_raw_cache_bytes(manifest_json: &str, payload: &[u8]) -> Vec<u8> {
+        let manifest_bytes = manifest_json.as_bytes();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(EMBEDDING_CACHE_MAGIC);
+        bytes.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(manifest_bytes);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_version_mismatch() {
+        // The version check runs before the payload hash check, so a bogus
+        // payload_sha256 here is fine — it must never be reached.
+        let manifest = r#"{"version":99,"payload_sha256":"deadbeef","base_model_rev":"model-a","tokenizer_rev":"tok-a","embedding_dim":3,"entry_count":0}"#;
+        let bytes = build_raw_cache_bytes(manifest, &[]);
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("version mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_truncated_manifest() {
+        // manifest_len declares 100 bytes but far fewer actually follow.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(EMBEDDING_CACHE_MAGIC);
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(b"{\"short\":true}");
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("manifest truncated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_manifest_len_over_cap() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(EMBEDDING_CACHE_MAGIC);
+        let over_cap = EMBEDDING_CACHE_MANIFEST_CAP + 1;
+        bytes.extend_from_slice(&over_cap.to_le_bytes());
+        // No manifest bytes needed: the cap check rejects before any read
+        // past the 12-byte header.
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("manifest length") && msg.contains("exceeds cap"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_entry_count_over_cap() {
+        let bytes = wrap_embedding_cache_payload(
+            Vec::new(),
+            "model-a",
+            "tok-a",
+            3,
+            EMBEDDING_CACHE_CAP + 1,
+        )
+        .unwrap();
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("entry_count") && msg.contains("exceeds cap"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_record_dim_mismatch() {
+        // The record's own dim field disagrees with the manifest-declared /
+        // caller-expected dimension, even though the manifest-level
+        // `embedding_dim` and the payload hash both match — only the
+        // per-record dim field is wrong.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        payload.extend_from_slice(&4u32.to_le_bytes()); // record claims dim=4
+        for f in [1.0f32, 2.0, 3.0] {
+            payload.extend_from_slice(&f.to_le_bytes());
+        }
+        let bytes = wrap_embedding_cache_payload(payload, "model-a", "tok-a", 3, 1).unwrap();
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("record dimension mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn qwen_embedding_cache_rejects_truncated_record() {
+        // entry_count declares 2 records but the payload holds only one
+        // record's worth of bytes.
+        let mut cache = HashMap::new();
+        cache.insert(42u64, vec![1.0f32, 2.0, 3.0]);
+        let payload = serialize_embedding_cache_payload(&cache);
+        let bytes = wrap_embedding_cache_payload(payload, "model-a", "tok-a", 3, 2).unwrap();
+        let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
+        assert!(
+            format!("{err}").contains("truncated record"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// No-op tokenizer for the `QwenModel` cache-test fixture below.
+    /// `cache_load`/`cache_save` never touch the tokenizer, so every method
+    /// here is unreachable in the tests that use the fixture.
+    struct NullTokenizer;
+    impl Tokenizer for NullTokenizer {
+        fn tokenize(&self, _text: &str) -> crate::tokenizer::common::TokenizedInput {
+            unimplemented!("NullTokenizer is a cache-test fixture; tokenize is never called")
+        }
+        fn tokenize_batch(&self, _texts: &[&str]) -> Vec<crate::tokenizer::common::TokenizedInput> {
+            unimplemented!("NullTokenizer is a cache-test fixture; tokenize_batch is never called")
+        }
+        fn vocab_size(&self) -> usize {
+            0
+        }
+        fn max_seq_len(&self) -> usize {
+            0
+        }
+    }
+
+    /// Build a `QwenModel` fixture with no real transformer weights — just
+    /// enough to exercise the public `cache_load`/`cache_save` contract,
+    /// which only touch `inference_config`, `cache`, and `dimensions()`
+    /// (derived from `config.hidden_size` / `output_dim`), never `weights`,
+    /// `tokenizer`, or `rope`. `from_directory` requires real safetensors
+    /// weight files that unit tests don't have, so this constructs the
+    /// struct directly (accessible since `mod tests` is a descendant of the
+    /// module that declares `QwenModel`'s private fields).
+    fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) -> QwenModel {
+        let config = QwenConfig {
+            vocab_size: 8,
+            hidden_size: dim,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            intermediate_size: 1,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        };
+        let rope = RopeTable::new(2, 1, 10_000.0);
+        let weights = QwenWeights {
+            embed_tokens: crate::weights::Tensor2D {
+                data: &[],
+                rows: 0,
+                cols: 0,
+            },
+            norm_weight: crate::weights::Tensor1D { data: &[], len: 0 },
+            layers: Vec::new(),
+        };
+        let storage = ShardedQwenBacking {
+            embed_tokens: Vec::new(),
+            norm_weight: Vec::new(),
+            q_proj: Vec::new(),
+            k_proj: Vec::new(),
+            v_proj: Vec::new(),
+            o_proj: Vec::new(),
+            q_norm: Vec::new(),
+            k_norm: Vec::new(),
+            input_ln: Vec::new(),
+            gate_proj: Vec::new(),
+            up_proj: Vec::new(),
+            down_proj: Vec::new(),
+            post_ln: Vec::new(),
+        };
+        QwenModel {
+            config,
+            inference_config,
+            tokenizer: Box::new(NullTokenizer),
+            rope,
+            output_dim: None,
+            buffers: Mutex::new(ForwardBuffers::new()),
+            cache: Mutex::new(HashMap::new()),
+            metal: None,
+            weights: ManuallyDrop::new(weights),
+            _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(Box::new(storage))),
+        }
+    }
+
+    #[test]
+    fn qwen_cache_load_missing_path_returns_ok_zero() {
+        // Public contract of `cache_load`: a missing cache file is not an
+        // error (no artifact was expected to be loaded), so it returns
+        // `Ok(0)` rather than propagating the NotFound error.
+        let model = build_cache_test_model(ModelInferenceConfig::default(), 3);
+        let path = std::env::temp_dir().join("lattice_test_cache_load_missing_public.bin");
+        std::fs::remove_file(&path).ok();
+        let result = model.cache_load(&path);
+        assert!(
+            matches!(result, Ok(0)),
+            "cache_load on a missing path must return Ok(0), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn qwen_cache_save_then_load_round_trip() {
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_load_round_trip");
+        // Clean up any leftovers from a prior interrupted/failed run before
+        // creating, so this test's own assertions can't be polluted by them.
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+        let saver = build_cache_test_model(cfg.clone(), 3);
+        saver.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+        let saved = saver.cache_save(&path).unwrap();
+        assert_eq!(saved, 1);
+
+        let loader = build_cache_test_model(cfg, 3);
+        let loaded = loader.cache_load(&path).unwrap();
+        assert_eq!(loaded, 1);
+        assert_eq!(
+            loader.cache.lock().unwrap().get(&42),
+            Some(&vec![1.0f32, 2.0, 3.0])
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_save_leaves_no_tmp_file_behind() {
+        // FIX 2 regression: `cache_save` writes to a temp file and renames
+        // it over the target, so no `.tmp.<pid>.<seq>` file should remain in
+        // the directory once `cache_save` returns `Ok`.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_no_tmp_leftover");
+        // Clean up any leftovers from a prior interrupted/failed run before
+        // creating, so this test's own assertions can't be polluted by them.
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+        let model = build_cache_test_model(cfg, 3);
+        model.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+        let n = model.cache_save(&path).unwrap();
+        assert_eq!(n, 1);
+        assert!(path.exists(), "final cache file must exist after save");
+
+        let leftover: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file(s) left behind after cache_save: {leftover:?}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_load_rejects_stale_cache_after_weight_only_change() {
+        // FIX-A end-to-end regression: two checkpoints sharing config.json
+        // (and tokenizer.json, absent here) but differing only in weights
+        // must NOT derive the same `base_model_rev` — otherwise a cache
+        // built against the old weights would silently pass `cache_load`'s
+        // compat check against the new ones.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_rejects_weight_drift");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+        let weights_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&weights_path, 4096);
+        let cache_path = tmp.join("cache.bin");
+
+        let cfg1 = ModelInferenceConfig::load(&tmp);
+        let saver = build_cache_test_model(cfg1.clone(), 3);
+        saver.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+        saver.cache_save(&cache_path).unwrap();
+
+        // Weight-only drift: config.json (and the absent tokenizer.json) are
+        // untouched, only the weight file's bytes change.
+        flip_byte_at(&weights_path, 10);
+
+        let cfg2 = ModelInferenceConfig::load(&tmp);
+        assert_ne!(
+            cfg1.base_model_rev, cfg2.base_model_rev,
+            "weight-only drift must change the derived base_model_rev"
+        );
+
+        let loader = build_cache_test_model(cfg2, 3);
+        let err = loader.cache_load(&cache_path).unwrap_err();
+        assert!(
+            format!("{err}").contains("base_model_rev"),
+            "error must name base_model_rev, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_save_sequential_calls_leave_one_final_file() {
+        // FIX-B regression: repeated `cache_save` calls in the same process
+        // (now each minting a distinct `<name>.tmp.<pid>.<seq>` name) must
+        // still converge on exactly one final file with no temp leftovers.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_sequential");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+        let model = build_cache_test_model(cfg, 3);
+        for i in 0..5u64 {
+            model
+                .cache
+                .lock()
+                .unwrap()
+                .insert(i, vec![i as f32, 0.0, 0.0]);
+            let n = model.cache_save(&path).unwrap();
+            assert_eq!(n, (i + 1) as usize);
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one final file expected, found: {entries:?}"
+        );
+        assert_eq!(
+            entries[0].file_name(),
+            std::ffi::OsString::from("cache.bin")
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn qwen_cache_save_concurrent_saves_no_torn_output() {
+        // FIX-B regression: distinct threads in one process sharing the same
+        // final cache path must not collide on `cache_save`'s temp file name
+        // and clobber/tear each other's write. Each thread saves a
+        // DIFFERENT single-entry cache to the SAME final path; whichever
+        // thread's rename lands last must win cleanly (exactly one intact
+        // entry), never a torn or merged file.
+        //
+        // Mutation-sensitivity note (see task report): this exercises real
+        // OS thread interleaving, so it is a probabilistic guard, not a
+        // deterministic one — under the reverted PID-only naming the race
+        // window is narrow (temp file open + write + rename), so failure
+        // isn't guaranteed on every run even though the bug is real.
+        let tmp = std::env::temp_dir().join("lattice_test_cache_save_concurrent");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("cache.bin");
+
+        let cfg = ModelInferenceConfig {
+            base_model_rev: "model-a".to_string(),
+            tokenizer_rev: "tok-a".to_string(),
+            ..Default::default()
+        };
+
+        const N: u64 = 8;
+        let candidates: Vec<(u64, Vec<f32>)> = (0..N)
+            .map(|i| (i, vec![i as f32, i as f32 + 1.0, i as f32 + 2.0]))
+            .collect();
+
+        let handles: Vec<_> = candidates
+            .clone()
+            .into_iter()
+            .map(|(key, floats)| {
+                let cfg = cfg.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let model = build_cache_test_model(cfg, 3);
+                    model.cache.lock().unwrap().insert(key, floats);
+                    model.cache_save(&path)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join()
+                .expect("save thread must not panic")
+                .expect("cache_save must not error under concurrent same-path saves");
+        }
+
+        let loader = build_cache_test_model(cfg, 3);
+        let loaded = loader.cache_load(&path).unwrap();
+        assert_eq!(
+            loaded, 1,
+            "final file must contain exactly one thread's single entry, no torn/merged output"
+        );
+        {
+            let cache = loader.cache.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            let (&winning_key, winning_floats) = cache.iter().next().unwrap();
+            let expected = candidates
+                .iter()
+                .find(|(k, _)| *k == winning_key)
+                .expect("winning key must be exactly one of the 8 candidate entries");
+            assert_eq!(winning_floats, &expected.1);
+        }
+
+        let leftover: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file(s) left behind after concurrent cache_save: {leftover:?}"
+        );
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
