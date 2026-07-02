@@ -229,38 +229,38 @@ fn bf16_to_f32(v: u16) -> f32 {
 // Core block quantization
 // ---------------------------------------------------------------------------
 
-/// Quantize exactly 32 f32 values into one [`Q4Block`] using asymmetric mode.
+/// Quantize one block from only the first `valid_len` real values of `vals`;
+/// the remaining `32 - valid_len` slots are caller-supplied zero padding used
+/// solely to fill the fixed-size packing loop below.
 ///
-/// Nibble layout: sequential pairs — `byte[b] = (q[2b+1] << 4) | q[2b]`.
-///
-/// # Errors
-///
-/// Returns [`InferenceError::InvalidInput`] if any value in `vals` is non-finite.
-/// IEEE-754 `NaN > x` is always false, so a NaN would silently leave the
-/// min/max accumulators unchanged and produce wrong-but-no-error quantization.
-#[inline]
-fn quantize_block(vals: &[f32; 32]) -> Result<Q4Block, InferenceError> {
-    quantize_block_with_mode(vals, false)
-}
-
-/// Quantize one block; symmetric mode is optimal for Hadamard-rotated weights
-/// (which are zero-mean by construction), asymmetric is optimal for raw weights
-/// with non-zero distributional center. Both modes share the same on-disk
-/// format: `dequant = nibble * scale + bias`. Symmetric mode sets
-/// `bias = -8 * scale` so that nibble=8 maps to exactly 0.
+/// Asymmetric mode derives `min_val`/`max_val` from the real `valid_len`
+/// elements only, so a zero-padded tail block gets the same scale resolution
+/// a full block would (padding zeros must never widen the range). Symmetric
+/// mode folds `abs_max` over the full padded array unconditionally: zero
+/// padding can never exceed a non-empty real element's absolute value, so the
+/// result is bit-identical to folding over the real elements alone, and doing
+/// it this way keeps the symmetric path source-identical to the pre-fix
+/// version (see `quantize_f64_to_q4_symmetric_partial_block_is_bit_identical_to_padded_block`).
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any element of `vals` is
-/// non-finite. IEEE-754 `NaN > x` is always false; a NaN silently leaves
-/// `abs_max`, `min_val`, or `max_val` unchanged, yielding wrong-but-no-error
-/// quantization. Rejecting here means the error points at the source weight
-/// rather than a downstream matmul.
+/// Returns [`InferenceError::InvalidInput`] if `valid_len` is not in `1..=32`,
+/// or if any element of `vals` is non-finite. IEEE-754 `NaN > x` is always
+/// false; a NaN silently leaves `abs_max`, `min_val`, or `max_val` unchanged,
+/// yielding wrong-but-no-error quantization. Rejecting here means the error
+/// points at the source weight rather than a downstream matmul.
 #[inline]
-pub(crate) fn quantize_block_with_mode(
+fn quantize_block_with_mode_len(
     vals: &[f32; 32],
+    valid_len: usize,
     symmetric: bool,
 ) -> Result<Q4Block, InferenceError> {
+    if !(1..=32).contains(&valid_len) {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 weight block valid_len {valid_len} must be in 1..=32"
+        )));
+    }
+
     for (i, &v) in vals.iter().enumerate() {
         if !v.is_finite() {
             return Err(InferenceError::InvalidInput(format!(
@@ -290,8 +290,9 @@ pub(crate) fn quantize_block_with_mode(
             packed,
         })
     } else {
-        let min_val = vals.iter().copied().fold(f32::INFINITY, f32::min);
-        let max_val = vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let real = &vals[..valid_len];
+        let min_val = real.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_val = real.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let range = max_val - min_val;
         let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
         let inv_scale = 1.0 / scale;
@@ -329,7 +330,7 @@ pub fn quantize_row_q4_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
     for chunk in src.chunks(32) {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
-        let block = quantize_block(&vals)?;
+        let block = quantize_block_with_mode_len(&vals, chunk.len(), false)?;
         // SAFETY: Q4Block is #[repr(C)] with size 20; its alignment is 2 (the
         // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
         // rule). Casting to `&[u8; 20]` is valid because the target element type
@@ -441,7 +442,7 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, In
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = bf16_to_f32(v);
         }
-        blocks.push(quantize_block(&vals)?);
+        blocks.push(quantize_block_with_mode_len(&vals, chunk.len(), false)?);
     }
 
     Ok(Q4Tensor {
@@ -482,7 +483,7 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, Inf
     for chunk in data.chunks(32) {
         let mut vals = [0.0f32; 32];
         vals[..chunk.len()].copy_from_slice(chunk);
-        blocks.push(quantize_block(&vals)?);
+        blocks.push(quantize_block_with_mode_len(&vals, chunk.len(), false)?);
     }
 
     Ok(Q4Tensor {
@@ -549,7 +550,7 @@ pub fn quantize_f64_to_q4_mode(
         for (i, &v) in chunk.iter().enumerate() {
             vals[i] = v as f32;
         }
-        blocks.push(quantize_block_with_mode(&vals, symmetric)?);
+        blocks.push(quantize_block_with_mode_len(&vals, chunk.len(), symmetric)?);
     }
 
     Ok(Q4Tensor {
@@ -602,7 +603,11 @@ pub fn stream_quantize_shard(
             let v = u16::from_ne_bytes([pair[0], pair[1]]);
             vals[j] = bf16_to_f32(v);
         }
-        blocks.push(quantize_block(&vals).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?);
+        let valid_len = chunk.len() / 2;
+        blocks.push(
+            quantize_block_with_mode_len(&vals, valid_len, false)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?,
+        );
     }
 
     Ok(blocks)
@@ -1391,6 +1396,54 @@ mod tests {
     }
 
     #[test]
+    fn quantize_f32_to_q4_partial_block_uses_real_tail_min_max() {
+        // Mutation-sensitive: a tail block of [5, 6, 7] zero-padded to 32
+        // slots would (pre-fix) fold min/max over the padded zeros too,
+        // yielding min=0/max=7 instead of the real min=5/max=7. This test
+        // fails if the asymmetric path reverts to computing stats over the
+        // padded [f32; 32] array instead of the real `chunk.len()` elements.
+        let src = [5.0f32, 6.0, 7.0];
+        let q = quantize_f32_to_q4(&src, &[3]).unwrap();
+        assert_eq!(q.original_len, 3);
+        assert_eq!(q.blocks.len(), 1);
+
+        let block = q.blocks[0];
+        assert_eq!(block.scale, q4_f32_to_f16(2.0f32 / 15.0));
+        assert_eq!(block.bias, q4_f32_to_f16(5.0));
+        assert_ne!(
+            block.scale,
+            q4_f32_to_f16(7.0f32 / 15.0),
+            "partial tail scale must not include padded zero in max-min range"
+        );
+        assert_ne!(
+            block.bias,
+            q4_f32_to_f16(0.0),
+            "partial tail bias must be the real tail min, not padded zero"
+        );
+    }
+
+    #[test]
+    fn quantize_f64_to_q4_symmetric_partial_block_is_bit_identical_to_padded_block() {
+        // Symmetric mode must stay bit-identical to the old always-padded
+        // path: adding zeros to a non-empty real chunk can never increase
+        // abs_max, so the fixed length-aware helper must produce exactly the
+        // same Q4Block as folding over the full zero-padded array.
+        let src = [5.0f64, -6.0, 7.0];
+        let mut padded = [0.0f32; 32];
+        for (dst, src) in padded.iter_mut().zip(src.iter()) {
+            *dst = *src as f32;
+        }
+
+        let expected = quantize_block_with_mode_len(&padded, 32, true).unwrap();
+        let q = quantize_f64_to_q4_mode(&src, &[3], true).unwrap();
+
+        assert_eq!(
+            q.blocks[0], expected,
+            "symmetric partial blocks must stay byte-identical to the old padded path"
+        );
+    }
+
+    #[test]
     fn quantize_f64_to_q4_matches_f32_path_after_downcast() {
         // The f64 wrapper must agree byte-for-byte with the f32 entry under
         // the same symmetry mode. `quantize_f64_to_q4` defaults to symmetric
@@ -1924,6 +1977,102 @@ mod tests {
         assert!(
             r.is_err(),
             "u32::MAX ndim in .f16 must be rejected, not OOM-aborted"
+        );
+    }
+
+    #[test]
+    fn test_q4_rejects_original_len_near_usize_max() {
+        // original_len = usize::MAX - 3, with a single-dim shape equal to
+        // original_len so shape_product == original_len and the loader
+        // reaches the block-payload guard (not the earlier shape-mismatch
+        // guard). n_blocks*20 does not itself overflow u64 at this
+        // magnitude, so this exercises the file_len-bound branch of
+        // checked_alloc_bytes: it must return a clean Err, never panic or
+        // attempt a multi-exabyte allocation. Removing the `checked_mul`
+        // guard (reverting to `n_blocks * 20`) does not panic here either
+        // since the multiply itself doesn't overflow — this test instead
+        // proves the *file_len bound* check is load-bearing on its own.
+        let huge = usize::MAX - 3;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes()); // version
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0] == original_len
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // original_len
+        let path = std::path::PathBuf::from("/tmp/test_q4_original_len_near_usize_max.q4");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_q4_file(&path);
+        std::fs::remove_file(&path).ok();
+        let err = r.expect_err("original_len near usize::MAX must be rejected, not panic/OOM");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("block payload") || msg.contains("header claims"),
+            "expected the block-payload allocation guard to fire, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_f16_rejects_numel_near_usize_max() {
+        // numel = usize::MAX - 3: numel*2 does not itself wrap past u64::MAX
+        // by much (wraps to usize::MAX - 7, still far above any real
+        // file_len), so this is caught by the file_len-bound branch — same
+        // guard class as test_q4_rejects_original_len_near_usize_max above.
+        let huge = usize::MAX - 3;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
+        let path = std::path::PathBuf::from("/tmp/test_f16_numel_near_usize_max.f16");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_f16_tensor_file(&path);
+        std::fs::remove_file(&path).ok();
+        let err = r.expect_err("numel near usize::MAX must be rejected, not panic/OOM");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("f16 data") || msg.contains("overflows usize"),
+            "expected the f16-data allocation guard to fire, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_f16_rejects_numel_that_wraps_to_small_value_on_overflow() {
+        // numel = usize::MAX/2 + 5: numel*2 overflows u64 and wraps to a
+        // *small* residual (10, mod 2^64) that would sail past the
+        // file_len-bound check if `checked_mul` were replaced by a plain
+        // wrapping multiply — a silent-corruption bug (an ~empty read
+        // reported as success with the wrong shape/numel) rather than the
+        // OOM/panic the near-usize::MAX test above guards against. This is
+        // the scenario `checked_mul` uniquely defends: the bound check alone
+        // cannot catch it because the wrapped byte count looks small.
+        let huge = usize::MAX / 2 + 5;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
+        // Trailing filler: `huge * 2` wraps to a small residue (10 bytes) if
+        // `checked_mul` is bypassed, so pad enough real bytes that a buggy
+        // wrapping multiply would successfully `read_exact` a plausible
+        // (wrong) buffer instead of also failing on a short read — isolating
+        // the assertion to the overflow guard itself, not an incidental
+        // short-file error.
+        buf.extend_from_slice(&[0xABu8; 64]);
+        let path =
+            std::path::PathBuf::from("/tmp/test_f16_numel_wraps_to_small_value_on_overflow.f16");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_f16_tensor_file(&path);
+        std::fs::remove_file(&path).ok();
+        let err = r.expect_err(
+            "numel whose ×2 wraps to a small value must still be rejected via checked_mul, \
+             not silently accepted as a tiny (wrong) allocation",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overflows usize"),
+            "expected the checked_mul overflow branch specifically, got: {msg}"
         );
     }
 
