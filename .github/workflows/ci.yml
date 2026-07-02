@@ -128,6 +128,28 @@ jobs:
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
+      # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
+      # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
+      # exposes a PARAVIRTUAL Metal GPU, not a real Apple7 device — a test
+      # gated on `supports_family(Apple7)` would silently skip-pass here. The
+      # f16 KV kernels (copy_buf_offset_f16, copy_kv_cache_batch_f16,
+      # decode_attention_f16, prefill_attention_batched_causal_f16) are not
+      # Apple7-gated, so this leg actually executes them and fails closed:
+      # LATTICE_METAL_TEST_ENFORCE=1 panics if no Metal device is present,
+      # and the grep below rejects a zero-test filter match as well as a run
+      # that never prints the runtime capability marker.
+      - name: inference - f16 KV-cache Metal path (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+          LATTICE_KV_F16: '1'
+          LATTICE_METAL_PATH_PROOF: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/f16-kv-metal-test.log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib f16_kv_metal_path_executes_and_reports_capability -- --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Fq '[METAL_F16_KV_CAPABILITY] supported=true' "$log"
 
   # The benchmark harnesses live behind their own feature flags / target gates
   # and are never built by `cargo test`. A `Qwen35Config` field added to the

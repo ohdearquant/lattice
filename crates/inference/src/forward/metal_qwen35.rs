@@ -17790,6 +17790,99 @@ kernel void decode_attention_reference(
             }
         }
 
+        /// Issue #252 (#238 follow-up): runtime capability probe for the f16
+        /// KV-cache Metal path. GitHub's hosted `macos-latest` runner exposes a
+        /// PARAVIRTUAL Metal GPU (not a real Apple7 device), so this test must
+        /// NOT gate on `supports_family(Apple7)` — it gates on whether the f16
+        /// KV kernels actually construct and execute, and fails loudly
+        /// (LATTICE_METAL_TEST_ENFORCE=1) instead of skip-passing when a Metal
+        /// device is absent.
+        #[test]
+        fn f16_kv_metal_path_executes_and_reports_capability() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!("[METAL_F16_KV_CAPABILITY] supported=false reason=no_metal_device");
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+
+            assert!(
+                matches!(
+                    std::env::var("LATTICE_KV_F16").as_deref(),
+                    Ok("1") | Ok("true")
+                ),
+                "f16 KV Metal probe must run with LATTICE_KV_F16=1"
+            );
+            assert!(
+                matches!(
+                    std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                    Ok("1") | Ok("true")
+                ),
+                "f16 KV Metal probe must run with LATTICE_METAL_PATH_PROOF=1"
+            );
+
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = match MetalQwen35State::new(&weights, &cfg, 16) {
+                Ok(state) => state,
+                Err(err) => {
+                    eprintln!(
+                        "[METAL_F16_KV_CAPABILITY] supported=false reason=construct_failed error={err}"
+                    );
+                    panic!("f16 KV Metal capability probe failed during state construction: {err}");
+                }
+            };
+
+            assert!(state.use_kv_f16, "state did not enable f16 KV cache");
+            assert!(state.session.kv_cache.kv_f16, "KV cache layout is not f16");
+            assert!(state.path_proof_enabled, "path-proof counters are disabled");
+
+            let expected_kv_bytes = 16 * cfg.full_kv_dim() * 2;
+            assert_eq!(
+                state.session.kv_cache.k_bufs[0].length() as usize,
+                expected_kv_bytes,
+                "K cache buffer must use f16 element size"
+            );
+
+            state.reset_path_proof_counters();
+            let _ = state.forward_prefill(&[1, 2, 3]);
+            let decode_pos = state.session.kv_cache.seq_len;
+            let _ = state.forward_step(4, decode_pos);
+
+            let proof = state.path_proof_snapshot();
+            eprintln!(
+                "[METAL_F16_KV_CAPABILITY] supported=true kv_f16={} prefill_kv_batch={} prefill_attn_batched={} decode_kv_copy={} decode_attn_direct={} decode_attn_split_partial={} decode_attn_split_reduce={}",
+                proof.kv_f16,
+                proof.prefill_kv_batch,
+                proof.prefill_attn_batched,
+                proof.decode_kv_copy,
+                proof.decode_attn_direct,
+                proof.decode_attn_split_partial,
+                proof.decode_attn_split_reduce,
+            );
+
+            assert!(proof.kv_f16, "path proof did not report kv_f16=true");
+            assert!(
+                proof.prefill_kv_batch > 0,
+                "f16 batch KV write did not execute"
+            );
+            assert!(
+                proof.prefill_attn_batched > 0,
+                "f16 batched prefill attention did not execute"
+            );
+            assert!(
+                proof.decode_kv_copy > 0,
+                "f16 decode KV copy did not execute"
+            );
+            assert!(
+                proof.decode_attn_direct > 0
+                    || (proof.decode_attn_split_partial > 0 && proof.decode_attn_split_reduce > 0),
+                "f16 decode attention did not execute"
+            );
+        }
+
         #[test]
         fn test_metal_qwen35_engine_session_isolation() {
             let Some(_) = Device::system_default() else {
