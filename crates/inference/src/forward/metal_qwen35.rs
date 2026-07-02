@@ -948,9 +948,9 @@ kernel void copy_buf_offset_f16(
     dst[dst_offset + gid] = half(src[gid]);
 }
 
-// ===== Q4_0 GEMV Decode: 4-bit x float32 with simd_sum reduction =====
-// Q4_0 block: [f16 scale (2B)][16 bytes packed 4-bit] = 18 bytes per 32 weights.
-// Packed as unsigned offset: real_value = (nibble - 8) * scale.
+// ===== Q4 GEMV Decode: asymmetric 4-bit x float32 with simd_sum reduction =====
+// Q4 block: [f16 scale (2B)][f16 bias/min (2B)][16 bytes packed 4-bit] = 20 bytes per 32 weights.
+// Packed nibbles are unsigned sequential pairs: real_value = nibble * scale + bias.
 // NR=2 output rows per threadgroup, 4 simdgroups of 32 = 128 threads.
 // Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
 kernel void gemv_q4_decode(
@@ -12274,7 +12274,7 @@ kernel void gdn_chunk_norm_silu_c32(
             &self,
             enc: &ComputeCommandEncoderRef,
             x: &Buffer,       // activation [1,K] float
-            qw: &Q4WeightBuf, // Q4_0 packed weights [N, K/32 * 18]; payload at qw.payload_offset
+            qw: &Q4WeightBuf, // Q4 packed weights [N, (K/32) * 20]; payload at qw.payload_offset
             y: &Buffer,       // output [1,N] float
             _m: u32,
             n: u32,
@@ -14232,7 +14232,7 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Create a Metal buffer from pre-quantized Q4 block bytes (raw `[u8]`).
         ///
         /// The bytes are the serialized `Q4Block` array as written by `save_q4_file`
-        /// (after the file header), i.e. `n_blocks × 18` raw bytes.
+        /// (after the file header), i.e. `n_blocks × 20` raw bytes.
         fn make_buffer_from_q4_raw(device: &Device, raw: &[u8], label: &str) -> Buffer {
             let buf = device.new_buffer_with_data(
                 raw.as_ptr() as *const _,
