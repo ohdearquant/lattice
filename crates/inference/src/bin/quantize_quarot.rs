@@ -230,7 +230,10 @@ a model whose logits diverged during conversion.
 ";
 
 fn parse_u64_flex(s: &str) -> Result<u64, String> {
-    let trimmed = s.trim();
+    // Strip `_` separators so seeds can be written the same way Rust writes u64
+    // literals (e.g. `0xCAFE_BABE_DEAD_BEEF`), matching the recorded-seed
+    // convention documented in `scripts/gen_quarot_q4_composed_golden.py`.
+    let trimmed: String = s.trim().chars().filter(|&c| c != '_').collect();
     if let Some(rest) = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
