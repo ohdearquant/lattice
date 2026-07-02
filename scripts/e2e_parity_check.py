@@ -383,6 +383,13 @@ def run_lattice_metal(prompt: str, max_tokens: int) -> dict:
         "--prompt", prompt,
         "--max-tokens", str(max_tokens),
         "--temperature", "0.0",
+        # chat_metal's serving default is repetition_penalty 1.1, but the HF
+        # reference applies none — the same greedy-decision mismatch documented
+        # on the CPU path above (run_lattice). Force 1.0 so both sides run the
+        # same greedy rule and any remaining divergence is genuinely the
+        # engine's (e.g. the long-prefill Metal divergence, which reproduces
+        # with this flag set and with either GDN prefill mode).
+        "--repetition-penalty", "1.0",
         "--json",
     ]
 
