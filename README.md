@@ -111,8 +111,9 @@ PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4
 | [`lattice-tune`](crates/tune/)           | Training: knowledge distillation pipeline, dataset management, LoRA adapter management, model registry                                                                | [![](https://img.shields.io/crates/v/lattice-tune.svg)](https://crates.io/crates/lattice-tune)           |
 | [`lattice-transport`](crates/transport/) | Optimal transport: Sinkhorn-Knopp (balanced + unbalanced), Wasserstein barycenters, embedding drift detection                                                         | [![](https://img.shields.io/crates/v/lattice-transport.svg)](https://crates.io/crates/lattice-transport) |
 
-The three leaf crates (`inference`, `fann`, `transport`) have zero intra-workspace dependencies
-and can be used standalone.
+Two leaf crates (`fann`, `transport`) have zero intra-workspace dependencies. `inference` is
+standalone by default and pulls in `fann` only when the optional `mixture` feature is enabled.
+All three can be used on their own.
 
 ---
 

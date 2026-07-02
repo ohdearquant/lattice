@@ -92,9 +92,11 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-inference (~118K)  fann (7.7K)  transport (5.4K)   ← leaf, zero internal deps
-    |                |
-  embed (12K)    tune (20K)                       ← depend on leaves only
+fann (7.7K)   transport (5.4K)                    ← leaf, zero internal deps
+    |
+inference (~118K)                                 ← optional dep on fann (`mixture` feature)
+    |
+embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
 ### lattice-inference — Transformer kernel
@@ -235,7 +237,7 @@ make ci              # full local CI (fmt + clippy + deno lint + test + build)
 make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
 make publish-dry     # verify crates.io packaging
-make publish         # publish (leaf crates first, sleeps for indexing)
+make publish         # publish (dependency order, sleeps for indexing)
 
 # E2E parity (HF reference vs lattice)
 make e2e-parity                          # run locally (needs torch + transformers)

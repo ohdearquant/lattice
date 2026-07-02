@@ -115,7 +115,7 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 ## Crate Ownership
 
-Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `tune`. Changes to `transport`, `fann`, or `inference` alone are safe — they're leaf crates.
+Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `inference` (via the optional `mixture` feature) and `tune`. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only).
 
 ## Publishing
 
