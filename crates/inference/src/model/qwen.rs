@@ -366,12 +366,16 @@ const WEIGHT_FINGERPRINT_INLINE_CAP: u64 = 2 * 1024 * 1024; // 2 MiB
 
 /// Resolve the model directory's weight shard filenames for
 /// `derive_base_model_rev`, in the same precedence order the weight loader
-/// itself uses: a sharded `model.safetensors.index.json` if present (its
-/// `weight_map` values, deduplicated and lexically sorted so the fingerprint
-/// is stable regardless of key iteration order), else a single
-/// `model.safetensors` if present, else no weight files (config-only
-/// derivation).
+/// itself uses: a single `model.safetensors` if present — matching
+/// `QwenModel::from_directory`, which takes the single-file path first when
+/// both a single file and a sharded index exist — else a sharded
+/// `model.safetensors.index.json` if present (its `weight_map` values,
+/// deduplicated and lexically sorted so the fingerprint is stable regardless
+/// of key iteration order), else no weight files (config-only derivation).
 fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
+    if dir.join("model.safetensors").is_file() {
+        return vec!["model.safetensors".to_string()];
+    }
     let index_path = dir.join("model.safetensors.index.json");
     if let Ok(index_bytes) = std::fs::read(&index_path) {
         if let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes) {
@@ -385,9 +389,6 @@ fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
                 }
             }
         }
-    }
-    if dir.join("model.safetensors").is_file() {
-        return vec!["model.safetensors".to_string()];
     }
     Vec::new()
 }
@@ -2801,6 +2802,48 @@ mod tests {
         assert_ne!(
             before, after,
             "flipping a byte in the second (non-first-mentioned) shard must change the rev"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_mixed_layout_follows_loader_precedence() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_mixed_layout");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+
+        // Both a single-file checkpoint AND a sharded index are present.
+        // `QwenModel::from_directory` loads `model.safetensors` first in
+        // this layout, so the fingerprint must track that file, not the
+        // index's shard.
+        let single_path = tmp.join("model.safetensors");
+        write_pattern_bytes(&single_path, 4096);
+
+        let shard_path = tmp.join("model-00001-of-00001.safetensors");
+        write_pattern_bytes(&shard_path, 4096);
+        let index_json = r#"{"weight_map": {
+            "a.weight": "model-00001-of-00001.safetensors"
+        }}"#;
+        std::fs::write(tmp.join("model.safetensors.index.json"), index_json).unwrap();
+
+        let before = derive_base_model_rev(&tmp);
+
+        flip_byte_at(&single_path, 10);
+        let after_single_flip = derive_base_model_rev(&tmp);
+        assert_ne!(
+            before, after_single_flip,
+            "flipping a byte in the actually-loaded model.safetensors must change the rev"
+        );
+
+        flip_byte_at(&single_path, 10); // restore
+        flip_byte_at(&shard_path, 10);
+        let after_shard_flip = derive_base_model_rev(&tmp);
+        assert_eq!(
+            before, after_shard_flip,
+            "flipping a byte in the unused index shard must NOT change the rev — the \
+             fingerprint follows the file the loader actually loads"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
