@@ -14418,19 +14418,6 @@ kernel void gdn_chunk_norm_silu_c32(
             }
         }
 
-        /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
-        ///
-        /// Returns `None` when the file is absent, malformed, or lacks a `quarot_seed`
-        /// key — all three are valid "no rotation" states for backwards compatibility
-        /// with older artifacts. The caller falls back to the legacy `config.json`
-        /// field on `None`.
-        fn read_quarot_seed_from_index(q4_dir: &std::path::Path) -> Option<u64> {
-            let path = q4_dir.join("quantize_index.json");
-            let bytes = std::fs::read(&path).ok()?;
-            let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            v.get("quarot_seed").and_then(serde_json::Value::as_u64)
-        }
-
         /// Create a new [`MetalQwen35State`] by loading pre-quantized Q4/F16 files directly
         /// from a directory, without going through the full f32 weight representation.
         ///
@@ -15224,8 +15211,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 // ADR-051 contract: `quarot_seed` lives in `quantize_index.json`. Fall back
                 // to the legacy `config.json` field (`quarot_rotation_seed`) for
                 // backwards compatibility with artifacts produced before the contract was
-                // formalized.
-                let index_seed = Self::read_quarot_seed_from_index(q4_dir);
+                // formalized. #504 remaining slice 2: a *present but malformed* index is a
+                // hard error (fail-closed) — only a genuinely absent index falls back.
+                let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
+                    .map_err(|e| format!("from_q4_dir: {e}"))?;
                 let seed_opt = index_seed.or(cfg.quarot_rotation_seed);
                 match seed_opt {
                     Some(seed) => Some(
@@ -18075,49 +18064,12 @@ kernel void decode_attention_reference(
         // -------------------------------------------------------------------
         // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
         // -------------------------------------------------------------------
-
-        #[test]
-        fn read_quarot_seed_from_index_finds_seed() {
-            // ADR-051 contract: `quantize_index.json` carries `quarot_seed`. The runtime
-            // loader's helper must extract it when present, return None when absent or the
-            // file is missing/malformed, and ignore everything else in the index.
-            let tmp = tempfile::tempdir().unwrap();
-
-            // Absent file → None.
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "missing quantize_index.json must yield None"
-            );
-
-            // File without `quarot_seed` → None.
-            std::fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "index without quarot_seed key must yield None"
-            );
-
-            // File with `quarot_seed` → Some(seed).
-            std::fs::write(
-                tmp.path().join("quantize_index.json"),
-                r#"{"quarot_seed":13258600446175248384,"tensors":[]}"#,
-            )
-            .unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                Some(13_258_600_446_175_248_384_u64),
-                "index with quarot_seed key must round-trip the u64 exactly"
-            );
-
-            // Malformed JSON → None (silent fallback, never panics).
-            std::fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
-            assert_eq!(
-                MetalQwen35State::read_quarot_seed_from_index(tmp.path()),
-                None,
-                "malformed index must yield None (never panic)"
-            );
-        }
+        //
+        // `read_quarot_seed_from_index` itself (the `quantize_index.json`
+        // reader) moved to `crate::quant::quarot::convert` (#504 remaining
+        // slice 2) — it is pure file-I/O with no Metal dependency, so its
+        // tests live there where they run under default (CPU-only) features
+        // instead of requiring `metal-gpu`.
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
