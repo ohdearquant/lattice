@@ -3492,16 +3492,20 @@ kernel void gdn_chunk_norm_silu_c32(
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
         let header = read_q4_header(&file)
             .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len();
         // Fail closed on a truncated/malformed Q4 file *before* the mmap is
         // handed to the GPU: unlike the CPU sibling (`load_q4_file`), which
         // fails via `read_exact` short of the block payload, this no-copy
         // path never reads the payload itself, so a missing bounds check
         // here would let a truncated on-disk checkpoint reach Metal dispatch
         // and read past the end of the mapped payload.
-        validate_q4_header_payload_bounds(&header, mmap.len() as u64, path)
+        validate_q4_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
