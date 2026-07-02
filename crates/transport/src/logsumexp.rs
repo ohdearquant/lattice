@@ -216,7 +216,7 @@ pub fn median(values: &[f32]) -> f32 {
             .unwrap_or(core::cmp::Ordering::Equal)
     });
     let mid = scratch.len() / 2;
-    if scratch.len() % 2 == 0 {
+    if scratch.len().is_multiple_of(2) {
         0.5 * (scratch[mid - 1] + scratch[mid])
     } else {
         scratch[mid]

@@ -548,10 +548,10 @@ impl WordPieceTokenizer {
     fn match_added_token(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
         let tail = &text[pos..];
         for token in &self.inner.added_tokens_sorted {
-            if tail.starts_with(token.as_str()) {
-                if let Some(&id) = self.inner.added_tokens.get(token) {
-                    return Some((pos + token.len(), id));
-                }
+            if tail.starts_with(token.as_str())
+                && let Some(&id) = self.inner.added_tokens.get(token)
+            {
+                return Some((pos + token.len(), id));
             }
         }
         None

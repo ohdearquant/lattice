@@ -131,7 +131,7 @@ pub fn flash_attention_causal_with_config(
     }
 
     assert!(
-        num_heads % num_kv_heads == 0,
+        num_heads.is_multiple_of(num_kv_heads),
         "num_heads must be divisible by num_kv_heads"
     );
 
@@ -280,7 +280,7 @@ pub fn flash_attention_causal_with_config(
 #[inline]
 fn ceil_div(n: usize, d: usize) -> usize {
     debug_assert!(d > 0);
-    n / d + usize::from(n % d != 0)
+    n / d + usize::from(!n.is_multiple_of(d))
 }
 
 /// Release-active precondition guard: reject head/sequence shapes whose `usize`

@@ -149,10 +149,10 @@ fn require_env_dir(name: &str) -> Option<PathBuf> {
 /// Minimal `~` expansion so `LATTICE_MODEL_DIR=~/.lattice/models/...` works
 /// the same way it does when a user types it at a shell prompt.
 fn shellexpand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
     path.to_string()
 }

@@ -508,17 +508,17 @@ pub fn generate(
     // only after a successful advance so a grammar-rejected token (sampled despite
     // the mask, e.g. from rounding on a boundary logit) does not appear in the
     // output (#398).
-    if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-        if !engine.advance(gs, first_token) {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                token_ids: vec![],
-                stopped_by_eos: false,
-                stop_reason: Some(StopReason::Grammar),
-            });
-        }
+    if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state)
+        && !engine.advance(gs, first_token)
+    {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            token_ids: vec![],
+            stopped_by_eos: false,
+            stop_reason: Some(StopReason::Grammar),
+        });
     }
     generated_ids.push(first_token);
 
@@ -566,11 +566,11 @@ pub fn generate(
 
             let token = sampler.sample(&scratch.logits[..cfg.vocab_size]);
             // Advance grammar state after sampling.
-            if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-                if !engine.advance(gs, token) {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
+            if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state)
+                && !engine.advance(gs, token)
+            {
+                stop_reason = StopReason::Grammar;
+                break;
             }
             generated_ids.push(token);
 

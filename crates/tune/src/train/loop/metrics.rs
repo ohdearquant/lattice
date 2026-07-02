@@ -112,11 +112,11 @@ impl TrainingMetrics {
     /// Add epoch metrics
     pub fn add_epoch(&mut self, metrics: EpochMetrics) {
         // Update best validation loss
-        if let Some(val_loss) = metrics.val_loss {
-            if self.best_val_loss.is_none_or(|best| val_loss < best) {
-                self.best_val_loss = Some(val_loss);
-                self.best_epoch = Some(metrics.epoch);
-            }
+        if let Some(val_loss) = metrics.val_loss
+            && self.best_val_loss.is_none_or(|best| val_loss < best)
+        {
+            self.best_val_loss = Some(val_loss);
+            self.best_epoch = Some(metrics.epoch);
         }
 
         self.final_train_loss = metrics.train_loss;

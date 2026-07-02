@@ -77,13 +77,13 @@ impl DatasetConfig {
                 "batch_size must be > 0".to_string(),
             ));
         }
-        if let Some(max) = self.max_context_size {
-            if max < self.min_context_size {
-                return Err(TuneError::InvalidConfig(format!(
-                    "max_context_size ({}) must be >= min_context_size ({})",
-                    max, self.min_context_size
-                )));
-            }
+        if let Some(max) = self.max_context_size
+            && max < self.min_context_size
+        {
+            return Err(TuneError::InvalidConfig(format!(
+                "max_context_size ({}) must be >= min_context_size ({})",
+                max, self.min_context_size
+            )));
         }
         Ok(())
     }

@@ -322,10 +322,11 @@ impl GrammarEngine {
     /// appropriate.
     fn find_state_id(&self, state: &GrammarState) -> Option<usize> {
         for sid in 0..self.partition.num_states() {
-            if let Some(ps) = self.partition.grammar_state(sid) {
-                if ps.stack == state.stack && ps.complete == state.complete {
-                    return Some(sid);
-                }
+            if let Some(ps) = self.partition.grammar_state(sid)
+                && ps.stack == state.stack
+                && ps.complete == state.complete
+            {
+                return Some(sid);
             }
         }
         None

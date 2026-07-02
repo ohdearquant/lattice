@@ -13,7 +13,7 @@ use super::simd::simd_config;
 pub fn rms_norm(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
     assert!(hidden > 0, "hidden must be > 0");
     assert!(
-        x.len() % hidden == 0,
+        x.len().is_multiple_of(hidden),
         "x.len() must be a multiple of hidden"
     );
     assert!(gamma.len() == hidden, "gamma.len() must equal hidden");

@@ -109,12 +109,12 @@ impl DistillationConfig {
                 "concurrency must be > 0".to_string(),
             ));
         }
-        if let Some(conf) = self.min_confidence {
-            if !(0.0..=1.0).contains(&conf) {
-                return Err(TuneError::InvalidConfig(format!(
-                    "min_confidence must be between 0.0 and 1.0, got {conf}"
-                )));
-            }
+        if let Some(conf) = self.min_confidence
+            && !(0.0..=1.0).contains(&conf)
+        {
+            return Err(TuneError::InvalidConfig(format!(
+                "min_confidence must be between 0.0 and 1.0, got {conf}"
+            )));
         }
         Ok(())
     }

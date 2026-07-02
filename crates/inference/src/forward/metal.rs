@@ -1021,7 +1021,7 @@ kernel void fused_qk_norm_rope(
         if config.head_dim == 0 {
             return Err("Metal fused attention requires nonzero head_dim".to_string());
         }
-        if config.head_dim % 4 != 0 {
+        if !config.head_dim.is_multiple_of(4) {
             return Err(format!(
                 "Metal fused attention requires head_dim divisible by 4 (for float4 ops); got {}",
                 config.head_dim
@@ -1030,7 +1030,10 @@ kernel void fused_qk_norm_rope(
         if config.num_key_value_heads == 0 {
             return Err("Metal fused attention requires nonzero num_key_value_heads".to_string());
         }
-        if config.num_attention_heads % config.num_key_value_heads != 0 {
+        if !config
+            .num_attention_heads
+            .is_multiple_of(config.num_key_value_heads)
+        {
             return Err(format!(
                 "Metal fused attention requires num_attention_heads divisible by num_key_value_heads; got {}/{}",
                 config.num_attention_heads, config.num_key_value_heads

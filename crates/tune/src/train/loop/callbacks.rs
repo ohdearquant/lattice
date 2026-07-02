@@ -67,7 +67,7 @@ impl TrainingCallback for LoggingCallback {
     }
 
     fn on_batch_end(&mut self, batch_idx: usize, loss: f32) {
-        if batch_idx % self.log_interval == 0 {
+        if batch_idx.is_multiple_of(self.log_interval) {
             println!("  batch {batch_idx}: loss {loss:.4}");
         }
     }

@@ -495,10 +495,10 @@ impl BpeTokenizer {
 
     fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> Vec<u32> {
         scratch.ids.clear();
-        if self.inner.add_bos {
-            if let Some(bos_id) = self.inner.bos_id {
-                scratch.ids.push(bos_id);
-            }
+        if self.inner.add_bos
+            && let Some(bos_id) = self.inner.bos_id
+        {
+            scratch.ids.push(bos_id);
         }
 
         let mut segment_start = 0usize;
@@ -575,10 +575,10 @@ impl BpeTokenizer {
     fn match_special(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
         let tail = &text[pos..];
         for token in &self.inner.special_tokens_sorted {
-            if tail.starts_with(token) {
-                if let Some(&id) = self.inner.special_tokens.get(token) {
-                    return Some((pos + token.len(), id));
-                }
+            if tail.starts_with(token)
+                && let Some(&id) = self.inner.special_tokens.get(token)
+            {
+                return Some((pos + token.len(), id));
             }
         }
         None

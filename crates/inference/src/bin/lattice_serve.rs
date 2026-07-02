@@ -567,10 +567,10 @@ mod imp {
     }
 
     fn resolve_model_dir(arg: &str) -> std::path::PathBuf {
-        if let Some(rest) = arg.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return std::path::PathBuf::from(home).join(rest);
-            }
+        if let Some(rest) = arg.strip_prefix("~/")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            return std::path::PathBuf::from(home).join(rest);
         }
         let p = std::path::PathBuf::from(arg);
         if p.is_absolute() {

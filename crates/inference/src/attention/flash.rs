@@ -95,7 +95,7 @@ impl TiledAttentionConfig {
         assert!(self.num_q_heads > 0, "num_q_heads must be > 0");
         assert!(self.num_kv_heads > 0, "num_kv_heads must be > 0");
         assert!(
-            self.num_q_heads % self.num_kv_heads == 0,
+            self.num_q_heads.is_multiple_of(self.num_kv_heads),
             "num_q_heads ({}) must be divisible by num_kv_heads ({})",
             self.num_q_heads,
             self.num_kv_heads
@@ -305,7 +305,7 @@ fn assert_flash_tiled_no_overflow(
 
 #[inline]
 fn kv_head_index(q_head: usize, num_q_heads: usize, num_kv_heads: usize) -> usize {
-    debug_assert!(num_q_heads % num_kv_heads == 0);
+    debug_assert!(num_q_heads.is_multiple_of(num_kv_heads));
     q_head / (num_q_heads / num_kv_heads)
 }
 

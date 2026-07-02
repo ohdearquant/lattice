@@ -125,7 +125,7 @@ impl MlpMerger {
         raw_patches: usize,
     ) -> Result<Vec<f32>, VisionError> {
         let merge_sq = self.merge_size * self.merge_size;
-        if raw_patches % merge_sq != 0 {
+        if !raw_patches.is_multiple_of(merge_sq) {
             return Err(VisionError::ShapeMismatch {
                 expected: 0, // divisible by merge_sq
                 actual: raw_patches % merge_sq,

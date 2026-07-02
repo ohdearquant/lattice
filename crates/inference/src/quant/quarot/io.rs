@@ -613,7 +613,7 @@ impl QuarotTensorReader {
 fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, InferenceError> {
     match dtype {
         SourceDType::F32 => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "F32 tensor byte length {} not divisible by 4",
                     bytes.len()
@@ -625,7 +625,7 @@ fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, Inf
                 .collect())
         }
         SourceDType::BF16 => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "BF16 tensor byte length {} not divisible by 2",
                     bytes.len()
@@ -640,7 +640,7 @@ fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, Inf
                 .collect())
         }
         SourceDType::F16 => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "F16 tensor byte length {} not divisible by 2",
                     bytes.len()

@@ -583,7 +583,10 @@ impl<'a> MtpVerifier<'a> {
                 "MtpConfig num_key_value_heads must be > 0".into(),
             ));
         }
-        if config.num_attention_heads % config.num_key_value_heads != 0 {
+        if !config
+            .num_attention_heads
+            .is_multiple_of(config.num_key_value_heads)
+        {
             return Err(InferenceError::Inference(format!(
                 "MtpConfig num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
                 config.num_attention_heads, config.num_key_value_heads

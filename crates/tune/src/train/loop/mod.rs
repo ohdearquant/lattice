@@ -142,17 +142,17 @@ impl TrainingLoop {
             }
 
             // Check early stopping
-            if let Some(ref es) = self.early_stopping {
-                if let Some(metric_val) = epoch_metrics.get_metric(&es.monitor) {
-                    if es.is_improvement(metric_val, self.state.best_metric) {
-                        self.state.best_metric = metric_val;
-                        self.state.patience_counter = 0;
-                    } else {
-                        self.state.patience_counter += 1;
-                        if self.state.patience_counter >= es.patience {
-                            self.metrics.early_stopped = true;
-                            break;
-                        }
+            if let Some(ref es) = self.early_stopping
+                && let Some(metric_val) = epoch_metrics.get_metric(&es.monitor)
+            {
+                if es.is_improvement(metric_val, self.state.best_metric) {
+                    self.state.best_metric = metric_val;
+                    self.state.patience_counter = 0;
+                } else {
+                    self.state.patience_counter += 1;
+                    if self.state.patience_counter >= es.patience {
+                        self.metrics.early_stopped = true;
+                        break;
                     }
                 }
             }

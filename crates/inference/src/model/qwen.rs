@@ -327,15 +327,15 @@ impl ModelInferenceConfig {
         // a real revision when the field is still at the "unset" sentinel, so
         // the manifest compat check in `cache_load` is non-vacuous by default
         // instead of comparing "none" == "none" on every real deployment.
-        if cfg.base_model_rev == default_cache_compat_rev() {
-            if let Some(rev) = derive_base_model_rev(model_dir) {
-                cfg.base_model_rev = rev;
-            }
+        if cfg.base_model_rev == default_cache_compat_rev()
+            && let Some(rev) = derive_base_model_rev(model_dir)
+        {
+            cfg.base_model_rev = rev;
         }
-        if cfg.tokenizer_rev == default_cache_compat_rev() {
-            if let Some(rev) = derive_cache_compat_rev(&model_dir.join("tokenizer.json")) {
-                cfg.tokenizer_rev = rev;
-            }
+        if cfg.tokenizer_rev == default_cache_compat_rev()
+            && let Some(rev) = derive_cache_compat_rev(&model_dir.join("tokenizer.json"))
+        {
+            cfg.tokenizer_rev = rev;
         }
 
         cfg
@@ -377,17 +377,16 @@ fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
         return vec!["model.safetensors".to_string()];
     }
     let index_path = dir.join("model.safetensors.index.json");
-    if let Ok(index_bytes) = std::fs::read(&index_path) {
-        if let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes) {
-            if let Some(weight_map) = index_json.get("weight_map").and_then(|v| v.as_object()) {
-                let files: std::collections::BTreeSet<String> = weight_map
-                    .values()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect();
-                if !files.is_empty() {
-                    return files.into_iter().collect();
-                }
-            }
+    if let Ok(index_bytes) = std::fs::read(&index_path)
+        && let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes)
+        && let Some(weight_map) = index_json.get("weight_map").and_then(|v| v.as_object())
+    {
+        let files: std::collections::BTreeSet<String> = weight_map
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !files.is_empty() {
+            return files.into_iter().collect();
         }
     }
     Vec::new()

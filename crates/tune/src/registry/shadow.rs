@@ -259,25 +259,25 @@ impl ShadowSession {
     ///
     /// The current (possibly updated) session state.
     pub fn evaluate(&mut self) -> &ShadowState {
-        if let ShadowState::Running { .. } = &self.state {
-            if self.samples.len() >= self.config.min_samples {
-                let comparison = self.compute_comparison();
+        if let ShadowState::Running { .. } = &self.state
+            && self.samples.len() >= self.config.min_samples
+        {
+            let comparison = self.compute_comparison();
 
-                if comparison.agreement_rate >= self.config.min_agreement
-                    && comparison.latency_diff_ms <= self.config.max_latency_increase_ms
-                {
-                    self.state = ShadowState::Passed {
-                        comparison,
-                        completed_at: Utc::now(),
-                    };
-                } else {
-                    let reason = self.failure_reason(&comparison);
-                    self.state = ShadowState::Failed {
-                        comparison,
-                        reason,
-                        completed_at: Utc::now(),
-                    };
-                }
+            if comparison.agreement_rate >= self.config.min_agreement
+                && comparison.latency_diff_ms <= self.config.max_latency_increase_ms
+            {
+                self.state = ShadowState::Passed {
+                    comparison,
+                    completed_at: Utc::now(),
+                };
+            } else {
+                let reason = self.failure_reason(&comparison);
+                self.state = ShadowState::Failed {
+                    comparison,
+                    reason,
+                    completed_at: Utc::now(),
+                };
             }
         }
         &self.state
