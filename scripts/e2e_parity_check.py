@@ -36,10 +36,16 @@ PROMPTS: list[tuple[str, int]] = [
     ("In the year 2024, artificial intelligence", 3),
     ("def fibonacci(n):\n    if n <= 1:\n        return n\n    return", 3),
     # LONG_PROMPT: ~816 tokens (measured with Qwen/Qwen3.5-0.8B tokenizer).
-    # Must exceed max_prefill=512 so forward_prefill_impl takes the sequential
-    # per-token forward_step loop (the n > self.session.max_prefill branch in
-    # metal_qwen35.rs:forward_prefill_impl). This exercises the oversize /
-    # chunked-prefill path that upcoming PRs #188 and #189 modify.
+    # NOTE on call graph: CI builds qwen35_generate with --features f16 only,
+    # so this prompt exercises the CPU/f16 forward path — NOT the Metal
+    # chunked/oversize-prefill code in metal_qwen35.rs, which is gated behind
+    # `metal-gpu` and never compiled here. (An earlier version of this comment
+    # claimed otherwise, and that stale call-graph model misdirected the #520
+    # triage toward Metal prefill.) What the length DOES stress is the
+    # sampling decision after a long prompt history: with ~816 prompt tokens
+    # in previous_ids, a repetition-penalty mismatch between lattice and the
+    # HF reference flips the first greedy token (#520). Covering Metal
+    # chunked prefill requires a separate metal-gpu gate (see #239).
     # match_window=2: the first two generated tokens are a direct function of
     # the full 816-step prefill final-position logits. GDN recurrent state
     # drifts during decode (same reason short prompts use 3 not 15), but the
@@ -230,6 +236,19 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
         "--prompt", prompt,
         "--max-tokens", str(max_tokens),
         "--temperature", "0.0",
+        # GenerateConfig::default() carries a production repetition_penalty of
+        # 1.1 (see qwen35_config.rs), matching chat_metal.rs's serving default.
+        # The HF reference call below passes no repetition_penalty kwarg, so
+        # transformers applies none (factor 1.0 = no-op). Left at lattice's
+        # default, the two sides sample from different distributions even at
+        # temperature=0.0 (repetition penalty is applied to logits before the
+        # greedy argmax, not after) — invisible on short prompts because few
+        # candidate tokens have already appeared, but decisive on the ~816-token
+        # long-prefill prompt: nearly the whole Python-keyword vocabulary is
+        # already in the prompt, so penalizing every previously-seen token
+        # flips the post-prefill argmax away from HF's continuation (#520).
+        # Force 1.0 here so both sides run the same greedy decision rule.
+        "--repetition-penalty", "1.0",
     ]
 
     t0 = time.time()

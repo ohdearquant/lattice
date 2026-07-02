@@ -343,6 +343,59 @@ mod tests {
         assert_eq!(token, 0, "NaN penalty must be a no-op");
     }
 
+    /// Regression guard for #520: a nonzero repetition_penalty is applied to
+    /// logits BEFORE the temperature-degenerate greedy short-circuit, so
+    /// `temperature=0.0` ("greedy") does not by itself guarantee the raw
+    /// argmax wins when `previous_ids` (the full prompt + generated history)
+    /// already contains the argmax token.
+    ///
+    /// This is exactly the mechanism behind the long-prefill e2e-parity
+    /// divergence: `qwen35_generate`'s default `GenerateConfig` carries
+    /// `repetition_penalty: 1.1` (production serving default, matching
+    /// `chat_metal.rs`), while the HF reference in `e2e_parity_check.py`
+    /// applies none. On an ~800+ token prompt that already contains most of
+    /// the model's natural high-probability continuation tokens, penalizing
+    /// every previously-seen id flips the post-prefill greedy pick away from
+    /// the unpenalized argmax — reproduced here with a 3-way logit vector and
+    /// a `previous_ids` history containing the argmax token, standing in for
+    /// the 816-token prompt. If this test is reverted (repetition_penalty
+    /// applied after the greedy short-circuit, or skipped entirely at
+    /// temperature=0.0), both assertions below fail because token 0 would win
+    /// regardless of `previous_ids`.
+    #[test]
+    fn test_repetition_penalty_can_flip_greedy_argmax_when_seen_in_history() {
+        // Token 0 has the highest raw logit; token 1 is a close second. Chosen
+        // so that 5.0 / 1.1 == 4.5454... falls below token 1's unpenalized 4.6,
+        // flipping the argmax only when the penalty is actually applied.
+        let logits = [5.0_f32, 4.6, 0.1];
+
+        // No penalty (HF reference contract): argmax (token 0) wins regardless
+        // of history.
+        let mut cfg_no_penalty = cfg(0.0, 0);
+        cfg_no_penalty.repetition_penalty = 1.0;
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg_no_penalty, &[0, 0, 0], &mut rng);
+        assert_eq!(
+            token, 0,
+            "with repetition_penalty=1.0, greedy must return the raw argmax"
+        );
+
+        // With repetition_penalty=1.1 (lattice's production default) and token 0
+        // already in `previous_ids` (as it would be after a long prefill that
+        // happens to contain the argmax token), the penalized logit for token 0
+        // drops below token 1's unpenalized logit and the greedy pick flips.
+        let mut cfg_penalized = cfg(0.0, 0);
+        cfg_penalized.repetition_penalty = 1.1;
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg_penalized, &[0, 0, 0], &mut rng);
+        assert_eq!(
+            token, 1,
+            "repetition_penalty=1.1 must penalize a previously-seen argmax \
+             enough to flip greedy selection to the runner-up — this is the \
+             #520 divergence mechanism, not a chunked-prefill bug"
+        );
+    }
+
     /// Realistic-input parity regression guard: `Sampler::sample` (Path A) and
     /// `sample_token` (Path B) must produce IDENTICAL token sequences for the same
     /// logits, config, and seed on a typical no-tie logit vector.
