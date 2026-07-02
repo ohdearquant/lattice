@@ -231,6 +231,36 @@ fn w3_mlp_dir_fails_closed_on_nonexistent_directory() {
 }
 
 #[test]
+fn decode_loop_ppl_w3_mlp_dir_fails_closed_on_nonexistent_directory() {
+    // Round-3 (issue #420/#530/#531): --decode-loop-ppl must thread through
+    // exactly like the default scorer for artifact-loading failures — it
+    // only changes how a *loaded* session is scored, not the fail-closed
+    // load-failure path.
+    let corpus = corpus_file();
+    let out = run(&[
+        "--decode-loop-ppl",
+        "--w3-mlp-dir",
+        "/tmp/eval-perplexity-w3-cli-test-nonexistent-dir-decode-loop",
+        "--tokenizer-dir",
+        valid_tokenizer_dir().to_str().unwrap(),
+        "--corpus-file",
+        corpus.to_str().unwrap(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "a nonexistent --w3-mlp-dir must be a hard failure under --decode-loop-ppl too"
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out_text.contains("=== Perplexity Report"),
+        "must never print a report for a nonexistent artifact dir"
+    );
+    assert_no_panic(&out);
+    let _ = std::fs::remove_file(&corpus);
+}
+
+#[test]
 fn w3_mlp_dir_fails_closed_on_directory_missing_config_json() {
     // A directory that exists but is missing config.json is what a
     // corrupted/incomplete `quantize_w3_mlp` output looks like: present on
@@ -243,6 +273,44 @@ fn w3_mlp_dir_fails_closed_on_directory_missing_config_json() {
     std::fs::create_dir_all(&empty_w3_dir).unwrap();
 
     let out = run(&[
+        "--w3-mlp-dir",
+        empty_w3_dir.to_str().unwrap(),
+        "--tokenizer-dir",
+        valid_tokenizer_dir().to_str().unwrap(),
+        "--corpus-file",
+        corpus.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("config.json"),
+        "error must name the missing artifact (config.json); got:\n{err}"
+    );
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out_text.contains("=== Perplexity Report"));
+    assert_no_panic(&out);
+
+    std::fs::remove_dir_all(&empty_w3_dir).ok();
+    let _ = std::fs::remove_file(&corpus);
+}
+
+#[test]
+fn decode_loop_ppl_w3_mlp_dir_fails_closed_on_directory_missing_config_json() {
+    // Same corrupted-artifact shape as `w3_mlp_dir_fails_closed_on_directory_missing_config_json`
+    // (a directory that exists but is missing config.json), with `--decode-loop-ppl` added.
+    // Artifact loading happens before the scoring-mode branch, so this must fail closed
+    // identically to the default scorer — not panic, not silently skip validation because
+    // decode-loop mode was requested.
+    let corpus = corpus_file();
+    let empty_w3_dir = std::env::temp_dir().join(format!(
+        "eval_perplexity_w3_cli_test_empty_dir_decode_loop_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&empty_w3_dir).unwrap();
+
+    let out = run(&[
+        "--decode-loop-ppl",
         "--w3-mlp-dir",
         empty_w3_dir.to_str().unwrap(),
         "--tokenizer-dir",
@@ -331,6 +399,80 @@ fn w3_mlp_dir_fails_closed_on_corrupt_w3_artifact_if_real_model_cache_present() 
     assert!(
         !out.status.success(),
         "a corrupted W3 tensor must be a hard failure, never a silent/degraded report"
+    );
+    let out_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out_text.contains("=== Perplexity Report"),
+        "must never print a report when a required W3 artifact is corrupt"
+    );
+    assert_no_panic(&out);
+
+    std::fs::remove_dir_all(&fixture_dir).ok();
+    let _ = std::fs::remove_file(&corpus);
+}
+
+#[test]
+fn decode_loop_ppl_fails_closed_on_corrupt_w3_artifact_if_real_model_cache_present() {
+    // Same corrupted-tensor fixture as
+    // `w3_mlp_dir_fails_closed_on_corrupt_w3_artifact_if_real_model_cache_present`,
+    // with `--decode-loop-ppl` added. Round-2 known risk (issue #420/#531): the
+    // default scorer panics mid-scoring on a W3 session; `--decode-loop-ppl`
+    // must not silently paper over a corrupt artifact either — loading still
+    // happens before the scoring-mode branch is reached, so this must fail
+    // closed identically. Skips cleanly if the local model cache isn't present.
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let real_w3_dir = PathBuf::from(&home).join(".lattice/models/qwen3.5-0.8b-w3-mlp-420");
+    let real_tokenizer_dir = PathBuf::from(&home).join(".lattice/models/qwen3.5-0.8b");
+    if !real_w3_dir.is_dir() || !real_tokenizer_dir.join("tokenizer.json").is_file() {
+        eprintln!(
+            "skipping: local W3 model cache not present at {}",
+            real_w3_dir.display()
+        );
+        return;
+    }
+
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "eval_perplexity_w3_cli_test_corrupt_fixture_decode_loop_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&fixture_dir).unwrap();
+    let mut corrupted_one = false;
+    for entry in std::fs::read_dir(&real_w3_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let dest = fixture_dir.join(&name);
+        if !corrupted_one && name_str.ends_with(".w3") && name_str.contains("mlp") {
+            std::fs::write(&dest, [0xDEu8, 0xAD, 0xBE, 0xEF]).unwrap();
+            corrupted_one = true;
+        } else {
+            std::os::unix::fs::symlink(entry.path(), &dest).unwrap();
+        }
+    }
+    assert!(
+        corrupted_one,
+        "test setup bug: no dense-MLP .w3 file found to corrupt in {}",
+        real_w3_dir.display()
+    );
+
+    let corpus = corpus_file();
+    let out = run(&[
+        "--decode-loop-ppl",
+        "--w3-mlp-dir",
+        fixture_dir.to_str().unwrap(),
+        "--tokenizer-dir",
+        real_tokenizer_dir.to_str().unwrap(),
+        "--corpus-file",
+        corpus.to_str().unwrap(),
+        "--max-tokens",
+        "8",
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "a corrupted W3 tensor must be a hard failure under --decode-loop-ppl too"
     );
     let out_text = String::from_utf8_lossy(&out.stdout);
     assert!(

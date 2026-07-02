@@ -16443,6 +16443,10 @@ kernel void gdn_chunk_norm_silu_c32(
                 std::env::var("LATTICE_KV_F16").as_deref(),
                 Ok("1") | Ok("true")
             );
+            let path_proof_enabled = matches!(
+                std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+                Ok("1") | Ok("true")
+            );
             let kv_cache = MetalKvCache::new(&device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
             let dur_d = t_d.elapsed();
@@ -16603,6 +16607,9 @@ kernel void gdn_chunk_norm_silu_c32(
                     Ok("0") | Ok("false")
                 ),
                 use_kv_f16,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled,
+                path_proof: PathProofCounters::default(),
             })
         }
 
@@ -16739,6 +16746,103 @@ kernel void gdn_chunk_norm_silu_c32(
             let max_ctx = self.max_context();
             crate::model::qwen35::run_strided_perplexity(tokens, cfg, max_ctx, |slice| {
                 self.compute_token_nlls(slice)
+            })
+        }
+
+        /// **Unstable**: decode-loop (M=1) sibling of [`Self::compute_token_nlls`].
+        ///
+        /// Computes per-position cross-entropy NLLs by feeding `tokens` one at a
+        /// time through [`Self::forward_step`] — the same M=1 decode kernel every
+        /// format (f16, Q4, W3) already uses for generation — instead of the
+        /// batched M>1 prefill path (`forward_prefill_all_logits`) that
+        /// [`Self::compute_token_nlls`] uses. W3 dense-MLP weights have no batched
+        /// prefill kernel (issue #420/#531): `forward_prefill_all_logits` panics
+        /// on a W3 session. This decode-loop path never calls that function, so
+        /// it is safe to use identically for f16, Q4, and W3 sessions, which is
+        /// what makes cross-format PPL deltas method-consistent.
+        ///
+        /// Resets all recurrent state ([`Self::reset_state`]) before stepping,
+        /// same contract as [`Self::compute_token_nlls`]: a single call does not
+        /// depend on the caller's previous KV cache / GDN state (including any
+        /// cross-turn KV prefix cache, which `forward_step` clears on every
+        /// call), and subsequent calls do not contaminate each other.
+        ///
+        /// Returns a `Vec<f32>` of length `tokens.len() - 1`. The value at
+        /// index `i` is `-log p(tokens[i + 1] | tokens[0..=i])`.
+        ///
+        /// Errors if `tokens.len() < 2`, if `tokens.len() > self.max_context()`
+        /// (the KV cache would overflow during the walk), or if any
+        /// `token_id >= vocab_size`. All token ids are validated up front so
+        /// none reach [`Self::forward_step`], whose `token_id >= vocab_size`
+        /// bound is an unconditional panic, not a `Result`.
+        pub fn compute_token_nlls_decode_loop(
+            &mut self,
+            tokens: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            if tokens.len() < 2 {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls_decode_loop: need at least 2 tokens, got {}",
+                    tokens.len()
+                )));
+            }
+            let max_context = self.max_context();
+            if tokens.len() > max_context {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls_decode_loop: tokens.len() ({}) exceeds Metal KV-cache \
+                     capacity ({}); use a shorter window or rebuild the session with a larger \
+                     max_cache_len",
+                    tokens.len(),
+                    max_context
+                )));
+            }
+            let vocab_size = self.engine.config.vocab_size;
+            if let Some((bad_idx, &bad)) = tokens
+                .iter()
+                .enumerate()
+                .find(|&(_, &t)| (t as usize) >= vocab_size)
+            {
+                return Err(crate::error::InferenceError::Inference(format!(
+                    "compute_token_nlls_decode_loop: tokens[{bad_idx}]={bad} >= vocab_size {vocab_size}"
+                )));
+            }
+
+            self.reset_state();
+            let mut nlls = Vec::with_capacity(tokens.len() - 1);
+            for (pos, &token_id) in tokens.iter().enumerate() {
+                let logits = self.forward_step(token_id, pos);
+                debug_assert_eq!(logits.len(), vocab_size);
+                if pos + 1 < tokens.len() {
+                    let target = tokens[pos + 1] as usize;
+                    nlls.push(crate::model::qwen35::log_softmax_nll(
+                        &logits[..vocab_size],
+                        target,
+                    ));
+                }
+            }
+            Ok(nlls)
+        }
+
+        /// **Unstable**: decode-loop (M=1) sibling of [`Self::compute_perplexity`].
+        ///
+        /// Thin wrapper around [`crate::model::qwen35::run_strided_perplexity`]
+        /// driving [`Self::compute_token_nlls_decode_loop`] as the per-window NLL
+        /// kernel, so the strided walk / aggregation semantics match every other
+        /// perplexity harness in this file — only the per-window NLL kernel
+        /// differs (decode loop vs batched prefill).
+        ///
+        /// Use this instead of [`Self::compute_perplexity`] whenever the
+        /// measurement must work identically across f16, Q4, and W3 sessions —
+        /// in particular, always for a W3 session ([`Self::from_w3_mlp_dir`]),
+        /// which has no batched-prefill kernel and would panic under
+        /// [`Self::compute_perplexity`].
+        pub fn compute_perplexity_decode_loop(
+            &mut self,
+            tokens: &[u32],
+            cfg: &crate::model::qwen35::PerplexityConfig,
+        ) -> Result<crate::model::qwen35::PerplexityReport, crate::error::InferenceError> {
+            let max_ctx = self.max_context();
+            crate::model::qwen35::run_strided_perplexity(tokens, cfg, max_ctx, |slice| {
+                self.compute_token_nlls_decode_loop(slice)
             })
         }
     }
@@ -19524,6 +19628,106 @@ kernel void decode_attention_reference(
             assert!(
                 msg.contains("context capacity") && msg.contains(&format!("{max_cache_len}")),
                 "error must name backend context capacity + cap; got: {msg}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Decode-loop (M=1) PPL scoring — issue #420/#530/#531 round 3.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn metal_compute_token_nlls_decode_loop_matches_prefill_nlls() {
+            // The decode-loop and batched-prefill scorers must agree on the
+            // same tokens: decode-loop is a method-consistency choice (it also
+            // works for W3, which has no prefill path), not a different
+            // mathematical answer.
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+            let prefill = state
+                .compute_token_nlls(&tokens)
+                .expect("prefill compute_token_nlls ok");
+            let decode_loop = state
+                .compute_token_nlls_decode_loop(&tokens)
+                .expect("decode-loop compute_token_nlls ok");
+
+            assert_eq!(decode_loop.len(), tokens.len() - 1);
+            for (i, (p, d)) in prefill.iter().zip(decode_loop.iter()).enumerate() {
+                assert!(
+                    (p - d).abs() < 1e-3,
+                    "decode-loop NLL[{i}] diverged from prefill NLL: prefill={p} decode_loop={d}"
+                );
+            }
+        }
+
+        #[test]
+        fn metal_compute_perplexity_decode_loop_equals_exp_mean_nll() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let tokens: Vec<u32> = (1u32..=12).collect();
+            let report = state
+                .compute_perplexity_decode_loop(
+                    &tokens,
+                    &crate::model::qwen35::PerplexityConfig {
+                        window: 6,
+                        stride: 3,
+                    },
+                )
+                .expect("decode-loop ppl ok");
+            let expected_ppl = report.mean_nll.exp();
+            assert!(
+                (report.ppl - expected_ppl).abs() < 1e-9,
+                "ppl must equal exp(mean_nll); got ppl={}, exp(mean_nll)={}",
+                report.ppl,
+                expected_ppl
+            );
+            assert!(report.ppl.is_finite() && report.ppl > 0.0);
+        }
+
+        #[test]
+        fn metal_compute_token_nlls_decode_loop_rejects_oversized_input() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4)
+                .expect("tiny MetalQwen35State fixture constructs with max_cache_len=4");
+            let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6];
+            let err = state
+                .compute_token_nlls_decode_loop(&tokens)
+                .expect_err("tokens.len() > max_cache_len must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("KV-cache") && msg.contains('4'),
+                "error must name the KV-cache cap; got: {msg}"
+            );
+        }
+
+        #[test]
+        fn metal_compute_token_nlls_decode_loop_rejects_out_of_vocab_token() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            let vocab = cfg.vocab_size as u32;
+            let err = state
+                .compute_token_nlls_decode_loop(&[1, vocab, 3])
+                .expect_err("out-of-vocab token must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("{vocab}")),
+                "error must name the bad token id; got: {msg}"
             );
         }
 
@@ -24997,6 +25201,27 @@ impl MetalQwen35State {
 
     /// **Unstable**: Metal Q4 perplexity stub; always errors without metal-gpu feature.
     pub fn compute_perplexity(
+        &mut self,
+        _tokens: &[u32],
+        _cfg: &crate::model::qwen35::PerplexityConfig,
+    ) -> Result<crate::model::qwen35::PerplexityReport, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: decode-loop per-token NLL stub; always errors without metal-gpu feature.
+    pub fn compute_token_nlls_decode_loop(
+        &mut self,
+        _tokens: &[u32],
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: decode-loop perplexity stub; always errors without metal-gpu feature.
+    pub fn compute_perplexity_decode_loop(
         &mut self,
         _tokens: &[u32],
         _cfg: &crate::model::qwen35::PerplexityConfig,

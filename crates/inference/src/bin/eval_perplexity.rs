@@ -22,6 +22,20 @@
 //!   produced by `bin/quantize_w3_mlp` (issue #420/#531). Mutually
 //!   exclusive with `--model-dir`, `--q4-dir`, and `--quarot-q4-dir`.
 //!
+//! `--decode-loop-ppl` (issue #420/#530/#531, round 3): opt-in scoring mode,
+//! explicit and never a silent default. Instead of the batched M>1 prefill
+//! path (`compute_perplexity` / `forward_prefill_all_logits`), it feeds the
+//! corpus one token at a time through the M=1 decode path
+//! (`forward_step`) — teacher-forced next-token NLL, identically for all
+//! three model modes above. Standard perplexity scoring runs prefill GEMM,
+//! and W3 has no prefill path (decode-only, m==1 GEMV) — the batched-prefill
+//! W3 MLP kernel panics, so prefill-style PPL is structurally unreachable
+//! for W3. `--decode-loop-ppl` is the only mode that produces a
+//! method-consistent number across f16, Q4, and W3: it never calls the
+//! batched-prefill kernel, so it cannot hit that panic on any of the three.
+//! The resulting numbers are NOT directly comparable to prefill-style PPL
+//! from other tools; they are only comparable to each other, in this mode.
+//!
 //! Load failures (missing/corrupt artifacts) fail closed: the process exits
 //! non-zero rather than silently substituting another format.
 //!
@@ -137,6 +151,7 @@ fn main() -> ExitCode {
     let mut lora_scale: Option<f32> = None;
     let mut emit_json: bool = false;
     let mut json_label: Option<String> = None;
+    let mut decode_loop_ppl: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -263,6 +278,9 @@ fn main() -> ExitCode {
                     Err(e) => return usage(&format!("--lora-scale: invalid f32: {e}")),
                 });
             }
+            "--decode-loop-ppl" => {
+                decode_loop_ppl = true;
+            }
             "--json" => {
                 emit_json = true;
             }
@@ -313,7 +331,7 @@ fn main() -> ExitCode {
     };
 
     let resolved_max_cache_len = max_cache_len.unwrap_or_else(|| cfg.window.max(4096));
-    if metal_paths_used && resolved_max_cache_len < cfg.window {
+    if (metal_paths_used || decode_loop_ppl) && resolved_max_cache_len < cfg.window {
         return usage(&format!(
             "--max-cache-len ({resolved_max_cache_len}) must be >= --window ({}); the Metal KV cache must fit a full window",
             cfg.window
@@ -339,11 +357,17 @@ fn main() -> ExitCode {
     eprintln!("Corpus:           {}", corpus_file.display());
     eprintln!("Window:           {}", cfg.window);
     eprintln!("Stride:           {}", cfg.stride);
-    if metal_paths_used {
+    if metal_paths_used || decode_loop_ppl {
         eprintln!("Max cache len:    {resolved_max_cache_len}");
     }
     if let Some(cap) = max_tokens {
         eprintln!("Max tokens:       {cap}");
+    }
+    if decode_loop_ppl {
+        eprintln!(
+            "Scoring method:   decode-loop (M=1 teacher-forced NLL via forward_step; \
+             NOT standard prefill PPL — see --help)"
+        );
     }
     eprintln!();
 
@@ -379,11 +403,38 @@ fn main() -> ExitCode {
         };
 
         let t_ppl = Instant::now();
-        let report = match model.compute_perplexity(&tokens, &cfg) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("ERROR: {e}");
-                return ExitCode::FAILURE;
+        let report = if decode_loop_ppl {
+            // Method-consistency (issue #420/#530/#531): decode-loop mode must
+            // score f16 through the same Metal `forward_step` M=1 path used for
+            // Q4 and W3, not the CPU prefill path, so the three formats' deltas
+            // are comparable.
+            let mut state = match MetalQwen35State::new(
+                model.weights(),
+                model.config(),
+                resolved_max_cache_len,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "ERROR: failed to build Metal state for decode-loop f16 scoring: {e}"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            match state.compute_perplexity_decode_loop(&tokens, &cfg) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            match model.compute_perplexity(&tokens, &cfg) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
         };
         let elapsed = t_ppl.elapsed();
@@ -433,6 +484,7 @@ fn main() -> ExitCode {
             lora_scale.unwrap_or(1.0),
             emit_json,
             json_label.as_deref().or(Some("q4")),
+            decode_loop_ppl,
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -459,6 +511,7 @@ fn main() -> ExitCode {
             lora_scale.unwrap_or(1.0),
             emit_json,
             json_label.as_deref().or(Some("quarot")),
+            decode_loop_ppl,
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -485,6 +538,7 @@ fn main() -> ExitCode {
             lora_scale.unwrap_or(1.0),
             emit_json,
             json_label.as_deref().or(Some("w3")),
+            decode_loop_ppl,
         ) {
             Ok(r) => Some(r),
             Err(code) => return code,
@@ -576,6 +630,7 @@ fn run_metal_q4(
     lora_scale: f32,
     emit_json: bool,
     json_label: Option<&str>,
+    decode_loop_ppl: bool,
 ) -> Result<PerplexityReport, ExitCode> {
     let t_load = Instant::now();
     let mut state =
@@ -607,7 +662,11 @@ fn run_metal_q4(
     }
 
     let t_ppl = Instant::now();
-    let report = match state.compute_perplexity(tokens, ppl_cfg) {
+    let report = match if decode_loop_ppl {
+        state.compute_perplexity_decode_loop(tokens, ppl_cfg)
+    } else {
+        state.compute_perplexity(tokens, ppl_cfg)
+    } {
         Ok(r) => r,
         Err(InferenceError::Inference(msg)) => {
             eprintln!("ERROR ({label}): {msg}");
@@ -641,6 +700,7 @@ fn run_metal_w3(
     lora_scale: f32,
     emit_json: bool,
     json_label: Option<&str>,
+    decode_loop_ppl: bool,
 ) -> Result<PerplexityReport, ExitCode> {
     let t_load = Instant::now();
     let mut state = match MetalQwen35State::from_w3_mlp_dir(
@@ -676,7 +736,16 @@ fn run_metal_w3(
     }
 
     let t_ppl = Instant::now();
-    let report = match state.compute_perplexity(tokens, ppl_cfg) {
+    // Round-2 known risk: the default `compute_perplexity` path runs batched
+    // M>1 prefill, which panics on this W3 session's dense-MLP kernel
+    // (issue #420/#531 — W3 has no prefill path). `--decode-loop-ppl` MUST
+    // route through the decode-loop scorer here so a W3 measurement never
+    // reaches that panic mid-scoring.
+    let report = match if decode_loop_ppl {
+        state.compute_perplexity_decode_loop(tokens, ppl_cfg)
+    } else {
+        state.compute_perplexity(tokens, ppl_cfg)
+    } {
         Ok(r) => r,
         Err(InferenceError::Inference(msg)) => {
             eprintln!("ERROR ({label}): {msg}");
@@ -806,6 +875,20 @@ text corpus (ADR-044 step 4). Three measurement modes:
     Fails closed: a missing/corrupt W3 artifact (bad header, wrong shape, stray
     .q4 file for a tensor the W3 runtime must own) is a hard error, never a
     silent fallback to another format.
+
+  Decode-loop scoring (issue #420/#530/#531, round 3):
+    --decode-loop-ppl     Explicit opt-in, never a silent default. Score PPL by
+                           feeding the corpus one token at a time through the M=1
+                           decode path (forward_step) instead of batched M>1
+                           prefill — teacher-forced next-token NLL. Works
+                           identically with --model-dir, --q4-dir/--quarot-q4-dir,
+                           and --w3-mlp-dir, so cross-format deltas are
+                           method-consistent. Required for --w3-mlp-dir corpus
+                           scoring: W3 has no prefill path (decode-only m==1
+                           GEMV) and the default batched-prefill scorer panics on
+                           W3 dense-MLP weights. Resulting PPL is NOT directly
+                           comparable to standard prefill-style PPL numbers from
+                           other tools — only to other --decode-loop-ppl runs.
 
 required (in addition to mode flags):
   --corpus-file <PATH>     UTF-8 text file to score.
