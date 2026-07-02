@@ -14252,10 +14252,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() && !on_token(&delta, next_id) {
-                    stopped_by_caller = true;
-                    stop_reason = StopReason::Interrupt;
-                    break;
+                if !delta.is_empty() {
+                    text.push_str(&delta);
+                    if !on_token(&delta, next_id) {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
@@ -20547,6 +20550,68 @@ kernel void decode_attention_reference(
                 out.generated_tokens, 0,
                 "max_new_tokens == 0 must produce no tokens, got {}",
                 out.generated_tokens
+            );
+        }
+
+        /// Regression (review finding on the streaming-retention PR): the non-prefix
+        /// `generate_streaming` decode loop must append every non-empty delta to the
+        /// returned `GenerateOutput.text`, not just hand it to `on_token`. A prior
+        /// version of the loop body called `on_token(&delta, next_id)` without first
+        /// doing `text.push_str(&delta)`, so `out.text` silently dropped every decode
+        /// token's contribution (only the prefill token and the final incomplete-UTF-8
+        /// tail were ever appended). `single_char_vocab_tokenizer` guarantees every
+        /// token decodes to exactly one non-empty-delta character (no UTF-8 boundary
+        /// holdback), so this test exercises the loop body on every one of its
+        /// iterations rather than being satisfied by the prefill token alone.
+        #[test]
+        fn streaming_text_accumulates_every_loop_delta_not_only_prefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 5,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Push eos_token_id out of the model's reachable output range so greedy
+            // sampling cannot end the stream after the prefill token — this test
+            // needs several decode-loop iterations (not just the prefill push) to
+            // exercise the bug.
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut accumulated = String::new();
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                accumulated.push_str(delta);
+                true
+            });
+
+            assert!(
+                out.generated_tokens >= 3,
+                "test needs at least 3 generated tokens to exercise the decode loop, got {}",
+                out.generated_tokens
+            );
+            assert_eq!(
+                out.text, accumulated,
+                "GenerateOutput.text must equal the concatenation of every on_token \
+                 delta (plus the finish() tail, already included in `accumulated` via \
+                 the callback) — a mismatch means the non-prefix decode loop dropped \
+                 deltas instead of appending them to the caller-owned `text` accumulator"
             );
         }
 

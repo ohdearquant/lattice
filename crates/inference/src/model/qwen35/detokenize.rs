@@ -314,6 +314,44 @@ mod tests {
         assert!(detok.retained_byte_capacity() <= DETOK_RETAINED_BYTE_CAPACITY);
     }
 
+    /// Companion regression for issue #324 (review finding on the retention-bound
+    /// PR): the test above only ever pushes 1-byte ASCII tokens, so `pending`'s
+    /// `Vec` never grows past its initial `with_capacity(DETOK_RETAINED_BYTE_CAPACITY)`
+    /// allocation — deleting the `compact_pending_capacity()` call (or its call
+    /// site) would still pass it, since there is never anything to compact.
+    /// This test feeds a *single* token whose decoded bytes (12, all valid
+    /// ASCII) exceed `DETOK_RETAINED_BYTE_CAPACITY` (8) in one `push`, forcing
+    /// `pending`'s allocation to grow past the bound before `flush_complete`
+    /// drains it back to empty — then asserts the retained *capacity* still
+    /// compacts back down to the bound afterward, actually exercising
+    /// `compact_pending_capacity`'s shrink path.
+    #[test]
+    fn incremental_detokenizer_retention_compacts_after_oversized_single_push() {
+        let byte_encoder = bytes_to_unicode();
+        // One BPE token whose decoded bytes are 12 copies of 'a' — longer than
+        // DETOK_RETAINED_BYTE_CAPACITY (8), all valid UTF-8, so every byte
+        // flushes in the same `push` call that appended it.
+        let oversized_token: String =
+            std::iter::repeat_n(byte_encoder[b'a' as usize], 12).collect();
+        let mut vocab = HashMap::new();
+        vocab.insert(oversized_token, 0u32);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("synthetic BPE tokenizer builds");
+
+        let mut detok = IncrementalDetokenizer::new();
+        let delta = detok.push(&tokenizer, 0);
+
+        assert_eq!(delta, "a".repeat(12));
+        assert_eq!(detok.retained_byte_len(), 0);
+        assert!(
+            detok.retained_byte_capacity() <= DETOK_RETAINED_BYTE_CAPACITY,
+            "a single push whose decoded bytes (12) exceed DETOK_RETAINED_BYTE_CAPACITY \
+             (8) must still leave the retained allocation compacted back down, got \
+             capacity {}",
+            detok.retained_byte_capacity()
+        );
+    }
+
     /// UTF-8-boundary property: a CJK/emoji/combining-mark/ZWJ-sequence token
     /// stream, fed one BPE-token-sized byte chunk at a time (deliberately
     /// splitting multibyte scalars and a multi-codepoint grapheme cluster across
