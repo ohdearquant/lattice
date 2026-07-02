@@ -1,11 +1,13 @@
 Implementation Notes
 
-- In `crates/inference/src/forward/metal_qwen35.rs::mmap_q4_weight`, reordered operations to validate Q4 payload bounds before calling `memmap2::MmapOptions::new().map(&file)`: open file → parse header → `file.metadata().len()` with `failed to stat` error mapping → bounds validation against file length → mmap call.
-- Did not modify function signatures, error text formats, or `q4_weights.rs`.
+- File changed: crates/inference/src/forward/metal_qwen35.rs
+- In `mmap_q4_weight`, reordered checks: parse header, `file.metadata().len()` with `map_err(|e| format!("failed to stat {}: {e}", path.display()))`, `validate_q4_header_payload_bounds` using file length, then `MmapOptions::map`.
+- No signature changes; no changes to `q4_weights.rs`.
 
-Tests run:
+Tests:
 - `cargo test -p lattice-inference mmap_q4_weight_ --features metal-gpu,f16`
-- Result: `3 passed; 0 failed; 0 ignored; 0 measured; 1536 filtered out` (covered tests: `mmap_q4_weight_rejects_truncated_block_payload_before_dispatch`, `mmap_q4_weight_rejects_payload_one_byte_short`, `mmap_q4_weight_accepts_fully_populated_payload`).
+- Result: `3 passed; 0 failed; 0 ignored; 0 measured; 1536 filtered out`
 
-Push confirmation:
-- To be added after successful commit and push.
+Git:
+- Commit: `7633d97f1`
+- Pushed to `origin/harden/540-q4-mmap-bounds` successfully (`c657ef0fb..7633d97f1`).
