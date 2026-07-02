@@ -101,6 +101,18 @@ jobs:
       - name: embed — metal-gpu (macOS only)
         if: runner.os == 'macOS'
         run: cargo build -p lattice-embed --features metal-gpu
+      # The two metal-gpu legs above build the lattice-inference and lattice-embed
+      # libraries (the embed leg pulls in lattice-inference/metal-gpu transitively),
+      # so a stale-field constructor in either library is already caught there. What
+      # they do NOT compile is the rest of the workspace's metal-gpu surface: the
+      # other default-member crates and the metal-gpu-gated binaries. A #537-class
+      # drift (a constructor left with a stale field set after a struct grew fields)
+      # in that surface compiles clean on both library legs, and the default-feature
+      # `ci` job cannot see the metal-gpu surface at all. Compile-only workspace
+      # check closes that gap.
+      - name: workspace — metal-gpu check (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo check --workspace --features metal-gpu
       # The required `ci` job runs `cargo clippy --workspace` with DEFAULT
       # features only, so the entire metal-gpu surface — including the ~18K-line
       # metal_qwen35.rs — was never linted, and 34 clippy errors accumulated
