@@ -1956,6 +1956,119 @@ kernel void logits_topk_fast_first(
     }
 }
 
+// ===== lm_head Two-Stage Block Top-K (issue #171) =====
+// Stage 1: fuses the lm_head GEMV with a block-local exact argmax/top-K
+// selection so the sampler never materializes the full [vocab_size] logit
+// buffer. One threadgroup owns ROWS_PER_TG consecutive vocab rows ("a tile");
+// each of the ROWS_PER_TG threads computes one row's full HIDDEN-length dot
+// product, then the whole tile is bitonic-sorted and the top LOCAL_K local
+// winners are emitted as compact (logit, token_id) pairs. Stage 2 (the
+// existing `logits_argmax_merge` / `logits_topk_merge_pass` kernels, unchanged)
+// then reduces the compact candidates from every tile to the global result.
+//
+// EXACTNESS: Stage 2 only sees the union of tile-local lists. For every
+// global top-K token t, Stage 1 for tile(t) must emit t in that tile's exact
+// local top-K list. Because every row in the tile participates in a full
+// bitonic sort of the tile (not an approximate reduction), the local list is
+// exact by construction. If LOCAL_K were ever reduced below the requested K,
+// or the tile selection made approximate, a distribution where all global
+// winners cluster inside one tile would silently drop valid global top-K
+// items — this is pinned by an adversarial clustered-tile test.
+//
+// Requires ROWS_PER_TG == 256 and dispatch threads == (256, 1, 1): the tile
+// is bitonic-sorted via the existing `bitonic_sort_desc_1024` helper, whose
+// inner stride is hardcoded to the 256-thread launch config.
+constant uint HIDDEN      [[function_constant(0)]];
+constant uint ROWS_PER_TG [[function_constant(1)]];
+constant uint LOCAL_K     [[function_constant(2)]];
+
+// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
+kernel void lm_head_block_topk_f16(
+    device const float*   hidden_in  [[buffer(0)]],
+    device const half*    weight     [[buffer(1)]],
+    device TopKCandidate* partial_out [[buffer(2)]],
+    constant uint&        vocab_size [[buffer(3)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[1024];
+
+    // DISPATCH GEOMETRY: tg_pos.x (tgid) owns vocab rows
+    // [tgid*ROWS_PER_TG, tgid*ROWS_PER_TG+ROWS_PER_TG). Tail guard: rows past
+    // vocab_size must rank last (sentinel), never silently win a slot.
+    uint row = tgid * ROWS_PER_TG + tid;
+    TopKCandidate cand = topk_sentinel();
+    if (row < vocab_size) {
+        device const half* wrow = weight + (ulong)row * (ulong)HIDDEN;
+        float dot = 0.0f;
+        for (uint i = 0; i < HIDDEN; i++) {
+            dot += hidden_in[i] * float(wrow[i]);
+        }
+        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
+    }
+    tg[tid] = cand;
+    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
+        tg[slot] = topk_sentinel();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_1024(tg, tid);
+
+    for (uint out = tid; out < LOCAL_K; out += 256u) {
+        partial_out[tgid * LOCAL_K + out] = tg[out];
+    }
+}
+
+// Q4_0 variant of `lm_head_block_topk_f16`. Dequant matches `gemv_q4_decode`:
+// asymmetric blocks of 32 weights, 20 bytes each (f16 scale + f16 bias + 16
+// packed-nibble bytes), w = nibble * scale + bias.
+// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
+kernel void lm_head_block_topk_q4(
+    device const float*   hidden_in  [[buffer(0)]],
+    device const uchar*   qweight    [[buffer(1)]],
+    device TopKCandidate* partial_out [[buffer(2)]],
+    constant uint&        vocab_size [[buffer(3)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[1024];
+
+    uint row = tgid * ROWS_PER_TG + tid;
+    TopKCandidate cand = topk_sentinel();
+    if (row < vocab_size) {
+        const uint nb = HIDDEN / 32u;
+        const uint row_bytes = nb * 20u;
+        device const uchar* base_row = qweight + (ulong)row * (ulong)row_bytes;
+        float dot = 0.0f;
+        for (uint blk = 0; blk < nb; blk++) {
+            device const uchar* base = base_row + blk * 20u;
+            float d    = float(*((device const half*)base));
+            float bias = float(*((device const half*)(base + 2)));
+            device const uchar* qs = base + 4;
+            uint x_base = blk * 32u;
+            for (uint byte_i = 0; byte_i < 16u; byte_i++) {
+                uchar packed = qs[byte_i];
+                float n0 = float(packed & 0x0fu);
+                float n1 = float(packed >> 4u);
+                dot += hidden_in[x_base + byte_i * 2u] * (n0 * d + bias);
+                dot += hidden_in[x_base + byte_i * 2u + 1u] * (n1 * d + bias);
+            }
+        }
+        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
+    }
+    tg[tid] = cand;
+    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
+        tg[slot] = topk_sentinel();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_1024(tg, tid);
+
+    for (uint out = tid; out < LOCAL_K; out += 256u) {
+        partial_out[tgid * LOCAL_K + out] = tg[out];
+    }
+}
+
 // ===== Hierarchical k=50 SIMD-Group Tournament =====
 // Two-stage exact selection without bitonic sort or threadgroup barriers in the
 // selection loop.  Only one threadgroup barrier is used (between stage 1 and 2).
@@ -3957,6 +4070,24 @@ kernel void gdn_chunk_norm_silu_c32(
         decode_attention_f16: ComputePipelineState,
         decode_attn_partial_f16: ComputePipelineState,
         prefill_attention_batched_f16: ComputePipelineState,
+        // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
+        // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
+        lm_head_block_topk_f16: [ComputePipelineState; 5],
+        lm_head_block_topk_q4: [ComputePipelineState; 5],
+    }
+
+    /// Vocab rows owned by one Stage-1 lm_head block-top-k threadgroup.
+    /// Fixed at 256 because the kernel reuses `bitonic_sort_desc_1024`, whose
+    /// inner loop stride is hardcoded to a 256-thread launch.
+    pub(crate) const LM_HEAD_ROWS_PER_TG: u32 = 256;
+    /// LOCAL_K values with precompiled Stage-1 pipeline variants. Index 0 is
+    /// the greedy (argmax) variant; the rest back `GpuTopkRoute::BlockTopK`.
+    pub(crate) const LM_HEAD_LOCAL_KS: [u32; 5] = [1, 8, 16, 40, 64];
+
+    fn lm_head_local_k_slot(k: u32) -> Option<usize> {
+        LM_HEAD_LOCAL_KS
+            .iter()
+            .position(|&candidate| candidate == k)
     }
 
     // -----------------------------------------------------------------------
@@ -3985,6 +4116,13 @@ kernel void gdn_chunk_norm_silu_c32(
         /// k=50 hierarchical SIMD-group tournament (two-stage, no bitonic sort).
         /// Requires LATTICE_COMPACT_TOPK and LATTICE_COMPACT_TOPK_SELECT env vars.
         HierarchicalK50,
+        /// Issue #171: Stage-1 fused GEMV + block-local argmax, Stage-2 global
+        /// reduce via the existing `argmax_merge` kernel. Greedy (k<=1) only.
+        BlockArgmax,
+        /// Issue #171: Stage-1 fused GEMV + block-local top-k, Stage-2 global
+        /// reduce via the existing `topk_merge_pass` kernel. `local_k` must be
+        /// one of `LM_HEAD_LOCAL_KS` (a precompiled Stage-1 pipeline variant).
+        BlockTopK { local_k: u32 },
     }
 
     /// Decide which GPU top-k route to take for a given `top_k` and env flags.
@@ -4000,6 +4138,88 @@ kernel void gdn_chunk_norm_silu_c32(
             return GpuTopkRoute::HierarchicalK50;
         }
         GpuTopkRoute::CpuFallback
+    }
+
+    /// Decide whether the issue #171 lm_head two-stage block-top-k path
+    /// applies. Tried before `choose_gpu_topk_route`; falls back to
+    /// `GpuTopkRoute::CpuFallback` (which the caller then re-resolves via the
+    /// older function) when this round's compiled LOCAL_K set or top-p exactness
+    /// requirement rule it out.
+    ///
+    /// `top_p < 1.0` requires `approx_topp_env` (`LATTICE_COMPACT_TOPP_APPROX`):
+    /// nucleus sampling over the compact top-k candidates is NOT equivalent to
+    /// full-vocab nucleus sampling once the tail is truncated, so exact mode is
+    /// the default and the approximation is opt-in only.
+    ///
+    /// Review round-1 finding 2: `top_k == 50` intentionally stays out of
+    /// `LM_HEAD_LOCAL_KS` and therefore falls through to `CpuFallback` here, so
+    /// the caller re-resolves it via `choose_gpu_topk_route`'s `HierarchicalK50`
+    /// path, which still does a full-logit GEMV before its compact dispatch.
+    /// This round's threadgroup-reduction claim (<=1,500 greedy / <=2,000
+    /// top-k<=64) is scoped to the precompiled `LM_HEAD_LOCAL_KS` set
+    /// `{1, 8, 16, 40, 64}`; adding a `local_k=50` Stage-1 pipeline variant
+    /// (new MSL function constant, precompile, agreement/bench coverage) is
+    /// out of scope for this PR and tracked as follow-up work rather than
+    /// silently claimed here.
+    fn choose_gpu_block_topk_route(
+        top_k: usize,
+        top_p: f32,
+        compact_env: bool,
+        approx_topp_env: bool,
+    ) -> GpuTopkRoute {
+        if !compact_env {
+            return GpuTopkRoute::CpuFallback;
+        }
+        if top_p < 1.0 && !approx_topp_env {
+            return GpuTopkRoute::CpuFallback;
+        }
+        match top_k {
+            // top_k == 0 means top-k is DISABLED (full-distribution sampling,
+            // see `SamplingConfig`), NOT greedy: routing it to BlockArgmax
+            // would silently collapse sampling to top-1 on the opt-in path.
+            // It must fall through to CpuFallback, whose legacy route keeps
+            // the full logit distribution available to the sampler.
+            1 => GpuTopkRoute::BlockArgmax,
+            8 | 16 | 40 | 64 => GpuTopkRoute::BlockTopK {
+                local_k: top_k as u32,
+            },
+            _ => GpuTopkRoute::CpuFallback,
+        }
+    }
+
+    /// Resolves a `compact_route` to `(local_k, precompiled Stage-1 pipeline
+    /// slot)`, or `None` if the route isn't a block-top-k route at all
+    /// (`Argmax`/`Select64`/`HierarchicalK50`/`CpuFallback`) **or** if
+    /// `local_k` has no precompiled Stage-1 pipeline variant.
+    ///
+    /// `choose_gpu_block_topk_route` only ever constructs `BlockArgmax` /
+    /// `BlockTopK { local_k }` with `local_k` in `LM_HEAD_LOCAL_KS`, so the
+    /// "route says Block* but local_k is unsupported" branch below should be
+    /// unreachable in production. It is guarded rather than assumed: both
+    /// call sites (`forward_prefill_impl`, `encode_final_head`) route their
+    /// decision through this function, so an invariant violation here falls
+    /// through to those call sites' existing full-logit exact-path code
+    /// instead of panicking — the exact path is always correct, so this
+    /// fail-closed fallback can only cost the compact-path speedup, never
+    /// produce a wrong token. `debug_assert!` surfaces the violation loudly
+    /// in tests/dev builds without making library code panic in release.
+    fn resolve_block_local_k(route: GpuTopkRoute) -> Option<(u32, usize)> {
+        let local_k = match route {
+            GpuTopkRoute::BlockArgmax => 1u32,
+            GpuTopkRoute::BlockTopK { local_k } => local_k,
+            _ => return None,
+        };
+        match lm_head_local_k_slot(local_k) {
+            Some(slot) => Some((local_k, slot)),
+            None => {
+                debug_assert!(
+                    false,
+                    "compact_route requested unsupported LOCAL_K {local_k} (not in \
+                     LM_HEAD_LOCAL_KS); falling back to the exact full-logit path"
+                );
+                None
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -5192,6 +5412,68 @@ kernel void gdn_chunk_norm_silu_c32(
         (dot / (aa.sqrt() * bb.sqrt())) as f32
     }
 
+    /// Compile one Stage-1 lm_head block-top-k pipeline variant with the
+    /// HIDDEN / ROWS_PER_TG / LOCAL_K function constants baked in.
+    fn make_lm_head_block_pipeline(
+        device: &Device,
+        library: &Library,
+        name: &str,
+        hidden: u32,
+        rows_per_tg: u32,
+        local_k: u32,
+    ) -> Result<ComputePipelineState, String> {
+        let constants = FunctionConstantValues::new();
+        constants.set_constant_value_at_index(
+            &hidden as *const u32 as *const std::ffi::c_void,
+            MTLDataType::UInt,
+            0,
+        );
+        constants.set_constant_value_at_index(
+            &rows_per_tg as *const u32 as *const std::ffi::c_void,
+            MTLDataType::UInt,
+            1,
+        );
+        constants.set_constant_value_at_index(
+            &local_k as *const u32 as *const std::ffi::c_void,
+            MTLDataType::UInt,
+            2,
+        );
+        let func = library.get_function(name, Some(constants)).map_err(|e| {
+            format!(
+                "function '{name}' (HIDDEN={hidden}, ROWS_PER_TG={rows_per_tg}, LOCAL_K={local_k}) not found: {e}"
+            )
+        })?;
+        device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| format!("pipeline for '{name}' LOCAL_K={local_k} failed: {e}"))
+    }
+
+    /// Compile all five LOCAL_K variants of a Stage-1 lm_head block-top-k kernel.
+    fn make_lm_head_block_pipelines(
+        device: &Device,
+        library: &Library,
+        name: &str,
+        hidden: u32,
+    ) -> Result<[ComputePipelineState; 5], String> {
+        let mut out: Vec<ComputePipelineState> = Vec::with_capacity(LM_HEAD_LOCAL_KS.len());
+        for &local_k in LM_HEAD_LOCAL_KS.iter() {
+            out.push(make_lm_head_block_pipeline(
+                device,
+                library,
+                name,
+                hidden,
+                LM_HEAD_ROWS_PER_TG,
+                local_k,
+            )?);
+        }
+        out.try_into().map_err(|_| {
+            format!(
+                "expected {} pipeline variants for '{name}'",
+                LM_HEAD_LOCAL_KS.len()
+            )
+        })
+    }
+
     impl MetalQwen35Engine {
         /// Load immutable model resources from CPU weights. Does NOT allocate any session state.
         ///
@@ -5343,6 +5625,18 @@ kernel void gdn_chunk_norm_silu_c32(
                 decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
                 prefill_attention_batched_f16: make_pipeline(
                     "prefill_attention_batched_causal_f16",
+                )?,
+                lm_head_block_topk_f16: make_lm_head_block_pipelines(
+                    &device,
+                    &library,
+                    "lm_head_block_topk_f16",
+                    cfg.hidden_size as u32,
+                )?,
+                lm_head_block_topk_q4: make_lm_head_block_pipelines(
+                    &device,
+                    &library,
+                    "lm_head_block_topk_q4",
+                    cfg.hidden_size as u32,
                 )?,
             };
 
@@ -5759,6 +6053,19 @@ kernel void gdn_chunk_norm_silu_c32(
                         raw_out: make_zero_buffer(device, bp * output_dim, "gdn_chunk_raw_out"),
                     }
                 },
+                // Review round-1 finding 3: this `[vocab_size]` buffer is allocated
+                // once per session and reused for both the compact and exact
+                // routes, so a compact-only generation still carries it. Issue
+                // #171's threadgroup-reduction claim is about *dispatch*, not
+                // this allocation: the compact greedy/top-k path (see
+                // `use_compact` in `generate_streaming`/`generate_cache_aware`)
+                // never issues the full-logit GEMV or reads/writes this buffer
+                // per token, so no per-token full-logit materialization or
+                // readback happens on that path. Making the allocation itself
+                // lazy/optional is a separate, larger session-layout change
+                // (this buffer backs the exact fallback used by grammar,
+                // repetition penalty, and non-compact sampling) and is left as
+                // follow-up rather than attempted under this round's scope.
                 logits: make_zero_buffer(device, cfg.vocab_size, "act_logits"),
                 topk_scratch_a: {
                     let groups = cfg.vocab_size.div_ceil(1024);
@@ -9274,18 +9581,48 @@ kernel void gdn_chunk_norm_silu_c32(
             // For Q4 format (from .q4 dirs), keep using the Q4 path because
             // the FP16 buffer was dequantized from Q4 and the original Q4
             // matmul kernel is faster + handles QuaRot rotations correctly.
-            let use_fp16_lm_head = matches!(self.engine.quant_format, QuantFormat::Q8_0);
-            if use_fp16_lm_head {
-                let vocab_n = cfg.vocab_size as u32;
-                let hidden_k = hidden as u32;
-                if let Some(ref pb) = ppl_buf {
-                    for p in 0..n {
-                        let hidden_off = (p * hidden) as u64 * 4;
-                        let logits_off = (p * cfg.vocab_size) as u64 * 4;
+            // Issue #171: when the last-token route only needs argmax/top-k (never
+            // the full logit vector), skip the full [vocab_size] GEMV entirely —
+            // Stage 1 fuses the GEMV with a block-local exact reduction, Stage 2
+            // (dispatch_block_topk_merge_enc) reduces those compact candidates to
+            // the global result. all_positions (perplexity) always takes the
+            // full-logit path below; it never sets compact_route to a Block route
+            // in the generate loop, but we gate here too as defense in depth.
+            let block_local_k = if all_positions {
+                None
+            } else {
+                resolve_block_local_k(self.session.compact_route)
+            };
+
+            let topk_which = if let Some((local_k, slot)) = block_local_k {
+                let candidate_groups =
+                    self.dispatch_lm_head_block_stage1_enc(enc, &cfg, last_off, local_k, slot);
+                Some(self.dispatch_block_topk_merge_enc(enc, candidate_groups, local_k))
+            } else {
+                let use_fp16_lm_head = matches!(self.engine.quant_format, QuantFormat::Q8_0);
+                if use_fp16_lm_head {
+                    let vocab_n = cfg.vocab_size as u32;
+                    let hidden_k = hidden as u32;
+                    if let Some(ref pb) = ppl_buf {
+                        for p in 0..n {
+                            let hidden_off = (p * hidden) as u64 * 4;
+                            let logits_off = (p * cfg.vocab_size) as u64 * 4;
+                            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
+                            enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_off);
+                            enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                            enc.set_buffer(2, Some(pb), logits_off);
+                            enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
+                            enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
+                            enc.dispatch_thread_groups(
+                                MTLSize::new(vocab_n.div_ceil(4) as u64, 1, 1),
+                                MTLSize::new(32, 4, 1),
+                            );
+                        }
+                    } else {
                         enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
-                        enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_off);
+                        enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
                         enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
-                        enc.set_buffer(2, Some(pb), logits_off);
+                        enc.set_buffer(2, Some(&self.session.activations.logits), 0);
                         enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
                         enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
                         enc.dispatch_thread_groups(
@@ -9293,50 +9630,39 @@ kernel void gdn_chunk_norm_silu_c32(
                             MTLSize::new(32, 4, 1),
                         );
                     }
+                } else if let Some(ref pb) = ppl_buf {
+                    self.dispatch_gemm(
+                        enc,
+                        &self.session.activations.hidden,
+                        0,
+                        &self.engine.embed_tokens_q8,
+                        pb,
+                        0,
+                        n as u32,
+                        cfg.vocab_size as u32,
+                        hidden as u32,
+                    );
                 } else {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
-                    enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
-                    enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
-                    enc.set_buffer(2, Some(&self.session.activations.logits), 0);
-                    enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
-                    enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(vocab_n.div_ceil(4) as u64, 1, 1),
-                        MTLSize::new(32, 4, 1),
+                    self.dispatch_gemm(
+                        enc,
+                        &self.session.activations.hidden,
+                        last_off,
+                        &self.engine.embed_tokens_q8,
+                        &self.session.activations.logits,
+                        0,
+                        1,
+                        cfg.vocab_size as u32,
+                        hidden as u32,
                     );
                 }
-            } else if let Some(ref pb) = ppl_buf {
-                self.dispatch_gemm(
-                    enc,
-                    &self.session.activations.hidden,
-                    0,
-                    &self.engine.embed_tokens_q8,
-                    pb,
-                    0,
-                    n as u32,
-                    cfg.vocab_size as u32,
-                    hidden as u32,
-                );
-            } else {
-                self.dispatch_gemm(
-                    enc,
-                    &self.session.activations.hidden,
-                    last_off,
-                    &self.engine.embed_tokens_q8,
-                    &self.session.activations.logits,
-                    0,
-                    1,
-                    cfg.vocab_size as u32,
-                    hidden as u32,
-                );
-            }
 
-            // Append top-k in the same encoder when compact mode is active (last-token only).
-            let topk_which = if !all_positions && self.session.compact_topk > 0 {
-                let k = self.session.compact_topk as u32;
-                Some(self.dispatch_topk_enc(enc, cfg.vocab_size as u32, k))
-            } else {
-                None
+                // Append top-k in the same encoder when compact mode is active (last-token only).
+                if !all_positions && self.session.compact_topk > 0 {
+                    let k = self.session.compact_topk as u32;
+                    Some(self.dispatch_topk_enc(enc, cfg.vocab_size as u32, k))
+                } else {
+                    None
+                }
             };
 
             enc.end_encoding();
@@ -9989,23 +10315,43 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            let route = choose_gpu_topk_route(
+            // Issue #171: try the block-top-k route first — far fewer threadgroups
+            // than the legacy HierarchicalK50/argmax routes, which stay reachable
+            // as a fallback for k values the block kernels don't cover.
+            let block_route = choose_gpu_block_topk_route(
                 gen_cfg.top_k,
+                gen_cfg.top_p,
                 std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
             );
+            let route = if block_route != GpuTopkRoute::CpuFallback {
+                block_route
+            } else {
+                choose_gpu_topk_route(
+                    gen_cfg.top_k,
+                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                )
+            };
             // Repetition penalty requires full logits — disable compact mode when active.
             // Grammar-constrained decoding also requires full logits (CpuFallback).
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
                 && gen_cfg.grammar.is_none();
-            self.session.compact_route = if use_compact {
-                route
-            } else {
-                GpuTopkRoute::CpuFallback
-            };
             if use_compact {
-                self.session.compact_topk = gen_cfg.top_k;
+                self.session.compact_route = route;
+                self.session.compact_topk = match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                };
+            } else {
+                // Issue #171 review round-1 finding 1: clear any compact request
+                // left over from a prior compact-eligible generation on this same
+                // state so the exact full-logit path isn't starved by stale state.
+                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.session.compact_topk = 0;
+                self.session.compact_result.clear();
             }
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
@@ -10485,6 +10831,17 @@ kernel void gdn_chunk_norm_silu_c32(
             // alive would let a later cache-aware call restore GDN state for
             // KV rows that no longer represent it (finding 2).
             self.cross_turn_prefix_cache.clear();
+            // Issue #171 review round-1 finding 1: a compact top-k request from a
+            // prior generation must not leak into the next one. Without this, a
+            // caller that reuses one `MetalQwen35State` for a compact-eligible
+            // generation followed by an exact-required generation (grammar,
+            // repetition penalty, or non-compact top_k) can hit `compact_topk > 0`
+            // with `use_compact == false`, which makes `forward_prefill` /
+            // `forward_step` append a compact top-k dispatch and return empty
+            // logits even though the caller expects the full-logit exact path.
+            self.session.compact_topk = 0;
+            self.session.compact_route = GpuTopkRoute::CpuFallback;
+            self.session.compact_result.clear();
         }
 
         /// Select the GDN prefill scan at runtime: `true` = chunked-parallel (default),
@@ -12098,6 +12455,25 @@ kernel void gdn_chunk_norm_silu_c32(
                 1,
                 cfg.rms_norm_eps,
             );
+            // Issue #171: lm_head two-stage block-top-k. When the route requires
+            // only argmax/top-k (never the full logit vector), skip the full
+            // [vocab_size] GEMV entirely — Stage 1 fuses the GEMV with a
+            // block-local exact reduction, Stage 2 (below) reduces those compact
+            // candidates to the global result. This is the threadgroup-flood fix:
+            // the full-logit GEMV alone dispatches tens of thousands of
+            // threadgroups (ceil(vocab/4) or ceil(vocab/2)); Stage 1 dispatches
+            // ceil(vocab/LM_HEAD_ROWS_PER_TG), ~100x fewer.
+            let block_local_k = resolve_block_local_k(self.session.compact_route);
+            if let Some((local_k, slot)) = block_local_k {
+                let candidate_groups =
+                    self.dispatch_lm_head_block_stage1_enc(enc, cfg, 0, local_k, slot);
+                let which = self.dispatch_block_topk_merge_enc(enc, candidate_groups, local_k);
+                if let Some(t0) = final_t0 {
+                    prof.final_us += t0.elapsed().as_micros();
+                }
+                return Some(which);
+            }
+
             // lm_head: for Q8 format use FP16 wide kernel (NR=4, fewer TGs than
             // gemv_decode_m1 which dispatches one TG per vocab row). For Q4 use Q4 path.
             match self.engine.quant_format {
@@ -13371,6 +13747,147 @@ kernel void gdn_chunk_norm_silu_c32(
         }
 
         // -----------------------------------------------------------------------
+        // lm_head two-stage block-top-k dispatch helpers (issue #171)
+        // -----------------------------------------------------------------------
+
+        /// Stage 1: fused lm_head GEMV + block-local exact argmax/top-k.
+        /// Writes compact `(logit, token_id)` candidates into `topk_scratch_a`,
+        /// `local_k` per tile. Appended to the same encoder as the caller's
+        /// other dispatches — no second command-buffer round-trip.
+        ///
+        /// `hidden_offset` is the byte offset into
+        /// `self.session.activations.hidden` of the single post-RMSNorm token
+        /// row to project (0 for decode; the last-token offset for prefill).
+        ///
+        /// DISPATCH GEOMETRY: the kernel owns vocab rows on tg_pos.x, so x
+        /// groups must be `ceil(vocab_size / LM_HEAD_ROWS_PER_TG)`.
+        /// Under-dispatch leaves rows unwritten, which has previously
+        /// corrupted lm_head outputs silently in this codebase.
+        ///
+        /// `slot` is the precompiled Stage-1 pipeline index for `local_k`
+        /// (`LM_HEAD_LOCAL_KS[slot] == local_k`). Callers must obtain both via
+        /// `resolve_block_local_k`, which is the single place that validates
+        /// `local_k` against `LM_HEAD_LOCAL_KS` and falls back to the exact
+        /// full-logit path on an unsupported value — by the time `slot`
+        /// reaches this function it is already a valid array index, so this
+        /// dispatch-encoding helper (mid command-buffer, nothing sane to
+        /// "return an error" to) has no unsupported-LOCAL_K case left to
+        /// guard against.
+        ///
+        /// Returns the candidate-group count (Stage 2's `candidate_groups`).
+        fn dispatch_lm_head_block_stage1_enc(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            cfg: &Qwen35Config,
+            hidden_offset: u64,
+            local_k: u32,
+            slot: usize,
+        ) -> u32 {
+            let vocab_size = cfg.vocab_size as u32;
+            let row_groups = vocab_size.div_ceil(LM_HEAD_ROWS_PER_TG);
+
+            // Fail closed rather than silently overrunning topk_scratch_a: for every
+            // vocab_size, ceil(vocab/1024)*256 (the existing allocation, sized for the
+            // older fixed-256-per-group scheme) is provably >= ceil(vocab/256)*local_k
+            // (this Stage-1's worst case, local_k<=64) because 1024 = 4*256 and
+            // 256*8/1024 == 64*8/256 — the two schemes reserve the same 2 bytes/vocab-row
+            // asymptotically, and the coarser grouping's ceiling only adds headroom. This
+            // assert documents and guards that invariant instead of leaving it implicit.
+            let candidate_capacity = self.session.activations.topk_scratch_a.length() / 8;
+            let candidates_written = row_groups as u64 * local_k as u64;
+            assert!(
+                candidates_written <= candidate_capacity,
+                "lm_head block-topk Stage-1 would write {candidates_written} candidates \
+                 ({row_groups} groups * local_k {local_k}) but topk_scratch_a only holds \
+                 {candidate_capacity} — buffer-sizing invariant violated"
+            );
+
+            match self.engine.quant_format {
+                QuantFormat::Q8_0 => {
+                    enc.set_compute_pipeline_state(
+                        &self.engine.pipelines.lm_head_block_topk_f16[slot],
+                    );
+                    enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
+                    enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
+                    enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
+                    enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
+                }
+                QuantFormat::Q4_0 => {
+                    let qw = &self.engine.embed_tokens_q8;
+                    enc.set_compute_pipeline_state(
+                        &self.engine.pipelines.lm_head_block_topk_q4[slot],
+                    );
+                    enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
+                    enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
+                    enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
+                    enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
+                }
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(row_groups as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            row_groups
+        }
+
+        /// Stage 2: reduces the compact per-tile candidates Stage 1 already
+        /// wrote into `topk_scratch_a` to the global result. Reuses the exact
+        /// same `argmax_merge` / `topk_merge_pass` kernels as the existing
+        /// `dispatch_topk_enc` seam below — the only difference is that the
+        /// input candidates come from Stage 1's fused GEMV instead of a
+        /// full-logits first pass over a materialized `[vocab_size]` buffer.
+        /// Appended to the same encoder; no second command-buffer round-trip.
+        ///
+        /// Returns 0 if the final `local_k` candidates are in
+        /// `topk_scratch_a`, 1 for `topk_scratch_b`.
+        fn dispatch_block_topk_merge_enc(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            candidate_groups: u32,
+            local_k: u32,
+        ) -> u8 {
+            if local_k == 1 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_merge);
+                enc.set_buffer(0, Some(&self.session.activations.topk_scratch_a), 0);
+                enc.set_buffer(1, Some(&self.session.activations.topk_scratch_b), 0);
+                enc.set_bytes(2, 4, &candidate_groups as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
+                return 1;
+            }
+
+            let mut current_groups = candidate_groups;
+            let mut which: u8 = 0;
+            while current_groups > 1 {
+                let fan_in: u32 = 16u32.min(current_groups);
+                let out_groups = current_groups.div_ceil(fan_in);
+                let (in_buf, out_buf) = if which == 0 {
+                    (
+                        &self.session.activations.topk_scratch_a,
+                        &self.session.activations.topk_scratch_b,
+                    )
+                } else {
+                    (
+                        &self.session.activations.topk_scratch_b,
+                        &self.session.activations.topk_scratch_a,
+                    )
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.topk_merge_pass);
+                enc.set_buffer(0, Some(in_buf), 0);
+                enc.set_buffer(1, Some(out_buf), 0);
+                enc.set_bytes(2, 4, &current_groups as *const u32 as *const _);
+                enc.set_bytes(3, 4, &local_k as *const u32 as *const _);
+                enc.set_bytes(4, 4, &fan_in as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(out_groups as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                current_groups = out_groups;
+                which = 1 - which;
+            }
+            which
+        }
+
+        // -----------------------------------------------------------------------
         // GPU Top-K dispatch helpers
         // -----------------------------------------------------------------------
 
@@ -13954,21 +14471,41 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            let route = choose_gpu_topk_route(
+            // Issue #171: try the block-top-k route first — far fewer threadgroups
+            // than the legacy HierarchicalK50/argmax routes, which stay reachable
+            // as a fallback for k values the block kernels don't cover.
+            let block_route = choose_gpu_block_topk_route(
                 gen_cfg.top_k,
+                gen_cfg.top_p,
                 std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
             );
+            let route = if block_route != GpuTopkRoute::CpuFallback {
+                block_route
+            } else {
+                choose_gpu_topk_route(
+                    gen_cfg.top_k,
+                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                )
+            };
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
                 && gen_cfg.grammar.is_none();
-            self.session.compact_route = if use_compact {
-                route
-            } else {
-                GpuTopkRoute::CpuFallback
-            };
             if use_compact {
-                self.session.compact_topk = gen_cfg.top_k;
+                self.session.compact_route = route;
+                self.session.compact_topk = match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                };
+            } else {
+                // Issue #171 review round-1 finding 1: clear any compact request
+                // left over from a prior compact-eligible generation on this same
+                // state so the exact full-logit path isn't starved by stale state.
+                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.session.compact_topk = 0;
+                self.session.compact_result.clear();
             }
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
@@ -14652,6 +15189,18 @@ kernel void gdn_chunk_norm_silu_c32(
                 decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
                 prefill_attention_batched_f16: make_pipeline(
                     "prefill_attention_batched_causal_f16",
+                )?,
+                lm_head_block_topk_f16: make_lm_head_block_pipelines(
+                    &device,
+                    &library,
+                    "lm_head_block_topk_f16",
+                    cfg.hidden_size as u32,
+                )?,
+                lm_head_block_topk_q4: make_lm_head_block_pipelines(
+                    &device,
+                    &library,
+                    "lm_head_block_topk_q4",
+                    cfg.hidden_size as u32,
                 )?,
             };
 
@@ -15990,21 +16539,41 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            let route = choose_gpu_topk_route(
+            // Issue #171: try the block-top-k route first — far fewer threadgroups
+            // than the legacy HierarchicalK50/argmax routes, which stay reachable
+            // as a fallback for k values the block kernels don't cover.
+            let block_route = choose_gpu_block_topk_route(
                 gen_cfg.top_k,
+                gen_cfg.top_p,
                 std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
             );
+            let route = if block_route != GpuTopkRoute::CpuFallback {
+                block_route
+            } else {
+                choose_gpu_topk_route(
+                    gen_cfg.top_k,
+                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                )
+            };
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
                 && gen_cfg.grammar.is_none();
-            self.session.compact_route = if use_compact {
-                route
-            } else {
-                GpuTopkRoute::CpuFallback
-            };
             if use_compact {
-                self.session.compact_topk = gen_cfg.top_k;
+                self.session.compact_route = route;
+                self.session.compact_topk = match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                };
+            } else {
+                // Issue #171 review round-1 finding 1: clear any compact request
+                // left over from a prior compact-eligible generation on this same
+                // state so the exact full-logit path isn't starved by stale state.
+                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.session.compact_topk = 0;
+                self.session.compact_result.clear();
             }
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -16306,6 +16875,9 @@ kernel void gdn_chunk_norm_silu_c32(
 
     #[cfg(test)]
     mod tests {
+        use super::super::{
+            LM_HEAD_TOPK_TIE_EPSILON, TopkSetAgreement, topk_set_agreement_or_boundary_tie,
+        };
         use super::*;
         use crate::model::qwen35::{
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
@@ -20131,6 +20703,1006 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// Issue #171 smoke test: the block-top-k Stage-1 (fused GEMV + block-local
+        /// argmax) / Stage-2 (existing `argmax_merge`) dispatch must select the
+        /// same logit value as the untouched full-logit exact path — it is a
+        /// reduction over identical dot products, not an approximation. Compares
+        /// logit *values* (with a full-logits lookup for the returned token_id)
+        /// rather than requiring an exact token_id match, since the tiny fixture's
+        /// zeroed projection weights make several vocab rows tie on value; a
+        /// tie-break difference between the CPU iteration order and the GPU
+        /// bitonic sort is not a bug. This is a compile/dispatch smoke test for
+        /// the tester's deeper 100%-agreement suite, not a replacement for it.
+        #[test]
+        fn lm_head_block_argmax_matches_full_logits() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+
+            let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("baseline state");
+            let full_logits = baseline.forward_step(3, 0);
+            let expected_max = full_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            let mut blocked = MetalQwen35State::new(&weights, &cfg, 8).expect("blocked state");
+            blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+            blocked.session.compact_topk = 1;
+            let empty_logits = blocked.forward_step(3, 0);
+            assert!(
+                empty_logits.is_empty(),
+                "compact route must return empty logits and populate compact_result instead"
+            );
+            assert_eq!(
+                blocked.session.compact_result.len(),
+                1,
+                "BlockArgmax must produce exactly one candidate"
+            );
+            let got = blocked.session.compact_result[0];
+            assert!(
+                (got.logit - expected_max).abs() < 1e-3,
+                "block-topk argmax logit {} disagreed with full-logit max {expected_max}",
+                got.logit
+            );
+            assert!(
+                (full_logits[got.token_id as usize] - expected_max).abs() < 1e-3,
+                "block-topk returned token_id {} whose full-logit value {} is not the max \
+                 {expected_max} — Stage-1/Stage-2 row/token_id bookkeeping bug",
+                got.token_id,
+                full_logits[got.token_id as usize]
+            );
+        }
+
+        /// Issue #171 smoke test: Stage-1 block-local top-k (LOCAL_K=8) merged via
+        /// the existing generic `topk_merge_pass` kernel must return the same
+        /// candidate *values* as the true top-8 of the full-logit exact path (see
+        /// the argmax test above for why value/row comparison is used instead of
+        /// token_id set equality).
+        #[test]
+        fn lm_head_block_topk8_matches_full_logits() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+
+            let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("baseline state");
+            let full_logits = baseline.forward_step(3, 0);
+            let mut sorted_desc = full_logits.clone();
+            sorted_desc.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let eighth_largest = sorted_desc[7];
+
+            let mut blocked = MetalQwen35State::new(&weights, &cfg, 8).expect("blocked state");
+            blocked.session.compact_route = GpuTopkRoute::BlockTopK { local_k: 8 };
+            blocked.session.compact_topk = 8;
+            let empty_logits = blocked.forward_step(3, 0);
+            assert!(empty_logits.is_empty());
+            assert_eq!(
+                blocked.session.compact_result.len(),
+                8,
+                "BlockTopK{{local_k:8}} must produce exactly 8 candidates"
+            );
+
+            let mut seen_ids = std::collections::HashSet::new();
+            for c in &blocked.session.compact_result {
+                assert!(
+                    seen_ids.insert(c.token_id),
+                    "duplicate token_id {} in block-topk result",
+                    c.token_id
+                );
+                assert!(
+                    (full_logits[c.token_id as usize] - c.logit).abs() < 1e-3,
+                    "candidate token_id {} logit {} does not match full-logit value {} \
+                     — Stage-1/Stage-2 row/token_id bookkeeping bug",
+                    c.token_id,
+                    c.logit,
+                    full_logits[c.token_id as usize]
+                );
+                assert!(
+                    c.logit >= eighth_largest - 1e-3,
+                    "candidate logit {} is outside the true top-8 (8th largest = {eighth_largest})",
+                    c.logit
+                );
+            }
+        }
+
+        // ===================================================================
+        // Tester suite (issue #171): mutation-sensitive correctness tests for
+        // the lm_head two-stage block-top-k path. See
+        // ../architect/design_spec.md (Test Plan) and
+        // ../implementer/impl_notes.md. Results + mutation-sensitivity
+        // evidence: ../tester/test_report.md.
+        // ===================================================================
+
+        /// Pure unit test for the route gate (no GPU). Design-spec "Routing
+        /// Rules": top_p < 1.0 must stay on the exact full-logit path
+        /// (`CpuFallback`) unless the explicit approximate gate is set, since
+        /// nucleus sampling over a truncated candidate set is not equivalent
+        /// to full-vocab nucleus sampling.
+        #[test]
+        fn choose_gpu_block_topk_route_gate() {
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_p<1.0 without the approx gate must stay exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, true),
+                GpuTopkRoute::BlockTopK { local_k: 8 },
+                "top_p<1.0 WITH the explicit approx gate may take the block route"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(0, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_k=0 means top-k DISABLED (full-distribution sampling), \
+                 not greedy; BlockArgmax here would collapse sampling to top-1"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(1, 1.0, true, false),
+                GpuTopkRoute::BlockArgmax
+            );
+            for &k in &[8u32, 16, 40, 64] {
+                assert_eq!(
+                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
+                    GpuTopkRoute::BlockTopK { local_k: k },
+                    "k={k} must map to BlockTopK"
+                );
+            }
+            assert_eq!(
+                choose_gpu_block_topk_route(50, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "k=50 has no precompiled Stage-1 variant; must fall back exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 1.0, false, false),
+                GpuTopkRoute::CpuFallback,
+                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
+            );
+        }
+
+        /// Same construction as `tiny_metal_qwen35_fixture` but with a
+        /// caller-chosen vocab size and an all-zero embedding table (only
+        /// component 0 of a token's embedding is ever set below — the same
+        /// tied-lm_head one-hot trick `tiny_metal_qwen35_fixture` and the
+        /// golden-logit-snapshot test rely on), so individual vocab rows'
+        /// logits can be hand-crafted for adversarial distributions.
+        fn zeroed_block_topk_fixture(vocab: usize) -> (Qwen35Config, ModelWeights) {
+            let hidden = 512usize;
+            let intermediate = 64usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 1,
+                vocab_size: vocab,
+                intermediate_size: intermediate,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: 1,
+                linear_num_value_heads: Some(1),
+                linear_key_head_dim: 16,
+                linear_value_head_dim: 16,
+                linear_conv_kernel_dim: 4,
+                num_experts: None,
+                num_experts_per_tok: None,
+                moe_intermediate_size: None,
+                shared_expert_intermediate_size: None,
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 1,
+                layer_types: vec![LayerType::FullAttention],
+                layer_mask: vec![true],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 128,
+                quarot_rotation_seed: None,
+            };
+
+            let embed_tokens = vec![0.0f32; vocab * hidden];
+            let common = CommonLayerWeights {
+                input_layernorm: vec![1.0; hidden],
+                post_attention_layernorm: vec![1.0; hidden],
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: vec![0.0; intermediate * hidden],
+                    up_proj: vec![0.0; intermediate * hidden],
+                    down_proj: vec![0.0; hidden * intermediate],
+                }),
+            };
+            let full = FullAttentionLayerWeights {
+                q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
+                k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+                q_norm: vec![1.0; cfg.head_dim],
+                k_norm: vec![1.0; cfg.head_dim],
+            };
+            let weights = ModelWeights {
+                embed_tokens,
+                lm_head: None,
+                final_norm: vec![1.0; hidden],
+                layers: vec![(AttentionWeights::Full(full), common)],
+            };
+            (cfg, weights)
+        }
+
+        /// CPU oracle: exact top-K token ids by full-logit value, descending.
+        fn cpu_topk_token_ids(logits: &[f32], k: usize) -> Vec<u32> {
+            let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+            idx.sort_by(|&a, &b| {
+                logits[b as usize]
+                    .partial_cmp(&logits[a as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(k);
+            idx
+        }
+
+        /// Adversarial distribution from `design_spec.md` Test Plan §3: every
+        /// global top-K token clusters inside ONE Stage-1 tile. Proves Stage 1
+        /// emits a true per-tile top-`local_k`, not merely a per-tile argmax
+        /// or an approximate/truncated local ranking — a distribution where
+        /// all global winners collide in one tile silently drops items under
+        /// either bug, per the exactness invariant documented at the Stage-1
+        /// top-k kernel.
+        ///
+        /// MUTATION-SENSITIVE: if Stage 1 emitted only a block-local argmax
+        /// (ignoring `local_k`) or a truncated/approximate local top-k, this
+        /// test's GPU output would be missing entries the CPU oracle has, and
+        /// the set-equality assertion below would fail.
+        #[test]
+        fn lm_head_block_topk_clustered_single_tile_set_agreement() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            const ROWS_PER_TG: usize = 256;
+            let vocab = ROWS_PER_TG * 5; // 5 exact tiles, no tail tile
+            let target_tile = 3usize;
+            let base = target_tile * ROWS_PER_TG;
+
+            let (cfg, mut weights) = zeroed_block_topk_fixture(vocab);
+            let hidden = cfg.hidden_size;
+
+            // Input token 0 drives x[0] = -1.0 through the (all-zero-weight)
+            // single layer, so the post-final-norm hidden is one-hot at
+            // component 0 with a fixed, deterministically-negative scalar
+            // c = -1.0 * (1+gamma) / rms(x) (gamma=1.0, rms>0 => c<0).
+            weights.embed_tokens[0] = -1.0; // token 0, component 0
+
+            // All 256 rows of the target tile get strictly monotonic,
+            // large-magnitude NEGATIVE embedding values (-300.0 up to -44.0)
+            // so that, multiplied by the negative c above, they become the
+            // largest POSITIVE logits in the whole vocabulary. Every other
+            // row stays at logit exactly 0.0 (zero embedding).
+            for i in 0..ROWS_PER_TG {
+                weights.embed_tokens[(base + i) * hidden] = -(300.0 - i as f32);
+            }
+
+            let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+            let full_logits = baseline.forward_step(0, 0);
+            assert_eq!(full_logits.len(), vocab);
+
+            for &k in &[8usize, 16, 40, 64] {
+                let expected: std::collections::HashSet<u32> =
+                    cpu_topk_token_ids(&full_logits, k).into_iter().collect();
+                // Sanity: the adversarial construction must actually cluster
+                // the true top-K inside the target tile, or this test proves
+                // nothing about the exactness invariant.
+                assert!(
+                    expected
+                        .iter()
+                        .all(|&t| (t as usize) >= base && (t as usize) < base + ROWS_PER_TG),
+                    "test construction bug: CPU oracle top-{k} is not fully clustered \
+                     in tile {target_tile}"
+                );
+
+                let mut blocked = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+                blocked.session.compact_route = GpuTopkRoute::BlockTopK { local_k: k as u32 };
+                blocked.session.compact_topk = k;
+                let empty = blocked.forward_step(0, 0);
+                assert!(
+                    empty.is_empty(),
+                    "compact route must return empty logits (k={k})"
+                );
+                assert_eq!(
+                    blocked.session.compact_result.len(),
+                    k,
+                    "BlockTopK{{local_k:{k}}} must produce exactly {k} candidates"
+                );
+                let got: std::collections::HashSet<u32> = blocked
+                    .session
+                    .compact_result
+                    .iter()
+                    .map(|c| c.token_id)
+                    .collect();
+                assert_eq!(
+                    got, expected,
+                    "clustered-tile top-{k} SET mismatch: GPU dropped or added tokens vs \
+                     CPU oracle (tile={target_tile}, base={base}) — Stage-1 local top-k \
+                     is not exact"
+                );
+            }
+        }
+
+        /// Design-spec dispatch-geometry requirement: "the known bug class is
+        /// under-dispatch leaving rows unwritten." Uses a vocab size NOT
+        /// divisible by `LM_HEAD_ROWS_PER_TG` (256) so the last Stage-1 tile
+        /// is partial (100 of 256 possible rows valid), and spikes the LAST
+        /// valid vocab row so it can only be found if the tail tile's
+        /// bounds-checked GEMV actually ran.
+        ///
+        /// MUTATION-SENSITIVE: reverting `div_ceil(ROWS_PER_TG)` to plain
+        /// integer division, or removing the kernel's `row >= vocab_size`
+        /// guard, either leaves the tail tile's valid rows undispatched (the
+        /// winning row is never computed) or corrupts the tile — either way
+        /// this test's GPU argmax stops matching the CPU oracle's last-row
+        /// argmax.
+        #[test]
+        fn lm_head_block_argmax_tail_tile_boundary() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            const ROWS_PER_TG: usize = 256;
+            let vocab = ROWS_PER_TG * 5 + 100; // 6 tiles; last tile has 100/256 valid rows
+            let last_row = vocab - 1;
+
+            let (cfg, mut weights) = zeroed_block_topk_fixture(vocab);
+            let hidden = cfg.hidden_size;
+            weights.embed_tokens[0] = -1.0; // input token 0, component 0 => c < 0
+            weights.embed_tokens[last_row * hidden] = -400.0; // dominates every other row
+
+            let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+            let full_logits = baseline.forward_step(0, 0);
+            let expected_argmax = cpu_topk_token_ids(&full_logits, 1)[0];
+            assert_eq!(
+                expected_argmax as usize, last_row,
+                "test construction bug: spiked last vocab row is not the CPU-oracle argmax"
+            );
+
+            let mut blocked = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+            blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+            blocked.session.compact_topk = 1;
+            let empty = blocked.forward_step(0, 0);
+            assert!(empty.is_empty());
+            assert_eq!(blocked.session.compact_result.len(), 1);
+            assert_eq!(
+                blocked.session.compact_result[0].token_id as usize,
+                last_row,
+                "tail-tile boundary row {last_row} (of vocab_size {vocab}, {} tiles, last \
+                 tile partial) was not found by Stage-1/Stage-2 — dispatch geometry / \
+                 tail guard bug",
+                vocab.div_ceil(ROWS_PER_TG)
+            );
+        }
+
+        /// Bypass-sensitive production-path test (design_spec.md Test Plan
+        /// §6): poisons the persistent logits buffer with a sentinel bit
+        /// pattern, runs the compact greedy route, and asserts the sentinel
+        /// survives untouched — proving the full `[vocab_size]` GEMV never
+        /// wrote to it, i.e. Stage 1/Stage 2 actually ran instead of the
+        /// full-logit path silently computing everything and discarding the
+        /// extra values.
+        ///
+        /// MUTATION-SENSITIVE: see test_report.md for the reverse-apply
+        /// proof — disabling the Stage-1/2 early return in
+        /// `encode_final_head` (forcing every route through the full-logit
+        /// GEMV) flips both the sentinel-buffer assertion below AND the
+        /// `out.is_empty()` assertion.
+        #[test]
+        fn lm_head_stage1_bypass_is_detected_via_logits_buffer() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let vocab = cfg.vocab_size;
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+
+            let sentinel_bits: u32 = 0xDEAD_BEEF;
+            // SAFETY: activations.logits is StorageModeShared f32[vocab_size];
+            // no GPU work is in flight on this fresh session.
+            unsafe {
+                let ptr = state.session.activations.logits.contents() as *mut u32;
+                for i in 0..vocab {
+                    std::ptr::write(ptr.add(i), sentinel_bits);
+                }
+            }
+
+            state.session.compact_route = GpuTopkRoute::BlockArgmax;
+            state.session.compact_topk = 1;
+            let out = state.forward_step(3, 0);
+
+            assert!(
+                out.is_empty(),
+                "compact greedy route must return empty logits, not the full vector — a \
+                 non-empty result here means the full-logit path ran (stage-1 bypass)"
+            );
+            assert_eq!(state.session.compact_result.len(), 1);
+
+            // SAFETY: same buffer; forward_step waits for GPU completion
+            // synchronously before returning.
+            unsafe {
+                let ptr = state.session.activations.logits.contents() as *const u32;
+                for i in 0..vocab {
+                    assert_eq!(
+                        std::ptr::read(ptr.add(i)),
+                        sentinel_bits,
+                        "logits buffer at vocab row {i} was overwritten — the full-logit \
+                         GEMV ran despite compact_route=BlockArgmax (stage-1 bypass not \
+                         caught by output alone)"
+                    );
+                }
+            }
+        }
+
+        /// Regression (issue #171 review round-1 finding 1): a compact top-k
+        /// request from one generation must not survive `reset_state()` into
+        /// the next generation on the same `MetalQwen35State`. Production
+        /// callers rely on this exact mechanism — every `generate_streaming`/
+        /// `generate`/cache-aware entry point calls `self.reset_state()` at
+        /// the top of every new generation, and a `use_compact == false`
+        /// decision (e.g. because the caller set `repetition_penalty != 1.0`,
+        /// which requires the full-logit exact path — see the route-decision
+        /// block's `else` arm a few hundred lines up) then simply never
+        /// re-engages the compact route for that call. If `reset_state`
+        /// failed to clear `compact_route`/`compact_topk`/`compact_result`,
+        /// that second generation would still see `compact_route ==
+        /// BlockArgmax` left over from the first, so `encode_final_head` /
+        /// `dispatch_lm_head_block_stage1_enc` would take the compact branch
+        /// again and return empty logits plus a stale one-candidate
+        /// `compact_result` instead of the full `[vocab_size]` logits a
+        /// non-compact (e.g. repetition-penalty) consumer requires —
+        /// sampling from that would read a stale/empty logits buffer.
+        ///
+        /// Engages the compact route the same way
+        /// `lm_head_block_argmax_matches_full_logits` above does (direct
+        /// `session.compact_route`/`compact_topk` assignment + `forward_step`,
+        /// no env vars — the production route-decision block would set these
+        /// same two fields from `LATTICE_COMPACT_TOPK` + `top_k<=1`, but
+        /// setting them directly here isolates this test to the
+        /// `reset_state`/route-builder clearing bug rather than also
+        /// depending on route *selection*, which already has its own
+        /// coverage in `choose_gpu_block_topk_route_gate`).
+        ///
+        /// MUTATION-SENSITIVE: commenting out the `reset_state` compact-state
+        /// clear (the `self.session.compact_topk = 0; self.session.compact_route
+        /// = GpuTopkRoute::CpuFallback; self.session.compact_result.clear();`
+        /// block added at the end of `reset_state`) makes call 2 below return
+        /// empty logits instead of the full-vocab exact-path logits, failing
+        /// the `assert_eq!(logits.len(), vocab)` line. See the PR report for
+        /// the reverse-apply fail/pass proof.
+        #[test]
+        fn compact_state_does_not_survive_reset_state_into_next_generation() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let vocab = cfg.vocab_size;
+
+            // Call 1: compact route engaged directly on a fresh state. This is
+            // exactly the session state `encode_final_head` would leave behind
+            // after a `generate_streaming` call with `LATTICE_COMPACT_TOPK` set
+            // and `top_k<=1` ran the block-top-k path.
+            let mut state = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
+            state.session.compact_route = GpuTopkRoute::BlockArgmax;
+            state.session.compact_topk = 1;
+            let empty_logits = state.forward_step(3, 0);
+            assert!(
+                empty_logits.is_empty(),
+                "test construction bug: call 1 did not take the compact route"
+            );
+            assert_eq!(state.session.compact_result.len(), 1);
+
+            // Call 2: same state, `reset_state()` — exactly what every
+            // `generate_*` entry point calls at the top of every new
+            // generation — followed by a forward pass that never re-engages
+            // the compact route (the production analogue: a caller-set
+            // `repetition_penalty != 1.0` makes `use_compact == false`, so the
+            // route-decision block's `else` arm runs instead of the `if
+            // use_compact` arm and never sets `compact_route` back to a Block
+            // route). `compact_route`/`compact_topk` are intentionally left
+            // untouched by this test after `reset_state()` so the assertions
+            // below observe exactly what `reset_state` itself did or didn't
+            // clear.
+            state.reset_state();
+            let logits = state.forward_step(3, 0);
+            assert_eq!(
+                logits.len(),
+                vocab,
+                "call 2 must return full [vocab_size] logits via the exact path \
+                 — a shorter/empty result means stale compact_route/compact_topk \
+                 from call 1 survived reset_state and hijacked the exact-path \
+                 forward pass"
+            );
+            assert_eq!(
+                state.session.compact_route,
+                GpuTopkRoute::CpuFallback,
+                "reset_state must clear compact_route back to CpuFallback"
+            );
+            assert_eq!(
+                state.session.compact_topk, 0,
+                "reset_state must clear compact_topk"
+            );
+            assert!(
+                state.session.compact_result.is_empty(),
+                "reset_state must clear compact_result"
+            );
+
+            // Observable: a completely fresh state's exact-path forward_step
+            // for the identical (token, position) must produce the same
+            // logit values and the same greedy token — proving call 2 ran
+            // the real full-logit GEMV, not a corrupted/stale variant. Uses
+            // the same value-tolerance idiom as the argmax/topk8 smoke tests
+            // above (bitonic-sort tie-break / dispatch-order noise is not a
+            // bug) rather than requiring bit-for-bit equality.
+            let mut fresh_state =
+                MetalQwen35State::new(&weights, &cfg, 8).expect("fresh fixture state");
+            let fresh_logits = fresh_state.forward_step(3, 0);
+            assert_eq!(fresh_logits.len(), vocab);
+            for (i, (&reused, &fresh)) in logits.iter().zip(fresh_logits.iter()).enumerate() {
+                assert!(
+                    (reused - fresh).abs() < 1e-3,
+                    "logit mismatch at vocab row {i}: reused-state {reused} vs \
+                     fresh-state {fresh} — call 1's compact state perturbed call \
+                     2's full-logit computation"
+                );
+            }
+            assert_eq!(
+                cpu_topk_token_ids(&logits, 1)[0],
+                cpu_topk_token_ids(&fresh_logits, 1)[0],
+                "reused-state and fresh-state exact-path greedy token must match"
+            );
+        }
+
+        /// Deterministic xorshift64* PRNG so the synthetic decode token
+        /// stream (and hence the test) is reproducible run-to-run (T.4)
+        /// without depending on real-tokenizer/corpus availability for a
+        /// 10K+-position sweep.
+        fn xorshift64_next(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn load_real_qwen35_0_8b_or_skip() -> Option<crate::model::qwen35::Qwen35Model> {
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping real-checkpoint test: model files missing at {}",
+                    model_dir.display()
+                );
+                return None;
+            }
+            Some(
+                crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                    .expect("load qwen3.5-0.8b"),
+            )
+        }
+
+        /// Acceptance test #1 (task order item 7 / design_spec.md Test Plan
+        /// §4): greedy token agreement 100% vs. the full-logit path on
+        /// \>=10,000 positions using the real Qwen3.5-0.8B checkpoint.
+        /// Overridable via `LATTICE_TEST_GREEDY_POSITIONS` for fast local
+        /// iteration; defaults to 10,000 to satisfy the acceptance gate. KV
+        /// cache is reset every 64 positions on BOTH sessions identically to
+        /// keep per-step attention cost bounded (this test exercises lm_head
+        /// numerical correctness across many diverse real hidden states, not
+        /// long-context decode).
+        #[test]
+        fn lm_head_real_checkpoint_greedy_agreement_10k_positions() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let num_positions: usize = std::env::var("LATTICE_TEST_GREEDY_POSITIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000);
+            let reset_every = 64usize;
+            let vocab = model.config().vocab_size;
+
+            let mut baseline = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("baseline real-checkpoint state");
+            let mut blocked = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("blocked real-checkpoint state");
+            blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+            blocked.session.compact_topk = 1;
+
+            let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
+            let mut mismatches = 0usize;
+            let mut pos_in_window = 0usize;
+            for step in 0..num_positions {
+                if pos_in_window >= reset_every {
+                    baseline.reset_state();
+                    blocked.reset_state();
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
+                    // review round-1 finding 1 — a prior generation's compact request
+                    // must not leak into the next one). This test drives `forward_step`
+                    // directly rather than through `generate_streaming`'s route-decision
+                    // block, so it must re-apply the compact-route configuration itself
+                    // after every reset, exactly as a real caller starting a fresh
+                    // `generate_*` call after a KV-cache-clearing reset would via that
+                    // route-decision block.
+                    blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+                    blocked.session.compact_topk = 1;
+                    pos_in_window = 0;
+                }
+                let token = (xorshift64_next(&mut rng) % vocab as u64) as u32;
+
+                let full_logits = baseline.forward_step(token, pos_in_window);
+                let expected = cpu_topk_token_ids(&full_logits, 1)[0];
+
+                let empty = blocked.forward_step(token, pos_in_window);
+                assert!(empty.is_empty(), "compact route must return empty logits");
+                assert_eq!(blocked.session.compact_result.len(), 1);
+                let got = blocked.session.compact_result[0].token_id;
+
+                if got != expected {
+                    mismatches += 1;
+                    eprintln!(
+                        "greedy mismatch at step {step} (pos {pos_in_window}): \
+                         expected {expected}, got {got}"
+                    );
+                }
+                pos_in_window += 1;
+                if step % 2000 == 0 {
+                    eprintln!("greedy agreement progress: {step}/{num_positions}");
+                }
+            }
+
+            eprintln!(
+                "greedy agreement: {}/{num_positions} positions matched",
+                num_positions - mismatches
+            );
+            assert_eq!(
+                mismatches, 0,
+                "{mismatches} greedy-token disagreements out of {num_positions} real-checkpoint positions"
+            );
+        }
+
+        /// Acceptance test #2 (task order item 7 / design_spec.md Test Plan
+        /// §5): top-k SET agreement 100% for K in {8,16,40,64} vs. the
+        /// full-logit CPU oracle, on real checkpoint positions (the
+        /// clustered-tile adversarial case is covered separately by
+        /// `lm_head_block_topk_clustered_single_tile_set_agreement`).
+        /// Overridable via `LATTICE_TEST_TOPK_POSITIONS`.
+        #[test]
+        fn lm_head_real_checkpoint_topk_set_agreement() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let num_positions: usize = std::env::var("LATTICE_TEST_TOPK_POSITIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500);
+            let reset_every = 64usize;
+            let vocab = model.config().vocab_size;
+            let ks = [8usize, 16, 40, 64];
+
+            let mut baseline = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("baseline real-checkpoint state");
+            let mut blocked_states: Vec<MetalQwen35State> = ks
+                .iter()
+                .map(|_| {
+                    MetalQwen35State::new(model.weights(), model.config(), 128)
+                        .expect("blocked real-checkpoint state")
+                })
+                .collect();
+            for (i, &k) in ks.iter().enumerate() {
+                blocked_states[i].session.compact_route =
+                    GpuTopkRoute::BlockTopK { local_k: k as u32 };
+                blocked_states[i].session.compact_topk = k;
+            }
+
+            let mut rng: u64 = 0xFEED_FACE_C0FF_EE00;
+            let mut accepted_ties = [0usize; 4];
+            let mut pos_in_window = 0usize;
+            for step in 0..num_positions {
+                if pos_in_window >= reset_every {
+                    baseline.reset_state();
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
+                    // review round-1 finding 1). This test drives `forward_step`
+                    // directly rather than through `generate_streaming`'s
+                    // route-decision block, so it must re-apply each state's
+                    // compact-route configuration after every reset, exactly as a
+                    // real caller starting a fresh `generate_*` call would via that
+                    // route-decision block.
+                    for (i, &k) in ks.iter().enumerate() {
+                        blocked_states[i].reset_state();
+                        blocked_states[i].session.compact_route =
+                            GpuTopkRoute::BlockTopK { local_k: k as u32 };
+                        blocked_states[i].session.compact_topk = k;
+                    }
+                    pos_in_window = 0;
+                }
+                let token = (xorshift64_next(&mut rng) % vocab as u64) as u32;
+                let full_logits = baseline.forward_step(token, pos_in_window);
+
+                for (i, &k) in ks.iter().enumerate() {
+                    let expected: std::collections::HashSet<u32> =
+                        cpu_topk_token_ids(&full_logits, k).into_iter().collect();
+                    let empty = blocked_states[i].forward_step(token, pos_in_window);
+                    assert!(empty.is_empty());
+                    assert_eq!(blocked_states[i].session.compact_result.len(), k);
+                    let got: std::collections::HashSet<u32> = blocked_states[i]
+                        .session
+                        .compact_result
+                        .iter()
+                        .map(|c| c.token_id)
+                        .collect();
+                    match topk_set_agreement_or_boundary_tie(
+                        &full_logits,
+                        &expected,
+                        &got,
+                        k,
+                        LM_HEAD_TOPK_TIE_EPSILON,
+                    ) {
+                        Ok(TopkSetAgreement::ExactSet) => {}
+                        Ok(TopkSetAgreement::AcceptedBoundaryTie {
+                            margin,
+                            epsilon,
+                            boundary_logit,
+                            differing_tokens,
+                        }) => {
+                            accepted_ties[i] += 1;
+                            eprintln!(
+                                "accepted top-{k} boundary tie at step {step} \
+                                 (pos {pos_in_window}): margin={margin:.6e}, \
+                                 epsilon={epsilon:.6e}, boundary_logit={boundary_logit:.6e}, \
+                                 differing_tokens={differing_tokens:?}"
+                            );
+                        }
+                        Err(mismatch) => {
+                            panic!(
+                                "top-{k} SET mismatch at step {step} \
+                                 (pos {pos_in_window}): {mismatch:?}"
+                            );
+                        }
+                    }
+                }
+                pos_in_window += 1;
+            }
+
+            for (i, &k) in ks.iter().enumerate() {
+                eprintln!(
+                    "top-{k} set agreement: {}/{num_positions} exact, {} accepted boundary ties",
+                    num_positions - accepted_ties[i],
+                    accepted_ties[i]
+                );
+            }
+        }
+
+        /// Resolve the on-disk Q4 checkpoint dir + parsed config for the
+        /// real Qwen3.5-0.8B Q4 checkpoint, or `None` (with an `eprintln!`
+        /// explanation) if the checkpoint isn't present locally. Mirrors
+        /// `load_real_qwen35_0_8b_or_skip` but for the `from_q4_dir` loading
+        /// path (issue #171 Task 3: extend real-checkpoint agreement
+        /// coverage from Q8-equivalent f16 to Q4).
+        fn load_real_qwen35_0_8b_q4_dir_or_skip() -> Option<(std::path::PathBuf, Qwen35Config)> {
+            let q4_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b-q4");
+            let config_path = q4_dir.join("config.json");
+            let embed_path = q4_dir.join("model_language_model_embed_tokens_weight.q4");
+            if !config_path.exists() || !embed_path.exists() {
+                eprintln!(
+                    "skipping real-checkpoint Q4 test: model files missing at {}",
+                    q4_dir.display()
+                );
+                return None;
+            }
+            let cfg = Qwen35Config::from_config_json(&config_path)
+                .expect("parse qwen3.5-0.8b-q4 config.json");
+            Some((q4_dir, cfg))
+        }
+
+        /// Q4 counterpart of `lm_head_real_checkpoint_greedy_agreement_10k_positions`
+        /// (issue #171 Task 3). `from_q4_dir` loads+dequantizes the full weight
+        /// set from disk per call (no shared-weights constructor like the f16
+        /// `Qwen35Model` path), so this leg uses a reduced default position
+        /// count to keep runtime sane; override via
+        /// `LATTICE_TEST_Q4_GREEDY_POSITIONS`. Same reset/re-apply-compact-route
+        /// discipline as the f16 leg (issue #171 review round-1 finding 1).
+        #[test]
+        fn lm_head_q4_real_checkpoint_greedy_agreement() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some((q4_dir, cfg)) = load_real_qwen35_0_8b_q4_dir_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let num_positions: usize = std::env::var("LATTICE_TEST_Q4_GREEDY_POSITIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2_000);
+            let reset_every = 64usize;
+            let vocab = cfg.vocab_size;
+            let max_cache_len = 128usize;
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            let mut baseline =
+                MetalQwen35State::from_q4_dir(&q4_dir, tokenizer_path, &cfg, max_cache_len)
+                    .expect("baseline real-checkpoint Q4 state");
+            let mut blocked =
+                MetalQwen35State::from_q4_dir(&q4_dir, tokenizer_path, &cfg, max_cache_len)
+                    .expect("blocked real-checkpoint Q4 state");
+            blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+            blocked.session.compact_topk = 1;
+
+            let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
+            let mut mismatches = 0usize;
+            let mut pos_in_window = 0usize;
+            for step in 0..num_positions {
+                if pos_in_window >= reset_every {
+                    baseline.reset_state();
+                    blocked.reset_state();
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
+                    // review round-1 finding 1); re-apply after every reset exactly as
+                    // a real caller starting a fresh `generate_*` call would via the
+                    // route-decision block.
+                    blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
+                    blocked.session.compact_topk = 1;
+                    pos_in_window = 0;
+                }
+                let token = (xorshift64_next(&mut rng) % vocab as u64) as u32;
+
+                let full_logits = baseline.forward_step(token, pos_in_window);
+                let expected = cpu_topk_token_ids(&full_logits, 1)[0];
+
+                let empty = blocked.forward_step(token, pos_in_window);
+                assert!(empty.is_empty(), "compact route must return empty logits");
+                assert_eq!(blocked.session.compact_result.len(), 1);
+                let got = blocked.session.compact_result[0].token_id;
+
+                if got != expected {
+                    mismatches += 1;
+                    eprintln!(
+                        "Q4 greedy mismatch at step {step} (pos {pos_in_window}): \
+                         expected {expected}, got {got}"
+                    );
+                }
+                pos_in_window += 1;
+                if step % 500 == 0 {
+                    eprintln!("Q4 greedy agreement progress: {step}/{num_positions}");
+                }
+            }
+
+            eprintln!(
+                "Q4 greedy agreement: {}/{num_positions} positions matched",
+                num_positions - mismatches
+            );
+            assert_eq!(
+                mismatches, 0,
+                "{mismatches} greedy-token disagreements out of {num_positions} real-checkpoint Q4 positions"
+            );
+        }
+
+        /// Q4 counterpart of `lm_head_real_checkpoint_topk_set_agreement`
+        /// (issue #171 Task 3). Reduced default position count (100 vs. 500)
+        /// to bound the cost of the five separate `from_q4_dir` loads
+        /// (baseline + one blocked state per K); override via
+        /// `LATTICE_TEST_Q4_TOPK_POSITIONS`.
+        #[test]
+        fn lm_head_q4_real_checkpoint_topk_set_agreement() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some((q4_dir, cfg)) = load_real_qwen35_0_8b_q4_dir_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let num_positions: usize = std::env::var("LATTICE_TEST_Q4_TOPK_POSITIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100);
+            let reset_every = 64usize;
+            let vocab = cfg.vocab_size;
+            let max_cache_len = 128usize;
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let ks = [8usize, 16, 40, 64];
+
+            let mut baseline =
+                MetalQwen35State::from_q4_dir(&q4_dir, tokenizer_path, &cfg, max_cache_len)
+                    .expect("baseline real-checkpoint Q4 state");
+            let mut blocked_states: Vec<MetalQwen35State> = ks
+                .iter()
+                .map(|_| {
+                    MetalQwen35State::from_q4_dir(&q4_dir, tokenizer_path, &cfg, max_cache_len)
+                        .expect("blocked real-checkpoint Q4 state")
+                })
+                .collect();
+            for (i, &k) in ks.iter().enumerate() {
+                blocked_states[i].session.compact_route =
+                    GpuTopkRoute::BlockTopK { local_k: k as u32 };
+                blocked_states[i].session.compact_topk = k;
+            }
+
+            let mut rng: u64 = 0xFEED_FACE_C0FF_EE00;
+            let mut mismatches = [0usize; 4];
+            let mut pos_in_window = 0usize;
+            for step in 0..num_positions {
+                if pos_in_window >= reset_every {
+                    baseline.reset_state();
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
+                    // review round-1 finding 1); re-apply each state's compact-route
+                    // configuration after every reset, exactly as a real caller
+                    // starting a fresh `generate_*` call would via the route-decision
+                    // block.
+                    for (i, &k) in ks.iter().enumerate() {
+                        blocked_states[i].reset_state();
+                        blocked_states[i].session.compact_route =
+                            GpuTopkRoute::BlockTopK { local_k: k as u32 };
+                        blocked_states[i].session.compact_topk = k;
+                    }
+                    pos_in_window = 0;
+                }
+                let token = (xorshift64_next(&mut rng) % vocab as u64) as u32;
+                let full_logits = baseline.forward_step(token, pos_in_window);
+
+                for (i, &k) in ks.iter().enumerate() {
+                    let expected: std::collections::HashSet<u32> =
+                        cpu_topk_token_ids(&full_logits, k).into_iter().collect();
+                    let empty = blocked_states[i].forward_step(token, pos_in_window);
+                    assert!(empty.is_empty());
+                    assert_eq!(blocked_states[i].session.compact_result.len(), k);
+                    let got: std::collections::HashSet<u32> = blocked_states[i]
+                        .session
+                        .compact_result
+                        .iter()
+                        .map(|c| c.token_id)
+                        .collect();
+                    if got != expected {
+                        mismatches[i] += 1;
+                        eprintln!("Q4 top-{k} SET mismatch at step {step}");
+                    }
+                }
+                pos_in_window += 1;
+            }
+
+            for (i, &k) in ks.iter().enumerate() {
+                eprintln!(
+                    "Q4 top-{k} set agreement: {}/{num_positions}",
+                    num_positions - mismatches[i]
+                );
+                assert_eq!(
+                    mismatches[i], 0,
+                    "{} top-{k} SET disagreements out of {num_positions} real-checkpoint Q4 positions",
+                    mismatches[i]
+                );
+            }
+        }
+
         /// Run `f` with `LATTICE_SELF_SPEC=1` in the process environment, then remove it.
         ///
         /// Rust 2024 marks `set_var`/`remove_var` as `unsafe` because they can race with
@@ -22783,6 +24355,276 @@ kernel void decode_attention_reference(
                 "error message must mention the aggregate budget; got: {msg}"
             );
         }
+    }
+}
+
+// Stage-1 block-top-k and the full-logit lm_head both accumulate ~1K f32
+// products for the real 0.8B checkpoint, but through different kernels/order.
+// f32 unit roundoff is ~6e-8, so gamma_1024 is ~6e-5; for logits in the tens,
+// boundary noise lands around 1e-4..1e-3. Existing lm_head GPU/full-logit
+// parity checks in this file use 1e-3 absolute logit tolerance, so use that
+// same scale only to accept rank-boundary ties, never broad ordering changes.
+#[cfg(test)]
+const LM_HEAD_TOPK_TIE_EPSILON: f32 = 1.0e-3;
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct TopkSetDiffToken {
+    token_id: u32,
+    baseline_logit: f32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopkSetMismatchReason {
+    InvalidInput,
+    SetCardinalityMismatch,
+    BoundaryMarginTooWide,
+    DifferingTokenOutsideBoundary,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct TopkSetMismatch {
+    k: usize,
+    margin: f32,
+    epsilon: f32,
+    boundary_logit: f32,
+    differing_tokens: Vec<TopkSetDiffToken>,
+    reason: TopkSetMismatchReason,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+enum TopkSetAgreement {
+    ExactSet,
+    AcceptedBoundaryTie {
+        margin: f32,
+        epsilon: f32,
+        boundary_logit: f32,
+        differing_tokens: Vec<TopkSetDiffToken>,
+    },
+}
+
+#[cfg(test)]
+fn topk_set_mismatch(
+    k: usize,
+    margin: f32,
+    epsilon: f32,
+    boundary_logit: f32,
+    differing_tokens: &[TopkSetDiffToken],
+    reason: TopkSetMismatchReason,
+) -> TopkSetMismatch {
+    TopkSetMismatch {
+        k,
+        margin,
+        epsilon,
+        boundary_logit,
+        differing_tokens: differing_tokens.to_vec(),
+        reason,
+    }
+}
+
+#[cfg(test)]
+fn topk_set_agreement_or_boundary_tie(
+    baseline_logits: &[f32],
+    baseline_set: &std::collections::HashSet<u32>,
+    candidate_set: &std::collections::HashSet<u32>,
+    k: usize,
+    epsilon: f32,
+) -> Result<TopkSetAgreement, TopkSetMismatch> {
+    if baseline_set == candidate_set {
+        return Ok(TopkSetAgreement::ExactSet);
+    }
+
+    let mut differing_tokens: Vec<TopkSetDiffToken> = baseline_set
+        .symmetric_difference(candidate_set)
+        .map(|&token_id| TopkSetDiffToken {
+            token_id,
+            baseline_logit: baseline_logits
+                .get(token_id as usize)
+                .copied()
+                .unwrap_or(f32::NAN),
+        })
+        .collect();
+    differing_tokens.sort_by_key(|diff| diff.token_id);
+
+    if k == 0 || k >= baseline_logits.len() || !epsilon.is_finite() || epsilon <= 0.0 {
+        return Err(topk_set_mismatch(
+            k,
+            f32::NAN,
+            epsilon,
+            f32::NAN,
+            &differing_tokens,
+            TopkSetMismatchReason::InvalidInput,
+        ));
+    }
+
+    let mut sorted_logits = baseline_logits.to_vec();
+    sorted_logits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let boundary_logit = sorted_logits[k - 1];
+    let first_excluded_logit = sorted_logits[k];
+    let margin = boundary_logit - first_excluded_logit;
+
+    if baseline_set.len() != k || candidate_set.len() != k {
+        return Err(topk_set_mismatch(
+            k,
+            margin,
+            epsilon,
+            boundary_logit,
+            &differing_tokens,
+            TopkSetMismatchReason::SetCardinalityMismatch,
+        ));
+    }
+
+    if margin >= epsilon {
+        return Err(topk_set_mismatch(
+            k,
+            margin,
+            epsilon,
+            boundary_logit,
+            &differing_tokens,
+            TopkSetMismatchReason::BoundaryMarginTooWide,
+        ));
+    }
+
+    if differing_tokens
+        .iter()
+        .all(|diff| (diff.baseline_logit - boundary_logit).abs() <= epsilon)
+    {
+        Ok(TopkSetAgreement::AcceptedBoundaryTie {
+            margin,
+            epsilon,
+            boundary_logit,
+            differing_tokens,
+        })
+    } else {
+        Err(topk_set_mismatch(
+            k,
+            margin,
+            epsilon,
+            boundary_logit,
+            &differing_tokens,
+            TopkSetMismatchReason::DifferingTokenOutsideBoundary,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod topk_boundary_tie_tests {
+    use super::*;
+
+    fn test_token_set(tokens: &[u32]) -> std::collections::HashSet<u32> {
+        tokens.iter().copied().collect()
+    }
+
+    #[test]
+    fn topk_boundary_tie_tight_margin_mismatch_is_accepted() {
+        let logits = [3.0, 2.0, 1.0, 0.9995, 0.0];
+        let baseline_set = test_token_set(&[0, 1, 2]);
+        let candidate_set = test_token_set(&[0, 1, 3]);
+
+        match topk_set_agreement_or_boundary_tie(
+            &logits,
+            &baseline_set,
+            &candidate_set,
+            3,
+            LM_HEAD_TOPK_TIE_EPSILON,
+        ) {
+            Ok(TopkSetAgreement::AcceptedBoundaryTie {
+                margin,
+                differing_tokens,
+                ..
+            }) => {
+                assert!(margin < LM_HEAD_TOPK_TIE_EPSILON);
+                assert_eq!(
+                    differing_tokens,
+                    vec![
+                        TopkSetDiffToken {
+                            token_id: 2,
+                            baseline_logit: 1.0,
+                        },
+                        TopkSetDiffToken {
+                            token_id: 3,
+                            baseline_logit: 0.9995,
+                        },
+                    ]
+                );
+            }
+            other => panic!("tight boundary mismatch must be accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_boundary_tie_wide_margin_mismatch_is_rejected() {
+        let logits = [3.0, 2.0, 1.0, 0.98, 0.0];
+        let baseline_set = test_token_set(&[0, 1, 2]);
+        let candidate_set = test_token_set(&[0, 1, 3]);
+
+        let result = topk_set_agreement_or_boundary_tie(
+            &logits,
+            &baseline_set,
+            &candidate_set,
+            3,
+            LM_HEAD_TOPK_TIE_EPSILON,
+        );
+        match result {
+            Err(err) => {
+                assert_eq!(err.reason, TopkSetMismatchReason::BoundaryMarginTooWide);
+                assert!(err.margin > LM_HEAD_TOPK_TIE_EPSILON);
+                assert_eq!(err.k, 3);
+                assert_eq!(err.epsilon, LM_HEAD_TOPK_TIE_EPSILON);
+            }
+            Ok(ok) => panic!("wide boundary margin must be rejected, got {ok:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_boundary_tie_far_differing_token_is_rejected() {
+        let logits = [10.0, 2.0, 1.0, 0.9995, 0.0];
+        let baseline_set = test_token_set(&[0, 1, 2]);
+        let candidate_set = test_token_set(&[1, 2, 3]);
+
+        let result = topk_set_agreement_or_boundary_tie(
+            &logits,
+            &baseline_set,
+            &candidate_set,
+            3,
+            LM_HEAD_TOPK_TIE_EPSILON,
+        );
+        match result {
+            Err(err) => {
+                assert_eq!(
+                    err.reason,
+                    TopkSetMismatchReason::DifferingTokenOutsideBoundary
+                );
+                assert!(err.margin < LM_HEAD_TOPK_TIE_EPSILON);
+                assert!(
+                    err.differing_tokens
+                        .iter()
+                        .any(|diff| diff.token_id == 0 && diff.baseline_logit == 10.0)
+                );
+            }
+            Ok(ok) => panic!("far differing token must be rejected, got {ok:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_boundary_tie_identical_sets_pass_exactly() {
+        let logits = [3.0, 2.0, 1.0, 0.0];
+        let baseline_set = test_token_set(&[0, 1, 2]);
+        let candidate_set = test_token_set(&[0, 1, 2]);
+
+        assert_eq!(
+            topk_set_agreement_or_boundary_tie(
+                &logits,
+                &baseline_set,
+                &candidate_set,
+                3,
+                LM_HEAD_TOPK_TIE_EPSILON,
+            ),
+            Ok(TopkSetAgreement::ExactSet)
+        );
     }
 }
 
