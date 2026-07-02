@@ -186,6 +186,30 @@ jobs:
       - name: embed benches
         run: cargo bench -p lattice-embed --no-run
 
+  # MSRV gate (#568). Every other job pins 1.94.1, so an API that stabilized in
+  # 1.94 compiles green across all of CI while breaking every user on an older
+  # stable — exactly how the nightly-gated NEON f16 intrinsics (stabilized in
+  # 1.94, rust-lang/rust#136306) shipped and broke a stable-1.93 user's build.
+  # This job compiles the workspace at the declared rust-version instead.
+  # macos-latest because it is aarch64 Apple Silicon: the NEON and Metal
+  # surfaces only compile there. --all-targets because one of the three #568
+  # intrinsic copies lived in a bench target. check (not test): the gate is
+  # "compiles at MSRV", behavior is covered by the 1.94.1 jobs above.
+  msrv:
+    name: msrv (1.93, f16+metal-gpu)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          cache-on-failure: true
+      - name: workspace — check at MSRV (f16,metal-gpu, all targets)
+        run: cargo check --workspace --features f16,metal-gpu --all-targets
+
   # Supply-chain gate. licenses/bans/sources are deterministic and REQUIRED:
   # a green main cannot turn red without a manifest/lockfile change. Advisories
   # run separately as informational (continue-on-error) because fresh RUSTSEC
