@@ -3,8 +3,10 @@
 //!
 //! Measures at N=1024 (the Qwen3.5-0.8B hidden size):
 //! - `scalar`: hand-written IEEE-754 bit-manipulation loop (~10 ops/element)
-//! - `neon`: `vcvt_f32_f16` NEON intrinsic (4 lanes/instruction) on aarch64;
-//!   falls back to scalar on other targets
+//!
+//! A NEON fast path (`vcvt_f32_f16`, 4 lanes/instruction) was removed in #568: it
+//! required the nightly-only `stdarch_neon_f16` feature and broke stable-toolchain
+//! builds. `convert_f16_row` in `metal_qwen35.rs` is scalar-only for the same reason.
 //!
 //! Run: `cargo bench -p lattice-inference --bench f16_convert_bench`
 //!
@@ -53,41 +55,6 @@ unsafe fn convert_f16_row_scalar(src: *const u16, dst: *mut f32, n: usize) {
 }
 
 // --------------------------------------------------------------------------
-// NEON fast path (aarch64 only; falls through to scalar on other targets)
-// --------------------------------------------------------------------------
-
-/// Convert n f16 values (as u16 bits) at `src` into f32 values at `dst`.
-///
-/// On aarch64 uses `vcvt_f32_f16` (4 lanes per instruction); scalar elsewhere.
-///
-/// # Safety
-/// `src` must point to at least `n` initialized u16 values; `dst` to at least `n` writable f32.
-unsafe fn convert_f16_row_neon(src: *const u16, dst: *mut f32, n: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use std::arch::aarch64::*;
-        // SAFETY: caller guarantees src has n u16 values and dst has n f32 values.
-        // NEON is always present on aarch64; we process 4 lanes per iter, scalar tail.
-        let mut i = 0usize;
-        while i + 4 <= n {
-            let v_u16 = vld1_u16(src.add(i));
-            let v_f16 = vreinterpret_f16_u16(v_u16);
-            let v_f32 = vcvt_f32_f16(v_f16);
-            vst1q_f32(dst.add(i), v_f32);
-            i += 4;
-        }
-        while i < n {
-            *dst.add(i) = f16_to_f32_scalar(*src.add(i));
-            i += 1;
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        convert_f16_row_scalar(src, dst, n);
-    }
-}
-
-// --------------------------------------------------------------------------
 // Bench harness
 // --------------------------------------------------------------------------
 
@@ -117,15 +84,6 @@ fn bench_f16_convert(c: &mut Criterion) {
             // SAFETY: src and dst are N-element buffers; loop is inbounds.
             unsafe {
                 convert_f16_row_scalar(black_box(src.as_ptr()), black_box(dst.as_mut_ptr()), N);
-            }
-        })
-    });
-
-    group.bench_with_input(BenchmarkId::new("neon", N), &N, |b, &_n| {
-        b.iter(|| {
-            // SAFETY: same as above.
-            unsafe {
-                convert_f16_row_neon(black_box(src.as_ptr()), black_box(dst.as_mut_ptr()), N);
             }
         })
     });

@@ -5151,37 +5151,19 @@ kernel void gdn_chunk_norm_silu_c32(
     /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
     /// to f32, writing into a pre-allocated destination buffer.
     ///
-    /// On aarch64 the inner loop uses `vcvt_f32_f16` (4 lanes per instruction) with a
-    /// scalar remainder tail. On other targets the scalar `f16_to_f32` is used throughout.
+    /// Scalar `f16_to_f32` throughout. A 4-lane NEON fast path (`vcvt_f32_f16`) was
+    /// tried on aarch64 but requires the nightly-only `stdarch_neon_f16` feature
+    /// (rust-lang/rust#136306) and broke stable-toolchain builds (#568) — this runs
+    /// off the GPU decode hot path (one row per token embedding lookup / readback),
+    /// so the scalar cost is not worth the unstable dependency.
     ///
     /// # Safety
     /// - `src` must point to at least `n` contiguous, initialized u16 values.
     /// - `dst` must point to at least `n` contiguous, writable f32 values.
     /// - `n` may be zero (no-op).
     unsafe fn convert_f16_row(src: *const u16, dst: *mut f32, n: usize) {
-        #[cfg(target_arch = "aarch64")]
-        {
-            use std::arch::aarch64::*;
-            // SAFETY: src has n u16 values; dst has n f32 values; we process 4 per iteration
-            // then handle the remainder scalarly. NEON is always present on aarch64.
-            let mut i = 0usize;
-            while i + 4 <= n {
-                let v_u16 = vld1_u16(src.add(i));
-                let v_f16 = vreinterpret_f16_u16(v_u16);
-                let v_f32 = vcvt_f32_f16(v_f16);
-                vst1q_f32(dst.add(i), v_f32);
-                i += 4;
-            }
-            while i < n {
-                *dst.add(i) = f16_to_f32(*src.add(i));
-                i += 1;
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            for i in 0..n {
-                *dst.add(i) = f16_to_f32(*src.add(i));
-            }
+        for i in 0..n {
+            *dst.add(i) = f16_to_f32(*src.add(i));
         }
     }
 
@@ -17001,9 +16983,10 @@ kernel void gdn_chunk_norm_silu_c32(
             );
         }
 
-        /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` (NEON
-        /// on aarch64, scalar on other targets) produces bit-identical output to the
-        /// scalar `f16_to_f32` reference for every pattern.
+        /// Sweep all 65 536 u16 bit patterns and assert that `convert_f16_row` produces
+        /// bit-identical output to the scalar `f16_to_f32` reference for every pattern
+        /// (regression guard: `convert_f16_row` is itself scalar-only post-#568, so this
+        /// mainly pins the loop's correctness against the reference implementation).
         ///
         /// NaN comparison policy: both outputs are NaN ⇒ pass (any NaN payload is
         /// acceptable; the bit pattern of a NaN is not architecturally meaningful).

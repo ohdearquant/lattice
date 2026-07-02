@@ -11,6 +11,15 @@ members = [
 [workspace.package]
 version = "0.4.2"
 edition = "2024"
+# MSRV, verified end-to-end (workspace + deps) on 1.93.1 and guarded by the msrv CI
+# job (aarch64 macOS, f16,metal-gpu, --all-targets) so a newer-toolchain-only API
+# cannot silently ship again (#568: nightly-gated NEON f16 intrinsics compiled on
+# CI's pinned 1.94.1 but broke users on 1.93). Locked deps already require >=1.88,
+# so 1.85 (the edition2024 floor in .clippy.toml) is not attainable. .clippy.toml
+# intentionally stays at 1.85: it only sets the style-lint floor, and raising it to
+# 1.93 activates manual_is_multiple_of across ~70 pre-existing sites (tracked as a
+# follow-up).
+rust-version = "1.93"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/lattice"
