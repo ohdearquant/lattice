@@ -34,3 +34,6 @@ Thumbs.db
 
 *__pycache__/
 uv.lock
+
+# Internal workspace artifacts (audits, notes, local tooling) — local-only
+.khive/
