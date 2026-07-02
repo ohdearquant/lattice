@@ -302,23 +302,29 @@ impl ModelRegistry {
         names
     }
 
-    /// Load model weights
+    /// Load model weights, verifying the recorded checksum when one is on
+    /// record.
+    ///
+    /// #504 remaining slice 3: this used to be a pure raw load with **no**
+    /// checksum check at all — a caller reaching for the "obvious" method
+    /// name silently bypassed the verification `load_weights_verified`
+    /// performed, even though every model registered via [`Self::register`]
+    /// always carries a `weights_hash`. Fail-closed discipline now applies
+    /// here too: if `model.weights_hash` is `Some`, a mismatch is a hard
+    /// `TuneError::WeightIntegrityError`, not a silent pass-through. A
+    /// model with no recorded hash at all (e.g. [`Self::register_metadata`]
+    /// with weights added out-of-band, or a legacy pre-hash record) has
+    /// nothing to check against and loads unverified — that is the only
+    /// remaining "raw" case, and it is explicit (a `None` hash on the
+    /// record), never a silent skip of a hash that *is* present.
     pub fn load_weights(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
         let path = model
             .weights_path
             .as_ref()
             .ok_or_else(|| TuneError::Storage("No weights path".to_string()))?;
 
-        self.storage.lock().load(path)
-    }
+        let weights = self.storage.lock().load(path)?;
 
-    /// Load model weights with checksum verification
-    ///
-    /// Returns `TuneError::WeightIntegrityError` if checksum doesn't match.
-    pub fn load_weights_verified(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
-        let weights = self.load_weights(model)?;
-
-        // Verify checksum if available
         if let Some(ref expected_hash) = model.weights_hash {
             let actual_hash = sha256_hash(&weights);
             if &actual_hash != expected_hash {
@@ -330,6 +336,31 @@ impl ModelRegistry {
         }
 
         Ok(weights)
+    }
+
+    /// Load model weights, **requiring** a recorded checksum to verify
+    /// against.
+    ///
+    /// This is [`Self::load_weights`] (which already verifies whenever a
+    /// hash is on record) plus one additional guarantee for callers that
+    /// explicitly want verification: a model with **no** recorded
+    /// `weights_hash` is rejected rather than silently loaded unverified.
+    /// Use this entry point wherever the caller's contract requires "this
+    /// load is verified", and [`Self::load_weights`] only when an
+    /// unverified load of a hash-less (metadata-only-registered) model is
+    /// an accepted, understood case.
+    ///
+    /// Returns `TuneError::WeightIntegrityError` if the checksum doesn't
+    /// match, or `TuneError::Storage` if no checksum is on record at all.
+    pub fn load_weights_verified(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
+        if model.weights_hash.is_none() {
+            return Err(TuneError::Storage(format!(
+                "load_weights_verified: model {} ({} v{}) has no recorded \
+                 weights_hash to verify against",
+                model.id, model.name, model.version
+            )));
+        }
+        self.load_weights(model)
     }
 
     /// Get number of registered models (lock-free snapshot)
