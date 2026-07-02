@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ADR-064: decode slope/intercept fit harness driver.
 #
-# Builds bench_decode_slopefit (if needed), runs it, pipes stdout through the
+# Builds bench_decode_slopefit, runs it, pipes stdout through the
 # Python post-processor, and emits the final ADR-064 JSON.
 #
 # Usage:
@@ -31,13 +31,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Build if stale.
-if [[ ! -x "$BIN" ]]; then
-    >&2 echo "[slopefit] building bench_decode_slopefit (release)..."
-    cargo build --release -p lattice-inference --bin bench_decode_slopefit \
-        --features "f16,metal-gpu" 2>&1 | grep -v "^$" >&2 \
-        || { echo '{"error":"build failed"}'; exit 1; }
-fi
+# Build before benchmarking; cargo incremental prevents stale release binaries.
+>&2 echo "[slopefit] building bench_decode_slopefit (release)..."
+cargo build --release -p lattice-inference --bin bench_decode_slopefit \
+    --features "f16,metal-gpu" 2>&1 | grep -v "^$" >&2 \
+    || { echo '{"error":"build failed"}'; exit 1; }
 
 >&2 echo "[slopefit] running measurement binary..."
 if [[ -n "$OUT" ]]; then
