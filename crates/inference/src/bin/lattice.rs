@@ -405,6 +405,32 @@ mod doctor {
         }
     }
 
+    /// `Placement::Metal`'s actual runtime path (`MetalChatBackend`, see its
+    /// `MAX_CACHE_LEN` doc comment) hard-caps the KV cache at 4096 tokens
+    /// regardless of `max_position_embeddings` -- without this, doctor
+    /// could report a context length the CLI's own chat/serve commands
+    /// would never actually allow. `MetalChatBackend` itself is
+    /// `metal-gpu`-only, and `doctor` must build without that feature too,
+    /// so the value is mirrored here (matching the existing
+    /// `load_q4_config` fallback in `build_report`) rather than shared
+    /// across the cfg-gate.
+    pub const METAL_RUNTIME_MAX_CACHE_LEN: usize = 4096;
+
+    /// The `max_position_embeddings` value doctor should actually plan
+    /// against: the model's own architectural ceiling, further capped by
+    /// [`METAL_RUNTIME_MAX_CACHE_LEN`] for `Placement::Metal` (the
+    /// CPU/safetensors path has no equivalent runtime cap).
+    pub fn effective_max_position_embeddings(
+        placement: Placement,
+        max_position_embeddings: usize,
+    ) -> usize {
+        if placement == Placement::Metal {
+            max_position_embeddings.min(METAL_RUNTIME_MAX_CACHE_LEN)
+        } else {
+            max_position_embeddings
+        }
+    }
+
     /// Render a byte count as a human-readable size (KiB/MiB/GiB).
     fn human_bytes(bytes: u64) -> String {
         const KIB: f64 = 1024.0;
@@ -659,6 +685,67 @@ mod doctor {
         file: String,
     }
 
+    /// Estimate a Q4-checkpoint tensor's RESIDENT byte footprint once loaded
+    /// by `MetalQwen35State::from_q4_dir` (`crates/inference/src/forward/metal_qwen35.rs`),
+    /// given its on-disk byte length. Mirrors `cpu_resident_bytes` above for
+    /// the Q4/Metal path: on-disk bytes alone are not a safe RAM/VRAM proxy
+    /// here either, for two independent reasons — dequantization expansion
+    /// and runtime-cache duplication:
+    ///
+    /// - `*.norm.weight` / `A_log` / `dt_bias` / `conv1d.weight`: `.f16` on
+    ///   disk, loaded via `load_f16_buf_f32` into an f32 Metal buffer — 2x.
+    /// - `in_proj_a` / `in_proj_b`: Q4 on disk, dequantized to an f16 Metal
+    ///   buffer (`load_q4_as_f16_buf` → `make_buffer_f16_from_q4`). A
+    ///   [`Q4Block`](crate::weights::q4_weights::Q4Block) packs 32 weights
+    ///   into 20 bytes (0.625 B/elem); f16 resident is 2 B/elem — 3.2x.
+    /// - `in_proj_qkv` / `in_proj_z`: each is mmap'd zero-copy at its own
+    ///   size (1x) AND its bytes are duplicated again into the merged
+    ///   `in_proj_qkvz` runtime-cache buffer (a mmap'd `merged_qkvz_*.q4`
+    ///   file, or a CPU-concat fallback), which has no manifest/directory
+    ///   entry of its own — so each contributes 2x total.
+    /// - `embed_tokens`: dequantized into a full f16 buffer for the CPU
+    ///   embedding lookup (3.2x, same ratio as `in_proj_a`/`b`) AND
+    ///   separately mmap'd at its own on-disk size for the GPU logits GEMV
+    ///   (`embed_tokens_q8`) — 4.2x total. (In the untied-embeddings case
+    ///   the logits mmap actually targets a separate `lm_head.weight.q4`
+    ///   file instead, which is already its own correctly-1x manifest
+    ///   entry; treating `embed_tokens` as a flat 4.2x in both cases is a
+    ///   deliberate, harmless over-estimate rather than added branching on
+    ///   `tie_word_embeddings` for a difference this small.)
+    /// - Everything else (full-attention `q/k/v/o_proj`, `mlp.down_proj`,
+    ///   `mlp.gate_proj`/`up_proj` fused by plain concatenation into
+    ///   `gate_up_proj`, `linear_attn.out_proj`, `lm_head`) is mmap'd
+    ///   zero-copy or fused without expansion: resident == on-disk.
+    ///
+    /// `name_or_file` accepts either the manifest's original dotted tensor
+    /// name (`quantize_index.json`'s `name` field) or a sanitized
+    /// `q4_tensor_path`-style filename (dots already replaced with `_`,
+    /// optionally with a trailing `.q4`/`.f16` extension) — both retain the
+    /// same distinguishing suffix tokens after normalizing separators.
+    fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
+        let mut n = name_or_file.replace('.', "_");
+        if let Some(stripped) = n.strip_suffix("_q4").or_else(|| n.strip_suffix("_f16")) {
+            n = stripped.to_string();
+        }
+        if n.ends_with("norm_weight")
+            || n.ends_with("A_log")
+            || n.ends_with("dt_bias")
+            || n.ends_with("conv1d_weight")
+        {
+            return on_disk_bytes.saturating_mul(2);
+        }
+        if n.ends_with("in_proj_a_weight") || n.ends_with("in_proj_b_weight") {
+            return (on_disk_bytes as f64 * 3.2).round() as u64;
+        }
+        if n.ends_with("in_proj_qkv_weight") || n.ends_with("in_proj_z_weight") {
+            return on_disk_bytes.saturating_mul(2);
+        }
+        if n.ends_with("embed_tokens_weight") {
+            return (on_disk_bytes as f64 * 4.2).round() as u64;
+        }
+        on_disk_bytes
+    }
+
     /// Sample one non-cache `.q4` file's header to identify the
     /// quantization format, using the real, already-shipped
     /// `read_q4_header` (a header-only read — no block payload is decoded).
@@ -720,7 +807,7 @@ mod doctor {
                 let file_path = dir.join(&entry.file);
                 match std::fs::metadata(&file_path) {
                     Ok(meta) => {
-                        total_bytes += meta.len();
+                        total_bytes += q4_resident_bytes(&entry.name, meta.len());
                         present_names.insert(entry.name.clone());
                     }
                     Err(_) => missing_tensors.push(format!(
@@ -765,7 +852,7 @@ mod doctor {
                 if (name.ends_with(".q4") || name.ends_with(".f16"))
                     && let Ok(meta) = entry.metadata()
                 {
-                    total_bytes += meta.len();
+                    total_bytes += q4_resident_bytes(name, meta.len());
                     tensor_count += 1;
                 }
             }
@@ -795,6 +882,11 @@ mod doctor {
         pub weight_bytes: u64,
         pub kv_bytes_per_token: u64,
         pub max_position_embeddings: usize,
+        /// `Some(4096)` for `Placement::Metal` -- the actual runtime cap
+        /// `MetalChatBackend::MAX_CACHE_LEN` imposes regardless of the
+        /// model's own `max_position_embeddings`. `None` for `Placement::Cpu`,
+        /// which has no equivalent hard cap.
+        pub metal_runtime_cache_cap: Option<usize>,
         pub available_memory_bytes: Option<u64>,
         pub max_context_len: Option<usize>,
         pub requested_context: Option<usize>,
@@ -838,6 +930,13 @@ mod doctor {
                 "Model max context (max_position_embeddings): {}",
                 self.max_position_embeddings
             )?;
+            if let Some(cap) = self.metal_runtime_cache_cap {
+                writeln!(
+                    f,
+                    "Metal runtime cache cap: {cap} tokens (MetalChatBackend::MAX_CACHE_LEN; \
+                     the chat/serve binaries never allow more, even if memory allows it)"
+                )?;
+            }
             match self.available_memory_bytes {
                 Some(avail) => writeln!(
                     f,
@@ -851,7 +950,12 @@ mod doctor {
                 )?,
             }
             match self.max_context_len {
-                Some(max_ctx) => writeln!(f, "Max feasible context length: {max_ctx} tokens")?,
+                Some(max_ctx) => writeln!(
+                    f,
+                    "Max feasible context length: {max_ctx} tokens \
+                     (weights + KV cache only -- activation buffers, GDN recurrent-state \
+                     scratch, and tokenizer tables are not counted)"
+                )?,
                 None => writeln!(
                     f,
                     "Max feasible context length: unknown (system memory undetected)"
@@ -892,7 +996,7 @@ mod doctor {
             }
             writeln!(f)?;
             if self.is_ready() {
-                writeln!(f, "Result: OK -- ready to load")?;
+                writeln!(f, "Result: OK -- weights + KV cache fit; ready to load")?;
             } else {
                 writeln!(f, "Result: NOT READY")?;
                 for reason in &self.blocking_reasons {
@@ -957,13 +1061,16 @@ mod doctor {
         let kv_bytes_per_token = cfg.kv_bytes_per_token(kv_cache_dtype_bytes()) as u64;
         let available_memory_bytes = available_memory_override.or_else(detect_total_memory_bytes);
 
+        let effective_max_position_embeddings =
+            effective_max_position_embeddings(placement, cfg.max_position_embeddings);
+
         let (max_context_len, requested_fits) = match available_memory_bytes {
             Some(avail) => {
                 let plan = plan_memory(
                     inventory.total_bytes,
                     kv_bytes_per_token,
                     avail,
-                    cfg.max_position_embeddings,
+                    effective_max_position_embeddings,
                     requested_context,
                 );
                 (Some(plan.max_context_len), plan.requested_fits)
@@ -1009,6 +1116,8 @@ mod doctor {
             weight_bytes: inventory.total_bytes,
             kv_bytes_per_token,
             max_position_embeddings: cfg.max_position_embeddings,
+            metal_runtime_cache_cap: (placement == Placement::Metal)
+                .then_some(METAL_RUNTIME_MAX_CACHE_LEN),
             available_memory_bytes,
             max_context_len,
             requested_context,
@@ -1073,6 +1182,39 @@ mod doctor {
             let plan = plan_memory(0, 1, 1_000_000_000_000, 4096, None);
             assert_eq!(plan.max_context_by_memory, 1_000_000_000_000);
             assert_eq!(plan.max_context_len, 4096);
+        }
+
+        // ---- effective_max_position_embeddings (Medium-2 fix) -----------
+
+        #[test]
+        fn effective_max_position_embeddings_caps_metal_placement_at_runtime_limit() {
+            // Qwen3.6-27B's real max_position_embeddings (131072) far
+            // exceeds MetalChatBackend's actual 4096-token runtime cap --
+            // doctor must not report a feasible context the binary would
+            // refuse to serve.
+            assert_eq!(
+                effective_max_position_embeddings(Placement::Metal, 131_072),
+                METAL_RUNTIME_MAX_CACHE_LEN
+            );
+        }
+
+        #[test]
+        fn effective_max_position_embeddings_leaves_smaller_model_ceiling_untouched() {
+            // A model whose own ceiling is already below the runtime cap
+            // must not be inflated up to it.
+            assert_eq!(
+                effective_max_position_embeddings(Placement::Metal, 2048),
+                2048
+            );
+        }
+
+        #[test]
+        fn effective_max_position_embeddings_does_not_cap_cpu_placement() {
+            // The CPU/safetensors path has no equivalent runtime cache cap.
+            assert_eq!(
+                effective_max_position_embeddings(Placement::Cpu, 131_072),
+                131_072
+            );
         }
 
         #[test]
@@ -1317,7 +1459,10 @@ mod doctor {
             write_fake_q4_file(&dir.join("layer0_qkv.q4"), 2, &[32], 32, 1);
             write_fake_q4_file(&dir.join("layer0_z.q4"), 2, &[32], 32, 1);
             // A runtime-created merge cache duplicating the two tensors
-            // above -- must NOT be double-counted.
+            // above -- must NOT be double-counted *from its own file* (it
+            // has no manifest entry), but its bytes ARE real resident
+            // duplicates of in_proj_qkv/in_proj_z, so each of those two
+            // entries counts twice (see `q4_resident_bytes`).
             write_fake_q4_file(&dir.join("merged_qkvz_0_100_50.q4"), 2, &[64], 64, 2);
 
             let qkv_len = fs::metadata(dir.join("layer0_qkv.q4")).unwrap().len();
@@ -1335,8 +1480,142 @@ mod doctor {
 
             let cfg = Qwen35Config::qwen35_0_8b();
             let inv = inspect_q4_dir(&dir, &cfg).unwrap();
-            assert_eq!(inv.total_bytes, qkv_len + z_len);
+            assert_eq!(inv.total_bytes, 2 * (qkv_len + z_len));
             fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_resident_bytes_exceed_raw_on_disk_sum_for_expanded_tensors() {
+            // The Major finding this test guards: several Q4/Metal tensor
+            // categories are dequantized or duplicated at load time, so a
+            // flat `meta.len()` sum under-reports real resident bytes. This
+            // must fail if `inspect_q4_dir` reverts to summing raw on-disk
+            // sizes unmodified.
+            let dir = tempdir("q4-resident-expansion");
+            // embed_tokens: expect 4.2x (dequantized f16 copy + separate
+            // mmap for the logits GEMV).
+            write_fake_q4_file(
+                &dir.join("embed.q4"),
+                2,
+                &[32],
+                32,
+                10, // 10 blocks * 20 bytes = 200 on-disk bytes
+            );
+            // in_proj_a: expect 3.2x (dequantized to an f16 Metal buffer).
+            write_fake_q4_file(&dir.join("proj_a.q4"), 2, &[32], 32, 10);
+            // A plain mmap'd tensor (q_proj): expect exactly 1x, unchanged.
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
+
+            let embed_len = fs::metadata(dir.join("embed.q4")).unwrap().len();
+            let proj_a_len = fs::metadata(dir.join("proj_a.q4")).unwrap().len();
+            let q_proj_len = fs::metadata(dir.join("q_proj.q4")).unwrap().len();
+
+            let index = serde_json::json!([
+                {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "model.language_model.layers.0.linear_attn.in_proj_a.weight", "file": "proj_a.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+
+            let naive_sum = embed_len + proj_a_len + q_proj_len;
+            let expected = (embed_len as f64 * 4.2).round() as u64
+                + (proj_a_len as f64 * 3.2).round() as u64
+                + q_proj_len;
+            assert!(
+                inv.total_bytes > naive_sum,
+                "resident estimate ({}) must exceed the naive on-disk sum ({naive_sum}) \
+                 once embed_tokens/in_proj_a expansion is accounted for",
+                inv.total_bytes
+            );
+            assert_eq!(inv.total_bytes, expected);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn q4_resident_bytes_classifies_every_known_category() {
+            // Direct unit coverage for the classifier itself, independent of
+            // the manifest/fallback-scan plumbing above -- also exercises
+            // the sanitized-filename form (dots -> `_`, `.q4`/`.f16` suffix)
+            // used by the no-manifest fallback path.
+            assert_eq!(
+                q4_resident_bytes("model.language_model.norm.weight", 100),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("model_language_model_norm_weight.f16", 100),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("model.language_model.layers.0.linear_attn.A_log", 100),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("model.language_model.layers.0.linear_attn.dt_bias", 100),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.conv1d.weight",
+                    100
+                ),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                    100
+                ),
+                320
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                    100
+                ),
+                320
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                    100
+                ),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                    100
+                ),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("model.language_model.embed_tokens.weight", 100),
+                420
+            );
+            // Unaffected categories stay at exactly 1x.
+            assert_eq!(
+                q4_resident_bytes("model.language_model.layers.0.self_attn.q_proj.weight", 100),
+                100
+            );
+            assert_eq!(
+                q4_resident_bytes("model.language_model.layers.0.mlp.gate_proj.weight", 100),
+                100
+            );
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.out_proj.weight",
+                    100
+                ),
+                100
+            );
+            assert_eq!(q4_resident_bytes("lm_head.weight", 100), 100);
         }
 
         #[test]
@@ -1375,6 +1654,43 @@ mod doctor {
             let inv = inspect_q4_dir(&dir, &cfg).unwrap();
             assert_eq!(inv.total_bytes, a_len + b_len);
             assert_eq!(inv.tensor_count, 2);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_fallback_scan_applies_resident_bytes_by_sanitized_filename() {
+            // The no-manifest fallback path only sees sanitized filenames
+            // (q4_tensor_path: dots -> `_`), not the original dotted tensor
+            // name -- this proves the classifier's suffix matching still
+            // works against that form for an expanded category.
+            let dir = tempdir("q4-no-manifest-embed");
+            write_fake_q4_file(
+                &dir.join("model_language_model_embed_tokens_weight.q4"),
+                2,
+                &[32],
+                32,
+                10,
+            );
+            write_fake_q4_file(
+                &dir.join("model_language_model_layers_0_self_attn_q_proj_weight.q4"),
+                2,
+                &[32],
+                32,
+                10,
+            );
+            let embed_len = fs::metadata(dir.join("model_language_model_embed_tokens_weight.q4"))
+                .unwrap()
+                .len();
+            let q_proj_len =
+                fs::metadata(dir.join("model_language_model_layers_0_self_attn_q_proj_weight.q4"))
+                    .unwrap()
+                    .len();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            let expected = (embed_len as f64 * 4.2).round() as u64 + q_proj_len;
+            assert_eq!(inv.total_bytes, expected);
+            assert!(inv.total_bytes > embed_len + q_proj_len);
             fs::remove_dir_all(&dir).ok();
         }
 
