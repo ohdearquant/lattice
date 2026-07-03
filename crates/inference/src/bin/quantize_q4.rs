@@ -10,196 +10,15 @@
 //!
 //! # Memory budget
 //!
-//! At any point only one BF16 tensor is live in RAM alongside its Q4 output.
-//! Peak ≈ (tensor_elements × 6 bytes) — 178MB BF16 + 89MB Q4 for the largest shard tensor.
+//! At any point only one tensor's decoded `f64` values are live in RAM
+//! alongside its `f32` downcast and Q4 output.
 
-use lattice_inference::weights::f32_weights::parse_index;
-use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_bf16_to_q4, save_q4_file};
-use memmap2::Mmap;
-use serde_json::Value;
-use std::collections::HashMap;
+use lattice_inference::quant::quarot::QuarotTensorReader;
+use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
-
-// ---------------------------------------------------------------------------
-// Minimal safetensors header parser (BF16 / F16 / F32 aware, no feature gate)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DType {
-    F32,
-    F16,
-    BF16,
-}
-
-impl DType {
-    fn bytes_per_elem(self) -> usize {
-        match self {
-            DType::F32 => 4,
-            DType::F16 | DType::BF16 => 2,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            DType::F32 => "F32",
-            DType::F16 => "F16",
-            DType::BF16 => "BF16",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TensorHeader {
-    dtype: DType,
-    shape: Vec<usize>,
-    /// Byte offsets *relative to the start of the data section* (after the 8-byte length prefix + header).
-    start: usize,
-    end: usize,
-}
-
-/// Open a safetensors shard file and return its memory map + parsed tensor headers.
-fn open_shard(path: &Path) -> io::Result<(Mmap, HashMap<String, TensorHeader>)> {
-    let file = fs::File::open(path)?;
-    // SAFETY: The file is opened read-only. The Mmap owns the mapping; the File
-    // can be dropped immediately after — the OS keeps the fd alive through the map.
-    let mmap = unsafe { Mmap::map(&file)? };
-
-    if mmap.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "safetensors file too small",
-        ));
-    }
-
-    let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-    let data_offset = 8 + header_len;
-    if data_offset > mmap.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "header extends past end of file: header_end={data_offset}, file_len={}",
-                mmap.len()
-            ),
-        ));
-    }
-
-    let header_str = std::str::from_utf8(&mmap[8..data_offset])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let root: Value = serde_json::from_str(header_str)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let obj = root.as_object().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "safetensors header is not an object",
-        )
-    })?;
-
-    let mut tensors = HashMap::new();
-    for (name, entry) in obj {
-        if name == "__metadata__" {
-            continue;
-        }
-        let dtype_str = entry["dtype"]
-            .as_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing dtype"))?;
-        let dtype = match dtype_str {
-            "F32" => DType::F32,
-            "F16" => DType::F16,
-            "BF16" => DType::BF16,
-            other => {
-                // Warn but skip unsupported dtypes (e.g. I32, I64 used by tokenizers)
-                eprintln!("  [skip] tensor {name}: unsupported dtype {other}");
-                continue;
-            }
-        };
-
-        let shape: Vec<usize> = entry["shape"]
-            .as_array()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing shape"))?
-            .iter()
-            .map(|v| {
-                v.as_u64()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-u64 shape dim"))
-                    .map(|x| x as usize)
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-
-        let offsets = entry["data_offsets"]
-            .as_array()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing data_offsets"))?;
-        if offsets.len() != 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "data_offsets must have length 2",
-            ));
-        }
-        let start = offsets[0].as_u64().unwrap() as usize;
-        let end = offsets[1].as_u64().unwrap() as usize;
-
-        // Sanity check byte length vs shape × dtype.
-        let numel: usize = shape.iter().product();
-        let expected_bytes = numel * dtype.bytes_per_elem();
-        if end - start != expected_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "tensor {name}: byte length mismatch — shape {:?} × {} bytes = {} expected, got {}",
-                    shape,
-                    dtype.bytes_per_elem(),
-                    expected_bytes,
-                    end - start
-                ),
-            ));
-        }
-
-        tensors.insert(
-            name.clone(),
-            TensorHeader {
-                dtype,
-                shape,
-                start,
-                end,
-            },
-        );
-    }
-
-    // Re-open to bake in the data_offset — store it in a wrapper that knows it.
-    // We return the raw mmap; callers use `data_offset` when indexing.
-    // Pack data_offset into the mmap key 0..8 via a simple trick: we wrap mmap
-    // in a struct below so we do NOT re-open.  The returned map uses data_offset
-    // by slicing: mmap[data_offset + start .. data_offset + end].
-    // We stash data_offset as an extra entry with key "" (impossible tensor name).
-    let fake_start = data_offset; // callers read this back via SENTINEL_KEY
-    tensors.insert(
-        "\x00data_offset".to_string(),
-        TensorHeader {
-            dtype: DType::F32,
-            shape: vec![],
-            start: fake_start,
-            end: fake_start,
-        },
-    );
-
-    Ok((mmap, tensors))
-}
-
-/// Get the raw bytes for a tensor from a parsed shard.
-///
-/// `tensors` is the map from `open_shard`.
-fn tensor_bytes<'m>(
-    mmap: &'m Mmap,
-    tensors: &HashMap<String, TensorHeader>,
-    name: &str,
-) -> &'m [u8] {
-    let data_offset = tensors["\x00data_offset"].start;
-    let h = &tensors[name];
-    &mmap[data_offset + h.start..data_offset + h.end]
-}
 
 // ---------------------------------------------------------------------------
 // Tensor classification: should_quantize
@@ -299,13 +118,36 @@ fn f32_to_f16(v: f32) -> u16 {
         return sign | (exp16 << 10) | frac16_final;
     }
 
-    sign
-}
+    // exp32 < -14: the f32 value is normal-range but smaller than the
+    // smallest f16 normal. F16 still represents 2^-24..2^-14 as subnormals,
+    // and a source-F16 subnormal reaches this point after widening through
+    // f64 and narrowing back to f32 (both exact), so flushing to zero here
+    // would silently destroy a value f16 can represent exactly. Encode it
+    // as an f16 subnormal instead, using the same round-to-nearest-even
+    // shape as the normal-range path above.
+    let sig = 0x0080_0000u32 | frac;
+    let shift = (-exp32 - 1) as u32;
 
-/// Convert BF16 bit pattern to f32.
-#[inline]
-fn bf16_to_f32(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
+    // Beyond this shift the discarded bits can never reach halfway to the
+    // smallest subnormal (2^-24), so the correctly rounded result is zero.
+    if shift >= 25 {
+        return sign;
+    }
+
+    let frac16_raw = (sig >> shift) as u16;
+    let round_bit = ((sig >> (shift - 1)) & 1) as u16;
+    let sticky = (sig & ((1u32 << (shift - 1)) - 1)) != 0;
+    let frac16 = frac16_raw
+        + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
+            1
+        } else {
+            0
+        };
+
+    // frac16 == 0x0400 means rounding overflowed the largest subnormal into
+    // the smallest normal f16 (exponent field 0x01, fraction 0) — that bit
+    // pattern is exactly `sign | 0x0400`, so no separate branch is needed.
+    sign | frac16
 }
 
 // ---------------------------------------------------------------------------
@@ -334,13 +176,20 @@ struct IndexEntry {
 fn print_usage_and_exit() -> ! {
     eprintln!("Usage: quantize_q4 --model-dir <DIR> --output-dir <DIR> [--dry-run]");
     eprintln!();
-    eprintln!("  --model-dir   directory containing model.safetensors.index.json");
+    eprintln!("  --model-dir   directory containing model.safetensors[.index.json]");
     eprintln!("  --output-dir  directory to write .q4 and index files");
-    eprintln!("  --dry-run     parse shards but skip writing output");
+    eprintln!("  --dry-run     read tensors but skip writing output");
     std::process::exit(1);
 }
 
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("quantize_q4 failed: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mut model_dir: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
@@ -382,46 +231,18 @@ fn main() {
     });
 
     if !dry_run {
-        fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-            panic!(
-                "failed to create output directory {}: {e}",
-                output_dir.display()
-            );
-        });
+        fs::create_dir_all(&output_dir)?;
     }
 
-    // Parse the shard index.
-    let shard_index = parse_index(&model_dir).unwrap_or_else(|e| {
-        panic!(
-            "failed to parse model.safetensors.index.json in {}: {e}",
-            model_dir.display()
-        );
-    });
+    let reader = QuarotTensorReader::open(&model_dir)?;
+    let mut tensor_names = reader.tensor_names();
+    tensor_names.sort();
+    let n_tensors = tensor_names.len();
 
-    // Collect unique shard filenames in sorted order (model-00001-of-00015, ...).
-    let mut shard_files: Vec<String> = {
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
-        for v in shard_index.weight_map.values() {
-            seen.insert(v.clone());
-        }
-        seen.into_iter().collect()
-    };
-    shard_files.sort();
-    let n_shards = shard_files.len();
-
-    // Build reverse map: shard_filename → [tensor_names in that shard].
-    let mut shard_to_tensors: HashMap<String, Vec<String>> = HashMap::new();
-    for (tensor_name, shard_name) in &shard_index.weight_map {
-        shard_to_tensors
-            .entry(shard_name.clone())
-            .or_default()
-            .push(tensor_name.clone());
-    }
-
-    eprintln!("=== quantize_q4: BF16 → Q4_0 ===");
+    eprintln!("=== quantize_q4: SafeTensors → Q4_0 ===");
     eprintln!("Model dir:  {}", model_dir.display());
     eprintln!("Output dir: {}", output_dir.display());
-    eprintln!("Shards:     {n_shards}");
+    eprintln!("Tensors:    {n_tensors}");
     if dry_run {
         eprintln!("Mode:       DRY RUN (no files written)");
     }
@@ -435,196 +256,130 @@ fn main() {
     let mut total_bytes_in = 0u64;
     let mut total_bytes_out = 0u64;
 
-    for (shard_idx, shard_filename) in shard_files.iter().enumerate() {
-        let shard_path = model_dir.join(shard_filename);
-        eprintln!(
-            "[shard {}/{n_shards}] Opening {}",
-            shard_idx + 1,
-            shard_path.display()
-        );
-        let shard_start = Instant::now();
+    for (tensor_idx, tensor_name) in tensor_names.iter().enumerate() {
+        let tensor_start = Instant::now();
+        let bytes_in = reader.tensor_byte_len(tensor_name)?;
+        let source_dtype = reader.source_dtype(tensor_name)?;
+        let (data_f64, shape) = reader.read_tensor_f64(tensor_name)?;
 
-        let (mmap, headers) = open_shard(&shard_path).unwrap_or_else(|e| {
-            panic!("failed to open shard {}: {e}", shard_path.display());
-        });
-
-        // Sort tensors in this shard by their offset for sequential access.
-        let mut shard_tensors = shard_to_tensors
-            .get(shard_filename)
-            .cloned()
-            .unwrap_or_default();
-        shard_tensors.sort_by_key(|name| headers.get(name).map(|h| h.start).unwrap_or(usize::MAX));
-
-        let n_in_shard = shard_tensors.len();
-        eprintln!("  Tensors in shard: {n_in_shard}");
-
-        for (tensor_idx, tensor_name) in shard_tensors.iter().enumerate() {
-            let Some(h) = headers.get(tensor_name.as_str()) else {
-                eprintln!(
-                    "  [warn] tensor {tensor_name} listed in index but not found in shard header — skipping"
-                );
-                continue;
-            };
-
-            let shape = &h.shape;
-            let numel: usize = shape.iter().product();
-            let bytes_in = (h.end - h.start) as u64;
-            total_bytes_in += bytes_in;
-
-            let tensor_start = Instant::now();
-            let raw_bytes = tensor_bytes(&mmap, &headers, tensor_name);
-
-            if should_quantize(tensor_name) {
-                // BF16 → f32 → Q4_0
-                let bf16_vals: Vec<u16> = raw_bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-
-                let q4 = quantize_bf16_to_q4(&bf16_vals, shape)
-                    .expect("Q4 quantization failed: source weights contain non-finite values");
-                let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
-                total_bytes_out += bytes_out;
-
-                // Output file: <tensor_name_sanitized>.q4 (replace '.' and '/' with '_')
-                let sanitized: String = tensor_name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let out_filename = format!("{sanitized}.q4");
-                let out_path = output_dir.join(&out_filename);
-
-                if !dry_run {
-                    save_q4_file(&out_path, &q4).unwrap_or_else(|e| {
-                        panic!("failed to write {}: {e}", out_path.display());
-                    });
-                }
-
-                let elapsed = tensor_start.elapsed();
-                eprintln!(
-                    "  [{}/{n_in_shard}] Q4_0  {tensor_name}  shape={shape:?}  \
-                     {:.1}MB→{:.1}MB  {:.2}s",
-                    tensor_idx + 1,
-                    bytes_in as f64 / 1_048_576.0,
-                    bytes_out as f64 / 1_048_576.0,
-                    elapsed.as_secs_f64()
-                );
-
-                index_entries.push(IndexEntry {
-                    name: tensor_name.clone(),
-                    file: out_filename,
-                    quantized: true,
-                    shape: shape.clone(),
-                    numel,
-                });
-                total_quantized += 1;
-            } else {
-                // Keep as f16: convert BF16→f32→f16 (or F16→f16 as-is, or F32→f16).
-                let f16_data: Vec<u8> = match h.dtype {
-                    DType::BF16 => {
-                        // BF16 → f32 → f16 (recompress to f16 for uniformity)
-                        raw_bytes
-                            .chunks_exact(2)
-                            .flat_map(|c| {
-                                let bf = u16::from_le_bytes([c[0], c[1]]);
-                                let f = bf16_to_f32(bf);
-                                f32_to_f16(f).to_le_bytes()
-                            })
-                            .collect()
-                    }
-                    DType::F16 => {
-                        // Already f16: pass through byte-for-byte.
-                        raw_bytes.to_vec()
-                    }
-                    DType::F32 => {
-                        // F32 → f16 (lossy downcast for norm weights etc.)
-                        raw_bytes
-                            .chunks_exact(4)
-                            .flat_map(|c| {
-                                let f = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                                f32_to_f16(f).to_le_bytes()
-                            })
-                            .collect()
-                    }
-                };
-
-                let bytes_out = f16_data.len() as u64;
-                total_bytes_out += bytes_out;
-
-                // Output file: <sanitized>.f16 for kept tensors
-                let sanitized: String = tensor_name
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() || c == '-' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let out_filename = format!("{sanitized}.f16");
-                let out_path = output_dir.join(&out_filename);
-
-                if !dry_run {
-                    let mut f = fs::File::create(&out_path).unwrap_or_else(|e| {
-                        panic!("failed to create {}: {e}", out_path.display());
-                    });
-                    use std::io::Write;
-                    // Write a minimal header: magic "KHF1" + version u32 + ndim u32 + shape[i] u64 + data
-                    f.write_all(b"KHF1").unwrap();
-                    f.write_all(&1u32.to_le_bytes()).unwrap();
-                    f.write_all(&(shape.len() as u32).to_le_bytes()).unwrap();
-                    for &dim in shape {
-                        f.write_all(&(dim as u64).to_le_bytes()).unwrap();
-                    }
-                    f.write_all(&(numel as u64).to_le_bytes()).unwrap();
-                    f.write_all(&f16_data).unwrap();
-                }
-
-                let elapsed = tensor_start.elapsed();
-                eprintln!(
-                    "  [{}/{n_in_shard}] F16   {tensor_name}  shape={shape:?}  \
-                     {:.1}MB  dtype={}  {:.3}s",
-                    tensor_idx + 1,
-                    bytes_in as f64 / 1_048_576.0,
-                    h.dtype.name(),
-                    elapsed.as_secs_f64()
-                );
-
-                index_entries.push(IndexEntry {
-                    name: tensor_name.clone(),
-                    file: out_filename,
-                    quantized: false,
-                    shape: shape.clone(),
-                    numel,
-                });
-                total_kept_f16 += 1;
-            }
-
-            total_tensors += 1;
+        let expected_numel = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| format!("tensor {tensor_name}: shape product overflow for {shape:?}"))?;
+        if expected_numel != data_f64.len() {
+            return Err(format!(
+                "tensor {tensor_name}: shape {shape:?} has {expected_numel} elements, \
+                 reader returned {}",
+                data_f64.len()
+            )
+            .into());
         }
 
-        let shard_elapsed = shard_start.elapsed();
-        eprintln!("  Shard done in {:.1}s\n", shard_elapsed.as_secs_f64());
+        // Reader decodes to f64; the Q4 quantizer works in f32 (ADR-044 step 3c).
+        let data_f32: Vec<f32> = data_f64.iter().map(|&v| v as f32).collect();
+        let numel = data_f32.len();
+        total_bytes_in += bytes_in;
 
-        // Drop mmap explicitly before opening the next shard.
-        drop(mmap);
+        let sanitized: String = tensor_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        if should_quantize(tensor_name) {
+            let q4 = quantize_f32_to_q4(&data_f32, &shape)?;
+            let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
+            total_bytes_out += bytes_out;
+
+            let out_filename = format!("{sanitized}.q4");
+            let out_path = output_dir.join(&out_filename);
+
+            if !dry_run {
+                save_q4_file(&out_path, &q4)
+                    .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+            }
+
+            let elapsed = tensor_start.elapsed();
+            eprintln!(
+                "  [{}/{n_tensors}] Q4_0  {tensor_name}  shape={shape:?}  \
+                 {:.1}MB→{:.1}MB  {:.2}s",
+                tensor_idx + 1,
+                bytes_in as f64 / 1_048_576.0,
+                bytes_out as f64 / 1_048_576.0,
+                elapsed.as_secs_f64()
+            );
+
+            index_entries.push(IndexEntry {
+                name: tensor_name.clone(),
+                file: out_filename,
+                quantized: true,
+                shape: shape.clone(),
+                numel,
+            });
+            total_quantized += 1;
+        } else {
+            // Kept tensor: reader already decoded to numeric values, so the
+            // common path is decoded-value → f16 for every source dtype.
+            let f16_data: Vec<u8> = data_f32
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+
+            let bytes_out = f16_data.len() as u64;
+            total_bytes_out += bytes_out;
+
+            let out_filename = format!("{sanitized}.f16");
+            let out_path = output_dir.join(&out_filename);
+
+            if !dry_run {
+                let mut f = fs::File::create(&out_path)
+                    .map_err(|e| format!("failed to create {}: {e}", out_path.display()))?;
+                // Minimal header: magic "KHF1" + version u32 + ndim u32 + shape[i] u64 + numel u64 + data
+                f.write_all(b"KHF1")?;
+                f.write_all(&1u32.to_le_bytes())?;
+                f.write_all(&(shape.len() as u32).to_le_bytes())?;
+                for &dim in &shape {
+                    f.write_all(&(dim as u64).to_le_bytes())?;
+                }
+                f.write_all(&(numel as u64).to_le_bytes())?;
+                f.write_all(&f16_data)?;
+            }
+
+            let elapsed = tensor_start.elapsed();
+            eprintln!(
+                "  [{}/{n_tensors}] F16   {tensor_name}  shape={shape:?}  \
+                 {:.1}MB  dtype={}  {:.3}s",
+                tensor_idx + 1,
+                bytes_in as f64 / 1_048_576.0,
+                source_dtype.name(),
+                elapsed.as_secs_f64()
+            );
+
+            index_entries.push(IndexEntry {
+                name: tensor_name.clone(),
+                file: out_filename,
+                quantized: false,
+                shape: shape.clone(),
+                numel,
+            });
+            total_kept_f16 += 1;
+        }
+
+        total_tensors += 1;
     }
 
     // Write the quantization index.
     if !dry_run {
         let index_path = output_dir.join("quantize_index.json");
         let index_json = serde_json::to_string_pretty(&index_entries)
-            .unwrap_or_else(|e| panic!("failed to serialize index: {e}"));
-        fs::write(&index_path, index_json).unwrap_or_else(|e| {
-            panic!("failed to write {}: {e}", index_path.display());
-        });
+            .map_err(|e| format!("failed to serialize index: {e}"))?;
+        fs::write(&index_path, index_json)
+            .map_err(|e| format!("failed to write {}: {e}", index_path.display()))?;
         eprintln!("Index written: {}", index_path.display());
     }
 
@@ -654,4 +409,6 @@ fn main() {
         compression * 100.0
     );
     eprintln!("Total time:   {:.1}s", total_elapsed.as_secs_f64());
+
+    Ok(())
 }
