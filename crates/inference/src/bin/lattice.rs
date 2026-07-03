@@ -353,6 +353,14 @@ mod doctor {
         /// Required tensors that exist but use a dtype the loader does not
         /// support.
         unsupported_dtypes: Vec<String>,
+        /// True when the directory contains any `mtp.*` / `mtp_*` tensor
+        /// file. Always `false` for the safetensors/CPU path -- MTP is a
+        /// Q4/Metal-only feature (`from_q4_dir`'s `load_mtp_q4_weights`).
+        /// Q4/Metal directories that load MTP weights allocate a separate
+        /// `MetalMtpCache` K/V buffer pair that `kv_bytes_per_token` does
+        /// not account for, so this flag drives an explicit disclosure in
+        /// `DoctorReport`'s `Display` rather than a silent gap.
+        has_mtp_tensors: bool,
     }
 
     // -----------------------------------------------------------------------
@@ -672,6 +680,7 @@ mod doctor {
             quantization_error: None,
             missing_tensors,
             unsupported_dtypes,
+            has_mtp_tensors: false,
         })
     }
 
@@ -692,8 +701,10 @@ mod doctor {
     /// here either, for two independent reasons — dequantization expansion
     /// and runtime-cache duplication:
     ///
-    /// - `*.norm.weight` / `A_log` / `dt_bias` / `conv1d.weight`: `.f16` on
-    ///   disk, loaded via `load_f16_buf_f32` into an f32 Metal buffer — 2x.
+    /// - `*.norm.weight` / `A_log` / `dt_bias` / `conv1d.weight` / MTP's
+    ///   `pre_fc_norm_embedding.weight` / `pre_fc_norm_hidden.weight`:
+    ///   `.f16` on disk, loaded via `load_f16_buf_f32` into an f32 Metal
+    ///   buffer — 2x.
     /// - `in_proj_a` / `in_proj_b`: Q4 on disk, dequantized to an f16 Metal
     ///   buffer (`load_q4_as_f16_buf` → `make_buffer_f16_from_q4`). A
     ///   [`Q4Block`](crate::weights::q4_weights::Q4Block) packs 32 weights
@@ -731,6 +742,8 @@ mod doctor {
             || n.ends_with("A_log")
             || n.ends_with("dt_bias")
             || n.ends_with("conv1d_weight")
+            || n.ends_with("pre_fc_norm_embedding_weight")
+            || n.ends_with("pre_fc_norm_hidden_weight")
         {
             return on_disk_bytes.saturating_mul(2);
         }
@@ -803,12 +816,14 @@ mod doctor {
             let mut total_bytes = 0u64;
             let mut missing_tensors = Vec::new();
             let mut present_names: BTreeSet<String> = BTreeSet::new();
+            let mut has_mtp_tensors = false;
             for entry in &entries {
                 let file_path = dir.join(&entry.file);
                 match std::fs::metadata(&file_path) {
                     Ok(meta) => {
                         total_bytes += q4_resident_bytes(&entry.name, meta.len());
                         present_names.insert(entry.name.clone());
+                        has_mtp_tensors |= entry.name.starts_with("mtp.");
                     }
                     Err(_) => missing_tensors.push(format!(
                         "{} (listed in quantize_index.json as '{}', file not found)",
@@ -829,6 +844,7 @@ mod doctor {
                 quantization_error,
                 missing_tensors,
                 unsupported_dtypes: Vec::new(),
+                has_mtp_tensors,
             })
         } else {
             // No manifest: fall back to a directory scan, excluding
@@ -839,6 +855,7 @@ mod doctor {
             // empty here rather than guessed.
             let mut total_bytes = 0u64;
             let mut tensor_count = 0usize;
+            let mut has_mtp_tensors = false;
             let read_dir = std::fs::read_dir(dir)
                 .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?;
             for entry in read_dir.flatten() {
@@ -854,6 +871,7 @@ mod doctor {
                 {
                     total_bytes += q4_resident_bytes(name, meta.len());
                     tensor_count += 1;
+                    has_mtp_tensors |= name.starts_with("mtp_");
                 }
             }
             Ok(WeightInventory {
@@ -863,6 +881,7 @@ mod doctor {
                 quantization_error,
                 missing_tensors: Vec::new(),
                 unsupported_dtypes: Vec::new(),
+                has_mtp_tensors,
             })
         }
     }
@@ -897,6 +916,12 @@ mod doctor {
         /// Non-empty ⇒ this artifact is not ready to run as configured.
         /// Each entry is a standalone, actionable explanation.
         pub blocking_reasons: Vec<String>,
+        /// True when the Q4 directory has MTP tensor files -- `kv_bytes_per_token`
+        /// above only ever covers the main model's full-attention KV cache,
+        /// never the separate `MetalMtpCache` K/V buffers `from_q4_dir`
+        /// allocates when MTP weights load, so this drives an explicit
+        /// disclosure line rather than a silently-optimistic context estimate.
+        pub has_mtp_tensors: bool,
     }
 
     impl DoctorReport {
@@ -960,6 +985,14 @@ mod doctor {
                     f,
                     "Max feasible context length: unknown (system memory undetected)"
                 )?,
+            }
+            if self.has_mtp_tensors {
+                writeln!(
+                    f,
+                    "Note: this directory includes MTP (multi-token prediction) files -- \
+                     the separate MTP K/V cache and session buffers `from_q4_dir` allocates \
+                     for them are also not counted in the estimate above."
+                )?;
             }
             if let Some(requested) = self.requested_context {
                 match self.requested_fits {
@@ -1126,6 +1159,7 @@ mod doctor {
             tokenizer_present,
             missing_tensors: inventory.missing_tensors,
             blocking_reasons,
+            has_mtp_tensors: inventory.has_mtp_tensors,
         })
     }
 
@@ -1599,6 +1633,19 @@ mod doctor {
                 q4_resident_bytes("model.language_model.embed_tokens.weight", 100),
                 420
             );
+            assert_eq!(
+                q4_resident_bytes("mtp.pre_fc_norm_embedding.weight", 100),
+                200
+            );
+            assert_eq!(q4_resident_bytes("mtp.pre_fc_norm_hidden.weight", 100), 200);
+            assert_eq!(
+                q4_resident_bytes("mtp_pre_fc_norm_embedding_weight.f16", 100),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("mtp_pre_fc_norm_hidden_weight.f16", 100),
+                200
+            );
             // Unaffected categories stay at exactly 1x.
             assert_eq!(
                 q4_resident_bytes("model.language_model.layers.0.self_attn.q_proj.weight", 100),
@@ -1691,6 +1738,87 @@ mod doctor {
             let expected = (embed_len as f64 * 4.2).round() as u64 + q_proj_len;
             assert_eq!(inv.total_bytes, expected);
             assert!(inv.total_bytes > embed_len + q_proj_len);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_detects_mtp_tensors_via_manifest() {
+            let dir = tempdir("q4-mtp-manifest");
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("mtp_norm.f16"), 2, &[32], 32, 1);
+            let index = serde_json::json!([
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "mtp.norm.weight", "file": "mtp_norm.f16", "quantized": false, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert!(inv.has_mtp_tensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_no_mtp_tensors_via_manifest_when_absent() {
+            let dir = tempdir("q4-no-mtp-manifest");
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
+            let index = serde_json::json!([
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert!(!inv.has_mtp_tensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_detects_mtp_tensors_via_fallback_scan() {
+            let dir = tempdir("q4-mtp-fallback");
+            write_fake_q4_file(
+                &dir.join("model_language_model_layers_0_self_attn_q_proj_weight.q4"),
+                2,
+                &[32],
+                32,
+                1,
+            );
+            write_fake_q4_file(
+                &dir.join("mtp_pre_fc_norm_embedding_weight.f16"),
+                2,
+                &[32],
+                32,
+                1,
+            );
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert!(inv.has_mtp_tensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_no_mtp_tensors_via_fallback_scan_when_absent() {
+            let dir = tempdir("q4-no-mtp-fallback");
+            write_fake_q4_file(
+                &dir.join("model_language_model_layers_0_self_attn_q_proj_weight.q4"),
+                2,
+                &[32],
+                32,
+                1,
+            );
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert!(!inv.has_mtp_tensors);
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -1826,6 +1954,56 @@ mod doctor {
             let err = build_report(&dir, None, None, None).unwrap_err();
             assert!(err.contains("not a recognized model directory"));
             fs::remove_dir_all(&dir).ok();
+        }
+
+        // ---- DoctorReport Display: MTP disclosure --------------------------
+
+        fn minimal_doctor_report(has_mtp_tensors: bool) -> DoctorReport {
+            // Constructed directly rather than through `build_report` -- this
+            // targets the `Display` impl's MTP-disclosure branch in
+            // isolation, without needing a full valid Q4 checkpoint fixture
+            // (manifest + every required tensor + tokenizer.json) that no
+            // other test in this module builds either.
+            DoctorReport {
+                model_dir: PathBuf::from("/fake/model"),
+                format: crate::backend::ModelFormat::Q4,
+                placement: Placement::Metal,
+                quantization: "Q4_0".to_string(),
+                tensor_count: 1,
+                weight_bytes: 100,
+                kv_bytes_per_token: 100,
+                max_position_embeddings: 4096,
+                metal_runtime_cache_cap: Some(METAL_RUNTIME_MAX_CACHE_LEN),
+                available_memory_bytes: Some(1u64 << 40),
+                max_context_len: Some(4096),
+                requested_context: None,
+                requested_fits: None,
+                tokenizer_path: PathBuf::from("/fake/model/tokenizer.json"),
+                tokenizer_present: true,
+                missing_tensors: Vec::new(),
+                blocking_reasons: Vec::new(),
+                has_mtp_tensors,
+            }
+        }
+
+        #[test]
+        fn doctor_report_display_includes_mtp_disclosure_when_mtp_tensors_present() {
+            let report = minimal_doctor_report(true);
+            let text = format!("{report}");
+            assert!(
+                text.contains("MTP"),
+                "report must disclose the uncounted MTP K/V cache when MTP tensors are present:\n{text}"
+            );
+        }
+
+        #[test]
+        fn doctor_report_display_omits_mtp_disclosure_when_no_mtp_tensors() {
+            let report = minimal_doctor_report(false);
+            let text = format!("{report}");
+            assert!(
+                !text.contains("MTP"),
+                "report must not mention MTP for a directory with no MTP tensors:\n{text}"
+            );
         }
     }
 }
