@@ -33,24 +33,24 @@ library from a single window. To build and install it, follow the step-by-step g
 
 ## Capabilities
 
-|                        |                                                                                                 |
-| ---------------------- | ----------------------------------------------------------------------------------------------- |
-| Pure Rust compute      | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                |
-| Metal GPU backend      | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.      |
-| Generation models      | Qwen3.5-0.8B / 2B, Qwen3.6-35B-A3B (MoE), Qwen3.6-27B. Hybrid GatedDeltaNet + GQA architecture. |
-| Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.  |
-| Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                          |
-| Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5.  |
-| LoRA                   | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`.  |
-| HTTP API               | OpenAI-compatible `/v1/chat/completions` via `lattice serve`.                                   |
-| Safetensors native     | Memory-mapped weight loading. Single-file and sharded checkpoints.                              |
-| KV cache               | Incremental decoding with key-value caching.                                                    |
-| Speculative decoding   | Draft-model acceleration on the CPU path.                                                       |
-| Grammar decoding       | Constrained output via a pushdown automaton. OpenAI string-level stop sequences.                |
-| MRL support            | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32).                      |
-| LRU cache              | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats.                       |
-| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`.               |
-| Optimal transport      | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`.                    |
+|                        |                                                                                                                                                                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pure Rust compute      | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                                                                                                                                        |
+| Metal GPU backend      | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.                                                                                                                              |
+| Generation models      | Qwen3.5-0.8B / 2B via `lattice chat`/`serve`. Qwen3.6-27B and 35B-A3B (MoE): engine-level loader + quantized Metal generation; not yet wired into the `chat`/`serve` binaries. Hybrid GatedDeltaNet + GQA architecture. |
+| Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.                                                                                                                          |
+| Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                                                                                                                                                  |
+| Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5.                                                                                                                          |
+| LoRA                   | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`.                                                                                                                          |
+| HTTP API               | OpenAI-compatible `/v1/chat/completions` via `lattice serve`.                                                                                                                                                           |
+| Safetensors native     | Memory-mapped weight loading. Single-file and sharded checkpoints.                                                                                                                                                      |
+| KV cache               | Incremental decoding with key-value caching.                                                                                                                                                                            |
+| Speculative decoding   | Draft-model acceleration on the CPU path.                                                                                                                                                                               |
+| Grammar decoding       | Constrained output via a pushdown automaton. OpenAI string-level stop sequences.                                                                                                                                        |
+| MRL support            | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32).                                                                                                                                              |
+| LRU cache              | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats.                                                                                                                                               |
+| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`.                                                                                                                                       |
+| Optimal transport      | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`.                                                                                                                                            |
 
 ---
 
@@ -347,12 +347,12 @@ E5 `embed_passage()` applies the `"passage: "` prefix automatically.
 
 ### Generation models (local files required)
 
-| Config preset                  | Description                                                                 |
-| ------------------------------ | --------------------------------------------------------------------------- |
-| `Qwen35Config::qwen35_0_8b`    | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental. |
-| `Qwen35Config::qwen35_2b`      | 24 layers, 2048 hidden, dense FFN, tied embeddings.                         |
-| `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported.       |
-| `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN.                                          |
+| Config preset                  | Description                                                                                                                 |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `Qwen35Config::qwen35_0_8b`    | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental.                                                 |
+| `Qwen35Config::qwen35_2b`      | 24 layers, 2048 hidden, dense FFN, tied embeddings.                                                                         |
+| `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported.                                                       |
+| `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN. Loader/config support plus quantized Metal generation; not yet a `chat`/`serve` surface. |
 
 The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA attention layers.
 Lattice is the only open-source engine that correctly runs this hybrid recurrence at Q4 on Apple Silicon.
