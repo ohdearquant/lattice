@@ -1,10 +1,11 @@
-//! `lattice` CLI — interactive chat and HTTP serve subcommands.
+//! `lattice` CLI — interactive chat, HTTP serve, and preflight subcommands.
 //!
 //! # Usage
 //!
 //! ```text
 //! lattice chat --model /path/to/model [--max-tokens 256] [--temperature 0.7]
 //! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
+//! lattice doctor --model /path/to/model [--context 4096]
 //! ```
 
 use clap::{Parser, Subcommand};
@@ -54,6 +55,23 @@ enum Command {
         /// Model identifier echoed in responses (defaults to the model path basename)
         #[arg(long)]
         model_id: Option<String>,
+        /// Directory containing tokenizer.json, when it is not shipped inside
+        /// --model (only needed for Q4 directories produced without a
+        /// co-located tokenizer; safetensors directories always ship one).
+        #[arg(long)]
+        tokenizer_dir: Option<String>,
+    },
+    /// Preflight check: memory fit and artifact compatibility, without
+    /// loading any model weights (config + tensor index inspection only).
+    Doctor {
+        /// Path to model directory (SafeTensors, or a native Q4 quantized
+        /// directory produced by `quantize_q4`)
+        #[arg(long)]
+        model: String,
+        /// Context length to check feasibility for. When omitted, only the
+        /// maximum feasible context length is reported.
+        #[arg(long)]
+        context: Option<usize>,
         /// Directory containing tokenizer.json, when it is not shipped inside
         /// --model (only needed for Q4 directories produced without a
         /// co-located tokenizer; safetensors directories always ship one).
@@ -254,6 +272,1192 @@ mod backend {
             // those exit the process, which a unit test cannot cross.
             let msg = metal_gpu_required_message(&dir);
             assert!(msg.contains("metal-gpu"));
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// doctor subcommand: memory-fit + artifact-compatibility preflight
+//
+// `lattice doctor <model>` answers "will this load, and what context length
+// fits" before any tensor payload is read. It reuses the same tensor-name
+// requirements (`qwen_required_tensor_names`) and KV-cache formula
+// (`Qwen35Config::kv_bytes_per_token`) the real loaders and the Metal
+// forward pass already use, so its numbers describe the actual load path
+// rather than a separate approximation. It never touches
+// `metal_qwen35.rs`'s KV-cache allocator or `new_session`/`new_session_inner`
+// — only their inputs (`Qwen35Config`) and already-published formula.
+// ---------------------------------------------------------------------------
+
+mod doctor {
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::{Path, PathBuf};
+
+    use lattice_inference::model::qwen35::qwen_required_tensor_names;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+
+    /// Bytes per KV-cache element `MetalQwen35State::new_session` would use:
+    /// f32 (4 bytes) unless `LATTICE_KV_F16=1`/`true` — matches that
+    /// function's own `use_kv_f16` check exactly (`metal_qwen35.rs`).
+    fn kv_cache_dtype_bytes() -> usize {
+        if matches!(
+            std::env::var("LATTICE_KV_F16").as_deref(),
+            Ok("1") | Ok("true")
+        ) {
+            2
+        } else {
+            4
+        }
+    }
+
+    /// Which backend a format runs on in *this* binary. Mirrors the
+    /// dispatch already in `run_chat`/`main`: `Safetensors` always loads via
+    /// `Qwen35Model::from_safetensors` (CPU); `Q4` always requires the Metal
+    /// forward pass (`MetalChatBackend` / `serve::ModelBackend::spawn_metal`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Placement {
+        Cpu,
+        Metal,
+    }
+
+    impl std::fmt::Display for Placement {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Placement::Cpu => write!(f, "CPU"),
+                Placement::Metal => write!(f, "Metal GPU"),
+            }
+        }
+    }
+
+    /// One discovered tensor: its dtype label (safetensors) and its on-disk
+    /// byte length.
+    #[derive(Debug)]
+    struct TensorEntry {
+        dtype: String,
+        byte_len: u64,
+    }
+
+    /// Everything discovered about a model directory's weight files,
+    /// without reading any tensor payload.
+    struct WeightInventory {
+        total_bytes: u64,
+        tensor_count: usize,
+        quantization: String,
+        /// `Some` when the quantization scheme itself could not be read
+        /// (e.g. a legacy Q4 v1 file) — a blocking, actionable reason.
+        quantization_error: Option<String>,
+        /// Tensor names `qwen_required_tensor_names` expects that were not
+        /// found on disk.
+        missing_tensors: Vec<String>,
+        /// Required tensors that exist but use a dtype the loader does not
+        /// support.
+        unsupported_dtypes: Vec<String>,
+    }
+
+    // -----------------------------------------------------------------------
+    // pure math: no I/O, directly unit-testable
+    // -----------------------------------------------------------------------
+
+    /// Memory-fit computation. Pure function of already-known inputs; the
+    /// only formula here is the one described in the issue: KV-cache bytes
+    /// scale linearly with context length, weight bytes are fixed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MemoryPlan {
+        pub weight_bytes: u64,
+        pub kv_bytes_per_token: u64,
+        pub available_memory_bytes: u64,
+        /// Context length the available memory alone allows, ignoring the
+        /// model's own `max_position_embeddings` ceiling.
+        pub max_context_by_memory: u64,
+        pub max_position_embeddings: usize,
+        /// `min(max_context_by_memory, max_position_embeddings)` — the
+        /// actually-usable maximum.
+        pub max_context_len: usize,
+        pub requested_context: Option<usize>,
+        pub requested_fits: Option<bool>,
+    }
+
+    pub fn plan_memory(
+        weight_bytes: u64,
+        kv_bytes_per_token: u64,
+        available_memory_bytes: u64,
+        max_position_embeddings: usize,
+        requested_context: Option<usize>,
+    ) -> MemoryPlan {
+        let usable = available_memory_bytes.saturating_sub(weight_bytes);
+        let max_context_by_memory = if kv_bytes_per_token == 0 {
+            u64::MAX
+        } else {
+            usable / kv_bytes_per_token
+        };
+        let max_context_len = max_context_by_memory.min(max_position_embeddings as u64) as usize;
+        let requested_fits = requested_context.map(|c| c <= max_context_len);
+        MemoryPlan {
+            weight_bytes,
+            kv_bytes_per_token,
+            available_memory_bytes,
+            max_context_by_memory,
+            max_position_embeddings,
+            max_context_len,
+            requested_context,
+            requested_fits,
+        }
+    }
+
+    /// Render a byte count as a human-readable size (KiB/MiB/GiB).
+    fn human_bytes(bytes: u64) -> String {
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = KIB * 1024.0;
+        const GIB: f64 = MIB * 1024.0;
+        let b = bytes as f64;
+        if b >= GIB {
+            format!("{:.2} GiB", b / GIB)
+        } else if b >= MIB {
+            format!("{:.2} MiB", b / MIB)
+        } else if b >= KIB {
+            format!("{:.2} KiB", b / KIB)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // system memory detection
+    // -----------------------------------------------------------------------
+
+    /// Total physical memory in bytes, or `None` when it cannot be
+    /// determined (unsupported OS, or the query failed). On Apple Silicon
+    /// this doubles as the Metal ("VRAM") ceiling: Metal uses unified
+    /// memory, there is no separate GPU memory pool.
+    ///
+    /// Mirrors the established `sysctl`-via-`Command` convention already
+    /// used for system queries in this workspace (`examples/bench_suite.rs`
+    /// `detect_device`): no new dependency, never panics, degrades to
+    /// `None` on any failure.
+    pub fn detect_total_memory_bytes() -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|contents| {
+                    contents.lines().find_map(|line| {
+                        let rest = line.strip_prefix("MemTotal:")?;
+                        let kb_str = rest.trim().strip_suffix(" kB")?.trim();
+                        kb_str.parse::<u64>().ok().map(|kb| kb * 1024)
+                    })
+                })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // safetensors weight inventory
+    // -----------------------------------------------------------------------
+
+    /// Read only a safetensors file's JSON header (the 8-byte little-endian
+    /// length prefix, then that many header bytes) and return each tensor's
+    /// dtype label and on-disk byte length. Never reads tensor payload
+    /// bytes. Mirrors the parser already hand-rolled in `quantize_q4.rs`
+    /// (same `dtype`/`shape`/`data_offsets` keys, same `__metadata__` skip)
+    /// — this crate has no public API that exposes per-tensor dtype/byte
+    /// size without either private internals or full tensor materialization.
+    fn read_safetensors_header(path: &Path) -> Result<HashMap<String, TensorEntry>, String> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len();
+        let mut len_buf = [0u8; 8];
+        file.read_exact(&mut len_buf)
+            .map_err(|e| format!("failed to read header length from {}: {e}", path.display()))?;
+        let header_len = u64::from_le_bytes(len_buf);
+        if header_len > file_len.saturating_sub(8) {
+            return Err(format!(
+                "{}: header length {header_len} exceeds file size {file_len}",
+                path.display()
+            ));
+        }
+        let mut header_buf = vec![0u8; header_len as usize];
+        file.read_exact(&mut header_buf)
+            .map_err(|e| format!("failed to read header from {}: {e}", path.display()))?;
+        let header_str = std::str::from_utf8(&header_buf)
+            .map_err(|e| format!("{} header is not valid UTF-8: {e}", path.display()))?;
+        let root: serde_json::Value = serde_json::from_str(header_str)
+            .map_err(|e| format!("{} header is not valid JSON: {e}", path.display()))?;
+        let obj = root
+            .as_object()
+            .ok_or_else(|| format!("{} header is not a JSON object", path.display()))?;
+
+        let mut out = HashMap::with_capacity(obj.len());
+        for (name, entry) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let dtype = entry
+                .get("dtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            let Some(offsets) = entry.get("data_offsets").and_then(|v| v.as_array()) else {
+                return Err(format!(
+                    "tensor '{name}' in {} has no data_offsets",
+                    path.display()
+                ));
+            };
+            if offsets.len() != 2 {
+                return Err(format!(
+                    "tensor '{name}' in {} has malformed data_offsets",
+                    path.display()
+                ));
+            }
+            let start = offsets[0].as_u64().unwrap_or(0);
+            let end = offsets[1].as_u64().unwrap_or(0);
+            out.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype,
+                    byte_len: end.saturating_sub(start),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// Supported safetensors dtypes — matches `f32_weights.rs`'s private
+    /// `DType` enum (`F32`, `F16`, `BF16`). Any other dtype on a *required*
+    /// tensor is reported as an actionable, unsupported-dtype reason rather
+    /// than discovered only when the real loader fails.
+    const SUPPORTED_DTYPES: [&str; 3] = ["F32", "F16", "BF16"];
+
+    /// Inventory a safetensors model directory: total tensor payload bytes,
+    /// distinct dtypes observed, and any tensor `qwen_required_tensor_names`
+    /// expects that is missing or has an unsupported dtype.
+    ///
+    /// Mirrors `Qwen35Model::from_safetensors`'s own precedence exactly:
+    /// `model.safetensors` (single file) is preferred over
+    /// `model.safetensors.index.json` (sharded) when both exist.
+    fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
+        let single = dir.join("model.safetensors");
+        let index_path = dir.join("model.safetensors.index.json");
+
+        let all_tensors: HashMap<String, TensorEntry> = if single.exists() {
+            read_safetensors_header(&single)?
+        } else if index_path.exists() {
+            let index_bytes = std::fs::read(&index_path)
+                .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
+            let index: serde_json::Value = serde_json::from_slice(&index_bytes)
+                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?;
+            let weight_map = index
+                .get("weight_map")
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| format!("{} has no weight_map object", index_path.display()))?;
+
+            // Dedupe shard filenames — many tensors share one shard.
+            let mut shard_names: BTreeSet<String> = BTreeSet::new();
+            for v in weight_map.values() {
+                if let Some(s) = v.as_str() {
+                    shard_names.insert(s.to_string());
+                }
+            }
+            let mut merged = HashMap::new();
+            for shard_name in shard_names {
+                let shard_path = dir.join(&shard_name);
+                if !shard_path.exists() {
+                    return Err(format!(
+                        "shard '{shard_name}' referenced by {} not found in {}",
+                        index_path.display(),
+                        dir.display()
+                    ));
+                }
+                merged.extend(read_safetensors_header(&shard_path)?);
+            }
+            merged
+        } else {
+            return Err(format!(
+                "no model.safetensors or model.safetensors.index.json in {}",
+                dir.display()
+            ));
+        };
+
+        let total_bytes: u64 = all_tensors.values().map(|t| t.byte_len).sum();
+        let dtypes: BTreeSet<&str> = all_tensors.values().map(|t| t.dtype.as_str()).collect();
+        let quantization = if dtypes.is_empty() {
+            "unknown".to_string()
+        } else {
+            dtypes.into_iter().collect::<Vec<_>>().join(", ")
+        };
+
+        let mut missing_tensors = Vec::new();
+        let mut unsupported_dtypes = Vec::new();
+        for name in qwen_required_tensor_names(cfg) {
+            match all_tensors.get(&name) {
+                Some(entry) if !SUPPORTED_DTYPES.contains(&entry.dtype.as_str()) => {
+                    unsupported_dtypes.push(format!(
+                        "tensor '{name}' has dtype {}, which is not supported (supported: F32, F16, BF16)",
+                        entry.dtype
+                    ));
+                }
+                Some(_) => {}
+                None => missing_tensors.push(name),
+            }
+        }
+
+        Ok(WeightInventory {
+            total_bytes,
+            tensor_count: all_tensors.len(),
+            quantization,
+            quantization_error: None,
+            missing_tensors,
+            unsupported_dtypes,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Q4 directory weight inventory
+    // -----------------------------------------------------------------------
+
+    #[derive(serde::Deserialize)]
+    struct Q4IndexEntry {
+        name: String,
+        file: String,
+    }
+
+    /// Sample one non-cache `.q4` file's header to identify the
+    /// quantization format, using the real, already-shipped
+    /// `read_q4_header` (a header-only read — no block payload is decoded).
+    /// Catches a legacy v1 file or other corruption the same way the Metal
+    /// loader would.
+    fn detect_q4_quantization_label(dir: &Path) -> Result<String, String> {
+        let sample = std::fs::read_dir(dir)
+            .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
+            .flatten()
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with(".q4") && !n.starts_with("merged_qkvz_"))
+                    .unwrap_or(false)
+            });
+        let Some(sample) = sample else {
+            return Ok("Q4 (no .q4 files found to sample)".to_string());
+        };
+        let file = std::fs::File::open(sample.path())
+            .map_err(|e| format!("failed to open {}: {e}", sample.path().display()))?;
+        lattice_inference::weights::q4_weights::read_q4_header(&file)
+            .map(|_| "Q4_0 (lattice native, v2 asymmetric)".to_string())
+            .map_err(|e| {
+                format!(
+                    "unsupported quantization scheme in {}: {e}",
+                    sample.path().display()
+                )
+            })
+    }
+
+    /// Inventory a native Q4 quantized directory (the output of
+    /// `quantize_q4`). Prefers `quantize_index.json` — the manifest
+    /// `quantize_q4` writes listing exactly the original per-tensor
+    /// `.q4`/`.f16` files — over a raw directory scan. This matters: on
+    /// first Metal load, `MetalQwen35State` creates `merged_qkvz_*.q4`
+    /// runtime-cache files that merge (and duplicate the bytes of) each
+    /// layer's still-present `in_proj_qkv`/`in_proj_z` source tensors: a
+    /// directory scan that does not exclude them double-counts. The
+    /// manifest sidesteps the problem entirely since it lists only the
+    /// original tensors; the fallback path (no manifest) excludes any
+    /// `merged_qkvz_`-prefixed file explicitly.
+    fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
+        let (quantization, quantization_error) = match detect_q4_quantization_label(dir) {
+            Ok(label) => (label, None),
+            Err(e) => ("unknown (see blocking reasons)".to_string(), Some(e)),
+        };
+
+        let index_path = dir.join("quantize_index.json");
+        if index_path.exists() {
+            let bytes = std::fs::read(&index_path)
+                .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
+            let entries: Vec<Q4IndexEntry> = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?;
+
+            let mut total_bytes = 0u64;
+            let mut missing_tensors = Vec::new();
+            let mut present_names: BTreeSet<String> = BTreeSet::new();
+            for entry in &entries {
+                let file_path = dir.join(&entry.file);
+                match std::fs::metadata(&file_path) {
+                    Ok(meta) => {
+                        total_bytes += meta.len();
+                        present_names.insert(entry.name.clone());
+                    }
+                    Err(_) => missing_tensors.push(format!(
+                        "{} (listed in quantize_index.json as '{}', file not found)",
+                        entry.name, entry.file
+                    )),
+                }
+            }
+            for name in qwen_required_tensor_names(cfg) {
+                if !present_names.contains(&name) {
+                    missing_tensors.push(name);
+                }
+            }
+
+            Ok(WeightInventory {
+                total_bytes,
+                tensor_count: entries.len(),
+                quantization,
+                quantization_error,
+                missing_tensors,
+                unsupported_dtypes: Vec::new(),
+            })
+        } else {
+            // No manifest: fall back to a directory scan, excluding
+            // merged_qkvz_* runtime-cache files (see doc comment above).
+            // Tensor-name coverage is not checked in this path — sanitized
+            // filenames don't reliably reverse to the original dotted
+            // tensor names, so `missing_tensors` is intentionally left
+            // empty here rather than guessed.
+            let mut total_bytes = 0u64;
+            let mut tensor_count = 0usize;
+            let read_dir = std::fs::read_dir(dir)
+                .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?;
+            for entry in read_dir.flatten() {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                if name.starts_with("merged_qkvz_") {
+                    continue;
+                }
+                if (name.ends_with(".q4") || name.ends_with(".f16"))
+                    && let Ok(meta) = entry.metadata()
+                {
+                    total_bytes += meta.len();
+                    tensor_count += 1;
+                }
+            }
+            Ok(WeightInventory {
+                total_bytes,
+                tensor_count,
+                quantization,
+                quantization_error,
+                missing_tensors: Vec::new(),
+                unsupported_dtypes: Vec::new(),
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // top-level report
+    // -----------------------------------------------------------------------
+
+    /// Full preflight report for one model directory.
+    #[derive(Debug)]
+    pub struct DoctorReport {
+        pub model_dir: PathBuf,
+        pub format: crate::backend::ModelFormat,
+        pub placement: Placement,
+        pub quantization: String,
+        pub tensor_count: usize,
+        pub weight_bytes: u64,
+        pub kv_bytes_per_token: u64,
+        pub max_position_embeddings: usize,
+        pub available_memory_bytes: Option<u64>,
+        pub max_context_len: Option<usize>,
+        pub requested_context: Option<usize>,
+        pub requested_fits: Option<bool>,
+        pub tokenizer_path: PathBuf,
+        pub tokenizer_present: bool,
+        pub missing_tensors: Vec<String>,
+        /// Non-empty ⇒ this artifact is not ready to run as configured.
+        /// Each entry is a standalone, actionable explanation.
+        pub blocking_reasons: Vec<String>,
+    }
+
+    impl DoctorReport {
+        pub fn is_ready(&self) -> bool {
+            self.blocking_reasons.is_empty()
+        }
+    }
+
+    impl std::fmt::Display for DoctorReport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            writeln!(f, "Model directory : {}", self.model_dir.display())?;
+            writeln!(f, "Format          : {:?}", self.format)?;
+            writeln!(f, "Placement       : {}", self.placement)?;
+            writeln!(f, "Quantization    : {}", self.quantization)?;
+            writeln!(f, "Tensors found   : {}", self.tensor_count)?;
+            writeln!(
+                f,
+                "Weight memory   : {} ({} bytes)",
+                human_bytes(self.weight_bytes),
+                self.weight_bytes
+            )?;
+            writeln!(
+                f,
+                "KV cache        : {}/token ({} bytes/token; at 4096 tokens ~= {})",
+                human_bytes(self.kv_bytes_per_token),
+                self.kv_bytes_per_token,
+                human_bytes(self.kv_bytes_per_token.saturating_mul(4096))
+            )?;
+            writeln!(
+                f,
+                "Model max context (max_position_embeddings): {}",
+                self.max_position_embeddings
+            )?;
+            match self.available_memory_bytes {
+                Some(avail) => writeln!(
+                    f,
+                    "Detected system memory: {} ({} bytes)",
+                    human_bytes(avail),
+                    avail
+                )?,
+                None => writeln!(
+                    f,
+                    "Detected system memory: unknown (unsupported OS or query failed)"
+                )?,
+            }
+            match self.max_context_len {
+                Some(max_ctx) => writeln!(f, "Max feasible context length: {max_ctx} tokens")?,
+                None => writeln!(
+                    f,
+                    "Max feasible context length: unknown (system memory undetected)"
+                )?,
+            }
+            if let Some(requested) = self.requested_context {
+                match self.requested_fits {
+                    Some(true) => writeln!(f, "Requested context {requested}: fits")?,
+                    Some(false) => writeln!(f, "Requested context {requested}: DOES NOT FIT")?,
+                    None => writeln!(
+                        f,
+                        "Requested context {requested}: unknown (system memory undetected)"
+                    )?,
+                }
+            }
+            writeln!(
+                f,
+                "Tokenizer       : {} ({})",
+                self.tokenizer_path.display(),
+                if self.tokenizer_present {
+                    "found"
+                } else {
+                    "MISSING"
+                }
+            )?;
+            if !self.missing_tensors.is_empty() {
+                writeln!(
+                    f,
+                    "Missing required tensors ({}):",
+                    self.missing_tensors.len()
+                )?;
+                for name in self.missing_tensors.iter().take(20) {
+                    writeln!(f, "  - {name}")?;
+                }
+                if self.missing_tensors.len() > 20 {
+                    writeln!(f, "  ... and {} more", self.missing_tensors.len() - 20)?;
+                }
+            }
+            writeln!(f)?;
+            if self.is_ready() {
+                writeln!(f, "Result: OK -- ready to load")?;
+            } else {
+                writeln!(f, "Result: NOT READY")?;
+                for reason in &self.blocking_reasons {
+                    writeln!(f, "  - {reason}")?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Build a full preflight report for `model_dir` without loading any
+    /// tensor payload.
+    ///
+    /// `available_memory_override` exists so tests can simulate a
+    /// memory-constrained machine deterministically; real callers (the
+    /// `doctor` CLI subcommand) always pass `None`, which detects the
+    /// machine's actual total memory via [`detect_total_memory_bytes`].
+    pub fn build_report(
+        model_dir: &Path,
+        tokenizer_dir: Option<&Path>,
+        requested_context: Option<usize>,
+        available_memory_override: Option<u64>,
+    ) -> Result<DoctorReport, String> {
+        let format = crate::backend::detect_format(model_dir);
+
+        let (placement, cfg, inventory) = match format {
+            crate::backend::ModelFormat::Safetensors => {
+                let config_path = model_dir.join("config.json");
+                let cfg = if config_path.exists() {
+                    Qwen35Config::from_config_json(&config_path)
+                        .map_err(|e| format!("config.json parse failed: {e}"))?
+                } else {
+                    // Mirrors `Qwen35Model::from_safetensors`'s own fallback.
+                    Qwen35Config::qwen35_2b()
+                };
+                let inventory = inspect_safetensors_dir(model_dir, &cfg)?;
+                (Placement::Cpu, cfg, inventory)
+            }
+            crate::backend::ModelFormat::Q4 => {
+                let config_path = model_dir.join("config.json");
+                let cfg = if config_path.exists() {
+                    Qwen35Config::from_config_json(&config_path)
+                        .map_err(|e| format!("config.json parse failed: {e}"))?
+                } else {
+                    // Mirrors `load_q4_config`'s own fallback (that function
+                    // is `metal-gpu`-only; `doctor` must work without the
+                    // feature too, so the two-line fallback is duplicated
+                    // here rather than shared across the cfg-gate).
+                    Qwen35Config::qwen36_27b()
+                };
+                let inventory = inspect_q4_dir(model_dir, &cfg)?;
+                (Placement::Metal, cfg, inventory)
+            }
+            crate::backend::ModelFormat::Unknown => {
+                return Err(crate::backend::unrecognized_format_message(model_dir));
+            }
+        };
+
+        let tokenizer_path = tokenizer_dir.unwrap_or(model_dir).join("tokenizer.json");
+        let tokenizer_present = tokenizer_path.exists();
+
+        let kv_bytes_per_token = cfg.kv_bytes_per_token(kv_cache_dtype_bytes()) as u64;
+        let available_memory_bytes = available_memory_override.or_else(detect_total_memory_bytes);
+
+        let (max_context_len, requested_fits) = match available_memory_bytes {
+            Some(avail) => {
+                let plan = plan_memory(
+                    inventory.total_bytes,
+                    kv_bytes_per_token,
+                    avail,
+                    cfg.max_position_embeddings,
+                    requested_context,
+                );
+                (Some(plan.max_context_len), plan.requested_fits)
+            }
+            None => (None, None),
+        };
+
+        let mut blocking_reasons = Vec::new();
+        if let Some(e) = &inventory.quantization_error {
+            blocking_reasons.push(e.clone());
+        }
+        blocking_reasons.extend(inventory.unsupported_dtypes.iter().cloned());
+        if !inventory.missing_tensors.is_empty() {
+            blocking_reasons.push(format!(
+                "{} required tensor(s) missing (see list below), e.g. '{}'",
+                inventory.missing_tensors.len(),
+                inventory.missing_tensors[0]
+            ));
+        }
+        if !tokenizer_present {
+            blocking_reasons.push(format!(
+                "tokenizer.json not found at {}",
+                tokenizer_path.display()
+            ));
+        }
+        if format == crate::backend::ModelFormat::Q4 && !cfg!(feature = "metal-gpu") {
+            blocking_reasons.push(crate::backend::metal_gpu_required_message(model_dir));
+        }
+        if requested_fits == Some(false) {
+            let requested = requested_context.unwrap_or(0);
+            let max_ctx = max_context_len.unwrap_or(0);
+            blocking_reasons.push(format!(
+                "requested context {requested} does not fit: max feasible is {max_ctx} tokens"
+            ));
+        }
+
+        Ok(DoctorReport {
+            model_dir: model_dir.to_path_buf(),
+            format,
+            placement,
+            quantization: inventory.quantization,
+            tensor_count: inventory.tensor_count,
+            weight_bytes: inventory.total_bytes,
+            kv_bytes_per_token,
+            max_position_embeddings: cfg.max_position_embeddings,
+            available_memory_bytes,
+            max_context_len,
+            requested_context,
+            requested_fits,
+            tokenizer_path,
+            tokenizer_present,
+            missing_tensors: inventory.missing_tensors,
+            blocking_reasons,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn tempdir(name: &str) -> PathBuf {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "lattice-doctor-test-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&dir).expect("create tempdir");
+            dir
+        }
+
+        // ---- human_bytes ----------------------------------------------
+
+        #[test]
+        fn human_bytes_formats_units() {
+            assert_eq!(human_bytes(0), "0 B");
+            assert_eq!(human_bytes(512), "512 B");
+            assert_eq!(human_bytes(1024), "1.00 KiB");
+            assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
+            assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GiB");
+            assert_eq!(human_bytes(1536 * 1024 * 1024), "1.50 GiB");
+        }
+
+        // ---- plan_memory (pure math) ------------------------------------
+
+        #[test]
+        fn plan_memory_hand_computed() {
+            // weight=100 bytes, kv=10 bytes/token, available=1000 bytes.
+            // usable = 1000 - 100 = 900. max_by_memory = 900 / 10 = 90.
+            let plan = plan_memory(100, 10, 1000, 1_000_000, Some(50));
+            assert_eq!(plan.max_context_by_memory, 90);
+            assert_eq!(plan.max_context_len, 90); // min(90, 1_000_000)
+            assert_eq!(plan.requested_fits, Some(true)); // 50 <= 90
+
+            let plan2 = plan_memory(100, 10, 1000, 1_000_000, Some(95));
+            assert_eq!(plan2.requested_fits, Some(false)); // 95 > 90
+        }
+
+        #[test]
+        fn plan_memory_capped_by_max_position_embeddings() {
+            // Effectively unlimited memory; the model architecture caps
+            // context instead.
+            let plan = plan_memory(0, 1, 1_000_000_000_000, 4096, None);
+            assert_eq!(plan.max_context_by_memory, 1_000_000_000_000);
+            assert_eq!(plan.max_context_len, 4096);
+        }
+
+        #[test]
+        fn plan_memory_weight_bytes_exceeding_available_yields_zero_context() {
+            // Weights alone don't fit -- no room for any KV cache at all.
+            let plan = plan_memory(2_000, 10, 1_000, 1_000_000, Some(1));
+            assert_eq!(plan.max_context_by_memory, 0);
+            assert_eq!(plan.max_context_len, 0);
+            assert_eq!(plan.requested_fits, Some(false));
+        }
+
+        #[test]
+        fn plan_memory_kv_bytes_per_token_matches_qwen35_0_8b_doc_identity() {
+            // Cross-check against `Qwen35Config::kv_bytes_per_token`'s own
+            // doc-comment worked example: 6 full-attention layers * 2 (K+V)
+            // * 512 full_kv_dim * 2 bytes (f16) = 12_288 bytes/token.
+            let cfg = Qwen35Config::qwen35_0_8b();
+            assert_eq!(cfg.num_full_attention_layers(), 6);
+            assert_eq!(cfg.full_kv_dim(), 512);
+            assert_eq!(cfg.kv_bytes_per_token(2), 12_288);
+            assert_eq!(cfg.kv_bytes_per_token(4), 24_576);
+        }
+
+        // ---- safetensors header parsing ---------------------------------
+
+        fn write_fake_safetensors(path: &Path, tensors: &[(&str, &str, u64, u64)]) {
+            let mut header = serde_json::Map::new();
+            for (name, dtype, start, end) in tensors {
+                header.insert(
+                    (*name).to_string(),
+                    serde_json::json!({
+                        "dtype": dtype,
+                        "shape": [1],
+                        "data_offsets": [start, end],
+                    }),
+                );
+            }
+            let header_json = serde_json::Value::Object(header).to_string();
+            let header_bytes = header_json.as_bytes();
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+            buf.extend_from_slice(header_bytes);
+            let payload_len = tensors.iter().map(|(_, _, _, e)| *e).max().unwrap_or(0);
+            buf.resize(buf.len() + payload_len as usize, 0);
+            fs::write(path, buf).expect("write fake safetensors file");
+        }
+
+        #[test]
+        fn read_safetensors_header_computes_exact_byte_lengths() {
+            let dir = tempdir("st-header");
+            let path = dir.join("model.safetensors");
+            write_fake_safetensors(
+                &path,
+                &[("tensor.a", "F32", 0, 400), ("tensor.b", "BF16", 400, 600)],
+            );
+            let tensors = read_safetensors_header(&path).unwrap();
+            assert_eq!(tensors.len(), 2);
+            assert_eq!(tensors["tensor.a"].byte_len, 400);
+            assert_eq!(tensors["tensor.a"].dtype, "F32");
+            assert_eq!(tensors["tensor.b"].byte_len, 200);
+            assert_eq!(tensors["tensor.b"].dtype, "BF16");
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn read_safetensors_header_rejects_oversized_header_length() {
+            let dir = tempdir("st-header-bad");
+            let path = dir.join("model.safetensors");
+            // A header-length prefix claiming far more bytes than the file
+            // actually has -- must fail, never attempt the allocation.
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&(1_000_000_000u64).to_le_bytes());
+            buf.extend_from_slice(b"tiny");
+            fs::write(&path, buf).unwrap();
+            let err = read_safetensors_header(&path).unwrap_err();
+            assert!(err.contains("exceeds file size"));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        fn required_tensor_fixture(cfg: &Qwen35Config) -> Vec<(String, String, u64, u64)> {
+            let mut offset = 0u64;
+            qwen_required_tensor_names(cfg)
+                .into_iter()
+                .map(|name| {
+                    let start = offset;
+                    offset += 64;
+                    (name, "F32".to_string(), start, offset)
+                })
+                .collect()
+        }
+
+        #[test]
+        fn inspect_safetensors_dir_all_tensors_present_no_missing() {
+            let dir = tempdir("st-complete");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let tensors = required_tensor_fixture(&cfg);
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+
+            let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+            assert!(inv.missing_tensors.is_empty());
+            assert!(inv.unsupported_dtypes.is_empty());
+            assert_eq!(inv.total_bytes, tensors.len() as u64 * 64);
+            assert_eq!(inv.quantization, "F32");
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_safetensors_dir_detects_missing_tensor() {
+            let dir = tempdir("st-missing");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let mut tensors = required_tensor_fixture(&cfg);
+            let (dropped_name, _, _, _) = tensors.pop().unwrap();
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+
+            let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.missing_tensors, vec![dropped_name]);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_safetensors_dir_flags_unsupported_dtype() {
+            let dir = tempdir("st-baddtype");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let mut tensors = required_tensor_fixture(&cfg);
+            // Corrupt one required tensor's dtype to something unsupported.
+            tensors[0].1 = "I64".to_string();
+            let bad_name = tensors[0].0.clone();
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+
+            let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.unsupported_dtypes.len(), 1);
+            assert!(inv.unsupported_dtypes[0].contains(&bad_name));
+            assert!(inv.unsupported_dtypes[0].contains("I64"));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_safetensors_dir_prefers_single_file_over_index() {
+            // Mirrors `Qwen35Model::from_safetensors`'s precedence: when
+            // both `model.safetensors` and `model.safetensors.index.json`
+            // exist, the single file wins and the index is never consulted.
+            let dir = tempdir("st-precedence");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let tensors = required_tensor_fixture(&cfg);
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+            // A bogus index.json that would error if it were ever read.
+            fs::write(dir.join("model.safetensors.index.json"), b"not valid json").unwrap();
+
+            let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+            assert!(inv.missing_tensors.is_empty());
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // ---- Q4 directory inventory --------------------------------------
+
+        fn write_fake_q4_file(
+            path: &Path,
+            version: u32,
+            shape: &[u64],
+            original_len: u64,
+            n_blocks: usize,
+        ) {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"KHQ4");
+            buf.extend_from_slice(&version.to_le_bytes());
+            buf.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+            for s in shape {
+                buf.extend_from_slice(&s.to_le_bytes());
+            }
+            buf.extend_from_slice(&original_len.to_le_bytes());
+            buf.resize(buf.len() + n_blocks * 20, 0);
+            fs::write(path, buf).expect("write fake q4 file");
+        }
+
+        #[test]
+        fn detect_q4_quantization_label_accepts_v2_file() {
+            let dir = tempdir("q4-label-v2");
+            write_fake_q4_file(&dir.join("sample.q4"), 2, &[32], 32, 1);
+            let label = detect_q4_quantization_label(&dir).unwrap();
+            assert!(label.contains("Q4_0"));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_q4_quantization_label_rejects_legacy_v1_file() {
+            let dir = tempdir("q4-label-v1");
+            write_fake_q4_file(&dir.join("sample.q4"), 1, &[32], 32, 1);
+            let err = detect_q4_quantization_label(&dir).unwrap_err();
+            assert!(err.contains("legacy"));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_uses_index_manifest_and_ignores_merged_cache_files() {
+            let dir = tempdir("q4-merge-safe");
+            write_fake_q4_file(&dir.join("layer0_qkv.q4"), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("layer0_z.q4"), 2, &[32], 32, 1);
+            // A runtime-created merge cache duplicating the two tensors
+            // above -- must NOT be double-counted.
+            write_fake_q4_file(&dir.join("merged_qkvz_0_100_50.q4"), 2, &[64], 64, 2);
+
+            let qkv_len = fs::metadata(dir.join("layer0_qkv.q4")).unwrap().len();
+            let z_len = fs::metadata(dir.join("layer0_z.q4")).unwrap().len();
+
+            let index = serde_json::json!([
+                {"name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", "file": "layer0_qkv.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "model.language_model.layers.0.linear_attn.in_proj_z.weight", "file": "layer0_z.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.total_bytes, qkv_len + z_len);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_manifest_flags_missing_file() {
+            let dir = tempdir("q4-missing-file");
+            let index = serde_json::json!([
+                {"name": "some.tensor.weight", "file": "does_not_exist.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+            write_fake_q4_file(&dir.join("sample.q4"), 2, &[32], 32, 1);
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert!(
+                inv.missing_tensors
+                    .iter()
+                    .any(|m| m.contains("some.tensor.weight"))
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_falls_back_to_directory_scan_without_manifest() {
+            let dir = tempdir("q4-no-manifest");
+            write_fake_q4_file(&dir.join("a.q4"), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("b.q4"), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("merged_qkvz_x.q4"), 2, &[64], 64, 2);
+            let a_len = fs::metadata(dir.join("a.q4")).unwrap().len();
+            let b_len = fs::metadata(dir.join("b.q4")).unwrap().len();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.total_bytes, a_len + b_len);
+            assert_eq!(inv.tensor_count, 2);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // ---- system memory detection --------------------------------------
+
+        #[test]
+        fn detect_total_memory_bytes_is_plausible_when_known() {
+            if let Some(bytes) = detect_total_memory_bytes() {
+                assert!(bytes > 0);
+                assert!(bytes < (1u64 << 50)); // sanity upper bound: 1 PiB
+            }
+        }
+
+        // ---- build_report end-to-end --------------------------------------
+
+        fn write_config_json(dir: &Path, cfg: &Qwen35Config) {
+            let config_json = serde_json::json!({
+                "text_config": {
+                    "hidden_size": cfg.hidden_size,
+                    "num_hidden_layers": cfg.num_hidden_layers,
+                    "vocab_size": cfg.vocab_size,
+                    "intermediate_size": cfg.intermediate_size,
+                    "num_attention_heads": cfg.num_attention_heads,
+                    "num_key_value_heads": cfg.num_key_value_heads,
+                    "head_dim": cfg.head_dim,
+                    "rope_theta": cfg.rope_theta,
+                    "partial_rotary_factor": cfg.partial_rotary_factor,
+                    "linear_num_key_heads": cfg.linear_num_key_heads,
+                    "linear_num_value_heads": cfg.linear_num_value_heads,
+                    "linear_key_head_dim": cfg.linear_key_head_dim,
+                    "linear_value_head_dim": cfg.linear_value_head_dim,
+                    "linear_conv_kernel_dim": cfg.linear_conv_kernel_dim,
+                    "tie_word_embeddings": cfg.tie_word_embeddings,
+                    "max_position_embeddings": cfg.max_position_embeddings,
+                    "eos_token_id": cfg.eos_token_id,
+                    "full_attention_interval": cfg.full_attention_interval,
+                }
+            });
+            fs::write(
+                dir.join("config.json"),
+                serde_json::to_vec_pretty(&config_json).unwrap(),
+            )
+            .unwrap();
+        }
+
+        fn write_complete_safetensors_fixture(dir: &Path, cfg: &Qwen35Config) {
+            let tensors = required_tensor_fixture(cfg);
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+            write_config_json(dir, cfg);
+            fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+        }
+
+        #[test]
+        fn build_report_happy_path_is_ready() {
+            let dir = tempdir("report-happy");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+
+            let report = build_report(&dir, None, Some(4096), Some(1u64 << 40)).unwrap();
+            assert!(
+                report.is_ready(),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            assert_eq!(report.placement, Placement::Cpu);
+            assert_eq!(report.requested_fits, Some(true));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_infeasible_context_via_memory_override_exits_not_ready() {
+            let dir = tempdir("report-infeasible");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+
+            // Force a tiny "machine": far less memory than the weights
+            // alone need, so no context length fits.
+            let report = build_report(&dir, None, Some(1), Some(1024)).unwrap();
+            assert!(!report.is_ready());
+            assert_eq!(report.requested_fits, Some(false));
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("does not fit"))
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_context_exceeding_any_real_machine_is_not_ready() {
+            // Belt-and-suspenders alternative to the override above: an
+            // absurd requested context against REAL detected memory (no
+            // override) must still be infeasible on any real machine.
+            let dir = tempdir("report-absurd-context");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+
+            let report = build_report(&dir, None, Some(usize::MAX / 2), None).unwrap();
+            if report.available_memory_bytes.is_some() {
+                assert_eq!(report.requested_fits, Some(false));
+                assert!(!report.is_ready());
+            }
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_missing_tokenizer_is_not_ready() {
+            let dir = tempdir("report-no-tokenizer");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let tensors = required_tensor_fixture(&cfg);
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+            write_config_json(&dir, &cfg);
+            // No tokenizer.json written.
+
+            let report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
+            assert!(!report.is_ready());
+            assert!(!report.tokenizer_present);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_unknown_format_is_err() {
+            let dir = tempdir("report-unknown");
+            let err = build_report(&dir, None, None, None).unwrap_err();
+            assert!(err.contains("not a recognized model directory"));
             fs::remove_dir_all(&dir).ok();
         }
     }
@@ -2509,6 +3713,29 @@ async fn main() {
             {
                 eprintln!("Server error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Command::Doctor {
+            model,
+            context,
+            tokenizer_dir,
+        } => {
+            use std::path::Path;
+
+            let model_path = Path::new(&model);
+            let tokenizer_dir_path = tokenizer_dir.as_deref().map(Path::new);
+            match doctor::build_report(model_path, tokenizer_dir_path, context, None) {
+                Ok(report) => {
+                    println!("{report}");
+                    if !report.is_ready() {
+                        eprintln!("doctor: model is NOT usable as configured (see reasons above)");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
     }
