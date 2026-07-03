@@ -180,7 +180,7 @@ jobs:
           shared-key: bench-compile
           cache-on-failure: true
       - name: inference benches (bench-internals)
-        run: cargo bench -p lattice-inference --features bench-internals --no-run
+        run: cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run
       - name: embed benches
         run: cargo bench -p lattice-embed --no-run
 

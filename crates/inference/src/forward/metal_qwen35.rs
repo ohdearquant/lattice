@@ -24435,6 +24435,102 @@ kernel void decode_attention_reference(
             );
         }
     }
+
+    /// Bench-only access to the real lm_head dispatch (issue #547). Kept
+    /// behind `bench-internals` so `LmHeadBenchRoute`/`read_topk_candidates`
+    /// visibility stays out of the normal public API; `run_once` calls the
+    /// same `encode_final_head` the production decode path uses, so the
+    /// group measures the shipped kernels rather than a bench-only
+    /// reimplementation.
+    #[cfg(feature = "bench-internals")]
+    pub mod bench_support {
+        use super::*;
+
+        #[derive(Clone, Copy, Debug)]
+        pub enum LmHeadBenchRoute {
+            Full,
+            BlockArgmax,
+            BlockTopK { local_k: u32 },
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        pub struct LmHeadBenchOutput {
+            pub marker: u32,
+        }
+
+        pub struct LmHeadBenchFixture {
+            state: MetalQwen35State,
+        }
+
+        impl LmHeadBenchFixture {
+            pub fn new(state: MetalQwen35State) -> Self {
+                Self { state }
+            }
+
+            /// Runs one real forward step so `session.activations.hidden`
+            /// holds a live hidden state before timing starts — `run_once`
+            /// then measures only the head dispatch, not
+            /// embedding/attention/MLP.
+            pub fn prepare_hidden_for_bench(&mut self, token_id: u32, position: usize) {
+                let _ = self.state.forward_step(token_id, position);
+            }
+
+            /// Dispatches the real head route once and reads back a minimal
+            /// marker to force GPU completion — mirrors what
+            /// `LATTICE_DECODE_PROFILE`'s head timing observes in
+            /// production.
+            pub fn run_once(&mut self, route: LmHeadBenchRoute) -> LmHeadBenchOutput {
+                let (gpu_route, topk) = match route {
+                    LmHeadBenchRoute::Full => (GpuTopkRoute::CpuFallback, 0usize),
+                    LmHeadBenchRoute::BlockArgmax => (GpuTopkRoute::BlockArgmax, 1usize),
+                    LmHeadBenchRoute::BlockTopK { local_k } => {
+                        (GpuTopkRoute::BlockTopK { local_k }, local_k as usize)
+                    }
+                };
+                self.state.session.compact_route = gpu_route;
+                self.state.session.compact_topk = topk;
+
+                let cfg = self.state.engine.config.clone();
+                let mut prof = StepProfile::default();
+                // Raw pointer breaks the borrow chain, matching the
+                // production fused-command-buffer path above: `cmd` is
+                // ref-counted by Metal and outlives the `engine.queue`
+                // borrow, and `encode_final_head` needs `&mut self` for
+                // session state but never touches `engine.queue`.
+                let cmd = unsafe {
+                    &*(self.state.engine.queue.new_command_buffer()
+                        as *const metal::CommandBufferRef)
+                };
+                let enc = cmd.new_compute_command_encoder();
+                let which = self
+                    .state
+                    .encode_final_head(enc, &cfg, false, &mut prof, false);
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let marker = match which {
+                    Some(slot) => {
+                        // SAFETY: command buffer completed above via
+                        // `wait_until_completed`; `topk` candidates were
+                        // written into the ping-pong scratch buffer this
+                        // dispatch just selected via `slot`.
+                        let candidates = unsafe { self.state.read_topk_candidates(slot, topk) };
+                        candidates.first().map(|c| c.token_id).unwrap_or(0)
+                    }
+                    None => {
+                        // SAFETY: command buffer completed above via
+                        // `wait_until_completed`; `logits[0]` was written by
+                        // the full-route GEMV this dispatch just issued.
+                        let logit =
+                            unsafe { read_buffer(&self.state.session.activations.logits, 1) }[0];
+                        logit.to_bits()
+                    }
+                };
+                LmHeadBenchOutput { marker }
+            }
+        }
+    }
 }
 
 // Stage-1 block-top-k and the full-logit lm_head both accumulate ~1K f32
@@ -25241,6 +25337,13 @@ pub use inner::{
     LoraLayerData, MetalQwen35State, PathProofSnapshot, blend_lora_layer_data,
     format_chat_template,
 };
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+pub use inner::bench_support;
 
 // Stub for non-macOS or non-metal builds.
 /// **Unstable**: LoRA layer data stub; real impl behind metal-gpu feature.
