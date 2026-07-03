@@ -118,7 +118,36 @@ fn f32_to_f16(v: f32) -> u16 {
         return sign | (exp16 << 10) | frac16_final;
     }
 
-    sign
+    // exp32 < -14: the f32 value is normal-range but smaller than the
+    // smallest f16 normal. F16 still represents 2^-24..2^-14 as subnormals,
+    // and a source-F16 subnormal reaches this point after widening through
+    // f64 and narrowing back to f32 (both exact), so flushing to zero here
+    // would silently destroy a value f16 can represent exactly. Encode it
+    // as an f16 subnormal instead, using the same round-to-nearest-even
+    // shape as the normal-range path above.
+    let sig = 0x0080_0000u32 | frac;
+    let shift = (-exp32 - 1) as u32;
+
+    // Beyond this shift the discarded bits can never reach halfway to the
+    // smallest subnormal (2^-24), so the correctly rounded result is zero.
+    if shift >= 25 {
+        return sign;
+    }
+
+    let frac16_raw = (sig >> shift) as u16;
+    let round_bit = ((sig >> (shift - 1)) & 1) as u16;
+    let sticky = (sig & ((1u32 << (shift - 1)) - 1)) != 0;
+    let frac16 = frac16_raw
+        + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
+            1
+        } else {
+            0
+        };
+
+    // frac16 == 0x0400 means rounding overflowed the largest subnormal into
+    // the smallest normal f16 (exponent field 0x01, fraction 0) — that bit
+    // pattern is exactly `sign | 0x0400`, so no separate branch is needed.
+    sign | frac16
 }
 
 // ---------------------------------------------------------------------------

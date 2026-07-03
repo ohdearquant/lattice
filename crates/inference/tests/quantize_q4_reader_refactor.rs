@@ -71,6 +71,44 @@ fn write_safetensors(path: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) {
     file.write_all(&payload).expect("write payload");
 }
 
+/// Writes a SafeTensors file with tensors declared as `F16`, given as raw f16
+/// bit patterns rather than values derived from `f32` — the only way to place
+/// exact edge-case bit patterns (e.g. subnormals) precisely in the fixture.
+fn write_safetensors_f16(path: &Path, tensors: &[(&str, Vec<usize>, Vec<u16>)]) {
+    let mut header = serde_json::Map::new();
+    let mut payload: Vec<u8> = Vec::new();
+    for (name, shape, values) in tensors {
+        let start = payload.len();
+        for &v in values {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let end = payload.len();
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("dtype".into(), serde_json::Value::String("F16".into()));
+        entry.insert(
+            "shape".into(),
+            serde_json::Value::Array(shape.iter().map(|d| serde_json::Value::from(*d)).collect()),
+        );
+        entry.insert(
+            "data_offsets".into(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::from(start),
+                serde_json::Value::from(end),
+            ]),
+        );
+        header.insert((*name).to_string(), serde_json::Value::Object(entry));
+    }
+    let header_bytes = serde_json::to_string(&serde_json::Value::Object(header))
+        .expect("header serializes")
+        .into_bytes();
+    let mut file = std::fs::File::create(path).expect("create safetensors file");
+    file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .expect("write header length");
+    file.write_all(&header_bytes).expect("write header");
+    file.write_all(&payload).expect("write payload");
+}
+
 /// Same three tensors used to generate the committed golden: one Q4 tensor
 /// spanning two full blocks plus a partial tail, one exactly-one-block Q4
 /// tensor, and one kept `.f16` norm tensor.
@@ -190,4 +228,59 @@ fn single_file_fixture_matches_same_q4_golden() {
 
     run_quantize_q4(&model_dir, &output_dir);
     assert_q4_matches_golden(&output_dir);
+}
+
+/// Parses the kept-tensor `.f16` output format `quantize_q4` writes: magic
+/// `KHF1` + version `u32` + ndim `u32` + shape dims (`u64` each) + numel
+/// (`u64`) + raw little-endian f16 bit patterns — returns the bit patterns.
+fn read_kept_f16_output(path: &Path) -> Vec<u16> {
+    let bytes = std::fs::read(path).expect("read kept f16 output");
+    assert_eq!(&bytes[0..4], b"KHF1", "unexpected magic");
+    let ndim = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let shape_end = 12 + ndim * 8;
+    let numel = u64::from_le_bytes(bytes[shape_end..shape_end + 8].try_into().unwrap()) as usize;
+    let data_start = shape_end + 8;
+    bytes[data_start..data_start + numel * 2]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// A kept (non-quantized) norm-weight tensor whose *source* dtype is F16, and
+/// whose values are genuine F16 subnormal bit patterns at both magnitude
+/// extremes and both signs. `QuarotTensorReader` widens F16 bytes to `f64`
+/// exactly, and narrowing back to `f32` is exact for values this small, so
+/// each subnormal arrives at the kept-tensor f16 re-encode as a tiny
+/// *normal* f32 — the re-encoder must still place it back in the f16
+/// subnormal range instead of flushing it to zero.
+#[test]
+fn f16_source_subnormals_survive_kept_tensor_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_dir = dir.path().join("model");
+    let output_dir = dir.path().join("out");
+    std::fs::create_dir_all(&model_dir).expect("create model dir");
+
+    let values: Vec<u16> = vec![
+        0x0001, // smallest positive subnormal
+        0x03ff, // largest positive subnormal
+        0x8001, // smallest negative subnormal
+        0x83ff, // largest negative subnormal
+    ];
+    write_safetensors_f16(
+        &model_dir.join("model.safetensors"),
+        &[(
+            "model.layers.0.input_layernorm.weight",
+            vec![values.len()],
+            values.clone(),
+        )],
+    );
+
+    run_quantize_q4(&model_dir, &output_dir);
+
+    let out_path = output_dir.join("model_layers_0_input_layernorm_weight.f16");
+    let round_tripped = read_kept_f16_output(&out_path);
+    assert_eq!(
+        round_tripped, values,
+        "F16 subnormal bit patterns did not survive the kept-tensor round trip"
+    );
 }
