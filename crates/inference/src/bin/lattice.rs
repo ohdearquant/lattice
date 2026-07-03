@@ -461,7 +461,7 @@ mod serve {
     use lattice_inference::Tokenizer;
     #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
-    use lattice_inference::model::qwen35_config::GenerateOutput;
+    use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::sync::Arc;
@@ -628,6 +628,16 @@ mod serve {
             }
         }
 
+        /// Tokenizer for this backend, used to render `logprobs` token ids
+        /// back into text/bytes (#585).
+        pub fn tokenizer(&self) -> &lattice_inference::tokenizer::bpe::BpeTokenizer {
+            match self {
+                ModelBackend::Cpu(m) => m.tokenizer(),
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { tokenizer, .. } => tokenizer,
+            }
+        }
+
         /// Load a native Q4 checkpoint on a dedicated Metal worker thread and
         /// return the `ModelBackend::Metal` handle plus the resolved context
         /// window, for `main()`'s `Command::Serve` startup sequence.
@@ -759,11 +769,13 @@ mod serve {
 
     /// OpenAI-compatible chat completions request.
     ///
-    /// Known-but-unsupported fields (`stream=true`, `tools`, `tool_choice`,
-    /// `logprobs=true`, `n > 1`, `response_format` other than `"text"`) are
-    /// parsed and explicitly rejected with HTTP 400 rather than silently dropped.
-    /// `stop` is accepted and parsed into string-level stop sequences.
-    /// Unknown fields are ignored by default (serde default).
+    /// Known-but-unsupported fields (`tools`, `tool_choice`, `n > 1`,
+    /// `response_format` other than `"text"`) are parsed and explicitly
+    /// rejected with HTTP 400 rather than silently dropped. `logprobs` /
+    /// `top_logprobs` are supported on the non-streaming path only; combined
+    /// with `stream=true` they are also rejected (#585). `stop` is accepted
+    /// and parsed into string-level stop sequences. Unknown fields are
+    /// ignored by default (serde default).
     #[derive(Deserialize)]
     pub struct ChatCompletionRequest {
         /// Required: must match the served model identifier.
@@ -777,7 +789,7 @@ mod serve {
         pub temperature: Option<f32>,
         /// Nucleus sampling probability mass.  Mapped into `GenerateConfig`.
         pub top_p: Option<f32>,
-        /// SSE streaming — not yet supported; rejected with 400.
+        /// SSE streaming — combined with `logprobs: true` this is rejected (#585).
         pub stream: Option<bool>,
         /// Stop sequences — a JSON string or array of strings (up to 4, non-empty).
         /// Parsed by `parse_stop_strings`; null/absent → empty vec (no stops).
@@ -790,8 +802,13 @@ mod serve {
         pub tools: Option<Value>,
         /// Tool choice — not supported; rejected with 400.
         pub tool_choice: Option<Value>,
-        /// Log-probabilities — not supported; rejected with 400.
+        /// Return per-token log-probabilities for the sampled tokens. Requires
+        /// the non-streaming path — combined with `stream: true` this is
+        /// rejected with 400 (#585).
         pub logprobs: Option<bool>,
+        /// Number of most-likely alternative tokens to return at each position
+        /// (0–20). Requires `logprobs: true`; validated by `validate_logprobs`.
+        pub top_logprobs: Option<usize>,
         /// Number of completions — only `1` is accepted.
         pub n: Option<usize>,
     }
@@ -838,6 +855,37 @@ mod serve {
         pub index: usize,
         pub message: ResponseMessage,
         pub finish_reason: String,
+        /// Per-token log-probabilities (#585). `None` unless the request set
+        /// `logprobs: true`, matching the OpenAI response shape where the
+        /// field is omitted rather than `null` for a plain completion.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub logprobs: Option<ChoiceLogprobs>,
+    }
+
+    /// `choices[].logprobs` — OpenAI chat-completions logprobs envelope (#585).
+    #[derive(Serialize)]
+    pub struct ChoiceLogprobs {
+        pub content: Vec<TokenLogprobEntry>,
+    }
+
+    /// One sampled token's log-probability, plus its top-N alternatives.
+    #[derive(Serialize)]
+    pub struct TokenLogprobEntry {
+        pub token: String,
+        pub logprob: f32,
+        /// Raw UTF-8 bytes of `token`. `None` when the token id could not be
+        /// resolved back to vocabulary text (should not happen for a token
+        /// this server just sampled, but fails closed rather than panicking).
+        pub bytes: Option<Vec<u8>>,
+        pub top_logprobs: Vec<TopLogprobEntry>,
+    }
+
+    /// One alternative token considered at a sampled position.
+    #[derive(Serialize)]
+    pub struct TopLogprobEntry {
+        pub token: String,
+        pub logprob: f32,
+        pub bytes: Option<Vec<u8>>,
     }
 
     #[derive(Serialize)]
@@ -975,6 +1023,38 @@ mod serve {
         Ok(top_p)
     }
 
+    /// Validate the `logprobs` / `top_logprobs` pair (#585) and resolve the
+    /// number of alternatives to capture per token.
+    ///
+    /// - `logprobs` absent or `false` → `Ok(None)` (capture disabled, zero cost).
+    /// - `logprobs: true`, `top_logprobs` absent → `Ok(Some(0))` (per-token
+    ///   logprob only, no alternatives — matches the OpenAI default).
+    /// - `logprobs: true`, `top_logprobs: Some(n)` with `0 <= n <= 20` → `Ok(Some(n))`.
+    /// - `top_logprobs` set without `logprobs: true` → rejected (matches OpenAI).
+    /// - `top_logprobs > 20` → rejected.
+    fn validate_logprobs(
+        logprobs: Option<bool>,
+        top_logprobs: Option<usize>,
+    ) -> Result<Option<usize>, ApiError> {
+        if !logprobs.unwrap_or(false) {
+            if top_logprobs.is_some() {
+                return Err(ApiError::BadRequest {
+                    message: "top_logprobs requires logprobs: true".to_string(),
+                    code: "invalid_request",
+                });
+            }
+            return Ok(None);
+        }
+        let top_n = top_logprobs.unwrap_or(0);
+        if top_n > 20 {
+            return Err(ApiError::BadRequest {
+                message: format!("top_logprobs {top_n} exceeds the maximum of 20"),
+                code: "invalid_top_logprobs",
+            });
+        }
+        Ok(Some(top_n))
+    }
+
     /// Parse the OpenAI `stop` field into a `Vec<String>`.
     ///
     /// Accepted forms:
@@ -1045,7 +1125,9 @@ mod serve {
     /// Reject OpenAI fields that are parsed but not yet implemented.
     ///
     /// Note: `stream=true` is now handled by the streaming path in `chat_completions`
-    /// and is intentionally NOT rejected here.
+    /// and is intentionally NOT rejected here. `logprobs`/`top_logprobs` are
+    /// implemented on the non-streaming path only (#585); combined with
+    /// `stream: true` they are rejected below rather than silently ignored.
     fn reject_unsupported(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         if req.tools.is_some() || req.tool_choice.is_some() {
             return Err(ApiError::BadRequest {
@@ -1053,9 +1135,9 @@ mod serve {
                 code: "unsupported_feature",
             });
         }
-        if req.logprobs.unwrap_or(false) {
+        if req.stream == Some(true) && req.logprobs.unwrap_or(false) {
             return Err(ApiError::BadRequest {
-                message: "logprobs is not supported by this server".to_string(),
+                message: "logprobs is not supported together with stream: true".to_string(),
                 code: "unsupported_feature",
             });
         }
@@ -1170,6 +1252,68 @@ mod serve {
         if output.stopped { "stop" } else { "length" }
     }
 
+    /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
+    ///
+    /// `token` uses the lossy UTF-8 rendering (matches OpenAI, which also shows
+    /// replacement characters for a token that is only part of a multi-byte
+    /// codepoint); `bytes` carries the exact original bytes so callers can
+    /// reconstruct byte-accurate output regardless of codepoint boundaries.
+    ///
+    /// Every token id this server places into `token_logprobs` was just sampled
+    /// by this same tokenizer's vocabulary, so `token_for_id` returning `None`
+    /// is not expected in practice; the fallback fails closed with a visibly
+    /// synthetic token string and no bytes, rather than panicking.
+    fn render_token_logprob(
+        tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+        token_id: u32,
+    ) -> (String, Option<Vec<u8>>) {
+        match tokenizer.token_for_id(token_id) {
+            Some(tok_str) => (
+                lattice_inference::tokenizer::bpe::byte_decode_token(tok_str),
+                Some(lattice_inference::tokenizer::bpe::byte_decode_token_bytes(
+                    tok_str,
+                )),
+            ),
+            None => (format!("<|unresolved_token_{token_id}|>"), None),
+        }
+    }
+
+    /// Build the `choices[].logprobs` envelope from the engine's raw
+    /// `token_logprobs` (#585). `token_logprobs` is empty when `logprobs` was
+    /// not requested, in which case this returns an empty `content` — callers
+    /// only invoke this when the request set `logprobs: true`, so that case
+    /// does not arise in practice.
+    fn build_choice_logprobs(
+        tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+        token_logprobs: &[TokenLogprob],
+    ) -> ChoiceLogprobs {
+        let content = token_logprobs
+            .iter()
+            .map(|tl| {
+                let (token, bytes) = render_token_logprob(tokenizer, tl.token_id);
+                let top_logprobs = tl
+                    .top
+                    .iter()
+                    .map(|alt| {
+                        let (token, bytes) = render_token_logprob(tokenizer, alt.token_id);
+                        TopLogprobEntry {
+                            token,
+                            logprob: alt.logprob,
+                            bytes,
+                        }
+                    })
+                    .collect();
+                TokenLogprobEntry {
+                    token,
+                    logprob: tl.logprob,
+                    bytes,
+                    top_logprobs,
+                }
+            })
+            .collect();
+        ChoiceLogprobs { content }
+    }
+
     // Handlers
     // -----------------------------------------------------------------------
 
@@ -1236,6 +1380,7 @@ mod serve {
         )?;
         let temperature = validate_temperature(req.temperature)?;
         let top_p = validate_top_p(req.top_p)?;
+        let logprobs = validate_logprobs(req.logprobs, req.top_logprobs)?;
 
         // Render the full conversation into a ChatML prompt.  Returns 400 for
         // any unsupported role or content-part type encountered.
@@ -1264,6 +1409,7 @@ mod serve {
             top_p,
             seed: req.seed,
             stop_strings,
+            logprobs,
             ..Default::default()
         };
 
@@ -1509,6 +1655,13 @@ mod serve {
             }
             let finish_reason = finish_reason_for(&output);
 
+            // #585: only render logprobs (and touch the tokenizer for it) when
+            // the request actually asked for them — `logprobs` is `None` on
+            // every other request, so this is a no-op on the default path.
+            let choice_logprobs = logprobs
+                .is_some()
+                .then(|| build_choice_logprobs(state.model.tokenizer(), &output.token_logprobs));
+
             let response = ChatCompletionResponse {
                 id: response_id,
                 object: "chat.completion".to_string(),
@@ -1521,6 +1674,7 @@ mod serve {
                         content: output.text.clone(),
                     },
                     finish_reason: finish_reason.to_string(),
+                    logprobs: choice_logprobs,
                 }],
                 usage: Usage {
                     prompt_tokens: output.prompt_tokens,
@@ -1743,6 +1897,7 @@ mod serve {
                 generated_tokens: 64,
                 stopped: false,
                 stop_reason: Some(lattice_inference::StopReason::Length),
+                token_logprobs: vec![],
             };
             assert_eq!(super::finish_reason_for(&cap), "length");
 
@@ -1753,6 +1908,7 @@ mod serve {
                 generated_tokens: 3,
                 stopped: true,
                 stop_reason: Some(lattice_inference::StopReason::Eos),
+                token_logprobs: vec![],
             };
             assert_eq!(super::finish_reason_for(&natural), "stop");
         }
@@ -1778,6 +1934,7 @@ mod serve {
                 generated_tokens: max_tokens,
                 stopped: true,
                 stop_reason: Some(lattice_inference::StopReason::Eos),
+                token_logprobs: vec![],
             };
             assert_eq!(
                 super::finish_reason_for(&output),
@@ -1797,6 +1954,7 @@ mod serve {
                 generated_tokens: 4,
                 stopped: false,
                 stop_reason: Some(lattice_inference::StopReason::Length),
+                token_logprobs: vec![],
             };
             assert_eq!(super::finish_reason_for(&output), "length");
         }
@@ -1819,9 +1977,30 @@ mod serve {
                 tools: None,
                 tool_choice: None,
                 logprobs: None,
+                top_logprobs: None,
                 n: None,
             };
             assert!(reject_unsupported(&req).is_ok());
+        }
+
+        #[test]
+        fn reject_unsupported_stream_and_logprobs_rejected() {
+            // #585: logprobs is implemented on the non-streaming path only;
+            // combined with stream: true it must be rejected, not silently
+            // ignored.
+            let req = ChatCompletionRequest {
+                stream: Some(true),
+                logprobs: Some(true),
+                ..bare_req()
+            };
+            let err = reject_unsupported(&req).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
         }
 
         // -----------------------------------------------------------------------
@@ -1904,6 +2083,7 @@ mod serve {
                 tools: None,
                 tool_choice: None,
                 logprobs: None,
+                top_logprobs: None,
                 n: Some(3),
             };
             let err = reject_unsupported(&req).unwrap_err();
@@ -1934,6 +2114,7 @@ mod serve {
                 tools: None,
                 tool_choice: None,
                 logprobs: None,
+                top_logprobs: None,
                 n: None,
             };
             let err = reject_unsupported(&req).unwrap_err();
@@ -1965,6 +2146,7 @@ mod serve {
                 tools: None,
                 tool_choice: None,
                 logprobs: None,
+                top_logprobs: None,
                 n: None,
             }
         }
@@ -2002,19 +2184,15 @@ mod serve {
         }
 
         #[test]
-        fn reject_unsupported_logprobs_rejected() {
+        fn reject_unsupported_logprobs_true_ok() {
+            // #585: logprobs is now implemented on the non-streaming path, so a
+            // standalone `logprobs: true` (no `stream: true`) must be accepted
+            // here — validation of the value itself is `validate_logprobs`'s job.
             let req = ChatCompletionRequest {
                 logprobs: Some(true),
                 ..bare_req()
             };
-            let err = reject_unsupported(&req).unwrap_err();
-            assert!(matches!(
-                err,
-                ApiError::BadRequest {
-                    code: "unsupported_feature",
-                    ..
-                }
-            ));
+            assert!(reject_unsupported(&req).is_ok());
         }
 
         #[test]
@@ -2380,6 +2558,203 @@ mod serve {
                     ..
                 }
             ));
+        }
+
+        // -----------------------------------------------------------------------
+        // validate_logprobs (#585)
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn validate_logprobs_absent_disables_capture() {
+            assert_eq!(validate_logprobs(None, None).unwrap(), None);
+        }
+
+        #[test]
+        fn validate_logprobs_false_disables_capture() {
+            assert_eq!(validate_logprobs(Some(false), None).unwrap(), None);
+        }
+
+        #[test]
+        fn validate_logprobs_true_no_top_logprobs_defaults_to_zero() {
+            // logprobs: true with no top_logprobs still captures the sampled
+            // token's own logprob, just with no alternatives.
+            assert_eq!(validate_logprobs(Some(true), None).unwrap(), Some(0));
+        }
+
+        #[test]
+        fn validate_logprobs_true_with_top_logprobs_ok() {
+            assert_eq!(validate_logprobs(Some(true), Some(5)).unwrap(), Some(5));
+        }
+
+        #[test]
+        fn validate_logprobs_top_logprobs_at_boundary_twenty_ok() {
+            assert_eq!(validate_logprobs(Some(true), Some(20)).unwrap(), Some(20));
+        }
+
+        #[test]
+        fn validate_logprobs_top_logprobs_over_twenty_rejected() {
+            let err = validate_logprobs(Some(true), Some(21)).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_top_logprobs",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn validate_logprobs_top_logprobs_without_logprobs_true_rejected() {
+            let err = validate_logprobs(None, Some(5)).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_request",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn validate_logprobs_top_logprobs_with_logprobs_false_rejected() {
+            let err = validate_logprobs(Some(false), Some(5)).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_request",
+                    ..
+                }
+            ));
+        }
+
+        // -----------------------------------------------------------------------
+        // render_token_logprob / build_choice_logprobs (#585)
+        // -----------------------------------------------------------------------
+
+        /// Tiny in-memory tokenizer for logprob-rendering tests — no merges,
+        /// just a fixed id -> token vocabulary large enough to exercise both a
+        /// known and an unresolved token id. "Hello"/"world" are plain ASCII in
+        /// the printable range the GPT-2 byte table maps to itself, so they
+        /// round-trip byte-for-byte through `byte_decode_token[_bytes]`.
+        fn logprob_test_tokenizer() -> lattice_inference::tokenizer::bpe::BpeTokenizer {
+            let vocab: std::collections::HashMap<String, u32> =
+                [("Hello".to_string(), 0u32), ("world".to_string(), 1u32)]
+                    .into_iter()
+                    .collect();
+            lattice_inference::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, vec![])
+                .expect("in-memory test vocab must construct")
+        }
+
+        #[test]
+        fn render_token_logprob_resolves_known_token() {
+            let tokenizer = logprob_test_tokenizer();
+            let (token, bytes) = render_token_logprob(&tokenizer, 0);
+            assert_eq!(token, "Hello");
+            assert_eq!(bytes, Some(b"Hello".to_vec()));
+        }
+
+        #[test]
+        fn render_token_logprob_unresolved_id_fails_closed() {
+            // Token id 999 does not exist in the 2-entry test vocab: this must
+            // fail closed with a visibly synthetic token and no bytes, never panic.
+            let tokenizer = logprob_test_tokenizer();
+            let (token, bytes) = render_token_logprob(&tokenizer, 999);
+            assert_eq!(token, "<|unresolved_token_999|>");
+            assert_eq!(bytes, None);
+        }
+
+        #[test]
+        fn build_choice_logprobs_shapes_content_and_alternatives() {
+            let tokenizer = logprob_test_tokenizer();
+            let token_logprobs = vec![
+                TokenLogprob {
+                    token_id: 0,
+                    logprob: -0.1,
+                    top: vec![
+                        lattice_inference::model::qwen35_config::TopLogprob {
+                            token_id: 0,
+                            logprob: -0.1,
+                        },
+                        lattice_inference::model::qwen35_config::TopLogprob {
+                            token_id: 1,
+                            logprob: -2.3,
+                        },
+                    ],
+                },
+                TokenLogprob {
+                    token_id: 1,
+                    logprob: -0.05,
+                    top: vec![],
+                },
+            ];
+            let choice_logprobs = build_choice_logprobs(&tokenizer, &token_logprobs);
+            assert_eq!(choice_logprobs.content.len(), 2);
+
+            assert_eq!(choice_logprobs.content[0].token, "Hello");
+            assert_eq!(choice_logprobs.content[0].logprob, -0.1);
+            assert_eq!(choice_logprobs.content[0].top_logprobs.len(), 2);
+            assert_eq!(choice_logprobs.content[0].top_logprobs[0].token, "Hello");
+            assert_eq!(choice_logprobs.content[0].top_logprobs[1].token, "world");
+
+            assert_eq!(choice_logprobs.content[1].token, "world");
+            assert_eq!(choice_logprobs.content[1].logprob, -0.05);
+            assert!(choice_logprobs.content[1].top_logprobs.is_empty());
+        }
+
+        // -----------------------------------------------------------------------
+        // Choice.logprobs — JSON shape (#585)
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn choice_logprobs_omitted_from_json_when_none() {
+            // The no-logprobs-requested response must be byte-identical to
+            // before this feature existed: the key is absent, not `null`.
+            let choice = Choice {
+                index: 0,
+                message: ResponseMessage {
+                    role: "assistant".to_string(),
+                    content: "hi".to_string(),
+                },
+                finish_reason: "stop".to_string(),
+                logprobs: None,
+            };
+            let json = serde_json::to_string(&choice).unwrap();
+            assert!(
+                !json.contains("logprobs"),
+                "logprobs key must be entirely absent when None, got: {json}"
+            );
+        }
+
+        #[test]
+        fn choice_logprobs_present_when_requested() {
+            let choice = Choice {
+                index: 0,
+                message: ResponseMessage {
+                    role: "assistant".to_string(),
+                    content: "hi".to_string(),
+                },
+                finish_reason: "stop".to_string(),
+                logprobs: Some(ChoiceLogprobs {
+                    content: vec![TokenLogprobEntry {
+                        token: "hi".to_string(),
+                        logprob: -0.2,
+                        bytes: Some(b"hi".to_vec()),
+                        top_logprobs: vec![],
+                    }],
+                }),
+            };
+            let json = serde_json::to_string(&choice).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["logprobs"]["content"][0]["token"], "hi");
+            assert_eq!(v["logprobs"]["content"][0]["logprob"], -0.2);
+            assert_eq!(
+                v["logprobs"]["content"][0]["bytes"],
+                serde_json::json!([104, 105])
+            );
+            assert_eq!(
+                v["logprobs"]["content"][0]["top_logprobs"],
+                serde_json::json!([])
+            );
         }
     }
 }

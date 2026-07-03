@@ -7,8 +7,9 @@ use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
 use crate::grammar::pda::GrammarState;
 use crate::model::qwen35_config::{
-    GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
+    GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
 };
+use crate::sampling::record_logprob;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
 
@@ -42,6 +43,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
                 stop_reason: Some(StopReason::Length),
+                token_logprobs: vec![],
             });
         }
 
@@ -84,6 +86,9 @@ impl Qwen35Model {
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
         let mut all_ids = prompt_ids.clone();
+        // Empty `Vec` costs no heap allocation until pushed to, so this is
+        // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
+        let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
         prefill_tokens(
             self,
@@ -131,6 +136,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
                 stop_reason: Some(StopReason::Grammar),
+                token_logprobs: vec![],
             });
         }
 
@@ -142,11 +148,19 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: true,
                 stop_reason: Some(StopReason::Eos),
+                token_logprobs: vec![],
             });
         }
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        record_logprob(
+            &mut token_logprobs,
+            &scratch.logits[..cfg.vocab_size],
+            next_id,
+            gen_cfg.temperature,
+            gen_cfg.logprobs,
+        );
 
         // Budget forcing: resolve </think> once and seed thinking_closed from the
         // prefill token so budget=1 works. Mirrors generate_streaming exactly;
@@ -176,6 +190,7 @@ impl Qwen35Model {
                 &mut grammar_state,
                 think_close_id,
                 thinking_closed_seed,
+                &mut token_logprobs,
             )?;
 
             let text = decode_tokens(&self.tokenizer, &generated_ids);
@@ -187,6 +202,7 @@ impl Qwen35Model {
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(loop_stop_reason),
+                token_logprobs,
             })
         } else {
             // String-stop path: accumulate decoded text and check after every token.
@@ -206,6 +222,7 @@ impl Qwen35Model {
                     generated_tokens: generated_ids.len(),
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs,
                 });
             }
 
@@ -223,6 +240,7 @@ impl Qwen35Model {
                 &mut grammar_state,
                 think_close_id,
                 thinking_closed_seed,
+                &mut token_logprobs,
             )?;
 
             Ok(GenerateOutput {
@@ -232,6 +250,7 @@ impl Qwen35Model {
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(loop_stop_reason),
+                token_logprobs,
             })
         }
     }
@@ -273,6 +292,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
                 stop_reason: Some(StopReason::Length),
+                token_logprobs: vec![],
             });
         }
 
@@ -305,6 +325,9 @@ impl Qwen35Model {
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
         let mut all_ids = prompt_ids.clone();
+        // Empty `Vec` costs no heap allocation until pushed to, so this is
+        // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
+        let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
         prefill_tokens(
             self,
@@ -345,6 +368,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
                 stop_reason: Some(StopReason::Grammar),
+                token_logprobs: vec![],
             });
         }
 
@@ -356,11 +380,19 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: true,
                 stop_reason: Some(StopReason::Eos),
+                token_logprobs: vec![],
             });
         }
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        record_logprob(
+            &mut token_logprobs,
+            &scratch.logits[..cfg.vocab_size],
+            next_id,
+            gen_cfg.temperature,
+            gen_cfg.logprobs,
+        );
 
         // Budget forcing setup: resolve the </think> token id once and seed
         // the thinking_closed state from the prefill token so budget=1 works.
@@ -470,6 +502,13 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                record_logprob(
+                    &mut token_logprobs,
+                    &scratch.logits[..cfg.vocab_size],
+                    next_id,
+                    gen_cfg.temperature,
+                    gen_cfg.logprobs,
+                );
                 // Capture close-point after push so </think> is the last reasoning token.
                 if thinking_closed && reasoning_end_len.is_none() {
                     reasoning_end_len = Some(generated_ids.len());
@@ -504,6 +543,7 @@ impl Qwen35Model {
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs,
             })
         } else {
             // String-stop path: use StopStreamer to hold back (max_stop - 1) bytes and
@@ -521,6 +561,7 @@ impl Qwen35Model {
                     generated_tokens: generated_ids.len(),
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs,
                 });
             }
 
@@ -597,6 +638,13 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                record_logprob(
+                    &mut token_logprobs,
+                    &scratch.logits[..cfg.vocab_size],
+                    next_id,
+                    gen_cfg.temperature,
+                    gen_cfg.logprobs,
+                );
                 // Capture close-point after push so </think> is the last reasoning token.
                 if thinking_closed && reasoning_end_len.is_none() {
                     reasoning_end_len = Some(generated_ids.len());
@@ -632,6 +680,7 @@ impl Qwen35Model {
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs,
             })
         }
     }
@@ -809,6 +858,7 @@ fn decode_loop(
     grammar_state: &mut Option<GrammarState>,
     think_close_id: Option<u32>,
     thinking_closed_seed: bool,
+    token_logprobs: &mut Vec<TokenLogprob>,
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut thinking_closed = thinking_closed_seed;
@@ -876,6 +926,13 @@ fn decode_loop(
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        record_logprob(
+            token_logprobs,
+            &scratch.logits[..cfg.vocab_size],
+            next_id,
+            gen_cfg.temperature,
+            gen_cfg.logprobs,
+        );
         // Capture close-point after push so </think> is the last reasoning token.
         if thinking_closed && reasoning_end_len.is_none() {
             reasoning_end_len = Some(generated_ids.len());
@@ -915,6 +972,7 @@ fn decode_loop_with_stops(
     grammar_state: &mut Option<GrammarState>,
     think_close_id: Option<u32>,
     thinking_closed_seed: bool,
+    token_logprobs: &mut Vec<TokenLogprob>,
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
@@ -988,6 +1046,13 @@ fn decode_loop_with_stops(
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        record_logprob(
+            token_logprobs,
+            &scratch.logits[..cfg.vocab_size],
+            next_id,
+            gen_cfg.temperature,
+            gen_cfg.logprobs,
+        );
         // Capture close-point after push so </think> is the last reasoning token.
         if thinking_closed && reasoning_end_len.is_none() {
             reasoning_end_len = Some(generated_ids.len());
@@ -1072,6 +1137,25 @@ pub(crate) fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), Infe
             "grammar-constrained decoding is not yet supported on this path; \
              use the Qwen3.5 CPU generate() / generate_streaming() or the generic \
              generate() in src/generate.rs, which implement grammar masking"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Sibling guard to [`check_grammar_not_set`]: fails closed instead of silently
+/// dropping a `logprobs` request on a generation path that has not been wired
+/// to capture per-step log-probabilities (#585). Same five paths, same
+/// rationale — see `check_grammar_not_set` for the full list.
+///
+/// The base CPU `generate()` / `generate_streaming()` paths in this module
+/// wire logprobs capture directly and therefore do not call this guard.
+pub(crate) fn check_logprobs_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+    if gen_cfg.logprobs.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "per-token logprobs are not yet supported on this generation path; \
+             use the Qwen3.5 CPU generate() / generate_streaming() or the Metal \
+             generate_streaming(), which implement logprobs capture"
                 .into(),
         ));
     }

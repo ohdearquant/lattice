@@ -25,8 +25,8 @@ use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
-    FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, decode_tokens,
-    qwen35_rms_norm, resize, sample_token, should_stop_token,
+    FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, check_logprobs_not_set,
+    decode_tokens, qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::stop_reason::StopReason;
@@ -378,6 +378,9 @@ impl Qwen35Model {
         // grammar configs before any sampling to avoid silently producing unconstrained
         // output when a caller sets gen_cfg.grammar (#397/#398).
         check_grammar_not_set(gen_cfg)?;
+        // Same rationale for logprobs capture, which is also not wired into this
+        // generate loop (#585).
+        check_logprobs_not_set(gen_cfg)?;
         // Context preflight. apply_partial_rope indexes the precomputed cos/sin table
         // without bounds checks, so a position at or past max_context() is an out-of-bounds
         // slice access — a release panic, not a clean error. Mirror the same total-token
@@ -430,6 +433,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: true,
                 stop_reason: Some(StopReason::Eos),
+                token_logprobs: vec![],
             });
         }
 
@@ -480,6 +484,7 @@ impl Qwen35Model {
             generated_tokens: generated_ids.len(),
             stopped,
             stop_reason: Some(stop_reason),
+            token_logprobs: vec![],
         })
     }
 

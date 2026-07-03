@@ -871,6 +871,9 @@ pub fn generate_f16(
     // the guard the grammar field would be silently ignored, producing
     // unconstrained output despite a grammar being set (#397/#398).
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+    // Same rationale for logprobs capture, which is also not wired into this
+    // generate loop (#585).
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
 
     // Context preflight. The RoPE cos/sin tables are indexed unchecked in
     // forward_step_f16 (`rope.cos_at(base + i)`), so a position at or past the
@@ -933,6 +936,7 @@ pub fn generate_f16(
             generated_tokens: 0,
             stopped: true,
             stop_reason: Some(StopReason::Eos),
+            token_logprobs: vec![],
         });
     }
 
@@ -987,6 +991,7 @@ pub fn generate_f16(
         generated_tokens: generated_ids.len(),
         stopped,
         stop_reason: Some(stop_reason),
+        token_logprobs: vec![],
     })
 }
 
