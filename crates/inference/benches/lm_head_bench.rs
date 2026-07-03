@@ -5,8 +5,10 @@
 //! - route: full logits, block-argmax, block-top-k for K in {8, 16, 40, 64}
 //!
 //! Real measurement only compiles/runs with `--features metal-gpu,f16,bench-internals`
-//! on macOS. Default features compile a clean skip so CI (no checkpoint, no GPU
-//! feature) stays green:
+//! on macOS. Default features compile a clean skip so the default CI jobs (no
+//! checkpoint) stay green; the `bench-compile` job separately compiles (but does
+//! not run, no checkpoint) the real path under exactly that feature trio, so the
+//! unsafe `bench_support` code is still type-checked and linted on every PR:
 //!
 //! ```bash
 //! cargo bench -p lattice-inference --bench lm_head_bench -- "lm_head"
