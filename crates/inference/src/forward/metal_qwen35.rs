@@ -10577,6 +10577,20 @@ kernel void gdn_chunk_norm_silu_c32(
                 });
             }
 
+            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
+            // so we never emit a token the caller did not ask for. Mirrors the
+            // guard in generate() above (#612 sibling-path audit).
+            if gen_cfg.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: total_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                });
+            }
+
             if total_len > self.session.kv_cache.max_cache_len {
                 return Err(InferenceError::InvalidInput(format!(
                     "generate_multimodal: total sequence length ({}) exceeds KV cache capacity ({}); \
