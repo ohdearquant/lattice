@@ -47,6 +47,10 @@ default = ["native"]
 native = ["dep:lattice-inference"]
 metal-gpu = ["lattice-inference/metal-gpu"]
 avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
+# Deprecated no-op: gated a bench module for a service removed long ago, but the
+# feature is part of the published 0.4.x surface (removing it would break manifests
+# that list it). Remove in 0.5.0.
+local = []
 
 [[bin]]
 name = "embed"

@@ -14,8 +14,6 @@ RUSTFLAGS="-C target-cpu=native" cargo bench -p lattice-embed
 # SimSIMD comparison
 RUSTFLAGS="-C target-cpu=native" cargo bench -p lattice-embed --bench simsimd_comparison
 
-# Service benchmarks (requires model download)
-cargo bench -p lattice-embed --features local -- --ignored
 ```
 
 ## Benchmark Files
