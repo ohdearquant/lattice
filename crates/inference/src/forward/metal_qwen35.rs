@@ -14583,6 +14583,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -14605,6 +14606,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -22245,6 +22247,7 @@ kernel void decode_attention_reference(
                 top_p: 1.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
+                logprobs: None,
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
@@ -22323,6 +22326,7 @@ kernel void decode_attention_reference(
                 top_p: 1.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
+                logprobs: None,
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
