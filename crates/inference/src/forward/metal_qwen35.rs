@@ -22216,6 +22216,19 @@ kernel void decode_attention_reference(
                 "should_cancel already true before prefill must return before \
                  on_token is ever called, got {on_token_calls} calls"
             );
+            // `on_token_calls == 0` alone doesn't prove *which* checkpoint fired --
+            // the after-prefill check would produce the same on_token count if the
+            // before-prefill one were missing, since prefill's own output never
+            // reaches on_token either way (round-2 review finding). Prefill is the
+            // only thing that advances kv_cache.seq_len (metal_qwen35_chunked_prefill*
+            // tests assert seq_len == tokens.len() once it has run), so a still-zero
+            // seq_len is direct evidence prefill itself never started.
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "should_cancel already true before prefill must return before prefill \
+                 itself runs, but kv_cache.seq_len={} shows it advanced",
+                state.session.kv_cache.seq_len
+            );
             assert_eq!(
                 out.generated_tokens, 0,
                 "cancelled-before-prefill must produce zero tokens"
