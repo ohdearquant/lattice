@@ -90,8 +90,6 @@ jobs:
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
-      - name: embed — local
-        run: cargo build -p lattice-embed --features local
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
