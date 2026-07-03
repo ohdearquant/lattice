@@ -176,7 +176,7 @@ lattice-embed = { version = "0.4", features = ["wgpu-gpu"] }
 
 ## Quick Start: CLI
 
-Build from source (requires Rust 1.80+ and, for Metal, macOS 14+):
+Build from source (requires Rust 1.93+ and, for Metal, macOS 14+):
 
 ```bash
 git clone https://github.com/ohdearquant/lattice
@@ -197,6 +197,40 @@ With Metal GPU (macOS only):
 ```bash
 cargo build --release -p lattice-inference --bin lattice --features metal-gpu,f16
 ```
+
+### Raspberry Pi / ARM Linux (aarch64)
+
+Lattice builds and runs on 64-bit ARM Linux with no GPU: the CPU path dispatches
+hand-written NEON kernels at runtime. Linux aarch64 is part of CI (`ubuntu-24.04-arm`),
+and the same steps apply to a Raspberry Pi running a 64-bit OS.
+
+Requirements and tips:
+
+- **64-bit OS required.** Raspberry Pi OS (64-bit) or Ubuntu Server for Pi. Check with
+  `uname -m` — it must say `aarch64`, not `armv7l`.
+- **Rust via rustup** (1.93+): `curl https://sh.rustup.rs -sSf | sh`, then build with the
+  default features exactly as above. Leave `metal-gpu` off — it is macOS-only.
+- **Memory: 8 GB strongly recommended for chat models.** The CPU path converts bf16
+  weights to f32 in RAM, so Qwen3.5-0.8B occupies roughly 3.2 GB plus KV cache and
+  activations. On a 4 GB board this will swap-thrash or be OOM-killed. Embedding models
+  are much smaller (bge-small is ~130 MB) and run comfortably on 4 GB.
+- **Get a chat model** the same way as on macOS — download from HuggingFace and point
+  `--model` at the directory:
+
+  ```bash
+  pip install -U "huggingface_hub[cli]"
+  huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/.lattice/models/qwen3.5-0.8b
+  ./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
+  ```
+
+- **Compile time:** a release build takes a while on a Pi (expect tens of minutes on a
+  Pi 5). Cross-compiling from a faster machine with target `aarch64-unknown-linux-gnu`
+  works too.
+- **Set expectations:** this is a CPU-only, memory-bandwidth-bound path. Decode speed is
+  far below the Apple Silicon numbers in the benchmark table above — treat a Pi as a
+  functional target for experimenting with a fully self-contained Rust inference stack,
+  not a fast one. We haven't published Pi throughput numbers yet; benchmark reports from
+  real boards are welcome in the issues.
 
 ### HTTP API
 
