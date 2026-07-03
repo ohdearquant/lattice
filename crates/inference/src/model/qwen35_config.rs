@@ -399,7 +399,10 @@ impl Qwen35Config {
                 "invalid Qwen config.json: num_key_value_heads must be > 0".to_string(),
             ));
         }
-        if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+        if !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+        {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: num_attention_heads ({}) must be divisible by \
                  num_key_value_heads ({})",
@@ -446,7 +449,7 @@ impl Qwen35Config {
         // factor 1.0.  Reject all three fail-closed; no-RoPE variants that need rope_dim==0
         // require an explicit dispatch path (Refs #401).
         let rope_dim = cfg.rope_dim();
-        if rope_dim < 2 || rope_dim % 2 != 0 || rope_dim > cfg.head_dim {
+        if rope_dim < 2 || !rope_dim.is_multiple_of(2) || rope_dim > cfg.head_dim {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: derived rope_dim ({rope_dim}) must be even, >= 2, \
                  and <= head_dim ({hd}) (partial_rotary_factor={prf})",
@@ -466,7 +469,7 @@ impl Qwen35Config {
                 "invalid Qwen config.json: linear_num_key_heads must be > 0".to_string(),
             ));
         }
-        if value_heads == 0 || value_heads % key_heads != 0 {
+        if value_heads == 0 || !value_heads.is_multiple_of(key_heads) {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: linear_num_value_heads ({value_heads}) must be a \
                  positive multiple of linear_num_key_heads ({key_heads})"

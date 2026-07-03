@@ -347,7 +347,7 @@ impl UnbalancedSinkhornSolver {
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
             iterations = iteration + 1;
-            if iterations % check_every == 0 || iterations == self.config.max_iterations {
+            if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
                 last_error = max_du.max(max_dv);
                 if let Some(observer) = progress.as_deref_mut() {
                     let keep_going = observer.on_progress(ProgressState {
@@ -566,7 +566,7 @@ impl UnbalancedSinkhornSolver {
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
             iterations = iteration + 1;
-            if iterations % check_every == 0 || iterations == self.config.max_iterations {
+            if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
                 last_error = max_du.max(max_dv);
                 if let Some(observer) = progress.as_deref_mut() {
                     let keep_going = observer.on_progress(ProgressState {

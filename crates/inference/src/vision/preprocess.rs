@@ -89,7 +89,7 @@ pub fn preprocess(image_bytes: &[u8], cfg: &PreprocessConfig) -> Result<ImageTen
     if cfg.patch_size == 0 {
         return Err(VisionError::InvalidConfig("patch_size must be > 0".into()));
     }
-    if cfg.image_size % cfg.patch_size != 0 {
+    if !cfg.image_size.is_multiple_of(cfg.patch_size) {
         return Err(VisionError::InvalidConfig(format!(
             "image_size {} must be divisible by patch_size {}",
             cfg.image_size, cfg.patch_size

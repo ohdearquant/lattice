@@ -177,14 +177,14 @@ pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) ->
         ];
 
         for path in keys {
-            if let Some(value) = json_path(&json, path).and_then(JsonValue::as_u64) {
-                if value > 0 {
-                    // Cap at 2048 for embedding workloads. Models like Qwen3 advertise
-                    // 32K positions but practical embedding inference uses ≤2K tokens.
-                    // The GPU activation buffers are pre-allocated for this limit.
-                    let capped = (value as usize).min(2048);
-                    return capped;
-                }
+            if let Some(value) = json_path(&json, path).and_then(JsonValue::as_u64)
+                && value > 0
+            {
+                // Cap at 2048 for embedding workloads. Models like Qwen3 advertise
+                // 32K positions but practical embedding inference uses ≤2K tokens.
+                // The GPU activation buffers are pre-allocated for this limit.
+                let capped = (value as usize).min(2048);
+                return capped;
             }
         }
     }

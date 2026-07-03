@@ -212,13 +212,13 @@ impl TrainingConfig {
     /// # Arguments
     /// * `required_mb` - Estimated memory requirement in MB
     pub fn check_memory_budget(&self, required_mb: usize) -> Result<()> {
-        if let Some(budget_mb) = self.memory_budget_mb {
-            if required_mb > budget_mb {
-                return Err(TuneError::MemoryBudgetExceeded {
-                    required_mb,
-                    budget_mb,
-                });
-            }
+        if let Some(budget_mb) = self.memory_budget_mb
+            && required_mb > budget_mb
+        {
+            return Err(TuneError::MemoryBudgetExceeded {
+                required_mb,
+                budget_mb,
+            });
         }
         Ok(())
     }

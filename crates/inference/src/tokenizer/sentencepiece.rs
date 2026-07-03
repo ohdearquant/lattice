@@ -317,12 +317,12 @@ impl SentencePieceTokenizer {
             ("bos_id", model.bos_id),
             ("eos_id", model.eos_id),
         ] {
-            if let Some(id) = id {
-                if id >= vocab_len {
-                    return Err(InferenceError::Tokenizer(format!(
-                        "SentencePiece {name} ({id}) out of range for vocab size {vocab_len}"
-                    )));
-                }
+            if let Some(id) = id
+                && id >= vocab_len
+            {
+                return Err(InferenceError::Tokenizer(format!(
+                    "SentencePiece {name} ({id}) out of range for vocab size {vocab_len}"
+                )));
             }
         }
 
@@ -497,10 +497,10 @@ impl SentencePieceTokenizer {
     }
 
     fn add_special_tokens_and_truncate(&self, ids: &mut Vec<u32>) {
-        if self.inner.add_bos {
-            if let Some(id) = self.inner.bos_id {
-                ids.insert(0, id);
-            }
+        if self.inner.add_bos
+            && let Some(id) = self.inner.bos_id
+        {
+            ids.insert(0, id);
         }
 
         if self.inner.add_eos {

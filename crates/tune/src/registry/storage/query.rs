@@ -62,17 +62,17 @@ impl ModelQuery {
             .into_iter()
             .filter(|m| {
                 // Name filter
-                if let Some(ref name) = self.name {
-                    if &m.name != name {
-                        return false;
-                    }
+                if let Some(ref name) = self.name
+                    && &m.name != name
+                {
+                    return false;
                 }
 
                 // Status filter
-                if let Some(ref status) = self.status {
-                    if &m.status != status {
-                        return false;
-                    }
+                if let Some(ref status) = self.status
+                    && &m.status != status
+                {
+                    return false;
                 }
 
                 // Accuracy filter

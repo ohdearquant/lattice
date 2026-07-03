@@ -67,6 +67,10 @@ impl TrainingCallback for LoggingCallback {
     }
 
     fn on_batch_end(&mut self, batch_idx: usize, loss: f32) {
+        // log_interval is a public constructor parameter with no nonzero validation,
+        // so `%` intentionally panics on a zero divisor; `is_multiple_of(0)` would
+        // instead silently log only batch 0.
+        #[allow(clippy::manual_is_multiple_of)]
         if batch_idx % self.log_interval == 0 {
             println!("  batch {batch_idx}: loss {loss:.4}");
         }

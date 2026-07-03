@@ -167,7 +167,7 @@ impl OnlineDriftDetector {
             });
         }
 
-        if self.samples_seen % self.config.check_interval != 0 {
+        if !self.samples_seen.is_multiple_of(self.config.check_interval) {
             return Ok(OnlineDriftSignal::Skipped {
                 samples_seen: self.samples_seen,
                 next_check_in: self.next_check_in(),

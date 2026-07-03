@@ -594,7 +594,7 @@ pub fn dequantize_q4_to_f32(tensor: &Q4Tensor) -> Vec<f32> {
 pub fn stream_quantize_shard(
     bf16_bytes: &[u8],
 ) -> Result<Vec<Q4Block>, Box<dyn std::error::Error>> {
-    if bf16_bytes.len() % 2 != 0 {
+    if !bf16_bytes.len().is_multiple_of(2) {
         return Err("bf16_bytes length must be even (2 bytes per BF16 value)".into());
     }
     let n = bf16_bytes.len() / 2;

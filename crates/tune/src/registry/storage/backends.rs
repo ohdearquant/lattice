@@ -331,18 +331,17 @@ impl StorageBackend for FileSystemStorage {
         let mut paths = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if let Ok(versions) = std::fs::read_dir(entry.path()) {
-                            for version_entry in versions.flatten() {
-                                if version_entry.path().is_dir() {
-                                    if let Some(version) = version_entry.file_name().to_str() {
-                                        let weights_path = format!("{name}/{version}/weights.bin");
-                                        if self.root.join(&weights_path).exists() {
-                                            paths.push(weights_path);
-                                        }
-                                    }
-                                }
+                if entry.path().is_dir()
+                    && let Some(name) = entry.file_name().to_str()
+                    && let Ok(versions) = std::fs::read_dir(entry.path())
+                {
+                    for version_entry in versions.flatten() {
+                        if version_entry.path().is_dir()
+                            && let Some(version) = version_entry.file_name().to_str()
+                        {
+                            let weights_path = format!("{name}/{version}/weights.bin");
+                            if self.root.join(&weights_path).exists() {
+                                paths.push(weights_path);
                             }
                         }
                     }

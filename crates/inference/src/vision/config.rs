@@ -88,7 +88,7 @@ impl VisionConfig {
                 "patch_size must be > 0".into(),
             ));
         }
-        if self.image_size % self.patch_size != 0 {
+        if !self.image_size.is_multiple_of(self.patch_size) {
             return Err(super::VisionError::InvalidConfig(format!(
                 "image_size {} must be divisible by patch_size {}",
                 self.image_size, self.patch_size
@@ -101,6 +101,10 @@ impl VisionConfig {
                 self.n_patches, self.image_size, self.patch_size, expected_n_patches
             )));
         }
+        // spatial_merge_size is not validated as nonzero above (unlike patch_size/n_heads),
+        // so `%` here intentionally panics on a zero divisor as a fail-closed guard;
+        // `is_multiple_of(0)` would instead silently return `n_patches == 0`.
+        #[allow(clippy::manual_is_multiple_of)]
         if self.n_patches % (self.spatial_merge_size * self.spatial_merge_size) != 0 {
             return Err(super::VisionError::InvalidConfig(format!(
                 "n_patches {} must be divisible by spatial_merge_size^2={}",
@@ -113,7 +117,7 @@ impl VisionConfig {
                 "d_model must be > 0".into(),
             ));
         }
-        if self.n_heads == 0 || self.d_model % self.n_heads != 0 {
+        if self.n_heads == 0 || !self.d_model.is_multiple_of(self.n_heads) {
             return Err(super::VisionError::InvalidConfig(format!(
                 "d_model {} must be divisible by n_heads {}",
                 self.d_model, self.n_heads

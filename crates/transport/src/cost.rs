@@ -131,7 +131,7 @@ impl<'a> ContiguousPoints<'a> {
         if dim == 0 || data.is_empty() {
             return Err(CostError::EmptyPointSet);
         }
-        if data.len() % dim != 0 {
+        if !data.len().is_multiple_of(dim) {
             return Err(CostError::InvalidContiguousLayout {
                 values: data.len(),
                 dim,

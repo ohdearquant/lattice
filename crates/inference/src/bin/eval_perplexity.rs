@@ -483,10 +483,10 @@ fn tokenize_with(
     let t_tok = Instant::now();
     let tokenized = bumped.tokenize(text);
     let mut tokens: Vec<u32> = tokenized.input_ids[..tokenized.real_length].to_vec();
-    if let Some(cap) = max_tokens {
-        if tokens.len() > cap {
-            tokens.truncate(cap);
-        }
+    if let Some(cap) = max_tokens
+        && tokens.len() > cap
+    {
+        tokens.truncate(cap);
     }
     eprintln!(
         "Tokenized {} → {} tokens in {}ms",

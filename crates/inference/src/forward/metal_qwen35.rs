@@ -4852,7 +4852,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 "Metal FlashAttention decode requires nonzero heads; got num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}"
             ));
         }
-        if num_q_heads % num_kv_heads != 0 {
+        if !num_q_heads.is_multiple_of(num_kv_heads) {
             return Err(format!(
                 "Metal FlashAttention decode requires num_q_heads divisible by num_kv_heads; got {num_q_heads}/{num_kv_heads}"
             ));
@@ -6888,10 +6888,10 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             // Bug 3 fix: restore MTP KV cache position to prevent ghost entries.
-            if let Some(base_mtp) = mtp_base {
-                if let Some(ref mut mtp) = self.session.mtp {
-                    mtp.cache.seq_len = base_mtp + slot;
-                }
+            if let Some(base_mtp) = mtp_base
+                && let Some(ref mut mtp) = self.session.mtp
+            {
+                mtp.cache.seq_len = base_mtp + slot;
             }
             Ok(())
         }
@@ -10400,18 +10400,18 @@ kernel void gdn_chunk_norm_silu_c32(
             };
 
             // Advance grammar state after sampling the prefill token.
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                if !engine.advance(gs, next_id) {
-                    let text = tokenizer.decode(&generated_ids).unwrap_or_default();
-                    return GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false,
-                        stop_reason: Some(StopReason::Grammar),
-                    };
-                }
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                && !engine.advance(gs, next_id)
+            {
+                let text = tokenizer.decode(&generated_ids).unwrap_or_default();
+                return GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false,
+                    stop_reason: Some(StopReason::Grammar),
+                };
             }
 
             let is_stop = |id: u32| -> bool {
@@ -10479,11 +10479,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 };
 
                 // Advance grammar state after sampling.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    if !engine.advance(gs, next_id) {
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                    && !engine.advance(gs, next_id)
+                {
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 if is_stop(next_id) {
@@ -12589,7 +12589,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 return;
             }
             assert!(
-                k > 0 && k % 32 == 0,
+                k > 0 && k.is_multiple_of(32),
                 "dispatch_gemm_q8 requires K non-zero and divisible by 32, got {k}"
             );
             if m <= 1 {
@@ -12672,7 +12672,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 return;
             }
             assert!(
-                k > 0 && k % 32 == 0,
+                k > 0 && k.is_multiple_of(32),
                 "dispatch_gemm_q4 requires K to be non-zero and divisible by 32, got {k}"
             );
 
@@ -13424,7 +13424,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 return;
             }
             assert!(
-                k > 0 && k % 32 == 0,
+                k > 0 && k.is_multiple_of(32),
                 "dispatch_gemm_q8_at requires K non-zero and divisible by 32, got {k}"
             );
             if m <= 1 {
@@ -13484,7 +13484,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 return;
             }
             assert!(
-                k > 0 && k % 32 == 0,
+                k > 0 && k.is_multiple_of(32),
                 "dispatch_gemm_q4_at requires K to be non-zero and divisible by 32, got {k}"
             );
             let wq_offset = qw.payload_offset + qw_extra_offset;
@@ -14357,10 +14357,10 @@ kernel void gdn_chunk_norm_silu_c32(
             let prompt = format_chat_template(messages);
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
-            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>") {
-                if !cfg.stop_token_ids.contains(&im_end_id) {
-                    cfg.stop_token_ids.push(im_end_id);
-                }
+            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
+                && !cfg.stop_token_ids.contains(&im_end_id)
+            {
+                cfg.stop_token_ids.push(im_end_id);
             }
             let result = self.generate(&prompt, tokenizer, &cfg);
             let text = result.text.trim_end().to_string();
@@ -14528,18 +14528,18 @@ kernel void gdn_chunk_norm_silu_c32(
             };
 
             // Advance grammar state after sampling the prefill token.
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                if !engine.advance(gs, next_id) {
-                    let text = decode_tokens(tokenizer, &generated_ids);
-                    return GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false, // grammar constraint, not an OpenAI stop condition
-                        stop_reason: Some(StopReason::Grammar),
-                    };
-                }
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                && !engine.advance(gs, next_id)
+            {
+                let text = decode_tokens(tokenizer, &generated_ids);
+                return GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // grammar constraint, not an OpenAI stop condition
+                    stop_reason: Some(StopReason::Grammar),
+                };
             }
 
             let is_stop = |id: u32| -> bool {
@@ -14653,11 +14653,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    if !engine.advance(gs, next_id) {
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                    && !engine.advance(gs, next_id)
+                {
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 // Track when the thinking block closes (natural or forced).
@@ -14693,10 +14693,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len {
-                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                        break;
-                    }
+                if let Some(end) = reasoning_end_len
+                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+                {
+                    break;
                 }
             }
 
@@ -15839,10 +15839,10 @@ kernel void gdn_chunk_norm_silu_c32(
         {
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
-            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>") {
-                if !cfg.stop_token_ids.contains(&im_end_id) {
-                    cfg.stop_token_ids.push(im_end_id);
-                }
+            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
+                && !cfg.stop_token_ids.contains(&im_end_id)
+            {
+                cfg.stop_token_ids.push(im_end_id);
             }
             let result = self.generate_streaming(&prompt, tokenizer, &cfg, on_token);
             let text = result.text.trim_end().to_string();
@@ -16601,26 +16601,22 @@ kernel void gdn_chunk_norm_silu_c32(
                 mode,
             };
 
-            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                if !engine.advance(gs, next_id) {
-                    let text = decode_tokens(tokenizer, &generated_ids);
-                    self.save_cross_turn_prefix_or_clear(
-                        slot_id,
-                        metadata.clone(),
-                        prompt_ids.clone(),
-                    );
-                    return Ok(CachedGenerateOutput {
-                        output: GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false,
-                            stop_reason: Some(StopReason::Grammar),
-                        },
-                        cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                    });
-                }
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                && !engine.advance(gs, next_id)
+            {
+                let text = decode_tokens(tokenizer, &generated_ids);
+                self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), prompt_ids.clone());
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false,
+                        stop_reason: Some(StopReason::Grammar),
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
             }
 
             let is_stop = |id: u32| -> bool {
@@ -16728,11 +16724,11 @@ kernel void gdn_chunk_norm_silu_c32(
                 )
                 .unwrap_or(sampled_id);
 
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    if !engine.advance(gs, next_id) {
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                    && !engine.advance(gs, next_id)
+                {
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 if Some(next_id) == think_close_id {
@@ -16764,10 +16760,10 @@ kernel void gdn_chunk_norm_silu_c32(
                     stop_reason = StopReason::KvFull;
                     break;
                 }
-                if let Some(end) = reasoning_end_len {
-                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                        break;
-                    }
+                if let Some(end) = reasoning_end_len
+                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+                {
+                    break;
                 }
             }
 
@@ -16837,10 +16833,10 @@ kernel void gdn_chunk_norm_silu_c32(
         {
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
-            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>") {
-                if !cfg.stop_token_ids.contains(&im_end_id) {
-                    cfg.stop_token_ids.push(im_end_id);
-                }
+            if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
+                && !cfg.stop_token_ids.contains(&im_end_id)
+            {
+                cfg.stop_token_ids.push(im_end_id);
             }
             let cached = self.generate_streaming_with_prefix_cache(
                 slot_id, &prompt, tokenizer, &cfg, on_token,
@@ -26576,7 +26572,7 @@ mod self_spec_eos_tests {
         for trial in 0..trials {
             let seq_len = (rng.next_u64() % 6 + 2) as usize;
             let max_len = 20;
-            let fallback = rng.next_u64() % 4 == 0; // 25% fallback
+            let fallback = rng.next_u64().is_multiple_of(4); // 25% fallback
 
             let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
                 .map(|_| {
@@ -26617,7 +26613,7 @@ mod self_spec_eos_tests {
         for trial in 0..trials {
             let seq_len = (rng.next_u64() % 6 + 2) as usize;
             let max_len = (rng.next_u64() % 4 + 1) as usize; // 1..=4
-            let fallback = rng.next_u64() % 4 == 0;
+            let fallback = rng.next_u64().is_multiple_of(4);
 
             let logit_rows: Vec<Vec<f32>> = (0..=seq_len)
                 .map(|_| {

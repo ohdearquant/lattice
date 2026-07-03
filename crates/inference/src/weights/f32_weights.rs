@@ -706,7 +706,7 @@ impl SafetensorsFile {
 
 /// Reinterpret a byte slice as a f32 slice (zero-copy).
 fn bytes_to_f32_slice(bytes: &[u8]) -> &[f32] {
-    assert!(bytes.len() % 4 == 0);
+    assert!(bytes.len().is_multiple_of(4));
     assert!(bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0);
     // SAFETY: The caller guarantees that `bytes` is 4-byte aligned, its length is
     // a multiple of 4, and the backing storage outlives the returned slice.

@@ -94,13 +94,13 @@ impl DistillationPipeline {
         let latency_ms = start.elapsed().as_millis() as u64;
 
         // Check confidence threshold
-        if let Some(min_conf) = self.config.min_confidence {
-            if confidence < min_conf {
-                self.stats.skipped += 1;
-                return Err(TuneError::Validation(format!(
-                    "Confidence {confidence} below threshold {min_conf}"
-                )));
-            }
+        if let Some(min_conf) = self.config.min_confidence
+            && confidence < min_conf
+        {
+            self.stats.skipped += 1;
+            return Err(TuneError::Validation(format!(
+                "Confidence {confidence} below threshold {min_conf}"
+            )));
         }
 
         let result = LabelingResult::success(raw.id, labels, confidence, latency_ms);

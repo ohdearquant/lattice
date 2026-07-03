@@ -121,17 +121,17 @@ impl Qwen35Model {
         // grammar has no valid continuation for the selected token, signalling the
         // end of grammar-constrained generation. Mirror the same early-return used
         // in crate::generate::generate for parity.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            if !engine.advance(gs, next_id) {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Grammar),
-                });
-            }
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+            && !engine.advance(gs, next_id)
+        {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Grammar),
+            });
         }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
@@ -335,17 +335,17 @@ impl Qwen35Model {
         );
 
         // Grammar advance after sampling the first token, mirroring generate().
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            if !engine.advance(gs, next_id) {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Grammar),
-                });
-            }
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+            && !engine.advance(gs, next_id)
+        {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Grammar),
+            });
         }
 
         if should_stop_token(cfg, gen_cfg, next_id) {
@@ -449,12 +449,12 @@ impl Qwen35Model {
                 // override): a false return signals grammar completion. Set
                 // stopped=true before breaking so the caller sees a grammar-terminal
                 // stop as stopped=true, matching decode_loop's `return Ok(true)`.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    if !engine.advance(gs, next_id) {
-                        stopped = true;
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                    && !engine.advance(gs, next_id)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 // Track when the thinking block closes (natural or forced).
@@ -482,10 +482,10 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len {
-                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                        break;
-                    }
+                if let Some(end) = reasoning_end_len
+                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+                {
+                    break;
                 }
             }
 
@@ -576,12 +576,12 @@ impl Qwen35Model {
 
                 // Grammar advance on the actually-emitted token (after any budget
                 // override): break cleanly when the grammar signals completion.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    if !engine.advance(gs, next_id) {
-                        stopped = true;
-                        stop_reason = StopReason::Grammar;
-                        break;
-                    }
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
+                    && !engine.advance(gs, next_id)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 // Track when the thinking block closes (natural or forced).
@@ -610,10 +610,10 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len {
-                    if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                        break;
-                    }
+                if let Some(end) = reasoning_end_len
+                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+                {
+                    break;
                 }
             }
 
@@ -859,10 +859,10 @@ fn decode_loop(
 
         // Grammar advance on the actually-emitted token (after any budget
         // override); a false return signals grammar completion.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            if !engine.advance(gs, next_id) {
-                return Ok((true, StopReason::Grammar));
-            }
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state)
+            && !engine.advance(gs, next_id)
+        {
+            return Ok((true, StopReason::Grammar));
         }
 
         // Track when the thinking block closes (natural or forced).
@@ -882,10 +882,10 @@ fn decode_loop(
         }
 
         // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if let Some(end) = reasoning_end_len {
-            if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                break;
-            }
+        if let Some(end) = reasoning_end_len
+            && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+        {
+            break;
         }
     }
     Ok((false, StopReason::Length))
@@ -967,12 +967,12 @@ fn decode_loop_with_stops(
 
         // Grammar advance on the actually-emitted token (after any budget
         // override); a false return signals grammar completion.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            if !engine.advance(gs, next_id) {
-                stopped = true;
-                stop_reason = StopReason::Grammar;
-                break;
-            }
+        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state)
+            && !engine.advance(gs, next_id)
+        {
+            stopped = true;
+            stop_reason = StopReason::Grammar;
+            break;
         }
 
         // Track when the thinking block closes (natural or forced).
@@ -1006,10 +1006,10 @@ fn decode_loop_with_stops(
         }
 
         // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if let Some(end) = reasoning_end_len {
-            if generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens {
-                break;
-            }
+        if let Some(end) = reasoning_end_len
+            && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
+        {
+            break;
         }
     }
 

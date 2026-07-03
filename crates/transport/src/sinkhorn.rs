@@ -625,7 +625,7 @@ impl SinkhornSolver {
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
             iterations = iteration + 1;
-            if iterations % check_every == 0 || iterations == self.config.max_iterations {
+            if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
                 let (row_res, col_res) = marginal_residuals(
                     cost,
                     epsilon,
@@ -779,7 +779,7 @@ impl SinkhornSolver {
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
             iterations = iteration + 1;
-            if iterations % check_every == 0 || iterations == self.config.max_iterations {
+            if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
                 // FP-026: convergence criterion is marginal constraint satisfaction
                 // (L1 residuals), not dual-variable update size. Dual updates are a
                 // proxy that can declare convergence while marginal constraints are

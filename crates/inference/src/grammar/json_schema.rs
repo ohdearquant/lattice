@@ -640,13 +640,13 @@ impl<'a> CompileCtx<'a> {
         // object schema with an absurd number of keys overflows the stack at
         // compile time. Reject at the parse boundary, mirroring the
         // `MAX_ARRAY_CARDINALITY` guard.
-        if let Some(m) = properties_map {
-            if m.len() > MAX_OBJECT_PROPERTIES {
-                return Err(SchemaError(format!(
-                    "object property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
-                    m.len()
-                )));
-            }
+        if let Some(m) = properties_map
+            && m.len() > MAX_OBJECT_PROPERTIES
+        {
+            return Err(SchemaError(format!(
+                "object property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                m.len()
+            )));
         }
         let properties = properties_map.map(|m| m.iter().collect::<Vec<_>>());
 
@@ -655,13 +655,13 @@ impl<'a> CompileCtx<'a> {
         // `properties` (a schema can declare a huge `required` array against a
         // tiny or empty `properties` map), and the filter_map/collect below is
         // proportional to it — bound it before collecting too.
-        if let Some(a) = required_arr {
-            if a.len() > MAX_OBJECT_PROPERTIES {
-                return Err(SchemaError(format!(
-                    "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
-                    a.len()
-                )));
-            }
+        if let Some(a) = required_arr
+            && a.len() > MAX_OBJECT_PROPERTIES
+        {
+            return Err(SchemaError(format!(
+                "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                a.len()
+            )));
         }
         let required: Vec<&str> = required_arr
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
@@ -986,21 +986,21 @@ impl<'a> CompileCtx<'a> {
                 "array schema minItems ({min_items}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
             )));
         }
-        if let Some(max) = max_items {
-            if max > MAX_ARRAY_CARDINALITY {
-                return Err(SchemaError(format!(
-                    "array schema maxItems ({max}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
-                )));
-            }
+        if let Some(max) = max_items
+            && max > MAX_ARRAY_CARDINALITY
+        {
+            return Err(SchemaError(format!(
+                "array schema maxItems ({max}) exceeds the supported limit ({MAX_ARRAY_CARDINALITY})"
+            )));
         }
 
         // issue #310 finding #2: validate cardinality constraints up front.
-        if let Some(max) = max_items {
-            if max < min_items {
-                return Err(SchemaError(format!(
-                    "array schema maxItems ({max}) < minItems ({min_items})"
-                )));
-            }
+        if let Some(max) = max_items
+            && max < min_items
+        {
+            return Err(SchemaError(format!(
+                "array schema maxItems ({max}) < minItems ({min_items})"
+            )));
         }
 
         // issue #310 finding #3: handle prefixItems (tuple arrays).
@@ -1035,12 +1035,12 @@ impl<'a> CompileCtx<'a> {
                 }
 
                 // Cardinality validation against the fixed prefix length.
-                if let Some(m) = max_items {
-                    if m < p {
-                        return Err(SchemaError(format!(
-                            "array maxItems ({m}) < prefixItems length ({p})"
-                        )));
-                    }
+                if let Some(m) = max_items
+                    && m < p
+                {
+                    return Err(SchemaError(format!(
+                        "array maxItems ({m}) < prefixItems length ({p})"
+                    )));
                 }
                 if min_items > p {
                     return Err(SchemaError(format!(

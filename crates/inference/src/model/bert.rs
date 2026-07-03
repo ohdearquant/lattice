@@ -547,12 +547,11 @@ fn infer_config_from_safetensors(file: &SafetensorsFile) -> Result<BertConfig, I
 
     let mut max_layer = None::<usize>;
     for name in file.tensor_names() {
-        if let Some(rest) = name.strip_prefix("encoder.layer.") {
-            if let Some(index_str) = rest.split('.').next() {
-                if let Ok(index) = index_str.parse::<usize>() {
-                    max_layer = Some(max_layer.map_or(index, |curr| curr.max(index)));
-                }
-            }
+        if let Some(rest) = name.strip_prefix("encoder.layer.")
+            && let Some(index_str) = rest.split('.').next()
+            && let Ok(index) = index_str.parse::<usize>()
+        {
+            max_layer = Some(max_layer.map_or(index, |curr| curr.max(index)));
         }
     }
 

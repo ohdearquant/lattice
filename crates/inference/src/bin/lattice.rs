@@ -541,16 +541,16 @@ mod serve {
                 code: "unsupported_feature",
             });
         }
-        if let Some(fmt) = &req.response_format {
-            if fmt.r#type != "text" {
-                return Err(ApiError::BadRequest {
-                    message: format!(
-                        "response_format.type '{}' is not supported; use 'text'",
-                        fmt.r#type
-                    ),
-                    code: "unsupported_feature",
-                });
-            }
+        if let Some(fmt) = &req.response_format
+            && fmt.r#type != "text"
+        {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "response_format.type '{}' is not supported; use 'text'",
+                    fmt.r#type
+                ),
+                code: "unsupported_feature",
+            });
         }
         Ok(())
     }

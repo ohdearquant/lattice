@@ -129,19 +129,19 @@ impl RegularizationConfig {
                 self.label_smoothing
             )));
         }
-        if let Some(clip) = self.gradient_clip {
-            if clip <= 0.0 {
-                return Err(TuneError::InvalidConfig(
-                    "gradient_clip must be > 0".to_string(),
-                ));
-            }
+        if let Some(clip) = self.gradient_clip
+            && clip <= 0.0
+        {
+            return Err(TuneError::InvalidConfig(
+                "gradient_clip must be > 0".to_string(),
+            ));
         }
-        if let Some(alpha) = self.mixup_alpha {
-            if alpha <= 0.0 {
-                return Err(TuneError::InvalidConfig(
-                    "mixup_alpha must be > 0".to_string(),
-                ));
-            }
+        if let Some(alpha) = self.mixup_alpha
+            && alpha <= 0.0
+        {
+            return Err(TuneError::InvalidConfig(
+                "mixup_alpha must be > 0".to_string(),
+            ));
         }
         Ok(())
     }

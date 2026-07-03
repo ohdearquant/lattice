@@ -126,12 +126,12 @@ impl EndpointSecurity {
 
     /// Verify model checksum (for local models)
     pub fn verify_model_checksum(&self, actual_checksum: &str) -> Result<(), String> {
-        if let Some(ref expected) = self.model_checksum {
-            if expected != actual_checksum {
-                return Err(format!(
-                    "Model checksum mismatch: expected {expected}, got {actual_checksum}"
-                ));
-            }
+        if let Some(ref expected) = self.model_checksum
+            && expected != actual_checksum
+        {
+            return Err(format!(
+                "Model checksum mismatch: expected {expected}, got {actual_checksum}"
+            ));
         }
         Ok(())
     }

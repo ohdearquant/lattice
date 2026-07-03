@@ -183,21 +183,20 @@ fn load_lora_safetensors(
         if let Some(rest) = name.strip_prefix("base_model.model.model.layers.") {
             let parts: Vec<&str> = rest.splitn(6, '.').collect();
             // parts: [i, "self_attn", module, "lora_A" | "lora_B", "weight"]
-            if parts.len() >= 4 {
-                if let Ok(layer_idx) = parts[0].parse::<usize>() {
-                    if parts[1] == "self_attn" {
-                        let module = parts[2].to_string();
-                        let is_a = parts[3] == "lora_A";
-                        let is_b = parts[3] == "lora_B";
-                        if is_a || is_b {
-                            parsed.push(ParsedKey {
-                                layer_idx,
-                                module,
-                                is_a,
-                                tensor_name: name.clone(),
-                            });
-                        }
-                    }
+            if parts.len() >= 4
+                && let Ok(layer_idx) = parts[0].parse::<usize>()
+                && parts[1] == "self_attn"
+            {
+                let module = parts[2].to_string();
+                let is_a = parts[3] == "lora_A";
+                let is_b = parts[3] == "lora_B";
+                if is_a || is_b {
+                    parsed.push(ParsedKey {
+                        layer_idx,
+                        module,
+                        is_a,
+                        tensor_name: name.clone(),
+                    });
                 }
             }
             continue;
@@ -207,21 +206,20 @@ fn load_lora_safetensors(
         if let Some(rest) = name.strip_prefix("model.layers.") {
             let parts: Vec<&str> = rest.splitn(5, '.').collect();
             // parts: [i, "self_attn", module, "lora_a" | "lora_b"]
-            if parts.len() >= 4 {
-                if let Ok(layer_idx) = parts[0].parse::<usize>() {
-                    if parts[1] == "self_attn" {
-                        let module = parts[2].to_string();
-                        let is_a = parts[3] == "lora_a";
-                        let is_b = parts[3] == "lora_b";
-                        if is_a || is_b {
-                            parsed.push(ParsedKey {
-                                layer_idx,
-                                module,
-                                is_a,
-                                tensor_name: name.clone(),
-                            });
-                        }
-                    }
+            if parts.len() >= 4
+                && let Ok(layer_idx) = parts[0].parse::<usize>()
+                && parts[1] == "self_attn"
+            {
+                let module = parts[2].to_string();
+                let is_a = parts[3] == "lora_a";
+                let is_b = parts[3] == "lora_b";
+                if is_a || is_b {
+                    parsed.push(ParsedKey {
+                        layer_idx,
+                        module,
+                        is_a,
+                        tensor_name: name.clone(),
+                    });
                 }
             }
         }

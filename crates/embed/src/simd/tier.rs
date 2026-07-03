@@ -379,11 +379,12 @@ pub fn approximate_cosine_distance_prepared_with_meta(
     stored: &QuantizedData,
     stored_norm: NormalizationHint,
 ) -> f32 {
-    if meta.norm == NormalizationHint::Unit && stored_norm == NormalizationHint::Unit {
-        if let (PreparedQuery::Full(q), QuantizedData::Full(s)) = (&meta.query, stored) {
-            let dot = dot_product(q, s);
-            return 1.0 - dot.clamp(-1.0, 1.0);
-        }
+    if meta.norm == NormalizationHint::Unit
+        && stored_norm == NormalizationHint::Unit
+        && let (PreparedQuery::Full(q), QuantizedData::Full(s)) = (&meta.query, stored)
+    {
+        let dot = dot_product(q, s);
+        return 1.0 - dot.clamp(-1.0, 1.0);
     }
     approximate_cosine_distance_prepared(&meta.query, stored)
 }
