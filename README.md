@@ -37,7 +37,7 @@ library from a single window. To build and install it, follow the step-by-step g
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Pure Rust compute      | Hand-written SIMD kernels (AVX2/NEON). No C++, no ONNX, no CUDA.                                                                                                                                                                                |
 | Metal GPU backend      | Native Apple Silicon acceleration via Metal MSL shaders. WGPU fallback for cross-platform.                                                                                                                                                      |
-| Generation models      | Qwen3.5-0.8B / 2B via `lattice chat`/`serve`. Qwen3.6-27B: engine-level loader + quantized Metal generation, not yet wired into `chat`/`serve`. Qwen3.6-35B-A3B (MoE): config + weight loader support. Hybrid GatedDeltaNet + GQA architecture. |
+| Generation models      | Qwen3.5-0.8B / 2B via `lattice chat`/`serve`. Qwen3.6-27B via `lattice chat`/`serve` from a native Q4 checkpoint (requires the Metal GPU build, `--features "f16 metal-gpu"`); safetensors 27B is loader-level only. Qwen3.6-35B-A3B (MoE): config + weight loader support. Hybrid GatedDeltaNet + GQA architecture. |
 | Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.                                                                                                                                                  |
 | Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                                                                                                                                                                          |
 | Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5.                                                                                                                                                  |
@@ -352,7 +352,7 @@ E5 `embed_passage()` applies the `"passage: "` prefix automatically.
 | `Qwen35Config::qwen35_0_8b`    | 24 layers, 1024 hidden, 1 MTP layer. Base decode shipped; MTP experimental.                                                 |
 | `Qwen35Config::qwen35_2b`      | 24 layers, 2048 hidden, dense FFN, tied embeddings.                                                                         |
 | `Qwen35Config::qwen36_35b_a3b` | 40 layers, MoE 256 experts top-8. Config and weight loader supported.                                                       |
-| `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN. Loader/config support plus quantized Metal generation; not yet a `chat`/`serve` surface. |
+| `Qwen35Config::qwen36_27b`     | 64 layers, 5120 hidden, dense FFN. Runs in `lattice chat`/`serve` from a native Q4 checkpoint (Metal GPU build).            |
 
 The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA attention layers.
 Lattice is the only open-source engine that correctly runs this hybrid recurrence at Q4 on Apple Silicon.
