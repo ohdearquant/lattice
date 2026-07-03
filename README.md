@@ -182,8 +182,9 @@ Build from source (requires Rust 1.93+ and, for Metal, macOS 14+):
 git clone https://github.com/ohdearquant/lattice
 cd lattice
 
-# CLI binary (chat + serve)
-cargo build --release -p lattice-inference --bin lattice
+# CLI binary (chat + serve). The f16 feature is required to load the
+# BF16/F16 safetensors that HuggingFace checkpoints ship in.
+cargo build --release -p lattice-inference --bin lattice --features f16
 
 # Interactive chat
 ./target/release/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
@@ -208,12 +209,15 @@ Requirements and tips:
 
 - **64-bit OS required.** Raspberry Pi OS (64-bit) or Ubuntu Server for Pi. Check with
   `uname -m` — it must say `aarch64`, not `armv7l`.
-- **Rust via rustup** (1.93+): `curl https://sh.rustup.rs -sSf | sh`, then build with the
-  default features exactly as above. Leave `metal-gpu` off — it is macOS-only.
+- **Rust via rustup** (1.93+): `curl https://sh.rustup.rs -sSf | sh`, then build with
+  `--features f16` exactly as above — without it, BF16/F16 checkpoints fail at load
+  time. Leave `metal-gpu` off — it is macOS-only.
 - **Memory: 8 GB strongly recommended for chat models.** The CPU path converts bf16
-  weights to f32 in RAM, so Qwen3.5-0.8B occupies roughly 3.2 GB plus KV cache and
-  activations. On a 4 GB board this will swap-thrash or be OOM-killed. Embedding models
-  are much smaller (bge-small is ~130 MB) and run comfortably on 4 GB.
+  weights to f32 in RAM, so Qwen3.5-0.8B occupies roughly 3.2 GB steady-state plus KV
+  cache and activations — and the load-time peak is higher still, because the mapped
+  bf16 source and converted f32 tensors coexist during conversion. On a 4 GB board this
+  will swap-thrash or be OOM-killed. Embedding models are much smaller (bge-small is
+  ~130 MB) and run comfortably on 4 GB.
 - **Get a chat model** the same way as on macOS — download from HuggingFace and point
   `--model` at the directory:
 
