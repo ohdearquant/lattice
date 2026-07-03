@@ -246,12 +246,12 @@ mod backend {
             let dir = tempdir("q4-no-metal");
             fs::write(dir.join("model_layers_0_weight.q4"), b"stub").unwrap();
             assert_eq!(detect_format(&dir), ModelFormat::Q4);
-            // With metal-gpu compiled out there is no code path that can load
-            // this directory; the caller must reject it with
-            // `metal_gpu_required_message` rather than attempting
-            // `Qwen35Model::from_safetensors` (which would fail with a
-            // confusing "missing model.safetensors" error instead of the
-            // accurate "needs metal-gpu" one).
+            // Scope: detection + message content only. This proves a Q4 dir
+            // classifies as `ModelFormat::Q4` (so the `run_chat`/`main` match
+            // arms take the fail-closed branch, never
+            // `Qwen35Model::from_safetensors`) and that the error names the
+            // rebuild flags. It does not drive `run_chat`/`main` themselves —
+            // those exit the process, which a unit test cannot cross.
             let msg = metal_gpu_required_message(&dir);
             assert!(msg.contains("metal-gpu"));
             fs::remove_dir_all(&dir).ok();
@@ -520,29 +520,13 @@ mod serve {
         /// the socket.
         fn spawn(
             model_dir: std::path::PathBuf,
-            tokenizer_dir: Option<std::path::PathBuf>,
+            tokenizer_path: std::path::PathBuf,
+            tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
         ) -> Result<Self, String> {
             let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<MetalJob>();
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
             std::thread::spawn(move || {
-                let tokenizer_path = tokenizer_dir
-                    .as_deref()
-                    .unwrap_or(&model_dir)
-                    .join("tokenizer.json");
-                let tokenizer =
-                    match lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(
-                        &tokenizer_path,
-                    ) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(format!(
-                                "tokenizer load failed ({}): {e}",
-                                tokenizer_path.display()
-                            )));
-                            return;
-                        }
-                    };
                 let cfg = match super::load_q4_config(&model_dir) {
                     Ok(c) => c,
                     Err(e) => {
@@ -656,16 +640,20 @@ mod serve {
                 .as_deref()
                 .unwrap_or(&model_dir)
                 .join("tokenizer.json");
-            let tokenizer = lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(
-                &tokenizer_path,
-            )
-            .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?;
+            let tokenizer = Arc::new(
+                lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(
+                    &tokenizer_path,
+                )
+                .map_err(|e| {
+                    format!("tokenizer load failed ({}): {e}", tokenizer_path.display())
+                })?,
+            );
             let max_context = super::MetalChatBackend::MAX_CACHE_LEN;
-            let handle = MetalHandle::spawn(model_dir, tokenizer_dir)?;
+            let handle = MetalHandle::spawn(model_dir, tokenizer_path, Arc::clone(&tokenizer))?;
             Ok((
                 ModelBackend::Metal {
                     handle,
-                    tokenizer: Arc::new(tokenizer),
+                    tokenizer,
                     max_context,
                 },
                 max_context,
