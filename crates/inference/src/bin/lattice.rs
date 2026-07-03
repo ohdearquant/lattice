@@ -20,7 +20,8 @@ struct Cli {
 enum Command {
     /// Interactive chat with a model
     Chat {
-        /// Path to model directory (SafeTensors + config.json)
+        /// Path to model directory (SafeTensors, or a native Q4 quantized
+        /// directory produced by `quantize_q4`)
         #[arg(long)]
         model: String,
         /// Maximum tokens to generate per response
@@ -29,10 +30,16 @@ enum Command {
         /// Sampling temperature
         #[arg(long, default_value = "0.7")]
         temperature: f32,
+        /// Directory containing tokenizer.json, when it is not shipped inside
+        /// --model (only needed for Q4 directories produced without a
+        /// co-located tokenizer; safetensors directories always ship one).
+        #[arg(long)]
+        tokenizer_dir: Option<String>,
     },
     /// Start HTTP server with OpenAI-compatible API
     Serve {
-        /// Path to model directory
+        /// Path to model directory (SafeTensors, or a native Q4 quantized
+        /// directory produced by `quantize_q4`)
         #[arg(long)]
         model: String,
         /// Host address to bind (default: 127.0.0.1; use 0.0.0.0 for LAN)
@@ -47,23 +54,336 @@ enum Command {
         /// Model identifier echoed in responses (defaults to the model path basename)
         #[arg(long)]
         model_id: Option<String>,
+        /// Directory containing tokenizer.json, when it is not shipped inside
+        /// --model (only needed for Q4 directories produced without a
+        /// co-located tokenizer; safetensors directories always ship one).
+        #[arg(long)]
+        tokenizer_dir: Option<String>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// backend: model-directory format detection + Q4/Metal loading
+//
+// `lattice chat`/`lattice serve` originally only understood a safetensors
+// directory (`model.safetensors` or a sharded index). This module adds
+// support for native Q4 quantized directories (per-tensor `.q4` files, the
+// output of `quantize_q4`) by detecting the format up front and routing to
+// the Metal GPU forward pass. Safetensors directories are completely
+// unaffected: `detect_format` returns `Safetensors` for them exactly as
+// before, and the safetensors load path is untouched.
+// ---------------------------------------------------------------------------
+
+mod backend {
+    use std::path::Path;
+
+    /// The on-disk format of a model directory, decided before any tensor I/O.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModelFormat {
+        /// `model.safetensors` or `model.safetensors.index.json` present.
+        Safetensors,
+        /// No safetensors file, but at least one `*.q4` tensor file present
+        /// (the output of `quantize_q4`).
+        Q4,
+        /// Neither a safetensors file nor a `.q4` file was found.
+        Unknown,
+    }
+
+    /// Detect whether `dir` is a safetensors model directory, a native Q4
+    /// quantized directory, or neither.
+    ///
+    /// Mirrors the detection heuristic already shipped in `chat_metal.rs` and
+    /// `lattice_serve.rs`: a directory is Q4 when it has no safetensors file
+    /// and contains at least one file whose name ends in `.q4`.
+    pub fn detect_format(dir: &Path) -> ModelFormat {
+        if dir.join("model.safetensors").exists()
+            || dir.join("model.safetensors.index.json").exists()
+        {
+            return ModelFormat::Safetensors;
+        }
+        let has_q4_file = std::fs::read_dir(dir)
+            .ok()
+            .and_then(|mut entries| {
+                entries.find(|e| {
+                    e.as_ref()
+                        .ok()
+                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
+                        .unwrap_or(false)
+                })
+            })
+            .is_some();
+        if has_q4_file {
+            ModelFormat::Q4
+        } else {
+            ModelFormat::Unknown
+        }
+    }
+
+    /// Error message shown when a Q4 directory is passed to a binary that was
+    /// built without the `metal-gpu` feature. Q4 inference only runs on the
+    /// Metal GPU forward pass; there is no CPU fallback for `.q4` tensors, so
+    /// this is a hard, fail-closed error rather than a silent degrade.
+    ///
+    /// Only reachable from the `#[cfg(not(feature = "metal-gpu"))]` call sites
+    /// in `run_chat` / `main`; a `metal-gpu` build never calls this (it loads
+    /// Q4 directories instead), so it is legitimately unused in that
+    /// configuration rather than by mistake.
+    #[cfg_attr(feature = "metal-gpu", allow(dead_code))]
+    pub fn metal_gpu_required_message(dir: &Path) -> String {
+        format!(
+            "model directory '{}' is a native Q4 quantized checkpoint, which requires \
+             the Metal GPU forward pass. This binary was built without the `metal-gpu` \
+             feature. Rebuild with `--features \"f16 metal-gpu\"` (macOS only), or point \
+             --model at a safetensors directory instead.",
+            dir.display()
+        )
+    }
+
+    /// Error message for a directory that is neither safetensors nor Q4.
+    pub fn unrecognized_format_message(dir: &Path) -> String {
+        format!(
+            "'{}' is not a recognized model directory: no model.safetensors, \
+             model.safetensors.index.json, or *.q4 tensor files were found",
+            dir.display()
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::fs;
+
+        fn tempdir(name: &str) -> std::path::PathBuf {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!(
+                "lattice-backend-test-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&dir).expect("create tempdir");
+            dir
+        }
+
+        #[test]
+        fn detect_format_safetensors_file() {
+            let dir = tempdir("safetensors-file");
+            fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_format_safetensors_index_only() {
+            let dir = tempdir("safetensors-index");
+            fs::write(dir.join("model.safetensors.index.json"), b"{}").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_format_q4_dir() {
+            let dir = tempdir("q4");
+            fs::write(dir.join("model_layers_0_weight.q4"), b"stub").unwrap();
+            fs::write(dir.join("config.json"), b"{}").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Q4);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_format_prefers_safetensors_over_q4_files() {
+            // A directory that (unusually) has both a safetensors file and a
+            // stray .q4 file must resolve as Safetensors — the safetensors
+            // loader path is untouched and takes priority.
+            let dir = tempdir("mixed");
+            fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+            fs::write(dir.join("leftover.q4"), b"stub").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_format_empty_dir_is_unknown() {
+            let dir = tempdir("empty");
+            assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn detect_format_unrelated_files_is_unknown() {
+            let dir = tempdir("unrelated");
+            fs::write(dir.join("readme.txt"), b"hello").unwrap();
+            fs::write(dir.join("config.json"), b"{}").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn metal_gpu_required_message_mentions_rebuild_flags() {
+            let msg = metal_gpu_required_message(Path::new("/tmp/some-q4-dir"));
+            assert!(msg.contains("metal-gpu"));
+            assert!(msg.contains("--features"));
+        }
+
+        #[test]
+        fn unrecognized_format_message_mentions_expected_files() {
+            let msg = unrecognized_format_message(Path::new("/tmp/bogus"));
+            assert!(msg.contains("model.safetensors"));
+            assert!(msg.contains(".q4"));
+        }
+
+        // Fail-closed without metal-gpu: a Q4 directory must never silently
+        // fall back to the CPU safetensors loader. This test only compiles
+        // (and only means anything) when the binary is built WITHOUT the
+        // metal-gpu feature — it asserts that the code path this binary
+        // would take for a Q4 directory is the explicit error message above,
+        // never `Qwen35Model::from_safetensors`.
+        #[cfg(not(feature = "metal-gpu"))]
+        #[test]
+        fn q4_dir_without_metal_gpu_feature_fails_closed() {
+            let dir = tempdir("q4-no-metal");
+            fs::write(dir.join("model_layers_0_weight.q4"), b"stub").unwrap();
+            assert_eq!(detect_format(&dir), ModelFormat::Q4);
+            // Scope: detection + message content only. This proves a Q4 dir
+            // classifies as `ModelFormat::Q4` (so the `run_chat`/`main` match
+            // arms take the fail-closed branch, never
+            // `Qwen35Model::from_safetensors`) and that the error names the
+            // rebuild flags. It does not drive `run_chat`/`main` themselves —
+            // those exit the process, which a unit test cannot cross.
+            let msg = metal_gpu_required_message(&dir);
+            assert!(msg.contains("metal-gpu"));
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // chat subcommand
 // ---------------------------------------------------------------------------
 
-fn run_chat(model_path: &str, max_tokens: usize, temperature: f32) {
+/// Load `config.json` for a Q4 directory, falling back to the Qwen3.6-27B
+/// default config (matching `chat_metal.rs` / `lattice_serve.rs`) when the
+/// directory has none, with a visible warning so a missing config.json is
+/// never silently misinterpreted as intentional.
+#[cfg(feature = "metal-gpu")]
+fn load_q4_config(
+    dir: &std::path::Path,
+) -> Result<lattice_inference::model::qwen35_config::Qwen35Config, String> {
+    let config_path = dir.join("config.json");
+    if config_path.exists() {
+        lattice_inference::model::qwen35_config::Qwen35Config::from_config_json(&config_path)
+            .map_err(|e| format!("config.json parse failed: {e}"))
+    } else {
+        eprintln!(
+            "Warning: {} has no config.json; falling back to the Qwen3.6-27B default config.",
+            dir.display()
+        );
+        Ok(lattice_inference::model::qwen35_config::Qwen35Config::qwen36_27b())
+    }
+}
+
+/// Metal-GPU chat backend: owns a `MetalQwen35State` plus the tokenizer and
+/// context-window cap needed to serve `generate`/`generate_streaming` calls
+/// the same way the CPU (`Qwen35Model`) backend does.
+///
+/// `MetalQwen35State` is `!Send` (it owns raw `metal::*` FFI objects), so
+/// this type must never be shared across threads. `run_chat`'s REPL uses it
+/// directly on the calling thread; the `serve` module never constructs one
+/// on an async task — it lives on a dedicated worker thread instead (see
+/// `serve::spawn_metal_worker`).
+#[cfg(feature = "metal-gpu")]
+struct MetalChatBackend {
+    state: lattice_inference::forward::metal_qwen35::MetalQwen35State,
+    tokenizer: lattice_inference::tokenizer::bpe::BpeTokenizer,
+}
+
+#[cfg(feature = "metal-gpu")]
+impl MetalChatBackend {
+    /// `max_cache_len` bounds the KV cache (and therefore the usable context
+    /// window). 4096 matches the cap used by `chat_metal.rs`.
+    const MAX_CACHE_LEN: usize = 4096;
+
+    /// `tokenizer_dir` overrides where `tokenizer.json` is read from, for Q4
+    /// directories that were produced without a co-located tokenizer. `None`
+    /// resolves it from `dir` itself (the common case: Q4 dirs ship it).
+    fn load(
+        dir: &std::path::Path,
+        tokenizer_dir: Option<&std::path::Path>,
+    ) -> Result<Self, String> {
+        let tokenizer_path = tokenizer_dir.unwrap_or(dir).join("tokenizer.json");
+        let tokenizer =
+            lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
+                .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?;
+        let cfg = load_q4_config(dir)?;
+        let state = lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
+            dir,
+            &tokenizer_path,
+            &cfg,
+            Self::MAX_CACHE_LEN,
+        )
+        .map_err(|e| format!("Q4 model load failed: {e}"))?;
+        Ok(Self { state, tokenizer })
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        gen_cfg: &lattice_inference::model::qwen35_config::GenerateConfig,
+    ) -> lattice_inference::model::qwen35_config::GenerateOutput {
+        self.state.generate(prompt, &self.tokenizer, gen_cfg)
+    }
+}
+
+fn run_chat(model_path: &str, max_tokens: usize, temperature: f32, tokenizer_dir: Option<&str>) {
     use std::io::{BufRead, Write};
     use std::path::Path;
 
     let path = Path::new(model_path);
+    let format = backend::detect_format(path);
+    #[cfg(feature = "metal-gpu")]
+    let tokenizer_dir_path = tokenizer_dir.map(Path::new);
+    #[cfg(not(feature = "metal-gpu"))]
+    let _ = tokenizer_dir;
+
     eprintln!("Loading model from {model_path}...");
-    let model = match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Error: failed to load model: {e}");
+
+    enum Backend {
+        Cpu(Box<lattice_inference::model::qwen35::Qwen35Model>),
+        #[cfg(feature = "metal-gpu")]
+        Metal(Box<MetalChatBackend>),
+    }
+
+    let mut model = match format {
+        backend::ModelFormat::Safetensors => {
+            match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(path) {
+                Ok(m) => Backend::Cpu(Box::new(m)),
+                Err(e) => {
+                    eprintln!("Error: failed to load model: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        backend::ModelFormat::Q4 => {
+            #[cfg(feature = "metal-gpu")]
+            {
+                match MetalChatBackend::load(path, tokenizer_dir_path) {
+                    Ok(m) => Backend::Metal(Box::new(m)),
+                    Err(e) => {
+                        eprintln!("Error: failed to load Q4 model: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            #[cfg(not(feature = "metal-gpu"))]
+            {
+                eprintln!("Error: {}", backend::metal_gpu_required_message(path));
+                std::process::exit(1);
+            }
+        }
+        backend::ModelFormat::Unknown => {
+            eprintln!("Error: {}", backend::unrecognized_format_message(path));
             std::process::exit(1);
         }
     };
@@ -94,17 +414,29 @@ fn run_chat(model_path: &str, max_tokens: usize, temperature: f32) {
             break;
         }
 
-        match model.generate(trimmed, &gen_cfg) {
-            Ok(output) => {
+        match &mut model {
+            Backend::Cpu(m) => match m.generate(trimmed, &gen_cfg) {
+                Ok(output) => {
+                    let _ = writeln!(stdout, "{}", output.text);
+                    let _ = writeln!(
+                        stdout,
+                        "[{} prompt tokens, {} generated]",
+                        output.prompt_tokens, output.generated_tokens
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Generation error: {e}");
+                }
+            },
+            #[cfg(feature = "metal-gpu")]
+            Backend::Metal(m) => {
+                let output = m.generate(trimmed, &gen_cfg);
                 let _ = writeln!(stdout, "{}", output.text);
                 let _ = writeln!(
                     stdout,
                     "[{} prompt tokens, {} generated]",
                     output.prompt_tokens, output.generated_tokens
                 );
-            }
-            Err(e) => {
-                eprintln!("Generation error: {e}");
             }
         }
     }
@@ -127,6 +459,9 @@ mod serve {
     };
     use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
+    #[cfg(feature = "metal-gpu")]
+    use lattice_inference::model::qwen35_config::GenerateConfig;
+    use lattice_inference::model::qwen35_config::GenerateOutput;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::sync::Arc;
@@ -137,15 +472,204 @@ mod serve {
     const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 
     // -----------------------------------------------------------------------
+    // Model backend: CPU (safetensors) or Metal GPU (native Q4)
+    // -----------------------------------------------------------------------
+
+    /// One generation request handed to the Metal GPU worker thread.
+    ///
+    /// `MetalQwen35State` owns raw `metal::*` FFI objects and is `!Send`, so it
+    /// cannot be moved into a `tokio::task::spawn_blocking` closure the way the
+    /// CPU model is (`Arc<Qwen35Model>` is `Send + Sync`; `MetalQwen35State` is
+    /// neither). Instead the Metal state lives on ONE dedicated OS thread for
+    /// the whole process lifetime, and async handlers ship it a `MetalJob` over
+    /// an unbounded `tokio::sync::mpsc` channel — the same design already
+    /// shipped in `lattice_serve.rs`. `on_token` is called synchronously from
+    /// the worker thread for each streamed delta; returning `false` stops
+    /// generation early (client disconnected).
+    ///
+    /// This serializes ALL Metal generation onto one thread: two concurrent
+    /// requests to a Q4-backed `lattice serve` run back-to-back, not in
+    /// parallel. That is correct for a single-GPU local engine (the same
+    /// default ollama uses) and is documented here rather than hidden behind
+    /// an innocuous-looking channel send.
+    #[cfg(feature = "metal-gpu")]
+    struct MetalJob {
+        prompt: String,
+        gen_cfg: GenerateConfig,
+        on_token: Box<dyn FnMut(&str) -> bool + Send>,
+        reply: tokio::sync::oneshot::Sender<GenerateOutput>,
+    }
+
+    /// Handle to the Metal GPU worker thread. Cheaply `Clone` (an `mpsc`
+    /// sender), `Send + Sync`, so it can live in `AppState` like the CPU
+    /// `Arc<Qwen35Model>` does — only the underlying `MetalQwen35State` is
+    /// confined to the worker thread.
+    #[cfg(feature = "metal-gpu")]
+    #[derive(Clone)]
+    pub struct MetalHandle {
+        jobs: tokio::sync::mpsc::UnboundedSender<MetalJob>,
+    }
+
+    #[cfg(feature = "metal-gpu")]
+    impl MetalHandle {
+        /// Load the Q4 model on a new dedicated worker thread and return a
+        /// handle once loading succeeds. Loading happens synchronously (the
+        /// caller blocks until the model is ready or loading fails) so that
+        /// `lattice serve`'s startup sequence keeps its existing "load, then
+        /// bind, then listen" ordering and fails closed before ever binding
+        /// the socket.
+        fn spawn(
+            model_dir: std::path::PathBuf,
+            tokenizer_path: std::path::PathBuf,
+            tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
+        ) -> Result<Self, String> {
+            let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<MetalJob>();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+            std::thread::spawn(move || {
+                let cfg = match super::load_q4_config(&model_dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut state =
+                    match lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
+                        &model_dir,
+                        &tokenizer_path,
+                        &cfg,
+                        super::MetalChatBackend::MAX_CACHE_LEN,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("Q4 model load failed: {e}")));
+                            return;
+                        }
+                    };
+                let _ = ready_tx.send(Ok(()));
+
+                while let Some(job) = job_rx.blocking_recv() {
+                    let mut on_token = job.on_token;
+                    let output = state.generate_streaming(
+                        &job.prompt,
+                        &tokenizer,
+                        &job.gen_cfg,
+                        |delta, _token_id| on_token(delta),
+                    );
+                    let _ = job.reply.send(output);
+                }
+            });
+
+            match ready_rx.recv() {
+                Ok(Ok(())) => Ok(Self { jobs: job_tx }),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("Metal worker thread exited before loading finished".to_string()),
+            }
+        }
+
+        /// Run one generation on the worker thread, forwarding each token
+        /// delta to `on_token`. Returns the full `GenerateOutput` (including
+        /// `stopped`/`stop_reason`) so callers can compute `finish_reason`
+        /// with the exact same `finish_reason_for` helper the CPU path uses.
+        async fn generate_streaming(
+            &self,
+            prompt: String,
+            gen_cfg: GenerateConfig,
+            on_token: impl FnMut(&str) -> bool + Send + 'static,
+        ) -> Result<GenerateOutput, ApiError> {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let job = MetalJob {
+                prompt,
+                gen_cfg,
+                on_token: Box::new(on_token),
+                reply: reply_tx,
+            };
+            self.jobs.send(job).map_err(|_| ApiError::Internal {
+                message: "inference worker is not running".to_string(),
+            })?;
+            reply_rx.await.map_err(|_| ApiError::Internal {
+                message: "inference worker dropped the request".to_string(),
+            })
+        }
+    }
+
+    /// The two ways `AppState` can run generation: the original CPU
+    /// (safetensors) path via `Arc<Qwen35Model>`, or the Metal GPU (native
+    /// Q4) path via a worker-thread handle. Both variants funnel into the
+    /// same request handler code below — `chat_completions` branches on this
+    /// enum in exactly two places (streaming and non-streaming) rather than
+    /// duplicating the handler.
+    #[derive(Clone)]
+    pub enum ModelBackend {
+        Cpu(Arc<lattice_inference::model::qwen35::Qwen35Model>),
+        #[cfg(feature = "metal-gpu")]
+        Metal {
+            handle: MetalHandle,
+            tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
+            max_context: usize,
+        },
+    }
+
+    impl ModelBackend {
+        pub fn tokenize_len(&self, text: &str) -> usize {
+            match self {
+                ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).real_length,
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).real_length,
+            }
+        }
+
+        pub fn max_context(&self) -> usize {
+            match self {
+                ModelBackend::Cpu(m) => m.max_context(),
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { max_context, .. } => *max_context,
+            }
+        }
+
+        /// Load a native Q4 checkpoint on a dedicated Metal worker thread and
+        /// return the `ModelBackend::Metal` handle plus the resolved context
+        /// window, for `main()`'s `Command::Serve` startup sequence.
+        #[cfg(feature = "metal-gpu")]
+        pub fn spawn_metal(
+            model_dir: std::path::PathBuf,
+            tokenizer_dir: Option<std::path::PathBuf>,
+        ) -> Result<(Self, usize), String> {
+            let tokenizer_path = tokenizer_dir
+                .as_deref()
+                .unwrap_or(&model_dir)
+                .join("tokenizer.json");
+            let tokenizer = Arc::new(
+                lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(
+                    &tokenizer_path,
+                )
+                .map_err(|e| {
+                    format!("tokenizer load failed ({}): {e}", tokenizer_path.display())
+                })?,
+            );
+            let max_context = super::MetalChatBackend::MAX_CACHE_LEN;
+            let handle = MetalHandle::spawn(model_dir, tokenizer_path, Arc::clone(&tokenizer))?;
+            Ok((
+                ModelBackend::Metal {
+                    handle,
+                    tokenizer,
+                    max_context,
+                },
+                max_context,
+            ))
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Shared application state
     // -----------------------------------------------------------------------
 
     /// State shared across all request handlers via axum's `State` extractor.
     #[derive(Clone)]
     pub struct AppState {
-        /// The loaded model, wrapped in Arc so it can be cheaply cloned into
-        /// `spawn_blocking` closures without copying weights.
-        pub model: Arc<lattice_inference::model::qwen35::Qwen35Model>,
+        /// The loaded model backend (CPU safetensors or Metal GPU Q4).
+        pub model: ModelBackend,
         /// Default `max_tokens` value used when a request omits the field.
         /// Set from the `--max-tokens` CLI flag passed to `lattice serve`.
         pub default_max_tokens: usize,
@@ -720,7 +1244,7 @@ mod serve {
         // Preflight: reject prompts that would overflow the model's context window
         // before entering the blocking generation path.  This converts what would
         // otherwise be a panic inside spawn_blocking into a clean 400 response.
-        let prompt_token_count = state.model.tokenizer().tokenize(&prompt).real_length;
+        let prompt_token_count = state.model.tokenize_len(&prompt);
         let max_context = state.model.max_context();
         if prompt_token_count == 0 || prompt_token_count.saturating_add(max_tokens) > max_context {
             return Err(ApiError::BadRequest {
@@ -743,7 +1267,7 @@ mod serve {
             ..Default::default()
         };
 
-        let model = Arc::clone(&state.model);
+        let model = state.model.clone();
 
         // Compute shared response metadata before branching on stream flag.
         let created = SystemTime::now()
@@ -774,34 +1298,64 @@ mod serve {
             let stream_id = response_id.clone();
             let stream_model = state.model_id.clone();
 
-            tokio::task::spawn_blocking(move || {
-                let tx_delta = tx.clone();
-                let result = model.generate_streaming(&prompt, &gen_cfg, |delta| {
-                    // Send each incremental text delta; ignore if the receiver
-                    // dropped (client disconnected).
-                    let _ = tx_delta.unbounded_send(StreamMsg::Delta(delta.to_string()));
-                });
-                match result {
-                    Ok(output) => {
-                        // Mirror the same finish-reason logic used by the
-                        // non-streaming path via the shared helper.
-                        if output.generated_tokens > max_tokens {
-                            eprintln!(
-                                "generation invariant violation: generated_tokens={} max_tokens={}",
-                                output.generated_tokens, max_tokens
-                            );
-                            let _ = tx.unbounded_send(StreamMsg::Failed);
-                        } else {
-                            let finish_reason = finish_reason_for(&output);
-                            let _ = tx.unbounded_send(StreamMsg::Done { finish_reason });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("generation error (streaming): {e}");
+            // Both backends funnel their result through this closure so the
+            // "generated_tokens > max_tokens invariant, then finish_reason_for"
+            // logic is written exactly once and shared by CPU and Metal.
+            let finish_streaming = {
+                let tx = tx.clone();
+                move |output: GenerateOutput| {
+                    if output.generated_tokens > max_tokens {
+                        eprintln!(
+                            "generation invariant violation: generated_tokens={} max_tokens={}",
+                            output.generated_tokens, max_tokens
+                        );
                         let _ = tx.unbounded_send(StreamMsg::Failed);
+                    } else {
+                        let finish_reason = finish_reason_for(&output);
+                        let _ = tx.unbounded_send(StreamMsg::Done { finish_reason });
                     }
                 }
-            });
+            };
+
+            match model {
+                ModelBackend::Cpu(cpu_model) => {
+                    tokio::task::spawn_blocking(move || {
+                        let tx_delta = tx.clone();
+                        let result = cpu_model.generate_streaming(&prompt, &gen_cfg, |delta| {
+                            // Send each incremental text delta; ignore if the receiver
+                            // dropped (client disconnected).
+                            let _ = tx_delta.unbounded_send(StreamMsg::Delta(delta.to_string()));
+                        });
+                        match result {
+                            Ok(output) => finish_streaming(output),
+                            Err(e) => {
+                                eprintln!("generation error (streaming): {e}");
+                                let _ = tx.unbounded_send(StreamMsg::Failed);
+                            }
+                        }
+                    });
+                }
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { handle, .. } => {
+                    tokio::spawn(async move {
+                        let tx_delta = tx.clone();
+                        let result = handle
+                            .generate_streaming(prompt, gen_cfg, move |delta| {
+                                tx_delta
+                                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                    .is_ok()
+                            })
+                            .await;
+                        match result {
+                            Ok(output) => finish_streaming(output),
+                            Err(e) => {
+                                eprintln!("generation error (streaming, metal): {e:?}");
+                                let _ = tx.unbounded_send(StreamMsg::Failed);
+                            }
+                        }
+                    });
+                }
+            }
 
             // Build the SSE stream.
             //
@@ -910,23 +1464,36 @@ mod serve {
                 .keep_alive(KeepAlive::default())
                 .into_response())
         } else {
-            // --- Non-streaming path (byte-identical to the original) ---
-            //
-            // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
-            let output = tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
-                .await
-                .map_err(|e| {
-                    eprintln!("task join error: {e}");
-                    ApiError::Internal {
-                        message: "inference failed".to_string(),
-                    }
-                })?
-                .map_err(|e| {
-                    eprintln!("generation error: {e}");
-                    ApiError::Internal {
-                        message: "inference failed".to_string(),
-                    }
-                })?;
+            // --- Non-streaming path (CPU leg byte-identical to the original) ---
+            let output = match model {
+                ModelBackend::Cpu(cpu_model) => {
+                    // `generate` is CPU-bound blocking work; run it on the blocking thread pool.
+                    tokio::task::spawn_blocking(move || cpu_model.generate(&prompt, &gen_cfg))
+                        .await
+                        .map_err(|e| {
+                            eprintln!("task join error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                        .map_err(|e| {
+                            eprintln!("generation error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                }
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { handle, .. } => handle
+                    .generate_streaming(prompt, gen_cfg, |_delta| true)
+                    .await
+                    .map_err(|e| {
+                        eprintln!("generation error (metal): {e:?}");
+                        ApiError::Internal {
+                            message: "inference failed".to_string(),
+                        }
+                    })?,
+            };
 
             // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
             // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
@@ -1830,8 +2397,9 @@ async fn main() {
             model,
             max_tokens,
             temperature,
+            tokenizer_dir,
         } => {
-            run_chat(&model, max_tokens, temperature);
+            run_chat(&model, max_tokens, temperature, tokenizer_dir.as_deref());
         }
         Command::Serve {
             model,
@@ -1839,6 +2407,7 @@ async fn main() {
             port,
             max_tokens,
             model_id,
+            tokenizer_dir,
         } => {
             use std::path::Path;
             use std::sync::Arc;
@@ -1854,20 +2423,57 @@ async fn main() {
                     .to_string()
             });
 
+            let model_path = Path::new(&model);
+            let format = backend::detect_format(model_path);
+
             eprintln!("Loading model from {model}...");
-            let qwen_model = match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
-                Path::new(&model),
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Error: failed to load model: {e}");
+            let model_backend: serve::ModelBackend = match format {
+                backend::ModelFormat::Safetensors => {
+                    match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(
+                        model_path,
+                    ) {
+                        Ok(m) => serve::ModelBackend::Cpu(Arc::new(m)),
+                        Err(e) => {
+                            eprintln!("Error: failed to load model: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                backend::ModelFormat::Q4 => {
+                    #[cfg(feature = "metal-gpu")]
+                    {
+                        let tokenizer_dir_path =
+                            tokenizer_dir.as_ref().map(std::path::PathBuf::from);
+                        match serve::ModelBackend::spawn_metal(
+                            model_path.to_path_buf(),
+                            tokenizer_dir_path,
+                        ) {
+                            Ok((backend, _max_context)) => backend,
+                            Err(e) => {
+                                eprintln!("Error: failed to load Q4 model: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "metal-gpu"))]
+                    {
+                        let _ = &tokenizer_dir;
+                        eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
+                        std::process::exit(1);
+                    }
+                }
+                backend::ModelFormat::Unknown => {
+                    eprintln!(
+                        "Error: {}",
+                        backend::unrecognized_format_message(model_path)
+                    );
                     std::process::exit(1);
                 }
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
             let state = serve::AppState {
-                model: Arc::new(qwen_model),
+                model: model_backend,
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
