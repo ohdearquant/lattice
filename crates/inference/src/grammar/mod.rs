@@ -48,25 +48,21 @@
 //! Grammar-constrained generation is **BETA**. It is opt-in via
 //! `GenerateConfig::grammar` and disabled by default.
 //!
-//! Known issues tracked at the time of this release:
-//!
-//! - **Object schemas mixing required and optional properties may reject valid
-//!   JSON** ([#355]). A JSON object that satisfies a schema with both
-//!   `required` and non-required properties can be incorrectly refused by the
-//!   PDA state machine during generation. Workaround: use schemas with either
-//!   all-required or all-optional properties, or inline the optional fields as
-//!   `anyOf: [{...}, {}]`.
-//!
-//! - **The PDA backtracker does not rewind consumed bytes** ([#353]). Once the
-//!   PDA advances past a byte, it cannot backtrack. This means some shared-prefix
-//!   `anyOf`/`oneOf` grammars over-accept or over-reject tokens at branch points
-//!   where the correct parse requires lookahead beyond a committed prefix.
-//!
-//! Both issues are pre-existing (present since v0.3.0) and tracked. Follow
-//! [#353] and [#355] on GitHub for fixes.
+//! The mixed-required/optional JSON-Schema rejection and the no-rewind-backtracker
+//! over-accept/over-reject class this BETA originally shipped with are fixed
+//! ([#355], [#353] — closed via [#380], [#468], [#471], [#472]). Correctness work in
+//! this area is ongoing: residual and newer findings in the JSON-Schema compiler and
+//! the PDA/engine runtime are tracked live at [#310] and [#322] respectively — check
+//! those issues for current status rather than assuming this comment stays up to date.
 //!
 //! [#353]: https://github.com/ohdearquant/lattice/issues/353
 //! [#355]: https://github.com/ohdearquant/lattice/issues/355
+//! [#380]: https://github.com/ohdearquant/lattice/pull/380
+//! [#468]: https://github.com/ohdearquant/lattice/pull/468
+//! [#471]: https://github.com/ohdearquant/lattice/pull/471
+//! [#472]: https://github.com/ohdearquant/lattice/pull/472
+//! [#310]: https://github.com/ohdearquant/lattice/issues/310
+//! [#322]: https://github.com/ohdearquant/lattice/issues/322
 
 pub mod engine;
 pub mod gbnf;
