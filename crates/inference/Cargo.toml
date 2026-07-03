@@ -248,6 +248,11 @@ harness = false
 required-features = ["metal-gpu", "f16"]
 
 [[bench]]
+name = "cross_turn_prefix_cache_bench"
+harness = false
+required-features = ["metal-gpu", "f16"]
+
+[[bench]]
 name = "mtp_decode"
 harness = false
 required-features = ["metal-gpu", "f16"]
