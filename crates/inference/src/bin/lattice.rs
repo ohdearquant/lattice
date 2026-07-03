@@ -552,6 +552,24 @@ mod doctor {
     /// Mirrors `Qwen35Model::from_safetensors`'s own precedence exactly:
     /// `model.safetensors` (single file) is preferred over
     /// `model.safetensors.index.json` (sharded) when both exist.
+    /// Bytes one tensor occupies once resident in CPU RAM after
+    /// `Qwen35Model::from_safetensors` loads it. The CPU path
+    /// (`crates/inference/src/weights/f32_weights.rs`) always materializes
+    /// weights as owned `f32`, converting on load via
+    /// `convert_f16_bytes_to_f32`/`convert_bf16_bytes_to_f32` — so an
+    /// F16/BF16 tensor's on-disk byte length under-counts its resident
+    /// footprint by 2x. Dtypes the loader doesn't specially convert are
+    /// left at their on-disk size; a required tensor in one of those
+    /// (e.g. an unsupported dtype) is already flagged via
+    /// `unsupported_dtypes` and blocks a "ready" verdict regardless, so
+    /// its exact resident size doesn't matter for the feasibility number.
+    fn cpu_resident_bytes(dtype: &str, on_disk_byte_len: u64) -> u64 {
+        match dtype {
+            "F16" | "BF16" => on_disk_byte_len * 2,
+            _ => on_disk_byte_len,
+        }
+    }
+
     fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
         let single = dir.join("model.safetensors");
         let index_path = dir.join("model.safetensors.index.json");
@@ -595,7 +613,10 @@ mod doctor {
             ));
         };
 
-        let total_bytes: u64 = all_tensors.values().map(|t| t.byte_len).sum();
+        let total_bytes: u64 = all_tensors
+            .values()
+            .map(|t| cpu_resident_bytes(&t.dtype, t.byte_len))
+            .sum();
         let dtypes: BTreeSet<&str> = all_tensors.values().map(|t| t.dtype.as_str()).collect();
         let quantization = if dtypes.is_empty() {
             "unknown".to_string()
@@ -1159,6 +1180,36 @@ mod doctor {
             assert!(inv.unsupported_dtypes.is_empty());
             assert_eq!(inv.total_bytes, tensors.len() as u64 * 64);
             assert_eq!(inv.quantization, "F32");
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_safetensors_dir_scales_f16_bf16_to_resident_f32_bytes() {
+            // The CPU loader always materializes weights as owned f32,
+            // converting F16/BF16 on load (see `cpu_resident_bytes`'s doc
+            // comment) -- so a 2-byte-per-element on-disk tensor must count
+            // double toward the RAM budget, while F32 tensors (already 4
+            // bytes/elem) must not be scaled.
+            let dir = tempdir("st-mixed-dtype");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let mut tensors = required_tensor_fixture(&cfg);
+            assert!(
+                tensors.len() >= 2,
+                "fixture must have room to mutate two entries"
+            );
+            tensors[0].1 = "F16".to_string();
+            tensors[1].1 = "BF16".to_string();
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+
+            let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+            // Every tensor is 64 on-disk bytes; the two F16/BF16 entries
+            // must count as 128 resident bytes each, the rest stay at 64.
+            let expected = (tensors.len() as u64 - 2) * 64 + 2 * 128;
+            assert_eq!(inv.total_bytes, expected);
             fs::remove_dir_all(&dir).ok();
         }
 
