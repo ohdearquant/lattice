@@ -14392,15 +14392,51 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Streaming generation: calls `on_token` for each generated token.
         /// Returns total generated token count.
         /// The callback receives (token_text, token_id) and returns true to continue.
+        ///
+        /// Cancellable only through `on_token`'s return value. Callers that need to
+        /// observe cancellation independently of text emission -- so an
+        /// empty-delta decode iteration, or the uninterruptible prefill call
+        /// itself, can't silently swallow a disconnect -- should call
+        /// [`Self::generate_streaming_with_cancel`] instead.
         pub fn generate_streaming<F>(
             &mut self,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-            mut on_token: F,
+            on_token: F,
         ) -> GenerateOutput
         where
             F: FnMut(&str, u32) -> bool,
+        {
+            self.generate_streaming_with_cancel(prompt, tokenizer, gen_cfg, on_token, || false)
+        }
+
+        /// Cancellation-aware sibling of [`Self::generate_streaming`].
+        ///
+        /// `should_cancel` is polled independently of `on_token`: before starting
+        /// the prefill pass, immediately after it returns, and at the top of every
+        /// decode iteration -- all before any further expensive GPU work runs for
+        /// that step. This closes two gaps `on_token`-only cancellation has:
+        /// prefill itself has no callback point at all (a long prompt can run to
+        /// completion after the client is already gone), and the decode loop only
+        /// calls `on_token` for non-empty text deltas, so a run of tokens that
+        /// decode to an incomplete UTF-8 tail (a multi-token codepoint mid-stream)
+        /// would otherwise skip the cancellation check for those iterations too.
+        /// SSE emission itself stays gated on non-empty deltas, unchanged.
+        ///
+        /// `generate_streaming` is the `should_cancel = || false` convenience form
+        /// and is otherwise identical; both share this one implementation.
+        pub fn generate_streaming_with_cancel<F, C>(
+            &mut self,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut on_token: F,
+            mut should_cancel: C,
+        ) -> GenerateOutput
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
         {
             let cfg = self.engine.config.clone();
 
@@ -14532,8 +14568,45 @@ kernel void gdn_chunk_norm_silu_c32(
             };
             let mut thinking_closed = false;
 
+            // Checked independently of `on_token`: a client that disconnected
+            // between dequeue and here must not pay for the (potentially large,
+            // uninterruptible once started) prefill matmul below.
+            if should_cancel() {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                };
+            }
+
             // Batch prefill
             let mut prefill_logits = self.forward_prefill(&prompt_ids);
+
+            // The prefill call itself cannot be interrupted mid-flight (it is one
+            // GPU dispatch), so this is the earliest point a disconnect that
+            // happened *during* prefill can be observed -- before paying for any
+            // sampling or decode-loop work on its output.
+            if should_cancel() {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                };
+            }
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -14648,6 +14721,16 @@ kernel void gdn_chunk_norm_silu_c32(
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
             for _ in 1..cap {
+                // Checked before any per-step GPU work, independent of whether this
+                // iteration's delta ends up non-empty -- closes the gap where a run
+                // of tokens decoding to an incomplete UTF-8 tail (a multi-token
+                // codepoint mid-stream) would otherwise never reach the on_token
+                // check below and so never observe cancellation.
+                if should_cancel() {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -15875,6 +15958,10 @@ kernel void gdn_chunk_norm_silu_c32(
         /// **Unstable**: streaming chat completion; callback signature may change.
         ///
         /// Streaming chat completion with token-by-token callback.
+        ///
+        /// Cancellable only through `on_token`'s return value; see
+        /// [`Self::chat_completion_streaming_with_cancel`] for a variant that also
+        /// observes cancellation during prefill and on empty-delta decode steps.
         pub fn chat_completion_streaming<F>(
             &mut self,
             messages: &[ChatMessage],
@@ -15885,6 +15972,30 @@ kernel void gdn_chunk_norm_silu_c32(
         where
             F: FnMut(&str, u32) -> bool,
         {
+            self.chat_completion_streaming_with_cancel(
+                messages,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                || false,
+            )
+        }
+
+        /// Cancellation-aware sibling of [`Self::chat_completion_streaming`]; see
+        /// [`Self::generate_streaming_with_cancel`] for exactly what `should_cancel`
+        /// observes that `on_token` alone cannot.
+        pub fn chat_completion_streaming_with_cancel<F, C>(
+            &mut self,
+            messages: &[ChatMessage],
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> ChatCompletionOutput
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -15892,7 +16003,13 @@ kernel void gdn_chunk_norm_silu_c32(
             {
                 cfg.stop_token_ids.push(im_end_id);
             }
-            let result = self.generate_streaming(&prompt, tokenizer, &cfg, on_token);
+            let result = self.generate_streaming_with_cancel(
+                &prompt,
+                tokenizer,
+                &cfg,
+                on_token,
+                should_cancel,
+            );
             let text = result.text.trim_end().to_string();
             ChatCompletionOutput {
                 message: ChatMessage::assistant(text),
@@ -22106,6 +22223,161 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// PR #606 review (Major finding): `on_token`-only cancellation cannot
+        /// observe a disconnect that happens before or during prefill, since
+        /// prefill has no callback point at all. `generate_streaming_with_cancel`
+        /// must check `should_cancel` before paying for prefill, so a client
+        /// that is already gone never even starts it and `on_token` is never
+        /// called.
+        #[test]
+        fn stop_reason_interrupt_when_cancelled_before_prefill_starts() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 8,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut on_token_calls = 0u32;
+            let out = state.generate_streaming_with_cancel(
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_delta, _id| {
+                    on_token_calls += 1;
+                    true
+                },
+                || true, // already cancelled before generation ever starts
+            );
+
+            assert_eq!(
+                on_token_calls, 0,
+                "should_cancel already true before prefill must return before \
+                 on_token is ever called, got {on_token_calls} calls"
+            );
+            // `on_token_calls == 0` alone doesn't prove *which* checkpoint fired --
+            // the after-prefill check would produce the same on_token count if the
+            // before-prefill one were missing, since prefill's own output never
+            // reaches on_token either way (round-2 review finding). Prefill is the
+            // only thing that advances kv_cache.seq_len (metal_qwen35_chunked_prefill*
+            // tests assert seq_len == tokens.len() once it has run), so a still-zero
+            // seq_len is direct evidence prefill itself never started.
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "should_cancel already true before prefill must return before prefill \
+                 itself runs, but kv_cache.seq_len={} shows it advanced",
+                state.session.kv_cache.seq_len
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "cancelled-before-prefill must produce zero tokens"
+            );
+            assert!(!out.stopped, "cancellation is not an OpenAI stop condition");
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "cancelled-before-prefill must report Interrupt, got {:?}",
+                out.stop_reason
+            );
+        }
+
+        /// PR #606 review (Major finding): the decode loop only called
+        /// `on_token` for non-empty deltas, so a client disconnect could be
+        /// missed for however many iterations produced an empty delta (an
+        /// incomplete UTF-8 tail mid-codepoint). This proves `should_cancel`
+        /// stops generation at the top of a decode iteration on its own, even
+        /// when `on_token` itself always answers "keep going" -- the decode
+        /// loop's own independent check, not the callback, is what halts it.
+        #[test]
+        fn stop_reason_interrupt_when_should_cancel_alone_stops_mid_decode() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 8,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut on_token_calls = 0u32;
+            let mut should_cancel_calls = 0u32;
+            let out = state.generate_streaming_with_cancel(
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_delta, _id| {
+                    on_token_calls += 1;
+                    true // on_token itself never asks to stop.
+                },
+                move || {
+                    should_cancel_calls += 1;
+                    // False for the before-prefill and after-prefill checks
+                    // (calls 1-2), letting exactly the prefill-sampled token
+                    // through; true starting at the decode loop's very first
+                    // check (call 3), before that iteration samples anything.
+                    should_cancel_calls > 2
+                },
+            );
+
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the prefill-sampled token should reach on_token before \
+                 should_cancel stops the decode loop on its first iteration, got \
+                 {on_token_calls} calls"
+            );
+            assert_eq!(
+                out.generated_tokens, 1,
+                "generation must stop after exactly 1 token (the prefill sample) \
+                 once should_cancel goes true at the top of the first decode \
+                 iteration, got {}",
+                out.generated_tokens
+            );
+            assert!(!out.stopped, "cancellation is not an OpenAI stop condition");
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "should_cancel alone (on_token always returns true) must still \
+                 report Interrupt, got {:?}",
+                out.stop_reason
+            );
+        }
+
         /// `generate`'s `max_new_tokens == 0` guard must return before the prefill
         /// token is ever pushed into the output, matching the CPU `generate()`
         /// contract (model::qwen35::generation): zero tokens, `StopReason::Length`.
@@ -24498,6 +24770,102 @@ kernel void decode_attention_reference(
             );
         }
     }
+
+    /// Bench-only access to the real lm_head dispatch (issue #547). Kept
+    /// behind `bench-internals` so `LmHeadBenchRoute`/`read_topk_candidates`
+    /// visibility stays out of the normal public API; `run_once` calls the
+    /// same `encode_final_head` the production decode path uses, so the
+    /// group measures the shipped kernels rather than a bench-only
+    /// reimplementation.
+    #[cfg(feature = "bench-internals")]
+    pub mod bench_support {
+        use super::*;
+
+        #[derive(Clone, Copy, Debug)]
+        pub enum LmHeadBenchRoute {
+            Full,
+            BlockArgmax,
+            BlockTopK { local_k: u32 },
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        pub struct LmHeadBenchOutput {
+            pub marker: u32,
+        }
+
+        pub struct LmHeadBenchFixture {
+            state: MetalQwen35State,
+        }
+
+        impl LmHeadBenchFixture {
+            pub fn new(state: MetalQwen35State) -> Self {
+                Self { state }
+            }
+
+            /// Runs one real forward step so `session.activations.hidden`
+            /// holds a live hidden state before timing starts — `run_once`
+            /// then measures only the head dispatch, not
+            /// embedding/attention/MLP.
+            pub fn prepare_hidden_for_bench(&mut self, token_id: u32, position: usize) {
+                let _ = self.state.forward_step(token_id, position);
+            }
+
+            /// Dispatches the real head route once and reads back a minimal
+            /// marker to force GPU completion — mirrors what
+            /// `LATTICE_DECODE_PROFILE`'s head timing observes in
+            /// production.
+            pub fn run_once(&mut self, route: LmHeadBenchRoute) -> LmHeadBenchOutput {
+                let (gpu_route, topk) = match route {
+                    LmHeadBenchRoute::Full => (GpuTopkRoute::CpuFallback, 0usize),
+                    LmHeadBenchRoute::BlockArgmax => (GpuTopkRoute::BlockArgmax, 1usize),
+                    LmHeadBenchRoute::BlockTopK { local_k } => {
+                        (GpuTopkRoute::BlockTopK { local_k }, local_k as usize)
+                    }
+                };
+                self.state.session.compact_route = gpu_route;
+                self.state.session.compact_topk = topk;
+
+                let cfg = self.state.engine.config.clone();
+                let mut prof = StepProfile::default();
+                // Raw pointer breaks the borrow chain, matching the
+                // production fused-command-buffer path above: `cmd` is
+                // ref-counted by Metal and outlives the `engine.queue`
+                // borrow, and `encode_final_head` needs `&mut self` for
+                // session state but never touches `engine.queue`.
+                let cmd = unsafe {
+                    &*(self.state.engine.queue.new_command_buffer()
+                        as *const metal::CommandBufferRef)
+                };
+                let enc = cmd.new_compute_command_encoder();
+                let which = self
+                    .state
+                    .encode_final_head(enc, &cfg, false, &mut prof, false);
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let marker = match which {
+                    Some(slot) => {
+                        // SAFETY: command buffer completed above via
+                        // `wait_until_completed`; `topk` candidates were
+                        // written into the ping-pong scratch buffer this
+                        // dispatch just selected via `slot`.
+                        let candidates = unsafe { self.state.read_topk_candidates(slot, topk) };
+                        candidates.first().map(|c| c.token_id).unwrap_or(0)
+                    }
+                    None => {
+                        // SAFETY: command buffer completed above via
+                        // `wait_until_completed`; `logits[0]` was written by
+                        // the full-route GEMV this dispatch just issued.
+                        let logit =
+                            unsafe { read_buffer(&self.state.session.activations.logits, 1) }[0];
+                        logit.to_bits()
+                    }
+                };
+                LmHeadBenchOutput { marker }
+            }
+        }
+    }
 }
 
 // Stage-1 block-top-k and the full-logit lm_head both accumulate ~1K f32
@@ -25336,6 +25704,13 @@ pub use inner::{
     LoraLayerData, MetalQwen35State, PathProofSnapshot, blend_lora_layer_data,
     format_chat_template,
 };
+
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "bench-internals"
+))]
+pub use inner::bench_support;
 
 // Stub for non-macOS or non-metal builds.
 /// **Unstable**: LoRA layer data stub; real impl behind metal-gpu feature.

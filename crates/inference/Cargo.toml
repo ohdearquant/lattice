@@ -253,6 +253,10 @@ harness = false
 required-features = ["metal-gpu", "f16"]
 
 [[bench]]
+name = "lm_head_bench"
+harness = false
+
+[[bench]]
 name = "elementwise_cpu_bench"
 harness = false
 
