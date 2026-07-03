@@ -91,12 +91,16 @@ mod imp {
     ///
     /// `cancel` reflects whether the client that submitted this job is still
     /// there. It starts `false` and flips to `true` the moment the matching
-    /// [`CancelOnDrop`] guard is dropped — i.e. the instant axum drops the
+    /// [`CancelOnDrop`] guard is dropped -- i.e. the instant axum drops the
     /// response future/stream, which is exactly what happens on client
     /// disconnect (browser tab closed, `curl` killed, request future
-    /// cancelled). The worker checks it (a) once at dequeue, before doing
-    /// any work, and (b) on every decode step, so an abandoned job is either
-    /// skipped entirely or stopped within one token of the client leaving.
+    /// cancelled). The worker checks it (a) once at dequeue, before doing any
+    /// work, and (b) independently of token emission, via
+    /// `chat_completion_streaming_with_cancel`'s `should_cancel` predicate --
+    /// before prefill, immediately after prefill returns, and at the top of
+    /// every decode iteration -- so an abandoned job is skipped entirely,
+    /// stopped before paying for prefill, or stopped within one decode step
+    /// of the client leaving.
     struct Job {
         messages: Vec<ChatMessage>,
         cfg: GenerateConfig,
@@ -251,9 +255,15 @@ mod imp {
             };
             let _ = ready.send(Ok(fmt));
 
-            run_worker_loop(job_rx, move |messages, cfg, on_token| {
+            run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
                 metal.reset_state();
-                let out = metal.chat_completion_streaming(messages, &tokenizer, cfg, on_token);
+                let out = metal.chat_completion_streaming_with_cancel(
+                    messages,
+                    &tokenizer,
+                    cfg,
+                    on_token,
+                    should_cancel,
+                );
                 (out.prompt_tokens, out.completion_tokens)
             });
         });
@@ -266,15 +276,19 @@ mod imp {
     /// `generate` is injected so tests can swap in a fake, GPU-free generator
     /// while exercising the exact same queue/cancellation logic production
     /// uses. It must call `on_token` for each generated delta and stop as
-    /// soon as `on_token` returns `false`, returning
-    /// `(prompt_tokens, completion_tokens)` for whatever was actually
-    /// produced before stopping (early or at the cap).
+    /// soon as `on_token` returns `false`; it must also poll `should_cancel`
+    /// independently of `on_token` -- including during any phase that never
+    /// calls `on_token` at all (a prefill-like section, or a run of
+    /// empty-delta steps) -- and stop as soon as `should_cancel` returns
+    /// `true`. Either way, return `(prompt_tokens, completion_tokens)` for
+    /// whatever was actually produced before stopping (early or at the cap).
     fn run_worker_loop(
         mut job_rx: mpsc::UnboundedReceiver<Job>,
         mut generate: impl FnMut(
             &[ChatMessage],
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
         ) -> (usize, usize),
     ) {
         while let Some(job) = job_rx.blocking_recv() {
@@ -284,9 +298,9 @@ mod imp {
                 continue;
             }
             let cb_tx = job.tx.clone();
-            let cancel = job.cancel.clone();
+            let cancel_for_token = job.cancel.clone();
             let mut on_token = move |delta: &str, _id: u32| {
-                if *cancel.borrow() {
+                if *cancel_for_token.borrow() {
                     return false;
                 }
                 // `send` also fails once the client hangs up; kept as a
@@ -295,8 +309,14 @@ mod imp {
                 // its reply channel is gone.
                 cb_tx.send(Ev::Delta(delta.to_string())).is_ok()
             };
+            // Separate from `on_token`: this is what reaches the generator's
+            // prefill gap and its empty-delta decode iterations, neither of
+            // which ever calls `on_token` (see
+            // `MetalQwen35State::generate_streaming_with_cancel`).
+            let cancel_for_predicate = job.cancel.clone();
+            let mut should_cancel = move || *cancel_for_predicate.borrow();
             let (prompt_tokens, completion_tokens) =
-                generate(&job.messages, &job.cfg, &mut on_token);
+                generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel);
             let _ = job.tx.send(Ev::Done {
                 prompt_tokens,
                 completion_tokens,
@@ -773,16 +793,19 @@ mod imp {
     mod tests {
         use super::*;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::Duration;
 
-        /// A GPU-free stand-in for `MetalQwen35State::chat_completion_streaming`:
+        /// A GPU-free stand-in for `MetalQwen35State::chat_completion_streaming_with_cancel`:
         /// "generates" up to `cap` fake tokens, sleeping briefly between each so
         /// a cancelled job has many opportunities to be observed running past
         /// where it should have stopped. Counts how many times it was entered
         /// (`started`) and how many fake tokens actually ran (`ran_tokens`), so
         /// tests can assert a cancelled queued job's generator was never called
-        /// at all.
+        /// at all. Checks `should_cancel` at the top of each iteration in
+        /// addition to `on_token`'s own check, mirroring the production
+        /// contract; existing tests here only rely on the `on_token` path, so
+        /// this addition does not change their outcomes.
         #[allow(clippy::type_complexity)]
         fn fake_generate(
             cap: usize,
@@ -792,17 +815,62 @@ mod imp {
             &[ChatMessage],
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
         ) -> (usize, usize) {
-            move |_messages, _cfg, on_token| {
+            move |_messages, _cfg, on_token, should_cancel| {
                 started.fetch_add(1, Ordering::SeqCst);
                 let mut n = 0usize;
                 for i in 0..cap {
                     std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        break;
+                    }
                     if !on_token("x", i as u32) {
                         break;
                     }
                     n += 1;
                     ran_tokens.fetch_add(1, Ordering::SeqCst);
+                }
+                (1, n)
+            }
+        }
+
+        /// A GPU-free fake with an explicit prefill-like phase *before* any
+        /// `on_token` call -- mirroring the real gap this fix closes:
+        /// production prefill has no callback point at all, so only
+        /// `should_cancel` (never `on_token`) can observe a disconnect that
+        /// happens during it. `entered_decode` flips only if the prefill-like
+        /// phase runs to completion uncancelled, so tests can assert it never
+        /// does.
+        #[allow(clippy::type_complexity)]
+        fn fake_generate_with_prefill_gap(
+            prefill_steps: usize,
+            decode_cap: usize,
+            entered_decode: Arc<AtomicBool>,
+        ) -> impl FnMut(
+            &[ChatMessage],
+            &GenerateConfig,
+            &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> (usize, usize) {
+            move |_messages, _cfg, on_token, should_cancel| {
+                for _ in 0..prefill_steps {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        return (1, 0);
+                    }
+                }
+                entered_decode.store(true, Ordering::SeqCst);
+                let mut n = 0usize;
+                for i in 0..decode_cap {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        break;
+                    }
+                    if !on_token("x", i as u32) {
+                        break;
+                    }
+                    n += 1;
                 }
                 (1, n)
             }
@@ -974,6 +1042,64 @@ mod imp {
             );
 
             handle.join().expect("worker thread must not panic");
+        }
+
+        /// Codex review of PR #606: cancellation was only observed through the
+        /// `on_token` callback, so a generator phase that never calls it -- the
+        /// real prefill pass has no callback point at all -- could run
+        /// unbounded after the client already disconnected. This proves
+        /// `run_worker_loop` threads an independent `should_cancel` signal
+        /// through to `generate` and that a fake generator honoring only that
+        /// signal (never `on_token`) still gets stopped promptly, well short
+        /// of its prefill-like phase's natural end.
+        #[test]
+        fn running_job_cancelled_during_prefill_like_phase_never_calls_on_token() {
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+            let entered_decode = Arc::new(AtomicBool::new(false));
+
+            let (job1, mut rx1, guard1) = make_job();
+            job_tx.send(job1).unwrap();
+            drop(job_tx);
+
+            // 400 * 5ms = up to 2s of "prefill" if never cancelled -- the test
+            // cancels at 20ms in, ~100x margin, so reaching Done quickly is
+            // only possible if should_cancel actually stopped it early.
+            let entered2 = entered_decode.clone();
+            let handle = std::thread::spawn(move || {
+                run_worker_loop(job_rx, fake_generate_with_prefill_gap(400, 50, entered2))
+            });
+
+            std::thread::sleep(Duration::from_millis(20));
+            drop(guard1);
+
+            match rx1.blocking_recv() {
+                Some(Ev::Delta(_)) => panic!(
+                    "on_token must never be called: cancellation happened while the \
+                     fake generator was still in its prefill-like phase, which does \
+                     not call on_token at all"
+                ),
+                Some(Ev::Done {
+                    completion_tokens, ..
+                }) => {
+                    assert_eq!(
+                        completion_tokens, 0,
+                        "job cancelled during the prefill-like phase must produce \
+                         zero tokens, got {completion_tokens}"
+                    );
+                }
+                None => panic!("job 1's reply channel closed before a Done event"),
+            }
+
+            handle.join().expect("worker thread must not panic");
+
+            assert!(
+                !entered_decode.load(Ordering::SeqCst),
+                "should_cancel alone (on_token is never called during this phase) \
+                 must stop the job before the decode phase is ever reached -- this \
+                 is the exact blind spot from the PR #606 review, where production \
+                 prefill has no on_token callback point and so could run to \
+                 completion after the client already disconnected"
+            );
         }
     }
 }
