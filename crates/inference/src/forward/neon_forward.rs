@@ -907,6 +907,20 @@ pub fn generate_q8_neon(
         ));
     }
 
+    // max_new_tokens == 0 means "generate nothing": return before sampling so
+    // we never emit a token the caller did not ask for. Mirrors the guard in
+    // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: vec![],
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped: false,
+            stop_reason: Some(StopReason::Length),
+        });
+    }
+
     // Reject grammar configs before allocating any state. Grammar masking
     // (`mask_logits` + `advance`) is not wired into this generate loop; without
     // the guard the grammar field would be silently ignored, producing
@@ -2726,6 +2740,62 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(_))),
             "generate_q8_neon must fail closed with InvalidInput when grammar is set \
              (#397/#398); got {result:?}"
+        );
+    }
+
+    /// `generate_q8_neon` with `max_new_tokens == 0` must return zero generated
+    /// tokens without running prefill or sampling anything (#612, 3rd recurrence
+    /// of the #226/#456 bug class).
+    ///
+    /// The guard fires before any weight dereference or state allocation, so
+    /// empty weight vecs are sufficient — mirrors the grammar-guard test above.
+    ///
+    /// Mutation sensitivity: removing the `max_new_tokens == 0` early return
+    /// causes the function to run prefill (against empty weight vecs, which
+    /// would panic) and sample one token, so `generated_tokens` becomes 1
+    /// instead of 0 and the assertion below fails.
+    #[test]
+    fn generate_q8_neon_max_new_tokens_zero_returns_empty() {
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![("h".to_string(), "e".to_string())];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let model = Q8NeonModel {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            lm_head_packed: vec![],
+            lm_head_rows: 0,
+            lm_head_cols: 0,
+            layers: vec![],
+        };
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 0,
+            ..Default::default()
+        };
+
+        let out = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "hello", &gen_cfg)
+            .expect("max_new_tokens=0 must succeed, not error");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "max_new_tokens=0 must produce zero generated tokens"
+        );
+        assert!(
+            out.token_ids.is_empty(),
+            "max_new_tokens=0 must produce an empty token list"
+        );
+        assert_eq!(
+            out.stop_reason,
+            Some(StopReason::Length),
+            "max_new_tokens=0 must report stop_reason=Length"
         );
     }
 }
