@@ -210,9 +210,26 @@ impl Qwen35Model {
             let first_delta = detok.push(&self.tokenizer, next_id);
             let mut full = first_delta;
 
+            // Tracks, per recorded `token_logprobs` entry, the length of `full`
+            // immediately after that token's delta landed — grown in lockstep
+            // with token_logprobs (both gated on gen_cfg.logprobs.is_some()), so
+            // a stop-string truncation can drop exactly the trailing entries
+            // whose text didn't fully survive. See
+            // `truncate_token_logprobs_to_retained_text`.
+            let mut token_logprob_end_offsets: Vec<usize> = if token_logprobs.is_empty() {
+                Vec::new()
+            } else {
+                vec![full.len()]
+            };
+
             // Check stop strings after the first token.
             if let Some(hit) = earliest_stop_match(&full, &gen_cfg.stop_strings) {
                 full.truncate(hit);
+                truncate_token_logprobs_to_retained_text(
+                    &mut token_logprobs,
+                    &token_logprob_end_offsets,
+                    hit,
+                );
                 // generated_ids already contains next_id; we cannot un-generate it,
                 // so token_ids/generated_tokens reflect all tokens up to the match.
                 return Ok(GenerateOutput {
@@ -241,6 +258,7 @@ impl Qwen35Model {
                 think_close_id,
                 thinking_closed_seed,
                 &mut token_logprobs,
+                &mut token_logprob_end_offsets,
             )?;
 
             Ok(GenerateOutput {
@@ -973,6 +991,7 @@ fn decode_loop_with_stops(
     think_close_id: Option<u32>,
     thinking_closed_seed: bool,
     token_logprobs: &mut Vec<TokenLogprob>,
+    token_logprob_end_offsets: &mut Vec<usize>,
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
@@ -1063,8 +1082,19 @@ fn decode_loop_with_stops(
             full.push_str(&delta);
         }
 
+        // Keep the offset tracker in lockstep with token_logprobs' conditional
+        // growth (record_logprob is a no-op unless gen_cfg.logprobs is set).
+        if token_logprobs.len() > token_logprob_end_offsets.len() {
+            token_logprob_end_offsets.push(full.len());
+        }
+
         if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
             full.truncate(hit);
+            truncate_token_logprobs_to_retained_text(
+                token_logprobs,
+                token_logprob_end_offsets,
+                hit,
+            );
             stopped = true;
             stop_reason = StopReason::Eos;
             break;
@@ -1087,6 +1117,11 @@ fn decode_loop_with_stops(
             // The tail itself might complete a stop string.
             if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
                 full.truncate(hit);
+                truncate_token_logprobs_to_retained_text(
+                    token_logprobs,
+                    token_logprob_end_offsets,
+                    hit,
+                );
                 return Ok((true, StopReason::Eos));
             }
         }
@@ -1099,6 +1134,33 @@ fn decode_loop_with_stops(
 /// or `None` if no stop string is present.
 pub(crate) fn earliest_stop_match(haystack: &str, stops: &[String]) -> Option<usize> {
     stops.iter().filter_map(|s| haystack.find(s.as_str())).min()
+}
+
+/// Drops trailing `token_logprobs` entries whose decoded text extends past
+/// `retained_len` (the text length after a stop-string match truncates the
+/// output).
+///
+/// A stop match can complete mid-token or even mid-multi-token (an
+/// incrementally-detokenized delta may itself span several sampled tokens),
+/// so more than one trailing token can end up with text that no longer
+/// appears in the truncated output. The OpenAI `logprobs.content` shape is
+/// one entry per whole token; a token whose text was only partially retained
+/// can't be represented as a partial entry, so it — and any token after it —
+/// is dropped rather than left describing text the caller never receives in
+/// `message.content` (#620 round-1 review finding).
+///
+/// `token_logprob_end_offsets[i]` must be the length of the accumulated
+/// output text immediately after token `i`'s delta was appended, and the two
+/// slices must be the same length (both grow in lockstep, gated on the same
+/// `gen_cfg.logprobs.is_some()` condition — see call sites).
+fn truncate_token_logprobs_to_retained_text(
+    token_logprobs: &mut Vec<TokenLogprob>,
+    token_logprob_end_offsets: &[usize],
+    retained_len: usize,
+) {
+    debug_assert_eq!(token_logprobs.len(), token_logprob_end_offsets.len());
+    let keep = token_logprob_end_offsets.partition_point(|&end| end <= retained_len);
+    token_logprobs.truncate(keep);
 }
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
@@ -2015,5 +2077,60 @@ mod tests {
              sampled token, not the forced token"
         );
         assert_eq!(result.generated_tokens, 1);
+    }
+
+    /// Stop-string truncation must drop `token_logprobs` entries whose decoded
+    /// text didn't fully survive the truncation, not leave them describing
+    /// bytes the caller never sees in `text` (#620 round-1 review finding:
+    /// `build_choice_logprobs` in lattice.rs builds `logprobs.content` directly
+    /// off `token_logprobs`, so a stale entry there silently corrupts the
+    /// OpenAI-compatible response).
+    ///
+    /// Zero-weight model → every sampled token is id 0, which decodes to the
+    /// literal text "<unk>" (all 5 chars sit in the byte-level decoder's
+    /// printable range, so `append_token_bytes` skips none of them as
+    /// "special"). Two tokens concatenate to "<unk><unk>" (10 bytes); the stop
+    /// string "k><unk" (6 bytes) first matches at byte 3 — entirely PAST the
+    /// token boundary at byte 5, so the match clips into the FIRST token's own
+    /// trailing bytes too, not just the second token's. Both entries' text is
+    /// therefore only partially retained, and both must be dropped — this is
+    /// the multi-token-span case `truncate_token_logprobs_to_retained_text`
+    /// exists to handle, not just "drop the most recent entry".
+    ///
+    /// Mutation sensitivity: without the truncation call, `token_logprobs`
+    /// keeps both entries (len 2) even though `text` is only "<un" (3 bytes) —
+    /// neither entry's full text is representable in the truncated output.
+    /// With the fix, `token_logprobs` is empty.
+    #[test]
+    fn stop_string_truncation_drops_stale_token_logprobs() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            temperature: 0.0,
+            logprobs: Some(0),
+            stop_strings: vec!["k><unk".to_string()],
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("stop-string generate must succeed");
+
+        assert_eq!(
+            result.text, "<un",
+            "stop string must truncate at the first match; got {:?}",
+            result.text
+        );
+        assert_eq!(
+            result.generated_tokens, 2,
+            "both tokens were sampled before the match completed (can't un-generate); \
+             got {}",
+            result.generated_tokens
+        );
+        assert!(
+            result.token_logprobs.is_empty(),
+            "both tokens' text was only partially retained after truncation, so both \
+             logprobs entries must be dropped; got {} entries",
+            result.token_logprobs.len()
+        );
     }
 }
