@@ -26,13 +26,534 @@
 //! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
 //! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
+// -----------------------------------------------------------------------------
+// MTP Q4/F16 tensor resolution (#630, #636) -- pure, `Device`-free, compiled
+// unconditionally in test builds (round-2 fix: these previously lived inside
+// `mod inner`, gated on `metal-gpu`, so `cargo test -p lattice-inference --lib
+// resolve_mtp` with no features reported "running 0 tests" -- the exact
+// skip-pass class round 1 flagged, just one layer up. `mod inner` re-imports
+// these via `use super::{...}` below.)
+// -----------------------------------------------------------------------------
+
+/// Build the sanitized MTP tensor file path (dots/slashes -> underscores),
+/// mirroring `MetalQwen35State::q4_tensor_path` -- duplicated here (rather than
+/// called through `MetalQwen35State`, which only exists under `metal-gpu`) so
+/// this module compiles and is unit-testable without the Metal feature at all
+/// (#636 round-2).
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
+    let sanitized: String = tensor_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    dir.join(format!("{sanitized}.{ext}"))
+}
+
+/// Failure modes for resolving a single MTP tensor from disk (#636 round-1).
+///
+/// `Missing` is the pre-existing graceful case: the caller (the MTP
+/// projection-load closure in [`load_mtp_q4_weights`]) turns it into a
+/// warn-and-fall-back-to-non-MTP-decode result via
+/// [`mtp_missing_weights_warning`]. `Incompatible` is new and
+/// deliberately NOT graceful: it means the on-disk artifact exists but
+/// cannot be trusted (a stale `.q4` sibling in a QuaRot rotated-space
+/// checkpoint, or a shape/transpose mismatch) — silently disabling MTP
+/// would be safe, but silently *loading* it would produce garbage
+/// drafts, so this propagates as a hard `from_q4_dir` load error
+/// instead.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Debug)]
+enum MtpLoadErr {
+    // The path is read by the real `metal-gpu` production caller
+    // (`load_mtp_q4_weights`) but only via `matches!` in the pure
+    // default-feature-only tests, so it looks unused in that specific
+    // build configuration.
+    Missing(#[allow(dead_code)] std::path::PathBuf),
+    Incompatible(String),
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+impl From<std::path::PathBuf> for MtpLoadErr {
+    fn from(path: std::path::PathBuf) -> Self {
+        MtpLoadErr::Missing(path)
+    }
+}
+
+/// One MTP tensor's values as read from disk, before Metal buffer
+/// creation — deliberately `Device`-free so flavor selection and shape
+/// validation are unit-testable without a GPU (#636 round-1 medium #3).
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Debug)]
+enum MtpTensorSource {
+    F16 {
+        // Read by the real `metal-gpu` production caller
+        // (`load_mtp_q4_weights`'s `load_proj_as_half`); only the
+        // `#[cfg(test)]`-only `shape()`/`is_q4()` accessors read this in a
+        // default-feature (no metal-gpu) test-only build.
+        #[allow(dead_code)]
+        values: Vec<f32>,
+        #[allow(dead_code)] // read via `shape()`, only exercised by `#[cfg(test)]` callers
+        shape: Vec<usize>,
+    },
+    Q4(crate::weights::q4_weights::Q4Tensor),
+}
+
+#[cfg(test)]
+impl MtpTensorSource {
+    /// Test-only accessor for the resolved on-disk shape, used to assert
+    /// which flavor + shape a `resolve_mtp_projection` call picked
+    /// without needing a Metal `Device`.
+    fn shape(&self) -> &[usize] {
+        match self {
+            MtpTensorSource::F16 { shape, .. } => shape,
+            MtpTensorSource::Q4(tensor) => &tensor.shape,
+        }
+    }
+
+    fn is_q4(&self) -> bool {
+        matches!(self, MtpTensorSource::Q4(_))
+    }
+}
+
+/// Resolve one of the 8 MTP projection matrices from `q4_dir`, pure
+/// CPU I/O only (no `Device`).
+///
+/// `quantize_q4` applies the same `should_quantize` name-suffix rule to
+/// MTP tensors as to the main model, so the 8 `*_proj*.weight` MTP
+/// matrices are written as `.q4` on a plain (non-rotated) Q4 checkpoint.
+/// `quantize_quarot` instead keeps every MTP tensor as unrotated `.f16`
+/// (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights),
+/// and MUST NOT have a `.q4` sibling for any MTP tensor.
+///
+/// `allow_q4` therefore encodes the checkpoint flavor, determined by
+/// the caller BEFORE any projection is loaded (not sniffed per-file):
+/// `true` for a plain Q4 checkpoint (no QuaRot rotation seed anywhere),
+/// `false` for a QuaRot checkpoint. When `allow_q4` is `false` and a
+/// `.q4` sibling exists anyway, that is an incompatible stale artifact
+/// — `quantize_q4` was re-run into a QuaRot output directory (the
+/// converter reuses a non-empty output dir rather than rejecting it),
+/// producing rotated-space `.q4` weights that the runtime's
+/// counter-rotation (keyed off the same directory's `quarot_seed`)
+/// would silently apply on top of, corrupting every MTP draft without
+/// any load failure to reveal it (#636 round-1 MAJOR). This is
+/// rejected loudly instead of silently preferring `.f16`.
+///
+/// Also validates the resolved tensor's on-disk shape against
+/// `expected_shape`: a same-numel transposed file loads and generates
+/// tokens but produces garbage MTP drafts (#636 round-1 medium #1), so
+/// shape mismatches are rejected the same way as an incompatible
+/// artifact rather than silently accepted.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn resolve_mtp_projection(
+    q4_dir: &std::path::Path,
+    name: &str,
+    expected_shape: &[usize],
+    allow_q4: bool,
+) -> Result<MtpTensorSource, MtpLoadErr> {
+    use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
+
+    let q4_path = mtp_tensor_path(q4_dir, name, "q4");
+    if q4_path.exists() {
+        if !allow_q4 {
+            return Err(MtpLoadErr::Incompatible(format!(
+                "{}: incompatible stale MTP .q4 artifact found alongside a QuaRot \
+                 (rotated-space) checkpoint; QuaRot Phase 1 requires MTP projections \
+                 to remain unrotated .f16 — a .q4 sibling here means quantize_q4 was \
+                 re-run into a QuaRot output directory, and loading it would silently \
+                 apply counter-rotation on top of already-rotated-space weights, \
+                 corrupting every MTP draft without a load failure to reveal it. \
+                 Refusing to load — delete the stale .q4 file or regenerate the \
+                 checkpoint.",
+                q4_path.display()
+            )));
+        }
+        let tensor = load_q4_file(&q4_path).map_err(|_| MtpLoadErr::Missing(q4_path.clone()))?;
+        if tensor.shape != expected_shape {
+            return Err(MtpLoadErr::Incompatible(format!(
+                "{}: MTP tensor '{name}' has shape {:?}, expected {expected_shape:?} — \
+                 refusing to load (a mismatched/transposed weight file loads and \
+                 generates tokens but silently produces garbage MTP drafts)",
+                q4_path.display(),
+                tensor.shape
+            )));
+        }
+        return Ok(MtpTensorSource::Q4(tensor));
+    }
+
+    let f16_path = mtp_tensor_path(q4_dir, name, "f16");
+    if !f16_path.exists() {
+        return Err(MtpLoadErr::Missing(f16_path));
+    }
+    let (values, shape) =
+        load_f16_tensor_file(&f16_path).map_err(|_| MtpLoadErr::Missing(f16_path.clone()))?;
+    if shape != expected_shape {
+        return Err(MtpLoadErr::Incompatible(format!(
+            "{}: MTP tensor '{name}' has shape {shape:?}, expected {expected_shape:?} — \
+             refusing to load (a mismatched/transposed weight file loads and generates \
+             tokens but silently produces garbage MTP drafts)",
+            f16_path.display()
+        )));
+    }
+    Ok(MtpTensorSource::F16 { values, shape })
+}
+
+/// Resolve one of the 7 MTP norm tensors from `q4_dir`, pure CPU I/O
+/// only (no `Device`). Norms are never quantized by `should_quantize`
+/// in either quantizer, so they are always `.f16`-only regardless of
+/// checkpoint flavor; a `.q4` sibling under a norm's name is treated
+/// as an incompatible artifact rather than silently ignored (defense
+/// in depth — should never occur on a checkpoint from either
+/// quantizer). Also validates on-disk shape (#636 round-1 medium #1).
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn resolve_mtp_norm(
+    q4_dir: &std::path::Path,
+    name: &str,
+    expected_shape: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), MtpLoadErr> {
+    use crate::weights::q4_weights::load_f16_tensor_file;
+
+    let q4_path = mtp_tensor_path(q4_dir, name, "q4");
+    if q4_path.exists() {
+        return Err(MtpLoadErr::Incompatible(format!(
+            "{}: unexpected MTP .q4 artifact for norm tensor '{name}' — norms are never \
+             quantized by either quantizer; refusing to load an incompatible checkpoint",
+            q4_path.display()
+        )));
+    }
+    let f16_path = mtp_tensor_path(q4_dir, name, "f16");
+    if !f16_path.exists() {
+        return Err(MtpLoadErr::Missing(f16_path));
+    }
+    let (values, shape) =
+        load_f16_tensor_file(&f16_path).map_err(|_| MtpLoadErr::Missing(f16_path.clone()))?;
+    if shape != expected_shape {
+        return Err(MtpLoadErr::Incompatible(format!(
+            "{}: MTP norm tensor '{name}' has shape {shape:?}, expected \
+             {expected_shape:?} — refusing to load",
+            f16_path.display()
+        )));
+    }
+    Ok((values, shape))
+}
+
+#[cfg(test)]
+mod mtp_resolve_tests {
+    use super::*;
+    use crate::model::qwen35_config::{LayerType, Qwen35Config};
+
+    /// Minimal `Qwen35Config` for the pure `resolve_mtp_*` tests: no
+    /// `ModelWeights`/Metal `Device` construction at all (unlike
+    /// `tiny_metal_qwen35_fixture`, which lives inside `mod inner` and is
+    /// gated on the `metal-gpu` feature -- these tests must not depend on
+    /// it, or they'd silently disappear again on a Metal-less/no-feature
+    /// build, exactly the round-1/round-2 skip-pass class). Field values
+    /// mirror `tiny_metal_qwen35_fixture`'s config so the derived MTP
+    /// projection/norm shapes match the same real-checkpoint-verified
+    /// formulas.
+    fn tiny_mtp_test_config() -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 512,
+            num_hidden_layers: 1,
+            vocab_size: 64,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            mtp_num_hidden_layers: 1,
+            mtp_use_dedicated_embeddings: false,
+            full_attention_interval: 1,
+            layer_types: vec![LayerType::FullAttention],
+            layer_mask: vec![true],
+            eos_token_id: 63,
+            max_position_embeddings: 128,
+            quarot_rotation_seed: None,
+        }
+    }
+
+    // MTP Q4/F16 tensor resolution (#630, #636): `quantize_q4` applies its
+    // `should_quantize` name-suffix rule to MTP tensor names exactly like the
+    // main model, so the 8 `*_proj*` matrices (q/k/v/o_proj, gate/up/down_proj,
+    // fc) are written as `.q4` while the 7 norm tensors are written as `.f16`.
+    // `quantize_quarot` instead keeps ALL 15 MTP tensors as unrotated `.f16`
+    // (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights).
+    // `resolve_mtp_projection`/`resolve_mtp_norm` must accept both flavors,
+    // reject a stale `.q4` MTP sibling under a QuaRot (`is_quarot=true`)
+    // directory (round-1 MAJOR), and reject a transposed/mismatched tensor
+    // shape (round-1 medium #1). These tests live at the file top level,
+    // compiled unconditionally in any test build -- not gated on `metal-gpu`
+    // -- so this coverage never skip-passes on a Metal-less CI runner
+    // (round-1 medium #3, hardened further in round 2: see the module doc
+    // comment above `mtp_tensor_path` for why this code moved out of
+    // `mod inner` entirely).
+
+    /// Write a tiny `.f16` (KHF1) tensor file with the given `shape`,
+    /// filled with copies of `1.0`, mirroring the format
+    /// `load_f16_tensor_file` reads (crates/inference/src/weights/q4_weights.rs).
+    pub(crate) fn write_tiny_f16_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
+        use crate::weights::q4_weights::q4_f32_to_f16;
+        let numel: usize = shape.iter().product();
+        let path = mtp_tensor_path(dir, name, "f16");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes()); // ndim
+        for &dim in shape {
+            buf.extend_from_slice(&(dim as u64).to_le_bytes());
+        }
+        buf.extend_from_slice(&(numel as u64).to_le_bytes()); // numel
+        for _ in 0..numel {
+            buf.extend_from_slice(&q4_f32_to_f16(1.0).to_le_bytes());
+        }
+        std::fs::write(&path, buf).expect("write .f16 fixture");
+    }
+
+    /// Write a tiny `.q4` tensor file with the given `shape`, filled with
+    /// copies of `0.1`.
+    pub(crate) fn write_tiny_q4_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
+        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
+        let numel: usize = shape.iter().product();
+        let data = vec![0.1f32; numel];
+        let tensor = quantize_f32_to_q4(&data, shape).expect("quantize tiny tensor");
+        let path = mtp_tensor_path(dir, name, "q4");
+        save_q4_file(&path, &tensor).expect("save .q4 fixture");
+    }
+
+    /// The 8 MTP projection tensor names paired with their expected
+    /// on-disk shape, derived from the real qwen3.5-0.8b-q4 checkpoint
+    /// (`~/.lattice/models/qwen3.5-0.8b-q4/mtp_*.q4` headers, verified by
+    /// hand during #636 round-1 remediation): on-disk shape is always
+    /// `[d_out, d_in]`, matching `expected_lora_shape`'s `(d_in, d_out)`
+    /// convention reversed.
+    pub(crate) fn mtp_proj_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 8] {
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.full_q_dim();
+        let kv_dim = cfg.full_kv_dim();
+        let inter = cfg.intermediate_size;
+        [
+            (
+                "mtp.layers.0.self_attn.q_proj.weight",
+                vec![2 * q_dim, hidden],
+            ),
+            ("mtp.layers.0.self_attn.k_proj.weight", vec![kv_dim, hidden]),
+            ("mtp.layers.0.self_attn.v_proj.weight", vec![kv_dim, hidden]),
+            ("mtp.layers.0.self_attn.o_proj.weight", vec![hidden, q_dim]),
+            ("mtp.layers.0.mlp.gate_proj.weight", vec![inter, hidden]),
+            ("mtp.layers.0.mlp.up_proj.weight", vec![inter, hidden]),
+            ("mtp.layers.0.mlp.down_proj.weight", vec![hidden, inter]),
+            ("mtp.fc.weight", vec![hidden, 2 * hidden]),
+        ]
+    }
+
+    /// The 7 MTP norm tensor names paired with their expected shape —
+    /// never quantized (`should_quantize` excludes anything containing
+    /// `norm.weight`). `q_norm`/`k_norm` are `[head_dim]`; the rest are
+    /// `[hidden]`.
+    // Only reachable via `write_full_mtp_fixture` (see its own
+    // `#[allow(dead_code)]` note above).
+    #[allow(dead_code)]
+    fn mtp_norm_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 7] {
+        let hidden = cfg.hidden_size;
+        let head_dim = cfg.head_dim;
+        [
+            ("mtp.layers.0.input_layernorm.weight", vec![hidden]),
+            ("mtp.layers.0.post_attention_layernorm.weight", vec![hidden]),
+            ("mtp.layers.0.self_attn.q_norm.weight", vec![head_dim]),
+            ("mtp.layers.0.self_attn.k_norm.weight", vec![head_dim]),
+            ("mtp.norm.weight", vec![hidden]),
+            ("mtp.pre_fc_norm_embedding.weight", vec![hidden]),
+            ("mtp.pre_fc_norm_hidden.weight", vec![hidden]),
+        ]
+    }
+
+    /// Write a complete, well-formed MTP tensor set to `dir`: the 8
+    /// projections in `proj_flavor` (`.q4` or `.f16`) and the 7 norms as
+    /// `.f16`.
+    // Only consumed by the Device-gated integration tests in `mod
+    // inner::tests`, which don't exist in a default-feature (no
+    // metal-gpu) build -- looks dead in that configuration.
+    #[allow(dead_code)]
+    pub(crate) fn write_full_mtp_fixture(
+        dir: &std::path::Path,
+        cfg: &Qwen35Config,
+        proj_as_q4: bool,
+    ) {
+        for (name, shape) in mtp_proj_names_and_shapes(cfg) {
+            if proj_as_q4 {
+                write_tiny_q4_fixture(dir, name, &shape);
+            } else {
+                write_tiny_f16_fixture(dir, name, &shape);
+            }
+        }
+        for (name, shape) in mtp_norm_names_and_shapes(cfg) {
+            write_tiny_f16_fixture(dir, name, &shape);
+        }
+    }
+
+    // --- CPU-only, Device-free coverage of the flavor/shape logic itself ---
+    // (round-1 medium #3: these never skip on a Metal-less CI runner.)
+
+    #[test]
+    fn resolve_mtp_projection_prefers_q4_when_allowed() {
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0]; // q_proj
+        write_tiny_q4_fixture(tmp.path(), name, shape);
+
+        let resolved = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
+            .expect("plain Q4 dir must resolve the .q4 sibling");
+        assert!(
+            resolved.is_q4(),
+            "allow_q4=true with a .q4 file present must prefer the .q4 flavor"
+        );
+        assert_eq!(resolved.shape(), shape.as_slice());
+    }
+
+    #[test]
+    fn resolve_mtp_projection_falls_back_to_f16_when_q4_absent() {
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
+        write_tiny_f16_fixture(tmp.path(), name, shape);
+
+        let resolved = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
+            .expect("QuaRot-shaped all-.f16 dir must resolve the .f16 sibling");
+        assert!(!resolved.is_q4(), "no .q4 file exists; must resolve .f16");
+    }
+
+    #[test]
+    fn resolve_mtp_projection_rejects_stale_q4_sibling_under_quarot() {
+        // Round-1 MAJOR: a QuaRot (rotated-space) checkpoint directory
+        // must never load an MTP `.q4` sibling even if one exists —
+        // that shape is reachable when `quantize_q4` is re-run into an
+        // existing QuaRot output dir (the converter reuses a non-empty
+        // output dir rather than rejecting it). Silently preferring
+        // `.q4` there would load rotated-space weights while
+        // counter-rotation (keyed off the same dir's `quarot_seed`)
+        // stays enabled, corrupting every MTP draft with no load
+        // failure to reveal it.
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
+        // Mixed/stale layout: BOTH a .q4 (leftover from a re-run
+        // quantize_q4) and the expected QuaRot .f16 exist side by side.
+        write_tiny_q4_fixture(tmp.path(), name, shape);
+        write_tiny_f16_fixture(tmp.path(), name, shape);
+
+        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ false).expect_err(
+            "allow_q4=false (QuaRot flavor) with a .q4 sibling present must fail closed",
+        );
+        let MtpLoadErr::Incompatible(message) = err else {
+            panic!("expected Incompatible, got {err:?}");
+        };
+        assert!(
+            message.contains("incompatible") && message.contains(".q4"),
+            "error must name the incompatible .q4 artifact; got: {message}"
+        );
+    }
+
+    #[test]
+    fn resolve_mtp_projection_rejects_transposed_q4_shape() {
+        // Round-1 medium #1: a same-numel transposed file must not
+        // silently load — it would generate tokens but produce garbage
+        // MTP drafts (0% accept class).
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0]; // q_proj: [2*q_dim, hidden]
+        let transposed: Vec<usize> = shape.iter().rev().copied().collect();
+        assert_ne!(
+            shape, &transposed,
+            "fixture cfg must have distinguishable q_proj dims for this test to be meaningful"
+        );
+        write_tiny_q4_fixture(tmp.path(), name, &transposed);
+
+        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
+            .expect_err("a transposed same-numel .q4 tensor must be rejected, not accepted");
+        let MtpLoadErr::Incompatible(message) = err else {
+            panic!("expected Incompatible, got {err:?}");
+        };
+        assert!(
+            message.contains("shape"),
+            "error must name the shape mismatch; got: {message}"
+        );
+    }
+
+    #[test]
+    fn resolve_mtp_projection_rejects_transposed_f16_shape() {
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[6]; // down_proj: [hidden, inter]
+        let transposed: Vec<usize> = shape.iter().rev().copied().collect();
+        assert_ne!(
+            shape, &transposed,
+            "fixture cfg must have distinguishable down_proj dims for this test to be meaningful"
+        );
+        write_tiny_f16_fixture(tmp.path(), name, &transposed);
+
+        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
+            .expect_err("a transposed same-numel .f16 tensor must be rejected, not accepted");
+        assert!(matches!(err, MtpLoadErr::Incompatible(_)));
+    }
+
+    #[test]
+    fn resolve_mtp_projection_reports_missing_when_neither_flavor_present() {
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
+
+        let err = resolve_mtp_projection(tmp.path(), name, shape, true)
+            .expect_err("neither flavor present must be Missing, not Ok");
+        assert!(matches!(err, MtpLoadErr::Missing(_)));
+    }
+
+    #[test]
+    fn resolve_mtp_norm_rejects_transposed_shape() {
+        let cfg = tiny_mtp_test_config();
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        // input_layernorm is [hidden]; use a 2-D reshape as the "wrong
+        // shape" stand-in since a 1-D vector has no transpose.
+        let name = "mtp.layers.0.input_layernorm.weight";
+        let hidden = cfg.hidden_size;
+        write_tiny_f16_fixture(tmp.path(), name, &[hidden, 1]);
+
+        let err = resolve_mtp_norm(tmp.path(), name, &[hidden])
+            .expect_err("a reshaped norm tensor must be rejected, not accepted");
+        assert!(matches!(err, MtpLoadErr::Incompatible(_)));
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     use super::GdnStateTrafficScope;
+    // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
+    // top level (module-scope, above `mod inner`) so it compiles and is
+    // unit-testable without the `metal-gpu` feature at all (round-2 fix).
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
     };
+    use super::{MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection};
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     #[cfg(debug_assertions)]
@@ -6698,10 +7219,11 @@ kernel void gdn_chunk_norm_silu_c32(
             let output = self.generate(prompt, tokenizer, gen_cfg);
 
             // Always unload after the request so the slot does not leak into the
-            // next call on this state object.
+            // next call on this state object — regardless of whether generate()
+            // succeeded or failed closed (e.g. an exhausted grammar mask, #611).
             self.unload_lora_adapter();
 
-            Ok(output)
+            output
         }
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
@@ -10272,12 +10794,20 @@ kernel void gdn_chunk_norm_silu_c32(
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token (prefill or any decode step) — mirrors the CPU
+        /// `generate` contract (#611).
         pub fn generate(
             &mut self,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> GenerateOutput {
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
             let cfg = self.engine.config.clone();
 
             // Initialize RNG
@@ -10305,7 +10835,7 @@ kernel void gdn_chunk_norm_silu_c32(
             let prompt_len = prompt_ids.len();
 
             if prompt_len == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: 0,
@@ -10313,14 +10843,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false,
                     stop_reason: None,
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
             // so we never emit a token the caller did not ask for. Mirrors the CPU
             // generate() guard (model::qwen35::generation) and generate_streaming below.
             if gen_cfg.max_new_tokens == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -10328,7 +10858,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // Fail-closed: a prompt longer than the KV cache would trip the
@@ -10336,7 +10866,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // caller thread. Return a clean empty completion instead. Mirrors the
             // streaming path and the CPU generate() preflight (see generate_streaming).
             if prompt_len > self.max_context() {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -10344,7 +10874,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // Reset state for new generation
@@ -10401,6 +10931,16 @@ kernel void gdn_chunk_norm_silu_c32(
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
@@ -10418,7 +10958,12 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return self.generate_greedy_mtp(&prefill_logits, prompt_len, tokenizer, gen_cfg);
+                return Ok(self.generate_greedy_mtp(
+                    &prefill_logits,
+                    prompt_len,
+                    tokenizer,
+                    gen_cfg,
+                ));
             }
 
             // GDN-first self-speculative greedy path: env-gated, greedy only.
@@ -10430,12 +10975,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 && gen_cfg.grammar.is_none()
                 && cfg.num_active_linear_attention_layers() > 0;
             if use_self_spec {
-                return self.generate_greedy_self_spec(
+                return Ok(self.generate_greedy_self_spec(
                     &prefill_logits,
                     prompt_len,
                     tokenizer,
                     gen_cfg,
-                );
+                ));
             }
 
             let next_id = if use_compact {
@@ -10454,7 +10999,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !engine.advance(gs, next_id)
             {
                 let text = tokenizer.decode(&generated_ids).unwrap_or_default();
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
@@ -10462,7 +11007,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false,
                     stop_reason: Some(StopReason::Grammar),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             let is_stop = |id: u32| -> bool {
@@ -10474,7 +11019,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -10482,7 +11027,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             generated_ids.push(next_id);
@@ -10516,6 +11061,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                         engine.mask_logits(gs, &mut step_logits);
+                        // Fail closed if the grammar blocked every continuation,
+                        // matching the CPU contract (#611).
+                        if !super::has_finite_logit(&step_logits) {
+                            return Err(InferenceError::InvalidInput(
+                                "grammar constraint blocked every token; \
+                                 no legal continuation exists in the current grammar state"
+                                    .into(),
+                            ));
+                        }
                     }
 
                     if use_compact {
@@ -10560,7 +11114,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // Detokenize
             let text = decode_tokens(tokenizer, &generated_ids);
 
-            GenerateOutput {
+            Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
@@ -10568,7 +11122,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 stopped,
                 stop_reason: Some(stop_reason),
                 token_logprobs: vec![],
-            }
+            })
         }
 
         /// **Unstable**: multimodal generation; visual token handling and position encoding
@@ -14419,12 +14973,17 @@ kernel void gdn_chunk_norm_silu_c32(
         ///
         /// Chat completion: format messages with Qwen3.5 template, generate response.
         /// Stops on <|im_end|> or EOS or max tokens.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token — propagated from [`Self::generate`] (#611).
         pub fn chat_completion(
             &mut self,
             messages: &[ChatMessage],
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> ChatCompletionOutput {
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
             let prompt = format_chat_template(messages);
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
@@ -14433,13 +14992,13 @@ kernel void gdn_chunk_norm_silu_c32(
             {
                 cfg.stop_token_ids.push(im_end_id);
             }
-            let result = self.generate(&prompt, tokenizer, &cfg);
+            let result = self.generate(&prompt, tokenizer, &cfg)?;
             let text = result.text.trim_end().to_string();
-            ChatCompletionOutput {
+            Ok(ChatCompletionOutput {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
-            }
+            })
         }
 
         /// **Unstable**: streaming generation; callback signature may change.
@@ -14459,7 +15018,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             on_token: F,
-        ) -> GenerateOutput
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
         {
@@ -14481,6 +15040,12 @@ kernel void gdn_chunk_norm_silu_c32(
         ///
         /// `generate_streaming` is the `should_cancel = || false` convenience form
         /// and is otherwise identical; both share this one implementation.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token (prefill or any decode step) — mirrors the CPU
+        /// `generate_streaming` contract (#611).
         pub fn generate_streaming_with_cancel<F, C>(
             &mut self,
             prompt: &str,
@@ -14488,11 +15053,13 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
             mut on_token: F,
             mut should_cancel: C,
-        ) -> GenerateOutput
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            use crate::error::InferenceError;
+
             let cfg = self.engine.config.clone();
 
             let mut rng_state = match gen_cfg.seed {
@@ -14518,7 +15085,7 @@ kernel void gdn_chunk_norm_silu_c32(
             let prompt_len = prompt_ids.len();
 
             if prompt_len == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: 0,
@@ -14526,7 +15093,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false,
                     stop_reason: None,
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
@@ -14534,7 +15101,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
             // and the generate() guard above.
             if gen_cfg.max_new_tokens == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -14542,19 +15109,21 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len), panicking and
             // killing this GPU worker thread — a persistent DoS for every later
             // request routed to it. Return a clean empty completion instead so the
-            // worker survives. Mirrors the CPU generate() preflight (which returns
-            // Err); this Metal entry point has no Result, so it yields an empty
-            // stopped output. The decode loop self-limits the prompt+completion case
+            // worker survives. Mirrors the CPU generate() preflight in spirit (both
+            // fail closed on an over-length prompt), but intentionally keeps
+            // returning an empty stopped output here rather than Err — this guard's
+            // contract is unrelated to and unchanged by the grammar fail-closed fix
+            // below (#611). The decode loop self-limits the prompt+completion case
             // (it breaks on seq_len >= max_cache_len), so only prefill needs guarding.
             if prompt_len > self.max_context() {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -14562,7 +15131,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             self.reset_state();
@@ -14631,7 +15200,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -14639,7 +15208,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // Batch prefill
@@ -14654,7 +15223,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -14662,12 +15231,22 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
                     token_logprobs: vec![],
-                };
+                });
             }
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let next_id = if use_compact {
@@ -14686,7 +15265,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !engine.advance(gs, next_id)
             {
                 let text = decode_tokens(tokenizer, &generated_ids);
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
@@ -14694,7 +15273,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: false, // grammar constraint, not an OpenAI stop condition
                     stop_reason: Some(StopReason::Grammar),
                     token_logprobs: token_logprobs.clone(),
-                };
+                });
             }
 
             let is_stop = |id: u32| -> bool {
@@ -14706,7 +15285,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
@@ -14714,7 +15293,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     stopped: true, // EOS/stop-token hit immediately after prefill
                     stop_reason: Some(StopReason::Eos),
                     token_logprobs: token_logprobs.clone(),
-                };
+                });
             }
 
             // Track whether the thinking block has been closed after prefill sampling.
@@ -14759,7 +15338,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         self.session.compact_topk = 0;
                         self.session.compact_route = GpuTopkRoute::CpuFallback;
                     }
-                    return GenerateOutput {
+                    return Ok(GenerateOutput {
                         text,
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
@@ -14767,7 +15346,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         stopped: false, // caller interrupted the stream, not a stop condition
                         stop_reason: Some(StopReason::Interrupt),
                         token_logprobs: token_logprobs.clone(),
-                    };
+                    });
                 }
             }
             let mut stopped = false;
@@ -14801,6 +15380,15 @@ kernel void gdn_chunk_norm_silu_c32(
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
+                    // Fail closed if the grammar blocked every continuation,
+                    // matching the CPU contract (#611).
+                    if !super::has_finite_logit(&step_logits) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
 
                 let sampled_id = if use_compact {
@@ -14908,7 +15496,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     on_token(&tail, last_pushed_id);
                 }
             }
-            GenerateOutput {
+            Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
@@ -14916,7 +15504,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 stopped,
                 stop_reason: Some(stop_reason),
                 token_logprobs: token_logprobs.clone(),
-            }
+            })
         }
 
         // ---------------------------------------------------------------------------
@@ -15013,87 +15601,132 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Returns no weights if the model has no MTP layers or if any weight file is
         /// missing; in the latter case the first missing file path is carried in the
         /// result so the caller can warn instead of silently falling back.
+        ///
+        /// `is_quarot` must reflect whether `q4_dir` is a QuaRot (rotated-space)
+        /// checkpoint — determined by the caller from `quarot_seed` presence
+        /// (`quantize_index.json` object manifest or the legacy `config.json`
+        /// field) BEFORE calling this function, so flavor detection never
+        /// depends on which files happen to exist per-tensor (#636 round-1
+        /// MAJOR). Returns `Err` (hard load failure, not a gracefully-disabled
+        /// warning) when an MTP tensor is present but untrustworthy: an
+        /// incompatible stale `.q4` sibling under `is_quarot`, or a
+        /// shape/transpose mismatch against the tensor's expected dimensions.
         fn load_mtp_q4_weights(
             q4_dir: &std::path::Path,
             cfg: &Qwen35Config,
             device: &Device,
-        ) -> MtpQ4LoadResult {
-            use crate::weights::q4_weights::load_f16_tensor_file;
-
+            is_quarot: bool,
+        ) -> Result<MtpQ4LoadResult, String> {
             if cfg.mtp_num_hidden_layers == 0 {
-                return MtpQ4LoadResult {
+                return Ok(MtpQ4LoadResult {
                     weights: None,
                     first_missing_file: None,
-                };
+                });
             }
 
-            let f16p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "f16");
-            // follow-up: #418's actual-load part is deferred; this loader still expects .f16 MTP files while the shipped Q4 checkpoint provides those weights as .q4.
+            let hidden = cfg.hidden_size;
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+            let inter = cfg.intermediate_size;
+            let head_dim = cfg.head_dim;
+            // Projections may load .q4 only on a plain (non-QuaRot) checkpoint;
+            // QuaRot dirs must keep every MTP tensor unrotated .f16.
+            let allow_q4 = !is_quarot;
 
-            // Helper: load an f16 file as a f32 Metal buffer (for norm gammas / biases
-            // consumed by RMSNorm kernels that read f32 input).
-            let load_f16_buf_as_f32 =
-                |name: &str, label: &str| -> Result<Buffer, std::path::PathBuf> {
-                    let path = f16p(name);
-                    if !path.exists() {
-                        return Err(path);
-                    }
-                    let (vals, _) = load_f16_tensor_file(&path).map_err(|_| path.clone())?;
-                    Ok(make_buffer(device, &vals, label))
+            // Helper: resolve + widen an MTP norm to an f32 Metal buffer (for
+            // RMSNorm kernels that read f32 input).
+            let load_norm_as_f32 =
+                |name: &str, expected_shape: &[usize], label: &str| -> Result<Buffer, MtpLoadErr> {
+                    let (values, _) = resolve_mtp_norm(q4_dir, name, expected_shape)?;
+                    Ok(make_buffer(device, &values, label))
                 };
 
-            // Helper: load an f16 file as a Metal half-precision (f16) buffer for use
-            // by `dispatch_matmul_half` / `gemv_decode_m1`. ADR-051 Phase 1 mandates
-            // f16 storage for the 8 MTP projection matrices so the runtime applies
-            // counter-rotation on unquantized weights.
-            let load_f16_buf_as_half =
-                |name: &str, label: &str| -> Result<Buffer, std::path::PathBuf> {
-                    let path = f16p(name);
-                    if !path.exists() {
-                        return Err(path);
+            // Helper: resolve one of the 8 MTP projections and materialize it
+            // as an f16 Metal buffer for `dispatch_matmul_half` / `gemv_decode_m1`
+            // (ADR-051 Phase 1: both flavors store MTP projections unrotated).
+            let load_proj_as_half =
+                |name: &str, expected_shape: &[usize], label: &str| -> Result<Buffer, MtpLoadErr> {
+                    match resolve_mtp_projection(q4_dir, name, expected_shape, allow_q4)? {
+                        MtpTensorSource::Q4(tensor) => Ok(
+                            MetalQwen35State::make_buffer_f16_from_q4(device, &tensor, label),
+                        ),
+                        MtpTensorSource::F16 { values, .. } => {
+                            Ok(make_buffer_f16(device, &values, label))
+                        }
                     }
-                    let (vals, _) = load_f16_tensor_file(&path).map_err(|_| path.clone())?;
-                    Ok(make_buffer_f16(device, &vals, label))
                 };
 
-            let weights = (|| -> Result<MetalMtpWeights, std::path::PathBuf> {
+            let weights = (|| -> Result<MetalMtpWeights, MtpLoadErr> {
                 // --- Layer 0 weights (ADR-051: 8 projections as f16, 7 norms as f32) ---
-                let input_layernorm = load_f16_buf_as_f32(
+                let input_layernorm = load_norm_as_f32(
                     "mtp.layers.0.input_layernorm.weight",
+                    &[hidden],
                     "mtp.l0.input_layernorm",
                 )?;
-                let post_attention_layernorm = load_f16_buf_as_f32(
+                let post_attention_layernorm = load_norm_as_f32(
                     "mtp.layers.0.post_attention_layernorm.weight",
+                    &[hidden],
                     "mtp.l0.post_attn_layernorm",
                 )?;
-                let q_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
-                let k_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
-                let v_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
-                let o_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
-                let q_norm =
-                    load_f16_buf_as_f32("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
-                let k_norm =
-                    load_f16_buf_as_f32("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
-                let gate_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
-                let up_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
-                let down_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
+                let q_proj = load_proj_as_half(
+                    "mtp.layers.0.self_attn.q_proj.weight",
+                    &[2 * q_dim, hidden],
+                    "mtp.l0.q_proj",
+                )?;
+                let k_proj = load_proj_as_half(
+                    "mtp.layers.0.self_attn.k_proj.weight",
+                    &[kv_dim, hidden],
+                    "mtp.l0.k_proj",
+                )?;
+                let v_proj = load_proj_as_half(
+                    "mtp.layers.0.self_attn.v_proj.weight",
+                    &[kv_dim, hidden],
+                    "mtp.l0.v_proj",
+                )?;
+                let o_proj = load_proj_as_half(
+                    "mtp.layers.0.self_attn.o_proj.weight",
+                    &[hidden, q_dim],
+                    "mtp.l0.o_proj",
+                )?;
+                let q_norm = load_norm_as_f32(
+                    "mtp.layers.0.self_attn.q_norm.weight",
+                    &[head_dim],
+                    "mtp.l0.q_norm",
+                )?;
+                let k_norm = load_norm_as_f32(
+                    "mtp.layers.0.self_attn.k_norm.weight",
+                    &[head_dim],
+                    "mtp.l0.k_norm",
+                )?;
+                let gate_proj = load_proj_as_half(
+                    "mtp.layers.0.mlp.gate_proj.weight",
+                    &[inter, hidden],
+                    "mtp.l0.gate_proj",
+                )?;
+                let up_proj = load_proj_as_half(
+                    "mtp.layers.0.mlp.up_proj.weight",
+                    &[inter, hidden],
+                    "mtp.l0.up_proj",
+                )?;
+                let down_proj = load_proj_as_half(
+                    "mtp.layers.0.mlp.down_proj.weight",
+                    &[hidden, inter],
+                    "mtp.l0.down_proj",
+                )?;
 
                 // --- Top-level MTP weights ---
-                let fc = load_f16_buf_as_half("mtp.fc.weight", "mtp.fc")?;
-                let pre_fc_norm_embedding = load_f16_buf_as_f32(
+                let fc = load_proj_as_half("mtp.fc.weight", &[hidden, 2 * hidden], "mtp.fc")?;
+                let pre_fc_norm_embedding = load_norm_as_f32(
                     "mtp.pre_fc_norm_embedding.weight",
+                    &[hidden],
                     "mtp.pre_fc_norm_embedding",
                 )?;
-                let pre_fc_norm_hidden =
-                    load_f16_buf_as_f32("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden")?;
-                let norm = load_f16_buf_as_f32("mtp.norm.weight", "mtp.norm")?;
+                let pre_fc_norm_hidden = load_norm_as_f32(
+                    "mtp.pre_fc_norm_hidden.weight",
+                    &[hidden],
+                    "mtp.pre_fc_norm_hidden",
+                )?;
+                let norm = load_norm_as_f32("mtp.norm.weight", &[hidden], "mtp.norm")?;
 
                 eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
                 Ok(MetalMtpWeights {
@@ -15120,14 +15753,15 @@ kernel void gdn_chunk_norm_silu_c32(
             })();
 
             match weights {
-                Ok(weights) => MtpQ4LoadResult {
+                Ok(weights) => Ok(MtpQ4LoadResult {
                     weights: Some(weights),
                     first_missing_file: None,
-                },
-                Err(first_missing_file) => MtpQ4LoadResult {
+                }),
+                Err(MtpLoadErr::Missing(first_missing_file)) => Ok(MtpQ4LoadResult {
                     weights: None,
                     first_missing_file: Some(first_missing_file),
-                },
+                }),
+                Err(MtpLoadErr::Incompatible(message)) => Err(message),
             }
         }
 
@@ -15871,12 +16505,27 @@ kernel void gdn_chunk_norm_silu_c32(
             // tokenizer_path is accepted but not stored — tokenizer is loaded by the caller.
             let _ = tokenizer_path;
 
+            // Determine the QuaRot flavor BEFORE loading any MTP projection, so a
+            // stale MTP `.q4` sibling in a rotated-space checkpoint fails closed
+            // instead of silently loading rotated weights under counter-rotation
+            // (#636 round-1 MAJOR). ADR-051 contract: `quarot_seed` lives in
+            // `quantize_index.json`. Fall back to the legacy `config.json` field
+            // (`quarot_rotation_seed`) for backwards compatibility with artifacts
+            // produced before the contract was formalized. #504 remaining slice 2:
+            // a *present but malformed* index is a hard error (fail-closed) — only
+            // a genuinely absent index falls back.
+            let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
+                .map_err(|e| format!("from_q4_dir: {e}"))?;
+            let quarot_seed_opt = index_seed.or(cfg.quarot_rotation_seed);
+            let is_quarot = quarot_seed_opt.is_some();
+
             // Load MTP weights (cache+activations go into session, not engine).
             let mtp_requested = std::env::var_os("LATTICE_MTP").is_some();
             let MtpQ4LoadResult {
                 weights: mtp_weights_opt,
                 first_missing_file: mtp_missing_file,
-            } = Self::load_mtp_q4_weights(q4_dir, cfg, &device);
+            } = Self::load_mtp_q4_weights(q4_dir, cfg, &device, is_quarot)
+                .map_err(|e| format!("from_q4_dir: {e}"))?;
             if let Some(message) = super::mtp_missing_weights_warning(
                 mtp_requested,
                 mtp_weights_opt.is_some(),
@@ -15933,15 +16582,7 @@ kernel void gdn_chunk_norm_silu_c32(
             };
 
             let quarot_rotation = if mtp_weights_opt.is_some() {
-                // ADR-051 contract: `quarot_seed` lives in `quantize_index.json`. Fall back
-                // to the legacy `config.json` field (`quarot_rotation_seed`) for
-                // backwards compatibility with artifacts produced before the contract was
-                // formalized. #504 remaining slice 2: a *present but malformed* index is a
-                // hard error (fail-closed) — only a genuinely absent index falls back.
-                let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
-                    .map_err(|e| format!("from_q4_dir: {e}"))?;
-                let seed_opt = index_seed.or(cfg.quarot_rotation_seed);
-                match seed_opt {
+                match quarot_seed_opt {
                     Some(seed) => Some(
                         crate::quant::quarot::hadamard::RandomizedHadamard::new(seed, hidden)
                             .map_err(|e| {
@@ -16025,7 +16666,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             on_token: F,
-        ) -> ChatCompletionOutput
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
         {
@@ -16041,6 +16682,11 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Cancellation-aware sibling of [`Self::chat_completion_streaming`]; see
         /// [`Self::generate_streaming_with_cancel`] for exactly what `should_cancel`
         /// observes that `on_token` alone cannot.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token — propagated from [`Self::generate_streaming_with_cancel`] (#611).
         pub fn chat_completion_streaming_with_cancel<F, C>(
             &mut self,
             messages: &[ChatMessage],
@@ -16048,7 +16694,7 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
             on_token: F,
             should_cancel: C,
-        ) -> ChatCompletionOutput
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
@@ -16066,13 +16712,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 &cfg,
                 on_token,
                 should_cancel,
-            );
+            )?;
             let text = result.text.trim_end().to_string();
-            ChatCompletionOutput {
+            Ok(ChatCompletionOutput {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
-            }
+            })
         }
     }
 
@@ -16734,6 +17380,7 @@ kernel void gdn_chunk_norm_silu_c32(
         where
             F: FnMut(&str, u32) -> bool,
         {
+            use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
             let cfg = self.engine.config.clone();
@@ -16896,6 +17543,16 @@ kernel void gdn_chunk_norm_silu_c32(
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let next_id = if use_compact {
@@ -17031,6 +17688,15 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
+                    // Fail closed if the grammar blocked every continuation,
+                    // matching the CPU contract (#611).
+                    if !super::has_finite_logit(&step_logits) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
 
                 let sampled_id = if use_compact {
@@ -17197,6 +17863,14 @@ kernel void gdn_chunk_norm_silu_c32(
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
             topk_set_agreement_or_boundary_tie,
+        };
+        // Fixture helpers for the MTP Q4/F16 loader tests below now live in
+        // the top-level `mtp_resolve_tests` module (round-2: moved out of
+        // `mod inner` so the pure resolver tests compile without
+        // `metal-gpu` -- these Device-gated integration tests still share
+        // the same fixture writers).
+        use super::super::mtp_resolve_tests::{
+            mtp_proj_names_and_shapes, write_full_mtp_fixture, write_tiny_q4_fixture,
         };
         use super::*;
         use crate::model::qwen35::{
@@ -19139,6 +19813,174 @@ kernel void decode_attention_reference(
                 result.is_ok(),
                 "mmap_q4_weight must accept a fully populated payload: {:?}",
                 result.err()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // load_mtp_q4_weights: Device-gated integration smoke (#630, #636)
+        // -------------------------------------------------------------------
+        //
+        // Pure, `Device`-free coverage of the flavor/shape-resolution logic
+        // itself (`resolve_mtp_projection`/`resolve_mtp_norm`) lives at the
+        // file top level in `mod mtp_resolve_tests`, compiled unconditionally
+        // in any test build (not gated on the `metal-gpu` feature), so it
+        // never skip-passes on a Metal-less CI runner (#636 round-2 -- these
+        // tests used to live right here, inside this `metal-gpu`-gated
+        // `mod inner`, and `cargo test --lib resolve_mtp` with no features
+        // reported "running 0 tests"). The tests below instead exercise
+        // `load_mtp_q4_weights` end-to-end against a real Metal `Device`.
+
+        // --- Device-gated integration smoke on top of the CPU-only coverage above ---
+
+        #[test]
+        fn load_mtp_q4_weights_accepts_q4_projections_with_f16_norms() {
+            // Straight (non-QuaRot) Q4 checkpoint shape: 8 projections as
+            // `.q4`, 7 norms as `.f16`. Before the #630 fix,
+            // `load_mtp_q4_weights` only tried `.f16` for the projections,
+            // so it always reported the first projection as missing on
+            // this exact directory layout (the real shape `quantize_q4`
+            // ships) — reverting the fix must fail this assertion.
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            write_full_mtp_fixture(tmp.path(), &cfg, /* proj_as_q4 */ true);
+
+            let result = MetalQwen35State::load_mtp_q4_weights(
+                tmp.path(),
+                &cfg,
+                &device,
+                /* is_quarot */ false,
+            )
+            .expect("well-formed plain-Q4 MTP directory must not hard-error");
+
+            assert!(
+                result.weights.is_some(),
+                "load_mtp_q4_weights must load MTP weights when the 8 projections \
+                 are .q4 and the 7 norms are .f16 (the real quantize_q4 output \
+                 shape); first_missing_file={:?}",
+                result.first_missing_file
+            );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_still_accepts_all_f16_quarot_layout() {
+            // QuaRot checkpoints (`quantize_quarot`) keep every MTP tensor,
+            // including the 8 projections, as unrotated `.f16` (ADR-051
+            // Phase 1). The Q4-preferring loader must fall back to `.f16`
+            // when no `.q4` sibling exists, so this checkpoint flavor keeps
+            // working exactly as before.
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            write_full_mtp_fixture(tmp.path(), &cfg, /* proj_as_q4 */ false);
+
+            let result = MetalQwen35State::load_mtp_q4_weights(
+                tmp.path(),
+                &cfg,
+                &device,
+                /* is_quarot */ true,
+            )
+            .expect("well-formed all-.f16 QuaRot MTP directory must not hard-error");
+
+            assert!(
+                result.weights.is_some(),
+                "load_mtp_q4_weights must still accept the all-.f16 QuaRot \
+                 layout; first_missing_file={:?}",
+                result.first_missing_file
+            );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_reports_missing_file_when_neither_flavor_present() {
+            // Fail-closed contract: if a projection has neither a `.q4` nor
+            // a `.f16` sibling, the loader must report it as missing (and
+            // the caller falls back to the non-MTP decode path with a
+            // warning) rather than silently loading garbage.
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            // Deliberately write nothing — the directory is empty.
+
+            let result = MetalQwen35State::load_mtp_q4_weights(tmp.path(), &cfg, &device, false)
+                .expect("a genuinely-missing (not incompatible) artifact must not hard-error");
+
+            assert!(
+                result.weights.is_none(),
+                "load_mtp_q4_weights must not synthesize weights when both \
+                 .q4 and .f16 are absent"
+            );
+            assert!(
+                result.first_missing_file.is_some(),
+                "load_mtp_q4_weights must report a first_missing_file when \
+                 nothing is on disk"
+            );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_hard_errors_on_stale_q4_under_quarot() {
+            // Round-1 MAJOR integration coverage: a mixed/stale QuaRot
+            // directory (both .q4 and .f16 for a projection, is_quarot=true)
+            // must be a hard `Err`, not a gracefully-disabled `None` — this
+            // is the exact failure-open scenario codex flagged.
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            write_full_mtp_fixture(tmp.path(), &cfg, /* proj_as_q4 */ false);
+            // Stale leftover from a prior `quantize_q4` run into this dir.
+            let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
+            write_tiny_q4_fixture(tmp.path(), name, shape);
+
+            let result = MetalQwen35State::load_mtp_q4_weights(
+                tmp.path(),
+                &cfg,
+                &device,
+                /* is_quarot */ true,
+            );
+            let Err(err) = result else {
+                panic!(
+                    "a stale MTP .q4 sibling under a QuaRot directory must hard-error, \
+                     not silently disable MTP or silently load the .q4"
+                )
+            };
+            assert!(
+                err.contains("incompatible") && err.contains(".q4"),
+                "error must name the incompatible .q4 artifact; got: {err}"
             );
         }
 
@@ -22802,7 +23644,9 @@ kernel void decode_attention_reference(
             // length preflight must trip before any prefill/decode work happens.
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny hybrid fixture");
 
-            let out = state.generate("abcdefgh", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("abcdefgh", &tokenizer, &gen_cfg)
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 out.generated_tokens, 0,
@@ -22858,14 +23702,16 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut calls = 0u32;
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
-                calls += 1;
-                assert!(
-                    !delta.is_empty(),
-                    "on_token must only be invoked with a non-empty delta"
-                );
-                false
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    calls += 1;
+                    assert!(
+                        !delta.is_empty(),
+                        "on_token must only be invoked with a non-empty delta"
+                    );
+                    false
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 calls, 1,
@@ -22920,16 +23766,18 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut on_token_calls = 0u32;
-            let out = state.generate_streaming_with_cancel(
-                "a",
-                &tokenizer,
-                &gen_cfg,
-                |_delta, _id| {
-                    on_token_calls += 1;
-                    true
-                },
-                || true, // already cancelled before generation ever starts
-            );
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        on_token_calls += 1;
+                        true
+                    },
+                    || true, // already cancelled before generation ever starts
+                )
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 on_token_calls, 0,
@@ -23000,23 +23848,25 @@ kernel void decode_attention_reference(
 
             let mut on_token_calls = 0u32;
             let mut should_cancel_calls = 0u32;
-            let out = state.generate_streaming_with_cancel(
-                "a",
-                &tokenizer,
-                &gen_cfg,
-                |_delta, _id| {
-                    on_token_calls += 1;
-                    true // on_token itself never asks to stop.
-                },
-                move || {
-                    should_cancel_calls += 1;
-                    // False for the before-prefill and after-prefill checks
-                    // (calls 1-2), letting exactly the prefill-sampled token
-                    // through; true starting at the decode loop's very first
-                    // check (call 3), before that iteration samples anything.
-                    should_cancel_calls > 2
-                },
-            );
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        on_token_calls += 1;
+                        true // on_token itself never asks to stop.
+                    },
+                    move || {
+                        should_cancel_calls += 1;
+                        // False for the before-prefill and after-prefill checks
+                        // (calls 1-2), letting exactly the prefill-sampled token
+                        // through; true starting at the decode loop's very first
+                        // check (call 3), before that iteration samples anything.
+                        should_cancel_calls > 2
+                    },
+                )
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 on_token_calls, 1,
@@ -23080,7 +23930,9 @@ kernel void decode_attention_reference(
             cfg.eos_token_id = u32::MAX;
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
-            let out = state.generate("a", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 out.stop_reason,
@@ -23135,10 +23987,12 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut calls = 0u32;
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
-                calls += 1;
-                true
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                    calls += 1;
+                    true
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 calls, 0,
@@ -23201,10 +24055,12 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut accumulated = String::new();
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
-                accumulated.push_str(delta);
-                true
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    accumulated.push_str(delta);
+                    true
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert!(
                 out.generated_tokens >= 3,
@@ -24545,12 +25401,14 @@ kernel void decode_attention_reference(
                 let mut reference_state =
                     MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
-                let reference_out = reference_state.generate_streaming(
-                    &conversation,
-                    &tokenizer,
-                    &reference_gen_cfg,
-                    |_delta, _id| true,
-                );
+                let reference_out = reference_state
+                    .generate_streaming(
+                        &conversation,
+                        &tokenizer,
+                        &reference_gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("no grammar configured; must not fail closed");
 
                 assert_eq!(
                     cached_out.output.token_ids, reference_out.token_ids,
@@ -24962,8 +25820,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after a prefix-mismatch invalidation, output must still match full re-prefill"
@@ -25092,8 +25951,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after cross-slot eviction, output must still match full re-prefill"
@@ -25167,8 +26027,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after an interleaved plain-path reset, output must still match full re-prefill"
@@ -25240,9 +26101,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state
-                    .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "exact-equal prompt retry output must match full re-prefill"
@@ -25419,8 +26280,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after an interleaved raw forward_step call, output must still match full re-prefill"
@@ -25502,6 +26364,480 @@ kernel void decode_attention_reference(
                 second.cache.mode,
                 crate::kv_cache::PrefixReuseMode::ExactAppend,
                 "an entry saved under the other GDN prefill mode must never be restored via ExactAppend"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Grammar fail-closed integration tests (#611)
+        //
+        // These three tests are the hardware-gated end-to-end counterpart to the
+        // pure-function `has_finite_logit_tests` module further down this file:
+        // that module proves the *predicate* is correct in isolation, these prove
+        // it is actually *wired in* at each real public Metal entry point, using
+        // the same technique as the CPU reference test
+        // `grammar_wiring_mask_logits_called_in_generate` in
+        // `model/qwen35/generation.rs`: a `GrammarEngine` built over a vocab
+        // table of all-empty byte sequences. `VocabPartition::build` rejects
+        // empty entries (they can never advance the PDA), so the precomputed
+        // bitmask for the initial state is all-zeros and `mask_logits` sets
+        // every one of `tiny_hybrid_fixture`'s 32 logits to `NEG_INFINITY`
+        // before the very first sample — a real, not simulated, all-blocked
+        // mask flowing through the real Metal forward path.
+        //
+        // Scope: these three cover the post-prefill masking site in each
+        // function. The decode-loop site — a second, structurally identical
+        // `has_finite_logit` guard a few lines below the prefill one in each
+        // of the three functions (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) — is reachable only
+        // from step 2 onward and needs a grammar that allows exactly one
+        // token and then blocks everything. #611 round-1 codex review (medium
+        // finding) flagged that gap: it is covered separately by the
+        // "DECODE-LOOP integration tests" block below this one, which builds
+        // exactly that allow-then-block fixture.
+        //
+        // Mutation sensitivity (all three): reverting the Metal-side
+        // `has_finite_logit` guard at the corresponding prefill site (or
+        // stubbing it to always return `true`) leaves the all-`NEG_INFINITY`
+        // row in place; the sampler's non-finite-max short-circuit then
+        // silently returns token 0 and each `matches!(result, Err(...))`
+        // assertion below fails instead of passing — this was verified by
+        // temporarily reverting the guard and re-running these three tests
+        // (see PR description).
+
+        /// #611: `generate`'s post-prefill grammar-masking site must fail
+        /// closed via `has_finite_logit`, exactly like the CPU path.
+        #[test]
+        fn generate_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // vocab_size=32 in `tiny_hybrid_fixture`; an all-empty-byte-sequence
+            // vocab table makes every one of the 32 entries unreachable by the
+            // PDA, so the initial-state mask blocks every logit.
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via generate(); got {result:?}"
+            );
+        }
+
+        /// #611: `generate_streaming`'s post-prefill grammar-masking site must
+        /// fail closed too. `generate_streaming` is a pure
+        /// `should_cancel = || false` delegate to
+        /// `generate_streaming_with_cancel` (see that method's doc comment),
+        /// so this one GPU run exercises both public entry points' shared
+        /// implementation without a redundant second pass.
+        #[test]
+        fn generate_streaming_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via generate_streaming(); \
+                 got {result:?}"
+            );
+            assert_eq!(
+                on_token_calls, 0,
+                "a prefill-blocked grammar must fail before any token ever reaches on_token"
+            );
+        }
+
+        /// #611: `generate_streaming_with_prefix_cache`'s post-prefill
+        /// grammar-masking site (inside
+        /// `generate_streaming_with_prefix_cache_inner`) must fail closed too,
+        /// AND the public wrapper's error path must not leave a stale cache
+        /// entry behind: unlike the CPU-only `_inner`, the public wrapper
+        /// resets state and evicts `slot_id`'s cache entry on any `Err` before
+        /// re-raising it (see that method's doc comment), so a
+        /// grammar-fail-closed turn can never leave the cache in a state a
+        /// later turn could incorrectly reuse.
+        #[test]
+        fn generate_streaming_with_prefix_cache_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a grammar-fail-closed turn must not leave a stale cache entry behind"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Grammar fail-closed DECODE-LOOP integration tests (#611 round-1 codex
+        // finding, medium)
+        //
+        // The three tests above only reach the post-prefill masking site: their
+        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
+        // never survives long enough to exercise the second, structurally
+        // identical guard a few lines below in the decode loop of each function
+        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
+        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
+        // of those three decode-loop guards left the three tests above green.
+        //
+        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
+        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
+        // `'a'`, so the initial-state mask allows exactly that one token and
+        // blocks the other 31. After `'a'` is sampled and the grammar state
+        // advances past it, the PDA stack is empty AND `complete == true`
+        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
+        // blocks all 32 tokens — the fixed point this test targets is one step
+        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
+        // is required so the loop actually reaches the decode iteration that
+        // hits the second mask; with `max_new_tokens: 1` the function would
+        // return successfully after the prefill token and never reach the
+        // decode-loop guard at all.
+        //
+        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
+        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
+        // mask in place, and the sampler's non-finite-max short-circuit then
+        // silently returns a token instead of failing — each assertion below
+        // fails instead of passing. Verified by temporarily reverse-applying
+        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
+        // re-running these three tests; restored afterward.
+
+        /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
+        /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
+        /// over it can accept/reject real single-character tokens instead of
+        /// the all-empty fixture the prefill-only tests above use.
+        fn single_char_vocab_bytes() -> Vec<Vec<u8>> {
+            (0u32..32)
+                .map(|i| {
+                    let byte = if i < 26 {
+                        b'a' + i as u8
+                    } else {
+                        b'A' + (i - 26) as u8
+                    };
+                    vec![byte]
+                })
+                .collect()
+        }
+
+        /// #611 round-1: `generate`'s DECODE-LOOP grammar-masking site
+        /// (:10502) must fail closed too, not just the post-prefill site.
+        #[test]
+        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard once the second step's mask blocks every \
+                 continuation; got {result:?}"
+            );
+        }
+
+        /// #611 round-1: `generate_streaming`'s DECODE-LOOP grammar-masking
+        /// site (`generate_streaming_with_cancel` :14821) must fail closed
+        /// too. Also asserts `on_token` is invoked at most once — the
+        /// fail-open bug this closes would otherwise emit a bogus second
+        /// token to the caller instead of erroring.
+        #[test]
+        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard via generate_streaming(); got {result:?}"
+            );
+            assert!(
+                on_token_calls <= 1,
+                "the decode-loop guard must fire before a second (bogus) token \
+                 ever reaches on_token; got {on_token_calls} calls"
+            );
+        }
+
+        /// #611 round-1: `generate_streaming_with_prefix_cache`'s
+        /// DECODE-LOOP grammar-masking site (inside
+        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
+        /// closed too, AND the public wrapper's error path must not save a
+        /// cache entry the decode-loop failure invalidated.
+        #[test]
+        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard via generate_streaming_with_prefix_cache(); \
+                 got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a decode-loop grammar-fail-closed turn must not leave a stale \
+                 cache entry behind"
             );
         }
     }
@@ -26286,6 +27622,83 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "logprobs = None must not trigger the preflight guard"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-free grammar fail-closed guard (mirrors CPU `has_finite_logit`, #611).
+//
+// `generate`, `generate_streaming_with_cancel`, and
+// `generate_streaming_with_prefix_cache_inner` all apply grammar masking via
+// `GrammarEngine::mask_logits`, which sets every disallowed logit position to
+// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
+// (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
+// check and fail closed with `InferenceError::InvalidInput` when the grammar
+// blocks every token — otherwise the sampler's non-finite-max short-circuit
+// would silently return the first candidate's token id (numerically safe, but
+// a silent violation of the grammar contract). This is that same guard,
+// mirrored for the Metal paths.
+//
+// Lives at module level (no cfg gate beyond test/macos+metal-gpu) so it
+// compiles and is unit-testable on every platform without Metal GPU hardware,
+// the same way `multimodal_generate_preflight` above is.
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when at least one logit is strictly greater than
+/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
+}
+
+#[cfg(test)]
+mod has_finite_logit_tests {
+    use super::has_finite_logit;
+
+    /// Mutation sensitivity: change `has_finite_logit` to always return `true`
+    /// → this assertion fails, catching the regression that would let an
+    /// all-blocked grammar mask silently reach the sampler.
+    #[test]
+    fn all_neg_infinity_has_no_finite_logit() {
+        let logits = vec![f32::NEG_INFINITY; 8];
+        assert!(
+            !has_finite_logit(&logits),
+            "an all-NEG_INFINITY buffer must report no finite logit"
+        );
+    }
+
+    /// One surviving finite logit (even a very negative one, or NaN elsewhere)
+    /// must be enough to pass. Mutation sensitivity: change the comparison
+    /// from `>` to `>=` or invert it → this fails.
+    #[test]
+    fn one_finite_logit_among_neg_infinity_passes() {
+        let mut logits = vec![f32::NEG_INFINITY; 8];
+        logits[3] = -1e30; // finite, just very negative — still a legal token
+        assert!(
+            has_finite_logit(&logits),
+            "one surviving finite logit must be detected"
+        );
+    }
+
+    /// NaN is neither `> NEG_INFINITY` nor `<= NEG_INFINITY`; every NaN
+    /// comparison is false, so an all-NaN buffer must also fail closed.
+    #[test]
+    fn all_nan_has_no_finite_logit() {
+        let logits = vec![f32::NAN; 8];
+        assert!(
+            !has_finite_logit(&logits),
+            "an all-NaN buffer must also report no finite logit (NaN is not > NEG_INFINITY)"
+        );
+    }
+
+    /// A normal, fully-unmasked logit buffer must pass.
+    #[test]
+    fn normal_logits_pass() {
+        let logits = vec![0.1_f32, -2.0, 5.5, -0.001];
+        assert!(
+            has_finite_logit(&logits),
+            "an ordinary logit buffer must report at least one finite logit"
         );
     }
 }

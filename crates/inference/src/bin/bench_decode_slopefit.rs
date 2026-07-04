@@ -234,12 +234,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         for rep in 0..repeats {
             // Warmup phase: unrecorded decode primes Metal pipeline caches.
             metal.reset_state();
-            let _ = metal.generate(&prompt, &tokenizer, &make_cfg(warmup_tokens));
+            let _ = metal.generate(&prompt, &tokenizer, &make_cfg(warmup_tokens))?;
 
             // Measurement phase: fresh reset → identical KV state each repeat.
             metal.reset_state();
             let t = std::time::Instant::now();
-            let result = metal.generate(&prompt, &tokenizer, &make_cfg(measure_tokens));
+            let result = metal.generate(&prompt, &tokenizer, &make_cfg(measure_tokens))?;
             let measure_ms = t.elapsed().as_secs_f64() * 1000.0;
             let actual_tokens = result.generated_tokens;
 
