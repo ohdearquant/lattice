@@ -176,7 +176,49 @@ lattice-embed = { version = "0.4", features = ["wgpu-gpu"] }
 
 ## Quick Start: CLI
 
-Build from source (requires Rust 1.93+ and, for Metal, macOS 14+):
+### Install
+
+Three ways to get `lattice`, in order of convenience:
+
+**1. `cargo install` (from [crates.io](https://crates.io/crates/lattice-inference)):**
+
+```bash
+# CPU build (Linux/macOS). f16 is required to load the BF16/F16 safetensors
+# that HuggingFace checkpoints ship in.
+cargo install lattice-inference --bin lattice --features f16
+
+# With Metal GPU (macOS only)
+cargo install lattice-inference --bin lattice --features f16,metal-gpu
+```
+
+This installs `lattice` to `~/.cargo/bin/lattice`. Requires Rust 1.93+
+(`rustup update` if `cargo install` complains about the `rust-version`).
+
+**2. Prebuilt release binaries:**
+
+Every [GitHub release](https://github.com/ohdearquant/lattice/releases) ships
+`lattice-<version>-<target>.tar.gz` for `aarch64-apple-darwin` (macOS,
+Metal-enabled), `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`
+(both CPU-only), plus a matching `.sha256` file.
+
+```bash
+VERSION=0.4.2   # match the release you want
+TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
+
+curl -LO "https://github.com/ohdearquant/lattice/releases/download/v${VERSION}/lattice-${VERSION}-${TARGET}.tar.gz"
+curl -LO "https://github.com/ohdearquant/lattice/releases/download/v${VERSION}/lattice-${VERSION}-${TARGET}.tar.gz.sha256"
+
+# Verify before extracting
+shasum -a 256 -c "lattice-${VERSION}-${TARGET}.tar.gz.sha256"
+
+tar -xzf "lattice-${VERSION}-${TARGET}.tar.gz"
+./lattice-${VERSION}-${TARGET}/lattice chat --model ~/.lattice/models/qwen3.5-0.8b
+```
+
+No Homebrew tap yet — tracked as a follow-up once release binaries have shipped
+for a few versions ([#633](https://github.com/ohdearquant/lattice/issues/633)).
+
+**3. Build from source** (requires Rust 1.93+ and, for Metal, macOS 14+):
 
 ```bash
 git clone https://github.com/ohdearquant/lattice
