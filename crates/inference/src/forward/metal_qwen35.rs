@@ -21594,6 +21594,78 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// `generate_multimodal` with `max_new_tokens == 0` must return zero
+        /// generated tokens without running prefill or sampling (#612 sibling-
+        /// invocation-path audit found this 4th guard site; #621 review round 1
+        /// flagged it as missing mutation-sensitive coverage).
+        ///
+        /// Unlike the CPU-side zero-budget tests (which use empty weight vecs
+        /// to make mutation trivially observable via a panic), Metal GPU state
+        /// needs real buffers, so this loads the real Qwen3.5-0.8B checkpoint.
+        /// Mutation sensitivity: if the `max_new_tokens == 0` guard were
+        /// removed, execution would fall through to `reset_state` plus real
+        /// prefill/sampling against the loaded weights and produce at least
+        /// one generated token, failing the `generated_tokens == 0` assertion
+        /// below.
+        #[test]
+        fn generate_multimodal_max_new_tokens_zero_returns_empty() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+
+            let visual_tokens = 4usize;
+            let d_model = model.config().hidden_size;
+            let text_tokens = vec![1u32, 2, 3];
+            let input = crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0f32; visual_tokens * d_model],
+                raw_patches: 16,
+                visual_tokens,
+                d_model,
+                text_tokens: text_tokens.clone(),
+            };
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                ..Default::default()
+            };
+
+            let out = state
+                .generate_multimodal(input, &tokenizer, &gen_cfg)
+                .expect("max_new_tokens=0 must succeed, not error");
+
+            assert!(
+                out.token_ids.is_empty(),
+                "max_new_tokens=0 must produce no token IDs, got {:?}",
+                out.token_ids
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "max_new_tokens=0 must produce zero generated tokens"
+            );
+            assert_eq!(
+                out.prompt_tokens,
+                visual_tokens + text_tokens.len(),
+                "prompt_tokens must equal visual_tokens + text_tokens.len()"
+            );
+            assert!(
+                !out.stopped,
+                "max_new_tokens=0 exit is budget exhaustion, not a stop condition"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "max_new_tokens=0 must report StopReason::Length"
+            );
+        }
+
         /// Acceptance test #2 (task order item 7 / design_spec.md Test Plan
         /// §5): top-k SET agreement 100% for K in {8,16,40,64} vs. the
         /// full-logit CPU oracle, on real checkpoint positions (the
