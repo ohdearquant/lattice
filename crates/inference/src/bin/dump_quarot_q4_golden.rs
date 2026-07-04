@@ -126,6 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         grammar: None,
         stop_strings: vec![],
         reasoning_budget: None,
+        logprobs: None,
     };
 
     let mut cases = Vec::with_capacity(PROMPTS.len());

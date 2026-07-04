@@ -32,7 +32,34 @@ pub enum AdapterStatus {
     Revoked,
 }
 
+impl AdapterStatus {
+    /// Lowercase `snake_case` string form, matching the serde wire format
+    /// (`"approved"` / `"quarantined"` / `"revoked"`). Used where a plain
+    /// string is needed outside of JSON (de)serialization, e.g. embedding
+    /// status into a safetensors metadata header.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdapterStatus::Approved => "approved",
+            AdapterStatus::Quarantined => "quarantined",
+            AdapterStatus::Revoked => "revoked",
+        }
+    }
+}
+
 /// Metadata and governance state for one adapter in the manifest.
+///
+/// Field set intentionally matches the #439 design intent
+/// `{name, owner, uri, base_model_rev, tokenizer_rev, integrity_sha256,
+/// dtype, approved}` (see issue #610), with one reconciliation:
+/// `status: AdapterStatus` is carried instead of a separate `approved: bool`.
+/// `AdapterStatus` is a strict superset of that boolean —
+/// `status == AdapterStatus::Approved` *is* `approved == true`, and the
+/// `Quarantined` / `Revoked` variants add fail-closed distinctions the
+/// loader already gives distinct error messages for (see
+/// `loader::load_adapters_from_manifest` Check 1). Adding a redundant
+/// `approved: bool` alongside `status` would create two sources of truth
+/// for the same governance decision with no defined precedence when they
+/// disagree; recorded in ADR-045.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Opaque identifier; matched against the `adapter_id` field in the
@@ -40,6 +67,10 @@ pub struct ManifestEntry {
     pub id: AdapterId,
     /// Human-readable name for logging and debugging.
     pub name: String,
+    /// Owning team or individual responsible for this adapter (free-form,
+    /// e.g. `"team-inference"` or an email). Provenance only; not enforced
+    /// by the loader.
+    pub owner: String,
     /// File path or URI for the safetensors file. Relative paths are resolved
     /// from the manifest file's parent directory.
     pub uri: String,
@@ -55,6 +86,11 @@ pub struct ManifestEntry {
     pub alpha: f32,
     /// Target modules this adapter covers (e.g. `["q_proj", "v_proj"]`).
     pub target_modules: Vec<String>,
+    /// Tensor dtype the adapter was trained/saved in (free-form label, e.g.
+    /// `"f32"`, `"f16"`, `"bf16"`). Provenance only; not cross-checked
+    /// against the actual tensor bytes at load time (the safetensors parse
+    /// in Check 5 validates real tensor shapes/dtypes independently).
+    pub dtype: String,
     /// Governance status. Only `Approved` adapters may be loaded.
     pub status: AdapterStatus,
 }
@@ -141,6 +177,7 @@ mod tests {
         ManifestEntry {
             id: id.to_string(),
             name: format!("{id} test adapter"),
+            owner: "team-test".to_string(),
             uri: format!("adapters/{id}.safetensors"),
             integrity_sha256: "abc123def456".to_string(),
             base_model_rev: "main".to_string(),
@@ -148,6 +185,7 @@ mod tests {
             rank: 8,
             alpha: 16.0,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            dtype: "f32".to_string(),
             status,
         }
     }
@@ -172,19 +210,23 @@ mod tests {
         assert_eq!(parsed.adapters[1].status, AdapterStatus::Quarantined);
         assert_eq!(parsed.adapters[0].rank, 8);
         assert!((parsed.adapters[0].alpha - 16.0).abs() < 1e-6);
+        assert_eq!(parsed.adapters[0].owner, "team-test");
+        assert_eq!(parsed.adapters[0].dtype, "f32");
     }
 
     #[test]
     fn rejects_missing_required_field() {
-        // `id` is omitted — serde must reject this
+        // `id` is omitted — serde must reject this. `owner`/`dtype` are
+        // filled in (even though they're also required) so `id` remains the
+        // *sole* deliberately-missing field, matching this test's name.
         let json = r#"{
             "version": 1,
             "adapters": [{
-                "name": "test", "uri": "test.safetensors",
+                "name": "test", "owner": "team-test", "uri": "test.safetensors",
                 "integrity_sha256": "abc",
                 "base_model_rev": "none", "tokenizer_rev": "none",
                 "rank": 8, "alpha": 16.0, "target_modules": ["q_proj"],
-                "status": "approved"
+                "dtype": "f32", "status": "approved"
             }]
         }"#;
         assert!(LoraManifest::from_json(json).is_err());
@@ -209,13 +251,34 @@ mod tests {
     }
 
     #[test]
+    fn status_as_str_matches_serde_wire_format() {
+        for (status, expected) in [
+            (AdapterStatus::Approved, "approved"),
+            (AdapterStatus::Quarantined, "quarantined"),
+            (AdapterStatus::Revoked, "revoked"),
+        ] {
+            assert_eq!(status.as_str(), expected);
+            // `as_str()` must never drift from the serde wire format, since
+            // callers (e.g. the safetensors header writer) use it as a
+            // stand-in for JSON serialization.
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unknown_status() {
+        // `owner`/`dtype` are filled in so the failure is unambiguously
+        // about the bad `status` value, not an incidental missing field.
         let json = r#"{
-            "id": "x", "name": "n", "uri": "u",
+            "id": "x", "name": "n", "owner": "team-test", "uri": "u",
             "integrity_sha256": "h",
             "base_model_rev": "none", "tokenizer_rev": "none",
             "rank": 4, "alpha": 4.0,
             "target_modules": ["q_proj"],
+            "dtype": "f32",
             "status": "provisional"
         }"#;
         assert!(serde_json::from_str::<ManifestEntry>(json).is_err());
@@ -237,6 +300,8 @@ mod tests {
         assert_eq!(loaded.adapters[0].id, "rev-adapter");
         assert_eq!(loaded.adapters[0].base_model_rev, "main");
         assert_eq!(loaded.adapters[0].tokenizer_rev, "main");
+        assert_eq!(loaded.adapters[0].owner, "team-test");
+        assert_eq!(loaded.adapters[0].dtype, "f32");
     }
 
     #[test]
