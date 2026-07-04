@@ -560,7 +560,9 @@ fn bench_llm_metal() -> Vec<Metric> {
     for _ in 0..n_runs {
         metal_state.reset_state();
         let t0 = Instant::now();
-        let result = metal_state.generate(short_prompt, &tokenizer, &gen_cfg);
+        let result = metal_state
+            .generate(short_prompt, &tokenizer, &gen_cfg)
+            .expect("generation failed");
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         total_tok += result.generated_tokens;
         total_ms += elapsed_ms;

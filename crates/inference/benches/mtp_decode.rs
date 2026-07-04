@@ -124,7 +124,10 @@ fn bench_baseline(c: &mut Criterion) {
         let history = vec![ChatMessage::user(BENCH_PROMPT)];
 
         state.reset_state();
-        let warmup = state.chat_completion(&history, &tokenizer, &gen_cfg);
+        let Ok(warmup) = state.chat_completion(&history, &tokenizer, &gen_cfg) else {
+            eprintln!("SKIP mtp_decode/baseline: warmup generation failed");
+            return;
+        };
         let actual_tokens = warmup.completion_tokens;
         if actual_tokens < N_TOKENS {
             eprintln!(
@@ -142,7 +145,9 @@ fn bench_baseline(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("greedy", "baseline"), |b| {
             b.iter(|| {
                 state.reset_state();
-                let out = state.chat_completion(&history, &tokenizer, &gen_cfg);
+                let out = state
+                    .chat_completion(&history, &tokenizer, &gen_cfg)
+                    .expect("generation failed");
                 out.completion_tokens
             });
         });
@@ -223,7 +228,10 @@ fn bench_mtp(c: &mut Criterion) {
         let history = vec![ChatMessage::user(BENCH_PROMPT)];
 
         state.reset_state();
-        let warmup = state.chat_completion(&history, &tokenizer, &gen_cfg);
+        let Ok(warmup) = state.chat_completion(&history, &tokenizer, &gen_cfg) else {
+            eprintln!("SKIP mtp_decode/mtp: warmup generation failed");
+            return;
+        };
         let actual_tokens = warmup.completion_tokens;
         if actual_tokens < N_TOKENS {
             eprintln!(
@@ -241,7 +249,9 @@ fn bench_mtp(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("greedy", "mtp"), |b| {
             b.iter(|| {
                 state.reset_state();
-                let out = state.chat_completion(&history, &tokenizer, &gen_cfg);
+                let out = state
+                    .chat_completion(&history, &tokenizer, &gen_cfg)
+                    .expect("generation failed");
                 out.completion_tokens
             });
         });
