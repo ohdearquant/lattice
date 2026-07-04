@@ -101,6 +101,20 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 - Feature branches + PRs for all changes. Never push directly to main.
 - Conventional commits with crate scope: `feat(inference): add Qwen3.5 MoE support`.
 
+### Merge Gate (Ocean directive 2026-07-04)
+
+A PR merges only when its branch is **up to date with main** AND **green at its actual head**.
+Branch protection enforces this (`required_status_checks.strict = true`), added after #634
+merged green-on-a-stale-base and broke main for two hours: main had gained call sites of the
+API it changed, and the merged combination was never compiled anywhere before landing. Four
+more stale-base PRs (#636, #638, #639, #642) then auto-merged onto the red main.
+
+- Never arm auto-merge on a PR whose branch is behind main; `gh pr update-branch <N>` first.
+- When main goes red, treat every armed auto-merge as suspect: disarm or hold until main is
+  green, then refresh branches and let CI re-run at the true merge state.
+- After each merge from a queue of armed PRs, the survivors are out of date again by
+  definition; refresh them one at a time rather than arming a stale stack.
+
 ## Agent Spawning
 
 - Use `subagent_type` from: `implementer`, `tester`, `critic`, `architect`, `researcher`, `analyst`, `reviewer`.
