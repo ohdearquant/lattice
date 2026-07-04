@@ -761,11 +761,21 @@ pub(crate) fn decode_cap(reasoning_budget: Option<usize>, max_new_tokens: usize)
 }
 
 /// **Unstable**: text generation output struct; fields may expand with streaming support.
+///
+/// # Stop-token contract (#613)
+///
+/// When generation ends because a stop condition was hit (EOS, a configured
+/// stop token, or a stop string), that terminating token is **excluded** from
+/// `token_ids` and `text` — it is never appended to the output. Every
+/// generation entry point across this crate (CPU and Metal) honours this
+/// contract (see the `stop_token_contract` test module for the cross-path
+/// regression sweep). `generated_tokens` always equals `token_ids.len()`.
 #[derive(Debug, Clone)]
 pub struct GenerateOutput {
     /// Generated text (excluding prompt).
     pub text: String,
-    /// Generated token IDs.
+    /// Generated token IDs (excluding any terminating stop token — see the
+    /// stop-token contract above).
     pub token_ids: Vec<u32>,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
