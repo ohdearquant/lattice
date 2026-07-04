@@ -229,6 +229,10 @@ mod imp {
             grammar: None,
             stop_strings: vec![],
             reasoning_budget,
+            // ChatReq has no logprobs/top_logprobs fields (#585) — this minimal
+            // server does not expose them, same as the rest of the OpenAI
+            // surface it does not implement (tools, response_format, etc.).
+            logprobs: None,
         }
     }
 

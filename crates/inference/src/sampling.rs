@@ -3,6 +3,8 @@
 //! Supports temperature scaling, top-k filtering, top-p (nucleus) sampling,
 //! and repetition penalty.
 
+use crate::model::qwen35_config::{TokenLogprob, TopLogprob};
+
 /// **Unstable**: sampling configuration for decoder-only generation; fields
 /// and defaults may change as the generation API evolves.
 #[derive(Debug, Clone)]
@@ -489,6 +491,143 @@ pub(crate) fn penalized_logit(logit: f32, penalty: f32) -> f32 {
     } else {
         logit * penalty
     }
+}
+
+/// A finite stand-in for degenerate (`-inf`/`NaN`) log-probabilities. Every
+/// consumer of [`TokenLogprob`] is eventually JSON-encoded (the
+/// OpenAI-compatible HTTP response), and `serde_json` cannot serialize
+/// non-finite floats, so any degenerate case is clamped to this sentinel
+/// rather than propagating a value that would fail serialization. Chosen far
+/// below any real log-probability: natural-log probabilities are always
+/// `<= 0`, and for a vocabulary of a few hundred thousand tokens are bounded
+/// below by roughly `-13`.
+const LOGPROB_NEG_SENTINEL: f32 = -1.0e9;
+
+/// Computes the reporting log-probability of `token_id` plus its top `top_n`
+/// alternatives, under a temperature-scaled softmax over one step's raw
+/// `logits`.
+///
+/// Deliberately independent of [`Sampler`]/`sample_token`'s own selection
+/// pipeline: only temperature scaling is applied (no repetition penalty, no
+/// top-k/top-p truncation), matching what OpenAI's API reports -- the
+/// model's own probability estimate, not a post-hoc-filtered one. When
+/// `temperature` is degenerate (see [`temperature_degenerate`]), an unscaled
+/// (temperature = 1.0) softmax is reported instead of the sampler's `t ->
+/// 0+` one-hot fallback: argmax is invariant to positive temperature
+/// scaling, so the *selected* token is unaffected, and reporting log(1.0) =
+/// 0.0 for the winner with `-inf` for everything else would erase the
+/// model's actual confidence rather than describe it.
+///
+/// Falls back to [`LOGPROB_NEG_SENTINEL`] wherever a value would otherwise be
+/// non-finite (e.g. every logit non-finite) or `token_id` is outside the
+/// vocabulary covered by `logits`.
+fn compute_step_logprobs(
+    logits: &[f32],
+    token_id: u32,
+    temperature: f32,
+    top_n: usize,
+) -> (f32, Vec<TopLogprob>) {
+    let vocab_size = logits.len();
+    let scale = if temperature_degenerate(temperature) {
+        1.0
+    } else {
+        1.0 / temperature
+    };
+
+    let mut max_scaled = f32::NEG_INFINITY;
+    for &v in logits {
+        let scaled = v * scale;
+        if scaled > max_scaled {
+            max_scaled = scaled;
+        }
+    }
+    if !max_scaled.is_finite() {
+        let top = if top_n > 0 {
+            vec![TopLogprob {
+                token_id,
+                logprob: LOGPROB_NEG_SENTINEL,
+            }]
+        } else {
+            Vec::new()
+        };
+        return (LOGPROB_NEG_SENTINEL, top);
+    }
+
+    // sum >= 1.0 always: the max term alone contributes exp(0) = 1.0, so
+    // log_sum is finite and non-negative (bounded above by ln(vocab_size)) --
+    // it cannot overflow or introduce a fresh non-finite value here.
+    let mut sum = 0.0f32;
+    for &v in logits {
+        sum += (v * scale - max_scaled).exp();
+    }
+    let log_sum = sum.ln();
+
+    let logprob_of = |idx: usize| -> f32 {
+        let lp = (logits[idx] * scale - max_scaled) - log_sum;
+        if lp.is_finite() {
+            lp
+        } else {
+            LOGPROB_NEG_SENTINEL
+        }
+    };
+
+    let token_logprob = if (token_id as usize) < vocab_size {
+        logprob_of(token_id as usize)
+    } else {
+        LOGPROB_NEG_SENTINEL
+    };
+
+    let k = top_n.min(vocab_size);
+    let top = if k == 0 {
+        Vec::new()
+    } else {
+        // Reuse the same descending-logit, NaN-last, lowest-token-id-wins
+        // total order as the Metal-parity top-k path (`candidate_order`)
+        // rather than inventing a second comparator.
+        let mut candidates: Vec<Candidate> = (0..vocab_size)
+            .map(|i| Candidate {
+                token_id: i as u32,
+                logit: logits[i] * scale,
+            })
+            .collect();
+        candidates.select_nth_unstable_by(k - 1, candidate_order);
+        candidates.truncate(k);
+        candidates.sort_unstable_by(candidate_order);
+        candidates
+            .into_iter()
+            .map(|c| TopLogprob {
+                token_id: c.token_id,
+                logprob: logprob_of(c.token_id as usize),
+            })
+            .collect()
+    };
+
+    (token_logprob, top)
+}
+
+/// Appends one decode step's logprob data to `token_logprobs` when requested.
+///
+/// `logprobs_requested` is the caller's `top_logprobs` count (`Some(0)` when
+/// `logprobs` was requested without a `top_logprobs` count); `None` disables
+/// capture entirely and this is a no-op, so callers can invoke it
+/// unconditionally on every decode step -- the cost of the softmax pass over
+/// the full vocabulary is paid only when logprobs were actually requested.
+pub(crate) fn record_logprob(
+    token_logprobs: &mut Vec<TokenLogprob>,
+    logits: &[f32],
+    token_id: u32,
+    temperature: f32,
+    logprobs_requested: Option<usize>,
+) {
+    let Some(top_n) = logprobs_requested else {
+        return;
+    };
+    let (logprob, top) = compute_step_logprobs(logits, token_id, temperature, top_n);
+    token_logprobs.push(TokenLogprob {
+        token_id,
+        logprob,
+        top,
+    });
 }
 
 fn argmax_f32(logits: &[f32]) -> u32 {
@@ -1783,5 +1922,148 @@ mod tests {
              per-occurrence compounding yields 0.625 and wrongly selects token 0 \
              (mutation: replace HashSet dedup with per-occurrence penalty)"
         );
+    }
+
+    // --- logprobs (#585) ----------------------------------------------------
+
+    /// Hand-computed softmax reference for `logits = [1.0, 2.0, 3.0]`,
+    /// temperature 1.0: `p = softmax(logits)`, `ln(p) = logits - ln(sum(exp(logits)))`.
+    /// `sum(exp) = e^1 + e^2 + e^3 = 2.718282 + 7.389056 + 20.085537 = 30.192875`,
+    /// `ln(sum) = 3.407606`. So `ln(p[i]) = logits[i] - 3.407606`.
+    fn reference_ln_softmax(logits: &[f32]) -> Vec<f32> {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&v| (v - max).exp()).sum();
+        let log_sum = sum.ln();
+        logits.iter().map(|&v| (v - max) - log_sum).collect()
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_matches_hand_computed_softmax() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let reference = reference_ln_softmax(&logits);
+
+        let (logprob, top) = compute_step_logprobs(&logits, 2, 1.0, 0);
+        assert!(
+            (logprob - reference[2]).abs() < 1e-4,
+            "token 2 logprob {logprob} should match reference {}",
+            reference[2]
+        );
+        assert!(top.is_empty(), "top_n=0 must return no alternatives");
+
+        for (idx, &want) in reference.iter().enumerate() {
+            let (lp, _) = compute_step_logprobs(&logits, idx as u32, 1.0, 0);
+            assert!(
+                (lp - want).abs() < 1e-4,
+                "token {idx} logprob {lp} should match reference {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_top_n_sorted_descending_by_probability() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let reference = reference_ln_softmax(&logits);
+
+        let (_, top) = compute_step_logprobs(&logits, 2, 1.0, 2);
+        assert_eq!(top.len(), 2, "top_logprobs=2 must return exactly 2 entries");
+        // Descending logit == descending probability at fixed temperature.
+        assert_eq!(top[0].token_id, 2, "highest-logit token must be first");
+        assert_eq!(
+            top[1].token_id, 1,
+            "second-highest-logit token must be second"
+        );
+        assert!((top[0].logprob - reference[2]).abs() < 1e-4);
+        assert!((top[1].logprob - reference[1]).abs() < 1e-4);
+        assert!(
+            top[0].logprob > top[1].logprob,
+            "entries must be sorted descending by logprob"
+        );
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_top_n_clamped_to_vocab_size() {
+        let logits = [1.0f32, 2.0, 3.0];
+        // Requesting more alternatives than the vocabulary must not panic or
+        // fabricate entries -- it returns at most `vocab_size` of them.
+        let (_, top) = compute_step_logprobs(&logits, 0, 1.0, 20);
+        assert_eq!(top.len(), 3);
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_degenerate_temperature_reports_unscaled_softmax() {
+        // temperature <= 0 is degenerate (see `temperature_degenerate`): the
+        // *sampler* falls back to greedy argmax, but the reporting distribution
+        // here must fall back to an UNSCALED (temperature = 1.0) softmax, not a
+        // one-hot `t -> 0+` distribution -- argmax is invariant to positive
+        // temperature scaling, so reporting log(1.0) = 0.0 / -inf would erase
+        // the model's actual confidence rather than describe it.
+        let logits = [1.0f32, 2.0, 3.0];
+        let reference = reference_ln_softmax(&logits);
+        let (logprob, top) = compute_step_logprobs(&logits, 2, 0.0, 1);
+        assert!(
+            (logprob - reference[2]).abs() < 1e-4,
+            "degenerate temperature must report the T=1.0 softmax logprob \
+             ({}), not one-hot 0.0; mutation would collapse this to 0.0",
+            reference[2]
+        );
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].token_id, 2);
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_all_nonfinite_logits_falls_back_to_sentinel() {
+        let logits = [f32::NAN, f32::NAN, f32::NAN];
+        let (logprob, top) = compute_step_logprobs(&logits, 1, 1.0, 3);
+        assert_eq!(logprob, LOGPROB_NEG_SENTINEL);
+        assert_eq!(
+            top,
+            vec![TopLogprob {
+                token_id: 1,
+                logprob: LOGPROB_NEG_SENTINEL
+            }],
+            "the requested token_id must still be reported (as the sentinel), \
+             not dropped or replaced by an arbitrary index"
+        );
+    }
+
+    #[test]
+    fn test_compute_step_logprobs_out_of_vocab_token_id_falls_back_to_sentinel() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let reference = reference_ln_softmax(&logits);
+        // token_id beyond the logits slice: the requested token's logprob is
+        // the sentinel, but the top-N alternatives are still computed
+        // correctly over the real vocabulary (unaffected by the bad id).
+        let (logprob, top) = compute_step_logprobs(&logits, 99, 1.0, 1);
+        assert_eq!(logprob, LOGPROB_NEG_SENTINEL);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].token_id, 2);
+        assert!((top[0].logprob - reference[2]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_record_logprob_noop_when_not_requested() {
+        let mut token_logprobs = Vec::new();
+        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, None);
+        assert!(
+            token_logprobs.is_empty(),
+            "record_logprob must not allocate/push anything when logprobs \
+             were not requested -- this is the zero-cost default path"
+        );
+    }
+
+    #[test]
+    fn test_record_logprob_appends_entry_when_requested() {
+        let mut token_logprobs = Vec::new();
+        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, Some(2));
+        assert_eq!(token_logprobs.len(), 1);
+        assert_eq!(token_logprobs[0].token_id, 2);
+        assert_eq!(token_logprobs[0].top.len(), 2);
+
+        // A second call appends rather than overwrites, matching per-step
+        // accumulation across a whole generation.
+        record_logprob(&mut token_logprobs, &[3.0, 2.0, 1.0], 0, 1.0, Some(0));
+        assert_eq!(token_logprobs.len(), 2);
+        assert_eq!(token_logprobs[1].token_id, 0);
+        assert!(token_logprobs[1].top.is_empty());
     }
 }

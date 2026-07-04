@@ -676,6 +676,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         grammar: None,
         stop_strings: vec![],
         reasoning_budget,
+        logprobs: None,
     };
 
     // ── JSON modes (used by Lattice Studio app) ─────────────────────────────
@@ -779,6 +780,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     grammar: None,
                     stop_strings: vec![],
                     reasoning_budget: req_reasoning_budget,
+                    logprobs: None,
                 };
 
                 // Stateless per request: full ChatML history comes in the prompt.
