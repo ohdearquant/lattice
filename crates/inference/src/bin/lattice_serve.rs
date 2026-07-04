@@ -74,7 +74,7 @@ mod imp {
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     // ─── worker protocol ─────────────────────────────────────────────────────
 
@@ -88,10 +88,37 @@ mod imp {
     }
 
     /// A generation request handed to the single GPU worker thread.
+    ///
+    /// `cancel` reflects whether the client that submitted this job is still
+    /// there. It starts `false` and flips to `true` the moment the matching
+    /// [`CancelOnDrop`] guard is dropped -- i.e. the instant axum drops the
+    /// response future/stream, which is exactly what happens on client
+    /// disconnect (browser tab closed, `curl` killed, request future
+    /// cancelled). The worker checks it (a) once at dequeue, before doing any
+    /// work, and (b) independently of token emission, via
+    /// `chat_completion_streaming_with_cancel`'s `should_cancel` predicate --
+    /// before prefill, immediately after prefill returns, and at the top of
+    /// every decode iteration -- so an abandoned job is skipped entirely,
+    /// stopped before paying for prefill, or stopped within one decode step
+    /// of the client leaving.
     struct Job {
         messages: Vec<ChatMessage>,
         cfg: GenerateConfig,
         tx: mpsc::UnboundedSender<Ev>,
+        cancel: watch::Receiver<bool>,
+    }
+
+    /// Flips the paired `cancel` receiver to `true` when dropped. Held inside
+    /// the per-request SSE stream state (streaming) or the handler's local
+    /// scope (non-streaming) so it drops exactly when axum stops caring about
+    /// the response — on client disconnect, or harmlessly after the request
+    /// already finished normally (by then the worker has moved on anyway).
+    struct CancelOnDrop(watch::Sender<bool>);
+
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
+        }
     }
 
     /// Server-side sampling defaults, overridable per-request.
@@ -202,6 +229,10 @@ mod imp {
             grammar: None,
             stop_strings: vec![],
             reasoning_budget,
+            // ChatReq has no logprobs/top_logprobs fields (#585) — this minimal
+            // server does not expose them, same as the rest of the OpenAI
+            // surface it does not implement (tools, response_format, etc.).
+            logprobs: None,
         }
     }
 
@@ -216,7 +247,7 @@ mod imp {
         is_q4: bool,
         ready: std::sync::mpsc::Sender<Result<String, String>>,
     ) -> mpsc::UnboundedSender<Job> {
-        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<Job>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         std::thread::spawn(move || {
             let loaded = load_model(&model_dir, &tokenizer_path, is_q4);
             let (mut metal, tokenizer, fmt) = match loaded {
@@ -228,27 +259,73 @@ mod imp {
             };
             let _ = ready.send(Ok(fmt));
 
-            while let Some(job) = job_rx.blocking_recv() {
+            run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
                 metal.reset_state();
-                let cb_tx = job.tx.clone();
-                let out = metal.chat_completion_streaming(
-                    &job.messages,
+                let out = metal.chat_completion_streaming_with_cancel(
+                    messages,
                     &tokenizer,
-                    &job.cfg,
-                    |delta, _id| {
-                        // `send` fails once the client hangs up; returning false
-                        // stops generation early instead of burning GPU on a dead
-                        // connection.
-                        cb_tx.send(Ev::Delta(delta.to_string())).is_ok()
-                    },
+                    cfg,
+                    on_token,
+                    should_cancel,
                 );
-                let _ = job.tx.send(Ev::Done {
-                    prompt_tokens: out.prompt_tokens,
-                    completion_tokens: out.completion_tokens,
-                });
-            }
+                (out.prompt_tokens, out.completion_tokens)
+            });
         });
         job_tx
+    }
+
+    /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
+    /// thread calls this (the dedicated Metal worker thread in production).
+    ///
+    /// `generate` is injected so tests can swap in a fake, GPU-free generator
+    /// while exercising the exact same queue/cancellation logic production
+    /// uses. It must call `on_token` for each generated delta and stop as
+    /// soon as `on_token` returns `false`; it must also poll `should_cancel`
+    /// independently of `on_token` -- including during any phase that never
+    /// calls `on_token` at all (a prefill-like section, or a run of
+    /// empty-delta steps) -- and stop as soon as `should_cancel` returns
+    /// `true`. Either way, return `(prompt_tokens, completion_tokens)` for
+    /// whatever was actually produced before stopping (early or at the cap).
+    fn run_worker_loop(
+        mut job_rx: mpsc::UnboundedReceiver<Job>,
+        mut generate: impl FnMut(
+            &[ChatMessage],
+            &GenerateConfig,
+            &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> (usize, usize),
+    ) {
+        while let Some(job) = job_rx.blocking_recv() {
+            if *job.cancel.borrow() {
+                // The client was already gone before we ever got to this job:
+                // skip it entirely, no prefill, no decode, no reply.
+                continue;
+            }
+            let cb_tx = job.tx.clone();
+            let cancel_for_token = job.cancel.clone();
+            let mut on_token = move |delta: &str, _id: u32| {
+                if *cancel_for_token.borrow() {
+                    return false;
+                }
+                // `send` also fails once the client hangs up; kept as a
+                // second, independent check so a job whose cancellation
+                // notification is somehow delayed still stops the instant
+                // its reply channel is gone.
+                cb_tx.send(Ev::Delta(delta.to_string())).is_ok()
+            };
+            // Separate from `on_token`: this is what reaches the generator's
+            // prefill gap and its empty-delta decode iterations, neither of
+            // which ever calls `on_token` (see
+            // `MetalQwen35State::generate_streaming_with_cancel`).
+            let cancel_for_predicate = job.cancel.clone();
+            let mut should_cancel = move || *cancel_for_predicate.borrow();
+            let (prompt_tokens, completion_tokens) =
+                generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel);
+            let _ = job.tx.send(Ev::Done {
+                prompt_tokens,
+                completion_tokens,
+            });
+        }
     }
 
     fn load_model(
@@ -367,7 +444,16 @@ mod imp {
         let created = unix_secs();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-        if s.jobs.send(Job { messages, cfg, tx }).is_err() {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        if s.jobs
+            .send(Job {
+                messages,
+                cfg,
+                tx,
+                cancel: cancel_rx,
+            })
+            .is_err()
+        {
             emit_serve_event(
                 "POST",
                 "/v1/chat/completions",
@@ -381,81 +467,90 @@ mod imp {
                 "inference worker unavailable",
             );
         }
+        // Dropped when nobody cares about the response anymore: at the end of
+        // this SSE stream (moved in below) or at the end of this function for
+        // the non-streaming branch. Either way that's the client disconnect
+        // signal the worker checks in `run_worker_loop`.
+        let cancel_guard = CancelOnDrop(cancel_tx);
 
         if streaming {
-            let stream = futures::stream::unfold((rx, Phase::Start), move |(mut rx, phase)| {
-                let id = id.clone();
-                let model = model_id.clone();
-                async move {
-                    match phase {
-                        Phase::Start => {
-                            let chunk = json!({
-                                "id": id, "object": "chat.completion.chunk",
-                                "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
-                            });
-                            Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(chunk.to_string()),
-                                ),
-                                (rx, Phase::Body),
-                            ))
-                        }
-                        Phase::Body => match rx.recv().await {
-                            Some(Ev::Delta(d)) => {
+            let stream = futures::stream::unfold(
+                (rx, Phase::Start, cancel_guard),
+                move |(mut rx, phase, cancel_guard)| {
+                    let id = id.clone();
+                    let model = model_id.clone();
+                    async move {
+                        match phase {
+                            Phase::Start => {
                                 let chunk = json!({
                                     "id": id, "object": "chat.completion.chunk",
                                     "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
+                                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
                                 Some((
-                                    Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Body),
+                                    Ok::<Event, std::convert::Infallible>(
+                                        Event::default().data(chunk.to_string()),
+                                    ),
+                                    (rx, Phase::Body, cancel_guard),
                                 ))
                             }
-                            Some(Ev::Done {
-                                completion_tokens: ct,
-                                ..
-                            }) => {
-                                let chunk = json!({
-                                    "id": id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                });
-                                Some((
-                                    Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Done(ct)),
-                                ))
+                            Phase::Body => match rx.recv().await {
+                                Some(Ev::Delta(d)) => {
+                                    let chunk = json!({
+                                        "id": id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(chunk.to_string())),
+                                        (rx, Phase::Body, cancel_guard),
+                                    ))
+                                }
+                                Some(Ev::Done {
+                                    completion_tokens: ct,
+                                    ..
+                                }) => {
+                                    let chunk = json!({
+                                        "id": id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(chunk.to_string())),
+                                        (rx, Phase::Done(ct), cancel_guard),
+                                    ))
+                                }
+                                None => {
+                                    let chunk = json!({
+                                        "id": id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(chunk.to_string())),
+                                        (rx, Phase::Done(0), cancel_guard),
+                                    ))
+                                }
+                            },
+                            Phase::Done(ct) => Some((
+                                Ok(Event::default().data("[DONE]")),
+                                (rx, Phase::End(ct), cancel_guard),
+                            )),
+                            Phase::End(ct) => {
+                                emit_serve_event(
+                                    "POST",
+                                    "/v1/chat/completions",
+                                    200,
+                                    Some(ct),
+                                    timer.elapsed().as_secs_f64() * 1000.0,
+                                    true,
+                                );
+                                None
                             }
-                            None => {
-                                let chunk = json!({
-                                    "id": id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                });
-                                Some((
-                                    Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Done(0)),
-                                ))
-                            }
-                        },
-                        Phase::Done(ct) => {
-                            Some((Ok(Event::default().data("[DONE]")), (rx, Phase::End(ct))))
-                        }
-                        Phase::End(ct) => {
-                            emit_serve_event(
-                                "POST",
-                                "/v1/chat/completions",
-                                200,
-                                Some(ct),
-                                timer.elapsed().as_secs_f64() * 1000.0,
-                                true,
-                            );
-                            None
                         }
                     }
-                }
-            });
+                },
+            );
             Sse::new(stream)
                 .keep_alive(KeepAlive::default())
                 .into_response()
@@ -694,5 +789,321 @@ mod imp {
         })?;
 
         Ok(())
+    }
+
+    // ─── tests ───────────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// A GPU-free stand-in for `MetalQwen35State::chat_completion_streaming_with_cancel`:
+        /// "generates" up to `cap` fake tokens, sleeping briefly between each so
+        /// a cancelled job has many opportunities to be observed running past
+        /// where it should have stopped. Counts how many times it was entered
+        /// (`started`) and how many fake tokens actually ran (`ran_tokens`), so
+        /// tests can assert a cancelled queued job's generator was never called
+        /// at all. Checks `should_cancel` at the top of each iteration in
+        /// addition to `on_token`'s own check, mirroring the production
+        /// contract; existing tests here only rely on the `on_token` path, so
+        /// this addition does not change their outcomes.
+        #[allow(clippy::type_complexity)]
+        fn fake_generate(
+            cap: usize,
+            started: Arc<AtomicUsize>,
+            ran_tokens: Arc<AtomicUsize>,
+        ) -> impl FnMut(
+            &[ChatMessage],
+            &GenerateConfig,
+            &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> (usize, usize) {
+            move |_messages, _cfg, on_token, should_cancel| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let mut n = 0usize;
+                for i in 0..cap {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        break;
+                    }
+                    if !on_token("x", i as u32) {
+                        break;
+                    }
+                    n += 1;
+                    ran_tokens.fetch_add(1, Ordering::SeqCst);
+                }
+                (1, n)
+            }
+        }
+
+        /// A GPU-free fake with an explicit prefill-like phase *before* any
+        /// `on_token` call -- mirroring the real gap this fix closes:
+        /// production prefill has no callback point at all, so only
+        /// `should_cancel` (never `on_token`) can observe a disconnect that
+        /// happens during it. `entered_decode` flips only if the prefill-like
+        /// phase runs to completion uncancelled, so tests can assert it never
+        /// does.
+        #[allow(clippy::type_complexity)]
+        fn fake_generate_with_prefill_gap(
+            prefill_steps: usize,
+            decode_cap: usize,
+            entered_decode: Arc<AtomicBool>,
+        ) -> impl FnMut(
+            &[ChatMessage],
+            &GenerateConfig,
+            &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> (usize, usize) {
+            move |_messages, _cfg, on_token, should_cancel| {
+                for _ in 0..prefill_steps {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        return (1, 0);
+                    }
+                }
+                entered_decode.store(true, Ordering::SeqCst);
+                let mut n = 0usize;
+                for i in 0..decode_cap {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if should_cancel() {
+                        break;
+                    }
+                    if !on_token("x", i as u32) {
+                        break;
+                    }
+                    n += 1;
+                }
+                (1, n)
+            }
+        }
+
+        /// Builds a `Job` plus the receiver its worker replies on and the guard
+        /// that cancels it when dropped (the same guard `chat_completions`
+        /// moves into the SSE stream / keeps local for non-streaming, standing
+        /// in here for "the client is still connected").
+        fn make_job() -> (Job, mpsc::UnboundedReceiver<Ev>, CancelOnDrop) {
+            let (tx, rx) = mpsc::unbounded_channel::<Ev>();
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let job = Job {
+                messages: vec![ChatMessage::user("hi")],
+                cfg: GenerateConfig::default(),
+                tx,
+                cancel: cancel_rx,
+            };
+            (job, rx, CancelOnDrop(cancel_tx))
+        }
+
+        #[test]
+        fn queued_job_cancelled_before_dequeue_is_skipped_entirely() {
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+            let started = Arc::new(AtomicUsize::new(0));
+            let ran_tokens = Arc::new(AtomicUsize::new(0));
+
+            // Job 1 occupies the worker (50 fake tokens, 5ms apart = ~250ms)
+            // long enough that job 2 is still sitting in the queue, untouched,
+            // when we cancel it a few lines down.
+            let (job1, rx1, _guard1) = make_job();
+            job_tx.send(job1).unwrap();
+
+            // Job 2: cancelled client-side (guard dropped) immediately, while
+            // it is still queued behind job 1.
+            let (job2, mut rx2, guard2) = make_job();
+            job_tx.send(job2).unwrap();
+            drop(guard2);
+
+            // Job 3: submitted after the cancelled one, to prove the worker
+            // moves on and keeps serving correctly afterward.
+            let (job3, rx3, _guard3) = make_job();
+            job_tx.send(job3).unwrap();
+            drop(job_tx);
+
+            let started2 = started.clone();
+            let ran2 = ran_tokens.clone();
+            let handle = std::thread::spawn(move || {
+                run_worker_loop(job_rx, fake_generate(50, started2, ran2))
+            });
+
+            let completion_tokens_of = |mut rx: mpsc::UnboundedReceiver<Ev>| -> Option<usize> {
+                let mut ct = None;
+                while let Some(ev) = rx.blocking_recv() {
+                    if let Ev::Done {
+                        completion_tokens, ..
+                    } = ev
+                    {
+                        ct = Some(completion_tokens);
+                    }
+                }
+                ct
+            };
+
+            assert_eq!(
+                completion_tokens_of(rx1),
+                Some(50),
+                "job 1 should run to completion undisturbed"
+            );
+
+            // Job 2 must produce NOTHING: no Delta, no Done -- the worker
+            // `continue`d past it without ever touching `generate`, so its
+            // `tx` is simply dropped with the rest of the `Job`.
+            assert!(
+                rx2.blocking_recv().is_none(),
+                "cancelled queued job must be skipped entirely: no events at all"
+            );
+
+            assert_eq!(
+                completion_tokens_of(rx3),
+                Some(50),
+                "worker must survive cancelling job 2 and serve job 3 normally afterward"
+            );
+
+            handle.join().expect("worker thread must not panic");
+
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                2,
+                "generate() must run exactly twice (job 1, job 3) -- never for cancelled job 2"
+            );
+            assert_eq!(
+                ran_tokens.load(Ordering::SeqCst),
+                100,
+                "50 real fake-tokens each for job 1 and job 3, zero for cancelled job 2"
+            );
+        }
+
+        #[test]
+        fn running_job_cancelled_midstream_stops_early_and_worker_survives() {
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+            let started = Arc::new(AtomicUsize::new(0));
+            let ran_tokens = Arc::new(AtomicUsize::new(0));
+
+            // Job 1: a long fake generation (2000 tokens, 5ms apart) that we
+            // cancel partway through -- it must stop well short of the cap.
+            let (job1, mut rx1, guard1) = make_job();
+            job_tx.send(job1).unwrap();
+            // `Option` so it can be moved-out-and-dropped at most once from
+            // inside the loop below; the borrow checker cannot see that the
+            // `seen == 5` runtime condition only ever holds on one iteration,
+            // so a bare `drop(guard1)` there is rejected as a repeated move.
+            let mut guard1 = Some(guard1);
+
+            let (job2, mut rx2, _guard2) = make_job();
+            job_tx.send(job2).unwrap();
+            drop(job_tx);
+
+            let started2 = started.clone();
+            let ran2 = ran_tokens.clone();
+            let handle = std::thread::spawn(move || {
+                run_worker_loop(job_rx, fake_generate(2000, started2, ran2))
+            });
+
+            let mut seen = 0;
+            loop {
+                match rx1.blocking_recv() {
+                    Some(Ev::Delta(_)) => {
+                        seen += 1;
+                        if seen == 5 {
+                            // "Client disconnects" mid-stream.
+                            guard1.take();
+                        }
+                    }
+                    Some(Ev::Done {
+                        completion_tokens, ..
+                    }) => {
+                        assert!(
+                            completion_tokens < 2000,
+                            "job 1 must stop well short of its 2000-token cap after \
+                             cancellation, got {completion_tokens}"
+                        );
+                        assert!(
+                            completion_tokens < 100,
+                            "job 1 must stop within a handful of tokens of the client \
+                             disconnecting, not run on regardless; got {completion_tokens}"
+                        );
+                        break;
+                    }
+                    None => panic!("job 1's reply channel closed before a Done event"),
+                }
+            }
+
+            // Job 2 must still complete in full: the worker thread did not
+            // panic or wedge when job 1 was cancelled mid-generation.
+            let mut n2 = None;
+            while let Some(ev) = rx2.blocking_recv() {
+                if let Ev::Done {
+                    completion_tokens, ..
+                } = ev
+                {
+                    n2 = Some(completion_tokens);
+                }
+            }
+            assert_eq!(
+                n2,
+                Some(2000),
+                "worker must survive mid-stream cancellation and serve the next job to completion"
+            );
+
+            handle.join().expect("worker thread must not panic");
+        }
+
+        /// Codex review of PR #606: cancellation was only observed through the
+        /// `on_token` callback, so a generator phase that never calls it -- the
+        /// real prefill pass has no callback point at all -- could run
+        /// unbounded after the client already disconnected. This proves
+        /// `run_worker_loop` threads an independent `should_cancel` signal
+        /// through to `generate` and that a fake generator honoring only that
+        /// signal (never `on_token`) still gets stopped promptly, well short
+        /// of its prefill-like phase's natural end.
+        #[test]
+        fn running_job_cancelled_during_prefill_like_phase_never_calls_on_token() {
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+            let entered_decode = Arc::new(AtomicBool::new(false));
+
+            let (job1, mut rx1, guard1) = make_job();
+            job_tx.send(job1).unwrap();
+            drop(job_tx);
+
+            // 400 * 5ms = up to 2s of "prefill" if never cancelled -- the test
+            // cancels at 20ms in, ~100x margin, so reaching Done quickly is
+            // only possible if should_cancel actually stopped it early.
+            let entered2 = entered_decode.clone();
+            let handle = std::thread::spawn(move || {
+                run_worker_loop(job_rx, fake_generate_with_prefill_gap(400, 50, entered2))
+            });
+
+            std::thread::sleep(Duration::from_millis(20));
+            drop(guard1);
+
+            match rx1.blocking_recv() {
+                Some(Ev::Delta(_)) => panic!(
+                    "on_token must never be called: cancellation happened while the \
+                     fake generator was still in its prefill-like phase, which does \
+                     not call on_token at all"
+                ),
+                Some(Ev::Done {
+                    completion_tokens, ..
+                }) => {
+                    assert_eq!(
+                        completion_tokens, 0,
+                        "job cancelled during the prefill-like phase must produce \
+                         zero tokens, got {completion_tokens}"
+                    );
+                }
+                None => panic!("job 1's reply channel closed before a Done event"),
+            }
+
+            handle.join().expect("worker thread must not panic");
+
+            assert!(
+                !entered_decode.load(Ordering::SeqCst),
+                "should_cancel alone (on_token is never called during this phase) \
+                 must stop the job before the decode phase is ever reached -- this \
+                 is the exact blind spot from the PR #606 review, where production \
+                 prefill has no on_token callback point and so could run to \
+                 completion after the client already disconnected"
+            );
+        }
     }
 }

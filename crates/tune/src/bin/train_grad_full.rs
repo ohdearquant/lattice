@@ -740,7 +740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let adapter = LoraAdapter::new(config, adapter_layers);
             adapter
-                .save_safetensors(std::path::Path::new(path))
+                .save_safetensors(std::path::Path::new(path), None)
                 .map_err(|e| format!("save adapter: {e}"))?;
             println!("saved adapter ({num_slots} GQA slots, rank {rank}) → {path}");
         }

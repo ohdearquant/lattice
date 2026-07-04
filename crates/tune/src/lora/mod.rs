@@ -54,13 +54,13 @@ pub mod train_core;
 pub use apply::apply_lora;
 pub use blend::blend_lora_adapters;
 #[cfg(all(feature = "safetensors", feature = "serde"))]
-pub use loader::LoadedAdapter;
+pub use loader::{LoadedAdapter, RunningRevisions};
 #[cfg(feature = "serde")]
 pub use manifest::{AdapterId, LoraManifest, ManifestEntry};
 pub use online::{AdaptStepResult, adapt_step};
 pub use optimizer::{AdamState, LoraGradients, compute_lora_gradients};
 #[cfg(feature = "safetensors")]
-pub use safetensors::{load_peft_safetensors, save_peft_safetensors};
+pub use safetensors::{AdapterGovernance, load_peft_safetensors, save_peft_safetensors};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -138,12 +138,21 @@ impl LoraAdapter {
 
     /// Save this LoRA adapter to a PEFT-format safetensors file.
     ///
+    /// Pass `governance: Some(..)` to embed provenance fields (name, owner,
+    /// base/tokenizer rev, dtype, approval status) into the safetensors
+    /// metadata header; `None` preserves the pre-#610 behavior of writing
+    /// only `rank`/`alpha`/`target_modules`.
+    ///
     /// # Errors
     ///
     /// Returns an error if tensor serialization fails or the file cannot be written.
     #[cfg(feature = "safetensors")]
-    pub fn save_safetensors(&self, path: &Path) -> crate::error::Result<()> {
-        safetensors::save_peft_safetensors(self, path)
+    pub fn save_safetensors(
+        &self,
+        path: &Path,
+        governance: Option<&safetensors::AdapterGovernance>,
+    ) -> crate::error::Result<()> {
+        safetensors::save_peft_safetensors(self, path, governance)
     }
 
     /// Construct an adapter from pre-built components (for testing or
