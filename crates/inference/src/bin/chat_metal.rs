@@ -410,23 +410,25 @@ fn emit_json_generation(
     // Capture the first write/flush failure so we can stop generation and return Err
     // rather than silently completing a run whose output was never received.
     let mut stream_err: Option<std::io::Error> = None;
-    let output = metal.generate_streaming(prompt, tokenizer, gen_cfg, |delta, token_id| {
-        if !first_token_emitted {
-            ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
-            first_token_emitted = true;
-        }
-        let token_json = json_escape(delta);
-        let write_result = writeln!(
-            stdout,
-            "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"token_id\":{token_id},\"done\":false}}"
-        )
-        .and_then(|()| stdout.flush());
-        if let Err(e) = write_result {
-            stream_err = Some(e);
-            return false; // downstream consumer is gone — stop generating
-        }
-        true // continue generation
-    });
+    let output = metal
+        .generate_streaming(prompt, tokenizer, gen_cfg, |delta, token_id| {
+            if !first_token_emitted {
+                ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
+                first_token_emitted = true;
+            }
+            let token_json = json_escape(delta);
+            let write_result = writeln!(
+                stdout,
+                "@@lattice {{\"ev\":\"gen_token\",\"token\":{token_json},\"token_id\":{token_id},\"done\":false}}"
+            )
+            .and_then(|()| stdout.flush());
+            if let Err(e) = write_result {
+                stream_err = Some(e);
+                return false; // downstream consumer is gone — stop generating
+            }
+            true // continue generation
+        })
+        .map_err(|e| format!("generation failed: {e}"))?;
 
     if let Some(e) = stream_err {
         return Err(format!("streaming stdout write failed: {e}").into());
@@ -863,6 +865,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             true
         });
         println!();
+
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Generation error: {e}");
+                continue;
+            }
+        };
 
         let elapsed = t.elapsed();
         let tps = if result.completion_tokens > 0 {

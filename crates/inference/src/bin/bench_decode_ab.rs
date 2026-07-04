@@ -147,12 +147,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // One warmup (not recorded).
     metal.reset_state();
-    let _ = metal.chat_completion(&history, &tokenizer, &gen_cfg);
+    let _ = metal.chat_completion(&history, &tokenizer, &gen_cfg)?;
 
     for _ in 0..runs {
         metal.reset_state();
         let t = std::time::Instant::now();
-        let result = metal.chat_completion(&history, &tokenizer, &gen_cfg);
+        let result = metal.chat_completion(&history, &tokenizer, &gen_cfg)?;
         let total_ms = t.elapsed().as_secs_f64() * 1000.0;
         println!(
             "RESULT n_req={} completion={} total_ms={:.3}",

@@ -138,6 +138,48 @@ jobs:
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
+      # #611: Metal generation paths applied grammar masks via `mask_logits`
+      # but never checked for a surviving finite logit before sampling — a
+      # grammar that blocked every token silently emitted token 0 instead of
+      # failing closed, unlike the CPU paths (`crate::generate` /
+      # `model::qwen35::generation`), which have always guarded every
+      # `mask_logits` call this way. These three hardware-gated integration
+      # tests prove each real public Metal generation entry point (`generate`,
+      # `generate_streaming`, `generate_streaming_with_prefix_cache`) now
+      # returns `Err(InvalidInput)` rather than a token when a real
+      # `GrammarEngine` blocks every vocab entry. The exact "3 passed; 0
+      # failed" grep guards against a silently zero-matching filter, the same
+      # failure mode the Q4 and f16-KV steps above already guard against.
+      # #611 round-1 codex review (major): without LATTICE_METAL_TEST_ENFORCE,
+      # each test early-returns (asserted as "passed" by cargo) when
+      # `Device::system_default()` is absent, so a runner without a Metal
+      # device would silently green this gate without ever exercising the
+      # Metal path. LATTICE_METAL_TEST_ENFORCE=1 makes the tests panic instead
+      # of returning in that case, matching the Q4/f16-KV steps' convention.
+      - name: inference — Metal grammar fail-closed gate (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-test.log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_all_blocking_grammar -- --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #611 round-1 codex review (medium): the three tests above only reach
+      # the post-prefill masking site (their fixture blocks every vocab entry
+      # from step 0), so removing a DECODE-LOOP `has_finite_logit` guard left
+      # them green. These three companion tests use a grammar that allows
+      # exactly one token then blocks every continuation, so they exercise
+      # the second, decode-loop guard site in each of the three functions.
+      - name: inference — Metal grammar fail-closed decode-loop gate (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-decode-test.log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_blocking_second_token -- --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
       # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
       # exposes a PARAVIRTUAL Metal GPU, not a real Apple7 device — a test
