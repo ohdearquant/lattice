@@ -11,10 +11,12 @@ description = "Pure Rust transformer inference engine — safetensors loading, S
 [features]
 default = ["std", "download", "serve"]
 # HTTP serving stack (axum/tokio/futures) for the `lattice` CLI's serve
-# command and the standalone `lattice_serve` binary. On by default so
-# `cargo install lattice-inference` keeps shipping both binaries unchanged;
-# library consumers building with `default-features = false` no longer pull
-# an HTTP server into their dependency tree (the lib itself never uses it).
+# command and the standalone `lattice_serve` binary. On by default so a plain
+# `cargo install lattice-inference` keeps shipping the `lattice` CLI
+# unchanged, and existing `--features f16,metal-gpu` install/package profiles
+# keep including `lattice_serve` without needing an extra flag. Library
+# consumers building with `default-features = false` no longer pull an HTTP
+# server into their dependency tree (the lib itself never uses it).
 serve = ["dep:axum", "dep:tokio", "dep:futures"]
 std = []
 f16 = []
