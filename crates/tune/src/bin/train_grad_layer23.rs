@@ -729,7 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let adapter = LoraAdapter::new(config, layers);
             adapter
-                .save_safetensors(std::path::Path::new(save_path))
+                .save_safetensors(std::path::Path::new(save_path), None)
                 .map_err(|e| format!("save adapter: {e}"))?;
             println!("saved adapter (layer {LAYER}, q_proj+v_proj, rank {rank}) → {save_path}");
         }

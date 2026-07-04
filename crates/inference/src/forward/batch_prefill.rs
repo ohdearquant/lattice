@@ -374,6 +374,20 @@ impl Qwen35Model {
             return Err(InferenceError::Inference("empty prompt".into()));
         }
 
+        // max_new_tokens == 0 means "generate nothing": return before sampling so
+        // we never emit a token the caller did not ask for. Mirrors the guard in
+        // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Length),
+            });
+        }
+
         // Grammar-constrained decoding is not wired into the batch-prefill path; reject
         // grammar configs before any sampling to avoid silently producing unconstrained
         // output when a caller sets gen_cfg.grammar (#397/#398).
@@ -1998,6 +2012,43 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(_))),
             "generate_with_batch_prefill must fail closed with InvalidInput when grammar is \
              set (#397/#398); got {result:?}"
+        );
+    }
+
+    /// `generate_with_batch_prefill` with `max_new_tokens == 0` must return zero
+    /// generated tokens without running prefill or sampling anything (#612, 3rd
+    /// recurrence of the #226/#456 bug class).
+    ///
+    /// Mutation sensitivity: removing the `max_new_tokens == 0` early return
+    /// causes the function to run `prefill_prompt` and sample one token from the
+    /// final logits, so `generated_tokens` becomes 1 instead of 0 and the
+    /// assertion below fails.
+    #[test]
+    fn generate_with_batch_prefill_max_new_tokens_zero_returns_empty() {
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 0,
+            ..Default::default()
+        };
+
+        let out = model
+            .generate_with_batch_prefill("a b c", &gen_cfg)
+            .expect("max_new_tokens=0 must succeed, not error");
+
+        assert_eq!(
+            out.generated_tokens, 0,
+            "max_new_tokens=0 must produce zero generated tokens"
+        );
+        assert!(
+            out.token_ids.is_empty(),
+            "max_new_tokens=0 must produce an empty token list"
+        );
+        assert_eq!(
+            out.stop_reason,
+            Some(StopReason::Length),
+            "max_new_tokens=0 must report stop_reason=Length"
         );
     }
 }
