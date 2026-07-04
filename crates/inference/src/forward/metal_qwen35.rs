@@ -25507,12 +25507,14 @@ kernel void decode_attention_reference(
                 let mut reference_state =
                     MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 2);
-                let reference_out = reference_state.chat_completion_streaming(
-                    &history,
-                    &tokenizer,
-                    &reference_gen_cfg,
-                    |_delta, _id| true,
-                );
+                let reference_out = reference_state
+                    .chat_completion_streaming(
+                        &history,
+                        &tokenizer,
+                        &reference_gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("reference chat completion must not error on a valid history");
 
                 assert_eq!(
                     cached_out.output.message.content, reference_out.message.content,
