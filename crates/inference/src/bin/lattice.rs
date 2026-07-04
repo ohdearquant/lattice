@@ -699,23 +699,50 @@ mod doctor {
     /// serializes an object, `{"quarot_seed": ..., "tensors": [...]}`, so a
     /// loader can recover the QuaRot rotation seed without parsing
     /// `config.json`. `doctor` only inventories tensors -- the seed is
-    /// irrelevant here -- so both shapes normalize to the same entry list via
-    /// [`Q4IndexManifest::into_entries`]. Untagged so either JSON shape
-    /// deserializes into this one type (see also `MessageContent` below for
-    /// the same pattern applied to the OpenAI-compatible chat API).
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Q4IndexManifest {
-        Bare(Vec<Q4IndexEntry>),
-        Wrapped { tensors: Vec<Q4IndexEntry> },
-    }
-
-    impl Q4IndexManifest {
-        fn into_entries(self) -> Vec<Q4IndexEntry> {
-            match self {
-                Q4IndexManifest::Bare(entries) => entries,
-                Q4IndexManifest::Wrapped { tensors } => tensors,
+    /// irrelevant here -- so both shapes normalize to the same entry list.
+    ///
+    /// Shape-aware two-step parse (JSON value first, then the matching schema)
+    /// rather than a `#[serde(untagged)]` enum: untagged deserialization
+    /// collapses every schema error into "data did not match any variant",
+    /// which hides the actionable field/path detail (`missing field \`file\``,
+    /// `invalid type: string, expected a sequence`, ...) that a diagnostic
+    /// command owes the operator. Unknown object keys (`quarot_seed`, future
+    /// additions) stay tolerated because serde ignores unknown fields by
+    /// default.
+    fn parse_q4_index_manifest(
+        bytes: &[u8],
+        path: &std::path::Path,
+    ) -> Result<Vec<Q4IndexEntry>, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<Q4IndexEntry>>(value)
+                .map_err(|e| {
+                    format!(
+                        "{}: invalid bare-array (quantize_q4) manifest: {e}",
+                        path.display()
+                    )
+                }),
+            serde_json::Value::Object(_) => {
+                #[derive(serde::Deserialize)]
+                struct WrappedManifest {
+                    tensors: Vec<Q4IndexEntry>,
+                }
+                serde_json::from_value::<WrappedManifest>(value)
+                    .map(|w| w.tensors)
+                    .map_err(|e| {
+                        format!(
+                            "{}: invalid object-form (quantize_quarot) manifest: {e}",
+                            path.display()
+                        )
+                    })
             }
+            _ => Err(format!(
+                "{}: expected quantize_index.json to be either a bare array of tensor \
+                 entries (quantize_q4) or an object with a \"tensors\" array \
+                 (quantize_quarot)",
+                path.display()
+            )),
         }
     }
 
@@ -835,9 +862,7 @@ mod doctor {
         if index_path.exists() {
             let bytes = std::fs::read(&index_path)
                 .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
-            let entries: Vec<Q4IndexEntry> = serde_json::from_slice::<Q4IndexManifest>(&bytes)
-                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?
-                .into_entries();
+            let entries: Vec<Q4IndexEntry> = parse_q4_index_manifest(&bytes, &index_path)?;
 
             let mut total_bytes = 0u64;
             let mut missing_tensors = Vec::new();
@@ -1861,6 +1886,59 @@ mod doctor {
 
             fs::remove_dir_all(&bare_dir).ok();
             fs::remove_dir_all(&object_dir).ok();
+        }
+
+        #[test]
+        fn q4_manifest_malformed_bare_array_error_names_the_missing_field() {
+            // A doctor is a diagnostic tool: a malformed manifest must surface
+            // serde's precise schema error (here: which field is missing), not
+            // an untagged-enum "did not match any variant" fallthrough.
+            let err = parse_q4_index_manifest(
+                br#"[{"name": "x"}]"#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("bare-array entry missing `file` must fail");
+            assert!(
+                err.contains("file"),
+                "error must name the missing `file` field; got: {err}"
+            );
+            assert!(
+                !err.contains("did not match any variant"),
+                "error must not be the generic untagged-enum fallthrough; got: {err}"
+            );
+        }
+
+        #[test]
+        fn q4_manifest_malformed_object_tensors_error_names_tensors() {
+            let err = parse_q4_index_manifest(
+                br#"{"quarot_seed": 42, "tensors": "not-an-array"}"#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("object-form manifest with non-array tensors must fail");
+            assert!(
+                err.contains("tensors") || err.contains("sequence"),
+                "error must point at the bad `tensors` value; got: {err}"
+            );
+            assert!(
+                !err.contains("did not match any variant"),
+                "error must not be the generic untagged-enum fallthrough; got: {err}"
+            );
+        }
+
+        #[test]
+        fn q4_manifest_non_array_non_object_root_is_rejected_with_shape_hint() {
+            let err = parse_q4_index_manifest(
+                br#""just a string""#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("scalar manifest root must fail");
+            assert!(
+                err.contains("either a bare array") && err.contains("tensors"),
+                "error must explain both accepted shapes; got: {err}"
+            );
         }
 
         #[test]
