@@ -9855,10 +9855,16 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_ids.extend_from_slice(&tokens[..emit_len]);
                         // Stop-token contract (#613): `tokens` holds only the committed
                         // (non-stop) tokens for this round — the stop token itself is
-                        // never in it. `stopped` is true only when every committed
-                        // token was actually emitted within budget; a stop clipped by
-                        // max_new_tokens before reaching them still reports Length.
-                        stopped = emit_len == tokens.len();
+                        // never in it. Codex round-1 (#632): `emit_len == tokens.len()`
+                        // alone is not sufficient — if the committed payload exactly
+                        // fills `remaining`, the excluded stop token would have landed
+                        // one position *beyond* `max_new_tokens`, so plain greedy would
+                        // never have reached it either and reports Length, not Eos.
+                        // `stopped` is therefore true only when every committed token
+                        // was emitted AND at least one more slot remained for the
+                        // (excluded) stop token itself — i.e. the stop was genuinely
+                        // reached within budget, not merely coincident with the cap.
+                        stopped = emit_len == tokens.len() && remaining > tokens.len();
                         if stopped {
                             stop_reason = StopReason::Eos;
                         }
@@ -22482,6 +22488,56 @@ kernel void decode_attention_reference(
         }
 
         #[test]
+        fn metal_generate_multimodal_excludes_stop_token() {
+            // Codex round 1 (#632) flagged `generate_multimodal` as a public
+            // entry point with its own sampling loop, missing from both the
+            // `stop_token_contract` manifest and this test module's #613
+            // sweep. It already implements the EXCLUDE contract (checks
+            // `is_stop` before pushing at the first-token sample and inside
+            // the autoregressive decode loop); this test locks that in.
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let visual_tokens = 2usize;
+            let d_model = cfg.hidden_size;
+            let input = crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0f32; visual_tokens * d_model],
+                raw_patches: 4,
+                visual_tokens,
+                d_model,
+                text_tokens: vec![1u32],
+            };
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let out = state
+                .generate_multimodal(input, &tokenizer, &gen_cfg)
+                .expect("generate_multimodal must succeed");
+            assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate_multimodal");
+        }
+
+        #[test]
         fn self_spec_checkpoint_pool_allocated_when_env_set() {
             let Some(_) = metal::Device::system_default() else {
                 return;
@@ -27059,7 +27115,7 @@ mod mtp_greedy_round_tests {
     //
     //   let emit_len = tokens.len().min(remaining);
     //   generated_ids.extend_from_slice(&tokens[..emit_len]);
-    //   stopped = emit_len == tokens.len();   // ← FIX 1
+    //   stopped = emit_len == tokens.len() && remaining > tokens.len();   // ← FIX 1
     //
     // The pre-fix code was `stopped = true` unconditionally, which is wrong when
     // the budget clips the emission so not every committed token in `tokens`
@@ -27070,13 +27126,26 @@ mod mtp_greedy_round_tests {
     // *meaning* of "every token in tokens was emitted" shifts, since `tokens`
     // is shorter now (see the budget=2 test below for the concrete effect).
     //
+    // Codex round-1 (#632): `emit_len == tokens.len()` alone under-counts one
+    // more boundary — when the committed payload exactly *fills* `remaining`
+    // (`remaining == tokens.len()`), the excluded stop token itself would sit
+    // one position beyond `max_new_tokens`. Plain greedy never reaches that
+    // position either (its loop caps at `max_new_tokens` decode steps), so it
+    // reports `Length`, not `Eos`, in that exact-fill case. The additional
+    // `remaining > tokens.len()` conjunct requires strictly more room than the
+    // committed payload — i.e. a slot left over for the excluded stop token —
+    // before calling it a genuine stop.
+    //
     // `generate_greedy_mtp` requires Metal hardware and cannot be called from
     // `cargo test` (no GPU). `simulate_mtp_with_stopped` mirrors the call-site
     // logic exactly; tests here are mutation-sensitive against that logic.
     //
-    // Mutation-sensitivity: change `stopped = emit_len == tokens.len()` in
-    // `simulate_mtp_with_stopped` below back to `stopped = true` → the
-    // budget=1 test goes RED (expected false, got true).
+    // Mutation-sensitivity: change `stopped = emit_len == tokens.len() &&
+    // remaining > tokens.len()` in `simulate_mtp_with_stopped` below back to
+    // `stopped = emit_len == tokens.len()` (dropping the new conjunct) → the
+    // budget=2 exact-fill test goes RED (expected false, got true). Change it
+    // to `stopped = true` unconditionally → the budget=1 test also goes RED
+    // (expected false, got true).
     // -----------------------------------------------------------------------
     fn simulate_mtp_with_stopped(
         logit_rows: &[Vec<f32>],
@@ -27130,8 +27199,13 @@ mod mtp_greedy_round_tests {
                     let emit_len = tokens.len().min(remaining);
                     out.extend_from_slice(&tokens[..emit_len]);
                     // FIX 1: stopped only when every committed token was actually
-                    // emitted (not clipped) — tokens never includes the stop itself.
-                    stopped = emit_len == tokens.len();
+                    // emitted (not clipped) — tokens never includes the stop itself
+                    // — AND at least one more slot remained beyond the committed
+                    // payload for that excluded stop token (codex round-1, #632):
+                    // an exact-fill payload (remaining == tokens.len()) means the
+                    // stop token itself sits beyond the budget, so plain greedy
+                    // would report Length there, not Eos.
+                    stopped = emit_len == tokens.len() && remaining > tokens.len();
                     break;
                 }
                 MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
@@ -27162,22 +27236,92 @@ mod mtp_greedy_round_tests {
     #[test]
     fn test_mtp_stopped_stop_token_clipped_at_budget_2() {
         // Budget=2: EmitAndStop([10, 20]) — bonus EOS already excluded from
-        // `tokens` (#613) — so emit_len=2 == tokens.len()=2 → stopped=true.
+        // `tokens` (#613) — so emit_len=2 == tokens.len()=2, but `remaining`
+        // (2) is NOT strictly greater than `tokens.len()` (2): the committed
+        // payload exactly fills the budget, so the excluded bonus stop token
+        // would have landed one position beyond `max_new_tokens`.
         //
-        // This FLIPS relative to the pre-#613 contract (there, tokens was
-        // [10, 20, EOS] and budget=2 clipped it: emit_len=2 != tokens.len()=3
-        // → stopped=false). The *emitted* tokens are identical, [10, 20],
-        // either way — only the boolean changes. Under the exclude contract
-        // this round's non-stop payload fits exactly in budget=2, so the
-        // round completed on its own terms (the cap never actually bit);
-        // `stopped=true` is the correct value now, not a regression.
+        // Codex round-1 (#632) flagged the prior expectation here
+        // (`stopped=true`) as wrong: plain greedy's decode loop caps at
+        // exactly `max_new_tokens` steps and never samples that extra
+        // position, so it would report `Length`, not `Eos`, in this exact
+        // scenario. `stopped=false` is the correct value — the emitted
+        // tokens are still [10, 20] either way, only the boolean changes.
         let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
         let draft_seq = vec![20u32];
         let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
         assert_eq!(tokens, vec![10, 20]);
         assert!(
+            !stopped,
+            "#632: tokens=[pending,draft] (bonus excluded) exactly fills budget=2 \
+             with no slot left for the excluded stop token → stopped=false, matching \
+             plain greedy's Length outcome at the same boundary"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_accepted_draft_stop_budget_1() {
+        // Accept case: the accepted draft token is itself the stop (not the
+        // bonus). pending=10 (not stop), draft=EOS is accepted (target's
+        // argmax at pos+1 agrees) → EmitAndStop([pending]) = [10] (draft
+        // excluded, #613). Budget=1: remaining=1 == tokens.len()=1 (exact
+        // fill) → the excluded stop token would sit one position beyond the
+        // budget → stopped=false (codex round-1, #632 boundary case).
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "accepted-draft-stop exactly fills budget=1 → stopped=false, not Eos"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_accepted_draft_stop_budget_2() {
+        // Same accept-draft-is-stop shape as above, but budget=2 leaves one
+        // spare slot beyond the committed [pending] payload for the excluded
+        // stop token → genuine stop, stopped=true.
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
+        assert_eq!(tokens, vec![10]);
+        assert!(
             stopped,
-            "#613: tokens=[pending,draft] (bonus excluded) fits exactly in budget=2 → stopped=true"
+            "accepted-draft-stop with budget to spare → stopped=true (genuine Eos)"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_rejected_replacement_stop_budget_1() {
+        // Reject case: draft is rejected (target's own argmax at pos+1
+        // disagrees with the proposed draft), and the target's replacement
+        // (bonus_token) is itself the stop → EmitAndStop([pending]) = [10]
+        // (replacement excluded, #613). Budget=1: remaining=1 ==
+        // tokens.len()=1 (exact fill) → stopped=false (codex round-1, #632).
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        // draft_seq deliberately does not match argmax(logit_rows[1])=EOS,
+        // forcing rejection; the target's replacement (EOS) becomes bonus_token.
+        let draft_seq = vec![99u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "rejected-replacement-stop exactly fills budget=1 → stopped=false, not Eos"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_rejected_replacement_stop_budget_2() {
+        // Same rejected-replacement-is-stop shape as above, but budget=2
+        // leaves a spare slot for the excluded stop token → genuine stop.
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![99u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            stopped,
+            "rejected-replacement-stop with budget to spare → stopped=true (genuine Eos)"
         );
     }
 

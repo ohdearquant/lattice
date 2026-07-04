@@ -39,6 +39,16 @@
 //! | 9 | Metal `generate` with `LATTICE_SELF_SPEC=1` | `forward::metal_qwen35::inner::tests` + `self_spec_eos_tests` |
 //! | 10 | Metal `generate_streaming` | `forward::metal_qwen35::inner::tests` |
 //! | 11 | Metal `generate_streaming_with_prefix_cache` | `forward::metal_qwen35::inner::tests` |
+//! | 12 | Metal `generate_multimodal` | `forward::metal_qwen35::inner::tests` |
+//!
+//! Entry 12 (`generate_multimodal`) has its own independent sampling loop —
+//! it does not call `generate`/`generate_streaming` internally — and was
+//! missing from this manifest until codex round 1 on PR #632 flagged it as
+//! an unguarded sibling-invocation path (#613's own warning pattern). Its
+//! loop already used the EXCLUDE contract (checks `is_stop` before pushing
+//! at every termination point: first-token sample, KV-full break, and the
+//! autoregressive decode loop), so no production change was needed here —
+//! only manifest + test coverage.
 //!
 //! The Metal-family tests (7-11) live inside `metal_qwen35.rs`'s existing
 //! `mod tests` rather than here because its GPU test fixtures
