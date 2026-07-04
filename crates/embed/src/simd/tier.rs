@@ -354,8 +354,6 @@ pub fn try_approximate_dot_product_prepared(
 /// that batch many lookups against a fixed stored set should pre-check once and
 /// use the cheaper overload directly.
 ///
-/// # Panics
-///
 /// # Errors
 ///
 /// Returns [`EmbedError::TierMismatch`] (propagated from
@@ -440,11 +438,16 @@ pub fn batch_approximate_cosine_distance_prepared_into(
     out: &mut Vec<f32>,
 ) -> Result<()> {
     out.clear();
-    let results: Vec<f32> = stored
-        .iter()
-        .map(|item| approximate_cosine_distance_prepared(query, item))
-        .collect::<Result<_>>()?;
-    out.extend(results);
+    out.reserve(stored.len());
+    for item in stored {
+        match approximate_cosine_distance_prepared(query, item) {
+            Ok(distance) => out.push(distance),
+            Err(e) => {
+                out.clear();
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
