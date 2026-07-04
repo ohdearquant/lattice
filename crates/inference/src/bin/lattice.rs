@@ -694,6 +694,31 @@ mod doctor {
         file: String,
     }
 
+    /// `quantize_index.json`'s on-disk shape differs by writer: `quantize_q4`
+    /// serializes a bare `Vec<Q4IndexEntry>`, while `quantize_quarot` (ADR-051)
+    /// serializes an object, `{"quarot_seed": ..., "tensors": [...]}`, so a
+    /// loader can recover the QuaRot rotation seed without parsing
+    /// `config.json`. `doctor` only inventories tensors -- the seed is
+    /// irrelevant here -- so both shapes normalize to the same entry list via
+    /// [`Q4IndexManifest::into_entries`]. Untagged so either JSON shape
+    /// deserializes into this one type (see also `MessageContent` below for
+    /// the same pattern applied to the OpenAI-compatible chat API).
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Q4IndexManifest {
+        Bare(Vec<Q4IndexEntry>),
+        Wrapped { tensors: Vec<Q4IndexEntry> },
+    }
+
+    impl Q4IndexManifest {
+        fn into_entries(self) -> Vec<Q4IndexEntry> {
+            match self {
+                Q4IndexManifest::Bare(entries) => entries,
+                Q4IndexManifest::Wrapped { tensors } => tensors,
+            }
+        }
+    }
+
     /// Estimate a Q4-checkpoint tensor's RESIDENT byte footprint once loaded
     /// by `MetalQwen35State::from_q4_dir` (`crates/inference/src/forward/metal_qwen35.rs`),
     /// given its on-disk byte length. Mirrors `cpu_resident_bytes` above for
@@ -810,8 +835,9 @@ mod doctor {
         if index_path.exists() {
             let bytes = std::fs::read(&index_path)
                 .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
-            let entries: Vec<Q4IndexEntry> = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?;
+            let entries: Vec<Q4IndexEntry> = serde_json::from_slice::<Q4IndexManifest>(&bytes)
+                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?
+                .into_entries();
 
             let mut total_bytes = 0u64;
             let mut missing_tensors = Vec::new();
@@ -1779,6 +1805,62 @@ mod doctor {
             let inv = inspect_q4_dir(&dir, &cfg).unwrap();
             assert!(!inv.has_mtp_tensors);
             fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_accepts_both_bare_array_and_quarot_object_manifest_shapes() {
+            // Regression test for #626: `quantize_q4` writes
+            // `quantize_index.json` as a bare array, but `quantize_quarot`
+            // (ADR-051) writes an object -- `{"quarot_seed": ..., "tensors":
+            // [...]}` -- so a loader can recover the QuaRot rotation seed
+            // without parsing `config.json`. `doctor` crashed on the latter
+            // shape with "invalid type: map, expected a sequence" before this
+            // fix; both shapes must now load and produce equivalent
+            // inventories for an identical tensor list.
+            let bare_dir = tempdir("q4-manifest-bare-array");
+            let object_dir = tempdir("q4-manifest-quarot-object");
+            for dir in [&bare_dir, &object_dir] {
+                write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
+            }
+            let q_proj_len = fs::metadata(bare_dir.join("q_proj.q4")).unwrap().len();
+
+            let tensors = serde_json::json!([
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                bare_dir.join("quantize_index.json"),
+                serde_json::to_vec(&tensors).unwrap(),
+            )
+            .unwrap();
+
+            let quarot_seed: u64 = 0xCAFE_BABE_DEAD_BEEF;
+            let object_manifest = serde_json::json!({
+                "quarot_seed": quarot_seed,
+                "tensors": [
+                    {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+                ],
+            });
+            fs::write(
+                object_dir.join("quantize_index.json"),
+                serde_json::to_vec(&object_manifest).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let bare_inv = inspect_q4_dir(&bare_dir, &cfg)
+                .expect("bare-array quantize_index.json (quantize_q4's shape) must load");
+            let object_inv = inspect_q4_dir(&object_dir, &cfg)
+                .expect("object-form quantize_index.json (quantize_quarot's shape) must load");
+
+            assert_eq!(object_inv.total_bytes, bare_inv.total_bytes);
+            assert_eq!(object_inv.total_bytes, q_proj_len);
+            assert_eq!(object_inv.tensor_count, bare_inv.tensor_count);
+            assert_eq!(object_inv.tensor_count, 1);
+            assert_eq!(object_inv.missing_tensors, bare_inv.missing_tensors);
+            assert_eq!(object_inv.has_mtp_tensors, bare_inv.has_mtp_tensors);
+
+            fs::remove_dir_all(&bare_dir).ok();
+            fs::remove_dir_all(&object_dir).ok();
         }
 
         #[test]
