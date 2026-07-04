@@ -1,8 +1,8 @@
 //! Fail-closed manifest-driven loader for LoRA adapters.
 //!
-//! `load_adapters_from_manifest` validates every approved adapter through ten
-//! ordered checks, returning `Err` on the first anomaly encountered. There is
-//! no partial success and no silent skip.
+//! `load_adapters_from_manifest` validates every approved adapter through
+//! eleven ordered checks, returning `Err` on the first anomaly encountered.
+//! There is no partial success and no silent skip.
 
 use super::LoraAdapter;
 use super::manifest::{AdapterId, AdapterStatus, LoraManifest, ManifestEntry};
@@ -19,6 +19,58 @@ pub struct LoadedAdapter {
     pub entry: ManifestEntry,
     /// The loaded adapter weights.
     pub adapter: LoraAdapter,
+    /// `true` when this adapter's `base_model_rev`/`tokenizer_rev` did not
+    /// match the [`RunningRevisions`] supplied to
+    /// [`load_adapters_from_manifest`], but the load proceeded anyway because
+    /// `allow_mismatch` was set. Always `false` when `running` was `None`
+    /// (enforcement not requested) or when both revisions matched. Callers
+    /// should surface a `true` value (log, telemetry) — it means a
+    /// governance check was knowingly bypassed.
+    pub rev_mismatch_overridden: bool,
+}
+
+/// The base-model / tokenizer revisions the caller believes are currently
+/// serving, used by [`load_adapters_from_manifest`] (Check 11) to fail-closed
+/// on adapters trained against a different revision.
+///
+/// Comparison is plain string equality against `ManifestEntry::base_model_rev`
+/// / `tokenizer_rev` — the literal `"none"` sentinel some entries use for
+/// "untracked" is not treated as a wildcard. If a manifest predates revision
+/// tracking, supply `"none"` on the running side too, or use
+/// [`RunningRevisions::permissive`].
+#[derive(Debug, Clone, Copy)]
+pub struct RunningRevisions<'a> {
+    /// Revision of the base model weights currently loaded for serving.
+    pub base_model_rev: &'a str,
+    /// Revision of the tokenizer currently loaded for serving.
+    pub tokenizer_rev: &'a str,
+    /// When `true`, a revision mismatch is recorded via
+    /// `LoadedAdapter::rev_mismatch_overridden` instead of failing the load.
+    pub allow_mismatch: bool,
+}
+
+impl<'a> RunningRevisions<'a> {
+    /// Strict (fail-closed, default-recommended) revision context: any
+    /// mismatch on either field rejects the adapter.
+    pub fn strict(base_model_rev: &'a str, tokenizer_rev: &'a str) -> Self {
+        Self {
+            base_model_rev,
+            tokenizer_rev,
+            allow_mismatch: false,
+        }
+    }
+
+    /// Permissive revision context: mismatches are recorded on the loaded
+    /// adapter (`rev_mismatch_overridden`) but do not fail the load. Intended
+    /// for controlled migrations/backfills only — this reopens the silent
+    /// quality-loss gap Check 11 exists to close.
+    pub fn permissive(base_model_rev: &'a str, tokenizer_rev: &'a str) -> Self {
+        Self {
+            base_model_rev,
+            tokenizer_rev,
+            allow_mismatch: true,
+        }
+    }
 }
 
 /// Load and validate all approved adapters in a manifest.
@@ -45,6 +97,10 @@ pub struct LoadedAdapter {
 ///    `adapter.validate_against(model_config)` passes — else `Err`.
 /// 10. If the adapter's safetensors header contains an `adapter_id` key, it
 ///     must equal `entry.id` — else `Err(TuneError::Validation(...))`.
+/// 11. (When `running` is `Some`) `entry.base_model_rev == running.base_model_rev`
+///     and `entry.tokenizer_rev == running.tokenizer_rev` — else `Err`, unless
+///     `running.allow_mismatch` is set, in which case the load proceeds and
+///     `LoadedAdapter::rev_mismatch_overridden` is set to `true`.
 ///
 /// # Arguments
 ///
@@ -53,12 +109,16 @@ pub struct LoadedAdapter {
 ///   manifest file's parent directory).
 /// * `model_config` — (Only when `inference-hook` is active) Model config for
 ///   dimension validation; `None` skips step 9.
+/// * `running` — Base-model/tokenizer revisions currently serving, for step
+///   11. `None` skips revision enforcement entirely (e.g. offline manifest
+///   validation with no live model context).
 pub fn load_adapters_from_manifest(
     manifest: &LoraManifest,
     base_dir: &Path,
     #[cfg(feature = "inference-hook")] model_config: Option<
         &lattice_inference::model::qwen35_config::Qwen35Config,
     >,
+    running: Option<&RunningRevisions<'_>>,
 ) -> Result<Vec<LoadedAdapter>> {
     // Pre-scan: verify ALL entries are Approved before touching any file or
     // allocating the output buffer. A quarantined/revoked entry anywhere in the
@@ -258,12 +318,51 @@ pub fn load_adapters_from_manifest(
 
         // Check 10: If safetensors header carries `adapter_id`, it must equal entry.id.
         let header_id = crate::lora::safetensors::read_peft_header_adapter_id(&bytes);
-        if let Some(ref hid) = header_id {
-            if hid != &entry.id {
-                return Err(TuneError::Validation(format!(
-                    "adapter id mismatch: manifest id '{}' != safetensors header adapter_id '{hid}'",
-                    entry.id
-                )));
+        if let Some(ref hid) = header_id
+            && hid != &entry.id
+        {
+            return Err(TuneError::Validation(format!(
+                "adapter id mismatch: manifest id '{}' != safetensors header adapter_id '{hid}'",
+                entry.id
+            )));
+        }
+
+        // Check 11: Base-model / tokenizer revision enforcement (fail-closed).
+        // A revision mismatch is the classic silent-quality-loss failure for
+        // LoRA serving: an adapter trained against a different base or
+        // tokenizer revision loads and runs fine, it just produces worse
+        // output, with no error to signal the mismatch. `running` is `None`
+        // when the caller has no live-model context (e.g. offline manifest
+        // validation) — enforcement is skipped entirely in that case,
+        // mirroring the `model_config` idiom in Check 9. Placed last (rather
+        // than renumbering Checks 1-10) to keep this change additive; it does
+        // not gate file IO for other entries, only this one's already-read
+        // bytes are discarded on rejection.
+        let mut rev_mismatch_overridden = false;
+        if let Some(running) = running {
+            let mut mismatches = Vec::new();
+            if entry.base_model_rev != running.base_model_rev {
+                mismatches.push(format!(
+                    "base_model_rev (manifest '{}' != running '{}')",
+                    entry.base_model_rev, running.base_model_rev
+                ));
+            }
+            if entry.tokenizer_rev != running.tokenizer_rev {
+                mismatches.push(format!(
+                    "tokenizer_rev (manifest '{}' != running '{}')",
+                    entry.tokenizer_rev, running.tokenizer_rev
+                ));
+            }
+            if !mismatches.is_empty() {
+                if running.allow_mismatch {
+                    rev_mismatch_overridden = true;
+                } else {
+                    return Err(TuneError::Validation(format!(
+                        "revision mismatch for '{}': {}",
+                        entry.id,
+                        mismatches.join(", ")
+                    )));
+                }
             }
         }
 
@@ -271,6 +370,7 @@ pub fn load_adapters_from_manifest(
             id: entry.id.clone(),
             entry: entry.clone(),
             adapter,
+            rev_mismatch_overridden,
         });
     }
 
@@ -347,6 +447,7 @@ mod tests {
         ManifestEntry {
             id: id.to_string(),
             name: format!("{id} test"),
+            owner: "test-owner".to_string(),
             uri: uri.to_string(),
             integrity_sha256: sha256.to_string(),
             base_model_rev: "none".to_string(),
@@ -354,6 +455,7 @@ mod tests {
             rank,
             alpha,
             target_modules,
+            dtype: "f32".to_string(),
             status,
         }
     }
@@ -375,6 +477,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -403,6 +506,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -426,6 +530,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -452,6 +557,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -485,6 +591,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
     }
@@ -513,6 +620,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -548,6 +656,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -579,6 +688,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(
@@ -616,6 +726,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(
             result.is_ok(),
@@ -632,6 +743,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_ok());
@@ -676,6 +788,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -708,6 +821,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -735,6 +849,7 @@ mod tests {
             &manifest,
             dir.path(),
             #[cfg(feature = "inference-hook")]
+            None,
             None,
         );
         assert!(result.is_err());
@@ -803,6 +918,7 @@ mod tests {
             dir.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -847,6 +963,7 @@ mod tests {
             base.path(),
             #[cfg(feature = "inference-hook")]
             None,
+            None,
         );
         assert!(
             result.is_err(),
@@ -857,5 +974,216 @@ mod tests {
             msg.contains("escapes base directory"),
             "expected escape rejection; got: {msg}"
         );
+    }
+
+    /// Check 11, mutation-sensitive: an adapter stamped with a `base_model_rev`
+    /// that does not match the running context must be rejected, even though
+    /// every other check (status/path/hash/rank/alpha/modules/id) passes.
+    ///
+    /// Mutation-sensitive: removing the Check 11 block makes `running` inert
+    /// (the parameter is simply never consulted), so this load would return
+    /// `Ok` instead — the `result.is_err()` assertion fails when the guard is
+    /// absent. Verified by reverting the Check 11 addition and re-running:
+    /// this test fails (`Ok` returned) without the fix, passes with it.
+    #[test]
+    fn loader_rejects_base_model_rev_mismatch() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("adapter.safetensors");
+        write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
+        let bytes = std::fs::read(&file_path).unwrap();
+        let sha = sha256_hash(&bytes);
+
+        let mut manifest = LoraManifest::new();
+        let mut entry = make_entry(
+            "rev-adapter",
+            "adapter.safetensors",
+            &sha,
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+        entry.base_model_rev = "trained-rev-a".to_string();
+        entry.tokenizer_rev = "tok-rev-a".to_string();
+        manifest.adapters.push(entry);
+
+        // Tokenizer rev matches; base_model_rev does not.
+        let running = RunningRevisions::strict("running-rev-b", "tok-rev-a");
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+            Some(&running),
+        );
+        assert!(result.is_err(), "expected Err, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("revision mismatch") && msg.contains("base_model_rev"),
+            "expected revision-mismatch/base_model_rev in: {msg}"
+        );
+    }
+
+    /// Symmetric to the base-rev test above: a `tokenizer_rev` mismatch alone
+    /// must also be rejected.
+    #[test]
+    fn loader_rejects_tokenizer_rev_mismatch() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("adapter.safetensors");
+        write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
+        let bytes = std::fs::read(&file_path).unwrap();
+        let sha = sha256_hash(&bytes);
+
+        let mut manifest = LoraManifest::new();
+        let mut entry = make_entry(
+            "rev-adapter",
+            "adapter.safetensors",
+            &sha,
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+        entry.base_model_rev = "trained-rev-a".to_string();
+        entry.tokenizer_rev = "tok-rev-a".to_string();
+        manifest.adapters.push(entry);
+
+        // base_model_rev matches; tokenizer_rev does not.
+        let running = RunningRevisions::strict("trained-rev-a", "tok-rev-mismatch");
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+            Some(&running),
+        );
+        assert!(result.is_err(), "expected Err, got Ok");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("revision mismatch") && msg.contains("tokenizer_rev"),
+            "expected revision-mismatch/tokenizer_rev in: {msg}"
+        );
+    }
+
+    /// Complement to the rejection tests: matching revisions must load fine —
+    /// Check 11 is a comparison, not an unconditional reject.
+    #[test]
+    fn loader_accepts_matching_revs() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("adapter.safetensors");
+        write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
+        let bytes = std::fs::read(&file_path).unwrap();
+        let sha = sha256_hash(&bytes);
+
+        let mut manifest = LoraManifest::new();
+        let mut entry = make_entry(
+            "rev-adapter",
+            "adapter.safetensors",
+            &sha,
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+        entry.base_model_rev = "trained-rev-a".to_string();
+        entry.tokenizer_rev = "tok-rev-a".to_string();
+        manifest.adapters.push(entry);
+
+        let running = RunningRevisions::strict("trained-rev-a", "tok-rev-a");
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+            Some(&running),
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok, got: {:?}",
+            result.unwrap_err()
+        );
+        assert!(!result.unwrap()[0].rev_mismatch_overridden);
+    }
+
+    /// `RunningRevisions::permissive` lets a mismatch through but must record
+    /// it on `LoadedAdapter::rev_mismatch_overridden` — the override is
+    /// observable, not silent.
+    #[test]
+    fn loader_allows_rev_mismatch_with_override_flag() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("adapter.safetensors");
+        write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
+        let bytes = std::fs::read(&file_path).unwrap();
+        let sha = sha256_hash(&bytes);
+
+        let mut manifest = LoraManifest::new();
+        let mut entry = make_entry(
+            "rev-adapter",
+            "adapter.safetensors",
+            &sha,
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+        entry.base_model_rev = "trained-rev-a".to_string();
+        entry.tokenizer_rev = "tok-rev-a".to_string();
+        manifest.adapters.push(entry);
+
+        let running = RunningRevisions::permissive("running-rev-b", "tok-rev-mismatch");
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+            Some(&running),
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok (override), got: {:?}",
+            result.unwrap_err()
+        );
+        assert!(result.unwrap()[0].rev_mismatch_overridden);
+    }
+
+    /// `running: None` must skip revision enforcement entirely — every other
+    /// existing test in this module relies on this (they all pass `None`),
+    /// this test makes the opt-in semantics explicit with revs that would
+    /// otherwise mismatch.
+    #[test]
+    fn loader_skips_rev_enforcement_when_running_is_none() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("adapter.safetensors");
+        write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
+        let bytes = std::fs::read(&file_path).unwrap();
+        let sha = sha256_hash(&bytes);
+
+        let mut manifest = LoraManifest::new();
+        let mut entry = make_entry(
+            "rev-adapter",
+            "adapter.safetensors",
+            &sha,
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+        entry.base_model_rev = "trained-rev-a".to_string();
+        entry.tokenizer_rev = "tok-rev-a".to_string();
+        manifest.adapters.push(entry);
+
+        let result = load_adapters_from_manifest(
+            &manifest,
+            dir.path(),
+            #[cfg(feature = "inference-hook")]
+            None,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok (no enforcement requested), got: {:?}",
+            result.unwrap_err()
+        );
+        assert!(!result.unwrap()[0].rev_mismatch_overridden);
     }
 }
