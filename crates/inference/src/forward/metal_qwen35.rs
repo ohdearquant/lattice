@@ -23305,7 +23305,9 @@ kernel void decode_attention_reference(
                 logprobs: None,
             };
 
-            let out = state.generate("a", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("generate (plain)");
             assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate (plain)");
         }
 
@@ -23342,7 +23344,9 @@ kernel void decode_attention_reference(
                 logprobs: None,
             };
 
-            let out = state.generate("a", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("generate (LATTICE_MTP)");
             assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate (LATTICE_MTP)");
         }
 
@@ -23382,6 +23386,7 @@ kernel void decode_attention_reference(
                 );
                 state.generate("a", &tokenizer, &gen_cfg)
             });
+            let out = out.expect("generate (LATTICE_SELF_SPEC)");
             assert_excludes_stop_token_metal(
                 &out,
                 "MetalQwen35State::generate (LATTICE_SELF_SPEC)",
@@ -23416,10 +23421,12 @@ kernel void decode_attention_reference(
             };
 
             let mut deltas: Vec<String> = vec![];
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
-                deltas.push(delta.to_string());
-                true
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    deltas.push(delta.to_string());
+                    true
+                })
+                .expect("generate_streaming");
             assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate_streaming");
             assert!(
                 deltas.is_empty(),
@@ -25572,12 +25579,9 @@ kernel void decode_attention_reference(
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
             let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
-            let reference_out = reference_state.generate_streaming(
-                &edited_prompt,
-                &tokenizer,
-                &reference_gen_cfg,
-                |_, _| true,
-            );
+            let reference_out = reference_state
+                .generate_streaming(&edited_prompt, &tokenizer, &reference_gen_cfg, |_, _| true)
+                .expect("reference re-prefill generate_streaming");
             assert_eq!(
                 edited.output.token_ids, reference_out.token_ids,
                 "replayed-from-checkpoint token IDs must match full re-prefill exactly"
@@ -25627,12 +25631,14 @@ kernel void decode_attention_reference(
             );
             let mut probe_reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let probe_reference = probe_reference_state.generate_streaming(
-                &probe_prompt,
-                &tokenizer,
-                &cross_turn_test_gen_cfg(42, 3),
-                |_, _| true,
-            );
+            let probe_reference = probe_reference_state
+                .generate_streaming(
+                    &probe_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(42, 3),
+                    |_, _| true,
+                )
+                .expect("probe reference generate_streaming");
             assert_eq!(
                 probe.output.token_ids, probe_reference.token_ids,
                 "probe token IDs must match full re-prefill exactly"
@@ -25657,12 +25663,14 @@ kernel void decode_attention_reference(
             );
             let mut followup_reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let followup_reference = followup_reference_state.generate_streaming(
-                &followup_prompt,
-                &tokenizer,
-                &cross_turn_test_gen_cfg(42, 3),
-                |_, _| true,
-            );
+            let followup_reference = followup_reference_state
+                .generate_streaming(
+                    &followup_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(42, 3),
+                    |_, _| true,
+                )
+                .expect("followup reference generate_streaming");
             assert_eq!(
                 followup.output.token_ids, followup_reference.token_ids,
                 "post-replay append token IDs must match full re-prefill exactly"
