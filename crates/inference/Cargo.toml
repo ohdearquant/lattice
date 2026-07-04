@@ -9,7 +9,15 @@ repository.workspace = true
 description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
 
 [features]
-default = ["std", "download"]
+default = ["std", "download", "serve"]
+# HTTP serving stack (axum/tokio/futures) for the `lattice` CLI's serve
+# command and the standalone `lattice_serve` binary. On by default so a plain
+# `cargo install lattice-inference` keeps shipping the `lattice` CLI
+# unchanged, and existing `--features f16,metal-gpu` install/package profiles
+# keep including `lattice_serve` without needing an extra flag. Library
+# consumers building with `default-features = false` no longer pull an HTTP
+# server into their dependency tree (the lib itself never uses it).
+serve = ["dep:axum", "dep:tokio", "dep:futures"]
 std = []
 f16 = []
 metal-gpu = ["dep:metal", "dep:objc"]
@@ -38,9 +46,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
-axum = { workspace = true }
-futures = { workspace = true }
-tokio = { workspace = true }
+axum = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
@@ -57,6 +65,7 @@ lattice-fann = { version = "0.5.0", path = "../fann", optional = true }
 [[bin]]
 name = "lattice"
 path = "src/bin/lattice.rs"
+required-features = ["serve"]
 
 [[bin]]
 name = "backfill_qwen3"
@@ -75,7 +84,7 @@ required-features = ["f16", "metal-gpu"]
 [[bin]]
 name = "lattice_serve"
 path = "src/bin/lattice_serve.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "serve"]
 
 [[bin]]
 name = "bench_decode_ab"
@@ -244,6 +253,11 @@ required-features = ["bench-internals"]
 
 [[bench]]
 name = "metal_decode_bench"
+harness = false
+required-features = ["metal-gpu", "f16"]
+
+[[bench]]
+name = "cross_turn_prefix_cache_bench"
 harness = false
 required-features = ["metal-gpu", "f16"]
 

@@ -378,6 +378,13 @@ fn load_lora_safetensors(
 /// done:true line with tok_s and ttft_ms. Format is byte-identical to generate_lora
 /// so the app parser needs no changes. Returns Err on broken pipe or flush failure.
 ///
+/// Generation itself runs through the cross-turn prefix cache (#462): a
+/// same-slot conversation that safely extends the previous call reuses its KV
+/// state instead of re-prefilling from scratch. A rare cache/generation-level
+/// failure (already fail-closed and cleaned up inside the engine) is surfaced
+/// as an `{"ev":"error","msg":...}` line and this function still returns `Ok`,
+/// so one bad request doesn't tear down an otherwise-healthy serve loop.
+///
 /// Used by both `--json --prompt` (one-shot) and `--json --serve` (serve loop) so
 /// the event format cannot drift between the two paths.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -389,6 +396,7 @@ fn emit_json_generation(
     model_format: &str,
     lora_tag: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::kv_cache::CrossTurnSlotId;
     use std::io::Write;
 
     let mut stdout = std::io::stdout();
@@ -410,8 +418,17 @@ fn emit_json_generation(
     // Capture the first write/flush failure so we can stop generation and return Err
     // rather than silently completing a run whose output was never received.
     let mut stream_err: Option<std::io::Error> = None;
-    let output = metal
-        .generate_streaming(prompt, tokenizer, gen_cfg, |delta, token_id| {
+    // Cache-aware call (#462): reuses the previous request's shared token prefix
+    // instead of the caller reset_state()-ing before every request. Safe even when
+    // unrelated conversations are interleaved through one warm serve process — a
+    // divergent prompt just plans a full refill internally, matching the old
+    // unconditional-reset behavior exactly (see kv_cache::cross_turn).
+    let cache_result = metal.generate_streaming_with_prefix_cache(
+        CrossTurnSlotId::DEFAULT,
+        prompt,
+        tokenizer,
+        gen_cfg,
+        |delta, token_id| {
             if !first_token_emitted {
                 ttft_ms = t1.elapsed().as_secs_f64() * 1000.0;
                 first_token_emitted = true;
@@ -427,12 +444,29 @@ fn emit_json_generation(
                 return false; // downstream consumer is gone — stop generating
             }
             true // continue generation
-        })
-        .map_err(|e| format!("generation failed: {e}"))?;
+        },
+    );
 
     if let Some(e) = stream_err {
         return Err(format!("streaming stdout write failed: {e}").into());
     }
+
+    // A cache/generation failure is fail-closed at the engine level already (live
+    // KV/GDN state and the retained prefix entry are both reset before the error
+    // is returned), so the warm process is left in a clean state. Surface it as a
+    // protocol-level error event instead of tearing down the whole serve loop over
+    // one bad request.
+    let cached = match cache_result {
+        Ok(cached) => cached,
+        Err(e) => {
+            let msg = json_escape(&format!("generation failed: {e}"));
+            writeln!(stdout, "@@lattice {{\"ev\":\"error\",\"msg\":{msg}}}")
+                .and_then(|()| stdout.flush())
+                .map_err(|e| format!("error-event write failed: {e}"))?;
+            return Ok(());
+        }
+    };
+    let output = cached.output;
 
     let gen_ms = t1.elapsed().as_millis();
     let tok_s = if gen_ms > 0 {
@@ -452,8 +486,13 @@ fn emit_json_generation(
     .map_err(|e| format!("streaming done-event write failed: {e}"))?;
 
     eprintln!(
-        "[chat_metal] GPU Metal {model_format}{lora_tag}: {} prompt + {} gen in {}ms = {tok_s:.1} tok/s",
-        output.prompt_tokens, output.generated_tokens, gen_ms
+        "[chat_metal] GPU Metal {model_format}{lora_tag}: {} prompt + {} gen in {}ms = {tok_s:.1} tok/s | cache: {:?} reused {}/{}",
+        output.prompt_tokens,
+        output.generated_tokens,
+        gen_ms,
+        cached.cache.mode,
+        cached.cache.reused_tokens,
+        cached.cache.prompt_tokens,
     );
 
     // Emit the runtime path-proof marker (issue #239): CI gates on this to prove
@@ -482,6 +521,7 @@ fn emit_json_generation(
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+    use lattice_inference::kv_cache::CrossTurnSlotId;
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
@@ -785,8 +825,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     logprobs: None,
                 };
 
-                // Stateless per request: full ChatML history comes in the prompt.
-                metal.reset_state();
+                // Each request's full ChatML history is re-sent in `prompt` (the
+                // client is stateless), but the engine itself now reuses the KV
+                // state shared with the previous request when it's a safe append
+                // instead of unconditionally reset_state()-ing here (#462). A
+                // first request, a divergent conversation, or an edited history
+                // all just fall back to a full refill inside emit_json_generation.
 
                 // Broken pipe means the app closed its read end — stop the loop cleanly.
                 if let Err(e) = emit_json_generation(
@@ -852,27 +896,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // In REPL mode we support single --prompt as a one-shot and then enter the loop.
         // Build a chat prompt from history.
         history.push(ChatMessage::user(input));
-        metal.reset_state();
 
         let t = std::time::Instant::now();
 
-        // Use chat_completion_streaming for the REPL so output appears token-by-token.
+        // Use the cache-aware entry point so turn N reuses turn N-1's shared
+        // prefix instead of unconditionally reset_state()-ing and re-prefilling
+        // the whole conversation every turn (#462). Falls back to a full prefill
+        // on its own whenever the shared prefix isn't a safe append — new
+        // session, edited history, adapter change, etc. — see kv_cache::cross_turn.
         let mut response_text = String::new();
-        let result = metal.chat_completion_streaming(&history, &tokenizer, &gen_cfg, |delta, _| {
-            print!("{delta}");
-            std::io::stdout().flush().ok();
-            response_text.push_str(delta);
-            true
-        });
+        let cache_result = metal.chat_completion_streaming_with_prefix_cache(
+            CrossTurnSlotId::DEFAULT,
+            &history,
+            &tokenizer,
+            &gen_cfg,
+            |delta, _| {
+                print!("{delta}");
+                std::io::stdout().flush().ok();
+                response_text.push_str(delta);
+                true
+            },
+        );
         println!();
 
-        let result = match result {
-            Ok(result) => result,
+        let cached = match cache_result {
+            Ok(cached) => cached,
             Err(e) => {
-                eprintln!("Generation error: {e}");
+                eprintln!("[chat_metal] generation failed: {e}");
+                // The engine already reset its live state on this error path, so
+                // just drop the unanswered turn and let the user retry cleanly.
+                history.pop();
                 continue;
             }
         };
+        let result = cached.output;
 
         let elapsed = t.elapsed();
         let tps = if result.completion_tokens > 0 {
@@ -881,11 +938,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             0.0
         };
         eprintln!(
-            "[{} prompt + {} gen in {:.1}ms = {:.1} tok/s | GPU Metal {model_format}]",
+            "[{} prompt + {} gen in {:.1}ms = {:.1} tok/s | GPU Metal {model_format} | cache: {:?} reused {}/{}]",
             result.prompt_tokens,
             result.completion_tokens,
             elapsed.as_secs_f64() * 1000.0,
             tps,
+            cached.cache.mode,
+            cached.cache.reused_tokens,
+            cached.cache.prompt_tokens,
         );
 
         history.push(ChatMessage::assistant(response_text.trim()));

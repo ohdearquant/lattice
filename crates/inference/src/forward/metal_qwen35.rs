@@ -25454,6 +25454,106 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// Sibling of the above, but exercised through the `ChatMessage`-based
+        /// `chat_completion_streaming_with_prefix_cache` wrapper rather than raw
+        /// prompt strings — this is the exact entry point `chat_metal`'s
+        /// interactive REPL calls (#462), so it must reproduce plain
+        /// `chat_completion_streaming`'s output turn-for-turn on a growing
+        /// conversation history, including `format_chat_template`'s ChatML
+        /// framing and `<|im_end|>` stop-token handling.
+        #[test]
+        fn cross_turn_cache_chat_completion_matches_full_reprefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            // Keep EOS unreachable so every turn generates its full budget,
+            // guaranteeing the history keeps growing turn over turn (mirrors the
+            // raw-prompt sibling test above).
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            // max_cache_len=128 = this fixture's max_position_embeddings ceiling;
+            // four short turns of ChatML-formatted history (role words + content)
+            // stay well under it (~70 tokens at the last turn).
+            let mut cached_state =
+                MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+
+            let user_turns = ["a", "bc", "d", "ef"];
+            let mut history: Vec<ChatMessage> = vec![ChatMessage::system("")];
+            let mut saw_exact_append = false;
+
+            for (turn_idx, user_text) in user_turns.iter().enumerate() {
+                history.push(ChatMessage::user(*user_text));
+                let gen_cfg = cross_turn_test_gen_cfg(42, 2);
+
+                let cached_out = cached_state
+                    .chat_completion_streaming_with_prefix_cache(
+                        slot_id,
+                        &history,
+                        &tokenizer,
+                        &gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("cache-aware chat completion must not error on a valid history");
+
+                // Independent, from-scratch reference: a brand new state, the
+                // plain (non-cache) chat_completion_streaming path over the same
+                // history — exactly chat_metal's pre-#462 behavior (reset_state +
+                // full re-prefill of the whole ChatML-formatted history every turn).
+                let mut reference_state =
+                    MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+                let reference_gen_cfg = cross_turn_test_gen_cfg(42, 2);
+                let reference_out = reference_state
+                    .chat_completion_streaming(
+                        &history,
+                        &tokenizer,
+                        &reference_gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("reference chat completion must not error on a valid history");
+
+                assert_eq!(
+                    cached_out.output.message.content, reference_out.message.content,
+                    "turn {turn_idx}: cache-aware chat completion must match full re-prefill exactly"
+                );
+                assert_eq!(
+                    cached_out.output.prompt_tokens, reference_out.prompt_tokens,
+                    "turn {turn_idx}: prompt_tokens must match full re-prefill"
+                );
+                assert_eq!(
+                    cached_out.output.completion_tokens, reference_out.completion_tokens,
+                    "turn {turn_idx}: completion_tokens must match full re-prefill"
+                );
+
+                if matches!(
+                    cached_out.cache.mode,
+                    crate::kv_cache::PrefixReuseMode::ExactAppend
+                ) {
+                    saw_exact_append = true;
+                    assert!(
+                        cached_out.cache.reused_tokens > 0,
+                        "turn {turn_idx}: ExactAppend must report a nonzero reused prefix"
+                    );
+                }
+
+                // Grow history with the (validated-identical) reply so the next
+                // turn's prompt is a real append onto this one, matching real
+                // REPL usage in chat_metal.
+                history.push(cached_out.output.message.clone());
+            }
+
+            assert!(
+                saw_exact_append,
+                "at least one later turn must actually exercise ExactAppend reuse through the \
+                 ChatMessage-based wrapper — otherwise this test only proves the FullRefill \
+                 path works"
+            );
+        }
+
         /// The correctness gate for #590: editing an earlier turn (a prompt
         /// that diverges from the cached history mid-way, at or after a
         /// retained sparse GDN checkpoint boundary) must take the
