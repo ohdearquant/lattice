@@ -16583,8 +16583,46 @@ kernel void gdn_chunk_norm_silu_c32(
         where
             F: FnMut(&str, u32) -> bool,
         {
-            match self.generate_streaming_with_prefix_cache_inner(
-                slot_id, prompt, tokenizer, gen_cfg, on_token,
+            self.generate_streaming_with_prefix_cache_and_cancel(
+                slot_id,
+                prompt,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                || false,
+            )
+        }
+
+        /// Cancellation-aware sibling of [`Self::generate_streaming_with_prefix_cache`];
+        /// see [`Self::generate_streaming_with_cancel`] for exactly what
+        /// `should_cancel` observes that `on_token` alone cannot. Fail-closed
+        /// invariant: every path that can observe a cancellation runs strictly
+        /// after `restore_cross_turn_prefix` has already `take`n the slot's
+        /// entry (for `ExactAppend`) or `reset_state` has cleared the whole
+        /// cache (for `FullRefill`), so an early cancel-return never re-saves
+        /// and the slot is left empty rather than holding a stale/partial
+        /// entry — the same guarantee the existing error path documents
+        /// (#516 round-1 remediation D2).
+        pub fn generate_streaming_with_prefix_cache_and_cancel<F, C>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
+            match self.generate_streaming_with_prefix_cache_and_cancel_inner(
+                slot_id,
+                prompt,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                should_cancel,
             ) {
                 Ok(out) => Ok(out),
                 Err(e) => {
@@ -16598,16 +16636,18 @@ kernel void gdn_chunk_norm_silu_c32(
             }
         }
 
-        fn generate_streaming_with_prefix_cache_inner<F>(
+        fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
+            mut should_cancel: C,
         ) -> Result<CachedGenerateOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
         {
             use crate::kv_cache::PrefixReuseMode;
 
@@ -16709,6 +16749,35 @@ kernel void gdn_chunk_norm_silu_c32(
                 PrefixReuseMode::FullRefill => self.reset_state(),
             }
 
+            // Checked independently of `on_token`, mirroring the equivalent
+            // check in `generate_streaming_with_cancel` right after
+            // `reset_state` and before the (potentially large,
+            // uninterruptible once started) suffix prefill matmul below. The
+            // restore/reset above already leaves the cache fail-closed for
+            // this slot (ExactAppend `take`s the entry; FullRefill clears the
+            // whole map via `reset_state`), so bailing here never re-saves a
+            // partial entry — it simply skips paying for the prefill.
+            if should_cancel() {
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    },
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: prompt_len,
+                        reused_tokens: 0,
+                        prefetched_tokens: 0,
+                        mode: plan.mode,
+                    },
+                });
+            }
+
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
@@ -16762,6 +16831,38 @@ kernel void gdn_chunk_norm_silu_c32(
             // prefill only the divergent suffix, at its true absolute position.
             let suffix = &prompt_ids[plan.suffix_start..];
             let mut prefill_logits = self.forward_prefill_from(suffix, plan.suffix_start, false)?;
+
+            // The suffix prefill itself cannot be interrupted mid-flight (one
+            // GPU dispatch), so this is the earliest point a disconnect that
+            // happened *during* it can be observed — before paying for
+            // sampling or decode-loop work on its output. The cache is
+            // already fail-closed for this slot at this point (see the
+            // should_cancel check above), so bailing here is safe: it just
+            // means the suffix prefill's cost was spent without being reused.
+            if should_cancel() {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    },
+                    cache: CrossTurnCacheStats {
+                        slot_id,
+                        prompt_tokens: prompt_len,
+                        reused_tokens: plan.reusable_len,
+                        prefetched_tokens: plan.suffix_len,
+                        mode: plan.mode,
+                    },
+                });
+            }
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
@@ -16878,6 +16979,19 @@ kernel void gdn_chunk_norm_silu_c32(
 
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
             for _ in 1..cap {
+                // Checked before any per-step GPU work, independent of whether
+                // this iteration's delta ends up non-empty — mirrors
+                // `generate_streaming_with_cancel`'s decode-loop check and
+                // closes the same UTF-8-boundary gap `on_token`-only
+                // cancellation has. Every generated token up to this point
+                // was already forwarded (`forward_step` ran on the previous
+                // iteration), so this is exactly the on_token-returns-false
+                // case below: state is fully consistent, safe to save below.
+                if should_cancel() {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -17020,6 +17134,36 @@ kernel void gdn_chunk_norm_silu_c32(
         where
             F: FnMut(&str, u32) -> bool,
         {
+            self.chat_completion_streaming_with_prefix_cache_and_cancel(
+                slot_id,
+                messages,
+                tokenizer,
+                gen_cfg,
+                on_token,
+                || false,
+            )
+        }
+
+        /// Cancellation-aware sibling of
+        /// [`Self::chat_completion_streaming_with_prefix_cache`]: same ChatML
+        /// formatting and `<|im_end|>` stop-token handling, routed through
+        /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] instead
+        /// of `generate_streaming_with_prefix_cache`. See
+        /// [`Self::chat_completion_streaming_with_cancel`] for the analogous
+        /// non-cache entry point this mirrors.
+        pub fn chat_completion_streaming_with_prefix_cache_and_cancel<F, C>(
+            &mut self,
+            slot_id: crate::kv_cache::CrossTurnSlotId,
+            messages: &[ChatMessage],
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            on_token: F,
+            should_cancel: C,
+        ) -> Result<CachedChatCompletionOutput, crate::error::InferenceError>
+        where
+            F: FnMut(&str, u32) -> bool,
+            C: FnMut() -> bool,
+        {
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -17027,8 +17171,13 @@ kernel void gdn_chunk_norm_silu_c32(
             {
                 cfg.stop_token_ids.push(im_end_id);
             }
-            let cached = self.generate_streaming_with_prefix_cache(
-                slot_id, &prompt, tokenizer, &cfg, on_token,
+            let cached = self.generate_streaming_with_prefix_cache_and_cancel(
+                slot_id,
+                &prompt,
+                tokenizer,
+                &cfg,
+                on_token,
+                should_cancel,
             )?;
             let text = cached.output.text.trim_end().to_string();
             Ok(CachedChatCompletionOutput {
@@ -24846,6 +24995,93 @@ kernel void decode_attention_reference(
                 second.cache.mode,
                 crate::kv_cache::PrefixReuseMode::ExactAppend,
                 "an entry saved under the other GDN prefill mode must never be restored via ExactAppend"
+            );
+        }
+
+        /// #462 serve-wiring correctness gate for
+        /// `generate_streaming_with_prefix_cache_and_cancel`: an immediate
+        /// `should_cancel` (true before any GPU work runs) must return
+        /// `StopReason::Interrupt` with zero generated tokens, and must not
+        /// leave live state or the retained cache entry in a shape that
+        /// corrupts a later, uncancelled call on the same state — i.e. the
+        /// fail-closed guarantee the doc comment on
+        /// `generate_streaming_with_prefix_cache_and_cancel` promises.
+        #[test]
+        fn cross_turn_cache_and_cancel_immediate_leaves_state_usable() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(7, 3);
+
+            // Turn 1: establish a normal, saved cache entry.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 1 must not error");
+            assert!(
+                turn1.output.generated_tokens > 0,
+                "precondition: turn 1 must actually generate tokens"
+            );
+
+            // Turn 2: should_cancel is already true, so no GPU work for this
+            // turn should ever run. Must surface as Interrupt, not an error,
+            // and must not generate any tokens.
+            let turn2 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || true,
+                )
+                .expect("an immediate cancel must not surface as an engine error");
+            assert_eq!(
+                turn2.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "an immediate should_cancel=true must stop with Interrupt"
+            );
+            assert_eq!(
+                turn2.output.generated_tokens, 0,
+                "an immediate cancel must not generate any tokens"
+            );
+
+            // Turn 3: uncancelled call on the same conversation prefix as the
+            // cancelled turn 2. If the cancel path had left live KV/GDN state
+            // or the retained cache entry inconsistent, this would either
+            // error or diverge from a from-scratch reference.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out =
+                reference_state.generate_streaming("ab", &tokenizer, &gen_cfg, |_, _| true);
+
+            let turn3 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 3 must not error after a cancelled turn 2");
+            assert_eq!(
+                turn3.output.token_ids, reference_out.token_ids,
+                "post-cancel generation must still match full re-prefill exactly"
             );
         }
     }

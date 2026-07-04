@@ -260,15 +260,57 @@ mod imp {
             let _ = ready.send(Ok(fmt));
 
             run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-                metal.reset_state();
-                let out = metal.chat_completion_streaming_with_cancel(
+                // Cache-aware + cancellation-aware call (#462): reuses the
+                // previous turn's shared token prefix instead of the old
+                // unconditional `reset_state()` + full re-prefill on every
+                // request, while still observing client disconnect exactly
+                // like the old `chat_completion_streaming_with_cancel` call
+                // did (see `Job::cancel`'s doc comment above for what
+                // `should_cancel` observes). This is a single-worker,
+                // single-model binary sharing one Metal state across every
+                // request, so `CrossTurnSlotId::DEFAULT` is the only slot
+                // that exists and correctness does not depend on
+                // distinguishing clients: the planner token-verifies the
+                // retained prefix against this request's messages on every
+                // call and falls back to `PrefixReuseMode::FullRefill`
+                // whenever they diverge (a new conversation, edited history,
+                // or a second client's unrelated prompt interleaved on the
+                // same slot). Multi-client interleaving through one slot
+                // only forfeits the reuse speedup for whichever turn loses
+                // the shared prefix — it can never corrupt output, since the
+                // engine never trusts the cache without re-verifying it.
+                let cache_result = metal.chat_completion_streaming_with_prefix_cache_and_cancel(
+                    lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
                     messages,
                     &tokenizer,
                     cfg,
                     on_token,
                     should_cancel,
                 );
-                (out.prompt_tokens, out.completion_tokens)
+                match cache_result {
+                    Ok(cached) => {
+                        eprintln!(
+                            "[lattice_serve] cross-turn cache: mode={:?} reused={} prefetched={} prompt={}",
+                            cached.cache.mode,
+                            cached.cache.reused_tokens,
+                            cached.cache.prefetched_tokens,
+                            cached.cache.prompt_tokens,
+                        );
+                        (cached.output.prompt_tokens, cached.output.completion_tokens)
+                    }
+                    Err(e) => {
+                        // Fail-closed at the engine level already (live
+                        // KV/GDN state and the retained prefix entry are
+                        // both reset before this error is returned), so the
+                        // worker is left clean for the next job. No tokens
+                        // were streamed on this path (every fallible step
+                        // runs before the first `on_token` call), so
+                        // reporting zero completion tokens is accurate, not
+                        // a truncation of real output.
+                        eprintln!("[lattice_serve] generation failed: {e}");
+                        (0, 0)
+                    }
+                }
             });
         });
         job_tx
