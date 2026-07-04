@@ -4704,6 +4704,30 @@ kernel void gdn_chunk_norm_silu_c32(
         pub cache: CrossTurnCacheStats,
     }
 
+    /// One sparse GDN checkpoint retained at an earlier turn boundary
+    /// (#590): the token length it represents plus the exact GDN
+    /// recurrent-state snapshot taken at that boundary. Valid only while
+    /// the live KV rows below `len` still hold the prefix the snapshot was
+    /// taken against — the same lifetime as the owning entry, enforced by
+    /// storing checkpoints inside `MetalCrossTurnPrefixEntry` and pruning
+    /// on every save via `checkpoint_survives_save`.
+    #[derive(Debug, Clone)]
+    struct MetalGdnCheckpoint {
+        len: usize,
+        snapshot: crate::attention::gdn::GdnSnapshot,
+    }
+
+    /// Maximum sparse checkpoints retained per entry (#590). Each GDN
+    /// snapshot is ~19MiB on Qwen3.5-0.8B (#516's measurement), so the
+    /// worst-case cross-turn memory is `CAP + 1` snapshots (~76MiB): the
+    /// ring plus the entry's own boundary snapshot. Eviction keeps the
+    /// DEEPEST boundaries — in append-only chat flow boundaries grow
+    /// monotonically, so this equals keeping the most recent turns; a
+    /// deeper checkpoint also saves the most re-prefill work when a late
+    /// turn is edited or regenerated. The cost of an evicted checkpoint is
+    /// only a longer replay prefill, never wrong output.
+    const CROSS_TURN_GDN_CHECKPOINT_CAP: usize = 3;
+
     /// One retained cross-turn entry: the generic (Metal-agnostic) planning
     /// record plus the exact GDN recurrent-state snapshot taken at the same
     /// token boundary. The live full-attention KV buffers are NOT copied here
@@ -4713,6 +4737,12 @@ kernel void gdn_chunk_norm_silu_c32(
     struct MetalCrossTurnPrefixEntry {
         generic: crate::kv_cache::CrossTurnPrefixEntry,
         gdn_snapshot: crate::attention::gdn::GdnSnapshot,
+        /// Sparse GDN checkpoints at earlier turn boundaries, ascending by
+        /// `len`, at most [`CROSS_TURN_GDN_CHECKPOINT_CAP`] (#590). These
+        /// enable `PrefixReuseMode::ReplayFromCheckpoint` when a new prompt
+        /// diverges mid-history instead of falling all the way back to
+        /// `FullRefill`.
+        checkpoints: Vec<MetalGdnCheckpoint>,
     }
 
     /// Worker-local, single-live-entry cross-turn prefix cache (#516 round-1
@@ -16319,32 +16349,41 @@ kernel void gdn_chunk_norm_silu_c32(
         }
 
         /// Pure planning step: delegates to [`crate::kv_cache::plan_prefix_reuse`]
-        /// against whatever is currently cached for `slot_id`. v1 never owns
-        /// sparse GDN checkpoints, so it always plans with an empty checkpoint
-        /// set — `PrefixReuseMode::ReplayFromCheckpoint` is therefore never
-        /// produced by this call.
+        /// against whatever is currently cached for `slot_id`, supplying the
+        /// entry's retained sparse GDN checkpoint boundaries (#590) so the
+        /// planner can produce `PrefixReuseMode::ReplayFromCheckpoint` for
+        /// mid-history divergence instead of always falling back to
+        /// `FullRefill`.
         fn plan_cross_turn_reuse(
             &self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             metadata: &crate::kv_cache::CrossTurnPrefixMetadata,
             prompt_ids: &[u32],
         ) -> crate::kv_cache::PrefixRestorePlan {
-            let entry = self
-                .cross_turn_prefix_cache
-                .get(slot_id)
-                .map(|e| &e.generic);
-            crate::kv_cache::plan_prefix_reuse(entry, metadata, prompt_ids, &[])
+            let entry = self.cross_turn_prefix_cache.get(slot_id);
+            let checkpoint_lens: Vec<usize> = entry
+                .map(|e| e.checkpoints.iter().map(|c| c.len).collect())
+                .unwrap_or_default();
+            crate::kv_cache::plan_prefix_reuse(
+                entry.map(|e| &e.generic),
+                metadata,
+                prompt_ids,
+                &checkpoint_lens,
+            )
         }
 
-        /// Restore live state to the plan's reusable boundary. Only
-        /// `ExactAppend` is implemented; `FullRefill` is handled by the
-        /// caller (`self.reset_state()`) per design.md step 5, and
-        /// `ReplayFromCheckpoint` fails closed since v1 owns no checkpoints.
+        /// Restore live state to the plan's reusable boundary.
+        ///
+        /// `ExactAppend` and `ReplayFromCheckpoint` (#590) both consume the
+        /// cached entry and return it, so the caller can carry its
+        /// checkpoint ring (and its own boundary snapshot) into the
+        /// end-of-generation save. `FullRefill` is handled by the caller
+        /// (`self.reset_state()`) per design.md step 5 and returns `None`.
         fn restore_cross_turn_prefix(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             plan: &crate::kv_cache::PrefixRestorePlan,
-        ) -> Result<(), crate::error::InferenceError> {
+        ) -> Result<Option<MetalCrossTurnPrefixEntry>, crate::error::InferenceError> {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
@@ -16367,16 +16406,44 @@ kernel void gdn_chunk_norm_silu_c32(
                     })?;
                     self.restore_gdn_states_checked(&entry.gdn_snapshot)?;
                     self.session.set_position(plan.reusable_len);
-                    Ok(())
+                    Ok(Some(entry))
                 }
-                PrefixReuseMode::ReplayFromCheckpoint { .. } => Err(InferenceError::PrefixCache(
-                    "restore_cross_turn_prefix: sparse GDN checkpoint replay is not implemented \
-                     in v1"
-                        .into(),
-                )),
+                PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len } => {
+                    // Same take-not-clone fail-closed discipline as
+                    // ExactAppend. The GDN state is restored from the ring
+                    // checkpoint at exactly `checkpoint_len`; the live KV
+                    // rows below that boundary are reused in place (they
+                    // still hold the checkpoint's prefix — the planner only
+                    // selects checkpoints at or below the shared token
+                    // prefix), and the caller prefills the divergent suffix
+                    // forward from `checkpoint_len` via
+                    // `forward_prefill_from`, overwriting rows at and above
+                    // the divergence point.
+                    let entry = self.cross_turn_prefix_cache.take(slot_id).ok_or_else(|| {
+                        InferenceError::PrefixCache(
+                            "restore_cross_turn_prefix: ReplayFromCheckpoint plan but no cached \
+                             entry for this slot"
+                                .into(),
+                        )
+                    })?;
+                    let checkpoint = entry
+                        .checkpoints
+                        .iter()
+                        .find(|c| c.len == checkpoint_len)
+                        .ok_or_else(|| {
+                            InferenceError::PrefixCache(format!(
+                                "restore_cross_turn_prefix: plan selected checkpoint_len \
+                                 {checkpoint_len} but no retained snapshot exists at that \
+                                 boundary"
+                            ))
+                        })?;
+                    self.restore_gdn_states_checked(&checkpoint.snapshot)?;
+                    self.session.set_position(checkpoint_len);
+                    Ok(Some(entry))
+                }
                 PrefixReuseMode::FullRefill => {
                     self.reset_state();
-                    Ok(())
+                    Ok(None)
                 }
             }
         }
@@ -16468,6 +16535,7 @@ kernel void gdn_chunk_norm_silu_c32(
             slot_id: crate::kv_cache::CrossTurnSlotId,
             metadata: crate::kv_cache::CrossTurnPrefixMetadata,
             represented_token_ids: Vec<u32>,
+            consumed_entry: Option<MetalCrossTurnPrefixEntry>,
         ) -> Result<(), crate::error::InferenceError> {
             use crate::error::InferenceError;
 
@@ -16486,6 +16554,51 @@ kernel void gdn_chunk_norm_silu_c32(
                 max_cache_len: self.session.kv_cache.max_cache_len,
                 kv_f16: self.use_kv_f16,
             };
+
+            // #590: carry surviving sparse checkpoints from the entry this
+            // generation consumed (ExactAppend / ReplayFromCheckpoint), and
+            // promote that entry's own boundary snapshot into the ring. A
+            // checkpoint survives only while the live KV rows below its
+            // boundary still hold the tokens it was taken against — the
+            // pure predicate `checkpoint_survives_save` encodes that rule
+            // against the common token prefix. `FullRefill` saves pass
+            // `None`: `reset_state` rebuilt every KV row from scratch, so
+            // no prior snapshot is byte-consistent with the live buffers
+            // (chunk boundaries differ between the original and the
+            // re-prefill), and the ring starts empty by design.
+            let mut checkpoints: Vec<MetalGdnCheckpoint> = Vec::new();
+            if let Some(old) = consumed_entry {
+                let common = crate::kv_cache::longest_common_token_prefix(
+                    &old.generic.token_ids,
+                    &represented_token_ids,
+                );
+                for cp in old.checkpoints {
+                    if crate::kv_cache::checkpoint_survives_save(cp.len, common, represented_len) {
+                        checkpoints.push(cp);
+                    }
+                }
+                if old.generic.gdn_snapshot_len == old.generic.represented_len
+                    && crate::kv_cache::checkpoint_survives_save(
+                        old.generic.represented_len,
+                        common,
+                        represented_len,
+                    )
+                {
+                    checkpoints.push(MetalGdnCheckpoint {
+                        len: old.generic.represented_len,
+                        snapshot: old.gdn_snapshot,
+                    });
+                }
+                checkpoints.sort_by_key(|c| c.len);
+                checkpoints.dedup_by_key(|c| c.len);
+                // Evict the shallowest boundaries first — see
+                // CROSS_TURN_GDN_CHECKPOINT_CAP for the tradeoff.
+                if checkpoints.len() > CROSS_TURN_GDN_CHECKPOINT_CAP {
+                    let excess = checkpoints.len() - CROSS_TURN_GDN_CHECKPOINT_CAP;
+                    checkpoints.drain(..excess);
+                }
+            }
+
             let generic = crate::kv_cache::CrossTurnPrefixEntry {
                 slot_id,
                 metadata,
@@ -16498,6 +16611,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 .insert(MetalCrossTurnPrefixEntry {
                     generic,
                     gdn_snapshot,
+                    checkpoints,
                 });
             Ok(())
         }
@@ -16510,9 +16624,10 @@ kernel void gdn_chunk_norm_silu_c32(
             slot_id: crate::kv_cache::CrossTurnSlotId,
             metadata: crate::kv_cache::CrossTurnPrefixMetadata,
             represented_token_ids: Vec<u32>,
+            consumed_entry: Option<MetalCrossTurnPrefixEntry>,
         ) {
             if self
-                .save_cross_turn_prefix(slot_id, metadata, represented_token_ids)
+                .save_cross_turn_prefix(slot_id, metadata, represented_token_ids, consumed_entry)
                 .is_err()
             {
                 self.cross_turn_prefix_cache.remove(slot_id);
@@ -16712,12 +16827,18 @@ kernel void gdn_chunk_norm_silu_c32(
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
 
-            match plan.mode {
+            // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
+            // carried to the end-of-generation save so its checkpoint ring
+            // and boundary snapshot survive across turns (#590).
+            let mut consumed_entry = match plan.mode {
                 PrefixReuseMode::ExactAppend | PrefixReuseMode::ReplayFromCheckpoint { .. } => {
-                    self.restore_cross_turn_prefix(slot_id, &plan)?;
+                    self.restore_cross_turn_prefix(slot_id, &plan)?
                 }
-                PrefixReuseMode::FullRefill => self.reset_state(),
-            }
+                PrefixReuseMode::FullRefill => {
+                    self.reset_state();
+                    None
+                }
+            };
 
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
@@ -16800,7 +16921,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !engine.advance(gs, next_id)
             {
                 let text = decode_tokens(tokenizer, &generated_ids);
-                self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), prompt_ids.clone());
+                self.save_cross_turn_prefix_or_clear(
+                    slot_id,
+                    metadata.clone(),
+                    prompt_ids.clone(),
+                    consumed_entry.take(),
+                );
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
                         text,
@@ -16824,7 +16950,12 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), prompt_ids.clone());
+                self.save_cross_turn_prefix_or_clear(
+                    slot_id,
+                    metadata.clone(),
+                    prompt_ids.clone(),
+                    consumed_entry.take(),
+                );
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
                         text: String::new(),
@@ -16992,7 +17123,12 @@ kernel void gdn_chunk_norm_silu_c32(
             let generated_represented = represented_len - prompt_len;
             let mut represented_token_ids = prompt_ids.clone();
             represented_token_ids.extend_from_slice(&generated_ids[..generated_represented]);
-            self.save_cross_turn_prefix_or_clear(slot_id, metadata.clone(), represented_token_ids);
+            self.save_cross_turn_prefix_or_clear(
+                slot_id,
+                metadata.clone(),
+                represented_token_ids,
+                consumed_entry.take(),
+            );
 
             if !stopped_by_caller {
                 let tail = detok.finish();
@@ -24450,6 +24586,228 @@ kernel void decode_attention_reference(
                 saw_exact_append,
                 "at least one later turn must actually exercise ExactAppend reuse — \
                  otherwise this test only proves the FullRefill fallback path works"
+            );
+        }
+
+        /// The correctness gate for #590: editing an earlier turn (a prompt
+        /// that diverges from the cached history mid-way, at or after a
+        /// retained sparse GDN checkpoint boundary) must take the
+        /// `ReplayFromCheckpoint` path — GDN state restored from the ring
+        /// snapshot, KV rows below the boundary reused in place, divergent
+        /// suffix prefilled forward — and produce byte-identical token IDs
+        /// to running the edited conversation as a full re-prefill on a
+        /// fresh state. If checkpoint replay ever perturbs a single sampled
+        /// token, this test goes red.
+        ///
+        /// Mutation sensitivity: reverting the #590 restore arm to its old
+        /// fail-closed error makes the edited turn error out (the plan
+        /// selects `ReplayFromCheckpoint`, which the old arm rejected);
+        /// reverting the ring carry in `save_cross_turn_prefix` leaves the
+        /// plan at `FullRefill` and the mode assertion fails; disabling the
+        /// carry-time `checkpoint_survives_save` pruning lets the stale
+        /// turn-2 boundary survive the edit and the turn-5 probe's
+        /// `checkpoint_len == l1_len` assertion fails.
+        #[test]
+        fn cross_turn_replay_from_checkpoint_matches_full_reprefill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut cached_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(42, 3);
+
+            // Turn 1: establish the entry whose boundary becomes the ring
+            // checkpoint after turn 2's save.
+            let turn1_prompt = "abc".to_string();
+            let turn1 = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &turn1_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("turn 1 must succeed");
+            let history_through_turn1 = format!("{turn1_prompt}{}", turn1.output.text);
+
+            // Turn 2: exact append. Its save must promote turn 1's boundary
+            // snapshot into the checkpoint ring.
+            let turn2_prompt = format!("{history_through_turn1}de");
+            let turn2 = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &turn2_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("turn 2 must succeed");
+            assert_eq!(
+                turn2.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "turn 2 must exercise ExactAppend so its save carries turn 1's boundary \
+                 into the checkpoint ring"
+            );
+
+            // Turn 3: second exact append — its save carries turn 1's
+            // boundary forward AND promotes turn 2's boundary, so the ring
+            // now holds two checkpoints at different depths.
+            let turn2_full = format!("{turn2_prompt}{}", turn2.output.text);
+            let turn3_prompt = format!("{turn2_full}gh");
+            let turn3 = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &turn3_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("turn 3 must succeed");
+            assert_eq!(
+                turn3.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "turn 3 must exercise ExactAppend so the ring holds both the \
+                 turn-1 and turn-2 boundaries"
+            );
+            // Single-char ASCII vocab: 1 byte == 1 token, so boundary
+            // lengths are plain byte lengths of the transcript strings.
+            let l1_len = history_through_turn1.len();
+            let l2_len = turn2_full.len();
+
+            // Turn 4: EDIT turn 2 — same history through turn 1, different
+            // user text after it. The shared prefix with the cached entry
+            // ends where "de" was; the deepest eligible ring checkpoint at
+            // or below that divergence is turn 1's boundary (turn 2's is
+            // deeper than the divergence and must be ineligible), so the
+            // planner must select ReplayFromCheckpoint at exactly `l1_len`.
+            let edited_prompt = format!("{history_through_turn1}wxyz");
+            let edited = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &edited_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("edited-history turn must succeed");
+            assert_eq!(
+                edited.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint {
+                    checkpoint_len: l1_len
+                },
+                "editing turn 2 must replay from turn 1's boundary checkpoint"
+            );
+            assert!(
+                edited.cache.reused_tokens > 0,
+                "replay must report a nonzero reused prefix"
+            );
+
+            // Reference: the edited conversation as a full re-prefill on a
+            // brand-new state — exactly the behavior replay must reproduce.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
+            let reference_out = reference_state.generate_streaming(
+                &edited_prompt,
+                &tokenizer,
+                &reference_gen_cfg,
+                |_, _| true,
+            );
+            assert_eq!(
+                edited.output.token_ids, reference_out.token_ids,
+                "replayed-from-checkpoint token IDs must match full re-prefill exactly"
+            );
+            assert_eq!(
+                edited.output.text, reference_out.text,
+                "replayed-from-checkpoint decoded text must match full re-prefill"
+            );
+            assert_eq!(
+                edited.output.stop_reason, reference_out.stop_reason,
+                "stop reason must match full re-prefill"
+            );
+
+            // Turn 5: probe that the save after the replay PRUNED the stale
+            // turn-2 boundary (its history diverged) while keeping turn 1's.
+            // Diverge at exactly the old turn-2 boundary depth: a stale
+            // checkpoint surviving there would be the deepest eligible one,
+            // the planner would pick it, and GDN state from the abandoned
+            // timeline would drive generation. The correct ring holds only
+            // turn 1's boundary at or below this divergence.
+            let edited_full = format!("{edited_prompt}{}", edited.output.text);
+            assert!(
+                edited_full.len() > l2_len,
+                "edited transcript must extend past the old turn-2 boundary"
+            );
+            // Pick a divergent continuation guaranteed to differ from the
+            // generated char at the divergence point (vocab is a-z + A-F).
+            let cont = edited_full.as_bytes()[l2_len];
+            let div = if cont == b'A' { "BB" } else { "AA" };
+            let probe_prompt = format!("{}{div}", &edited_full[..l2_len]);
+            let probe = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &probe_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("stale-checkpoint probe turn must succeed");
+            assert_eq!(
+                probe.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint {
+                    checkpoint_len: l1_len
+                },
+                "the post-replay save must prune the stale turn-2 boundary; \
+                 only turn 1's checkpoint may serve this divergence"
+            );
+            let mut probe_reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let probe_reference = probe_reference_state.generate_streaming(
+                &probe_prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(42, 3),
+                |_, _| true,
+            );
+            assert_eq!(
+                probe.output.token_ids, probe_reference.token_ids,
+                "probe token IDs must match full re-prefill exactly"
+            );
+
+            // A follow-up append onto the probe history must still reuse
+            // cleanly.
+            let followup_prompt = format!("{probe_prompt}{}h", probe.output.text);
+            let followup = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &followup_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("follow-up append after replay must succeed");
+            assert_eq!(
+                followup.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "the post-replay save must leave a reusable entry for a plain append"
+            );
+            let mut followup_reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let followup_reference = followup_reference_state.generate_streaming(
+                &followup_prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(42, 3),
+                |_, _| true,
+            );
+            assert_eq!(
+                followup.output.token_ids, followup_reference.token_ids,
+                "post-replay append token IDs must match full re-prefill exactly"
             );
         }
 
