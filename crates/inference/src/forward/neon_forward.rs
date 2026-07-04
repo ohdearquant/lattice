@@ -918,6 +918,7 @@ pub fn generate_q8_neon(
             generated_tokens: 0,
             stopped: false,
             stop_reason: Some(StopReason::Length),
+            token_logprobs: vec![],
         });
     }
 
@@ -926,6 +927,9 @@ pub fn generate_q8_neon(
     // the guard the grammar field would be silently ignored, producing
     // unconstrained output despite a grammar being set (#397/#398).
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+    // Same rationale for logprobs capture, which is also not wired into this
+    // generate loop (#585).
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
 
     // Reject requests whose total token budget exceeds the RoPE table's
     // position capacity before allocating caches or dereferencing weights.
@@ -991,6 +995,7 @@ pub fn generate_q8_neon(
             generated_tokens: 0,
             stopped: true,
             stop_reason: Some(StopReason::Eos),
+            token_logprobs: vec![],
         });
     }
 
@@ -1045,6 +1050,7 @@ pub fn generate_q8_neon(
         generated_tokens: generated_ids.len(),
         stopped,
         stop_reason: Some(stop_reason),
+        token_logprobs: vec![],
     })
 }
 

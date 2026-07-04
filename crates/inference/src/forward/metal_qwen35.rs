@@ -43,8 +43,9 @@ mod inner {
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
     use crate::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, Qwen35Config, decode_cap, force_close_think,
+        GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
     };
+    use crate::sampling::record_logprob;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
@@ -9705,6 +9706,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -9732,6 +9734,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 1,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -9906,6 +9909,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs: vec![],
             }
         }
 
@@ -9939,6 +9943,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -9967,6 +9972,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 1,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10219,6 +10225,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs: vec![],
             }
         }
 
@@ -10265,6 +10272,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10279,6 +10287,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10294,6 +10303,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10411,6 +10421,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: generated_ids.len(),
                     stopped: false,
                     stop_reason: Some(StopReason::Grammar),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10430,6 +10441,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -10515,6 +10527,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs: vec![],
             }
         }
 
@@ -10574,6 +10587,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
+                    token_logprobs: vec![],
                 });
             }
 
@@ -10588,6 +10602,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
                 });
             }
 
@@ -10737,6 +10752,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
+                    token_logprobs: vec![],
                 });
             }
 
@@ -10787,6 +10803,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs: vec![],
             })
         }
 
@@ -14468,6 +14485,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
+                    token_logprobs: vec![],
                 };
             }
 
@@ -14483,6 +14501,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -14502,12 +14521,17 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
+                    token_logprobs: vec![],
                 };
             }
 
             self.reset_state();
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
+            // Per-token log-probabilities (#585): empty and untouched unless
+            // gen_cfg.logprobs is Some — record_logprob() below is a no-op in that
+            // case, so the default (no logprobs requested) path pays no extra cost.
+            let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
             // Issue #171: try the block-top-k route first — far fewer threadgroups
             // than the legacy HierarchicalK50/argmax routes, which stay reachable
@@ -14529,7 +14553,8 @@ kernel void gdn_chunk_norm_silu_c32(
             };
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
+                && gen_cfg.grammar.is_none()
+                && gen_cfg.logprobs.is_none();
             if use_compact {
                 self.session.compact_route = route;
                 self.session.compact_topk = match route {
@@ -14573,6 +14598,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -14595,6 +14621,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: vec![],
                 };
             }
 
@@ -14626,6 +14653,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: generated_ids.len(),
                     stopped: false, // grammar constraint, not an OpenAI stop condition
                     stop_reason: Some(StopReason::Grammar),
+                    token_logprobs: token_logprobs.clone(),
                 };
             }
 
@@ -14645,6 +14673,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: 0,
                     stopped: true, // EOS/stop-token hit immediately after prefill
                     stop_reason: Some(StopReason::Eos),
+                    token_logprobs: token_logprobs.clone(),
                 };
             }
 
@@ -14664,6 +14693,16 @@ kernel void gdn_chunk_norm_silu_c32(
             let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
+            // #585: record the prefill token's logprob (no-op unless requested).
+            // prefill_logits is untouched since forward_prefill() populated it above,
+            // and reflects the same distribution next_id was sampled from.
+            record_logprob(
+                &mut token_logprobs,
+                &prefill_logits,
+                next_id,
+                gen_cfg.temperature,
+                gen_cfg.logprobs,
+            );
             // Capture close-point after the prefill push (covers budget=1 edge case).
             if thinking_closed && reasoning_end_len.is_none() {
                 reasoning_end_len = Some(generated_ids.len());
@@ -14687,6 +14726,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: generated_ids.len(),
                         stopped: false, // caller interrupted the stream, not a stop condition
                         stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: token_logprobs.clone(),
                     };
                 }
             }
@@ -14770,6 +14810,16 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+                // #585: record this step's logprob (no-op unless requested). next_id
+                // here is the final, post-force_close_think token — step_logits is
+                // the distribution it was actually sampled/forced from.
+                record_logprob(
+                    &mut token_logprobs,
+                    &step_logits,
+                    next_id,
+                    gen_cfg.temperature,
+                    gen_cfg.logprobs,
+                );
                 // Capture the close-point after the push so </think> is the
                 // last reasoning token (not the first answer token).
                 if thinking_closed && reasoning_end_len.is_none() {
@@ -14825,6 +14875,7 @@ kernel void gdn_chunk_norm_silu_c32(
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
+                token_logprobs: token_logprobs.clone(),
             }
         }
 
@@ -16596,6 +16647,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: 0,
                         stopped: false,
                         stop_reason: None,
+                        token_logprobs: vec![],
                     },
                     cache: CrossTurnCacheStats {
                         slot_id,
@@ -16615,6 +16667,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: 0,
                         stopped: false,
                         stop_reason: Some(StopReason::Length),
+                        token_logprobs: vec![],
                     },
                     cache: CrossTurnCacheStats {
                         slot_id,
@@ -16634,6 +16687,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: 0,
                         stopped: true,
                         stop_reason: Some(StopReason::KvFull),
+                        token_logprobs: vec![],
                     },
                     cache: CrossTurnCacheStats {
                         slot_id,
@@ -16745,6 +16799,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: generated_ids.len(),
                         stopped: false,
                         stop_reason: Some(StopReason::Grammar),
+                        token_logprobs: vec![],
                     },
                     cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
                 });
@@ -16768,6 +16823,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_tokens: 0,
                         stopped: true,
                         stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
                     },
                     cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
                 });
@@ -16810,6 +16866,7 @@ kernel void gdn_chunk_norm_silu_c32(
                             generated_tokens: generated_ids.len(),
                             stopped: false,
                             stop_reason: Some(StopReason::Interrupt),
+                            token_logprobs: vec![],
                         },
                         cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
                     });
@@ -16942,6 +16999,7 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_tokens: generated_ids.len(),
                     stopped,
                     stop_reason: Some(stop_reason),
+                    token_logprobs: vec![],
                 },
                 cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
             })
@@ -22157,6 +22215,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let out = with_self_spec_env(|| {
@@ -22237,6 +22296,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22288,6 +22348,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22347,6 +22408,7 @@ kernel void decode_attention_reference(
                 top_p: 1.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
+                logprobs: None,
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
@@ -22425,6 +22487,7 @@ kernel void decode_attention_reference(
                 top_p: 1.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
+                logprobs: None,
                 stop_token_ids: vec![],
                 enable_thinking: false,
                 enable_mtp: Some(false),
@@ -22512,6 +22575,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22565,6 +22629,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22626,6 +22691,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22721,6 +22787,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let mut state = with_self_spec_env(|| {
@@ -23924,6 +23991,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             }
         }
 
@@ -25315,7 +25383,9 @@ mod topk_boundary_tie_tests {
 /// Grammar-constrained decoding is not wired into the multimodal forward
 /// pass; this function converts a silent correctness failure (unconstrained
 /// output despite `gen_cfg.grammar` being set) into a typed `InvalidInput`
-/// error that callers can act on.
+/// error that callers can act on. Per-token logprob capture (#585) is not
+/// wired into this path either, so `gen_cfg.logprobs` is rejected the same
+/// way rather than silently returning an empty `token_logprobs`.
 ///
 /// Compiled when Metal-GPU is enabled (the production caller lives inside
 /// `mod inner`) or during test builds so that the module-level test can
@@ -25324,7 +25394,8 @@ mod topk_boundary_tie_tests {
 pub(crate) fn multimodal_generate_preflight(
     gen_cfg: &crate::model::qwen35_config::GenerateConfig,
 ) -> Result<(), crate::error::InferenceError> {
-    crate::model::qwen35::check_grammar_not_set(gen_cfg)
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)
 }
 
 #[cfg(test)]
@@ -25368,6 +25439,35 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "grammar = None must not trigger the preflight guard"
+        );
+    }
+
+    /// Per-token logprob capture (#585) is not wired into the multimodal path;
+    /// the preflight must reject a config with `logprobs` set rather than
+    /// silently returning an output with an empty `token_logprobs`.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_logprobs_guard_rejects_logprobs_config() {
+        let cfg_with_logprobs = GenerateConfig {
+            logprobs: Some(5),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_logprobs);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when logprobs is set; got {result:?}"
+        );
+    }
+
+    /// A config with `logprobs` unset must pass through the preflight without error.
+    #[test]
+    fn generate_multimodal_logprobs_guard_allows_no_logprobs() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "logprobs = None must not trigger the preflight guard"
         );
     }
 }
@@ -25919,6 +26019,7 @@ impl MetalQwen35State {
             generated_tokens: 0,
             stopped: false,
             stop_reason: None,
+            token_logprobs: vec![],
         }
     }
 

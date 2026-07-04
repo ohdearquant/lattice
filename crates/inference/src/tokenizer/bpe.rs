@@ -851,20 +851,34 @@ fn bytes_to_unicode() -> Vec<char> {
 
 /// **Unstable**: byte-decode helper; encoding table and fallback behavior may change.
 ///
-/// Decode a byte-encoded BPE token string back to UTF-8.
-pub fn byte_decode_token(token_str: &str) -> String {
+/// Reverse the GPT-2 byte-level encoding of a single BPE token string back to
+/// its original raw bytes.
+///
+/// Unlike [`byte_decode_token`], this returns the exact bytes with no UTF-8
+/// re-encoding step, so it is lossless even for a token that represents only
+/// part of a multi-byte codepoint (common for byte-level BPE on CJK/emoji
+/// text). Used by the `logprobs`/`top_logprobs` response `bytes` field
+/// (#585), where callers reconstruct the original output byte-for-byte.
+pub fn byte_decode_token_bytes(token_str: &str) -> Vec<u8> {
     let table = bytes_to_unicode();
     let mut decoder = std::collections::HashMap::new();
     for (byte_val, &ch) in table.iter().enumerate() {
         decoder.insert(ch, byte_val as u8);
     }
-    let mut bytes = Vec::new();
-    for ch in token_str.chars() {
-        if let Some(&b) = decoder.get(&ch) {
-            bytes.push(b);
-        }
-    }
-    String::from_utf8_lossy(&bytes).to_string()
+    token_str
+        .chars()
+        .filter_map(|ch| decoder.get(&ch).copied())
+        .collect()
+}
+
+/// **Unstable**: byte-decode helper; encoding table and fallback behavior may change.
+///
+/// Decode a byte-encoded BPE token string back to UTF-8.
+///
+/// Lossy for a token that represents only part of a multi-byte codepoint —
+/// see [`byte_decode_token_bytes`] for the byte-exact form.
+pub fn byte_decode_token(token_str: &str) -> String {
+    String::from_utf8_lossy(&byte_decode_token_bytes(token_str)).to_string()
 }
 
 fn detect_gpt4_regex_pretokenizer(root: &JsonValue) -> bool {

@@ -41,6 +41,8 @@ pub(crate) use detokenize::decode_tokens;
 // neon_forward) can share the same typed grammar-not-set guard without
 // duplicating the predicate or the error message (#397/#398).
 pub(crate) use generation::check_grammar_not_set;
+// Sibling guard for `logprobs` on the same unwired paths (#585).
+pub(crate) use generation::check_logprobs_not_set;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

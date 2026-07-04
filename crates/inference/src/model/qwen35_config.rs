@@ -678,6 +678,13 @@ pub struct GenerateConfig {
     /// generated without a `</think>`, force-inject `</think>` to commit the model
     /// to an answer. `None` or `Some(0)` = disabled (no behaviour change).
     pub reasoning_budget: Option<usize>,
+    /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
+    /// `None` (default) disables capture entirely -- no extra allocation or
+    /// computation is added to the decode loop. `Some(n)` captures the
+    /// sampled token's log-probability plus its `n` highest-probability
+    /// alternatives at every generated step (`n == 0` is valid: report only
+    /// the sampled token's log-probability, no alternatives).
+    pub logprobs: Option<usize>,
 }
 
 impl std::fmt::Debug for GenerateConfig {
@@ -695,6 +702,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("grammar", &self.grammar.as_ref().map(|_| "<GrammarEngine>"))
             .field("stop_strings", &self.stop_strings)
             .field("reasoning_budget", &self.reasoning_budget)
+            .field("logprobs", &self.logprobs)
             .finish()
     }
 }
@@ -714,6 +722,7 @@ impl Default for GenerateConfig {
             grammar: None,
             stop_strings: vec![],
             reasoning_budget: None,
+            logprobs: None,
         }
     }
 }
@@ -760,6 +769,32 @@ pub(crate) fn decode_cap(reasoning_budget: Option<usize>, max_new_tokens: usize)
     }
 }
 
+/// One alternative token considered at a single generation step, paired with
+/// its log-probability under the reporting distribution computed by
+/// [`crate::sampling`]'s logprobs support. Ordered by descending probability
+/// when produced via [`GenerateConfig::logprobs`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+}
+
+/// Per-token log-probability data for one generated token. Only populated
+/// when [`GenerateConfig::logprobs`] is `Some`; `GenerateOutput::token_logprobs`
+/// stays empty otherwise (no extra allocation on the default path).
+#[derive(Debug, Clone)]
+pub struct TokenLogprob {
+    /// The token id that was actually sampled/generated at this step.
+    pub token_id: u32,
+    /// Natural-log probability of `token_id` under a temperature-scaled
+    /// softmax over that step's raw logits.
+    pub logprob: f32,
+    /// The requested number of highest-probability alternatives at this step
+    /// (may include `token_id` itself), sorted by descending probability.
+    /// Empty when `logprobs` was requested with a `top_logprobs` count of 0.
+    pub top: Vec<TopLogprob>,
+}
+
 /// **Unstable**: text generation output struct; fields may expand with streaming support.
 #[derive(Debug, Clone)]
 pub struct GenerateOutput {
@@ -778,6 +813,9 @@ pub struct GenerateOutput {
     /// Why generation terminated. `Some` on every real generation exit; `None` only on
     /// non-generation returns that have no issue-listed cause.
     pub stop_reason: Option<StopReason>,
+    /// Per-step log-probability data, one entry per generated token, in
+    /// generation order. Empty unless `GenerateConfig::logprobs` was `Some`.
+    pub token_logprobs: Vec<TokenLogprob>,
 }
 
 /// Compute the layer type pattern: every `interval`-th layer (1-indexed) is full attention.
