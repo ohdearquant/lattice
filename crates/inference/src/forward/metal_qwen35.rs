@@ -24302,10 +24302,13 @@ kernel void decode_attention_reference(
         /// token, this test goes red.
         ///
         /// Mutation sensitivity: reverting the #590 restore arm to its old
-        /// fail-closed error makes turn 3 error out (the plan selects
-        /// `ReplayFromCheckpoint`, which the old arm rejected); reverting
-        /// the ring carry in `save_cross_turn_prefix` leaves the plan at
-        /// `FullRefill` and the `saw_replay` assertion fails.
+        /// fail-closed error makes the edited turn error out (the plan
+        /// selects `ReplayFromCheckpoint`, which the old arm rejected);
+        /// reverting the ring carry in `save_cross_turn_prefix` leaves the
+        /// plan at `FullRefill` and the mode assertion fails; disabling the
+        /// carry-time `checkpoint_survives_save` pruning lets the stale
+        /// turn-2 boundary survive the edit and the turn-5 probe's
+        /// `checkpoint_len == l1_len` assertion fails.
         #[test]
         fn cross_turn_replay_from_checkpoint_matches_full_reprefill() {
             let Some(_) = metal::Device::system_default() else {
@@ -24355,12 +24358,38 @@ kernel void decode_attention_reference(
                  into the checkpoint ring"
             );
 
-            // Turn 3: EDIT turn 2 — same history through turn 1, different
+            // Turn 3: second exact append — its save carries turn 1's
+            // boundary forward AND promotes turn 2's boundary, so the ring
+            // now holds two checkpoints at different depths.
+            let turn2_full = format!("{turn2_prompt}{}", turn2.output.text);
+            let turn3_prompt = format!("{turn2_full}gh");
+            let turn3 = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &turn3_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("turn 3 must succeed");
+            assert_eq!(
+                turn3.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "turn 3 must exercise ExactAppend so the ring holds both the \
+                 turn-1 and turn-2 boundaries"
+            );
+            // Single-char ASCII vocab: 1 byte == 1 token, so boundary
+            // lengths are plain byte lengths of the transcript strings.
+            let l1_len = history_through_turn1.len();
+            let l2_len = turn2_full.len();
+
+            // Turn 4: EDIT turn 2 — same history through turn 1, different
             // user text after it. The shared prefix with the cached entry
-            // ends where "de" was; turn 1's boundary checkpoint sits at or
-            // below that divergence point, so the planner must select
-            // ReplayFromCheckpoint (not FullRefill).
-            let edited_prompt = format!("{history_through_turn1}fg");
+            // ends where "de" was; the deepest eligible ring checkpoint at
+            // or below that divergence is turn 1's boundary (turn 2's is
+            // deeper than the divergence and must be ineligible), so the
+            // planner must select ReplayFromCheckpoint at exactly `l1_len`.
+            let edited_prompt = format!("{history_through_turn1}wxyz");
             let edited = cached_state
                 .generate_streaming_with_prefix_cache(
                     slot_id,
@@ -24370,15 +24399,12 @@ kernel void decode_attention_reference(
                     |_, _| true,
                 )
                 .expect("edited-history turn must succeed");
-            let saw_replay = matches!(
+            assert_eq!(
                 edited.cache.mode,
-                crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint { .. }
-            );
-            assert!(
-                saw_replay,
-                "editing turn 2 must plan ReplayFromCheckpoint via turn 1's retained \
-                 boundary checkpoint, got {:?}",
-                edited.cache.mode
+                crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint {
+                    checkpoint_len: l1_len
+                },
+                "editing turn 2 must replay from turn 1's boundary checkpoint"
             );
             assert!(
                 edited.cache.reused_tokens > 0,
@@ -24409,10 +24435,56 @@ kernel void decode_attention_reference(
                 "stop reason must match full re-prefill"
             );
 
-            // A follow-up append onto the edited history must still reuse
-            // cleanly (the save after replay pruned diverged checkpoints and
-            // retained consistent ones).
-            let followup_prompt = format!("{edited_prompt}{}h", edited.output.text);
+            // Turn 5: probe that the save after the replay PRUNED the stale
+            // turn-2 boundary (its history diverged) while keeping turn 1's.
+            // Diverge at exactly the old turn-2 boundary depth: a stale
+            // checkpoint surviving there would be the deepest eligible one,
+            // the planner would pick it, and GDN state from the abandoned
+            // timeline would drive generation. The correct ring holds only
+            // turn 1's boundary at or below this divergence.
+            let edited_full = format!("{edited_prompt}{}", edited.output.text);
+            assert!(
+                edited_full.len() > l2_len,
+                "edited transcript must extend past the old turn-2 boundary"
+            );
+            // Pick a divergent continuation guaranteed to differ from the
+            // generated char at the divergence point (vocab is a-z + A-F).
+            let cont = edited_full.as_bytes()[l2_len];
+            let div = if cont == b'A' { "BB" } else { "AA" };
+            let probe_prompt = format!("{}{div}", &edited_full[..l2_len]);
+            let probe = cached_state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &probe_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("stale-checkpoint probe turn must succeed");
+            assert_eq!(
+                probe.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ReplayFromCheckpoint {
+                    checkpoint_len: l1_len
+                },
+                "the post-replay save must prune the stale turn-2 boundary; \
+                 only turn 1's checkpoint may serve this divergence"
+            );
+            let mut probe_reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let probe_reference = probe_reference_state.generate_streaming(
+                &probe_prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(42, 3),
+                |_, _| true,
+            );
+            assert_eq!(
+                probe.output.token_ids, probe_reference.token_ids,
+                "probe token IDs must match full re-prefill exactly"
+            );
+
+            // A follow-up append onto the probe history must still reuse
+            // cleanly.
+            let followup_prompt = format!("{probe_prompt}{}h", probe.output.text);
             let followup = cached_state
                 .generate_streaming_with_prefix_cache(
                     slot_id,

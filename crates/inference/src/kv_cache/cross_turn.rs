@@ -8,9 +8,13 @@
 //! `crate::forward::metal_qwen35`.
 //!
 //! See design.md step 4 (ADR: latest-boundary GDN snapshot + live KV logical
-//! reuse for v1). Reuse is only ever claimed for an exact token prefix that
-//! is already fully represented by retained state; any divergence falls
-//! back to `PrefixReuseMode::FullRefill`.
+//! reuse for v1). Three reuse modes exist: an exact token prefix that is
+//! already fully represented by retained state plans
+//! `PrefixReuseMode::ExactAppend`; a mid-history divergence at or after a
+//! retained sparse GDN checkpoint boundary plans
+//! `PrefixReuseMode::ReplayFromCheckpoint` (#590, deepest valid boundary
+//! wins); divergence with no usable checkpoint falls back to
+//! `PrefixReuseMode::FullRefill`.
 
 use crate::kv_cache::AdapterId;
 
