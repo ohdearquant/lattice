@@ -404,6 +404,88 @@ pub(crate) fn read_peft_header_adapter_id(data: &[u8]) -> Option<String> {
     })
 }
 
+/// Governance provenance fields embeddable into a saved adapter's
+/// safetensors metadata header, closing the "a manifest-less adapter file
+/// carries no provenance" gap (issue #610).
+///
+/// Deliberately does **not** include `integrity_sha256`: that field (as
+/// carried by a manifest `ManifestEntry`) is a SHA-256 hash of the
+/// *complete* safetensors file, header included (see the manifest loader's
+/// Check 4). A file cannot correctly embed a hash of its own complete byte
+/// stream inside itself — writing the hash into the header changes the
+/// header bytes, which changes the true hash, and there is no fixed point
+/// short of a cryptographic preimage. The governed manifest remains the sole
+/// authority for whole-file integrity; this struct carries everything else
+/// from the #439 field set that a header CAN coherently hold.
+#[derive(Debug, Clone)]
+pub struct AdapterGovernance {
+    /// Human-readable name for logging and debugging.
+    pub name: String,
+    /// Owning team or individual responsible for this adapter.
+    pub owner: String,
+    /// Git rev of the base model weights used during training.
+    pub base_model_rev: String,
+    /// Git rev of the tokenizer used during training.
+    pub tokenizer_rev: String,
+    /// Tensor dtype label (e.g. `"f32"`, `"f16"`, `"bf16"`).
+    pub dtype: String,
+    /// Governance status as a lowercase string (`"approved"` /
+    /// `"quarantined"` / `"revoked"`). A plain `String` here (rather than the
+    /// manifest's `AdapterStatus` enum) keeps this struct constructible when
+    /// the crate is built with `safetensors` but not `serde` — `AdapterStatus`
+    /// lives in the `serde`-gated `manifest` module. See
+    /// [`AdapterGovernance::from_entry`] for the common case of building this
+    /// from an existing manifest entry.
+    pub status: String,
+}
+
+impl AdapterGovernance {
+    /// Build governance metadata from a manifest entry (requires `serde`,
+    /// since `ManifestEntry` lives in the `serde`-gated `manifest` module).
+    /// This is the common way to construct this type when saving an adapter
+    /// that already has a governed manifest entry.
+    #[cfg(feature = "serde")]
+    pub fn from_entry(entry: &crate::lora::manifest::ManifestEntry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            owner: entry.owner.clone(),
+            base_model_rev: entry.base_model_rev.clone(),
+            tokenizer_rev: entry.tokenizer_rev.clone(),
+            dtype: entry.dtype.clone(),
+            status: entry.status.as_str().to_string(),
+        }
+    }
+}
+
+/// Read the governance fields embedded by [`save_peft_safetensors`] back out
+/// of a safetensors header, if present.
+///
+/// Returns `None` if the bytes cannot be parsed, the header has no metadata,
+/// or the `gov_name` key is absent. `gov_name` is used as the presence
+/// sentinel: the writer always sets all six governance keys together from a
+/// single `Option<&AdapterGovernance>`, so its absence means no governance
+/// was embedded (the other five default to an empty string rather than also
+/// gating on presence, since a partially-written header is not expected in
+/// practice and this reader is best-effort/advisory, not itself a
+/// governance gate).
+///
+/// Exercised today only by the round-trip tests below (no production caller
+/// consumes it yet — writing governance is the acceptance-critical half of
+/// issue #610; reading it back is provided for completeness/future tooling).
+#[allow(dead_code)]
+pub(crate) fn read_peft_header_governance(data: &[u8]) -> Option<AdapterGovernance> {
+    let (_, meta) = SafeTensors::read_metadata(data).ok()?;
+    let m = meta.metadata().as_ref()?;
+    Some(AdapterGovernance {
+        name: m.get("gov_name")?.clone(),
+        owner: m.get("gov_owner").cloned().unwrap_or_default(),
+        base_model_rev: m.get("gov_base_model_rev").cloned().unwrap_or_default(),
+        tokenizer_rev: m.get("gov_tokenizer_rev").cloned().unwrap_or_default(),
+        dtype: m.get("gov_dtype").cloned().unwrap_or_default(),
+        status: m.get("gov_status").cloned().unwrap_or_default(),
+    })
+}
+
 /// Maximum on-disk size of a single LoRA adapter file, in bytes (10 GiB).
 ///
 /// Adapter files are read fully into memory before parsing, so an unbounded
@@ -502,12 +584,21 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
 /// using the standard PEFT key format:
 /// `base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`
 ///
-/// Metadata stored in the safetensors header: `rank`, `alpha`, `target_modules`.
+/// Metadata stored in the safetensors header: `rank`, `alpha`, `target_modules`,
+/// and, when `governance` is `Some`, `gov_name`, `gov_owner`,
+/// `gov_base_model_rev`, `gov_tokenizer_rev`, `gov_dtype`, `gov_status` (see
+/// [`AdapterGovernance`] for why `integrity_sha256` is deliberately not
+/// among them). Pass `None` to save without embedding governance metadata
+/// (unchanged behavior from before issue #610).
 ///
 /// # Errors
 ///
 /// Returns an error if tensor views cannot be created or the file cannot be written.
-pub fn save_peft_safetensors(adapter: &LoraAdapter, path: &Path) -> Result<(), TuneError> {
+pub fn save_peft_safetensors(
+    adapter: &LoraAdapter,
+    path: &Path,
+    governance: Option<&AdapterGovernance>,
+) -> Result<(), TuneError> {
     // Collect owned byte buffers first; TensorView borrows from these.
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
@@ -552,6 +643,20 @@ pub fn save_peft_safetensors(adapter: &LoraAdapter, path: &Path) -> Result<(), T
         "target_modules".to_string(),
         adapter.config.target_modules.join(","),
     );
+    if let Some(governance) = governance {
+        metadata_map.insert("gov_name".to_string(), governance.name.clone());
+        metadata_map.insert("gov_owner".to_string(), governance.owner.clone());
+        metadata_map.insert(
+            "gov_base_model_rev".to_string(),
+            governance.base_model_rev.clone(),
+        );
+        metadata_map.insert(
+            "gov_tokenizer_rev".to_string(),
+            governance.tokenizer_rev.clone(),
+        );
+        metadata_map.insert("gov_dtype".to_string(), governance.dtype.clone());
+        metadata_map.insert("gov_status".to_string(), governance.status.clone());
+    }
     let metadata = Some(metadata_map);
 
     let bytes = serialize(&tensor_views, &metadata)
@@ -1039,7 +1144,7 @@ mod tests {
         let adapter = LoraAdapter::new(config, layers);
 
         let temp = NamedTempFile::new().unwrap();
-        save_peft_safetensors(&adapter, temp.path()).unwrap();
+        save_peft_safetensors(&adapter, temp.path(), None).unwrap();
 
         let loaded = load_peft_safetensors(temp.path()).unwrap();
 
@@ -1064,6 +1169,120 @@ mod tests {
                 assert!((g - w).abs() < f32::EPSILON, "B mismatch: {g} vs {w}");
             }
         }
+    }
+
+    /// `save_peft_safetensors(.., Some(governance))` must embed all six
+    /// governance fields into the header, round-trippable via
+    /// `read_peft_header_governance`. Mutation-sensitive: removing the
+    /// `if let Some(governance) = governance { .. }` embedding block makes
+    /// this `None` (no `gov_name` key present), so `.expect(..)` panics —
+    /// this test fails when the embedding is absent.
+    #[test]
+    fn test_governance_metadata_round_trips() {
+        use tempfile::NamedTempFile;
+
+        let rank = 4;
+        let config = LoraConfig {
+            rank,
+            alpha: rank as f32,
+            target_modules: vec!["q_proj".to_string()],
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0usize, "q_proj".to_string()),
+            LoraLayer {
+                a: vec![0.0; rank * 4],
+                b: vec![0.0; 4 * rank],
+                d_in: 4,
+                d_out: 4,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(config, layers);
+
+        let governance = AdapterGovernance {
+            name: "test-adapter".to_string(),
+            owner: "team-inference".to_string(),
+            base_model_rev: "rev-aaa".to_string(),
+            tokenizer_rev: "rev-bbb".to_string(),
+            dtype: "f32".to_string(),
+            status: "approved".to_string(),
+        };
+
+        let temp = NamedTempFile::new().unwrap();
+        save_peft_safetensors(&adapter, temp.path(), Some(&governance)).unwrap();
+
+        let bytes = std::fs::read(temp.path()).unwrap();
+        let got = read_peft_header_governance(&bytes).expect("governance metadata must be present");
+        assert_eq!(got.name, "test-adapter");
+        assert_eq!(got.owner, "team-inference");
+        assert_eq!(got.base_model_rev, "rev-aaa");
+        assert_eq!(got.tokenizer_rev, "rev-bbb");
+        assert_eq!(got.dtype, "f32");
+        assert_eq!(got.status, "approved");
+    }
+
+    /// Saving with `governance: None` must not embed any `gov_*` keys — the
+    /// feature is opt-in, not a default-on side effect.
+    #[test]
+    fn test_no_governance_metadata_when_not_supplied() {
+        use tempfile::NamedTempFile;
+
+        let rank = 4;
+        let config = LoraConfig {
+            rank,
+            alpha: rank as f32,
+            target_modules: vec!["q_proj".to_string()],
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0usize, "q_proj".to_string()),
+            LoraLayer {
+                a: vec![0.0; rank * 4],
+                b: vec![0.0; 4 * rank],
+                d_in: 4,
+                d_out: 4,
+                rank,
+            },
+        );
+        let adapter = LoraAdapter::new(config, layers);
+
+        let temp = NamedTempFile::new().unwrap();
+        save_peft_safetensors(&adapter, temp.path(), None).unwrap();
+
+        let bytes = std::fs::read(temp.path()).unwrap();
+        assert!(read_peft_header_governance(&bytes).is_none());
+    }
+
+    /// `AdapterGovernance::from_entry` must faithfully carry over every
+    /// field, converting `AdapterStatus` to its lowercase string form.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_adapter_governance_from_entry() {
+        use crate::lora::manifest::{AdapterStatus, ManifestEntry};
+
+        let entry = ManifestEntry {
+            id: "adapter-1".to_string(),
+            name: "adapter one".to_string(),
+            owner: "team-tune".to_string(),
+            uri: "adapter-1.safetensors".to_string(),
+            integrity_sha256: "deadbeef".to_string(),
+            base_model_rev: "rev-aaa".to_string(),
+            tokenizer_rev: "rev-bbb".to_string(),
+            rank: 8,
+            alpha: 16.0,
+            target_modules: vec!["q_proj".to_string()],
+            dtype: "f16".to_string(),
+            status: AdapterStatus::Approved,
+        };
+
+        let governance = AdapterGovernance::from_entry(&entry);
+        assert_eq!(governance.name, "adapter one");
+        assert_eq!(governance.owner, "team-tune");
+        assert_eq!(governance.base_model_rev, "rev-aaa");
+        assert_eq!(governance.tokenizer_rev, "rev-bbb");
+        assert_eq!(governance.dtype, "f16");
+        assert_eq!(governance.status, "approved");
     }
 
     #[test]
@@ -1096,7 +1315,7 @@ mod tests {
 
         let adapter = LoraAdapter::new(config, layers);
         let temp = NamedTempFile::new().unwrap();
-        save_peft_safetensors(&adapter, temp.path()).unwrap();
+        save_peft_safetensors(&adapter, temp.path(), None).unwrap();
         let loaded = load_peft_safetensors(temp.path()).unwrap();
 
         assert_eq!(loaded.config.rank, 4);
@@ -1247,7 +1466,7 @@ mod tests {
 
         let temp = NamedTempFile::new().unwrap();
         // This was the regression: pre-fix this call returned Err(InvalidTensorView).
-        save_peft_safetensors(&adapter, temp.path())
+        save_peft_safetensors(&adapter, temp.path(), None)
             .expect("save must succeed even with an empty-buffer GDN slot");
 
         let loaded = load_peft_safetensors(temp.path()).unwrap();
