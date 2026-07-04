@@ -385,6 +385,7 @@ impl Qwen35Model {
                 generated_tokens: 0,
                 stopped: false,
                 stop_reason: Some(StopReason::Length),
+                token_logprobs: vec![],
             });
         }
 

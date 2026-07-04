@@ -918,6 +918,7 @@ pub fn generate_q8_neon(
             generated_tokens: 0,
             stopped: false,
             stop_reason: Some(StopReason::Length),
+            token_logprobs: vec![],
         });
     }
 
