@@ -21,10 +21,11 @@ name: CI
 # `unwrap-in-lib-lint` stay ungated and directly required: they are already
 # cheap ubuntu-only jobs, so gating them would save nothing.
 #
-# Rollout note: branch protection's required contexts currently list the
-# seven heavy job/matrix names directly. Swapping them for `ci-gate` is a
-# repo-settings change (Settings -> Branches -> main protection rule), done
-# once this workflow shape is merged and green.
+# Rollout note: branch protection's required contexts were swapped on
+# 2026-07-04 from the seven heavy job/matrix names to `ci-gate` (plus the
+# unchanged cargo-deny, parity-gate, app-binaries-gate, and q4 composed
+# golden). PRs branched from a pre-ci-gate main must update their branch
+# (strict up-to-date protection forces this anyway) to produce the context.
 on:
   push:
     branches: [main]
@@ -427,23 +428,16 @@ jobs:
           version: '1.7.12'
 
   # cargo-semver-checks against the latest published crates.io release for
-  # every internal path-dependency crate. Not yet a required context, per the
-  # continue-on-error note below, but visible on every PR so a breaking public
-  # API change is flagged before it ships unversioned, the way #634 was not.
+  # every internal path-dependency crate, so a breaking public API change is
+  # flagged before it ships unversioned, the way #634 was not. Gated through
+  # ci-gate below (it is docs-gated, so it cannot be a direct required
+  # context). The v0.5.0 publish reset the baseline: all five crates pass
+  # against the published 0.5.0, so this is a real gate, not informational.
   semver-checks:
     name: semver-checks
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # Two of the five crates (lattice-inference, lattice-tune) already carry
-    # breaking public-API changes on main relative to the published 0.4.2
-    # baseline, accumulated before this gate existed and unrelated to any one
-    # PR; they will keep failing until the next version bump absorbs them.
-    # continue-on-error keeps the per-PR signal visible without holding every
-    # unrelated PR hostage to pre-existing debt this job did not create. Once
-    # a version bump brings the tree back to a clean baseline and this job
-    # proves green, it can be promoted to a required check.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -464,12 +458,12 @@ jobs:
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
-  # there is nothing to check (docs-only) and mirrors the four heavy jobs'
+  # there is nothing to check (docs-only) and mirrors the five gated jobs'
   # results when there is, exactly like `parity-gate` in e2e-parity.yml and
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, bench-compile, msrv]
+    needs: [changes, ci, feature-matrix, bench-compile, msrv, semver-checks]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -481,7 +475,8 @@ jobs:
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
           BENCH_COMPILE_RESULT="${{ needs.bench-compile.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT"
+          SEMVER_RESULT="${{ needs.semver-checks.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
@@ -506,5 +501,9 @@ jobs:
             echo "::error::msrv did not succeed (result=$MSRV_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, bench-compile, and msrv all PASSED."
+          if [ "$SEMVER_RESULT" != "success" ]; then
+            echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
+            exit 1
+          fi
+          echo "Code changed; ci, feature-matrix, bench-compile, msrv, and semver-checks all PASSED."
           exit 0
