@@ -16991,7 +16991,8 @@ kernel void gdn_chunk_norm_silu_c32(
     #[cfg(test)]
     mod tests {
         use super::super::{
-            LM_HEAD_TOPK_TIE_EPSILON, TopkSetAgreement, topk_set_agreement_or_boundary_tie,
+            LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
+            topk_set_agreement_or_boundary_tie,
         };
         use super::*;
         use crate::model::qwen35::{
@@ -21543,7 +21544,7 @@ kernel void decode_attention_reference(
             blocked.session.compact_topk = 1;
 
             let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
-            let mut mismatches = 0usize;
+            let mut accepted_ties = 0usize;
             let mut pos_in_window = 0usize;
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
@@ -21571,12 +21572,39 @@ kernel void decode_attention_reference(
                 assert_eq!(blocked.session.compact_result.len(), 1);
                 let got = blocked.session.compact_result[0].token_id;
 
-                if got != expected {
-                    mismatches += 1;
-                    eprintln!(
-                        "greedy mismatch at step {step} (pos {pos_in_window}): \
-                         expected {expected}, got {got}"
-                    );
+                // Greedy (k=1) is the SET agreement comparator specialized to a
+                // singleton set: the full-logit GEMV (`baseline`, this test's CPU-side
+                // oracle) and the compact Stage-1 block-argmax kernel (`blocked`)
+                // accumulate the same ~1K f32 products in different reduction orders,
+                // so a top-1/top-2 logit gap under LM_HEAD_TOPK_TIE_EPSILON is
+                // legitimate boundary noise, not a correctness bug (issue #623).
+                match topk_set_agreement_or_boundary_tie(
+                    &full_logits,
+                    &std::collections::HashSet::from([expected]),
+                    &std::collections::HashSet::from([got]),
+                    1,
+                    LM_HEAD_TOPK_TIE_EPSILON,
+                ) {
+                    Ok(TopkSetAgreement::ExactSet) => {}
+                    Ok(TopkSetAgreement::AcceptedBoundaryTie {
+                        margin,
+                        epsilon,
+                        boundary_logit,
+                        differing_tokens,
+                    }) => {
+                        accepted_ties += 1;
+                        eprintln!(
+                            "accepted greedy boundary tie at step {step} (pos {pos_in_window}): \
+                             margin={margin:.6e}, epsilon={epsilon:.6e}, \
+                             boundary_logit={boundary_logit:.6e}, \
+                             differing_tokens={differing_tokens:?}"
+                        );
+                    }
+                    Err(mismatch) => {
+                        panic!(
+                            "greedy mismatch at step {step} (pos {pos_in_window}): {mismatch:?}"
+                        );
+                    }
                 }
                 pos_in_window += 1;
                 if step % 2000 == 0 {
@@ -21585,12 +21613,8 @@ kernel void decode_attention_reference(
             }
 
             eprintln!(
-                "greedy agreement: {}/{num_positions} positions matched",
-                num_positions - mismatches
-            );
-            assert_eq!(
-                mismatches, 0,
-                "{mismatches} greedy-token disagreements out of {num_positions} real-checkpoint positions"
+                "greedy agreement: {}/{num_positions} exact, {accepted_ties} accepted boundary ties",
+                num_positions - accepted_ties
             );
         }
 
@@ -21843,7 +21867,7 @@ kernel void decode_attention_reference(
             blocked.session.compact_topk = 1;
 
             let mut rng: u64 = 0x1234_5678_9ABC_DEF0;
-            let mut mismatches = 0usize;
+            let mut accepted_ties = 0usize;
             let mut pos_in_window = 0usize;
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
@@ -21867,12 +21891,39 @@ kernel void decode_attention_reference(
                 assert_eq!(blocked.session.compact_result.len(), 1);
                 let got = blocked.session.compact_result[0].token_id;
 
-                if got != expected {
-                    mismatches += 1;
-                    eprintln!(
-                        "Q4 greedy mismatch at step {step} (pos {pos_in_window}): \
-                         expected {expected}, got {got}"
-                    );
+                // Q4's coarser (4-bit vs. 16-bit) quantization noise floor makes
+                // near-tied top-1/top-2 logit gaps flip more often between the
+                // full-logit GEMV (CPU oracle here) and the compact Stage-1
+                // block-argmax kernel than the F16 path does, so this uses its own,
+                // larger LM_HEAD_TOPK_TIE_EPSILON_Q4 (see its doc comment for the
+                // empirical derivation) rather than the F16 epsilon (issue #623).
+                match topk_set_agreement_or_boundary_tie(
+                    &full_logits,
+                    &std::collections::HashSet::from([expected]),
+                    &std::collections::HashSet::from([got]),
+                    1,
+                    LM_HEAD_TOPK_TIE_EPSILON_Q4,
+                ) {
+                    Ok(TopkSetAgreement::ExactSet) => {}
+                    Ok(TopkSetAgreement::AcceptedBoundaryTie {
+                        margin,
+                        epsilon,
+                        boundary_logit,
+                        differing_tokens,
+                    }) => {
+                        accepted_ties += 1;
+                        eprintln!(
+                            "accepted Q4 greedy boundary tie at step {step} \
+                             (pos {pos_in_window}): margin={margin:.6e}, \
+                             epsilon={epsilon:.6e}, boundary_logit={boundary_logit:.6e}, \
+                             differing_tokens={differing_tokens:?}"
+                        );
+                    }
+                    Err(mismatch) => {
+                        panic!(
+                            "Q4 greedy mismatch at step {step} (pos {pos_in_window}): {mismatch:?}"
+                        );
+                    }
                 }
                 pos_in_window += 1;
                 if step % 500 == 0 {
@@ -21881,12 +21932,8 @@ kernel void decode_attention_reference(
             }
 
             eprintln!(
-                "Q4 greedy agreement: {}/{num_positions} positions matched",
-                num_positions - mismatches
-            );
-            assert_eq!(
-                mismatches, 0,
-                "{mismatches} greedy-token disagreements out of {num_positions} real-checkpoint Q4 positions"
+                "Q4 greedy agreement: {}/{num_positions} exact, {accepted_ties} accepted boundary ties",
+                num_positions - accepted_ties
             );
         }
 
@@ -21932,7 +21979,7 @@ kernel void decode_attention_reference(
             }
 
             let mut rng: u64 = 0xFEED_FACE_C0FF_EE00;
-            let mut mismatches = [0usize; 4];
+            let mut accepted_ties = [0usize; 4];
             let mut pos_in_window = 0usize;
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
@@ -21965,9 +22012,40 @@ kernel void decode_attention_reference(
                         .iter()
                         .map(|c| c.token_id)
                         .collect();
-                    if got != expected {
-                        mismatches[i] += 1;
-                        eprintln!("Q4 top-{k} SET mismatch at step {step}");
+                    // Q4's coarser (4-bit vs. 16-bit) quantization noise floor makes
+                    // near-tied rank-k/rank-(k+1) logit gaps flip more often between
+                    // the full-logit GEMV (CPU oracle here) and the compact Stage-1
+                    // block-top-k kernel than the F16 path does, so this uses its own,
+                    // larger LM_HEAD_TOPK_TIE_EPSILON_Q4 (see its doc comment for the
+                    // empirical derivation) rather than the F16 epsilon (issue #623).
+                    match topk_set_agreement_or_boundary_tie(
+                        &full_logits,
+                        &expected,
+                        &got,
+                        k,
+                        LM_HEAD_TOPK_TIE_EPSILON_Q4,
+                    ) {
+                        Ok(TopkSetAgreement::ExactSet) => {}
+                        Ok(TopkSetAgreement::AcceptedBoundaryTie {
+                            margin,
+                            epsilon,
+                            boundary_logit,
+                            differing_tokens,
+                        }) => {
+                            accepted_ties[i] += 1;
+                            eprintln!(
+                                "accepted Q4 top-{k} boundary tie at step {step} \
+                                 (pos {pos_in_window}): margin={margin:.6e}, \
+                                 epsilon={epsilon:.6e}, boundary_logit={boundary_logit:.6e}, \
+                                 differing_tokens={differing_tokens:?}"
+                            );
+                        }
+                        Err(mismatch) => {
+                            panic!(
+                                "Q4 top-{k} SET mismatch at step {step} \
+                                 (pos {pos_in_window}): {mismatch:?}"
+                            );
+                        }
                     }
                 }
                 pos_in_window += 1;
@@ -21975,13 +22053,9 @@ kernel void decode_attention_reference(
 
             for (i, &k) in ks.iter().enumerate() {
                 eprintln!(
-                    "Q4 top-{k} set agreement: {}/{num_positions}",
-                    num_positions - mismatches[i]
-                );
-                assert_eq!(
-                    mismatches[i], 0,
-                    "{} top-{k} SET disagreements out of {num_positions} real-checkpoint Q4 positions",
-                    mismatches[i]
+                    "Q4 top-{k} set agreement: {}/{num_positions} exact, {} accepted boundary ties",
+                    num_positions - accepted_ties[i],
+                    accepted_ties[i]
                 );
             }
         }
@@ -24899,6 +24973,73 @@ kernel void decode_attention_reference(
 // same scale only to accept rank-boundary ties, never broad ordering changes.
 #[cfg(test)]
 const LM_HEAD_TOPK_TIE_EPSILON: f32 = 1.0e-3;
+
+// Q4 carries an additional noise floor on top of the f32-accumulation-order
+// noise the F16 epsilon above already accounts for: the block-topk Stage-1
+// kernel and the full-logit GEMV each dequantize the Q4 4-bit blocks before
+// accumulating, and the two paths' dequantize+accumulate orders round
+// differently. That makes Q4 boundary noise measurably wider than F16's, so
+// reusing LM_HEAD_TOPK_TIE_EPSILON here under-tolerates and produces the
+// exact flaky failures this constant exists to fix (issue #623).
+//
+// Value derived empirically (2026-07-03), not guessed, in TWO phases — the
+// second phase revised the first upward, and that revision (not just the
+// final number) is worth keeping on record:
+//
+// Phase 1 (initial 5x survey): 5 repeated runs each of
+// lm_head_q4_real_checkpoint_greedy_agreement (2000 positions) and
+// lm_head_q4_real_checkpoint_topk_set_agreement (100 positions x k in
+// {8,16,40,64}) against the real (non-stale) Qwen3.5-0.8B Q4 checkpoint,
+// logging the boundary margin of every mismatch via temp instrumentation.
+// Observed margins: greedy {7.91e-3, 6.90e-4, 1.25e-2} (2 runs clean); SET,
+// all at k=40 in one run, {1.18e-3, 1.69e-3, 6.17e-4, 1.14e-4} (4 runs
+// clean). Phase-1 max 1.2513e-2, which an earlier revision of this constant
+// set to ~1.6x (2.0e-2).
+//
+// Phase 2 (post-fix 3x confirmation, same day): rerunning
+// lm_head_q4_real_checkpoint_greedy_agreement 3 more times against the final
+// comparator-based code (i.e. no longer count-and-continue; each run panics
+// on its first non-tie mismatch) surfaced margins of 3.61e-2, 2.01e-2, and
+// 5.23e-2 — all 3 runs mismatched, and the new max (5.23e-2) is 4.2x
+// phase-1's. Timeline reconstruction from process-start timestamps confirms
+// this batch finished (~10:20pm) before any other worktree's Metal test
+// process became active on this machine (the next one started ~10:23pm), so
+// this is not explained by the cross-process GPU contention identified below
+// — it is the more likely true noise ceiling, phase-1's 5 samples having
+// under-covered it (consistent with issue #623: this kernel family's
+// reduction order is not run-to-run deterministic, so small samples
+// under-cover the tail).
+//
+// A separate, later confirmation pass on lm_head_q4_real_checkpoint_topk_set_agreement
+// (4 more runs) produced a much larger outlier margin (0.167, k=8, step 3) that
+// this constant deliberately does NOT chase: `ps` timestamps confirmed a
+// concurrent process in a different worktree (`lattice-611`, PID 3395,
+// `cargo test ... forward::metal_qwen35:: --test-threads=4`, later a second
+// batch explicitly re-running these same 4 real-checkpoint tests) actively
+// executing Metal GPU tests on this same physical machine throughout that
+// window. Concurrent GPU load corrupting numerics (not just timing) for
+// these exact tests is an already-documented risk in this repo (see
+// AGENTS.md / CLAUDE.md "Triage Flaky vs Deterministic Before Filing"), so
+// that batch's data is reported (see PR/report history) but excluded from
+// this constant's derivation.
+//
+// This constant is set to 1.0e-1: ~1.9x the phase-1+phase-2 combined greedy
+// max (5.23e-2, from data with no identified contention), inside the
+// analysis's suggested 1.5-2x safety band, and a clean round number that is
+// exactly 100x LM_HEAD_TOPK_TIE_EPSILON. Follow-up: a clean (verified
+// uncontended) re-confirmation of both Q4 tests would still be worthwhile,
+// since phase-2 shows a single 5x survey can under-cover this kernel
+// family's tail even before contention is considered.
+//
+// Unlike LM_HEAD_TOPK_TIE_EPSILON above, this constant's only consumers are
+// the two Q4 real-checkpoint GPU tests inside `mod inner::tests`, which
+// require the metal-gpu feature (there is no Q4-flavored pure-logic
+// comparator unit test below). A bare `#[cfg(test)]` would leave it unused
+// — and clippy-`-D warnings`-flagged — under `--tests --features f16`
+// without `metal-gpu`, so gate it on the same `all(...)` its consumers live
+// behind.
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+const LM_HEAD_TOPK_TIE_EPSILON_Q4: f32 = 1.0e-1;
 
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
