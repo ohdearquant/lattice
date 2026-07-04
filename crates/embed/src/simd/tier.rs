@@ -293,31 +293,12 @@ pub fn prepare_query_with_norm(
 ///
 /// Returns a value in [0, 2] where 0 = identical, 2 = opposite.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the query tier does not match the stored-data tier.  Use
-/// [`try_approximate_cosine_distance_prepared`] when tiers are not statically
-/// guaranteed to match.
+/// Returns [`EmbedError::TierMismatch`] if the query tier does not match the
+/// stored-data tier.
 #[inline]
-pub fn approximate_cosine_distance_prepared(query: &PreparedQuery, stored: &QuantizedData) -> f32 {
-    match (query, stored) {
-        (PreparedQuery::Full(q), QuantizedData::Full(s)) => 1.0 - cosine_similarity(q, s),
-        (PreparedQuery::Int8(q), QuantizedData::Int8(s)) => {
-            1.0 - cosine_similarity_i8_trusted(s, q)
-        }
-        (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => s.cosine_distance(q),
-        (PreparedQuery::Binary(q), QuantizedData::Binary(s)) => s.cosine_distance_approx(q),
-        _ => panic!("PreparedQuery tier must match QuantizedData tier"),
-    }
-}
-
-/// Non-panicking variant of [`approximate_cosine_distance_prepared`].
-///
-/// Returns `Err(EmbedError::Internal(...))` when the query tier does not match the
-/// stored-data tier instead of panicking.  Prefer this in contexts where the tiers
-/// may not be statically guaranteed to match.
-#[inline]
-pub fn try_approximate_cosine_distance_prepared(
+pub fn approximate_cosine_distance_prepared(
     query: &PreparedQuery,
     stored: &QuantizedData,
 ) -> Result<f32> {
@@ -328,33 +309,38 @@ pub fn try_approximate_cosine_distance_prepared(
         }
         (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => Ok(s.cosine_distance(q)),
         (PreparedQuery::Binary(q), QuantizedData::Binary(s)) => Ok(s.cosine_distance_approx(q)),
-        _ => Err(EmbedError::Internal(
-            "PreparedQuery tier must match QuantizedData tier for cosine distance".into(),
-        )),
+        _ => Err(EmbedError::TierMismatch {
+            op: "approximate_cosine_distance_prepared",
+            expected: stored.tier(),
+            actual: query.tier(),
+        }),
     }
 }
 
-/// Non-panicking variant of [`approximate_dot_product_prepared`].
+/// Alias for [`approximate_cosine_distance_prepared`], retained for API compatibility.
 ///
-/// Returns `Err(EmbedError::Internal(...))` for binary inputs or a tier mismatch
-/// instead of panicking.
+/// As of the tier-mismatch hardening fix (issue #210), the non-`try_` variant no
+/// longer panics and returns the same `Result` as this function. Prefer the
+/// non-`try_` name in new code.
+#[inline]
+pub fn try_approximate_cosine_distance_prepared(
+    query: &PreparedQuery,
+    stored: &QuantizedData,
+) -> Result<f32> {
+    approximate_cosine_distance_prepared(query, stored)
+}
+
+/// Alias for [`approximate_dot_product_prepared`], retained for API compatibility.
+///
+/// As of the tier-mismatch hardening fix (issue #210), the non-`try_` variant no
+/// longer panics and returns the same `Result` as this function. Prefer the
+/// non-`try_` name in new code.
 #[inline]
 pub fn try_approximate_dot_product_prepared(
     query: &PreparedQuery,
     stored: &QuantizedData,
 ) -> Result<f32> {
-    match (query, stored) {
-        (PreparedQuery::Full(q), QuantizedData::Full(s)) => Ok(dot_product(q, s)),
-        (PreparedQuery::Int8(q), QuantizedData::Int8(s)) => Ok(dot_product_i8_trusted(q, s)),
-        (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => Ok(s.dot_product(q)),
-        (PreparedQuery::Binary(_), QuantizedData::Binary(_)) => Err(EmbedError::Internal(
-            "Binary has no prepared dot product; use try_approximate_cosine_distance_prepared"
-                .into(),
-        )),
-        _ => Err(EmbedError::Internal(
-            "PreparedQuery tier must match QuantizedData tier for dot product".into(),
-        )),
-    }
+    approximate_dot_product_prepared(query, stored)
 }
 
 /// Cosine distance with unit-norm fast path.
@@ -370,58 +356,67 @@ pub fn try_approximate_dot_product_prepared(
 ///
 /// # Panics
 ///
-/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
-/// match the stored-data tier. The unit-norm `Full` fast path returns directly and
-/// never reaches the delegate.
+/// # Errors
+///
+/// Returns [`EmbedError::TierMismatch`] (propagated from
+/// [`approximate_cosine_distance_prepared`]) if the query tier does not match the
+/// stored-data tier. The unit-norm `Full` fast path returns directly and never
+/// reaches the delegate.
 #[inline]
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
     stored: &QuantizedData,
     stored_norm: NormalizationHint,
-) -> f32 {
+) -> Result<f32> {
     if meta.norm == NormalizationHint::Unit
         && stored_norm == NormalizationHint::Unit
         && let (PreparedQuery::Full(q), QuantizedData::Full(s)) = (&meta.query, stored)
     {
         let dot = dot_product(q, s);
-        return 1.0 - dot.clamp(-1.0, 1.0);
+        return Ok(1.0 - dot.clamp(-1.0, 1.0));
     }
     approximate_cosine_distance_prepared(&meta.query, stored)
 }
 
 /// **Unstable**: prepared dot product dispatch; query tier must match stored data tier.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the query tier does not match the stored-data tier, or if called
-/// with `Binary` data (binary has no meaningful dot product; use cosine distance
-/// instead).  Use [`try_approximate_dot_product_prepared`] for a non-panicking
-/// version.
+/// Returns [`EmbedError::TierMismatch`] if the query tier does not match the
+/// stored-data tier, or [`EmbedError::Internal`] if called with `Binary` data
+/// (binary has no meaningful dot product; use cosine distance instead).
 #[inline]
-pub fn approximate_dot_product_prepared(query: &PreparedQuery, stored: &QuantizedData) -> f32 {
+pub fn approximate_dot_product_prepared(
+    query: &PreparedQuery,
+    stored: &QuantizedData,
+) -> Result<f32> {
     match (query, stored) {
-        (PreparedQuery::Full(q), QuantizedData::Full(s)) => dot_product(q, s),
-        (PreparedQuery::Int8(q), QuantizedData::Int8(s)) => dot_product_i8_trusted(q, s),
-        (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => s.dot_product(q),
-        (PreparedQuery::Binary(_), QuantizedData::Binary(_)) => {
-            panic!("Binary has no prepared dot product; use approximate_cosine_distance_prepared")
-        }
-        _ => panic!("PreparedQuery tier must match QuantizedData tier"),
+        (PreparedQuery::Full(q), QuantizedData::Full(s)) => Ok(dot_product(q, s)),
+        (PreparedQuery::Int8(q), QuantizedData::Int8(s)) => Ok(dot_product_i8_trusted(q, s)),
+        (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => Ok(s.dot_product(q)),
+        (PreparedQuery::Binary(_), QuantizedData::Binary(_)) => Err(EmbedError::Internal(
+            "Binary has no prepared dot product; use approximate_cosine_distance_prepared".into(),
+        )),
+        _ => Err(EmbedError::TierMismatch {
+            op: "approximate_dot_product_prepared",
+            expected: stored.tier(),
+            actual: query.tier(),
+        }),
     }
 }
 
 /// Compute cosine distances from one prepared query to a slice of stored vectors.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
-/// match any stored vector's tier. Use [`try_approximate_cosine_distance_prepared`]
-/// per item when tiers are not statically guaranteed to match.
+/// Returns [`EmbedError::TierMismatch`] (propagated from
+/// [`approximate_cosine_distance_prepared`]) if the query tier does not match any
+/// stored vector's tier.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared(
     query: &PreparedQuery,
     stored: &[QuantizedData],
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     stored
         .iter()
         .map(|item| approximate_cosine_distance_prepared(query, item))
@@ -430,113 +425,137 @@ pub fn batch_approximate_cosine_distance_prepared(
 
 /// Like [`batch_approximate_cosine_distance_prepared`] but writes into a caller-supplied buffer.
 ///
-/// Clears and reuses the buffer to avoid allocations across repeated searches.
+/// Clears and reuses the buffer to avoid allocations across repeated searches. On error the
+/// buffer is left cleared (no partial results are written).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics (via [`approximate_cosine_distance_prepared`]) if the query tier does not
-/// match any stored vector's tier.
+/// Returns [`EmbedError::TierMismatch`] (propagated from
+/// [`approximate_cosine_distance_prepared`]) if the query tier does not match any
+/// stored vector's tier.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared_into(
     query: &PreparedQuery,
     stored: &[QuantizedData],
     out: &mut Vec<f32>,
-) {
+) -> Result<()> {
     out.clear();
-    out.reserve(stored.len());
-    out.extend(
-        stored
-            .iter()
-            .map(|item| approximate_cosine_distance_prepared(query, item)),
-    );
+    let results: Vec<f32> = stored
+        .iter()
+        .map(|item| approximate_cosine_distance_prepared(query, item))
+        .collect::<Result<_>>()?;
+    out.extend(results);
+    Ok(())
 }
 
 /// Compute cosine distances from a prepared INT8 query to a slice of INT8 candidates.
 ///
 /// The query is quantized once outside this function; no per-iteration `from_f32` is called.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `query` is not an `Int8` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int8` `PreparedQuery`.
 #[inline]
 pub fn approximate_int8_batch_prepared(
     query: &PreparedQuery,
     candidates: &[QuantizedVector],
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     let PreparedQuery::Int8(q) = query else {
-        panic!("PreparedQuery tier must be Int8");
+        return Err(EmbedError::TierMismatch {
+            op: "approximate_int8_batch_prepared",
+            expected: QuantizationTier::Int8,
+            actual: query.tier(),
+        });
     };
-    candidates
+    Ok(candidates
         .iter()
         .map(|candidate| 1.0 - cosine_similarity_i8_trusted(candidate, q))
-        .collect()
+        .collect())
 }
 
 /// Like [`approximate_int8_batch_prepared`] but writes into a caller-supplied buffer.
 ///
-/// # Panics
+/// On error the buffer is left cleared (no partial results are written).
 ///
-/// Panics if `query` is not an `Int8` `PreparedQuery`.
+/// # Errors
+///
+/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int8` `PreparedQuery`.
 #[inline]
 pub fn approximate_int8_batch_prepared_into(
     query: &PreparedQuery,
     candidates: &[QuantizedVector],
     out: &mut Vec<f32>,
-) {
-    let PreparedQuery::Int8(q) = query else {
-        panic!("PreparedQuery tier must be Int8");
-    };
+) -> Result<()> {
     out.clear();
+    let PreparedQuery::Int8(q) = query else {
+        return Err(EmbedError::TierMismatch {
+            op: "approximate_int8_batch_prepared_into",
+            expected: QuantizationTier::Int8,
+            actual: query.tier(),
+        });
+    };
     out.reserve(candidates.len());
     out.extend(
         candidates
             .iter()
             .map(|candidate| 1.0 - cosine_similarity_i8_trusted(candidate, q)),
     );
+    Ok(())
 }
 
 /// Compute cosine distances from a prepared INT4 query to a slice of INT4 candidates.
 ///
 /// The query is quantized once outside this function; no per-iteration `from_f32` is called.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `query` is not an `Int4` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int4` `PreparedQuery`.
 #[inline]
 pub fn approximate_int4_batch_prepared(
     query: &PreparedQuery,
     candidates: &[Int4Vector],
-) -> Vec<f32> {
+) -> Result<Vec<f32>> {
     let PreparedQuery::Int4(q) = query else {
-        panic!("PreparedQuery tier must be Int4");
+        return Err(EmbedError::TierMismatch {
+            op: "approximate_int4_batch_prepared",
+            expected: QuantizationTier::Int4,
+            actual: query.tier(),
+        });
     };
-    candidates
+    Ok(candidates
         .iter()
         .map(|candidate| candidate.cosine_distance(q))
-        .collect()
+        .collect())
 }
 
 /// Like [`approximate_int4_batch_prepared`] but writes into a caller-supplied buffer.
 ///
-/// # Panics
+/// On error the buffer is left cleared (no partial results are written).
 ///
-/// Panics if `query` is not an `Int4` `PreparedQuery`.
+/// # Errors
+///
+/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int4` `PreparedQuery`.
 #[inline]
 pub fn approximate_int4_batch_prepared_into(
     query: &PreparedQuery,
     candidates: &[Int4Vector],
     out: &mut Vec<f32>,
-) {
-    let PreparedQuery::Int4(q) = query else {
-        panic!("PreparedQuery tier must be Int4");
-    };
+) -> Result<()> {
     out.clear();
+    let PreparedQuery::Int4(q) = query else {
+        return Err(EmbedError::TierMismatch {
+            op: "approximate_int4_batch_prepared_into",
+            expected: QuantizationTier::Int4,
+            actual: query.tier(),
+        });
+    };
     out.reserve(candidates.len());
     out.extend(
         candidates
             .iter()
             .map(|candidate| candidate.cosine_distance(q)),
     );
+    Ok(())
 }
 
 /// **Unstable**: tiered distance dispatch; tier mix and formula may change.
@@ -754,9 +773,9 @@ mod tests {
             .map(QuantizedData::Int8)
             .collect();
 
-        let got = approximate_int8_batch_prepared(&prepared, &candidates);
+        let got = approximate_int8_batch_prepared(&prepared, &candidates).unwrap();
         for (i, item) in wrapped.iter().enumerate() {
-            let expected = approximate_cosine_distance_prepared(&prepared, item);
+            let expected = approximate_cosine_distance_prepared(&prepared, item).unwrap();
             assert!(
                 (got[i] - expected).abs() < 1e-6,
                 "int8 batch prepared mismatch at candidate {i}: got={}, expected={}",
@@ -779,9 +798,9 @@ mod tests {
             .map(QuantizedData::Int4)
             .collect();
 
-        let got = approximate_int4_batch_prepared(&prepared, &candidates);
+        let got = approximate_int4_batch_prepared(&prepared, &candidates).unwrap();
         for (i, item) in wrapped.iter().enumerate() {
-            let expected = approximate_cosine_distance_prepared(&prepared, item);
+            let expected = approximate_cosine_distance_prepared(&prepared, item).unwrap();
             assert!(
                 (got[i] - expected).abs() < 1e-5,
                 "int4 batch prepared mismatch at candidate {i}: got={}, expected={}",
@@ -804,8 +823,9 @@ mod tests {
             let q_cand = Int4Vector::from_f32(&candidate);
             let wrapped = QuantizedData::Int4(q_cand.clone());
 
-            let batch_result = approximate_int4_batch_prepared(&prepared, &[q_cand]);
-            let per_item_result = approximate_cosine_distance_prepared(&prepared, &wrapped);
+            let batch_result = approximate_int4_batch_prepared(&prepared, &[q_cand]).unwrap();
+            let per_item_result =
+                approximate_cosine_distance_prepared(&prepared, &wrapped).unwrap();
 
             assert!(
                 (batch_result[0] - per_item_result).abs() < 1e-5,
@@ -826,5 +846,164 @@ mod tests {
         for (a, b) in v.iter().zip(full_rt.iter()) {
             assert!((a - b).abs() < 1e-10, "Full tier should be lossless");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Regression tests for issue #210: tier-mismatch in prepared SIMD
+    // dispatch must return a typed error, not panic.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_cosine_distance_prepared_tier_mismatch_returns_typed_error() {
+        let v = generate_vector(64, 1);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Int8);
+        let stored = QuantizedData::from_f32(&v, QuantizationTier::Int4);
+
+        let err = approximate_cosine_distance_prepared(&query, &stored).unwrap_err();
+        match err {
+            EmbedError::TierMismatch {
+                op,
+                expected,
+                actual,
+            } => {
+                assert_eq!(op, "approximate_cosine_distance_prepared");
+                assert_eq!(expected, QuantizationTier::Int4);
+                assert_eq!(actual, QuantizationTier::Int8);
+            }
+            other => panic!("expected TierMismatch, got {other:?}"),
+        }
+
+        // try_ alias must agree.
+        assert!(try_approximate_cosine_distance_prepared(&query, &stored).is_err());
+    }
+
+    #[test]
+    fn test_dot_product_prepared_tier_mismatch_returns_typed_error() {
+        let v = generate_vector(64, 2);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Full);
+        let stored = QuantizedData::from_f32(&v, QuantizationTier::Int8);
+
+        let err = approximate_dot_product_prepared(&query, &stored).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EmbedError::TierMismatch {
+                    op: "approximate_dot_product_prepared",
+                    ..
+                }
+            ),
+            "unexpected error variant: {err:?}"
+        );
+
+        assert!(try_approximate_dot_product_prepared(&query, &stored).is_err());
+    }
+
+    #[test]
+    fn test_dot_product_prepared_binary_returns_typed_error_not_panic() {
+        let v = generate_vector(64, 3);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Binary);
+        let stored = QuantizedData::from_f32(&v, QuantizationTier::Binary);
+
+        let err = approximate_dot_product_prepared(&query, &stored).unwrap_err();
+        assert!(
+            matches!(err, EmbedError::Internal(_)),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_cosine_distance_prepared_with_meta_tier_mismatch_returns_typed_error() {
+        let v = generate_vector(64, 4);
+        let meta =
+            PreparedQueryWithMeta::from_f32(&v, QuantizationTier::Full, NormalizationHint::Unknown);
+        let stored = QuantizedData::from_f32(&v, QuantizationTier::Int8);
+
+        let err = approximate_cosine_distance_prepared_with_meta(
+            &meta,
+            &stored,
+            NormalizationHint::Unknown,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    }
+
+    #[test]
+    fn test_batch_cosine_distance_prepared_tier_mismatch_returns_typed_error() {
+        let v = generate_vector(64, 5);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Int8);
+        let stored = vec![
+            QuantizedData::from_f32(&v, QuantizationTier::Int8),
+            QuantizedData::from_f32(&v, QuantizationTier::Int4), // mismatched
+        ];
+
+        let err = batch_approximate_cosine_distance_prepared(&query, &stored).unwrap_err();
+        assert!(matches!(err, EmbedError::TierMismatch { .. }));
+
+        let mut out = vec![9.0, 9.0, 9.0]; // pre-populated, must be cleared even on error
+        let err =
+            batch_approximate_cosine_distance_prepared_into(&query, &stored, &mut out).unwrap_err();
+        assert!(matches!(err, EmbedError::TierMismatch { .. }));
+        assert!(
+            out.is_empty(),
+            "buffer must be cleared, not left with stale data"
+        );
+    }
+
+    #[test]
+    fn test_int8_batch_prepared_wrong_tier_returns_typed_error() {
+        let v = generate_vector(64, 6);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Int4); // not Int8
+        let candidates = vec![QuantizedVector::from_f32(&v)];
+
+        let err = approximate_int8_batch_prepared(&query, &candidates).unwrap_err();
+        match err {
+            EmbedError::TierMismatch {
+                op,
+                expected,
+                actual,
+            } => {
+                assert_eq!(op, "approximate_int8_batch_prepared");
+                assert_eq!(expected, QuantizationTier::Int8);
+                assert_eq!(actual, QuantizationTier::Int4);
+            }
+            other => panic!("expected TierMismatch, got {other:?}"),
+        }
+
+        let mut out = vec![9.0];
+        let err = approximate_int8_batch_prepared_into(&query, &candidates, &mut out).unwrap_err();
+        assert!(matches!(err, EmbedError::TierMismatch { .. }));
+        assert!(
+            out.is_empty(),
+            "buffer must be cleared, not left with stale data"
+        );
+    }
+
+    #[test]
+    fn test_int4_batch_prepared_wrong_tier_returns_typed_error() {
+        let v = generate_vector(64, 7);
+        let query = PreparedQuery::from_f32(&v, QuantizationTier::Int8); // not Int4
+        let candidates = vec![Int4Vector::from_f32(&v)];
+
+        let err = approximate_int4_batch_prepared(&query, &candidates).unwrap_err();
+        match err {
+            EmbedError::TierMismatch {
+                op,
+                expected,
+                actual,
+            } => {
+                assert_eq!(op, "approximate_int4_batch_prepared");
+                assert_eq!(expected, QuantizationTier::Int4);
+                assert_eq!(actual, QuantizationTier::Int8);
+            }
+            other => panic!("expected TierMismatch, got {other:?}"),
+        }
+
+        let mut out = vec![9.0];
+        let err = approximate_int4_batch_prepared_into(&query, &candidates, &mut out).unwrap_err();
+        assert!(matches!(err, EmbedError::TierMismatch { .. }));
+        assert!(
+            out.is_empty(),
+            "buffer must be cleared, not left with stale data"
+        );
     }
 }

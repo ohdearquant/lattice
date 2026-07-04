@@ -610,7 +610,7 @@ fn bench_prepared_query(c: &mut Criterion) {
         bench.iter(|| {
             let results: Vec<f32> = stored_int8_data
                 .iter()
-                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_int8), s))
+                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_int8), s).unwrap())
                 .collect();
             black_box(results)
         });
@@ -633,7 +633,7 @@ fn bench_prepared_query(c: &mut Criterion) {
         bench.iter(|| {
             let results: Vec<f32> = stored_int4_data
                 .iter()
-                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_int4), s))
+                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_int4), s).unwrap())
                 .collect();
             black_box(results)
         });
@@ -656,7 +656,7 @@ fn bench_prepared_query(c: &mut Criterion) {
         bench.iter(|| {
             let results: Vec<f32> = stored_binary_data
                 .iter()
-                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_binary), s))
+                .map(|s| approximate_cosine_distance_prepared(black_box(&pre_q_binary), s).unwrap())
                 .collect();
             black_box(results)
         });
@@ -738,10 +738,10 @@ fn bench_int8_prepared_dot_product(c: &mut Criterion) {
         let prepared = PreparedQuery::from_f32(&query_f32, QuantizationTier::Int8);
         group.bench_with_input(BenchmarkId::new("prepared", dim), &dim, |bench, _| {
             bench.iter(|| {
-                black_box(approximate_dot_product_prepared(
-                    black_box(&prepared),
-                    black_box(&stored_data),
-                ))
+                black_box(
+                    approximate_dot_product_prepared(black_box(&prepared), black_box(&stored_data))
+                        .unwrap(),
+                )
             });
         });
     }
@@ -853,7 +853,10 @@ fn bench_prepared_query_normalized_cosine(c: &mut Criterion) {
                 bench.iter(|| {
                     let results: Vec<f32> = stored_full
                         .iter()
-                        .map(|s| approximate_cosine_distance_prepared(black_box(&prepared_full), s))
+                        .map(|s| {
+                            approximate_cosine_distance_prepared(black_box(&prepared_full), s)
+                                .unwrap()
+                        })
                         .collect();
                     black_box(results)
                 });
@@ -898,6 +901,7 @@ fn bench_prepared_query_normalized_cosine(c: &mut Criterion) {
                                 s,
                                 NormalizationHint::Unit,
                             )
+                            .unwrap()
                         })
                         .collect();
                     black_box(results)
@@ -1144,10 +1148,13 @@ fn bench_prepared_batch_sizes(c: &mut Criterion) {
             &count,
             |bench, &n| {
                 bench.iter(|| {
-                    black_box(approximate_int8_batch_prepared(
-                        black_box(&pre_q_int8),
-                        black_box(&stored_int8[..n]),
-                    ))
+                    black_box(
+                        approximate_int8_batch_prepared(
+                            black_box(&pre_q_int8),
+                            black_box(&stored_int8[..n]),
+                        )
+                        .unwrap(),
+                    )
                 });
             },
         );
@@ -1171,10 +1178,13 @@ fn bench_prepared_batch_sizes(c: &mut Criterion) {
             &count,
             |bench, &n| {
                 bench.iter(|| {
-                    black_box(approximate_int4_batch_prepared(
-                        black_box(&pre_q_int4),
-                        black_box(&stored_int4[..n]),
-                    ))
+                    black_box(
+                        approximate_int4_batch_prepared(
+                            black_box(&pre_q_int4),
+                            black_box(&stored_int4[..n]),
+                        )
+                        .unwrap(),
+                    )
                 });
             },
         );
