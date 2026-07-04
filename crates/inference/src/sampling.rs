@@ -1618,6 +1618,59 @@ mod tests {
         assert_eq!(tok, 1, "+INF logit token must be selected");
     }
 
+    /// #611 defense-in-depth: even if a grammar's `has_finite_logit` guard
+    /// were ever bypassed upstream, the sampler itself must not let an
+    /// all-masked (all-`NEG_INFINITY`) `CandidateSet` poison softmax into NaN
+    /// or panic. The temperature=0 argmax path already has
+    /// `test_argmax_all_neg_inf_returns_0` and
+    /// `test_candidateset_argmax_all_masked_returns_first_in_set_token`; this
+    /// covers the same all-masked input through the temperature>0 / top-p
+    /// nucleus path (`sample_top_p_with_scratch`), a distinct code path with
+    /// its own pair of non-finite guards.
+    ///
+    /// Mutation sensitivity (verified empirically, not just asserted): this
+    /// input is defended by *two* independent guards — `!max_logit.is_finite()`
+    /// and `!sum.is_finite() || sum <= 0.0` a few lines below it. Disabling
+    /// either ONE alone still passes (the other one catches it — genuine
+    /// defense-in-depth, confirmed by temporarily disabling each in turn).
+    /// Disabling BOTH simultaneously computes `(NEG_INFINITY -
+    /// NEG_INFINITY).exp()` = `NaN.exp()` = `NaN` for every candidate, and the
+    /// `r < cumsum` weighted-sample loop is always false against a NaN cumsum,
+    /// so it falls through to the *last* sorted candidate (token_id 3, the
+    /// highest id, per the code's own comment) instead of this test's expected
+    /// token_id 1 — the assertion below then fails with `left: 3, right: 1`.
+    #[test]
+    fn test_sample_top_p_all_neg_inf_falls_back_to_first_sorted_candidate() {
+        let mut cs = CandidateSet {
+            candidates: vec![
+                Candidate {
+                    token_id: 3,
+                    logit: f32::NEG_INFINITY,
+                },
+                Candidate {
+                    token_id: 1,
+                    logit: f32::NEG_INFINITY,
+                },
+                Candidate {
+                    token_id: 2,
+                    logit: f32::NEG_INFINITY,
+                },
+            ],
+        };
+        let mut scratch = Vec::new();
+        // top_p < 1.0 so the nucleus-truncation branch is in play too, not just
+        // the full-distribution case.
+        let tok = cs.sample_top_p_with_scratch(0.9, 0.5, &mut scratch);
+        // All logits tie at NEG_INFINITY, so `candidate_order`'s tie-break
+        // (ascending token_id) sorts token_id 1 to `candidates[0]` — the
+        // non-finite-max guard's defined fallback answer.
+        assert_eq!(
+            tok, 1,
+            "an all-NEG_INFINITY CandidateSet must deterministically fall back \
+             to the first sorted candidate's token id, not NaN-derived garbage"
+        );
+    }
+
     #[test]
     fn test_penalized_logit_invalid_penalty_is_noop() {
         // Non-positive or non-finite penalties must not flip a logit's sign.

@@ -85,6 +85,15 @@ mod imp {
             prompt_tokens: usize,
             completion_tokens: usize,
         },
+        /// Generation failed closed instead of completing (#611: e.g. a
+        /// grammar mask that blocks every candidate token, mirroring the
+        /// CPU/`lattice.rs` fail-closed contract). Carries the underlying
+        /// error message for server-side logging; the streaming and
+        /// non-streaming handlers below decide separately how much (if any)
+        /// of it is safe to surface to the HTTP client.
+        Failed {
+            message: String,
+        },
     }
 
     /// A generation request handed to the single GPU worker thread.
@@ -257,14 +266,16 @@ mod imp {
 
             run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
                 metal.reset_state();
-                let out = metal.chat_completion_streaming_with_cancel(
-                    messages,
-                    &tokenizer,
-                    cfg,
-                    on_token,
-                    should_cancel,
-                );
-                (out.prompt_tokens, out.completion_tokens)
+                metal
+                    .chat_completion_streaming_with_cancel(
+                        messages,
+                        &tokenizer,
+                        cfg,
+                        on_token,
+                        should_cancel,
+                    )
+                    .map(|out| (out.prompt_tokens, out.completion_tokens))
+                    .map_err(|e| e.to_string())
             });
         });
         job_tx
@@ -280,8 +291,11 @@ mod imp {
     /// independently of `on_token` -- including during any phase that never
     /// calls `on_token` at all (a prefill-like section, or a run of
     /// empty-delta steps) -- and stop as soon as `should_cancel` returns
-    /// `true`. Either way, return `(prompt_tokens, completion_tokens)` for
-    /// whatever was actually produced before stopping (early or at the cap).
+    /// `true`. Either way, return `Ok((prompt_tokens, completion_tokens))` for
+    /// whatever was actually produced before stopping (early or at the cap),
+    /// or `Err(message)` if generation itself failed closed (#611: e.g. a
+    /// grammar mask that blocks every candidate token) rather than
+    /// completing or being cancelled.
     fn run_worker_loop(
         mut job_rx: mpsc::UnboundedReceiver<Job>,
         mut generate: impl FnMut(
@@ -289,7 +303,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> (usize, usize),
+        ) -> Result<(usize, usize), String>,
     ) {
         while let Some(job) = job_rx.blocking_recv() {
             if *job.cancel.borrow() {
@@ -315,12 +329,18 @@ mod imp {
             // `MetalQwen35State::generate_streaming_with_cancel`).
             let cancel_for_predicate = job.cancel.clone();
             let mut should_cancel = move || *cancel_for_predicate.borrow();
-            let (prompt_tokens, completion_tokens) =
-                generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel);
-            let _ = job.tx.send(Ev::Done {
-                prompt_tokens,
-                completion_tokens,
-            });
+            match generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel) {
+                Ok((prompt_tokens, completion_tokens)) => {
+                    let _ = job.tx.send(Ev::Done {
+                        prompt_tokens,
+                        completion_tokens,
+                    });
+                }
+                Err(message) => {
+                    eprintln!("generation error: {message}");
+                    let _ = job.tx.send(Ev::Failed { message });
+                }
+            }
         }
     }
 
@@ -516,6 +536,27 @@ mod imp {
                                         (rx, Phase::Done(ct), cancel_guard),
                                     ))
                                 }
+                                Some(Ev::Failed { message }) => {
+                                    // The HTTP response was already committed as
+                                    // 200 + text/event-stream when this SSE stream
+                                    // started, so an error mid-stream cannot change
+                                    // the status code. Mirror `lattice.rs`'s
+                                    // `StreamMsg::Failed` contract: log the real
+                                    // cause server-side (#611: e.g. a grammar mask
+                                    // that blocks every candidate token) and give
+                                    // the client a well-formed termination rather
+                                    // than hanging the stream open.
+                                    eprintln!("generation error (streaming): {message}");
+                                    let chunk = json!({
+                                        "id": id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(chunk.to_string())),
+                                        (rx, Phase::Done(0), cancel_guard),
+                                    ))
+                                }
                                 None => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -563,6 +604,24 @@ mod imp {
                     } => {
                         prompt_tokens = pt;
                         completion_tokens = ct;
+                    }
+                    Ev::Failed { message } => {
+                        // Unlike streaming, the response has not been committed
+                        // yet, so a generation failure (#611: e.g. a grammar mask
+                        // that blocks every candidate token) can still surface as
+                        // a real HTTP error instead of a disguised 200 -- the
+                        // same "generic 500, specific detail logged server-side"
+                        // contract the CPU/Metal handlers in `lattice.rs` use.
+                        eprintln!("generation error: {message}");
+                        emit_serve_event(
+                            "POST",
+                            "/v1/chat/completions",
+                            500,
+                            None,
+                            timer.elapsed().as_secs_f64() * 1000.0,
+                            false,
+                        );
+                        return err_response(StatusCode::INTERNAL_SERVER_ERROR, "inference failed");
                     }
                 }
             }
@@ -816,7 +875,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> (usize, usize) {
+        ) -> Result<(usize, usize), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 started.fetch_add(1, Ordering::SeqCst);
                 let mut n = 0usize;
@@ -831,7 +890,7 @@ mod imp {
                     n += 1;
                     ran_tokens.fetch_add(1, Ordering::SeqCst);
                 }
-                (1, n)
+                Ok((1, n))
             }
         }
 
@@ -852,12 +911,12 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> (usize, usize) {
+        ) -> Result<(usize, usize), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 for _ in 0..prefill_steps {
                     std::thread::sleep(Duration::from_millis(5));
                     if should_cancel() {
-                        return (1, 0);
+                        return Ok((1, 0));
                     }
                 }
                 entered_decode.store(true, Ordering::SeqCst);
@@ -872,7 +931,7 @@ mod imp {
                     }
                     n += 1;
                 }
-                (1, n)
+                Ok((1, n))
             }
         }
 
@@ -1020,6 +1079,9 @@ mod imp {
                         );
                         break;
                     }
+                    Some(Ev::Failed { message }) => {
+                        panic!("fake_generate never fails; unexpected Ev::Failed: {message}")
+                    }
                     None => panic!("job 1's reply channel closed before a Done event"),
                 }
             }
@@ -1087,6 +1149,9 @@ mod imp {
                          zero tokens, got {completion_tokens}"
                     );
                 }
+                Some(Ev::Failed { message }) => panic!(
+                    "fake_generate_with_prefill_gap never fails; unexpected Ev::Failed: {message}"
+                ),
                 None => panic!("job 1's reply channel closed before a Done event"),
             }
 
@@ -1100,6 +1165,103 @@ mod imp {
                  prefill has no on_token callback point and so could run to \
                  completion after the client already disconnected"
             );
+        }
+
+        /// A GPU-free fake that fails closed on its first call (mirroring the
+        /// #611 contract: `chat_completion_streaming_with_cancel` now returns
+        /// `Err` instead of silently sampling when a grammar mask blocks every
+        /// candidate token) and succeeds normally on every call after that, so
+        /// a single test can prove both halves of the contract: the failure is
+        /// reported honestly, and the worker thread survives it.
+        #[allow(clippy::type_complexity)]
+        fn fake_generate_fails_once_then_succeeds(
+            message: &'static str,
+            call_count: Arc<AtomicUsize>,
+        ) -> impl FnMut(
+            &[ChatMessage],
+            &GenerateConfig,
+            &mut dyn FnMut(&str, u32) -> bool,
+            &mut dyn FnMut() -> bool,
+        ) -> Result<(usize, usize), String> {
+            move |_messages, _cfg, on_token, _should_cancel| {
+                if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(message.to_string());
+                }
+                let _ = on_token("x", 0);
+                Ok((1, 1))
+            }
+        }
+
+        /// #611: a generation failure must reach the HTTP layer as
+        /// `Ev::Failed` carrying the real error, never as `Ev::Done` with a
+        /// fabricated token count -- the latter is exactly the fail-open shape
+        /// this issue closes (a blocked grammar silently reported as a normal
+        /// zero/short completion instead of an error). The worker thread must
+        /// also survive the failure and keep serving subsequent jobs, exactly
+        /// as it survives a cancelled job in the tests above.
+        #[test]
+        fn generation_failure_is_reported_as_ev_failed_not_ev_done() {
+            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+
+            let (job1, mut rx1, _guard1) = make_job();
+            job_tx.send(job1).unwrap();
+            let (job2, mut rx2, _guard2) = make_job();
+            job_tx.send(job2).unwrap();
+            drop(job_tx);
+
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let handle = std::thread::spawn({
+                let call_count = call_count.clone();
+                move || {
+                    run_worker_loop(
+                        job_rx,
+                        fake_generate_fails_once_then_succeeds(
+                            "grammar constraint blocked every token; no legal \
+                             continuation exists in the current grammar state",
+                            call_count,
+                        ),
+                    )
+                }
+            });
+
+            match rx1.blocking_recv() {
+                Some(Ev::Failed { message }) => {
+                    assert!(
+                        message.contains("grammar constraint blocked every token"),
+                        "Ev::Failed must carry the underlying error message, got: {message}"
+                    );
+                }
+                Some(Ev::Done { .. }) => panic!(
+                    "a failed generation must never be reported as Ev::Done -- that \
+                     would silently hand the HTTP layer a fabricated token count for \
+                     a request that produced no legal output, which is the #611 \
+                     fail-open failure mode this test guards against"
+                ),
+                Some(Ev::Delta(_)) => {
+                    panic!("a generator that fails on its first call must never emit a Delta first")
+                }
+                None => panic!("job 1's reply channel closed with no event at all"),
+            }
+
+            let mut done = None;
+            while let Some(ev) = rx2.blocking_recv() {
+                if let Ev::Done {
+                    completion_tokens, ..
+                } = ev
+                {
+                    done = Some(completion_tokens);
+                }
+            }
+            assert_eq!(
+                done,
+                Some(1),
+                "worker thread must survive a failed generation and serve the next \
+                 job normally afterward"
+            );
+
+            handle
+                .join()
+                .expect("worker thread must not panic on a generation error");
         }
     }
 }

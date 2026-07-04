@@ -193,7 +193,9 @@ fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
 
     let mut mismatches = 0;
     for case in &golden.cases {
-        let out = metal.generate(&case.prompt, &tokenizer, &gen_cfg);
+        let out = metal
+            .generate(&case.prompt, &tokenizer, &gen_cfg)
+            .expect("no grammar configured; must not fail closed");
         if out.token_ids != case.expected_generated_ids {
             mismatches += 1;
             eprintln!(

@@ -6667,10 +6667,11 @@ kernel void gdn_chunk_norm_silu_c32(
             let output = self.generate(prompt, tokenizer, gen_cfg);
 
             // Always unload after the request so the slot does not leak into the
-            // next call on this state object.
+            // next call on this state object — regardless of whether generate()
+            // succeeded or failed closed (e.g. an exhausted grammar mask, #611).
             self.unload_lora_adapter();
 
-            Ok(output)
+            output
         }
 
         /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
@@ -10225,12 +10226,20 @@ kernel void gdn_chunk_norm_silu_c32(
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token (prefill or any decode step) — mirrors the CPU
+        /// `generate` contract (#611).
         pub fn generate(
             &mut self,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> GenerateOutput {
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
             let cfg = self.engine.config.clone();
 
             // Initialize RNG
@@ -10258,28 +10267,28 @@ kernel void gdn_chunk_norm_silu_c32(
             let prompt_len = prompt_ids.len();
 
             if prompt_len == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
-                };
+                });
             }
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
             // so we never emit a token the caller did not ask for. Mirrors the CPU
             // generate() guard (model::qwen35::generation) and generate_streaming below.
             if gen_cfg.max_new_tokens == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
-                };
+                });
             }
 
             // Fail-closed: a prompt longer than the KV cache would trip the
@@ -10287,14 +10296,14 @@ kernel void gdn_chunk_norm_silu_c32(
             // caller thread. Return a clean empty completion instead. Mirrors the
             // streaming path and the CPU generate() preflight (see generate_streaming).
             if prompt_len > self.max_context() {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
-                };
+                });
             }
 
             // Reset state for new generation
@@ -10351,6 +10360,16 @@ kernel void gdn_chunk_norm_silu_c32(
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
@@ -10368,7 +10387,12 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return self.generate_greedy_mtp(&prefill_logits, prompt_len, tokenizer, gen_cfg);
+                return Ok(self.generate_greedy_mtp(
+                    &prefill_logits,
+                    prompt_len,
+                    tokenizer,
+                    gen_cfg,
+                ));
             }
 
             // GDN-first self-speculative greedy path: env-gated, greedy only.
@@ -10380,12 +10404,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 && gen_cfg.grammar.is_none()
                 && cfg.num_active_linear_attention_layers() > 0;
             if use_self_spec {
-                return self.generate_greedy_self_spec(
+                return Ok(self.generate_greedy_self_spec(
                     &prefill_logits,
                     prompt_len,
                     tokenizer,
                     gen_cfg,
-                );
+                ));
             }
 
             let next_id = if use_compact {
@@ -10404,14 +10428,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !engine.advance(gs, next_id)
             {
                 let text = tokenizer.decode(&generated_ids).unwrap_or_default();
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                     stopped: false,
                     stop_reason: Some(StopReason::Grammar),
-                };
+                });
             }
 
             let is_stop = |id: u32| -> bool {
@@ -10423,14 +10447,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
-                };
+                });
             }
 
             generated_ids.push(next_id);
@@ -10464,6 +10488,15 @@ kernel void gdn_chunk_norm_silu_c32(
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                         engine.mask_logits(gs, &mut step_logits);
+                        // Fail closed if the grammar blocked every continuation,
+                        // matching the CPU contract (#611).
+                        if !super::has_finite_logit(&step_logits) {
+                            return Err(InferenceError::InvalidInput(
+                                "grammar constraint blocked every token; \
+                                 no legal continuation exists in the current grammar state"
+                                    .into(),
+                            ));
+                        }
                     }
 
                     if use_compact {
@@ -10508,14 +10541,14 @@ kernel void gdn_chunk_norm_silu_c32(
             // Detokenize
             let text = decode_tokens(tokenizer, &generated_ids);
 
-            GenerateOutput {
+            Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
-            }
+            })
         }
 
         /// **Unstable**: multimodal generation; visual token handling and position encoding
@@ -14348,12 +14381,17 @@ kernel void gdn_chunk_norm_silu_c32(
         ///
         /// Chat completion: format messages with Qwen3.5 template, generate response.
         /// Stops on <|im_end|> or EOS or max tokens.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token — propagated from [`Self::generate`] (#611).
         pub fn chat_completion(
             &mut self,
             messages: &[ChatMessage],
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> ChatCompletionOutput {
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
             let prompt = format_chat_template(messages);
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
@@ -14362,13 +14400,13 @@ kernel void gdn_chunk_norm_silu_c32(
             {
                 cfg.stop_token_ids.push(im_end_id);
             }
-            let result = self.generate(&prompt, tokenizer, &cfg);
+            let result = self.generate(&prompt, tokenizer, &cfg)?;
             let text = result.text.trim_end().to_string();
-            ChatCompletionOutput {
+            Ok(ChatCompletionOutput {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
-            }
+            })
         }
 
         /// **Unstable**: streaming generation; callback signature may change.
@@ -14388,7 +14426,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             on_token: F,
-        ) -> GenerateOutput
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
         {
@@ -14410,6 +14448,12 @@ kernel void gdn_chunk_norm_silu_c32(
         ///
         /// `generate_streaming` is the `should_cancel = || false` convenience form
         /// and is otherwise identical; both share this one implementation.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token (prefill or any decode step) — mirrors the CPU
+        /// `generate_streaming` contract (#611).
         pub fn generate_streaming_with_cancel<F, C>(
             &mut self,
             prompt: &str,
@@ -14417,11 +14461,13 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
             mut on_token: F,
             mut should_cancel: C,
-        ) -> GenerateOutput
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            use crate::error::InferenceError;
+
             let cfg = self.engine.config.clone();
 
             let mut rng_state = match gen_cfg.seed {
@@ -14447,14 +14493,14 @@ kernel void gdn_chunk_norm_silu_c32(
             let prompt_len = prompt_ids.len();
 
             if prompt_len == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: 0,
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: None,
-                };
+                });
             }
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
@@ -14462,33 +14508,35 @@ kernel void gdn_chunk_norm_silu_c32(
             // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
             // and the generate() guard above.
             if gen_cfg.max_new_tokens == 0 {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false,
                     stop_reason: Some(StopReason::Length),
-                };
+                });
             }
 
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len), panicking and
             // killing this GPU worker thread — a persistent DoS for every later
             // request routed to it. Return a clean empty completion instead so the
-            // worker survives. Mirrors the CPU generate() preflight (which returns
-            // Err); this Metal entry point has no Result, so it yields an empty
-            // stopped output. The decode loop self-limits the prompt+completion case
+            // worker survives. Mirrors the CPU generate() preflight in spirit (both
+            // fail closed on an over-length prompt), but intentionally keeps
+            // returning an empty stopped output here rather than Err — this guard's
+            // contract is unrelated to and unchanged by the grammar fail-closed fix
+            // below (#611). The decode loop self-limits the prompt+completion case
             // (it breaks on seq_len >= max_cache_len), so only prefill needs guarding.
             if prompt_len > self.max_context() {
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::KvFull),
-                };
+                });
             }
 
             self.reset_state();
@@ -14552,14 +14600,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
-                };
+                });
             }
 
             // Batch prefill
@@ -14574,19 +14622,29 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: false, // caller interrupted the stream, not a stop condition
                     stop_reason: Some(StopReason::Interrupt),
-                };
+                });
             }
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let next_id = if use_compact {
@@ -14605,14 +14663,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 && !engine.advance(gs, next_id)
             {
                 let text = decode_tokens(tokenizer, &generated_ids);
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
                     stopped: false, // grammar constraint, not an OpenAI stop condition
                     stop_reason: Some(StopReason::Grammar),
-                };
+                });
             }
 
             let is_stop = |id: u32| -> bool {
@@ -14624,14 +14682,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
-                return GenerateOutput {
+                return Ok(GenerateOutput {
                     text: String::new(),
                     token_ids: vec![],
                     prompt_tokens: prompt_len,
                     generated_tokens: 0,
                     stopped: true, // EOS/stop-token hit immediately after prefill
                     stop_reason: Some(StopReason::Eos),
-                };
+                });
             }
 
             // Track whether the thinking block has been closed after prefill sampling.
@@ -14666,14 +14724,14 @@ kernel void gdn_chunk_norm_silu_c32(
                         self.session.compact_topk = 0;
                         self.session.compact_route = GpuTopkRoute::CpuFallback;
                     }
-                    return GenerateOutput {
+                    return Ok(GenerateOutput {
                         text,
                         token_ids: generated_ids.clone(),
                         prompt_tokens: prompt_len,
                         generated_tokens: generated_ids.len(),
                         stopped: false, // caller interrupted the stream, not a stop condition
                         stop_reason: Some(StopReason::Interrupt),
-                    };
+                    });
                 }
             }
             let mut stopped = false;
@@ -14707,6 +14765,15 @@ kernel void gdn_chunk_norm_silu_c32(
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
+                    // Fail closed if the grammar blocked every continuation,
+                    // matching the CPU contract (#611).
+                    if !super::has_finite_logit(&step_logits) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
 
                 let sampled_id = if use_compact {
@@ -14804,14 +14871,14 @@ kernel void gdn_chunk_norm_silu_c32(
                     on_token(&tail, last_pushed_id);
                 }
             }
-            GenerateOutput {
+            Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
                 stopped,
                 stop_reason: Some(stop_reason),
-            }
+            })
         }
 
         // ---------------------------------------------------------------------------
@@ -15920,7 +15987,7 @@ kernel void gdn_chunk_norm_silu_c32(
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             on_token: F,
-        ) -> ChatCompletionOutput
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
         {
@@ -15936,6 +16003,11 @@ kernel void gdn_chunk_norm_silu_c32(
         /// Cancellation-aware sibling of [`Self::chat_completion_streaming`]; see
         /// [`Self::generate_streaming_with_cancel`] for exactly what `should_cancel`
         /// observes that `on_token` alone cannot.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
+        /// blocks every token — propagated from [`Self::generate_streaming_with_cancel`] (#611).
         pub fn chat_completion_streaming_with_cancel<F, C>(
             &mut self,
             messages: &[ChatMessage],
@@ -15943,7 +16015,7 @@ kernel void gdn_chunk_norm_silu_c32(
             gen_cfg: &GenerateConfig,
             on_token: F,
             should_cancel: C,
-        ) -> ChatCompletionOutput
+        ) -> Result<ChatCompletionOutput, crate::error::InferenceError>
         where
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
@@ -15961,13 +16033,13 @@ kernel void gdn_chunk_norm_silu_c32(
                 &cfg,
                 on_token,
                 should_cancel,
-            );
+            )?;
             let text = result.text.trim_end().to_string();
-            ChatCompletionOutput {
+            Ok(ChatCompletionOutput {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
-            }
+            })
         }
     }
 
@@ -16544,6 +16616,7 @@ kernel void gdn_chunk_norm_silu_c32(
         where
             F: FnMut(&str, u32) -> bool,
         {
+            use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
             let cfg = self.engine.config.clone();
@@ -16697,6 +16770,16 @@ kernel void gdn_chunk_norm_silu_c32(
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
+                // If the grammar blocked every token the sampler's non-finite-max
+                // short-circuit would silently return the first candidate's token
+                // id. Fail closed instead, matching the CPU contract (#611).
+                if !super::has_finite_logit(&prefill_logits) {
+                    return Err(InferenceError::InvalidInput(
+                        "grammar constraint blocked every token at step 0; \
+                         no legal first token exists in the current grammar state"
+                            .into(),
+                    ));
+                }
             }
 
             let next_id = if use_compact {
@@ -16819,6 +16902,15 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
+                    // Fail closed if the grammar blocked every continuation,
+                    // matching the CPU contract (#611).
+                    if !super::has_finite_logit(&step_logits) {
+                        return Err(InferenceError::InvalidInput(
+                            "grammar constraint blocked every token; \
+                             no legal continuation exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
 
                 let sampled_id = if use_compact {
@@ -22084,7 +22176,9 @@ kernel void decode_attention_reference(
             // length preflight must trip before any prefill/decode work happens.
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny hybrid fixture");
 
-            let out = state.generate("abcdefgh", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("abcdefgh", &tokenizer, &gen_cfg)
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 out.generated_tokens, 0,
@@ -22139,14 +22233,16 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut calls = 0u32;
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
-                calls += 1;
-                assert!(
-                    !delta.is_empty(),
-                    "on_token must only be invoked with a non-empty delta"
-                );
-                false
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    calls += 1;
+                    assert!(
+                        !delta.is_empty(),
+                        "on_token must only be invoked with a non-empty delta"
+                    );
+                    false
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 calls, 1,
@@ -22200,16 +22296,18 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut on_token_calls = 0u32;
-            let out = state.generate_streaming_with_cancel(
-                "a",
-                &tokenizer,
-                &gen_cfg,
-                |_delta, _id| {
-                    on_token_calls += 1;
-                    true
-                },
-                || true, // already cancelled before generation ever starts
-            );
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        on_token_calls += 1;
+                        true
+                    },
+                    || true, // already cancelled before generation ever starts
+                )
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 on_token_calls, 0,
@@ -22279,23 +22377,25 @@ kernel void decode_attention_reference(
 
             let mut on_token_calls = 0u32;
             let mut should_cancel_calls = 0u32;
-            let out = state.generate_streaming_with_cancel(
-                "a",
-                &tokenizer,
-                &gen_cfg,
-                |_delta, _id| {
-                    on_token_calls += 1;
-                    true // on_token itself never asks to stop.
-                },
-                move || {
-                    should_cancel_calls += 1;
-                    // False for the before-prefill and after-prefill checks
-                    // (calls 1-2), letting exactly the prefill-sampled token
-                    // through; true starting at the decode loop's very first
-                    // check (call 3), before that iteration samples anything.
-                    should_cancel_calls > 2
-                },
-            );
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        on_token_calls += 1;
+                        true // on_token itself never asks to stop.
+                    },
+                    move || {
+                        should_cancel_calls += 1;
+                        // False for the before-prefill and after-prefill checks
+                        // (calls 1-2), letting exactly the prefill-sampled token
+                        // through; true starting at the decode loop's very first
+                        // check (call 3), before that iteration samples anything.
+                        should_cancel_calls > 2
+                    },
+                )
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 on_token_calls, 1,
@@ -22358,7 +22458,9 @@ kernel void decode_attention_reference(
             cfg.eos_token_id = u32::MAX;
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
-            let out = state.generate("a", &tokenizer, &gen_cfg);
+            let out = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 out.stop_reason,
@@ -22412,10 +22514,12 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut calls = 0u32;
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
-                calls += 1;
-                true
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                    calls += 1;
+                    true
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert_eq!(
                 calls, 0,
@@ -22477,10 +22581,12 @@ kernel void decode_attention_reference(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
 
             let mut accumulated = String::new();
-            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
-                accumulated.push_str(delta);
-                true
-            });
+            let out = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    accumulated.push_str(delta);
+                    true
+                })
+                .expect("no grammar configured; must not fail closed");
 
             assert!(
                 out.generated_tokens >= 3,
@@ -23819,12 +23925,14 @@ kernel void decode_attention_reference(
                 let mut reference_state =
                     MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 3);
-                let reference_out = reference_state.generate_streaming(
-                    &conversation,
-                    &tokenizer,
-                    &reference_gen_cfg,
-                    |_delta, _id| true,
-                );
+                let reference_out = reference_state
+                    .generate_streaming(
+                        &conversation,
+                        &tokenizer,
+                        &reference_gen_cfg,
+                        |_delta, _id| true,
+                    )
+                    .expect("no grammar configured; must not fail closed");
 
                 assert_eq!(
                     cached_out.output.token_ids, reference_out.token_ids,
@@ -23916,8 +24024,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming("xyz", &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after a prefix-mismatch invalidation, output must still match full re-prefill"
@@ -24046,8 +24155,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after cross-slot eviction, output must still match full re-prefill"
@@ -24121,8 +24231,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after an interleaved plain-path reset, output must still match full re-prefill"
@@ -24194,9 +24305,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state
-                    .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&conversation, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "exact-equal prompt retry output must match full re-prefill"
@@ -24373,8 +24484,9 @@ kernel void decode_attention_reference(
 
             let mut reference_state =
                 MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
-            let reference_out =
-                reference_state.generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true);
+            let reference_out = reference_state
+                .generate_streaming(&appended, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("no grammar configured; must not fail closed");
             assert_eq!(
                 second.output.token_ids, reference_out.token_ids,
                 "after an interleaved raw forward_step call, output must still match full re-prefill"
@@ -24456,6 +24568,219 @@ kernel void decode_attention_reference(
                 second.cache.mode,
                 crate::kv_cache::PrefixReuseMode::ExactAppend,
                 "an entry saved under the other GDN prefill mode must never be restored via ExactAppend"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Grammar fail-closed integration tests (#611)
+        //
+        // These three tests are the hardware-gated end-to-end counterpart to the
+        // pure-function `has_finite_logit_tests` module further down this file:
+        // that module proves the *predicate* is correct in isolation, these prove
+        // it is actually *wired in* at each real public Metal entry point, using
+        // the same technique as the CPU reference test
+        // `grammar_wiring_mask_logits_called_in_generate` in
+        // `model/qwen35/generation.rs`: a `GrammarEngine` built over a vocab
+        // table of all-empty byte sequences. `VocabPartition::build` rejects
+        // empty entries (they can never advance the PDA), so the precomputed
+        // bitmask for the initial state is all-zeros and `mask_logits` sets
+        // every one of `tiny_hybrid_fixture`'s 32 logits to `NEG_INFINITY`
+        // before the very first sample — a real, not simulated, all-blocked
+        // mask flowing through the real Metal forward path.
+        //
+        // Scope (mirrors the CPU test's own documented boundary): these cover
+        // the post-prefill masking site in each function. The decode-loop
+        // site is a second, structurally identical `has_finite_logit` guard a
+        // few lines below the prefill one in each of the three functions
+        // (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) — reachable only from
+        // step 2 onward, which would need a grammar that allows exactly one
+        // token and then blocks everything, a materially more complex fixture
+        // for marginal additional confidence given the two call sites are
+        // visually identical and reviewed together. Not separately covered
+        // here, same as upstream.
+        //
+        // Mutation sensitivity (all three): reverting the Metal-side
+        // `has_finite_logit` guard at the corresponding prefill site (or
+        // stubbing it to always return `true`) leaves the all-`NEG_INFINITY`
+        // row in place; the sampler's non-finite-max short-circuit then
+        // silently returns token 0 and each `matches!(result, Err(...))`
+        // assertion below fails instead of passing — this was verified by
+        // temporarily reverting the guard and re-running these three tests
+        // (see PR description).
+
+        /// #611: `generate`'s post-prefill grammar-masking site must fail
+        /// closed via `has_finite_logit`, exactly like the CPU path.
+        #[test]
+        fn generate_fails_closed_on_all_blocking_grammar() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // vocab_size=32 in `tiny_hybrid_fixture`; an all-empty-byte-sequence
+            // vocab table makes every one of the 32 entries unreachable by the
+            // PDA, so the initial-state mask blocks every logit.
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via generate(); got {result:?}"
+            );
+        }
+
+        /// #611: `generate_streaming`'s post-prefill grammar-masking site must
+        /// fail closed too. `generate_streaming` is a pure
+        /// `should_cancel = || false` delegate to
+        /// `generate_streaming_with_cancel` (see that method's doc comment),
+        /// so this one GPU run exercises both public entry points' shared
+        /// implementation without a redundant second pass.
+        #[test]
+        fn generate_streaming_fails_closed_on_all_blocking_grammar() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via generate_streaming(); \
+                 got {result:?}"
+            );
+            assert_eq!(
+                on_token_calls, 0,
+                "a prefill-blocked grammar must fail before any token ever reaches on_token"
+            );
+        }
+
+        /// #611: `generate_streaming_with_prefix_cache`'s post-prefill
+        /// grammar-masking site (inside
+        /// `generate_streaming_with_prefix_cache_inner`) must fail closed too,
+        /// AND the public wrapper's error path must not leave a stale cache
+        /// entry behind: unlike the CPU-only `_inner`, the public wrapper
+        /// resets state and evicts `slot_id`'s cache entry on any `Err` before
+        /// re-raising it (see that method's doc comment), so a
+        /// grammar-fail-closed turn can never leave the cache in a state a
+        /// later turn could incorrectly reuse.
+        #[test]
+        fn generate_streaming_with_prefix_cache_fails_closed_on_all_blocking_grammar() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let vocab_bytes: Vec<Vec<u8>> = vec![vec![]; 32];
+            let spec = GrammarSpec::Gbnf("root ::= \"ok\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, vocab_bytes)
+                    .expect("grammar engine builds with empty vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "grammar blocking every token must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a grammar-fail-closed turn must not leave a stale cache entry behind"
             );
         }
     }
@@ -25141,6 +25466,83 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "grammar = None must not trigger the preflight guard"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU-free grammar fail-closed guard (mirrors CPU `has_finite_logit`, #611).
+//
+// `generate`, `generate_streaming_with_cancel`, and
+// `generate_streaming_with_prefix_cache_inner` all apply grammar masking via
+// `GrammarEngine::mask_logits`, which sets every disallowed logit position to
+// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
+// (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
+// check and fail closed with `InferenceError::InvalidInput` when the grammar
+// blocks every token — otherwise the sampler's non-finite-max short-circuit
+// would silently return the first candidate's token id (numerically safe, but
+// a silent violation of the grammar contract). This is that same guard,
+// mirrored for the Metal paths.
+//
+// Lives at module level (no cfg gate beyond test/macos+metal-gpu) so it
+// compiles and is unit-testable on every platform without Metal GPU hardware,
+// the same way `multimodal_generate_preflight` above is.
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when at least one logit is strictly greater than
+/// `f32::NEG_INFINITY` — i.e. the grammar mask leaves at least one legal token.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
+    logits.iter().any(|&l| l > f32::NEG_INFINITY)
+}
+
+#[cfg(test)]
+mod has_finite_logit_tests {
+    use super::has_finite_logit;
+
+    /// Mutation sensitivity: change `has_finite_logit` to always return `true`
+    /// → this assertion fails, catching the regression that would let an
+    /// all-blocked grammar mask silently reach the sampler.
+    #[test]
+    fn all_neg_infinity_has_no_finite_logit() {
+        let logits = vec![f32::NEG_INFINITY; 8];
+        assert!(
+            !has_finite_logit(&logits),
+            "an all-NEG_INFINITY buffer must report no finite logit"
+        );
+    }
+
+    /// One surviving finite logit (even a very negative one, or NaN elsewhere)
+    /// must be enough to pass. Mutation sensitivity: change the comparison
+    /// from `>` to `>=` or invert it → this fails.
+    #[test]
+    fn one_finite_logit_among_neg_infinity_passes() {
+        let mut logits = vec![f32::NEG_INFINITY; 8];
+        logits[3] = -1e30; // finite, just very negative — still a legal token
+        assert!(
+            has_finite_logit(&logits),
+            "one surviving finite logit must be detected"
+        );
+    }
+
+    /// NaN is neither `> NEG_INFINITY` nor `<= NEG_INFINITY`; every NaN
+    /// comparison is false, so an all-NaN buffer must also fail closed.
+    #[test]
+    fn all_nan_has_no_finite_logit() {
+        let logits = vec![f32::NAN; 8];
+        assert!(
+            !has_finite_logit(&logits),
+            "an all-NaN buffer must also report no finite logit (NaN is not > NEG_INFINITY)"
+        );
+    }
+
+    /// A normal, fully-unmasked logit buffer must pass.
+    #[test]
+    fn normal_logits_pass() {
+        let logits = vec![0.1_f32, -2.0, 5.5, -0.001];
+        assert!(
+            has_finite_logit(&logits),
+            "an ordinary logit buffer must report at least one finite logit"
         );
     }
 }

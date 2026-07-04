@@ -131,7 +131,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut cases = Vec::with_capacity(PROMPTS.len());
     for (name, prompt) in PROMPTS {
         eprintln!("[dump_quarot_q4_golden] generating case={name}");
-        let out = metal.generate(prompt, &tokenizer, &gen_cfg);
+        let out = metal.generate(prompt, &tokenizer, &gen_cfg)?;
         eprintln!(
             "[dump_quarot_q4_golden] case={name} generated_tokens={} stopped={} stop_reason={:?}",
             out.generated_tokens, out.stopped, out.stop_reason
