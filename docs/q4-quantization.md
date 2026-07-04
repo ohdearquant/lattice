@@ -194,10 +194,23 @@ writes nothing** — `ConversionReport` is never returned, `main` prints `ERROR:
 There is no partial/corrupt output state to clean up.
 
 Note the different tensor counts (188 quantized + 148 kept = 336) versus plain `quantize_q4`'s
-271 + 217 = 488 on the same source directory: the QuaRot pipeline in this codebase operates on the
-core Qwen3.5 text transformer and does not carry the vision tower or MTP head through the rotation
-the way `quantize_q4`'s generic tensor-by-tensor pass does. If your workflow needs the QuaRot path
-specifically for text generation (chat/serve), this is expected; it is not a partial-conversion bug.
+271 + 217 = 488 on the same source directory. The two exclusions behind that gap are different
+kinds of things, and it's worth being precise about which is which
+(`crates/inference/src/quant/quarot/convert.rs`):
+
+- **Vision tower — excluded, never read.** Qwen3.5-0.8B's checkpoint on disk is multimodal (it
+  ships a `vision_config`); QuaRot's converter never reads or rewrites those tensors on either the
+  input or output side. They simply aren't part of this pipeline.
+- **MTP tensors — copied, not rotated or quantized.** When the config has `mtp_num_hidden_layers >
+  0` (true for Qwen3.5-0.8B, which ships 1 MTP layer), `write_mtp_weights_quarot` copies each MTP
+  tensor into the output directory as an unrotated, unquantized `.f16` file. They're part of the
+  336-tensor output — counted in the 148 "kept (F16)" — not silently dropped. Rotating and
+  quantizing MTP tensors is deferred to a later phase (see the ADR-051 note in `convert.rs`); today
+  they ride along as plain f16 copies.
+
+If your workflow needs the QuaRot path specifically for text generation (chat/serve), this is
+expected — the language-model tensors are the ones rotated and quantized, and MTP still loads and
+runs (as f16), it's just not yet part of the rotation; it is not a partial-conversion bug.
 
 ## Step 3: verify with perplexity, not just "it loaded"
 
@@ -313,21 +326,8 @@ codebase is Metal-only).
 `lattice doctor --model <dir> --tokenizer-dir <dir>` is a preflight check: it reports the detected
 format, weight memory footprint, KV-cache cost per token, and whether the checkpoint's tensors and
 your system's memory are actually sufficient to load it, without spending the time to load and run
-the model. Run it before `chat`/`serve` on any new Q4 output:
-
-```
-$ ./target/release/lattice doctor --model ~/.lattice/models/qwen3.5-0.8b-q4-quarot --tokenizer-dir ~/.lattice/models/qwen3.5-0.8b
-Model directory : /Users/lion/.lattice/models/qwen3.5-0.8b-q4-quarot
-Format          : Q4
-Placement       : Metal GPU
-Quantization    : Q4_0 (lattice native, v2 asymmetric)
-Tensors found   : 488
-Weight memory   : 1.07 GiB (1151517051 bytes)
-...
-Tokenizer       : /Users/lion/.lattice/models/qwen3.5-0.8b/tokenizer.json (found)
-
-Result: OK -- weights + KV cache fit; ready to load
-```
+the model. Run it before `chat`/`serve` on any new Q4 output — **but see the `quantize_quarot`
+limitation immediately below before pointing it at a QuaRot output directory.**
 
 exits 0 with `Result: OK` when the checkpoint is loadable and fits comfortably; exits 1 with
 `Result: NOT READY` and a specific reason otherwise. **If `doctor` reports dozens or hundreds of
@@ -338,6 +338,19 @@ corrupted or incomplete conversion — `doctor` inherits the same Qwen3.6-27B co
 `lattice serve`/`lattice chat`, so a missing config makes it expect a 27B-shaped tensor set against
 your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doctor` before assuming
 the conversion itself is broken.
+
+**Current limitation: `doctor` only understands `quantize_q4`'s bare-array manifest.**
+`lattice doctor` deserializes `quantize_index.json` as a plain JSON array of tensor entries
+(`Vec<Q4IndexEntry>` in `crates/inference/src/bin/lattice.rs`) — the shape `quantize_q4` writes.
+`quantize_quarot` writes a different, object-shaped manifest instead (`{"quarot_seed": ...,
+"tensors": [...]}`, see `crates/inference/src/quant/quarot/convert.rs`) so it can carry the
+rotation seed alongside the tensor list. Pointing `doctor` at a `quantize_quarot` output directory
+today does not produce a `Result: OK` or `Result: NOT READY` verdict at all — it fails at the
+manifest-parsing step with a JSON type-mismatch error (`invalid type: map, expected a sequence`),
+before any of the memory/tensor checks run. This is tracked as
+[issue #626](https://github.com/ohdearquant/lattice/issues/626); until it's resolved, treat
+`doctor` as `quantize_q4`-only, and verify a `quantize_quarot` checkpoint via `chat`/`serve`
+directly or `eval_perplexity --quarot-q4-dir` (Step 3 above) instead of `doctor`.
 
 ## Summary checklist
 

@@ -134,15 +134,23 @@ pub struct CachedGenerateOutput {
 
 This is your "did it actually reuse anything" signal — check `cache.mode` and
 `cache.reused_tokens` rather than assuming caching happened just because you called the
-`_with_prefix_cache` method. `chat_metal` (once PR #619 lands) prints exactly this to stderr after
-every turn:
+`_with_prefix_cache` method. `chat_metal` (once PR #619 lands — still an open draft as of this
+writing, so treat the lines below as a representative example, not a verbatim quote; exact wording
+may change before it merges) prints a line like this to stderr after every turn. The `--json` path
+(`--json --prompt` / `--json --serve`) and the interactive REPL use two different shapes:
 
 ```
-[chat_metal] GPU Metal q4-quarot: 812 prompt + 40 gen in 620ms = 64.5 tok/s | cache: ExactAppend reused 780/812
+# --json mode
+[chat_metal] GPU Metal q4: 812 prompt + 40 gen in 620ms = 64.5 tok/s | cache: ExactAppend reused 780/812
+
+# interactive REPL
+[812 prompt + 40 gen in 620.0ms = 64.5 tok/s | GPU Metal q4 | cache: ExactAppend reused 780/812]
 ```
 
-`reused_tokens` out of `prompt_tokens` tells you how much of this turn's prompt didn't need to be
-re-prefilled; `mode` tells you which of the three `PrefixReuseMode` variants applied.
+`model_format` here is `"bf16"` or `"q4"` — there is no separate `"q4-quarot"` label; a
+QuaRot-converted checkpoint loads and reports as plain `"q4"`. `reused_tokens` out of
+`prompt_tokens` tells you how much of this turn's prompt didn't need to be re-prefilled; `mode`
+tells you which of the three `PrefixReuseMode` variants applied.
 
 ### `PrefixReuseMode`: what actually happened
 

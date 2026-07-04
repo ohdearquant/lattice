@@ -85,6 +85,32 @@ Shut down with Ctrl-C — it's a graceful shutdown, not an immediate kill:
 (confirmed live: the process exits cleanly after printing this, rather than dropping in-flight
 connections.)
 
+## Auth, rate limiting, and concurrency
+
+None of this is implemented today — worth stating explicitly, since issue #601 asks for it:
+
+- **No authentication.** There is no API-key check, bearer-token check, or any other
+  `Authorization` handling anywhere in the router — it's exactly the two routes plus the
+  body-size layer shown above. Anyone who can reach the listening address can call it.
+- **No rate limiting, no per-request admission control.** There is no request-count or
+  concurrency-limiting middleware in front of the handlers. The only thing that rejects a request
+  before it reaches model code is the 1 MiB body-size cap already shown above.
+- **CPU backend: not serialized by the server, but not free either.** Each CPU request's
+  `generate` call runs as blocking work on a Tokio blocking-pool task
+  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
+  can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
+  limit, but concurrent CPU requests still contend for the same CPU cores and memory.
+- **Metal/Q4 backend: effectively concurrency-1.** All Metal generation is funneled through one
+  dedicated worker thread (an `mpsc` channel into a single OS thread holding the `!Send` Metal
+  state, `crates/inference/src/bin/lattice.rs`) — a deliberate design choice matching how one local
+  GPU device actually works, not an oversight. Two concurrent requests against a Q4-backed
+  `lattice serve` run back-to-back, not in parallel; the later request's connection simply stays
+  open until its turn in the channel comes up.
+
+None of this makes `lattice serve` unsafe to run locally or behind your own reverse proxy that adds
+auth and rate limiting — it just means `lattice serve` itself provides neither, so don't expose it
+directly to an untrusted network.
+
 ## `GET /health`
 
 ```
