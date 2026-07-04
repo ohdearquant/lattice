@@ -24880,17 +24880,16 @@ kernel void decode_attention_reference(
         // before the very first sample — a real, not simulated, all-blocked
         // mask flowing through the real Metal forward path.
         //
-        // Scope (mirrors the CPU test's own documented boundary): these cover
-        // the post-prefill masking site in each function. The decode-loop
-        // site is a second, structurally identical `has_finite_logit` guard a
-        // few lines below the prefill one in each of the three functions
-        // (`generate`, `generate_streaming_with_cancel`,
-        // `generate_streaming_with_prefix_cache_inner`) — reachable only from
-        // step 2 onward, which would need a grammar that allows exactly one
-        // token and then blocks everything, a materially more complex fixture
-        // for marginal additional confidence given the two call sites are
-        // visually identical and reviewed together. Not separately covered
-        // here, same as upstream.
+        // Scope: these three cover the post-prefill masking site in each
+        // function. The decode-loop site — a second, structurally identical
+        // `has_finite_logit` guard a few lines below the prefill one in each
+        // of the three functions (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) — is reachable only
+        // from step 2 onward and needs a grammar that allows exactly one
+        // token and then blocks everything. #611 round-1 codex review (medium
+        // finding) flagged that gap: it is covered separately by the
+        // "DECODE-LOOP integration tests" block below this one, which builds
+        // exactly that allow-then-block fixture.
         //
         // Mutation sensitivity (all three): reverting the Metal-side
         // `has_finite_logit` guard at the corresponding prefill site (or
@@ -24905,9 +24904,15 @@ kernel void decode_attention_reference(
         /// closed via `has_finite_logit`, exactly like the CPU path.
         #[test]
         fn generate_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
+            let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
@@ -24959,9 +24964,15 @@ kernel void decode_attention_reference(
         /// implementation without a redundant second pass.
         #[test]
         fn generate_streaming_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
+            let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
@@ -25023,9 +25034,15 @@ kernel void decode_attention_reference(
         /// later turn could incorrectly reuse.
         #[test]
         fn generate_streaming_with_prefix_cache_fails_closed_on_all_blocking_grammar() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
+            let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
@@ -25076,6 +25093,247 @@ kernel void decode_attention_reference(
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "a grammar-fail-closed turn must not leave a stale cache entry behind"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Grammar fail-closed DECODE-LOOP integration tests (#611 round-1 codex
+        // finding, medium)
+        //
+        // The three tests above only reach the post-prefill masking site: their
+        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
+        // never survives long enough to exercise the second, structurally
+        // identical guard a few lines below in the decode loop of each function
+        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
+        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
+        // of those three decode-loop guards left the three tests above green.
+        //
+        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
+        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
+        // `'a'`, so the initial-state mask allows exactly that one token and
+        // blocks the other 31. After `'a'` is sampled and the grammar state
+        // advances past it, the PDA stack is empty AND `complete == true`
+        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
+        // blocks all 32 tokens — the fixed point this test targets is one step
+        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
+        // is required so the loop actually reaches the decode iteration that
+        // hits the second mask; with `max_new_tokens: 1` the function would
+        // return successfully after the prefill token and never reach the
+        // decode-loop guard at all.
+        //
+        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
+        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
+        // mask in place, and the sampler's non-finite-max short-circuit then
+        // silently returns a token instead of failing — each assertion below
+        // fails instead of passing. Verified by temporarily reverse-applying
+        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
+        // re-running these three tests; restored afterward.
+
+        /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
+        /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
+        /// over it can accept/reject real single-character tokens instead of
+        /// the all-empty fixture the prefill-only tests above use.
+        fn single_char_vocab_bytes() -> Vec<Vec<u8>> {
+            (0u32..32)
+                .map(|i| {
+                    let byte = if i < 26 {
+                        b'a' + i as u8
+                    } else {
+                        b'A' + (i - 26) as u8
+                    };
+                    vec![byte]
+                })
+                .collect()
+        }
+
+        /// #611 round-1: `generate`'s DECODE-LOOP grammar-masking site
+        /// (:10502) must fail closed too, not just the post-prefill site.
+        #[test]
+        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard once the second step's mask blocks every \
+                 continuation; got {result:?}"
+            );
+        }
+
+        /// #611 round-1: `generate_streaming`'s DECODE-LOOP grammar-masking
+        /// site (`generate_streaming_with_cancel` :14821) must fail closed
+        /// too. Also asserts `on_token` is invoked at most once — the
+        /// fail-open bug this closes would otherwise emit a bogus second
+        /// token to the caller instead of erroring.
+        #[test]
+        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard via generate_streaming(); got {result:?}"
+            );
+            assert!(
+                on_token_calls <= 1,
+                "the decode-loop guard must fire before a second (bogus) token \
+                 ever reaches on_token; got {on_token_calls} calls"
+            );
+        }
+
+        /// #611 round-1: `generate_streaming_with_prefix_cache`'s
+        /// DECODE-LOOP grammar-masking site (inside
+        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
+        /// closed too, AND the public wrapper's error path must not save a
+        /// cache entry the decode-loop failure invalidated.
+        #[test]
+        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a grammar allowing exactly one token must fail closed at the \
+                 decode-loop guard via generate_streaming_with_prefix_cache(); \
+                 got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a decode-loop grammar-fail-closed turn must not leave a stale \
+                 cache entry behind"
             );
         }
     }
