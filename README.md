@@ -204,7 +204,7 @@ list first: releases published before this workflow landed have no prebuilt
 binaries (use `cargo install` for those versions).
 
 ```bash
-VERSION=0.4.2   # match a release that has binary assets attached
+VERSION=<version>   # replace with a release whose Assets list includes lattice-* tarballs
 TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
 
 curl -LO "https://github.com/ohdearquant/lattice/releases/download/v${VERSION}/lattice-${VERSION}-${TARGET}.tar.gz"
