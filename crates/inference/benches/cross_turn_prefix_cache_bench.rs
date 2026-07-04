@@ -80,6 +80,7 @@ fn bench_gen_cfg(max_new_tokens: usize) -> GenerateConfig {
         grammar: None,
         stop_strings: vec![],
         reasoning_budget: None,
+        logprobs: None,
     }
 }
 
