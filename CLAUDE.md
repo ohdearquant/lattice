@@ -106,8 +106,8 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 A PR merges only when its branch is **up to date with main** AND **green at its actual head**.
 Branch protection enforces this (`required_status_checks.strict = true`), added after #634
 merged green-on-a-stale-base and broke main for two hours: main had gained call sites of the
-API it changed, and the merged combination was never compiled anywhere before landing. Two
-more stale-base PRs then auto-merged onto the red main.
+API it changed, and the merged combination was never compiled anywhere before landing. Four
+more stale-base PRs (#636, #638, #639, #642) then auto-merged onto the red main.
 
 - Never arm auto-merge on a PR whose branch is behind main; `gh pr update-branch <N>` first.
 - When main goes red, treat every armed auto-merge as suspect: disarm or hold until main is
