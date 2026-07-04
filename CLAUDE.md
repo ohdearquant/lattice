@@ -70,6 +70,12 @@ When a test fails intermittently or fails alongside unrelated work, run the disc
 
 This split a two-test failure report cleanly: one test failed deterministically at every prompt length under solo idle-GPU conditions (real chunk-boundary accumulation drift, its own issue), while the other passed solo in 65 seconds (a load flake, a different issue). Filing them as one regression would have sent the fix to the wrong place.
 
+### Machine-Wide GPU Test Lock
+
+All Metal-touching tests in this repo serialize through `gpu_test_lock()` (crates/inference/src/forward/metal_qwen35.rs), which holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, fleet-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins ~3x and produced false failure reports (#628, #629).
+
+The lock blocks for up to 30 minutes, then panics with an `lsof /tmp/lion-metal-gpu-test.lock` hint rather than hanging silently. If a run appears stuck at test start, another process is holding the GPU; check who with `lsof` before killing anything.
+
 ### Regression Tests Must Be Mutation-Sensitive
 
 A regression test that passes with the fix reverted is decoration. Before claiming a test guards a fix: revert the fix (reverse-apply the diff — never `git checkout` over uncommitted work), `touch` the source file so cargo actually rebuilds, and watch the test fail. Then restore the fix and watch it pass.

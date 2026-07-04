@@ -22144,19 +22144,83 @@ kernel void decode_attention_reference(
             r
         }
 
-        /// Serializes GPU-heavy model tests onto the single shared Metal device.
-        /// Concurrent GPU execution amplifies the pre-existing ADR-065 attention
-        /// race, which perturbs the *serial* GDN reference that the cross-algorithm
-        /// parity tests compare against — producing false-positive failures under
-        /// `cargo test`'s default multi-threading. The chunked scan itself is
-        /// deterministic (see `gdn_chunked_b_vs_b_self_consistency`); serializing
-        /// device access keeps the serial reference clean run-to-run.
-        fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        /// Serializes GPU-heavy model tests onto the single shared Metal device —
+        /// across BOTH test threads in this process and any other process on the
+        /// machine.
+        ///
+        /// In-process half: concurrent GPU execution amplifies the pre-existing
+        /// ADR-065 attention race, which perturbs the *serial* GDN reference that
+        /// the cross-algorithm parity tests compare against — producing
+        /// false-positive failures under `cargo test`'s default multi-threading.
+        /// The chunked scan itself is deterministic (see
+        /// `gdn_chunked_b_vs_b_self_consistency`); serializing device access keeps
+        /// the serial reference clean run-to-run.
+        ///
+        /// Machine-level half (#628/#629 post-mortem): the in-process mutex cannot
+        /// stop `cargo test` runs launched from OTHER worktrees on the same
+        /// machine, and concurrent Metal load provably corrupts real-checkpoint
+        /// numerics (boundary-tie margins inflated ~3x during a confirmed
+        /// contention window). So the guard also holds an exclusive advisory
+        /// `flock` on a fixed machine-wide path, `/tmp/lion-metal-gpu-test.lock`,
+        /// making cross-process serialization automatic instead of a convention
+        /// agents must remember. Any harness touching the Metal GPU should
+        /// acquire the same path.
+        ///
+        /// Acquisition order is mutex-then-file, so at most one thread per
+        /// process ever contends the file lock. The file lock is polled with
+        /// `try_lock` so a wedged holder surfaces as a clear panic after a
+        /// generous timeout instead of a silent infinite hang.
+        struct GpuTestGuard {
+            _process: std::sync::MutexGuard<'static, ()>,
+            // Held for the guard's lifetime; dropping the File closes the fd,
+            // which releases the flock.
+            _machine: std::fs::File,
+        }
+
+        const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
+        const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(30 * 60);
+
+        fn gpu_test_lock() -> GpuTestGuard {
             use std::sync::Mutex;
             static GPU_LOCK: Mutex<()> = Mutex::new(());
-            GPU_LOCK
+            let process = GPU_LOCK
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(GPU_MACHINE_LOCK_PATH)
+                .unwrap_or_else(|e| {
+                    panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}")
+                });
+            let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!(
+                                "gpu_test_lock: another process has held \
+                                 {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
+                                 test run elsewhere on this machine is wedged or \
+                                 genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
+                                GPU_MACHINE_LOCK_TIMEOUT.as_secs()
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
+                    }
+                }
+            }
+            GpuTestGuard {
+                _process: process,
+                _machine: file,
+            }
         }
 
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
