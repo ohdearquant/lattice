@@ -14978,7 +14978,7 @@ kernel void gdn_chunk_norm_silu_c32(
             cfg: &Qwen35Config,
             device: &Device,
         ) -> MtpQ4LoadResult {
-            use crate::weights::q4_weights::load_f16_tensor_file;
+            use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
 
             if cfg.mtp_num_hidden_layers == 0 {
                 return MtpQ4LoadResult {
@@ -14988,7 +14988,6 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             let f16p = |name: &str| MetalQwen35State::q4_tensor_path(q4_dir, name, "f16");
-            // follow-up: #418's actual-load part is deferred; this loader still expects .f16 MTP files while the shipped Q4 checkpoint provides those weights as .q4.
 
             // Helper: load an f16 file as a f32 Metal buffer (for norm gammas / biases
             // consumed by RMSNorm kernels that read f32 input).
@@ -15016,6 +15015,30 @@ kernel void gdn_chunk_norm_silu_c32(
                     Ok(make_buffer_f16(device, &vals, label))
                 };
 
+            // Helper: load one of the 8 MTP projection matrices as a Metal
+            // half-precision (f16) buffer, accepting either on-disk flavor.
+            //
+            // `quantize_q4` applies the same `should_quantize` name-suffix rule
+            // to MTP tensors as to the main model, so the 8 `*_proj*.weight`
+            // MTP matrices are written as `.q4` (dequantize-on-load here).
+            // `quantize_quarot` instead keeps every MTP tensor as unrotated
+            // `.f16` (ADR-051 Phase 1: MTP counter-rotation needs unquantized
+            // weights, so QuaRot checkpoints never emit MTP `.q4` files).
+            // Preferring `.q4` when present and falling back to `.f16` lets
+            // both checkpoint flavors load through the same path without
+            // needing to sniff which quantizer produced the directory.
+            let load_q4_or_f16_proj_as_half =
+                |name: &str, label: &str| -> Result<Buffer, std::path::PathBuf> {
+                    let q4_path = MetalQwen35State::q4_tensor_path(q4_dir, name, "q4");
+                    if q4_path.exists() {
+                        let tensor = load_q4_file(&q4_path).map_err(|_| q4_path.clone())?;
+                        return Ok(MetalQwen35State::make_buffer_f16_from_q4(
+                            device, &tensor, label,
+                        ));
+                    }
+                    load_f16_buf_as_half(name, label)
+                };
+
             let weights = (|| -> Result<MetalMtpWeights, std::path::PathBuf> {
                 // --- Layer 0 weights (ADR-051: 8 projections as f16, 7 norms as f32) ---
                 let input_layernorm = load_f16_buf_as_f32(
@@ -15026,27 +15049,41 @@ kernel void gdn_chunk_norm_silu_c32(
                     "mtp.layers.0.post_attention_layernorm.weight",
                     "mtp.l0.post_attn_layernorm",
                 )?;
-                let q_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.q_proj.weight", "mtp.l0.q_proj")?;
-                let k_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.k_proj.weight", "mtp.l0.k_proj")?;
-                let v_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.v_proj.weight", "mtp.l0.v_proj")?;
-                let o_proj =
-                    load_f16_buf_as_half("mtp.layers.0.self_attn.o_proj.weight", "mtp.l0.o_proj")?;
+                let q_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.self_attn.q_proj.weight",
+                    "mtp.l0.q_proj",
+                )?;
+                let k_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.self_attn.k_proj.weight",
+                    "mtp.l0.k_proj",
+                )?;
+                let v_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.self_attn.v_proj.weight",
+                    "mtp.l0.v_proj",
+                )?;
+                let o_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.self_attn.o_proj.weight",
+                    "mtp.l0.o_proj",
+                )?;
                 let q_norm =
                     load_f16_buf_as_f32("mtp.layers.0.self_attn.q_norm.weight", "mtp.l0.q_norm")?;
                 let k_norm =
                     load_f16_buf_as_f32("mtp.layers.0.self_attn.k_norm.weight", "mtp.l0.k_norm")?;
-                let gate_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.gate_proj.weight", "mtp.l0.gate_proj")?;
-                let up_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.up_proj.weight", "mtp.l0.up_proj")?;
-                let down_proj =
-                    load_f16_buf_as_half("mtp.layers.0.mlp.down_proj.weight", "mtp.l0.down_proj")?;
+                let gate_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.mlp.gate_proj.weight",
+                    "mtp.l0.gate_proj",
+                )?;
+                let up_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.mlp.up_proj.weight",
+                    "mtp.l0.up_proj",
+                )?;
+                let down_proj = load_q4_or_f16_proj_as_half(
+                    "mtp.layers.0.mlp.down_proj.weight",
+                    "mtp.l0.down_proj",
+                )?;
 
                 // --- Top-level MTP weights ---
-                let fc = load_f16_buf_as_half("mtp.fc.weight", "mtp.fc")?;
+                let fc = load_q4_or_f16_proj_as_half("mtp.fc.weight", "mtp.fc")?;
                 let pre_fc_norm_embedding = load_f16_buf_as_f32(
                     "mtp.pre_fc_norm_embedding.weight",
                     "mtp.pre_fc_norm_embedding",
@@ -18993,6 +19030,174 @@ kernel void decode_attention_reference(
                 result.is_ok(),
                 "mmap_q4_weight must accept a fully populated payload: {:?}",
                 result.err()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // load_mtp_q4_weights: Q4-or-F16 MTP projection loading (#630)
+        // -------------------------------------------------------------------
+        //
+        // `quantize_q4` applies its `should_quantize` name-suffix rule to
+        // MTP tensor names exactly like the main model: the 8 `*_proj*`
+        // matrices (q/k/v/o_proj, gate/up/down_proj, fc) are written as
+        // `.q4`, while the 7 norm tensors are written as `.f16`.
+        // `quantize_quarot` instead keeps ALL 15 MTP tensors as unrotated
+        // `.f16` (ADR-051 Phase 1: MTP counter-rotation needs unquantized
+        // weights). `load_mtp_q4_weights` must accept both flavors.
+
+        /// Write a tiny `.f16` (KHF1) tensor file with `numel` copies of
+        /// `1.0`, mirroring the format `load_f16_tensor_file` reads
+        /// (crates/inference/src/weights/q4_weights.rs).
+        fn write_tiny_f16_fixture(dir: &std::path::Path, name: &str, numel: usize) {
+            use crate::weights::q4_weights::q4_f32_to_f16;
+            let path = MetalQwen35State::q4_tensor_path(dir, name, "f16");
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"KHF1");
+            buf.extend_from_slice(&1u32.to_le_bytes()); // version
+            buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
+            buf.extend_from_slice(&(numel as u64).to_le_bytes()); // shape[0]
+            buf.extend_from_slice(&(numel as u64).to_le_bytes()); // numel
+            for _ in 0..numel {
+                buf.extend_from_slice(&q4_f32_to_f16(1.0).to_le_bytes());
+            }
+            std::fs::write(&path, buf).expect("write .f16 fixture");
+        }
+
+        /// Write a tiny `.q4` tensor file with `numel` copies of `0.1`.
+        fn write_tiny_q4_fixture(dir: &std::path::Path, name: &str, numel: usize) {
+            use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
+            let data = vec![0.1f32; numel];
+            let tensor = quantize_f32_to_q4(&data, &[numel]).expect("quantize tiny tensor");
+            let path = MetalQwen35State::q4_tensor_path(dir, name, "q4");
+            save_q4_file(&path, &tensor).expect("save .q4 fixture");
+        }
+
+        /// The 8 MTP projection tensor names (q/k/v/o_proj, gate/up/down_proj, fc).
+        const MTP_PROJ_NAMES: [&str; 8] = [
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+            "mtp.fc.weight",
+        ];
+
+        /// The 7 MTP norm tensor names — never quantized (`should_quantize`
+        /// excludes anything containing `norm.weight`).
+        const MTP_NORM_NAMES: [&str; 7] = [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+
+        #[test]
+        fn load_mtp_q4_weights_accepts_q4_projections_with_f16_norms() {
+            // Straight (non-QuaRot) Q4 checkpoint shape: 8 projections as
+            // `.q4`, 7 norms as `.f16`. Before the #630 fix,
+            // `load_mtp_q4_weights` only tried `.f16` for the projections,
+            // so it always reported the first projection as missing on
+            // this exact directory layout (the real shape `quantize_q4`
+            // ships) — reverting the fix must fail this assertion.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+            let intermediate = cfg.intermediate_size;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+
+            for &name in &MTP_PROJ_NAMES {
+                let numel = if name.contains("gate_proj") || name.contains("up_proj") {
+                    intermediate * hidden
+                } else if name.contains("down_proj") {
+                    hidden * intermediate
+                } else {
+                    hidden * hidden
+                };
+                write_tiny_q4_fixture(tmp.path(), name, numel);
+            }
+            for &name in &MTP_NORM_NAMES {
+                write_tiny_f16_fixture(tmp.path(), name, hidden);
+            }
+
+            let result = MetalQwen35State::load_mtp_q4_weights(tmp.path(), &cfg, &device);
+
+            assert!(
+                result.weights.is_some(),
+                "load_mtp_q4_weights must load MTP weights when the 8 projections \
+                 are .q4 and the 7 norms are .f16 (the real quantize_q4 output \
+                 shape); first_missing_file={:?}",
+                result.first_missing_file
+            );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_still_accepts_all_f16_quarot_layout() {
+            // QuaRot checkpoints (`quantize_quarot`) keep every MTP tensor,
+            // including the 8 projections, as unrotated `.f16` (ADR-051
+            // Phase 1). The Q4-preferring loader must fall back to `.f16`
+            // when no `.q4` sibling exists, so this checkpoint flavor keeps
+            // working exactly as before.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let hidden = cfg.hidden_size;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+
+            for &name in &MTP_PROJ_NAMES {
+                write_tiny_f16_fixture(tmp.path(), name, hidden);
+            }
+            for &name in &MTP_NORM_NAMES {
+                write_tiny_f16_fixture(tmp.path(), name, hidden);
+            }
+
+            let result = MetalQwen35State::load_mtp_q4_weights(tmp.path(), &cfg, &device);
+
+            assert!(
+                result.weights.is_some(),
+                "load_mtp_q4_weights must still accept the all-.f16 QuaRot \
+                 layout; first_missing_file={:?}",
+                result.first_missing_file
+            );
+        }
+
+        #[test]
+        fn load_mtp_q4_weights_reports_missing_file_when_neither_flavor_present() {
+            // Fail-closed contract: if a projection has neither a `.q4` nor
+            // a `.f16` sibling, the loader must report it as missing (and
+            // the caller falls back to the non-MTP decode path with a
+            // warning) rather than silently loading garbage.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let (mut cfg, _weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            // Deliberately write nothing — the directory is empty.
+
+            let result = MetalQwen35State::load_mtp_q4_weights(tmp.path(), &cfg, &device);
+
+            assert!(
+                result.weights.is_none(),
+                "load_mtp_q4_weights must not synthesize weights when both \
+                 .q4 and .f16 are absent"
+            );
+            assert!(
+                result.first_missing_file.is_some(),
+                "load_mtp_q4_weights must report a first_missing_file when \
+                 nothing is on disk"
             );
         }
 
