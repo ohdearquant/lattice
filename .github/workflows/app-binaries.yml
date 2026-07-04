@@ -32,9 +32,13 @@ on:
 # Cancel a PR's own superseded runs so they stop occupying the shared macOS
 # runner pool (~5 concurrent, account-wide) while a newer push on the same PR
 # waits behind them. Never cancel a push to main or a manual dispatch: neither
-# has a "next run" to fall back on if killed mid-flight.
+# has a "next run" to fall back on if killed mid-flight. The event_name segment
+# keeps a push run and a workflow_dispatch run on the same ref out of each
+# other's queue: GitHub cancels a PENDING run whenever another run enters its
+# group, even with cancel-in-progress false, so two different trigger kinds
+# sharing one group could still replace each other while queued.
 concurrency:
-  group: app-binaries-${{ github.event.pull_request.number || github.ref }}
+  group: app-binaries-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

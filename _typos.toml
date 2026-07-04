@@ -5,14 +5,13 @@
 # Binary/data fixtures and large corpora are not prose; scanning them as text
 # produces thousands of false positives from arbitrary subword byte sequences
 # and floating-point dumps. Excluded even though `.gitignore` already covers
-# `target/` and `.khive/`, so the exclusion is explicit rather than incidental.
+# `target/`, so the exclusion is explicit rather than incidental.
 extend-exclude = [
     "crates/inference/tests/fixtures/tokenizers/**",
     "crates/inference/benchmarks/golden_logits/**",
     "crates/embed/tests/fixtures/**",
     "docs/bench_results/**",
     "target/**",
-    ".khive/**",
 ]
 
 [default.extend-words]

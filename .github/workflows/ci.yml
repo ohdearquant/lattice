@@ -4,13 +4,27 @@ name: CI
 # a *required* status check, and a required check whose workflow never even
 # runs leaves a PR stuck on "Expected, waiting for status to be reported"
 # forever. So this workflow always triggers on every PR to main. Docs-only
-# PRs are instead handled per-job: `ci`, `feature-matrix`, `bench-compile`,
-# and `msrv` are gated on the `changes` job below and report `skipped` rather
-# than spending the account-wide macOS runner pool on a diff that cannot
-# affect compilation. A skipped required check still satisfies branch
-# protection, unlike a job whose workflow never ran at all. `cargo-deny`,
-# `rustdoc-lint`, and `unwrap-in-lib-lint` stay ungated: they are already
+# PRs are instead handled by gating `ci`, `feature-matrix`, `bench-compile`,
+# and `msrv` on the `changes` job below.
+#
+# `ci` and `feature-matrix` are matrix jobs, so their required-check contexts
+# come from matrix expansion ("CI (macos-latest)", "feature-matrix
+# (ubuntu-latest)", etc). `jobs.<id>.if` is evaluated BEFORE the matrix
+# expands, so a docs-only skip at job level never even creates those
+# per-combination check runs; a required context that never gets created
+# stays "Expected, waiting for status" forever, the exact trap this
+# workflow's triggers are already written to avoid. So the matrix-expanded
+# names are NOT the required contexts here: `ci-gate` at the bottom of this
+# file is, mirroring `parity-gate` in e2e-parity.yml and `app-binaries-gate`
+# in app-binaries.yml. It always runs, always reports, and fails closed if
+# change-detection itself failed. `cargo-deny`, `rustdoc-lint`, and
+# `unwrap-in-lib-lint` stay ungated and directly required: they are already
 # cheap ubuntu-only jobs, so gating them would save nothing.
+#
+# Rollout note: branch protection's required contexts currently list the
+# seven heavy job/matrix names directly. Swapping them for `ci-gate` is a
+# repo-settings change (Settings -> Branches -> main protection rule), done
+# once this workflow shape is merged and green.
 on:
   push:
     branches: [main]
@@ -20,9 +34,13 @@ on:
 # Cancel a PR's own superseded runs so they stop occupying the shared
 # macOS runner pool (~5 concurrent, account-wide) while a newer push on the
 # same PR waits behind them. Never cancel a push to main: main has no "next
-# push" to fall back on if a run is killed mid-flight.
+# push" to fall back on if a run is killed mid-flight. The event_name segment
+# keeps a push run and a workflow_dispatch run on the same ref out of each
+# other's queue: GitHub cancels a PENDING run whenever another run enters its
+# group, even with cancel-in-progress false, so two different trigger kinds
+# sharing one group could still replace each other while queued.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -439,3 +457,54 @@ jobs:
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features
+
+  # REQUIRED status check (see the rollout note at the top of this file).
+  # Always runs, always reports. `ci`, `feature-matrix`, `bench-compile`, and
+  # `msrv` are matrix and/or docs-gated, so none of them is individually a
+  # safe required context: a matrix job skipped at job level never creates
+  # its per-combination check runs at all, and a plain gated job that skips
+  # reports success even if `changes` itself blew up. This job passes when
+  # there is nothing to check (docs-only) and mirrors the four heavy jobs'
+  # results when there is, exactly like `parity-gate` in e2e-parity.yml and
+  # `app-binaries-gate` in app-binaries.yml.
+  ci-gate:
+    name: ci-gate
+    needs: [changes, ci, feature-matrix, bench-compile, msrv]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve gate
+        run: |
+          CHANGES_RESULT="${{ needs.changes.result }}"
+          CODE="${{ needs.changes.outputs.code }}"
+          CI_RESULT="${{ needs.ci.result }}"
+          FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
+          BENCH_COMPILE_RESULT="${{ needs.bench-compile.result }}"
+          MSRV_RESULT="${{ needs.msrv.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::change-detection did not succeed, failing closed."
+            exit 1
+          fi
+          if [ "$CODE" != "true" ]; then
+            echo "Docs-only change, heavy compile jobs not required. PASS."
+            exit 0
+          fi
+          if [ "$CI_RESULT" != "success" ]; then
+            echo "::error::ci did not succeed (result=$CI_RESULT)."
+            exit 1
+          fi
+          if [ "$FEATURE_MATRIX_RESULT" != "success" ]; then
+            echo "::error::feature-matrix did not succeed (result=$FEATURE_MATRIX_RESULT)."
+            exit 1
+          fi
+          if [ "$BENCH_COMPILE_RESULT" != "success" ]; then
+            echo "::error::bench-compile did not succeed (result=$BENCH_COMPILE_RESULT)."
+            exit 1
+          fi
+          if [ "$MSRV_RESULT" != "success" ]; then
+            echo "::error::msrv did not succeed (result=$MSRV_RESULT)."
+            exit 1
+          fi
+          echo "Code changed; ci, feature-matrix, bench-compile, and msrv all PASSED."
+          exit 0
