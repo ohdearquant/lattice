@@ -85,6 +85,13 @@ pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`generate`].
 pub mod stop_reason;
 
+/// Cross-path sweep (#613): every CPU-family `generate*` entry point agrees on
+/// the stop-token contract (excluded from `token_ids`/`text`). The Metal-family
+/// entry points are covered in `forward::metal_qwen35`'s own test module; see
+/// this module's doc comment for the full manifest and rationale.
+#[cfg(test)]
+mod stop_token_contract;
+
 /// Backward-pass support for training and LoRA workflows, built on [`lora_hook`] and
 /// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]

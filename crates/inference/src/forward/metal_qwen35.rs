@@ -9722,16 +9722,15 @@ kernel void gdn_chunk_norm_silu_c32(
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
             if is_stop(pending_first) {
-                // Plain greedy (`generate()`) pushes the first token before
-                // checking for EOS (generate.rs line 292: generated_ids.push(first_token)
-                // then checks config.eos_token_id == Some(first_token)).  Match that
-                // contract: emit the stop token, return generated_tokens = 1.
-                let text = decode_tokens(tokenizer, &[pending_first]);
+                // Stop-token contract (#613): the terminating token is excluded
+                // from token_ids/text. max_new_tokens == 0 already returned above,
+                // so budget was available for this token — this is a genuine
+                // stop, not one clipped by the cap.
                 return GenerateOutput {
-                    text,
-                    token_ids: vec![pending_first],
+                    text: String::new(),
+                    token_ids: vec![],
                     prompt_tokens: prompt_len,
-                    generated_tokens: 1,
+                    generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
                     token_logprobs: vec![],
@@ -9854,9 +9853,18 @@ kernel void gdn_chunk_norm_silu_c32(
                         let remaining = gen_cfg.max_new_tokens - generated_ids.len();
                         let emit_len = tokens.len().min(remaining);
                         generated_ids.extend_from_slice(&tokens[..emit_len]);
-                        // The stop token is the last element of `tokens`; it is a real stop
-                        // only if it was emitted, not clipped off by the remaining budget.
-                        stopped = emit_len == tokens.len();
+                        // Stop-token contract (#613): `tokens` holds only the committed
+                        // (non-stop) tokens for this round — the stop token itself is
+                        // never in it. Codex round-1 (#632): `emit_len == tokens.len()`
+                        // alone is not sufficient — if the committed payload exactly
+                        // fills `remaining`, the excluded stop token would have landed
+                        // one position *beyond* `max_new_tokens`, so plain greedy would
+                        // never have reached it either and reports Length, not Eos.
+                        // `stopped` is therefore true only when every committed token
+                        // was emitted AND at least one more slot remained for the
+                        // (excluded) stop token itself — i.e. the stop was genuinely
+                        // reached within budget, not merely coincident with the cap.
+                        stopped = emit_len == tokens.len() && remaining > tokens.len();
                         if stopped {
                             stop_reason = StopReason::Eos;
                         }
@@ -9961,15 +9969,15 @@ kernel void gdn_chunk_norm_silu_c32(
 
             let pending_first = argmax_logits(prefill_logits);
             if is_stop(pending_first) {
-                // Plain greedy (generate.rs) pushes the first token before the EOS
-                // check — so the stop token is always the last element of the output.
-                // Mirror that contract: emit [pending_first], generated_tokens = 1.
-                let text = decode_tokens(tokenizer, &[pending_first]);
+                // Stop-token contract (#613): the terminating token is excluded
+                // from token_ids/text. max_new_tokens == 0 already returned above,
+                // so budget was available for this token — this is a genuine
+                // stop, not one clipped by the cap.
                 return GenerateOutput {
-                    text,
-                    token_ids: vec![pending_first],
+                    text: String::new(),
+                    token_ids: vec![],
                     prompt_tokens: prompt_len,
-                    generated_tokens: 1,
+                    generated_tokens: 0,
                     stopped: true,
                     stop_reason: Some(StopReason::Eos),
                     token_logprobs: vec![],
@@ -10007,11 +10015,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
-                    // Plain greedy pushes the terminating stop token before breaking.
-                    // If next is a stop and there is still budget, emit it before halting.
+                    // Stop-token contract (#613): `next` is never appended when it is
+                    // itself a stop — only `stopped`/`stop_reason` (gated on whether
+                    // budget allowed reaching this decision) still track it.
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
-                            generated_ids.push(next);
                             stopped = true;
                             stop_reason = StopReason::Eos;
                         }
@@ -10036,11 +10044,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     let logits = self.forward_step_inner(pending_token, pos, false).logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
-                    // Plain greedy pushes the terminating stop token before breaking.
-                    // If next is a stop and there is still budget, emit it before halting.
+                    // Stop-token contract (#613): `next` is never appended when it is
+                    // itself a stop — only `stopped`/`stop_reason` (gated on whether
+                    // budget allowed reaching this decision) still track it.
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
-                            generated_ids.push(next);
                             stopped = true;
                             stop_reason = StopReason::Eos;
                         }
@@ -10103,11 +10111,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     generated_ids.push(pending_token);
                     metrics.fallback_tokens += 1;
                     let next = argmax_logits(&first_draft_logits);
-                    // Plain greedy pushes the terminating stop token before breaking.
-                    // If next is a stop and there is still budget, emit it before halting.
+                    // Stop-token contract (#613): `next` is never appended when it is
+                    // itself a stop — only `stopped`/`stop_reason` (gated on whether
+                    // budget allowed reaching this decision) still track it.
                     if is_stop(next) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
-                            generated_ids.push(next);
                             stopped = true;
                             stop_reason = StopReason::Eos;
                         }
@@ -10138,17 +10146,19 @@ kernel void gdn_chunk_norm_silu_c32(
                     }
                     let target = argmax_logits(&verify_out.logits[i]);
                     if target == draft {
-                        generated_ids.push(draft);
-                        accepted_drafts += 1;
-                        metrics.accepted_extra_tokens += 1;
                         if is_stop(draft) {
-                            // Emitted stop token (within budget — loop-top guard ensures a
-                            // slot) terminates generation; break the outer round, not just
-                            // the inner draft loop, and record the stop.
+                            // Stop-token contract (#613): the accepted draft is itself a
+                            // stop — never appended to token_ids/text. Budget was
+                            // available (the loop-top guard ensures a slot), so this is
+                            // a genuine stop; terminate the outer round, not just the
+                            // inner draft loop.
                             stopped = true;
                             stop_reason = StopReason::Eos;
                             break 'round;
                         }
+                        generated_ids.push(draft);
+                        accepted_drafts += 1;
+                        metrics.accepted_extra_tokens += 1;
                     } else {
                         rejection_next = Some(target);
                         break;
@@ -10160,11 +10170,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     let t_rb = std::time::Instant::now();
                     let _ = self.rollback_speculative_state_to(pos + accepted_drafts + 1);
                     metrics.rollback_ms += t_rb.elapsed().as_secs_f64() * 1000.0;
-                    // Plain greedy pushes the terminating stop token before breaking.
-                    // If next_token is a stop and there is still budget, emit it before halting.
+                    // Stop-token contract (#613): `next_token` is never appended when
+                    // it is itself a stop — only `stopped`/`stop_reason` (gated on
+                    // whether budget allowed reaching this decision) still track it.
                     if is_stop(next_token) {
                         if generated_ids.len() < gen_cfg.max_new_tokens {
-                            generated_ids.push(next_token);
                             stopped = true;
                             stop_reason = StopReason::Eos;
                         }
@@ -10187,11 +10197,11 @@ kernel void gdn_chunk_norm_silu_c32(
                     .min(verify_out.logits.len().saturating_sub(1));
                 let next_pending = argmax_logits(&verify_out.logits[last_idx]);
                 metrics.rounds += 1;
-                // Plain greedy pushes the terminating stop token before breaking.
-                // If next_pending is a stop and there is still budget, emit it before halting.
+                // Stop-token contract (#613): `next_pending` is never appended when
+                // it is itself a stop — only `stopped`/`stop_reason` (gated on
+                // whether budget allowed reaching this decision) still track it.
                 if is_stop(next_pending) {
                     if generated_ids.len() < gen_cfg.max_new_tokens {
-                        generated_ids.push(next_pending);
                         stopped = true;
                         stop_reason = StopReason::Eos;
                     }
@@ -22239,6 +22249,294 @@ kernel void decode_attention_reference(
                 .expect("minimal tokenizer build")
         }
 
+        // -------------------------------------------------------------
+        // #613 cross-path stop-token contract sweep (Metal family).
+        //
+        // See `crate::stop_token_contract` for the full entry-point
+        // manifest, the chosen EXCLUDE contract, and the CPU-family half
+        // of this sweep (these fixtures are GPU-only, so their half lives
+        // here rather than in that file). Covers: plain generate,
+        // MTP-enabled generate, self-spec-enabled generate,
+        // generate_streaming, and generate_streaming_with_prefix_cache.
+        //
+        // Each test sets `stop_token_ids` to the fixture's ENTIRE vocab
+        // range, so the very first greedy token — whatever it turns out
+        // to be for these non-degenerate (real GDN+GQA layer) fixtures —
+        // is guaranteed to already be a configured stop. That sidesteps
+        // hand-deriving the exact greedy output of `tiny_hybrid_fixture`.
+        // -------------------------------------------------------------
+
+        /// The #613 contract: a stop token is EXCLUDED from `token_ids`/`text`.
+        /// `stopped` is true and `stop_reason` is `Eos` because budget was
+        /// available when the stop fired on the very first generated token.
+        fn assert_excludes_stop_token_metal(out: &GenerateOutput, entry_point: &str) {
+            assert_eq!(
+                out.generated_tokens, 0,
+                "{entry_point}: stop-token contract violated — generated_tokens \
+                 should be 0 (token excluded), got {}",
+                out.generated_tokens
+            );
+            assert!(
+                out.token_ids.is_empty(),
+                "{entry_point}: stop-token contract violated — token_ids should \
+                 be empty, got {:?}",
+                out.token_ids
+            );
+            assert!(
+                out.text.is_empty(),
+                "{entry_point}: stop-token contract violated — text should be \
+                 empty, got {:?}",
+                out.text
+            );
+            assert!(
+                out.stopped,
+                "{entry_point}: stopped must be true when a stop token is hit \
+                 with budget available"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Eos),
+                "{entry_point}: stop_reason must be Eos"
+            );
+        }
+
+        #[test]
+        fn metal_generate_plain_excludes_stop_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let out = state.generate("a", &tokenizer, &gen_cfg);
+            assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate (plain)");
+        }
+
+        #[test]
+        fn metal_generate_mtp_excludes_stop_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(
+                state.session.mtp.is_some(),
+                "synthetic MTP fixture must populate session.mtp so generate() \
+                 actually takes the MTP branch, not silently fall back"
+            );
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let out = state.generate("a", &tokenizer, &gen_cfg);
+            assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate (LATTICE_MTP)");
+        }
+
+        #[test]
+        fn metal_generate_self_spec_excludes_stop_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..32u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let out = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                assert!(
+                    state.session.gdn_checkpoints.is_some(),
+                    "LATTICE_SELF_SPEC must be observed at construction time so \
+                     generate() actually takes the self-spec branch"
+                );
+                state.generate("a", &tokenizer, &gen_cfg)
+            });
+            assert_excludes_stop_token_metal(
+                &out,
+                "MetalQwen35State::generate (LATTICE_SELF_SPEC)",
+            );
+        }
+
+        #[test]
+        fn metal_generate_streaming_excludes_stop_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut deltas: Vec<String> = vec![];
+            let out = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                deltas.push(delta.to_string());
+                true
+            });
+            assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate_streaming");
+            assert!(
+                deltas.is_empty(),
+                "generate_streaming must not emit an on_token callback for an \
+                 excluded stop token, got {deltas:?}"
+            );
+        }
+
+        #[test]
+        fn metal_generate_streaming_with_prefix_cache_excludes_stop_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let slot = crate::kv_cache::CrossTurnSlotId::new(1);
+            let result = state
+                .generate_streaming_with_prefix_cache(slot, "a", &tokenizer, &gen_cfg, |_, _| true)
+                .expect("generate_streaming_with_prefix_cache must succeed");
+            assert_excludes_stop_token_metal(
+                &result.output,
+                "MetalQwen35State::generate_streaming_with_prefix_cache",
+            );
+        }
+
+        #[test]
+        fn metal_generate_multimodal_excludes_stop_token() {
+            // Codex round 1 (#632) flagged `generate_multimodal` as a public
+            // entry point with its own sampling loop, missing from both the
+            // `stop_token_contract` manifest and this test module's #613
+            // sweep. It already implements the EXCLUDE contract (checks
+            // `is_stop` before pushing at the first-token sample and inside
+            // the autoregressive decode loop); this test locks that in.
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let visual_tokens = 2usize;
+            let d_model = cfg.hidden_size;
+            let input = crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0f32; visual_tokens * d_model],
+                raw_patches: 4,
+                visual_tokens,
+                d_model,
+                text_tokens: vec![1u32],
+            };
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let out = state
+                .generate_multimodal(input, &tokenizer, &gen_cfg)
+                .expect("generate_multimodal must succeed");
+            assert_excludes_stop_token_metal(&out, "MetalQwen35State::generate_multimodal");
+        }
+
         #[test]
         fn self_spec_checkpoint_pool_allocated_when_env_set() {
             let Some(_) = metal::Device::system_default() else {
@@ -25591,29 +25889,30 @@ pub enum MtpRoundOutcome {
 ///   choice for the draft position, replaces the rejected draft).
 /// * `is_stop` – Returns `true` for EOS / stop-token IDs.
 ///
-/// # EOS-faithful contract (matches plain greedy `generate()`)
+/// # Stop-token contract (#613, matches plain greedy `generate()`)
 ///
-/// Plain greedy always pushes the stop token to the output before breaking
-/// (generate.rs: `generated_ids.push(token)` precedes the EOS check).
-/// This function honours the same invariant for every terminal case:
+/// Plain greedy never appends the terminating stop token to the output
+/// (generate.rs checks `config.eos_token_id == Some(token)` *before*
+/// `generated_ids.push(token)` and skips the push on a match). This function
+/// honours the same invariant for every terminal case: a token that is itself
+/// a stop token is never included in the emitted vector.
 ///
 /// **Accept** (`accepted == true`):
-/// - Emit `[pending, draft_token]`.
-/// - If `draft_token` is a stop token: `EmitAndStop([pending, draft])`. The
-///   bonus (pos+2 prediction) is irrelevant once generation ends. This is
-///   the fix for #237 concern 2: the old code short-circuited *before* verify,
-///   so a wrong draft-EOS silently truncated generation early.
-/// - If `bonus_token` is a stop token: `EmitAndStop([pending, draft, bonus])`.
-///   The bonus is the target's genuine greedy token at pos+2; plain greedy
-///   would emit it as the next round's `pending` and then stop.
-/// - Otherwise: `EmitAndContinue { emit: [pending, draft], next_pending: bonus }`.
+/// - If `draft_token` is a stop token: `EmitAndStop([pending])` — the accepted
+///   draft is excluded. The bonus (pos+2 prediction) is irrelevant once
+///   generation ends. (This still resolves #237 concern 2: the draft's EOS
+///   guess is verified against the target before any stop decision is made,
+///   rather than short-circuited before verify.)
+/// - If `bonus_token` is a stop token: `EmitAndStop([pending, draft_token])` —
+///   both committed tokens are emitted; the bonus that would have followed is
+///   excluded.
+/// - Otherwise: `EmitAndContinue { emit: [pending, draft_token], next_pending: bonus }`.
 ///
 /// **Reject** (`accepted == false`):
 /// - `bonus_token` is the target's own greedy choice at the draft position.
-/// - Emit `[pending]` only (caller rolls back GPU state to pos+1).
-/// - If `bonus_token` is a stop token: `EmitAndStop([pending, bonus])`.
-///   The replacement would become the next pending and stop; plain greedy
-///   would push it then break.
+/// - If `bonus_token` is a stop token: `EmitAndStop([pending])` — the
+///   replacement stop token is excluded; only the already-committed `pending`
+///   is emitted.
 /// - Otherwise: `EmitAndContinue { emit: [pending], next_pending: bonus }`.
 pub fn mtp_greedy_round(
     pending_token: u32,
@@ -25624,16 +25923,16 @@ pub fn mtp_greedy_round(
 ) -> MtpRoundOutcome {
     if accepted {
         // Draft accepted: target agrees draft_token belongs at pos+1.
-        // Always emit [pending, draft_token].
         if is_stop(draft_token) {
-            // The accepted token is itself a stop — emit and halt.
-            // Bonus is the pos+2 prediction; irrelevant once EOS is emitted.
-            return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token]);
+            // The accepted token is itself a stop — exclude it, emit only
+            // the already-committed pending token, and halt.
+            return MtpRoundOutcome::EmitAndStop(vec![pending_token]);
         }
         if is_stop(bonus_token) {
-            // Accepted non-stop draft, but target's next greedy token is a stop.
-            // Plain greedy would emit the bonus as the next token then break.
-            return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token, bonus_token]);
+            // Accepted non-stop draft, but target's next greedy token is a
+            // stop. Emit the committed [pending, draft_token]; the bonus stop
+            // token itself is excluded.
+            return MtpRoundOutcome::EmitAndStop(vec![pending_token, draft_token]);
         }
         MtpRoundOutcome::EmitAndContinue {
             emit: vec![pending_token, draft_token],
@@ -25643,9 +25942,9 @@ pub fn mtp_greedy_round(
         // Draft rejected.  Emit pending only; caller rolls back GPU state.
         // bonus_token is the target's replacement greedy token at the draft position.
         if is_stop(bonus_token) {
-            // Target's own replacement is a stop.  Plain greedy would push it
-            // as the next token then break.
-            return MtpRoundOutcome::EmitAndStop(vec![pending_token, bonus_token]);
+            // Target's own replacement is a stop — exclude it, emit only the
+            // already-committed pending token.
+            return MtpRoundOutcome::EmitAndStop(vec![pending_token]);
         }
         MtpRoundOutcome::EmitAndContinue {
             emit: vec![pending_token],
@@ -26186,20 +26485,22 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Plain-greedy oracle: given a sequence of per-position logit vectors,
-    // greedily pick argmax at each position, push to output, stop when
-    // argmax is a stop token (including that stop token), or at max_len.
+    // greedily pick argmax at each position, stop when argmax is a stop
+    // token (excluding that stop token from the output), or at max_len.
     //
-    // Matches generate.rs: generated_ids.push(token) precedes the EOS check,
-    // so the stop token is always present in the output.
+    // Stop-token contract (#613): matches generate.rs's fixed logic — the
+    // is_stop check happens BEFORE the push, so a stop token is never
+    // present in `token_ids`/`text`. The stop still consumes the position
+    // (an "attempt" within max_len), it's just not emitted.
     // -----------------------------------------------------------------------
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
             let token = argmax(row);
-            out.push(token);
             if is_stop(token) {
                 break;
             }
+            out.push(token);
         }
         out
     }
@@ -26231,8 +26532,9 @@ mod mtp_greedy_round_tests {
     //   bonus            = accepted ? argmax(logit_rows[i+2])
     //                               : argmax(logit_rows[i+1])
     //
-    // Case A (pending is stop): emit [pending], stop — mirrors the FIXED
-    // Metal loop (generate.rs: first_token is pushed before EOS check).
+    // Case A (pending is stop): stop without emitting — stop-token contract
+    // (#613): the terminating token is excluded from the output. See the
+    // contract documented on `GenerateOutput`.
     // -----------------------------------------------------------------------
     fn simulate_mtp(logit_rows: &[Vec<f32>], draft_seq: &[u32], max_len: usize) -> Vec<u32> {
         assert!(
@@ -26249,12 +26551,11 @@ mod mtp_greedy_round_tests {
             }
             let pending_token = argmax(&logit_rows[pos]);
 
-            // Case A: pending is a stop token.  The fixed Metal loop emits it
-            // (matches generate.rs: push first_token then check EOS).  For
-            // subsequent rounds, mtp_greedy_round guarantees EmitAndContinue only
-            // returns non-stop next_pending, so this branch fires only at pos=0.
+            // Case A: pending is a stop token. Stop-token contract (#613):
+            // excluded from the output. For subsequent rounds,
+            // mtp_greedy_round guarantees EmitAndContinue only returns
+            // non-stop next_pending, so this branch fires only at pos=0.
             if is_stop(pending_token) {
-                out.push(pending_token);
                 break;
             }
 
@@ -26289,6 +26590,7 @@ mod mtp_greedy_round_tests {
                 MtpRoundOutcome::EmitAndStop(tokens) => {
                     // Mirror the real call site: clip the emission to the remaining
                     // budget so MTP never exceeds max_len (plain greedy caps exactly).
+                    // `tokens` already excludes the stop token itself (#613).
                     let remaining = max_len - out.len();
                     out.extend_from_slice(&tokens[..tokens.len().min(remaining)]);
                     break;
@@ -26310,8 +26612,8 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Case A: prefill argmax is a stop token.
-    // Oracle: [EOS].  MTP (FIXED): [EOS].
-    // Old MTP code returned token_ids: vec![] (generated_tokens: 0) — WRONG.
+    // Stop-token contract (#613): oracle and MTP both emit [] — the
+    // terminating token is excluded, generated_tokens = 0.
     // -----------------------------------------------------------------------
     #[test]
     fn test_case_a_prefill_eos() {
@@ -26324,12 +26626,20 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: push EOS, then stop → [EOS].
-        assert_eq!(oracle, vec![EOS], "oracle sanity: prefill EOS yields [EOS]");
+        // Oracle: EOS excluded → [].
+        assert_eq!(
+            oracle,
+            Vec::<u32>::new(),
+            "oracle sanity: prefill EOS yields []"
+        );
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        // Fixed MTP: pending_first = EOS → emit [EOS], return.
-        assert_eq!(mtp, vec![EOS], "case A: mtp must emit [EOS] not []");
+        // Fixed MTP: pending_first = EOS → emit [], return.
+        assert_eq!(
+            mtp,
+            Vec::<u32>::new(),
+            "case A: mtp must emit [] (stop excluded, #613)"
+        );
         assert_eq!(
             oracle, mtp,
             "case A: full oracle==mtp equality required; mtp={mtp:?}"
@@ -26338,8 +26648,8 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Case B: accept + bonus is stop.
-    // Oracle: [pending, draft, EOS].  MTP (FIXED): [pending, draft, EOS].
-    // Old mtp_greedy_round returned EmitAndStop([pending, draft]) — WRONG.
+    // Stop-token contract (#613): oracle and MTP both emit [pending, draft]
+    // — the bonus stop token is excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_case_b_accept_bonus_stop() {
@@ -26354,8 +26664,8 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: push 10, push 20, push EOS, stop → [10, 20, EOS].
-        assert_eq!(oracle, vec![10, 20, EOS], "case B oracle sanity");
+        // Oracle: push 10, push 20, EOS excluded, stop → [10, 20].
+        assert_eq!(oracle, vec![10, 20], "case B oracle sanity");
 
         // Verify the pure function directly.
         let outcome = mtp_greedy_round(
@@ -26367,12 +26677,12 @@ mod mtp_greedy_round_tests {
         );
         assert_eq!(
             outcome,
-            MtpRoundOutcome::EmitAndStop(vec![10, 20, EOS]),
-            "case B: accept+bonus-stop must emit [pending, draft, bonus]"
+            MtpRoundOutcome::EmitAndStop(vec![10, 20]),
+            "case B: accept+bonus-stop must emit [pending, draft] (bonus excluded, #613)"
         );
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        assert_eq!(mtp, vec![10, 20, EOS], "case B: mtp must match oracle");
+        assert_eq!(mtp, vec![10, 20], "case B: mtp must match oracle");
         assert_eq!(
             oracle, mtp,
             "case B: full oracle==mtp equality required; mtp={mtp:?}"
@@ -26381,8 +26691,8 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Case C: reject + replacement is stop.
-    // Oracle: [pending, EOS].  MTP (FIXED): [pending, EOS].
-    // Old mtp_greedy_round returned EmitAndStop([pending]) — WRONG.
+    // Stop-token contract (#613): oracle and MTP both emit [pending] — the
+    // replacement stop token is excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_case_c_reject_bonus_stop() {
@@ -26396,8 +26706,8 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        // Oracle: push 10, push EOS, stop → [10, EOS].
-        assert_eq!(oracle, vec![10, EOS], "case C oracle sanity");
+        // Oracle: push 10, EOS excluded, stop → [10].
+        assert_eq!(oracle, vec![10], "case C oracle sanity");
 
         // Verify the pure function directly.
         let outcome = mtp_greedy_round(
@@ -26409,12 +26719,12 @@ mod mtp_greedy_round_tests {
         );
         assert_eq!(
             outcome,
-            MtpRoundOutcome::EmitAndStop(vec![10, EOS]),
-            "case C: reject+bonus-stop must emit [pending, bonus]"
+            MtpRoundOutcome::EmitAndStop(vec![10]),
+            "case C: reject+bonus-stop must emit [pending] (bonus excluded, #613)"
         );
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        assert_eq!(mtp, vec![10, EOS], "case C: mtp must match oracle");
+        assert_eq!(mtp, vec![10], "case C: mtp must match oracle");
         assert_eq!(
             oracle, mtp,
             "case C: full oracle==mtp equality required; mtp={mtp:?}"
@@ -26469,7 +26779,7 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Hand-constructed: target emits EOS via the accept+bonus-stop path.
-    // After fix B, oracle and MTP both emit [10, 20, EOS].
+    // Stop-token contract (#613): oracle and MTP both emit [10, 20].
     // -----------------------------------------------------------------------
     #[test]
     fn test_target_eos_via_bonus() {
@@ -26482,17 +26792,13 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, 20, EOS], "oracle: [10, 20, EOS]");
+        assert_eq!(oracle, vec![10, 20], "oracle: [10, 20]");
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
         // Round 0: pending=10, draft=20, accepted, bonus=EOS
         //   → mtp_greedy_round(10, 20, true, EOS, is_stop)
-        //   → EmitAndStop([10, 20, EOS])   (case B fix)
-        assert_eq!(
-            mtp,
-            vec![10, 20, EOS],
-            "after case B fix, mtp must equal oracle"
-        );
+        //   → EmitAndStop([10, 20])   (case B, bonus excluded per #613)
+        assert_eq!(mtp, vec![10, 20], "after case B fix, mtp must equal oracle");
         assert_eq!(oracle, mtp);
     }
 
@@ -26515,7 +26821,7 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, 20, 30, EOS], "oracle sanity check");
+        assert_eq!(oracle, vec![10, 20, 30], "oracle sanity check");
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
         // Round 0: pending=10, draft=EOS, target[1]=20 (non-stop) → rejected.
@@ -26523,11 +26829,11 @@ mod mtp_greedy_round_tests {
         // Round 1: pending=20, draft=99, target[2]=30 → rejected.
         //   bonus = 30.  EmitAndContinue([20], 30).  pos→2.
         // Round 2: pending=30, draft=99, target[3]=EOS → rejected.
-        //   bonus = EOS.  EmitAndStop([30, EOS])   ← case C fix.
-        // MTP output = [10, 20, 30, EOS].
+        //   bonus = EOS.  EmitAndStop([30])   ← case C fix, EOS excluded (#613).
+        // MTP output = [10, 20, 30].
         assert_eq!(
             mtp,
-            vec![10, 20, 30, EOS],
+            vec![10, 20, 30],
             "draft-EOS-but-target-non-stop: must match oracle; got {mtp:?}"
         );
         assert_eq!(oracle, mtp);
@@ -26541,7 +26847,8 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Hand-constructed: Draft proposes EOS and target AGREES.
-    // MTP must emit [pending, EOS] and stop (accept+draft-is-stop path).
+    // Stop-token contract (#613): MTP must emit [pending] and stop
+    // (accept+draft-is-stop path, draft/stop excluded).
     // -----------------------------------------------------------------------
     #[test]
     fn test_draft_eos_accepted() {
@@ -26554,7 +26861,7 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, EOS]);
+        assert_eq!(oracle, vec![10]);
 
         let outcome = mtp_greedy_round(
             10,   // pending
@@ -26565,18 +26872,18 @@ mod mtp_greedy_round_tests {
         );
         assert_eq!(
             outcome,
-            MtpRoundOutcome::EmitAndStop(vec![10, EOS]),
-            "accepted draft-EOS must emit [pending, EOS] and stop"
+            MtpRoundOutcome::EmitAndStop(vec![10]),
+            "accepted draft-EOS must emit [pending] and stop (draft excluded, #613)"
         );
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
-        assert_eq!(mtp, vec![10, EOS], "accepted draft-EOS: mtp={mtp:?}");
+        assert_eq!(mtp, vec![10], "accepted draft-EOS: mtp={mtp:?}");
         assert_eq!(oracle, mtp);
     }
 
     // -----------------------------------------------------------------------
     // Mixed: some accepted, some rejected, EOS at the end via case C.
-    // After fixes, oracle and MTP agree fully including EOS.
+    // After fixes, oracle and MTP agree fully, EOS excluded (#613).
     // -----------------------------------------------------------------------
     #[test]
     fn test_mixed_accept_reject_then_eos() {
@@ -26591,7 +26898,7 @@ mod mtp_greedy_round_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, 20, 30, 40, EOS]);
+        assert_eq!(oracle, vec![10, 20, 30, 40]);
 
         let mtp = simulate_mtp(&logit_rows, &draft_seq, max_len);
         // Round 0: pending=10, draft=20, accepted, bonus=30 (non-stop)
@@ -26599,11 +26906,11 @@ mod mtp_greedy_round_tests {
         // Round 1: pending=30, draft=99, rejected, bonus=40 (non-stop)
         //   → EmitAndContinue([30], 40), pos=3
         // Round 2: pending=40, draft=99, rejected, bonus=EOS (stop)
-        //   → EmitAndStop([40, EOS])   ← case C fix
-        // MTP output = [10, 20, 30, 40, EOS].
+        //   → EmitAndStop([40])   ← case C fix, EOS excluded (#613)
+        // MTP output = [10, 20, 30, 40].
         assert_eq!(
             mtp,
-            vec![10, 20, 30, 40, EOS],
+            vec![10, 20, 30, 40],
             "mixed: mtp must fully match oracle"
         );
         assert_eq!(oracle, mtp);
@@ -26611,18 +26918,20 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // CAP-EDGE REGRESSION (codex finding #1 on PR #287):
-    // A round can emit up to 3 tokens (case B). When max_new_tokens lands
-    // mid-emission, the call site must clip so MTP never exceeds the cap —
-    // plain greedy `generate()` stops at the cap even before an EOS.
+    // A round can emit up to 2 non-stop tokens (case B, #613). When
+    // max_new_tokens lands mid-emission, the call site must clip so MTP
+    // never exceeds the cap — plain greedy `generate()` stops at the cap
+    // even before an EOS.
     // -----------------------------------------------------------------------
     #[test]
     fn test_cap_clips_case_b_before_bonus() {
-        // Case B logits: [10, 20, EOS]; uncapped MTP would emit [10, 20, EOS].
+        // Case B logits: [10, 20, EOS]; uncapped MTP would emit [10, 20]
+        // (bonus EOS excluded either way, #613).
         let logit_rows: Vec<Vec<f32>> =
             vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
         let draft_seq = vec![20u32];
 
-        // max_len = 2: cap lands before the bonus EOS.
+        // max_len = 2: cap lands exactly at the non-stop emission length.
         let oracle = plain_greedy_oracle(&logit_rows, 2);
         assert_eq!(oracle, vec![10, 20], "oracle caps at 2 tokens, no EOS");
         let mtp = simulate_mtp(&logit_rows, &draft_seq, 2);
@@ -26673,9 +26982,10 @@ mod mtp_greedy_round_tests {
     // -----------------------------------------------------------------------
     // Randomised / property-style sweep: seeded RNG, arbitrary draft choices.
     //
-    // With all three EOS-faithful fixes (A/B/C), `simulate_mtp` should produce
-    // token-for-token identical output to `plain_greedy_oracle` across all
-    // trials, including those where stop tokens appear at any position.
+    // With all three EOS-faithful fixes (A/B/C) and the stop-token exclusion
+    // contract (#613), `simulate_mtp` should produce token-for-token
+    // identical output to `plain_greedy_oracle` across all trials, including
+    // those where stop tokens appear at any position.
     //
     // The sweep also includes trials where logit_rows[0] is EOS (case A).
     // max_len is set large (20) so that natural EOS-stop is reached before
@@ -26725,7 +27035,8 @@ mod mtp_greedy_round_tests {
 
     // -----------------------------------------------------------------------
     // Randomised sweep with SMALL caps: stresses the emission-clip path so MTP
-    // never exceeds max_len even when a round wants to emit 2-3 tokens.
+    // never exceeds max_len even when a round wants to emit 2 tokens (#613:
+    // a round's non-stop payload is at most 2 tokens now, not 3).
     // -----------------------------------------------------------------------
     #[test]
     fn test_randomised_sweep_small_cap() {
@@ -26804,20 +27115,37 @@ mod mtp_greedy_round_tests {
     //
     //   let emit_len = tokens.len().min(remaining);
     //   generated_ids.extend_from_slice(&tokens[..emit_len]);
-    //   stopped = emit_len == tokens.len();   // ← FIX 1
+    //   stopped = emit_len == tokens.len() && remaining > tokens.len();   // ← FIX 1
     //
     // The pre-fix code was `stopped = true` unconditionally, which is wrong when
-    // the budget clips the emission so the stop token (last element of `tokens`)
-    // is never actually pushed — in that case the reason for termination is
-    // the length cap, not the stop condition.
+    // the budget clips the emission so not every committed token in `tokens`
+    // is actually pushed — in that case the reason for termination is the
+    // length cap, not the stop condition. Stop-token contract (#613): `tokens`
+    // never contains the stop token itself (only the committed non-stop
+    // tokens for the round), so this formula is unchanged by #613 — only the
+    // *meaning* of "every token in tokens was emitted" shifts, since `tokens`
+    // is shorter now (see the budget=2 test below for the concrete effect).
+    //
+    // Codex round-1 (#632): `emit_len == tokens.len()` alone under-counts one
+    // more boundary — when the committed payload exactly *fills* `remaining`
+    // (`remaining == tokens.len()`), the excluded stop token itself would sit
+    // one position beyond `max_new_tokens`. Plain greedy never reaches that
+    // position either (its loop caps at `max_new_tokens` decode steps), so it
+    // reports `Length`, not `Eos`, in that exact-fill case. The additional
+    // `remaining > tokens.len()` conjunct requires strictly more room than the
+    // committed payload — i.e. a slot left over for the excluded stop token —
+    // before calling it a genuine stop.
     //
     // `generate_greedy_mtp` requires Metal hardware and cannot be called from
     // `cargo test` (no GPU). `simulate_mtp_with_stopped` mirrors the call-site
     // logic exactly; tests here are mutation-sensitive against that logic.
     //
-    // Mutation-sensitivity: change `stopped = emit_len == tokens.len()` in
-    // `simulate_mtp_with_stopped` below back to `stopped = true` → both
-    // cap-clipped tests go RED (expected false, got true).
+    // Mutation-sensitivity: change `stopped = emit_len == tokens.len() &&
+    // remaining > tokens.len()` in `simulate_mtp_with_stopped` below back to
+    // `stopped = emit_len == tokens.len()` (dropping the new conjunct) → the
+    // budget=2 exact-fill test goes RED (expected false, got true). Change it
+    // to `stopped = true` unconditionally → the budget=1 test also goes RED
+    // (expected false, got true).
     // -----------------------------------------------------------------------
     fn simulate_mtp_with_stopped(
         logit_rows: &[Vec<f32>],
@@ -26835,7 +27163,9 @@ mod mtp_greedy_round_tests {
             }
             let pending_token = argmax(&logit_rows[pos]);
             if is_stop(pending_token) {
-                out.push(pending_token);
+                // Stop-token contract (#613): excluded from `out`. The
+                // loop-top guard already confirmed out.len() < max_len, so
+                // budget was available for this token — a genuine stop.
                 stopped = true;
                 break;
             }
@@ -26868,8 +27198,14 @@ mod mtp_greedy_round_tests {
                     let remaining = max_len - out.len();
                     let emit_len = tokens.len().min(remaining);
                     out.extend_from_slice(&tokens[..emit_len]);
-                    // FIX 1: stopped only when stop token was actually emitted (not clipped).
-                    stopped = emit_len == tokens.len();
+                    // FIX 1: stopped only when every committed token was actually
+                    // emitted (not clipped) — tokens never includes the stop itself
+                    // — AND at least one more slot remained beyond the committed
+                    // payload for that excluded stop token (codex round-1, #632):
+                    // an exact-fill payload (remaining == tokens.len()) means the
+                    // stop token itself sits beyond the budget, so plain greedy
+                    // would report Length there, not Eos.
+                    stopped = emit_len == tokens.len() && remaining > tokens.len();
                     break;
                 }
                 MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
@@ -26888,55 +27224,172 @@ mod mtp_greedy_round_tests {
 
     #[test]
     fn test_mtp_stopped_stop_token_emitted() {
-        // Budget=10: all of [10, 20, EOS] fit → emit_len=3 == tokens.len()=3 → stopped=true.
+        // Budget=10: [10, 20] fit with room to spare (bonus EOS excluded
+        // from `tokens`, #613) → emit_len=2 == tokens.len()=2 → stopped=true.
         let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
         let draft_seq = vec![20u32];
         let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 10);
-        assert_eq!(tokens, vec![10, 20, EOS]);
-        assert!(stopped, "stop token emitted → stopped must be true");
+        assert_eq!(tokens, vec![10, 20]);
+        assert!(stopped, "stop reached (not clipped) → stopped must be true");
     }
 
     #[test]
     fn test_mtp_stopped_stop_token_clipped_at_budget_2() {
-        // Budget=2: cap lands before the bonus EOS.
-        // EmitAndStop([10, 20, EOS]): emit_len=2 < tokens.len()=3 → stopped=false.
-        // Pre-fix (stopped = true): this test goes RED.
+        // Budget=2: EmitAndStop([10, 20]) — bonus EOS already excluded from
+        // `tokens` (#613) — so emit_len=2 == tokens.len()=2, but `remaining`
+        // (2) is NOT strictly greater than `tokens.len()` (2): the committed
+        // payload exactly fills the budget, so the excluded bonus stop token
+        // would have landed one position beyond `max_new_tokens`.
+        //
+        // Codex round-1 (#632) flagged the prior expectation here
+        // (`stopped=true`) as wrong: plain greedy's decode loop caps at
+        // exactly `max_new_tokens` steps and never samples that extra
+        // position, so it would report `Length`, not `Eos`, in this exact
+        // scenario. `stopped=false` is the correct value — the emitted
+        // tokens are still [10, 20] either way, only the boolean changes.
         let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
         let draft_seq = vec![20u32];
         let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
         assert_eq!(tokens, vec![10, 20]);
         assert!(
             !stopped,
-            "stop token clipped by budget cap → stopped must be false (length cap, not stop)"
+            "#632: tokens=[pending,draft] (bonus excluded) exactly fills budget=2 \
+             with no slot left for the excluded stop token → stopped=false, matching \
+             plain greedy's Length outcome at the same boundary"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_accepted_draft_stop_budget_1() {
+        // Accept case: the accepted draft token is itself the stop (not the
+        // bonus). pending=10 (not stop), draft=EOS is accepted (target's
+        // argmax at pos+1 agrees) → EmitAndStop([pending]) = [10] (draft
+        // excluded, #613). Budget=1: remaining=1 == tokens.len()=1 (exact
+        // fill) → the excluded stop token would sit one position beyond the
+        // budget → stopped=false (codex round-1, #632 boundary case).
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "accepted-draft-stop exactly fills budget=1 → stopped=false, not Eos"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_accepted_draft_stop_budget_2() {
+        // Same accept-draft-is-stop shape as above, but budget=2 leaves one
+        // spare slot beyond the committed [pending] payload for the excluded
+        // stop token → genuine stop, stopped=true.
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![EOS];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            stopped,
+            "accepted-draft-stop with budget to spare → stopped=true (genuine Eos)"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_rejected_replacement_stop_budget_1() {
+        // Reject case: draft is rejected (target's own argmax at pos+1
+        // disagrees with the proposed draft), and the target's replacement
+        // (bonus_token) is itself the stop → EmitAndStop([pending]) = [10]
+        // (replacement excluded, #613). Budget=1: remaining=1 ==
+        // tokens.len()=1 (exact fill) → stopped=false (codex round-1, #632).
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        // draft_seq deliberately does not match argmax(logit_rows[1])=EOS,
+        // forcing rejection; the target's replacement (EOS) becomes bonus_token.
+        let draft_seq = vec![99u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            !stopped,
+            "rejected-replacement-stop exactly fills budget=1 → stopped=false, not Eos"
+        );
+    }
+
+    #[test]
+    fn test_mtp_stopped_rejected_replacement_stop_budget_2() {
+        // Same rejected-replacement-is-stop shape as above, but budget=2
+        // leaves a spare slot for the excluded stop token → genuine stop.
+        let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
+        let draft_seq = vec![99u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 2);
+        assert_eq!(tokens, vec![10]);
+        assert!(
+            stopped,
+            "rejected-replacement-stop with budget to spare → stopped=true (genuine Eos)"
         );
     }
 
     #[test]
     fn test_mtp_stopped_stop_token_clipped_at_budget_1() {
-        // Budget=1: only the pending token fits; EOS never reached → stopped=false.
+        // Budget=1: only the pending token fits; the round's bonus stop is
+        // never reached → stopped=false. Unchanged by #613 (tokens=[10,20]
+        // now instead of [10,20,EOS], but budget=1 clips before either).
         let logit_rows = vec![make_logit(10, 5), make_logit(20, 5), make_logit(EOS, 5)];
         let draft_seq = vec![20u32];
         let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
         assert_eq!(tokens, vec![10]);
-        assert!(!stopped, "EOS not reached at all → stopped must be false");
+        assert!(
+            !stopped,
+            "stop not reached within budget → stopped must be false"
+        );
+    }
+
+    // Case A (prefill argmax is stop), budget available → stopped=true (#613:
+    // excluded from `out`, but the round genuinely stopped, not capped).
+    // Closes a pre-existing gap: no test previously exercised Case A through
+    // `simulate_mtp_with_stopped` (only the token-level oracle covered it).
+    // Mutation-sensitivity: remove `stopped = true` from the Case A branch
+    // → this test goes RED (expected true, got false).
+    #[test]
+    fn test_mtp_stopped_case_a_prefill_eos() {
+        let logit_rows = vec![make_logit(EOS, 5), make_logit(10, 5)];
+        let draft_seq = vec![10u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 10);
+        assert_eq!(tokens, Vec::<u32>::new());
+        assert!(
+            stopped,
+            "prefill stop with budget available → stopped must be true"
+        );
+    }
+
+    // Case A with zero budget: the loop-top `out.len() >= max_len` guard
+    // fires before the Case A check is ever reached (mirrors the real
+    // function's separate max_new_tokens==0 early return: Length, not Eos).
+    #[test]
+    fn test_mtp_stopped_case_a_zero_budget() {
+        let logit_rows = vec![make_logit(EOS, 5), make_logit(10, 5)];
+        let draft_seq = vec![10u32];
+        let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 0);
+        assert_eq!(tokens, Vec::<u32>::new());
+        assert!(
+            !stopped,
+            "zero budget → stopped must be false (Length, not Eos)"
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// Differential unit tests for `generate_greedy_self_spec` EOS-emission contract.
+// Differential unit tests for `generate_greedy_self_spec`'s stop-token contract.
 //
 // Strategy: mirror `mtp_greedy_round_tests` — write an independent plain-greedy
-// oracle (push token, then check is_stop, bounded by max_new_tokens) and a pure
+// oracle (check is_stop, then push, bounded by max_new_tokens) and a pure
 // simulation of the self-spec round logic. The simulation encodes exactly the
 // post-fix decision logic for each termination path WITHOUT re-deriving it from
 // the buggy pre-fix code, so it acts as an independent reference.
 //
-// EOS-faithful contract (matches generate.rs):
-//   A:  prefill argmax is EOS → emit [EOS], generated_tokens = 1.
-//   R:  rejection: target replacement is stop → emit [pending, stop] before halting.
-//   FA: full-accept: next_pending is stop → emit [next_pending] before halting.
+// Stop-token contract (#613, matches generate.rs / GenerateOutput docs): the
+// terminating token is EXCLUDED from token_ids/text at every termination path:
+//   A:  prefill argmax is stop → emit [], generated_tokens = 0.
+//   R:  rejection: target replacement is stop → emit [pending] (replacement excluded).
+//   FA: full-accept: next_pending is stop → emit [..] without next_pending.
 //   FB: fallback (no-checkpoint, checkpoint-failure, verify-failure): target's next
-//       is stop → emit that stop before halting (budget-clipped).
+//       is stop → emit up to (not including) that stop, budget-clipped.
 //
 // These tests run on every platform (no cfg gate — no GPU required).
 // ---------------------------------------------------------------------------
@@ -26959,18 +27412,19 @@ mod self_spec_eos_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Plain-greedy oracle: push token then check stop, bounded by max_len.
-    // Matches generate.rs invariant exactly — stop token is always in output.
+    // Plain-greedy oracle: check is_stop, then push, bounded by max_len.
+    // Stop-token contract (#613): the stop token is never in the output — it
+    // still consumes the position (an "attempt" within max_len).
     // Independent reference: do NOT derive from self-spec logic.
     // -----------------------------------------------------------------------
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
             let token = argmax(row);
-            out.push(token);
             if is_stop(token) {
                 break;
             }
+            out.push(token);
         }
         out
     }
@@ -26994,7 +27448,8 @@ mod self_spec_eos_tests {
     //   - on reject: push pending, target's replacement = argmax(logit_rows[pos+1])
     //   - fallback paths behave like the plain-greedy single-step decode
     //
-    // Termination for all paths: push the stop token if budget allows, then break.
+    // Termination for all paths: stop-token contract (#613) — the terminating
+    // token is excluded from `out`, never pushed, regardless of budget.
     // -----------------------------------------------------------------------
     fn simulate_self_spec(
         logit_rows: &[Vec<f32>],
@@ -27009,12 +27464,13 @@ mod self_spec_eos_tests {
         let mut out: Vec<u32> = Vec::new();
         let mut pos = 0usize; // logit_rows index for current pending
 
-        // Case A: prefill argmax is stop → emit it (budget-clipped), return.
+        // Case A: prefill argmax is stop. Stop-token contract (#613):
+        // excluded from the output unconditionally — the real function's
+        // max_new_tokens==0 guard already returns separately (Length)
+        // before this check ever runs, so budget is never the reason this
+        // branch produces an empty output.
         let pending_first = argmax(&logit_rows[pos]);
         if is_stop(pending_first) {
-            if max_len > 0 {
-                out.push(pending_first);
-            }
             return out;
         }
 
@@ -27034,11 +27490,8 @@ mod self_spec_eos_tests {
                     break;
                 }
                 let next = argmax(&logit_rows[pos + 1]);
-                // Push the terminating stop token before halting (EOS-faithful fix).
+                // Stop-token contract (#613): never push the terminating token.
                 if is_stop(next) {
-                    if out.len() < max_len {
-                        out.push(next);
-                    }
                     break;
                 }
                 if out.len() >= max_len {
@@ -27060,13 +27513,12 @@ mod self_spec_eos_tests {
             if accepted {
                 // pending_token is always pushed first.
                 out.push(pending_token);
-                if is_stop(draft) || out.len() >= max_len {
-                    // accept+draft-is-stop: push draft (already correct in original).
-                    if !is_stop(draft) {
-                        // cap hit — don't push draft
-                    } else if out.len() < max_len {
-                        out.push(draft);
-                    }
+                // Stop-token contract (#613): never push draft when it is
+                // itself the stop — independent of whether the cap is hit.
+                if is_stop(draft) {
+                    break;
+                }
+                if out.len() >= max_len {
                     break;
                 }
                 out.push(draft);
@@ -27079,11 +27531,9 @@ mod self_spec_eos_tests {
                     break;
                 }
                 let next_pending = argmax(&logit_rows[next_pending_pos]);
-                // Full-accept EOS fix: push before halting.
+                // Stop-token contract (#613): never push next_pending when
+                // it is itself the stop.
                 if is_stop(next_pending) {
-                    if out.len() < max_len {
-                        out.push(next_pending);
-                    }
                     break;
                 }
                 if out.len() >= max_len {
@@ -27095,11 +27545,9 @@ mod self_spec_eos_tests {
                 // Rejection: push pending, target's replacement is argmax(logit_rows[pos+1]).
                 out.push(pending_token);
                 let replacement = target_at_pos1;
-                // Rejection-EOS fix: push before halting.
+                // Stop-token contract (#613): never push the replacement
+                // when it is itself the stop.
                 if is_stop(replacement) {
-                    if out.len() < max_len {
-                        out.push(replacement);
-                    }
                     break;
                 }
                 if out.len() >= max_len {
@@ -27122,8 +27570,8 @@ mod self_spec_eos_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Case A: prefill argmax is stop → oracle emits [EOS]; sim must also emit [EOS].
-    // Pre-fix: self-spec returned token_ids: vec![], generated_tokens: 0 — WRONG.
+    // Case A: prefill argmax is stop. Stop-token contract (#613): oracle and
+    // sim both emit [] — the terminating token is excluded, generated_tokens = 0.
     // -----------------------------------------------------------------------
     #[test]
     fn test_case_a_prefill_eos() {
@@ -27132,15 +27580,29 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![EOS], "oracle sanity: prefill EOS yields [EOS]");
+        assert_eq!(
+            oracle,
+            Vec::<u32>::new(),
+            "oracle sanity: prefill EOS yields []"
+        );
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
-        assert_eq!(sim, vec![EOS], "case A: sim must emit [EOS] not []");
+        assert_eq!(
+            sim,
+            Vec::<u32>::new(),
+            "case A: sim must emit [] (stop excluded, #613)"
+        );
         assert_eq!(oracle, sim, "case A: oracle == sim required");
     }
 
     // -----------------------------------------------------------------------
-    // Case A with max_len = 0: no budget → emit nothing (mirrors MTP max_new_tokens=0 guard).
+    // Case A with max_len = 0: no budget → emit nothing (mirrors MTP
+    // max_new_tokens=0 guard). Stop-token contract (#613): identical output
+    // to `test_case_a_prefill_eos` above ([] either way) — under the
+    // exclude contract, Case A no longer has budget-dependent *token*
+    // behavior; only `stopped`/`stop_reason` still distinguish zero-budget
+    // (Length) from stop-at-first-token (Eos) — see
+    // `test_self_spec_stopped_case_a_*` below for that distinction.
     // -----------------------------------------------------------------------
     #[test]
     fn test_case_a_prefill_eos_zero_budget() {
@@ -27154,8 +27616,8 @@ mod self_spec_eos_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Rejection path: target replacement is stop → oracle/sim both emit [pending, EOS].
-    // Pre-fix: self-spec broke WITHOUT pushing next_token — WRONG.
+    // Rejection path: target replacement is stop. Stop-token contract
+    // (#613): oracle/sim both emit [pending] — the replacement is excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_rejection_eos() {
@@ -27165,10 +27627,10 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, EOS], "rejection-EOS oracle: [10, EOS]");
+        assert_eq!(oracle, vec![10], "rejection-EOS oracle: [10]");
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
-        assert_eq!(sim, vec![10, EOS], "rejection-EOS: sim must match oracle");
+        assert_eq!(sim, vec![10], "rejection-EOS: sim must match oracle");
         assert_eq!(oracle, sim);
     }
 
@@ -27188,8 +27650,8 @@ mod self_spec_eos_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Full-accept path: next_pending is stop → oracle/sim both emit [..., EOS].
-    // Pre-fix: self-spec broke WITHOUT pushing next_pending — WRONG.
+    // Full-accept path: next_pending is stop. Stop-token contract (#613):
+    // oracle/sim both emit [10, 20] — next_pending is excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_full_accept_next_pending_eos() {
@@ -27199,18 +27661,10 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(
-            oracle,
-            vec![10, 20, EOS],
-            "full-accept-EOS oracle: [10, 20, EOS]"
-        );
+        assert_eq!(oracle, vec![10, 20], "full-accept-EOS oracle: [10, 20]");
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
-        assert_eq!(
-            sim,
-            vec![10, 20, EOS],
-            "full-accept-EOS: sim must match oracle"
-        );
+        assert_eq!(sim, vec![10, 20], "full-accept-EOS: sim must match oracle");
         assert_eq!(oracle, sim);
     }
 
@@ -27230,7 +27684,7 @@ mod self_spec_eos_tests {
 
     // -----------------------------------------------------------------------
     // Fallback path (case FB): next token from single-step decode is stop.
-    // Pre-fix: all three fallback sites broke WITHOUT pushing next — WRONG.
+    // Stop-token contract (#613): oracle/sim both emit [10] — next excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_fallback_path_eos() {
@@ -27240,10 +27694,10 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, EOS], "fallback-EOS oracle: [10, EOS]");
+        assert_eq!(oracle, vec![10], "fallback-EOS oracle: [10]");
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, true, max_len);
-        assert_eq!(sim, vec![10, EOS], "fallback-EOS: sim must match oracle");
+        assert_eq!(sim, vec![10], "fallback-EOS: sim must match oracle");
         assert_eq!(oracle, sim);
     }
 
@@ -27262,8 +27716,11 @@ mod self_spec_eos_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Accept+draft-is-stop: already correct in original — verify it stays correct.
-    // Oracle: [pending, EOS].  Sim: [pending, EOS].
+    // Accept+draft-is-stop: this site name predates #613 ("already correct"
+    // referred to the pre-#613 include-contract, where this specific site
+    // pushed the stop-carrying draft even before the #237 EOS-faithfulness
+    // fixes landed elsewhere). Stop-token contract (#613): oracle/sim now
+    // both emit [pending] — the accepted draft (itself a stop) is excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_accept_draft_is_stop_already_correct() {
@@ -27273,10 +27730,10 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, EOS], "accept+draft-stop oracle: [10, EOS]");
+        assert_eq!(oracle, vec![10], "accept+draft-stop oracle: [10]");
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
-        assert_eq!(sim, vec![10, EOS], "accept+draft-stop: already correct");
+        assert_eq!(sim, vec![10], "accept+draft-stop: draft excluded (#613)");
         assert_eq!(oracle, sim);
     }
 
@@ -27303,6 +27760,7 @@ mod self_spec_eos_tests {
 
     // -----------------------------------------------------------------------
     // Mixed: some accepted, some rejected, EOS at the end via rejection path.
+    // Stop-token contract (#613): oracle/sim agree fully, EOS excluded.
     // -----------------------------------------------------------------------
     #[test]
     fn test_mixed_accept_reject_then_rejection_eos() {
@@ -27319,10 +27777,10 @@ mod self_spec_eos_tests {
         let max_len = 10;
 
         let oracle = plain_greedy_oracle(&logit_rows, max_len);
-        assert_eq!(oracle, vec![10, 20, 30, EOS]);
+        assert_eq!(oracle, vec![10, 20, 30]);
 
         let sim = simulate_self_spec(&logit_rows, &draft_seq, false, max_len);
-        assert_eq!(sim, vec![10, 20, 30, EOS], "mixed reject-EOS: got {sim:?}");
+        assert_eq!(sim, vec![10, 20, 30], "mixed reject-EOS: got {sim:?}");
         assert_eq!(oracle, sim);
     }
 
@@ -27441,6 +27899,17 @@ mod self_spec_eos_tests {
     //   loop to continue an extra iteration without recording stopped=true. Fix:
     //   `stopped = true; break 'round;` to exit both loops and record the stop.
     //
+    // Stop-token contract (#613): every terminating token below (`next`, `draft`
+    // when it's the stop, `next_pending`, `replacement`) is now EXCLUDED from
+    // `out` — never pushed. This does not change the FIX-2/FIX-3 `stopped`
+    // gating logic itself (still `stopped = true` inside the same budget
+    // guard); it only removes the push that used to accompany it. Concretely
+    // this means `tokens` in every test below drops its trailing EOS but the
+    // `stopped` boolean is UNCHANGED at all 4 existing boundaries (verified by
+    // trace: the guard `out.len() < max_len` is evaluated at the same point,
+    // over the same `out.len()`, in both the pre-#613 and post-#613 code —
+    // only the push after the guard is removed).
+    //
     // `generate_greedy_self_spec` requires Metal hardware (GPU). These tests drive
     // the identical decision logic via simulate_self_spec_with_stopped.
     //
@@ -27465,8 +27934,11 @@ mod self_spec_eos_tests {
 
         let pending_first = argmax(&logit_rows[pos]);
         if is_stop(pending_first) {
+            // Stop-token contract (#613): excluded from `out` regardless of
+            // budget. `stopped` still reflects whether budget was available
+            // (mirrors max_new_tokens==0 short-circuiting to Length upstream
+            // of this check in the real function).
             if max_len > 0 {
-                out.push(pending_first);
                 stopped = true;
             }
             return (out, stopped);
@@ -27489,11 +27961,11 @@ mod self_spec_eos_tests {
                 if pos + 1 < logit_rows.len() {
                     let next = argmax(&logit_rows[pos + 1]);
                     if is_stop(next) {
-                        // FIX 2: stopped=true only when the stop token is actually emitted.
-                        // When out.len() >= max_len the stop is clipped → stopped stays false.
+                        // Stop-token contract (#613): never push `next`.
+                        // FIX 2: stopped=true only when budget allowed
+                        // reaching this decision (not clipped).
                         if out.len() < max_len {
-                            out.push(next);
-                            stopped = true; // inside budget guard
+                            stopped = true;
                         }
                         break;
                     }
@@ -27517,9 +27989,10 @@ mod self_spec_eos_tests {
             if accepted {
                 out.push(pending_token);
                 if is_stop(draft) {
+                    // Stop-token contract (#613): never push draft. FIX 3:
+                    // still record stop and exit both loops when budget
+                    // allowed reaching this decision.
                     if out.len() < max_len {
-                        out.push(draft);
-                        // FIX 3: record stop and break the outer round loop.
                         stopped = true;
                     }
                     break 'round;
@@ -27537,9 +28010,10 @@ mod self_spec_eos_tests {
                 }
                 let next_pending = argmax(&logit_rows[next_pending_pos]);
                 if is_stop(next_pending) {
-                    // FIX 2 (full-accept path): stopped only when emitted.
+                    // Stop-token contract (#613): never push next_pending.
+                    // FIX 2 (full-accept path): stopped only when budget
+                    // allowed reaching this decision.
                     if out.len() < max_len {
-                        out.push(next_pending);
                         stopped = true;
                     }
                     break;
@@ -27553,9 +28027,10 @@ mod self_spec_eos_tests {
                 out.push(pending_token);
                 let replacement = target_at_pos1;
                 if is_stop(replacement) {
-                    // FIX 2 (rejection path): stopped only when emitted.
+                    // Stop-token contract (#613): never push the
+                    // replacement. FIX 2 (rejection path): stopped only
+                    // when budget allowed reaching this decision.
                     if out.len() < max_len {
-                        out.push(replacement);
                         stopped = true;
                     }
                     break;
@@ -27570,44 +28045,41 @@ mod self_spec_eos_tests {
         (out, stopped)
     }
 
-    // FIX 2: fallback path, budget not full → stop token emitted → stopped=true.
+    // FIX 2: fallback path, budget not full → stop reached (not clipped) → stopped=true.
     #[test]
     fn test_self_spec_stopped_fallback_eos_emitted() {
-        // Fallback: pending=10, next=EOS. Budget=10. EOS fits → stopped=true.
+        // Fallback: pending=10, next=EOS (excluded, #613). Budget=10 → stopped=true.
         let logit_rows = vec![make_logit(10), make_logit(EOS)];
         let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[], true, 10);
-        assert_eq!(tokens, vec![10, EOS]);
-        assert!(
-            stopped,
-            "EOS emitted in fallback path → stopped must be true"
-        );
+        assert_eq!(tokens, vec![10]);
+        assert!(stopped, "stop reached (not clipped) → stopped must be true");
     }
 
     // FIX 2: fallback path, budget already full after pushing pending → stop clipped → stopped=false.
     #[test]
     fn test_self_spec_stopped_fallback_eos_clipped() {
         // Fallback: pending=10, next=EOS. Budget=1. After pushing pending, out.len()=1 >= max_len=1.
-        // EOS is clipped → stopped=false.
+        // The stop is never reached (clipped) → stopped=false.
         // Pre-fix (stopped=true outside guard): this test goes RED.
         let logit_rows = vec![make_logit(10), make_logit(EOS)];
         let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[], true, 1);
         assert_eq!(tokens, vec![10]);
         assert!(
             !stopped,
-            "EOS clipped by budget cap in fallback path → stopped must be false (length cap)"
+            "stop clipped by budget cap in fallback path → stopped must be false (length cap)"
         );
     }
 
-    // FIX 3: accepted draft is stop token, budget allows → draft emitted → stopped=true.
+    // FIX 3: accepted draft is stop token, budget allows → stopped=true (draft excluded, #613).
     #[test]
     fn test_self_spec_stopped_accepted_draft_stop() {
         // logit_rows[0]=10 (pending), logit_rows[1]=EOS (target agrees with draft=EOS).
-        // draft accepted, is_stop(draft)=true, budget=10 → EOS pushed → stopped=true.
+        // draft accepted, is_stop(draft)=true, budget=10 → stopped=true (draft excluded).
         // Pre-fix (plain `break` without `stopped=true`): this test goes RED.
         let logit_rows = vec![make_logit(10), make_logit(EOS), make_logit(30)];
         let draft_seq = vec![EOS];
         let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &draft_seq, false, 10);
-        assert_eq!(tokens, vec![10, EOS]);
+        assert_eq!(tokens, vec![10]);
         assert!(
             stopped,
             "accepted draft is stop token → stopped must be true"
@@ -27617,14 +28089,44 @@ mod self_spec_eos_tests {
     // FIX 3: accepted draft is stop, but budget is already full after pending → draft clipped → stopped=false.
     #[test]
     fn test_self_spec_stopped_accepted_draft_stop_clipped() {
-        // pending=10 pushed (budget=1 full), draft=EOS clipped → stopped=false.
+        // pending=10 pushed (budget=1 full), draft=EOS never reached → stopped=false.
         let logit_rows = vec![make_logit(10), make_logit(EOS), make_logit(30)];
         let draft_seq = vec![EOS];
         let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &draft_seq, false, 1);
         assert_eq!(tokens, vec![10]);
         assert!(
             !stopped,
-            "accepted draft EOS clipped by budget cap → stopped must be false"
+            "accepted draft stop clipped by budget cap → stopped must be false"
+        );
+    }
+
+    // Case A (prefill argmax is stop), budget available → stopped=true (#613:
+    // excluded from `out`, but the round genuinely stopped, not capped).
+    // Closes a pre-existing gap: no test previously exercised Case A through
+    // `simulate_self_spec_with_stopped` (only the token-level oracle covered
+    // it). Mutation-sensitivity: remove `stopped = true` from the `is_stop
+    // (pending_first)` branch → this test goes RED (expected true, got false).
+    #[test]
+    fn test_self_spec_stopped_case_a_prefill_eos() {
+        let logit_rows = vec![make_logit(EOS), make_logit(10)];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[10], false, 10);
+        assert_eq!(tokens, Vec::<u32>::new());
+        assert!(
+            stopped,
+            "prefill stop with budget available → stopped must be true"
+        );
+    }
+
+    // Case A with zero budget: mirrors the real function's separate
+    // max_new_tokens==0 early return (Length, not Eos) — stopped=false.
+    #[test]
+    fn test_self_spec_stopped_case_a_zero_budget() {
+        let logit_rows = vec![make_logit(EOS), make_logit(10)];
+        let (tokens, stopped) = simulate_self_spec_with_stopped(&logit_rows, &[10], false, 0);
+        assert_eq!(tokens, Vec::<u32>::new());
+        assert!(
+            !stopped,
+            "zero budget → stopped must be false (Length, not Eos)"
         );
     }
 }

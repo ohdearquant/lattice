@@ -796,11 +796,34 @@ pub struct TokenLogprob {
 }
 
 /// **Unstable**: text generation output struct; fields may expand with streaming support.
+///
+/// # Stop-token contract (#613)
+///
+/// When generation ends because EOS or a configured `stop_token_ids` entry is
+/// hit, that terminating token is **excluded** from `token_ids` and `text` —
+/// it is never appended to the output. Every generation entry point across
+/// this crate (CPU and Metal) honours this contract (see the
+/// `stop_token_contract` test module for the cross-path regression sweep).
+/// `generated_tokens` always equals `token_ids.len()`.
+///
+/// **`stop_strings` behave differently (codex round 1, #632).** A
+/// `stop_strings` match truncates `text` to the point where the match begins,
+/// but the token(s) whose decoded text completed the match are **not**
+/// removed from `token_ids`/`generated_tokens` — the implementation cannot
+/// "un-generate" a token once it has been decoded and appended (see
+/// `decode_loop_with_stops` / `earliest_stop_match` in
+/// `crate::model::qwen35::generation`). So for a `stop_strings` stop,
+/// `token_ids.len()` (== `generated_tokens`) can exceed the number of tokens
+/// whose text actually survived in the truncated `text`. The EOS /
+/// `stop_token_ids` exclusion guarantee above does not extend to this case.
 #[derive(Debug, Clone)]
 pub struct GenerateOutput {
     /// Generated text (excluding prompt).
     pub text: String,
-    /// Generated token IDs.
+    /// Generated token IDs. Excludes the terminating token for EOS /
+    /// `stop_token_ids` stops (see the stop-token contract above), but a
+    /// `stop_strings` stop retains the token(s) that completed the match —
+    /// see the `stop_strings` note above.
     pub token_ids: Vec<u32>,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
