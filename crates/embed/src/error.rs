@@ -67,6 +67,21 @@ pub enum EmbedError {
     /// Internal logic error (count mismatch, unexpected state).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A quantization tier did not match the tier required by the operation.
+    ///
+    /// Raised by the `simd::tier` prepared-dispatch functions (e.g.
+    /// `approximate_cosine_distance_prepared`) when a `PreparedQuery`'s tier does not
+    /// match the stored data's tier, or a batch dispatch function's presumed tier.
+    #[error("tier mismatch in {op}: expected {expected:?}, got {actual:?}")]
+    TierMismatch {
+        /// Name of the operation where the mismatch was detected.
+        op: &'static str,
+        /// Tier the operation required.
+        expected: crate::simd::QuantizationTier,
+        /// Tier actually supplied.
+        actual: crate::simd::QuantizationTier,
+    },
 }
 
 /// **Stable**: result type alias for embedding operations.

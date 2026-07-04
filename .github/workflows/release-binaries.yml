@@ -1,0 +1,99 @@
+name: release-binaries
+# Prebuilt `lattice` CLI binaries attached to GitHub releases (#633).
+#
+# Triggers only on a *published* GitHub release (never on tag push, so a
+# `git tag && git push` alone does not fire a build — a release must be
+# explicitly published via `gh release create` / the UI, matching the
+# existing bump-and-yank release flow in CLAUDE.md).
+#
+# Runners are chosen to build each target NATIVELY (no cross-compilation
+# toolchain): `macos-latest` is arm64 (aarch64-apple-darwin), `ubuntu-latest`
+# is x86_64 (x86_64-unknown-linux-gnu), `ubuntu-24.04-arm` is aarch64
+# (aarch64-unknown-linux-gnu) — the same three-runner shape `bench-update.yml`
+# already uses for CPU benches. Metal is macOS-only, so only the darwin leg
+# builds with `metal-gpu`; both Linux legs build CPU-only (`f16` alone) so the
+# CLI still installs and runs (NEON dispatch, no GPU) on Linux — see the
+# Raspberry Pi / ARM Linux README section this mirrors.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build+upload against (e.g. v0.4.2). Required for manual runs.'
+        required: true
+
+permissions:
+  contents: write # required for `gh release upload`
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            features: f16,metal-gpu
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: f16
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: f16
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        # See ci.yml: some macos-latest images ship a rustup-init shim as
+        # ~/.cargo/bin/cargo rather than the rustup proxy.
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-binaries-${{ matrix.target }}
+
+      - name: Build lattice CLI (release)
+        run: cargo build --release -p lattice-inference --bin lattice --features ${{ matrix.features }}
+
+      - name: Package tarball + sha256
+        id: package
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          STAGE="lattice-${VERSION}-${TARGET}"
+          mkdir -p "$STAGE"
+          cp target/release/lattice "$STAGE/"
+          strip "$STAGE/lattice" || echo "::warning::strip failed or unavailable, shipping unstripped binary"
+          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          ARCHIVE="${STAGE}.tar.gz"
+          tar -czf "$ARCHIVE" "$STAGE"
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "sha256_file=${ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.sha256_file }}" \
+            --repo "${{ github.repository }}" \
+            --clobber
