@@ -2090,9 +2090,9 @@ mod tests {
     /// literal text "<unk>" (all 5 chars sit in the byte-level decoder's
     /// printable range, so `append_token_bytes` skips none of them as
     /// "special"). Two tokens concatenate to "<unk><unk>" (10 bytes); the stop
-    /// string "k><unk" (6 bytes) first matches at byte 3 — entirely PAST the
-    /// token boundary at byte 5, so the match clips into the FIRST token's own
-    /// trailing bytes too, not just the second token's. Both entries' text is
+    /// string "k><unk" (6 bytes) first matches at byte 3 — BEFORE the token
+    /// boundary at byte 5, so the match also clips into the FIRST token's own
+    /// trailing bytes, not just the second token's. Both entries' text is
     /// therefore only partially retained, and both must be dropped — this is
     /// the multi-token-span case `truncate_token_logprobs_to_retained_text`
     /// exists to handle, not just "drop the most recent entry".
