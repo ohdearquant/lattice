@@ -504,6 +504,7 @@ Tracking issues with first-milestone slices: see the
 - [Models](docs/models.md): full model support matrix, attention variants, inference features
 - [Getting started](docs/getting-started.md): step-by-step setup guide
 - [Examples](docs/examples.md): code samples for common tasks
+- [Capability matrix](docs/capability-matrix.md): `lattice` CLI vs `lattice_serve` endpoint/field parity
 - ADR directory: `docs/adr/`
 
 ---
