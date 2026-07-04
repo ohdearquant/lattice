@@ -82,11 +82,21 @@ impl Default for GenerateConfig {
 }
 
 /// **Unstable**: generation result; fields may be added or removed.
+///
+/// # Stop-token contract (#613)
+///
+/// When generation ends because a stop condition was hit (EOS or a configured
+/// stop token), that terminating token is **excluded** from `token_ids` and
+/// `text` — it is never appended to the output. Every generation entry point
+/// in this crate honours this contract (see the `stop_token_contract` test
+/// module for the cross-path regression sweep). `generated_tokens` always
+/// equals `token_ids.len()`.
 #[derive(Debug)]
 pub struct GenerateOutput {
     /// The generated text (excluding prompt unless include_prompt is set).
     pub text: String,
-    /// All generated token IDs (excluding prompt).
+    /// All generated token IDs (excluding prompt, excluding any terminating
+    /// stop token — see the stop-token contract above).
     pub token_ids: Vec<u32>,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
@@ -520,13 +530,15 @@ pub fn generate(
             stop_reason: Some(StopReason::Grammar),
         });
     }
-    generated_ids.push(first_token);
-
     let mut stopped_by_eos = false;
     let mut stop_reason = StopReason::Length;
+    // Stop-token contract (#613): the terminating token is excluded from
+    // `token_ids`/`text` — check before pushing, not after.
     if config.eos_token_id == Some(first_token) {
         stopped_by_eos = true;
         stop_reason = StopReason::Eos;
+    } else {
+        generated_ids.push(first_token);
     }
 
     // 7. Decode loop: one token at a time
@@ -572,13 +584,14 @@ pub fn generate(
                 stop_reason = StopReason::Grammar;
                 break;
             }
-            generated_ids.push(token);
-
+            // Stop-token contract (#613): check before pushing, so the
+            // terminating token is excluded from `token_ids`/`text`.
             if config.eos_token_id == Some(token) {
                 stopped_by_eos = true;
                 stop_reason = StopReason::Eos;
                 break;
             }
+            generated_ids.push(token);
         }
     }
 
