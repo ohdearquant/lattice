@@ -196,13 +196,15 @@ This installs `lattice` to `~/.cargo/bin/lattice`. Requires Rust 1.93+
 
 **2. Prebuilt release binaries:**
 
-Every [GitHub release](https://github.com/ohdearquant/lattice/releases) ships
+[GitHub releases](https://github.com/ohdearquant/lattice/releases) ship
 `lattice-<version>-<target>.tar.gz` for `aarch64-apple-darwin` (macOS,
 Metal-enabled), `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`
-(both CPU-only), plus a matching `.sha256` file.
+(both CPU-only), plus a matching `.sha256` file. Check the release's Assets
+list first: releases published before this workflow landed have no prebuilt
+binaries (use `cargo install` for those versions).
 
 ```bash
-VERSION=0.4.2   # match the release you want
+VERSION=0.4.2   # match a release that has binary assets attached
 TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
 
 curl -LO "https://github.com/ohdearquant/lattice/releases/download/v${VERSION}/lattice-${VERSION}-${TARGET}.tar.gz"
