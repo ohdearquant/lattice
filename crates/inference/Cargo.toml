@@ -60,7 +60,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.4.2", path = "../fann", optional = true }
+lattice-fann = { version = "0.5.0", path = "../fann", optional = true }
 
 [[bin]]
 name = "lattice"
