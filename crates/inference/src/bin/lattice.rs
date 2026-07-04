@@ -694,6 +694,58 @@ mod doctor {
         file: String,
     }
 
+    /// `quantize_index.json`'s on-disk shape differs by writer: `quantize_q4`
+    /// serializes a bare `Vec<Q4IndexEntry>`, while `quantize_quarot` (ADR-051)
+    /// serializes an object, `{"quarot_seed": ..., "tensors": [...]}`, so a
+    /// loader can recover the QuaRot rotation seed without parsing
+    /// `config.json`. `doctor` only inventories tensors -- the seed is
+    /// irrelevant here -- so both shapes normalize to the same entry list.
+    ///
+    /// Shape-aware two-step parse (JSON value first, then the matching schema)
+    /// rather than a `#[serde(untagged)]` enum: untagged deserialization
+    /// collapses every schema error into "data did not match any variant",
+    /// which hides the actionable field/path detail (`missing field \`file\``,
+    /// `invalid type: string, expected a sequence`, ...) that a diagnostic
+    /// command owes the operator. Unknown object keys (`quarot_seed`, future
+    /// additions) stay tolerated because serde ignores unknown fields by
+    /// default.
+    fn parse_q4_index_manifest(
+        bytes: &[u8],
+        path: &std::path::Path,
+    ) -> Result<Vec<Q4IndexEntry>, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?;
+        match value {
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<Q4IndexEntry>>(value)
+                .map_err(|e| {
+                    format!(
+                        "{}: invalid bare-array (quantize_q4) manifest: {e}",
+                        path.display()
+                    )
+                }),
+            serde_json::Value::Object(_) => {
+                #[derive(serde::Deserialize)]
+                struct WrappedManifest {
+                    tensors: Vec<Q4IndexEntry>,
+                }
+                serde_json::from_value::<WrappedManifest>(value)
+                    .map(|w| w.tensors)
+                    .map_err(|e| {
+                        format!(
+                            "{}: invalid object-form (quantize_quarot) manifest: {e}",
+                            path.display()
+                        )
+                    })
+            }
+            _ => Err(format!(
+                "{}: expected quantize_index.json to be either a bare array of tensor \
+                 entries (quantize_q4) or an object with a \"tensors\" array \
+                 (quantize_quarot)",
+                path.display()
+            )),
+        }
+    }
+
     /// Estimate a Q4-checkpoint tensor's RESIDENT byte footprint once loaded
     /// by `MetalQwen35State::from_q4_dir` (`crates/inference/src/forward/metal_qwen35.rs`),
     /// given its on-disk byte length. Mirrors `cpu_resident_bytes` above for
@@ -810,8 +862,7 @@ mod doctor {
         if index_path.exists() {
             let bytes = std::fs::read(&index_path)
                 .map_err(|e| format!("failed to read {}: {e}", index_path.display()))?;
-            let entries: Vec<Q4IndexEntry> = serde_json::from_slice(&bytes)
-                .map_err(|e| format!("{} is not valid JSON: {e}", index_path.display()))?;
+            let entries: Vec<Q4IndexEntry> = parse_q4_index_manifest(&bytes, &index_path)?;
 
             let mut total_bytes = 0u64;
             let mut missing_tensors = Vec::new();
@@ -1779,6 +1830,115 @@ mod doctor {
             let inv = inspect_q4_dir(&dir, &cfg).unwrap();
             assert!(!inv.has_mtp_tensors);
             fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn inspect_q4_dir_accepts_both_bare_array_and_quarot_object_manifest_shapes() {
+            // Regression test for #626: `quantize_q4` writes
+            // `quantize_index.json` as a bare array, but `quantize_quarot`
+            // (ADR-051) writes an object -- `{"quarot_seed": ..., "tensors":
+            // [...]}` -- so a loader can recover the QuaRot rotation seed
+            // without parsing `config.json`. `doctor` crashed on the latter
+            // shape with "invalid type: map, expected a sequence" before this
+            // fix; both shapes must now load and produce equivalent
+            // inventories for an identical tensor list.
+            let bare_dir = tempdir("q4-manifest-bare-array");
+            let object_dir = tempdir("q4-manifest-quarot-object");
+            for dir in [&bare_dir, &object_dir] {
+                write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
+            }
+            let q_proj_len = fs::metadata(bare_dir.join("q_proj.q4")).unwrap().len();
+
+            let tensors = serde_json::json!([
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                bare_dir.join("quantize_index.json"),
+                serde_json::to_vec(&tensors).unwrap(),
+            )
+            .unwrap();
+
+            let quarot_seed: u64 = 0xCAFE_BABE_DEAD_BEEF;
+            let object_manifest = serde_json::json!({
+                "quarot_seed": quarot_seed,
+                "tensors": [
+                    {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+                ],
+            });
+            fs::write(
+                object_dir.join("quantize_index.json"),
+                serde_json::to_vec(&object_manifest).unwrap(),
+            )
+            .unwrap();
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let bare_inv = inspect_q4_dir(&bare_dir, &cfg)
+                .expect("bare-array quantize_index.json (quantize_q4's shape) must load");
+            let object_inv = inspect_q4_dir(&object_dir, &cfg)
+                .expect("object-form quantize_index.json (quantize_quarot's shape) must load");
+
+            assert_eq!(object_inv.total_bytes, bare_inv.total_bytes);
+            assert_eq!(object_inv.total_bytes, q_proj_len);
+            assert_eq!(object_inv.tensor_count, bare_inv.tensor_count);
+            assert_eq!(object_inv.tensor_count, 1);
+            assert_eq!(object_inv.missing_tensors, bare_inv.missing_tensors);
+            assert_eq!(object_inv.has_mtp_tensors, bare_inv.has_mtp_tensors);
+
+            fs::remove_dir_all(&bare_dir).ok();
+            fs::remove_dir_all(&object_dir).ok();
+        }
+
+        #[test]
+        fn q4_manifest_malformed_bare_array_error_names_the_missing_field() {
+            // A doctor is a diagnostic tool: a malformed manifest must surface
+            // serde's precise schema error (here: which field is missing), not
+            // an untagged-enum "did not match any variant" fallthrough.
+            let err = parse_q4_index_manifest(
+                br#"[{"name": "x"}]"#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("bare-array entry missing `file` must fail");
+            assert!(
+                err.contains("file"),
+                "error must name the missing `file` field; got: {err}"
+            );
+            assert!(
+                !err.contains("did not match any variant"),
+                "error must not be the generic untagged-enum fallthrough; got: {err}"
+            );
+        }
+
+        #[test]
+        fn q4_manifest_malformed_object_tensors_error_names_tensors() {
+            let err = parse_q4_index_manifest(
+                br#"{"quarot_seed": 42, "tensors": "not-an-array"}"#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("object-form manifest with non-array tensors must fail");
+            assert!(
+                err.contains("tensors") || err.contains("sequence"),
+                "error must point at the bad `tensors` value; got: {err}"
+            );
+            assert!(
+                !err.contains("did not match any variant"),
+                "error must not be the generic untagged-enum fallthrough; got: {err}"
+            );
+        }
+
+        #[test]
+        fn q4_manifest_non_array_non_object_root_is_rejected_with_shape_hint() {
+            let err = parse_q4_index_manifest(
+                br#""just a string""#,
+                std::path::Path::new("quantize_index.json"),
+            )
+            .err()
+            .expect("scalar manifest root must fail");
+            assert!(
+                err.contains("either a bare array") && err.contains("tensors"),
+                "error must explain both accepted shapes; got: {err}"
+            );
         }
 
         #[test]
