@@ -22318,6 +22318,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let out = state.generate("a", &tokenizer, &gen_cfg);
@@ -22354,6 +22355,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let out = state.generate("a", &tokenizer, &gen_cfg);
@@ -22382,6 +22384,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let out = with_self_spec_env(|| {
@@ -22425,6 +22428,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let mut deltas: Vec<String> = vec![];
@@ -22464,6 +22468,7 @@ kernel void decode_attention_reference(
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
+                logprobs: None,
             };
 
             let slot = crate::kv_cache::CrossTurnSlotId::new(1);
