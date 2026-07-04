@@ -1,0 +1,44 @@
+# Spell-check config for `typos` (crate-ci/typos). Kept minimal: only what the
+# tool actually flags in this repo, not a preemptive kitchen-sink list.
+
+[files]
+# Binary/data fixtures and large corpora are not prose; scanning them as text
+# produces thousands of false positives from arbitrary subword byte sequences
+# and floating-point dumps. Excluded even though `.gitignore` already covers
+# `target/` and `.khive/`, so the exclusion is explicit rather than incidental.
+extend-exclude = [
+    "crates/inference/tests/fixtures/tokenizers/**",
+    "crates/inference/benchmarks/golden_logits/**",
+    "crates/embed/tests/fixtures/**",
+    "docs/bench_results/**",
+    "target/**",
+    ".khive/**",
+]
+
+[default.extend-words]
+# Domain vocabulary and established abbreviations, not misspellings:
+ot = "ot"       # optimal transport (crates/transport, ADR-035/036/038/039/055)
+wht = "wht"     # Walsh-Hadamard Transform (QuaRot rotation)
+nax = "nax"     # MLX's own `_nax` GEMM dispatch suffix, quoted in docs/mlx_kernel_study.md
+tpe = "tpe"     # Tree-structured Parzen Estimator (hyperparameter search)
+comput = "comput" # bibliographic abbreviation, "SIAM J. Sci. Comput."
+oll = "oll"     # ollama shell/plot variable abbreviation in bench scripts
+yhat = "yhat"   # statistics notation (predicted value)
+unparseable = "unparseable" # accepted alternate spelling (cf. Java ParseException)
+
+# Short local-variable and struct-field abbreviations the checker treats as
+# misspelled English words:
+ba = "ba"       # a/b-comparison suffix (ws_ba, div_ba, d_ba)
+alog = "alog"   # GDN a_log gate weight (w_alog)
+paln = "paln"   # post_attention_layernorm abbreviation
+clen = "clen"   # cache/context-length loop variable in decode benchmarks
+lits = "lits"   # `Vec<String>` of literals in the JSON-schema grammar compiler
+mis = "mis"     # the "mis-" prefix (mis-sample, mis-sized, mis-hoisted, mis-writes)
+pn = "pn"       # Metal shader-source string literal variable name
+
+# Deliberate test/bench literals, not real words:
+abd = "abd"     # JSON-schema grammar const-string test fixtures ("abc"/"abd"/"abe")
+fo = "fo"       # truncated-string grammar rejection test ("fo"/"foo"/"food")
+hel = "hel"     # tokenizer BPE merge-algorithm test fixture ("hel" + "l" -> "hell")
+transfor = "transfor" # progressive-substring bench label building up to "transform"
+artic = "artic"       # progressive-substring bench label building up to "artificial"
