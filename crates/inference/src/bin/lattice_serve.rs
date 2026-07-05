@@ -2639,5 +2639,64 @@ mod imp {
             let cfg = build_cfg(&req, &defaults, 4096);
             assert_eq!(cfg.max_new_tokens, 42);
         }
+
+        // -----------------------------------------------------------------------
+        // Capability-matrix fixtures (#654). The `chat_completions_*_400` tests
+        // above this block are ALSO capability-matrix fixtures in their own
+        // right — their names are the fixture IDs `docs/capability-matrix.md`'s
+        // Fixture manifest section cites for the tools/tool_choice/n/
+        // response_format/logprobs/stop/role/content-part rows on this surface.
+        // `scripts/check-capability-matrix.sh` greps this file for
+        // `fn <fixture_id>` and fails the build if a matrix row cites an ID
+        // that no longer exists here.
+        // -----------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn cm_lattice_serve_model_mismatch_accepted_expected_deviation() {
+            // Expected-deviation fixture, not a bug fix: `lattice serve` (the
+            // CLI's HTTP subcommand) rejects a request whose `model` field
+            // doesn't match the served model id with HTTP 400
+            // (`lattice.rs`'s `model_not_found` check, exercised by
+            // `cm_serve_model_mismatch_rejected` in that binary's own test
+            // module). This surface has no equivalent check at all: `req.model`
+            // is accepted as-is, and the request is queued for generation like
+            // any other. This fixture pins that CURRENT, documented divergence
+            // -- tracked in #663 -- by proving a mismatched `model` reaches the
+            // job queue rather than being rejected up front. If #663 ships a
+            // `model_not_found` check here, this fixture starts failing
+            // (`jobs_rx` never receives a `Job`), which is the intended signal
+            // to update it rather than a silent pass either way.
+            let (jobs, mut jobs_rx) = mpsc::unbounded_channel::<Job>();
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("served-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+            };
+            let body = Body::from(
+                r#"{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}"#
+                    .to_string(),
+            );
+            // The handler awaits a reply from a worker that doesn't exist in
+            // this test, so it never resolves; run it in the background and
+            // only wait on the job queue it should have fed synchronously
+            // before that await point.
+            tokio::spawn(async move {
+                let _ = chat_completions(State(state), body).await;
+            });
+            let queued = tokio::time::timeout(Duration::from_millis(500), jobs_rx.recv()).await;
+            assert!(
+                matches!(queued, Ok(Some(_))),
+                "a mismatched `model` must reach the job queue on this surface today \
+                 (expected deviation, tracked in #663)"
+            );
+        }
     }
 }

@@ -3264,35 +3264,43 @@ mod serve {
         Json(HealthResponse { status: "ok" })
     }
 
-    pub async fn chat_completions(
-        State(state): State<AppState>,
-        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
-    ) -> Result<Response, ApiError> {
-        // Surface JSON extraction failures as structured 400 responses.
-        // Log the raw parser message server-side; never forward it to clients.
-        let Json(req) = result.map_err(|rejection| {
-            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                ApiError::PayloadTooLarge {
-                    message: "request body exceeds 1 MiB limit".to_string(),
-                }
-            } else {
-                eprintln!("invalid request body: {}", rejection.body_text());
-                ApiError::BadRequest {
-                    message: "invalid JSON request body".to_string(),
-                    code: "invalid_request_body",
-                }
-            }
-        })?;
+    /// Everything `chat_completions` must check about a request *before* it
+    /// touches the loaded model: unsupported-feature rejection, model-id
+    /// match, message-shape, sampling-parameter bounds, and prompt
+    /// rendering. Pulled out of the handler so the capability-matrix
+    /// fixtures (`mod tests`, below) can exercise this exact validation
+    /// cascade — including the `model_not_found` / empty-messages /
+    /// last-role checks that previously had no test coverage at all —
+    /// without constructing a real `ModelBackend`. No behavior change
+    /// versus the inline sequence this replaces.
+    ///
+    /// The context-window check and `stop`-sequence parsing are not part of
+    /// this function — see `prepare_chat_request`, which composes this with
+    /// both in the exact order the original inline cascade used.
+    #[derive(Debug)]
+    struct ValidatedChatRequest {
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        logprobs: Option<usize>,
+        prompt: String,
+    }
 
+    fn validate_chat_request(
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<ValidatedChatRequest, ApiError> {
         // Reject unsupported OpenAI features before any further processing.
-        reject_unsupported(&req)?;
+        reject_unsupported(req)?;
 
         // Validate that the caller targets the served model.
-        if req.model != state.model_id {
+        if req.model != model_id {
             return Err(ApiError::BadRequest {
                 message: format!(
                     "model '{}' is not loaded; this server serves '{}'",
-                    req.model, state.model_id
+                    req.model, model_id
                 ),
                 code: "model_not_found",
             });
@@ -3318,8 +3326,8 @@ mod serve {
         let max_tokens = validate_max_tokens(
             req.max_tokens,
             req.max_completion_tokens,
-            state.default_max_tokens,
-            state.max_tokens_cap,
+            default_max_tokens,
+            max_tokens_cap,
         )?;
         let temperature = validate_temperature(req.temperature)?;
         let top_p = validate_top_p(req.top_p)?;
@@ -3329,11 +3337,28 @@ mod serve {
         // any unsupported role or content-part type encountered.
         let prompt = render_prompt(&req.messages)?;
 
-        // Preflight: reject prompts that would overflow the model's context window
-        // before entering the blocking generation path.  This converts what would
-        // otherwise be a panic inside spawn_blocking into a clean 400 response.
-        let prompt_token_count = state.model.tokenize_len(&prompt);
-        let max_context = state.model.max_context();
+        Ok(ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+        })
+    }
+
+    /// Reject prompts that would overflow the model's context window,
+    /// before entering the blocking generation path. This converts what
+    /// would otherwise be a panic inside `spawn_blocking` into a clean 400
+    /// response. Pulled out of `prepare_chat_request` as a pure function
+    /// (given already-computed token counts, not `state.model` itself)
+    /// purely so its precedence relative to `parse_stop_strings` is
+    /// directly testable; behavior is unchanged from the original inline
+    /// check.
+    fn check_context_window(
+        prompt_token_count: usize,
+        max_tokens: usize,
+        max_context: usize,
+    ) -> Result<(), ApiError> {
         if prompt_token_count == 0 || prompt_token_count.saturating_add(max_tokens) > max_context {
             return Err(ApiError::BadRequest {
                 message: format!(
@@ -3343,8 +3368,104 @@ mod serve {
                 code: "context_length_exceeded",
             });
         }
+        Ok(())
+    }
+
+    /// Output of the full pre-generation validation cascade, ready for
+    /// `gen_cfg` construction.
+    #[derive(Debug)]
+    struct PreparedChatRequest {
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        logprobs: Option<usize>,
+        prompt: String,
+        stop_strings: Vec<String>,
+    }
+
+    /// Composes `validate_chat_request`, the context-window preflight, and
+    /// `stop`-sequence parsing in the exact order the original inline
+    /// `chat_completions` cascade used: `stop` is validated *last*, after
+    /// both the served-model hard requirements and the context-window
+    /// check that guards against a panic in the blocking generation path.
+    /// A request that is both over-context and carries a malformed `stop`
+    /// field must fail with `context_length_exceeded`, not a stop-parsing
+    /// error — pinned by `cm_serve_context_window_checked_before_stop_parsing`.
+    ///
+    /// `tokenize_len`/`max_context` are threaded through as thunks (rather
+    /// than a `&ModelBackend`) so this whole cascade — including the
+    /// ordering — is testable without constructing a real model: the
+    /// rendered `prompt` that `tokenize_len` needs only exists once
+    /// `validate_chat_request` has already run, so the thunk form lets a
+    /// test control the token count `check_context_window` sees without
+    /// having to fake a tokenizer.
+    fn prepare_chat_request(
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+        tokenize_len: impl FnOnce(&str) -> usize,
+        max_context: impl FnOnce() -> usize,
+    ) -> Result<PreparedChatRequest, ApiError> {
+        let ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+        } = validate_chat_request(req, model_id, default_max_tokens, max_tokens_cap)?;
+
+        let prompt_token_count = tokenize_len(&prompt);
+        let max_context = max_context();
+        check_context_window(prompt_token_count, max_tokens, max_context)?;
 
         let stop_strings = parse_stop_strings(&req.stop)?;
+
+        Ok(PreparedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+        })
+    }
+
+    pub async fn chat_completions(
+        State(state): State<AppState>,
+        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+    ) -> Result<Response, ApiError> {
+        // Surface JSON extraction failures as structured 400 responses.
+        // Log the raw parser message server-side; never forward it to clients.
+        let Json(req) = result.map_err(|rejection| {
+            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".to_string(),
+                }
+            } else {
+                eprintln!("invalid request body: {}", rejection.body_text());
+                ApiError::BadRequest {
+                    message: "invalid JSON request body".to_string(),
+                    code: "invalid_request_body",
+                }
+            }
+        })?;
+
+        let PreparedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+        } = prepare_chat_request(
+            &req,
+            &state.model_id,
+            state.default_max_tokens,
+            state.max_tokens_cap,
+            |p| state.model.tokenize_len(p),
+            || state.model.max_context(),
+        )?;
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
             max_new_tokens: max_tokens,
@@ -4717,6 +4838,180 @@ mod serve {
                 v["logprobs"]["content"][0]["top_logprobs"],
                 serde_json::json!([])
             );
+        }
+
+        // -----------------------------------------------------------------------
+        // Capability-matrix fixtures (#654) — `validate_chat_request` cascade.
+        //
+        // Each `#[test]` fn name below is a fixture ID cited from
+        // `docs/capability-matrix.md`'s Fixture column; `scripts/check-capability-
+        // matrix.sh` greps this file for `fn <fixture_id>` and fails the build if
+        // a matrix row cites an ID that no longer exists here. These three checks
+        // (model-id match, empty messages, last-role-must-be-user) previously ran
+        // only inline in `chat_completions` with no dedicated test at all.
+        // -----------------------------------------------------------------------
+
+        fn user_msg(text: &str) -> Message {
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text(text.to_string()),
+            }
+        }
+
+        #[test]
+        fn cm_serve_model_mismatch_rejected() {
+            let req = ChatCompletionRequest {
+                model: "some-other-model".to_string(),
+                messages: vec![user_msg("hi")],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "model_not_found",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_model_match_passes_model_check() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                ..bare_req()
+            };
+            assert!(validate_chat_request(&req, "served-model", 256, 4096).is_ok());
+        }
+
+        #[test]
+        fn cm_serve_empty_messages_rejected() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_messages",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_last_message_not_user_rejected() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![
+                    user_msg("hi"),
+                    Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Text("hello".to_string()),
+                    },
+                ],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_messages",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_unsupported_feature_rejected_before_model_check() {
+            // `reject_unsupported` (tools/n/response_format/stream+logprobs) runs
+            // first in the cascade: a request that both targets the wrong model
+            // AND asks for `tools` must fail on the tools rejection, not the
+            // model-mismatch check, so callers get the more specific error.
+            let req = ChatCompletionRequest {
+                model: "some-other-model".to_string(),
+                messages: vec![user_msg("hi")],
+                tools: Some(serde_json::json!([{"type": "function"}])),
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_stop_sequences_accepted_end_to_end() {
+            // Full-cascade check that a well-formed request carrying `stop`
+            // resolves through to `PreparedChatRequest.stop_strings` — the
+            // capability matrix's "supported" claim for `stop` on this surface.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                stop: Some(serde_json::json!(["\n\n"])),
+                ..bare_req()
+            };
+            let prepared =
+                prepare_chat_request(&req, "served-model", 256, 4096, |_| 1, || 4096).unwrap();
+            assert_eq!(prepared.stop_strings, vec!["\n\n".to_string()]);
+        }
+
+        #[test]
+        fn cm_serve_context_window_checked_before_stop_parsing() {
+            // Regression fixture for a refactor bug: extracting stop-sequence
+            // parsing into the pre-model validation cascade moved it ahead of
+            // the context-window check. The pre-refactor inline sequence
+            // (verified directly against `crates/inference/src/bin/lattice.rs`
+            // at commit 3e0f74155, the base this PR built on) checked the
+            // context window BEFORE parsing `stop`. A request that is both
+            // over-context and carries a malformed `stop` field must
+            // therefore fail with `context_length_exceeded`, not a
+            // stop-parsing error.
+            //
+            // This drives `prepare_chat_request` itself (not just its
+            // sub-functions in isolation), with a `tokenize_len` thunk that
+            // reports the whole context window as already consumed by the
+            // prompt — so it is sensitive to a future reordering of the
+            // `check_context_window` / `parse_stop_strings` calls inside
+            // `prepare_chat_request`, not just to whether each sub-function
+            // works in isolation.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                stop: Some(serde_json::json!([])), // malformed: empty array is rejected
+                ..bare_req()
+            };
+            let err = prepare_chat_request(&req, "served-model", 256, 4096, |_| 4096, || 4096)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_logprobs_resolved_end_to_end() {
+            // Full-cascade check backing the matrix's "supported, non-streaming
+            // only" `logprobs`/`top_logprobs` claim for `lattice serve`.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                logprobs: Some(true),
+                top_logprobs: Some(3),
+                ..bare_req()
+            };
+            let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
+            assert_eq!(validated.logprobs, Some(3));
         }
     }
 }

@@ -516,6 +516,108 @@ fn emit_json_generation(
     Ok(())
 }
 
+// ─── --json --serve request parsing (#654) ─────────────────────────────────
+//
+// Factored out of the serve loop in `run()` below so the capability-matrix
+// fixtures (`mod tests`) can exercise the exact wire-parsing contract for
+// `--json --serve` request lines without a loaded Metal model. Pure — no
+// Metal/GPU dependency at all — so it is not behind the `metal-gpu` cfg gate
+// the rest of this binary uses; it is still only reachable from `run()`,
+// which is gated. No behavior change versus the inline code it replaces.
+
+/// CLI-level defaults a per-request field falls back to when the incoming
+/// JSON line omits it. Captured once from the parsed `--*` flags in `run()`.
+#[derive(Clone, Copy)]
+struct ServeRequestDefaults {
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repetition_penalty: f32,
+    seed: Option<u64>,
+    reasoning_budget: Option<usize>,
+}
+
+/// One request parsed from a newline-delimited JSON line in `--json --serve`
+/// mode. Every field but `prompt` falls back to `ServeRequestDefaults` when
+/// absent, mirroring the doc comment's advertised wire shape:
+/// `{"prompt":"<chatml>","max_tokens":64,"temperature":0.7,"top_k":50,"top_p":0.9,"repetition_penalty":1.1,"seed":42}`.
+#[derive(Debug)]
+struct ParsedServeRequest {
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repetition_penalty: f32,
+    seed: Option<u64>,
+    reasoning_budget: Option<usize>,
+}
+
+/// Why a `--json --serve` request line could not be turned into a
+/// `ParsedServeRequest`. Both variants map 1:1 to the `@@lattice`
+/// `{"ev":"error",...}` line `run()`'s serve loop emits on this `Err`.
+#[derive(Debug)]
+enum ServeRequestError {
+    /// The line was not valid JSON at all. Carries the raw `serde_json`
+    /// parse error message (embedded in the emitted error event, same as
+    /// before this factoring).
+    Malformed(String),
+    /// The line parsed as JSON but had no string `"prompt"` field.
+    MissingPrompt,
+}
+
+fn parse_serve_request_line(
+    line: &str,
+    defaults: ServeRequestDefaults,
+) -> Result<ParsedServeRequest, ServeRequestError> {
+    let req_val: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| ServeRequestError::Malformed(e.to_string()))?;
+
+    let prompt = req_val["prompt"]
+        .as_str()
+        .ok_or(ServeRequestError::MissingPrompt)?
+        .to_owned();
+
+    let max_tokens = req_val["max_tokens"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(defaults.max_tokens);
+    let temperature = req_val["temperature"]
+        .as_f64()
+        .map(|v| v as f32)
+        .unwrap_or(defaults.temperature);
+    let top_k = req_val["top_k"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(defaults.top_k);
+    let top_p = req_val["top_p"]
+        .as_f64()
+        .map(|v| v as f32)
+        .unwrap_or(defaults.top_p);
+    let repetition_penalty = req_val["repetition_penalty"]
+        .as_f64()
+        .map(|v| v as f32)
+        .unwrap_or(defaults.repetition_penalty);
+    let seed = req_val["seed"].as_u64().or(defaults.seed);
+    let reasoning_budget = req_val["reasoning_budget"]
+        .as_u64()
+        .map(|v| v as usize)
+        .filter(|&n| n > 0)
+        .or(defaults.reasoning_budget);
+
+    Ok(ParsedServeRequest {
+        prompt,
+        max_tokens,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        seed,
+        reasoning_budget,
+    })
+}
+
 // ─── main logic ─────────────────────────────────────────────────────────────
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -735,6 +837,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let stdin_lock = stdin.lock();
             let mut lines = stdin_lock.lines();
 
+            let serve_defaults = ServeRequestDefaults {
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                seed,
+                reasoning_budget,
+            };
+
             // The model is fully loaded by this point (built above, before the serve loop).
             // Emit a `ready` event so the app can spawn this process from a "Load model" button
             // and show an honest LOADED state once the weights are resident — without having to
@@ -757,10 +869,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                // Parse the request object.
-                let req_val: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(e) => {
+                // Parse the request line (#654: factored into a pure function,
+                // `parse_serve_request_line` below, so the capability-matrix
+                // fixtures can exercise this exact wire contract without a
+                // loaded Metal model). Same two failure modes, same messages.
+                let parsed = match parse_serve_request_line(&line, serve_defaults) {
+                    Ok(p) => p,
+                    Err(ServeRequestError::Malformed(e)) => {
                         let mut out = std::io::stdout();
                         use std::io::Write;
                         let msg = json_escape(&format!("malformed request: {e}"));
@@ -768,11 +883,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = out.flush();
                         continue; // robustness: keep loop alive on bad input
                     }
-                };
-
-                let prompt = match req_val["prompt"].as_str() {
-                    Some(p) => p.to_owned(),
-                    None => {
+                    Err(ServeRequestError::MissingPrompt) => {
                         let mut out = std::io::stdout();
                         use std::io::Write;
                         let _ = writeln!(
@@ -783,45 +894,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-
-                // Build per-request config, falling back to CLI defaults for absent fields.
-                let req_max_tokens = req_val["max_tokens"]
-                    .as_u64()
-                    .map(|v| v as usize)
-                    .unwrap_or(max_tokens);
-                let req_temperature = req_val["temperature"]
-                    .as_f64()
-                    .map(|v| v as f32)
-                    .unwrap_or(temperature);
-                let req_top_k = req_val["top_k"]
-                    .as_u64()
-                    .map(|v| v as usize)
-                    .unwrap_or(top_k);
-                let req_top_p = req_val["top_p"].as_f64().map(|v| v as f32).unwrap_or(top_p);
-                let req_repetition_penalty = req_val["repetition_penalty"]
-                    .as_f64()
-                    .map(|v| v as f32)
-                    .unwrap_or(repetition_penalty);
-                let req_seed = req_val["seed"].as_u64().or(seed);
-                let req_reasoning_budget = req_val["reasoning_budget"]
-                    .as_u64()
-                    .map(|v| v as usize)
-                    .filter(|&n| n > 0)
-                    .or(reasoning_budget);
+                let prompt = parsed.prompt;
 
                 let req_cfg = GenerateConfig {
-                    max_new_tokens: req_max_tokens,
-                    temperature: req_temperature,
-                    top_k: req_top_k,
-                    top_p: req_top_p,
-                    repetition_penalty: req_repetition_penalty,
-                    seed: req_seed,
+                    max_new_tokens: parsed.max_tokens,
+                    temperature: parsed.temperature,
+                    top_k: parsed.top_k,
+                    top_p: parsed.top_p,
+                    repetition_penalty: parsed.repetition_penalty,
+                    seed: parsed.seed,
                     stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
                     enable_thinking: true,
                     enable_mtp: None,
                     grammar: None,
                     stop_strings: vec![],
-                    reasoning_budget: req_reasoning_budget,
+                    reasoning_budget: parsed.reasoning_budget,
                     logprobs: None,
                 };
 
@@ -952,4 +1039,96 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults() -> ServeRequestDefaults {
+        ServeRequestDefaults {
+            max_tokens: 64,
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            seed: None,
+            reasoning_budget: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capability-matrix fixtures (#654). Fixture IDs cited from
+    // `docs/capability-matrix.md`'s Fixture manifest section;
+    // `scripts/check-capability-matrix.sh` greps this file for
+    // `fn <fixture_id>` and fails the build if a matrix row cites an ID that
+    // no longer exists here.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cm_chat_metal_serve_prompt_only_uses_all_defaults() {
+        let parsed = parse_serve_request_line(r#"{"prompt":"hi"}"#, defaults()).unwrap();
+        assert_eq!(parsed.prompt, "hi");
+        assert_eq!(parsed.max_tokens, 64);
+        assert_eq!(parsed.temperature, 0.7);
+        assert_eq!(parsed.top_k, 50);
+        assert_eq!(parsed.top_p, 0.9);
+        assert_eq!(parsed.repetition_penalty, 1.1);
+        assert_eq!(parsed.seed, None);
+        assert_eq!(parsed.reasoning_budget, None);
+    }
+
+    #[test]
+    fn cm_chat_metal_serve_per_request_overrides_all_fields() {
+        let line = r#"{"prompt":"hi","max_tokens":128,"temperature":0.2,"top_k":10,
+            "top_p":0.5,"repetition_penalty":1.3,"seed":7,"reasoning_budget":256}"#;
+        let parsed = parse_serve_request_line(line, defaults()).unwrap();
+        assert_eq!(parsed.max_tokens, 128);
+        assert_eq!(parsed.temperature, 0.2);
+        assert_eq!(parsed.top_k, 10);
+        assert_eq!(parsed.top_p, 0.5);
+        assert_eq!(parsed.repetition_penalty, 1.3);
+        assert_eq!(parsed.seed, Some(7));
+        assert_eq!(parsed.reasoning_budget, Some(256));
+    }
+
+    #[test]
+    fn cm_chat_metal_serve_malformed_json_rejected() {
+        let err = parse_serve_request_line("not json", defaults()).unwrap_err();
+        assert!(matches!(err, ServeRequestError::Malformed(_)));
+    }
+
+    #[test]
+    fn cm_chat_metal_serve_missing_prompt_rejected() {
+        let err = parse_serve_request_line(r#"{"max_tokens":64}"#, defaults()).unwrap_err();
+        assert!(matches!(err, ServeRequestError::MissingPrompt));
+    }
+
+    #[test]
+    fn cm_chat_metal_serve_zero_reasoning_budget_falls_back_to_default() {
+        // Matches the inline `.filter(|&n| n > 0)` this replaces: a
+        // request-supplied `reasoning_budget: 0` is treated as absent, not
+        // as an explicit zero-budget override.
+        let d = ServeRequestDefaults {
+            reasoning_budget: Some(512),
+            ..defaults()
+        };
+        let parsed =
+            parse_serve_request_line(r#"{"prompt":"hi","reasoning_budget":0}"#, d).unwrap();
+        assert_eq!(parsed.reasoning_budget, Some(512));
+    }
+
+    #[test]
+    fn cm_chat_metal_serve_stateless_no_stop_strings_or_history_fields() {
+        // Capability-matrix row: unlike the two HTTP surfaces, chat_metal
+        // --json --serve has no `stop`/`messages` wire fields at all -- the
+        // client resends the full ChatML-rendered history as `prompt` on
+        // every request (see the module doc comment's wire shape). This
+        // fixture pins that: `stop` in the request line is inert, not an
+        // error and not applied, because `ParsedServeRequest` has no field
+        // for it.
+        let parsed =
+            parse_serve_request_line(r#"{"prompt":"hi","stop":["\n"]}"#, defaults()).unwrap();
+        assert_eq!(parsed.prompt, "hi");
+    }
 }
