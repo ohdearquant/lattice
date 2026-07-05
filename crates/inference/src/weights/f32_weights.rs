@@ -80,6 +80,15 @@ pub struct TransformerLayerWeights<'a> {
     pub ffn_output_bias: Tensor1D<'a>,
     pub ffn_layer_norm_weight: Tensor1D<'a>,
     pub ffn_layer_norm_bias: Tensor1D<'a>,
+
+    /// Fused Q/K/V projection weight: `[3*hidden_size, hidden_size]` -- rows of
+    /// `query_weight`, `key_weight`, `value_weight` concatenated vertically.
+    /// Enables one `matmul_bt` call per layer instead of three (mirrors the
+    /// Qwen `fused_qkv` pattern in [`QwenLayerWeights`]).
+    pub fused_qkv: Vec<f32>,
+    /// Fused Q/K/V bias: `[3*hidden_size]` -- `query_bias`, `key_bias`, `value_bias`
+    /// concatenated.
+    pub fused_qkv_bias: Vec<f32>,
 }
 
 /// **Unstable**: full BERT model weight bundle; structure may change with model variants.
@@ -381,28 +390,50 @@ impl SafetensorsFile {
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             let prefix = format!("encoder.layer.{i}");
+
+            let query_weight = self.tensor2d(
+                &format!("{prefix}.attention.self.query.weight"),
+                hidden_size,
+                hidden_size,
+            )?;
+            let query_bias =
+                self.tensor1d(&format!("{prefix}.attention.self.query.bias"), hidden_size)?;
+            let key_weight = self.tensor2d(
+                &format!("{prefix}.attention.self.key.weight"),
+                hidden_size,
+                hidden_size,
+            )?;
+            let key_bias =
+                self.tensor1d(&format!("{prefix}.attention.self.key.bias"), hidden_size)?;
+            let value_weight = self.tensor2d(
+                &format!("{prefix}.attention.self.value.weight"),
+                hidden_size,
+                hidden_size,
+            )?;
+            let value_bias =
+                self.tensor1d(&format!("{prefix}.attention.self.value.bias"), hidden_size)?;
+
+            // Fused Q/K/V weight+bias: rows of Wq/Wk/Wv (and their biases)
+            // concatenated vertically, so one [3*hidden, hidden] matmul_bt call
+            // replaces three [hidden, hidden] calls (#674).
+            let mut fused_qkv = Vec::with_capacity(3 * hidden_size * hidden_size);
+            fused_qkv.extend_from_slice(query_weight.data);
+            fused_qkv.extend_from_slice(key_weight.data);
+            fused_qkv.extend_from_slice(value_weight.data);
+            let mut fused_qkv_bias = Vec::with_capacity(3 * hidden_size);
+            fused_qkv_bias.extend_from_slice(query_bias.data);
+            fused_qkv_bias.extend_from_slice(key_bias.data);
+            fused_qkv_bias.extend_from_slice(value_bias.data);
+
             layers.push(TransformerLayerWeights {
-                query_weight: self.tensor2d(
-                    &format!("{prefix}.attention.self.query.weight"),
-                    hidden_size,
-                    hidden_size,
-                )?,
-                query_bias: self
-                    .tensor1d(&format!("{prefix}.attention.self.query.bias"), hidden_size)?,
-                key_weight: self.tensor2d(
-                    &format!("{prefix}.attention.self.key.weight"),
-                    hidden_size,
-                    hidden_size,
-                )?,
-                key_bias: self
-                    .tensor1d(&format!("{prefix}.attention.self.key.bias"), hidden_size)?,
-                value_weight: self.tensor2d(
-                    &format!("{prefix}.attention.self.value.weight"),
-                    hidden_size,
-                    hidden_size,
-                )?,
-                value_bias: self
-                    .tensor1d(&format!("{prefix}.attention.self.value.bias"), hidden_size)?,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+                fused_qkv,
+                fused_qkv_bias,
                 attn_output_weight: self.tensor2d(
                     &format!("{prefix}.attention.output.dense.weight"),
                     hidden_size,

@@ -1017,6 +1017,22 @@ mod tests {
                     data: &self.v_bias,
                     len: self.kv_proj_dim,
                 },
+                fused_qkv: {
+                    let mut fused = Vec::with_capacity(
+                        (self.q_proj_dim + 2 * self.kv_proj_dim) * self.hidden_size,
+                    );
+                    fused.extend_from_slice(&self.q_weight);
+                    fused.extend_from_slice(&self.k_weight);
+                    fused.extend_from_slice(&self.v_weight);
+                    fused
+                },
+                fused_qkv_bias: {
+                    let mut fused = Vec::with_capacity(self.q_proj_dim + 2 * self.kv_proj_dim);
+                    fused.extend_from_slice(&self.q_bias);
+                    fused.extend_from_slice(&self.k_bias);
+                    fused.extend_from_slice(&self.v_bias);
+                    fused
+                },
                 attn_output_weight: Tensor2D {
                     data: &self.out_weight,
                     rows: self.hidden_size,
