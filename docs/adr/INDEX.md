@@ -90,7 +90,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | ---------------------------------------- | ----------------------------------------- |
 | [058](ADR-058-cpu-perf-regression-ci.md) | CPU Performance Regression Tracking in CI |
 
-## architecture / research (ADR-059 through ADR-068) — Proposed
+## architecture / research (ADR-059 onward)
 
 | ADR                                                | Title                                                         | Status       | Depends on   |
 | -------------------------------------------------- | ------------------------------------------------------------- | ------------ | ------------ |
@@ -104,6 +104,8 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [066](ADR-066-output-correctness-gate-architecture.md) | Output-correctness gate architecture                      | Accepted     | ADR-064, ADR-065 |
 | [067](ADR-067-gpu-decode-perf-regression-gates.md) | GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max) | Proposed | ADR-058, 061, 064 |
 | [068](ADR-068-grammar-wire-contract.md)            | Pluggable Custom-Grammar Wire Contract for the OpenAI-Compatible Serving Surface | Proposed | ADR-046, 063 |
+| [069](ADR-069-vision-encoder-qwen35-recalibration.md) | Vision Encoder Recalibration for Qwen3.5-0.8B                 | Proposed     | none         |
+| [070](ADR-070-cpu-embedding-batched-encode.md)     | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate | Proposed | ADR-058 |
 
 ## informational
 
