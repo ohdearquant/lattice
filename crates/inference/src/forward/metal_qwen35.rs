@@ -543,6 +543,128 @@ mod mtp_resolve_tests {
     }
 }
 
+// -----------------------------------------------------------------------------
+// MTP / self-spec route-around predicates (codex round-1 medium #1, PR #657) --
+// pure, `Device`-free, compiled unconditionally in test builds (same pattern
+// as the `resolve_mtp_*` functions above: `mod inner` re-imports these via
+// `use super::{...}` so the two real dispatch sites in `generate()` stay
+// single-source-of-truth, but the boolean logic itself is unit-testable
+// without a GPU or a Metal MTP/self-spec fixture).
+// -----------------------------------------------------------------------------
+
+/// Whether `generate()` should take the MTP greedy-draft branch instead of
+/// plain per-token decode. Mirrors the `use_mtp` computation inline in
+/// `MetalQwen35State::generate` exactly -- in particular
+/// `gen_cfg.stop_strings.is_empty()` is load-bearing: MTP's draft/verify loop
+/// has no string-stop awareness, so any non-empty `stop_strings` must route
+/// around it to the plain loop (which does check stops after every token).
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn mtp_route_active(
+    mtp_present: bool,
+    mtp_enabled: bool,
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    use_compact: bool,
+) -> bool {
+    mtp_present
+        && mtp_enabled
+        && gen_cfg.top_k <= 1
+        && gen_cfg.temperature <= 0.0
+        && !use_compact
+        && gen_cfg.grammar.is_none()
+        && gen_cfg.stop_strings.is_empty()
+}
+
+/// Whether `generate()` should take the GDN-first self-speculative greedy
+/// branch. Mirrors the `use_self_spec` computation inline in
+/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()`
+/// route-around rationale as [`mtp_route_active`].
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn self_spec_route_active(
+    gdn_checkpoints_present: bool,
+    self_spec_env_set: bool,
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    use_compact: bool,
+    num_active_linear_attention_layers: usize,
+) -> bool {
+    gdn_checkpoints_present
+        && self_spec_env_set
+        && gen_cfg.top_k <= 1
+        && gen_cfg.temperature <= 0.0
+        && !use_compact
+        && gen_cfg.grammar.is_none()
+        && gen_cfg.stop_strings.is_empty()
+        && num_active_linear_attention_layers > 0
+}
+
+#[cfg(test)]
+mod route_predicate_tests {
+    use super::{mtp_route_active, self_spec_route_active};
+    use crate::model::qwen35_config::GenerateConfig;
+
+    fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: Some(42),
+            stop_token_ids: vec![],
+            enable_thinking: false,
+            enable_mtp: Some(true),
+            grammar: None,
+            stop_strings,
+            reasoning_budget: None,
+            logprobs: None,
+        }
+    }
+
+    /// Baseline: with every other precondition satisfied and NO stop strings,
+    /// the MTP route is active. Establishes the contrast the next test
+    /// depends on -- without this, `mtp_route_active` returning `false` when
+    /// `stop_strings` is non-empty would be trivially true for the wrong
+    /// reason (e.g. a typo`'d always-false condition).
+    #[test]
+    fn mtp_route_active_when_no_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec![]);
+        assert!(mtp_route_active(true, true, &gen_cfg, false));
+    }
+
+    /// Codex medium #1: non-empty `stop_strings` must route around MTP even
+    /// though every other MTP precondition (present, enabled, greedy,
+    /// non-compact, no grammar) is satisfied.
+    #[test]
+    fn mtp_route_blocked_by_nonempty_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec!["never_matches_xyz".to_string()]);
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when stop_strings is non-empty -- its \
+             draft/verify loop has no string-stop awareness"
+        );
+    }
+
+    /// Baseline for self-spec, mirroring the MTP baseline above.
+    #[test]
+    fn self_spec_route_active_when_no_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec![]);
+        assert!(self_spec_route_active(true, true, &gen_cfg, false, 1));
+    }
+
+    /// Codex medium #1: non-empty `stop_strings` must route around
+    /// self-speculative decode even though every other precondition
+    /// (checkpoints present, env set, greedy, non-compact, no grammar, has
+    /// linear-attention layers) is satisfied.
+    #[test]
+    fn self_spec_route_blocked_by_nonempty_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec!["never_matches_xyz".to_string()]);
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when stop_strings is non-empty -- \
+             same string-stop-unaware draft/verify loop as MTP"
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     use super::GdnStateTrafficScope;
@@ -10948,13 +11070,12 @@ kernel void gdn_chunk_norm_silu_c32(
             let mtp_enabled = gen_cfg
                 .enable_mtp
                 .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
-            let use_mtp = self.session.mtp.is_some()
-                && mtp_enabled
-                && gen_cfg.top_k <= 1
-                && gen_cfg.temperature <= 0.0
-                && !use_compact
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.stop_strings.is_empty();
+            let use_mtp = super::mtp_route_active(
+                self.session.mtp.is_some(),
+                mtp_enabled,
+                gen_cfg,
+                use_compact,
+            );
             if use_mtp {
                 if use_compact {
                     self.session.compact_topk = 0;
@@ -10969,14 +11090,13 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             // GDN-first self-speculative greedy path: env-gated, greedy only.
-            let use_self_spec = self.session.gdn_checkpoints.is_some()
-                && std::env::var("LATTICE_SELF_SPEC").is_ok()
-                && gen_cfg.top_k <= 1
-                && gen_cfg.temperature <= 0.0
-                && !use_compact
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.stop_strings.is_empty()
-                && cfg.num_active_linear_attention_layers() > 0;
+            let use_self_spec = super::self_spec_route_active(
+                self.session.gdn_checkpoints.is_some(),
+                std::env::var("LATTICE_SELF_SPEC").is_ok(),
+                gen_cfg,
+                use_compact,
+                cfg.num_active_linear_attention_layers(),
+            );
             if use_self_spec {
                 return Ok(self.generate_greedy_self_spec(
                     &prefill_logits,
@@ -23904,8 +24024,25 @@ kernel void decode_attention_reference(
         /// multibyte UTF-8 codepoints (each 3 bytes) — exercising the UTF-8
         /// char-boundary clamp that `single_char_vocab_tokenizer` (all 1-byte
         /// tokens) cannot exercise on its own.
+        ///
+        /// Codex round-1 medium #2 (PR #657): the previous version of this
+        /// fixture inserted the literal chars `"世"`/`"界"` as BPE vocab
+        /// *strings*. Qwen's real decode path reverses GPT-2 byte-level token
+        /// strings through `byte_decoder` (`detokenize.rs::append_token_bytes`);
+        /// characters outside that decoder's placeholder set (any non-ASCII,
+        /// non-Latin-1-printable char — CJK included) are silently dropped, so
+        /// those literal entries never decoded to CJK bytes at all and any test
+        /// sampling ids 30/31 exercised nothing. Entries here instead use
+        /// `bytes_to_unicode()`'s placeholder chars over the raw UTF-8 bytes of
+        /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
+        /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
         fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
+            use crate::model::qwen35::detokenize::bytes_to_unicode;
             use std::collections::HashMap;
+            let byte_encoder = bytes_to_unicode();
+            let byte_level_token = |bytes: &[u8]| -> String {
+                bytes.iter().map(|&b| byte_encoder[b as usize]).collect()
+            };
             let mut vocab: HashMap<String, u32> = HashMap::new();
             for i in 0u32..30 {
                 let byte = if i < 26 {
@@ -23915,8 +24052,10 @@ kernel void decode_attention_reference(
                 };
                 vocab.insert((byte as char).to_string(), i);
             }
-            vocab.insert("世".to_string(), 30);
-            vocab.insert("界".to_string(), 31);
+            // 好 = 0xE5 0xA5 0xBD, split across two token ids so a stop string
+            // built from the completed codepoint spans a real token boundary.
+            vocab.insert(byte_level_token(&[0xE5, 0xA5]), 30);
+            vocab.insert(byte_level_token(&[0xBD]), 31);
             crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
                 .expect("multibyte vocab tokenizer build")
         }

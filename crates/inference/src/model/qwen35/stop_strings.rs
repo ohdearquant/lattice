@@ -50,11 +50,21 @@ impl<'a> StopStringMatcher<'a> {
     /// Append `delta` to the accumulated text, emit newly-safe text via `sink`.
     ///
     /// Returns `true` when a stop string was found (caller must break the decode loop).
+    ///
+    /// `delta` may be empty — `IncrementalDetokenizer::push` returns `""` while
+    /// buffering a split UTF-8 scalar, and `append_token_bytes` silently drops
+    /// characters outside the GPT-2 byte decoder (e.g. special tokens), so an
+    /// empty delta is a normal occurrence, not just a boundary case. The match
+    /// check below must still run on an empty delta: an empty stop string
+    /// (`stops == [""]`) matches `full` at byte 0 unconditionally via
+    /// `str::find("")`, and that match must fire on the very first generated
+    /// token even when that token's delta happens to be empty. Skipping the
+    /// scan here (as the previous `if delta.is_empty() { return false; }`
+    /// early-return did) silently swallowed that first-token stop.
     pub(crate) fn push(&mut self, delta: &str, sink: &mut impl FnMut(&str)) -> bool {
-        if delta.is_empty() {
-            return false;
+        if !delta.is_empty() {
+            self.full.push_str(delta);
         }
-        self.full.push_str(delta);
 
         if let Some(hit) = earliest_stop_match(&self.full, self.stops) {
             let slice = &self.full[self.emitted..hit];
@@ -311,5 +321,188 @@ mod tests {
         assert!(stopped);
         assert_eq!(buf, "hello ");
         assert_eq!(streamer.into_text(), "hello ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty-stop / empty-delta regression (codex review round 1, PR #657)
+    // -----------------------------------------------------------------------
+
+    /// Codex's exact counterexample: `StopStringMatcher::new(&[""]).push("", ...)`
+    /// must report a match at byte 0. `IncrementalDetokenizer::push` can return an
+    /// empty delta for the very first generated token (buffering a split UTF-8
+    /// scalar, or a token whose chars all fall outside the byte decoder), and an
+    /// empty stop string is documented (see the Metal prefix-cache test) to match
+    /// unconditionally at byte 0 via `str::find("")`. Before the fix, `push`
+    /// returned `false` immediately on an empty delta without ever scanning,
+    /// silently swallowing this first-token stop.
+    #[test]
+    fn stop_streamer_empty_stop_matches_on_empty_delta() {
+        let stops = vec![String::new()];
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+        let stopped = streamer.push("", &mut |s| emitted.push(s.to_string()));
+        assert!(
+            stopped,
+            "an empty stop string must match at byte 0 even when the delta is empty \
+             (empty-delta early-return regression)"
+        );
+        assert_eq!(emitted.join(""), "");
+        assert_eq!(streamer.into_text(), "");
+    }
+
+    /// Same as above but the empty delta arrives *after* one or more prior empty
+    /// deltas (e.g. several skipped special-token pushes before the first real
+    /// byte). The match must still fire on whichever push first observes it,
+    /// not be deferred until a non-empty delta shows up.
+    #[test]
+    fn stop_streamer_empty_stop_matches_after_leading_empty_deltas() {
+        let stops = vec![String::new()];
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+        let stopped = streamer.push("", &mut |s| emitted.push(s.to_string()));
+        assert!(
+            stopped,
+            "empty stop must match on the first push regardless of prior empty pushes"
+        );
+    }
+
+    /// A *non-empty* stop string must NOT falsely trigger on a leading empty
+    /// delta (mutation guard: proves the fix didn't just remove the early return
+    /// and start matching everything unconditionally). The matcher must keep
+    /// scanning correctly once real bytes arrive.
+    #[test]
+    fn stop_streamer_empty_delta_no_false_positive_for_nonempty_stop() {
+        let stops = vec!["STOP".to_string()];
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+
+        // Simulate a leading empty delta (buffered incomplete UTF-8 / skipped token).
+        let stopped1 = streamer.push("", &mut |s| emitted.push(s.to_string()));
+        assert!(
+            !stopped1,
+            "a non-empty stop string must not match an empty delta"
+        );
+
+        // Now real bytes arrive and eventually contain the stop.
+        let stopped2 = streamer.push("hello STOP world", &mut |s| emitted.push(s.to_string()));
+        assert!(stopped2);
+        assert_eq!(emitted.join(""), "hello ");
+        assert_eq!(streamer.into_text(), "hello ");
+    }
+
+    /// An empty delta arriving in the *middle* of a normal (non-empty-stop) run
+    /// must be a pure no-op: no spurious emit, no change to accumulated text,
+    /// and the eventual stop match is unaffected.
+    #[test]
+    fn stop_streamer_empty_delta_mid_run_is_noop() {
+        let stops = vec!["World".to_string()];
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+
+        let stopped1 = streamer.push("hello ", &mut |s| emitted.push(s.to_string()));
+        assert!(!stopped1);
+        // Empty delta mid-stream (e.g. a skipped special token): no-op.
+        let stopped_mid = streamer.push("", &mut |s| emitted.push(s.to_string()));
+        assert!(!stopped_mid);
+        let stopped2 = streamer.push("World!", &mut |s| emitted.push(s.to_string()));
+        assert!(stopped2);
+
+        assert_eq!(emitted.join(""), "hello ");
+        assert_eq!(streamer.into_text(), "hello ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Token-level byte-split CJK stop string (codex round-1 medium #2, PR #657)
+    //
+    // The Metal fixture `multibyte_vocab_tokenizer` inserted literal CJK chars
+    // ("世", "界") as BPE vocab *strings*. Qwen's real decode path reverses
+    // GPT-2 byte-level token strings through `byte_decoder`
+    // (`detokenize.rs::append_token_bytes`); characters not present in that
+    // decoder (like a literal "世") are silently skipped, so those fixture
+    // tokens never decoded to CJK bytes at all and the test exercised nothing
+    // but ASCII fallback. These tests build vocab entries the way a real
+    // byte-level BPE tokenizer does — via `bytes_to_unicode()`'s placeholder
+    // chars over the raw UTF-8 bytes of a CJK codepoint, split across two
+    // token ids — and drive `IncrementalDetokenizer::push` + `StopStringMatcher`
+    // together end to end, proving no mojibake and no dropped tail.
+    // -----------------------------------------------------------------------
+
+    /// Build a byte-level BPE vocab entry: the GPT-2 placeholder-char string
+    /// for a run of raw bytes, exactly how `append_token_bytes` expects to
+    /// reverse it via `byte_decoder`.
+    fn byte_level_token(byte_encoder: &[char], bytes: &[u8]) -> String {
+        bytes.iter().map(|&b| byte_encoder[b as usize]).collect()
+    }
+
+    /// `好` = 0xE5 0xA5 0xBD, split across two token ids (2 bytes then 1).
+    /// Token 0's delta must be empty (buffering an incomplete codepoint);
+    /// token 1's delta must be the complete "好", not mojibake or U+FFFD.
+    #[test]
+    fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
+        use crate::model::qwen35::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
+        use crate::tokenizer::bpe::BpeTokenizer;
+        use std::collections::HashMap;
+
+        let byte_encoder = bytes_to_unicode();
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        vocab.insert(byte_level_token(&byte_encoder, &[0xE5, 0xA5]), 0);
+        vocab.insert(byte_level_token(&byte_encoder, &[0xBD]), 1);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("byte-level split-CJK vocab builds");
+
+        let mut detok = IncrementalDetokenizer::new();
+        let delta0 = detok.push(&tokenizer, 0);
+        assert_eq!(
+            delta0, "",
+            "first 2 of 3 bytes of a CJK codepoint must buffer, not emit a replacement char"
+        );
+        let delta1 = detok.push(&tokenizer, 1);
+        assert_eq!(
+            delta1, "好",
+            "the completing byte must reveal the exact codepoint, not mojibake"
+        );
+    }
+
+    /// Same split-CJK token stream, but driven through `StopStringMatcher` with
+    /// `stop_strings: ["好"]` — proves the matcher correctly holds back through
+    /// the mid-codepoint empty delta (finding #1's fix) and matches only once
+    /// the codepoint actually completes, excluding it from `into_text()` and
+    /// never emitting a dropped/garbled tail for the preceding ASCII text.
+    #[test]
+    fn stop_streamer_matches_split_cjk_stop_string_no_dropped_tail() {
+        use crate::model::qwen35::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
+        use crate::tokenizer::bpe::BpeTokenizer;
+        use std::collections::HashMap;
+
+        let byte_encoder = bytes_to_unicode();
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        // id 2: ASCII "hi" prefix (single token, one BPE entry).
+        vocab.insert(byte_level_token(&byte_encoder, b"hi"), 2);
+        vocab.insert(byte_level_token(&byte_encoder, &[0xE5, 0xA5]), 0);
+        vocab.insert(byte_level_token(&byte_encoder, &[0xBD]), 1);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("byte-level split-CJK vocab builds");
+
+        let stops = vec!["好".to_string()];
+        let mut detok = IncrementalDetokenizer::new();
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+
+        // Token stream: "hi", then the two split bytes of "好".
+        for id in [2u32, 0, 1] {
+            let delta = detok.push(&tokenizer, id);
+            let stopped = streamer.push(&delta, &mut |s| emitted.push(s.to_string()));
+            if stopped {
+                break;
+            }
+        }
+
+        assert_eq!(
+            emitted.join(""),
+            "hi",
+            "must emit exactly the pre-stop ASCII prefix, no dropped tail and no \
+             CJK bytes leaking through before the codepoint completed"
+        );
+        assert_eq!(streamer.into_text(), "hi");
     }
 }
