@@ -20,6 +20,7 @@ mod model;
 mod moe;
 mod norm;
 mod sampling;
+pub(crate) mod stop_strings;
 mod weights;
 
 pub use eval::{PerplexityConfig, PerplexityReport};

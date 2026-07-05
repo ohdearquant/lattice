@@ -543,6 +543,128 @@ mod mtp_resolve_tests {
     }
 }
 
+// -----------------------------------------------------------------------------
+// MTP / self-spec route-around predicates (codex round-1 medium #1, PR #657) --
+// pure, `Device`-free, compiled unconditionally in test builds (same pattern
+// as the `resolve_mtp_*` functions above: `mod inner` re-imports these via
+// `use super::{...}` so the two real dispatch sites in `generate()` stay
+// single-source-of-truth, but the boolean logic itself is unit-testable
+// without a GPU or a Metal MTP/self-spec fixture).
+// -----------------------------------------------------------------------------
+
+/// Whether `generate()` should take the MTP greedy-draft branch instead of
+/// plain per-token decode. Mirrors the `use_mtp` computation inline in
+/// `MetalQwen35State::generate` exactly -- in particular
+/// `gen_cfg.stop_strings.is_empty()` is load-bearing: MTP's draft/verify loop
+/// has no string-stop awareness, so any non-empty `stop_strings` must route
+/// around it to the plain loop (which does check stops after every token).
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn mtp_route_active(
+    mtp_present: bool,
+    mtp_enabled: bool,
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    use_compact: bool,
+) -> bool {
+    mtp_present
+        && mtp_enabled
+        && gen_cfg.top_k <= 1
+        && gen_cfg.temperature <= 0.0
+        && !use_compact
+        && gen_cfg.grammar.is_none()
+        && gen_cfg.stop_strings.is_empty()
+}
+
+/// Whether `generate()` should take the GDN-first self-speculative greedy
+/// branch. Mirrors the `use_self_spec` computation inline in
+/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()`
+/// route-around rationale as [`mtp_route_active`].
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn self_spec_route_active(
+    gdn_checkpoints_present: bool,
+    self_spec_env_set: bool,
+    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    use_compact: bool,
+    num_active_linear_attention_layers: usize,
+) -> bool {
+    gdn_checkpoints_present
+        && self_spec_env_set
+        && gen_cfg.top_k <= 1
+        && gen_cfg.temperature <= 0.0
+        && !use_compact
+        && gen_cfg.grammar.is_none()
+        && gen_cfg.stop_strings.is_empty()
+        && num_active_linear_attention_layers > 0
+}
+
+#[cfg(test)]
+mod route_predicate_tests {
+    use super::{mtp_route_active, self_spec_route_active};
+    use crate::model::qwen35_config::GenerateConfig;
+
+    fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: Some(42),
+            stop_token_ids: vec![],
+            enable_thinking: false,
+            enable_mtp: Some(true),
+            grammar: None,
+            stop_strings,
+            reasoning_budget: None,
+            logprobs: None,
+        }
+    }
+
+    /// Baseline: with every other precondition satisfied and NO stop strings,
+    /// the MTP route is active. Establishes the contrast the next test
+    /// depends on -- without this, `mtp_route_active` returning `false` when
+    /// `stop_strings` is non-empty would be trivially true for the wrong
+    /// reason (e.g. a typo`'d always-false condition).
+    #[test]
+    fn mtp_route_active_when_no_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec![]);
+        assert!(mtp_route_active(true, true, &gen_cfg, false));
+    }
+
+    /// Codex medium #1: non-empty `stop_strings` must route around MTP even
+    /// though every other MTP precondition (present, enabled, greedy,
+    /// non-compact, no grammar) is satisfied.
+    #[test]
+    fn mtp_route_blocked_by_nonempty_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec!["never_matches_xyz".to_string()]);
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when stop_strings is non-empty -- its \
+             draft/verify loop has no string-stop awareness"
+        );
+    }
+
+    /// Baseline for self-spec, mirroring the MTP baseline above.
+    #[test]
+    fn self_spec_route_active_when_no_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec![]);
+        assert!(self_spec_route_active(true, true, &gen_cfg, false, 1));
+    }
+
+    /// Codex medium #1: non-empty `stop_strings` must route around
+    /// self-speculative decode even though every other precondition
+    /// (checkpoints present, env set, greedy, non-compact, no grammar, has
+    /// linear-attention layers) is satisfied.
+    #[test]
+    fn self_spec_route_blocked_by_nonempty_stop_strings() {
+        let gen_cfg = greedy_gen_cfg(vec!["never_matches_xyz".to_string()]);
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when stop_strings is non-empty -- \
+             same string-stop-unaware draft/verify loop as MTP"
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     use super::GdnStateTrafficScope;
@@ -562,6 +684,7 @@ mod inner {
         simd_matvec_transpose,
     };
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
+    use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
     use crate::model::qwen35_config::{
         GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
@@ -10947,12 +11070,12 @@ kernel void gdn_chunk_norm_silu_c32(
             let mtp_enabled = gen_cfg
                 .enable_mtp
                 .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
-            let use_mtp = self.session.mtp.is_some()
-                && mtp_enabled
-                && gen_cfg.top_k <= 1
-                && gen_cfg.temperature <= 0.0
-                && !use_compact
-                && gen_cfg.grammar.is_none();
+            let use_mtp = super::mtp_route_active(
+                self.session.mtp.is_some(),
+                mtp_enabled,
+                gen_cfg,
+                use_compact,
+            );
             if use_mtp {
                 if use_compact {
                     self.session.compact_topk = 0;
@@ -10967,13 +11090,13 @@ kernel void gdn_chunk_norm_silu_c32(
             }
 
             // GDN-first self-speculative greedy path: env-gated, greedy only.
-            let use_self_spec = self.session.gdn_checkpoints.is_some()
-                && std::env::var("LATTICE_SELF_SPEC").is_ok()
-                && gen_cfg.top_k <= 1
-                && gen_cfg.temperature <= 0.0
-                && !use_compact
-                && gen_cfg.grammar.is_none()
-                && cfg.num_active_linear_attention_layers() > 0;
+            let use_self_spec = super::self_spec_route_active(
+                self.session.gdn_checkpoints.is_some(),
+                std::env::var("LATTICE_SELF_SPEC").is_ok(),
+                gen_cfg,
+                use_compact,
+                cfg.num_active_linear_attention_layers(),
+            );
             if use_self_spec {
                 return Ok(self.generate_greedy_self_spec(
                     &prefill_logits,
@@ -11032,6 +11155,38 @@ kernel void gdn_chunk_norm_silu_c32(
 
             generated_ids.push(next_id);
             all_ids.push(next_id);
+
+            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
+            // `stop_text_state` is `None` for the (default) empty-`stop_strings` case,
+            // which keeps the original zero-overhead fast path untouched.
+            let mut stop_text_state = if gen_cfg.stop_strings.is_empty() {
+                None
+            } else {
+                Some((
+                    IncrementalDetokenizer::new(),
+                    StopStringMatcher::new(&gen_cfg.stop_strings),
+                ))
+            };
+
+            if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                let delta = detok.push(tokenizer, next_id);
+                if matcher.push(&delta, &mut |_| {}) {
+                    if use_compact {
+                        self.session.compact_topk = 0;
+                        self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    }
+                    let (_, matcher) = stop_text_state.take().expect("just matched Some(..)");
+                    return Ok(GenerateOutput {
+                        text: matcher.into_text(),
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
+                    });
+                }
+            }
 
             // Greedy fast path: zero-copy argmax avoids 993KB alloc+copy per step.
             let greedy_fast = gen_cfg.temperature <= 0.0
@@ -11100,6 +11255,16 @@ kernel void gdn_chunk_norm_silu_c32(
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+
+                if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                    let delta = detok.push(tokenizer, next_id);
+                    if matcher.push(&delta, &mut |_| {}) {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                }
+
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -11111,8 +11276,16 @@ kernel void gdn_chunk_norm_silu_c32(
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
             }
 
-            // Detokenize
-            let text = decode_tokens(tokenizer, &generated_ids);
+            // Detokenize: string-stop path uses the matcher's (possibly truncated)
+            // text; otherwise fall back to the original decode_tokens fast path.
+            let text = if let Some((mut detok, mut matcher)) = stop_text_state {
+                if !matcher.stopped() {
+                    matcher.finish(&detok.finish(), &mut |_| {});
+                }
+                matcher.into_text()
+            } else {
+                decode_tokens(tokenizer, &generated_ids)
+            };
 
             Ok(GenerateOutput {
                 text,
@@ -11355,6 +11528,17 @@ kernel void gdn_chunk_norm_silu_c32(
 
             let mut stopped = false;
             let mut stop_reason = StopReason::Length;
+
+            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
+            let mut stop_text_state = if gen_cfg.stop_strings.is_empty() {
+                None
+            } else {
+                Some((
+                    IncrementalDetokenizer::new(),
+                    StopStringMatcher::new(&gen_cfg.stop_strings),
+                ))
+            };
+
             let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
             if is_stop(first_id) {
                 stopped = true;
@@ -11362,6 +11546,13 @@ kernel void gdn_chunk_norm_silu_c32(
             } else {
                 generated_ids.push(first_id);
                 all_ids.push(first_id);
+                if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                    let delta = detok.push(tokenizer, first_id);
+                    if matcher.push(&delta, &mut |_| {}) {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                }
             }
 
             // Autoregressive decode loop.
@@ -11387,9 +11578,25 @@ kernel void gdn_chunk_norm_silu_c32(
                 }
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
+
+                if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                    let delta = detok.push(tokenizer, next_id);
+                    if matcher.push(&delta, &mut |_| {}) {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                }
             }
 
-            let text = decode_tokens(tokenizer, &generated_ids);
+            let text = if let Some((mut detok, mut matcher)) = stop_text_state {
+                if !matcher.stopped() {
+                    matcher.finish(&detok.finish(), &mut |_| {});
+                }
+                matcher.into_text()
+            } else {
+                decode_tokens(tokenizer, &generated_ids)
+            };
             Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
@@ -15327,23 +15534,73 @@ kernel void gdn_chunk_norm_silu_c32(
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
+            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
+            // Holds back a partial suffix that could still become a stop match, so
+            // `text`/`on_token` never see a stop string that spans a token boundary.
+            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
+                None
+            } else {
+                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
+            };
             let delta = detok.push(tokenizer, next_id);
             if !delta.is_empty() {
-                text.push_str(&delta);
-                if !on_token(&delta, next_id) {
-                    if use_compact {
-                        self.session.compact_topk = 0;
-                        self.session.compact_route = GpuTopkRoute::CpuFallback;
-                    }
-                    return Ok(GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false, // caller interrupted the stream, not a stop condition
-                        stop_reason: Some(StopReason::Interrupt),
-                        token_logprobs: token_logprobs.clone(),
+                if let Some(matcher) = stop_matcher.as_mut() {
+                    let mut caller_interrupted = false;
+                    let stop_matched = matcher.push(&delta, &mut |emit| {
+                        if !caller_interrupted && !emit.is_empty() {
+                            text.push_str(emit);
+                            if !on_token(emit, next_id) {
+                                caller_interrupted = true;
+                            }
+                        }
                     });
+                    if caller_interrupted {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        return Ok(GenerateOutput {
+                            text,
+                            token_ids: generated_ids.clone(),
+                            prompt_tokens: prompt_len,
+                            generated_tokens: generated_ids.len(),
+                            stopped: false, // caller interrupted the stream, not a stop condition
+                            stop_reason: Some(StopReason::Interrupt),
+                            token_logprobs: token_logprobs.clone(),
+                        });
+                    }
+                    if stop_matched {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        return Ok(GenerateOutput {
+                            text,
+                            token_ids: generated_ids.clone(),
+                            prompt_tokens: prompt_len,
+                            generated_tokens: generated_ids.len(),
+                            stopped: true,
+                            stop_reason: Some(StopReason::Eos),
+                            token_logprobs: token_logprobs.clone(),
+                        });
+                    }
+                } else {
+                    text.push_str(&delta);
+                    if !on_token(&delta, next_id) {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        return Ok(GenerateOutput {
+                            text,
+                            token_ids: generated_ids.clone(),
+                            prompt_tokens: prompt_len,
+                            generated_tokens: generated_ids.len(),
+                            stopped: false, // caller interrupted the stream, not a stop condition
+                            stop_reason: Some(StopReason::Interrupt),
+                            token_logprobs: token_logprobs.clone(),
+                        });
+                    }
                 }
             }
             let mut stopped = false;
@@ -15453,11 +15710,33 @@ kernel void gdn_chunk_norm_silu_c32(
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        stopped_by_caller = true;
-                        stop_reason = StopReason::Interrupt;
-                        break;
+                    if let Some(matcher) = stop_matcher.as_mut() {
+                        let mut caller_interrupted = false;
+                        let stop_matched = matcher.push(&delta, &mut |emit| {
+                            if !caller_interrupted && !emit.is_empty() {
+                                text.push_str(emit);
+                                if !on_token(emit, next_id) {
+                                    caller_interrupted = true;
+                                }
+                            }
+                        });
+                        if caller_interrupted {
+                            stopped_by_caller = true;
+                            stop_reason = StopReason::Interrupt;
+                            break;
+                        }
+                        if stop_matched {
+                            stopped = true;
+                            stop_reason = StopReason::Eos;
+                            break;
+                        }
+                    } else {
+                        text.push_str(&delta);
+                        if !on_token(&delta, next_id) {
+                            stopped_by_caller = true;
+                            stop_reason = StopReason::Interrupt;
+                            break;
+                        }
                     }
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -15482,7 +15761,21 @@ kernel void gdn_chunk_norm_silu_c32(
             // the caller asked to stop — it is no longer consuming the stream.
             if !stopped_by_caller {
                 let tail = detok.finish();
-                if !tail.is_empty() {
+                if let Some(matcher) = stop_matcher.as_mut() {
+                    // No-op if a stop already matched inside the loop; otherwise a
+                    // stop string can still complete in the final detokenizer tail.
+                    let already_stopped = matcher.stopped();
+                    matcher.finish(&tail, &mut |emit| {
+                        if !emit.is_empty() {
+                            text.push_str(emit);
+                            on_token(emit, last_pushed_id);
+                        }
+                    });
+                    if !already_stopped && matcher.stopped() {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                } else if !tail.is_empty() {
                     // This flush emits the residual incomplete-UTF-8 bytes of the
                     // already-generated final token, not a new generation step —
                     // generation has already terminated for the stop_reason decided
@@ -17639,32 +17932,92 @@ kernel void gdn_chunk_norm_silu_c32(
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
+            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
+            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
+                None
+            } else {
+                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
+            };
+            // Set when a stop string matches: CPU-identical semantics can retain
+            // token ids whose text was truncated, so the tokens behind a
+            // string-stop match must never be saved into the cross-turn cache —
+            // that would represent text the caller never received.
+            let mut stopped_by_stop_string = false;
             let delta = detok.push(tokenizer, next_id);
             if !delta.is_empty() {
-                text.push_str(&delta);
-                if !on_token(&delta, next_id) {
-                    if use_compact {
-                        self.session.compact_topk = 0;
-                        self.session.compact_route = GpuTopkRoute::CpuFallback;
-                    }
-                    // The caller cut the stream after exactly one forwarded
-                    // token (the prefill sample) — state represents prompt +
-                    // that one token already (forward happens on the *next*
-                    // iteration in the loop below, which never runs here).
-                    // Nothing further was forwarded, so do not save a cache
-                    // entry claiming more than live state represents.
-                    return Ok(CachedGenerateOutput {
-                        output: GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false,
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: vec![],
-                        },
-                        cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                if let Some(matcher) = stop_matcher.as_mut() {
+                    let mut caller_interrupted = false;
+                    let stop_matched = matcher.push(&delta, &mut |emit| {
+                        if !caller_interrupted && !emit.is_empty() {
+                            text.push_str(emit);
+                            if !on_token(emit, next_id) {
+                                caller_interrupted = true;
+                            }
+                        }
                     });
+                    if caller_interrupted {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text,
+                                token_ids: generated_ids.clone(),
+                                prompt_tokens: prompt_len,
+                                generated_tokens: generated_ids.len(),
+                                stopped: false,
+                                stop_reason: Some(StopReason::Interrupt),
+                                token_logprobs: vec![],
+                            },
+                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                        });
+                    }
+                    if stop_matched {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        self.cross_turn_prefix_cache.remove(slot_id);
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text,
+                                token_ids: generated_ids.clone(),
+                                prompt_tokens: prompt_len,
+                                generated_tokens: generated_ids.len(),
+                                stopped: true,
+                                stop_reason: Some(StopReason::Eos),
+                                token_logprobs: vec![],
+                            },
+                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                        });
+                    }
+                } else {
+                    text.push_str(&delta);
+                    if !on_token(&delta, next_id) {
+                        if use_compact {
+                            self.session.compact_topk = 0;
+                            self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        }
+                        // The caller cut the stream after exactly one forwarded
+                        // token (the prefill sample) — state represents prompt +
+                        // that one token already (forward happens on the *next*
+                        // iteration in the loop below, which never runs here).
+                        // Nothing further was forwarded, so do not save a cache
+                        // entry claiming more than live state represents.
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text,
+                                token_ids: generated_ids.clone(),
+                                prompt_tokens: prompt_len,
+                                generated_tokens: generated_ids.len(),
+                                stopped: false,
+                                stop_reason: Some(StopReason::Interrupt),
+                                token_logprobs: vec![],
+                            },
+                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                        });
+                    }
                 }
             }
             let mut stopped = false;
@@ -17741,11 +18094,34 @@ kernel void gdn_chunk_norm_silu_c32(
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        stopped_by_caller = true;
-                        stop_reason = StopReason::Interrupt;
-                        break;
+                    if let Some(matcher) = stop_matcher.as_mut() {
+                        let mut caller_interrupted = false;
+                        let stop_matched = matcher.push(&delta, &mut |emit| {
+                            if !caller_interrupted && !emit.is_empty() {
+                                text.push_str(emit);
+                                if !on_token(emit, next_id) {
+                                    caller_interrupted = true;
+                                }
+                            }
+                        });
+                        if caller_interrupted {
+                            stopped_by_caller = true;
+                            stop_reason = StopReason::Interrupt;
+                            break;
+                        }
+                        if stop_matched {
+                            stopped = true;
+                            stopped_by_stop_string = true;
+                            stop_reason = StopReason::Eos;
+                            break;
+                        }
+                    } else {
+                        text.push_str(&delta);
+                        if !on_token(&delta, next_id) {
+                            stopped_by_caller = true;
+                            stop_reason = StopReason::Interrupt;
+                            break;
+                        }
                     }
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -17764,42 +18140,67 @@ kernel void gdn_chunk_norm_silu_c32(
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
             }
 
-            // Every exit above leaves the last *pushed* generated token
-            // un-forwarded EXCEPT the `is_stop` break, where the stop token
-            // itself was never pushed and every element of `generated_ids`
-            // was already forwarded by the following iteration's
-            // `forward_step` call. Run one silent step so the next turn can
-            // reuse through the full assistant output (design.md step 8,
-            // "Better v1"). This must not sample or emit anything.
-            if !generated_ids.is_empty() && !stopped {
-                let seq_len = self.session.kv_cache.seq_len;
-                if seq_len < self.session.kv_cache.max_cache_len {
-                    let _ = self.forward_step(last_pushed_id, seq_len);
-                }
-                // else: KV is already full; the cache boundary stays one
-                // token short of `generated_ids` — still consistent, since
-                // KV/GDN and `represented_len` all agree at that boundary.
-            }
-
-            let represented_len = self.session.kv_cache.seq_len;
-            debug_assert!(represented_len >= prompt_len);
-            let generated_represented = represented_len - prompt_len;
-            let mut represented_token_ids = prompt_ids.clone();
-            represented_token_ids.extend_from_slice(&generated_ids[..generated_represented]);
-            self.save_cross_turn_prefix_or_clear(
-                slot_id,
-                metadata.clone(),
-                represented_token_ids,
-                consumed_entry.take(),
-            );
-
+            // Tail flush runs before the cache-save decision: a stop string can
+            // still complete in the final detokenizer tail, and that late match
+            // must also suppress caching the truncated generation (see below).
             if !stopped_by_caller {
                 let tail = detok.finish();
-                if !tail.is_empty() {
+                if let Some(matcher) = stop_matcher.as_mut() {
+                    let already_stopped = matcher.stopped();
+                    matcher.finish(&tail, &mut |emit| {
+                        if !emit.is_empty() {
+                            text.push_str(emit);
+                            on_token(emit, last_pushed_id);
+                        }
+                    });
+                    if !already_stopped && matcher.stopped() {
+                        stopped = true;
+                        stopped_by_stop_string = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                } else if !tail.is_empty() {
                     text.push_str(&tail);
                     on_token(&tail, last_pushed_id);
                 }
             }
+
+            if stopped_by_stop_string {
+                // CPU semantics can retain token ids whose text was truncated by
+                // the stop-string match; caching those hidden states would
+                // represent text the caller never received, so drop the cache
+                // entry for this slot entirely instead of saving a prefix.
+                self.cross_turn_prefix_cache.remove(slot_id);
+            } else {
+                // Every exit above leaves the last *pushed* generated token
+                // un-forwarded EXCEPT the `is_stop` break, where the stop token
+                // itself was never pushed and every element of `generated_ids`
+                // was already forwarded by the following iteration's
+                // `forward_step` call. Run one silent step so the next turn can
+                // reuse through the full assistant output (design.md step 8,
+                // "Better v1"). This must not sample or emit anything.
+                if !generated_ids.is_empty() && !stopped {
+                    let seq_len = self.session.kv_cache.seq_len;
+                    if seq_len < self.session.kv_cache.max_cache_len {
+                        let _ = self.forward_step(last_pushed_id, seq_len);
+                    }
+                    // else: KV is already full; the cache boundary stays one
+                    // token short of `generated_ids` — still consistent, since
+                    // KV/GDN and `represented_len` all agree at that boundary.
+                }
+
+                let represented_len = self.session.kv_cache.seq_len;
+                debug_assert!(represented_len >= prompt_len);
+                let generated_represented = represented_len - prompt_len;
+                let mut represented_token_ids = prompt_ids.clone();
+                represented_token_ids.extend_from_slice(&generated_ids[..generated_represented]);
+                self.save_cross_turn_prefix_or_clear(
+                    slot_id,
+                    metadata.clone(),
+                    represented_token_ids,
+                    consumed_entry.take(),
+                );
+            }
+
             Ok(CachedGenerateOutput {
                 output: GenerateOutput {
                     text,
@@ -23612,6 +24013,645 @@ kernel void decode_attention_reference(
             }
             crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
                 .expect("single-char vocab tokenizer build")
+        }
+
+        /// A vocab with two multibyte (CJK) single-token entries plus the same
+        /// single-char ASCII fallback as [`single_char_vocab_tokenizer`], so a
+        /// stop string spanning a token boundary can be built purely out of
+        /// multibyte UTF-8 codepoints (each 3 bytes) — exercising the UTF-8
+        /// char-boundary clamp that `single_char_vocab_tokenizer` (all 1-byte
+        /// tokens) cannot exercise on its own.
+        ///
+        /// Codex round-1 medium #2 (PR #657): the previous version of this
+        /// fixture inserted the literal chars `"世"`/`"界"` as BPE vocab
+        /// *strings*. Qwen's real decode path reverses GPT-2 byte-level token
+        /// strings through `byte_decoder` (`detokenize.rs::append_token_bytes`);
+        /// characters outside that decoder's placeholder set (any non-ASCII,
+        /// non-Latin-1-printable char — CJK included) are silently dropped, so
+        /// those literal entries never decoded to CJK bytes at all and any test
+        /// sampling ids 30/31 exercised nothing. Entries here instead use
+        /// `bytes_to_unicode()`'s placeholder chars over the raw UTF-8 bytes of
+        /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
+        /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
+        fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
+            use crate::model::qwen35::detokenize::bytes_to_unicode;
+            use std::collections::HashMap;
+            let byte_encoder = bytes_to_unicode();
+            let byte_level_token = |bytes: &[u8]| -> String {
+                bytes.iter().map(|&b| byte_encoder[b as usize]).collect()
+            };
+            let mut vocab: HashMap<String, u32> = HashMap::new();
+            for i in 0u32..30 {
+                let byte = if i < 26 {
+                    b'a' + i as u8
+                } else {
+                    b'A' + (i - 26) as u8
+                };
+                vocab.insert((byte as char).to_string(), i);
+            }
+            // 好 = 0xE5 0xA5 0xBD, split across two token ids so a stop string
+            // built from the completed codepoint spans a real token boundary.
+            vocab.insert(byte_level_token(&[0xE5, 0xA5]), 30);
+            vocab.insert(byte_level_token(&[0xBD]), 31);
+            crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                .expect("multibyte vocab tokenizer build")
+        }
+
+        /// #643: `MetalQwen35State::generate` (plain path) must honor
+        /// `GenerateConfig::stop_strings` with CPU-identical semantics — halt as
+        /// soon as a stop string completes and exclude the stop text from the
+        /// returned text.
+        ///
+        /// This drives the same seeded greedy config twice on fresh state: once
+        /// with no stop strings to observe the natural output, once with a stop
+        /// string built from a later character in that output. If the fix in
+        /// `generate` is reverted, `gen_cfg.stop_strings` is never consulted and
+        /// this assertion fails because the stopped run produces the full,
+        /// untruncated text instead.
+        #[test]
+        fn metal_generate_plain_honors_stop_string_mid_generation() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate("a", &tokenizer, &base_cfg)
+                    .expect("baseline generate (no stop_strings)")
+            };
+            assert!(
+                baseline.text.len() >= 3,
+                "need at least 3 generated chars to test a mid-generation stop, got {:?}",
+                baseline.text
+            );
+
+            // Stop on the character generated last. The expected truncation point
+            // is the *earliest* occurrence of that character in the baseline text
+            // (CPU-identical "earliest stop match" semantics) — for a baseline
+            // with a repeated character that is index 0, giving an empty prefix;
+            // either way this must match `earliest_stop_match`'s own answer.
+            let stop_char = baseline.text.chars().last().expect("non-empty baseline");
+            let hit = baseline
+                .text
+                .find(stop_char)
+                .expect("stop_char was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_char.to_string()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let out = state
+                .generate("a", &tokenizer, &stopped_cfg)
+                .expect("generate with stop_strings");
+
+            assert_eq!(
+                out.text, expected_prefix,
+                "stop string must truncate text to the prefix before the earliest match \
+                 (stop text excluded from returned output)"
+            );
+            assert!(out.stopped, "stop-string match must set stopped = true");
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+            assert!(
+                !out.text.contains(stop_char),
+                "returned text must not contain the stop string"
+            );
+        }
+
+        /// #643: `MetalQwen35State::generate_streaming_with_cancel` must honor
+        /// `GenerateConfig::stop_strings`: streamed chunks must concatenate to
+        /// exactly the truncated `GenerateOutput::text`, and the stop text itself
+        /// must never reach `on_token`.
+        #[test]
+        fn metal_generate_streaming_honors_stop_string_and_excludes_stop_text() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate("a", &tokenizer, &base_cfg)
+                    .expect("baseline generate (no stop_strings)")
+            };
+            assert!(
+                baseline.text.len() >= 3,
+                "need at least 3 generated chars to test a mid-generation stop, got {:?}",
+                baseline.text
+            );
+
+            let stop_char = baseline.text.chars().last().expect("non-empty baseline");
+            let hit = baseline
+                .text
+                .find(stop_char)
+                .expect("stop_char was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_char.to_string()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mut streamed = String::new();
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &stopped_cfg,
+                    |delta, _id| {
+                        streamed.push_str(delta);
+                        true
+                    },
+                    || false,
+                )
+                .expect("generate_streaming_with_cancel with stop_strings");
+
+            assert_eq!(out.text, expected_prefix);
+            assert_eq!(
+                streamed, expected_prefix,
+                "streamed chunks must concatenate to exactly the truncated text"
+            );
+            assert!(!streamed.contains(stop_char));
+            assert!(out.stopped);
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+        }
+
+        /// #643: a stop string built entirely out of multibyte (CJK, 3-byte)
+        /// codepoints must never split a codepoint across the emitted/held-back
+        /// boundary, and must still be excluded from the returned text once it
+        /// matches — exercising the UTF-8 char-boundary clamp in
+        /// `StopStringMatcher` from behind the Metal plain-generate path.
+        #[test]
+        fn metal_generate_plain_honors_multibyte_stop_string() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = multibyte_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(7),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate("a", &tokenizer, &base_cfg)
+                    .expect("baseline generate (no stop_strings)")
+            };
+            assert!(
+                baseline.text.chars().count() >= 2,
+                "need at least 2 generated chars, got {:?}",
+                baseline.text
+            );
+
+            // Stop on the last generated codepoint (which may itself be a 3-byte
+            // CJK character if the tiny model happens to sample token 30/31, or
+            // an ASCII fallback char otherwise) — either way this exercises a
+            // matcher configured with `max_stop` sized for a multibyte codepoint.
+            let stop_char = baseline.text.chars().last().expect("non-empty baseline");
+            let mut stop_string = String::new();
+            stop_string.push(stop_char);
+            let hit = baseline
+                .text
+                .find(stop_string.as_str())
+                .expect("stop_char was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_string.clone()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let out = state
+                .generate("a", &tokenizer, &stopped_cfg)
+                .expect("generate with multibyte stop_strings");
+
+            // Never split a codepoint: the returned text must itself be valid
+            // UTF-8 (guaranteed by the `String` type) and must equal the exact
+            // pre-stop prefix, byte for byte.
+            assert_eq!(out.text, expected_prefix);
+            assert!(!out.text.contains(stop_string.as_str()));
+            assert!(out.stopped);
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+        }
+
+        /// #643: a stop string that spans a token boundary (built from two
+        /// consecutive generated characters, each produced by a *separate*
+        /// token push in `single_char_vocab_tokenizer`) must still be caught by
+        /// `generate_streaming_with_cancel` — the matcher must hold back the
+        /// ambiguous partial suffix across pushes rather than only checking
+        /// each token's delta in isolation. If the held-back-suffix logic were
+        /// dropped (checking only the newest delta against the stop strings),
+        /// this two-character stop could never match and the run would go to
+        /// `max_new_tokens` instead.
+        #[test]
+        fn metal_generate_streaming_honors_stop_string_spanning_token_boundary() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 8,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate("a", &tokenizer, &base_cfg)
+                    .expect("baseline generate (no stop_strings)")
+            };
+            assert!(
+                baseline.text.chars().count() >= 4,
+                "need at least 4 generated chars to build a 2-char boundary-spanning stop, got {:?}",
+                baseline.text
+            );
+
+            // Every token in `single_char_vocab_tokenizer` decodes to exactly one
+            // char, so any 2-char stop string necessarily spans the boundary
+            // between two separate token pushes — there is no way to satisfy it
+            // from a single token's delta alone.
+            let chars: Vec<char> = baseline.text.chars().collect();
+            let stop_string: String = chars[chars.len() - 2..].iter().collect();
+            let hit = baseline
+                .text
+                .find(stop_string.as_str())
+                .expect("stop_string was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_string.clone()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mut streamed = String::new();
+            let out = state
+                .generate_streaming_with_cancel(
+                    "a",
+                    &tokenizer,
+                    &stopped_cfg,
+                    |delta, _id| {
+                        streamed.push_str(delta);
+                        true
+                    },
+                    || false,
+                )
+                .expect("generate_streaming_with_cancel with boundary-spanning stop_strings");
+
+            assert_eq!(
+                out.text, expected_prefix,
+                "boundary-spanning stop string must truncate at its earliest match"
+            );
+            assert_eq!(
+                streamed, expected_prefix,
+                "streamed chunks must concatenate to exactly the truncated text"
+            );
+            assert!(!streamed.contains(stop_string.as_str()));
+            assert!(
+                out.stopped,
+                "boundary-spanning stop-string match must set stopped = true"
+            );
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+        }
+
+        /// #643: when `stop_strings` is non-empty but never matches, generation
+        /// must run to `max_new_tokens` exactly as it would with no stop strings
+        /// at all — the matcher must not truncate, alter, or otherwise affect
+        /// output when it never sees a match. This guards against a mutation
+        /// that always treats a non-empty `stop_strings` config as "stop
+        /// immediately" or that corrupts the accumulated text when finishing
+        /// without a match.
+        #[test]
+        fn metal_generate_plain_runs_to_max_tokens_when_stop_string_absent() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate("a", &tokenizer, &base_cfg)
+                    .expect("baseline generate (no stop_strings)")
+            };
+            assert_eq!(
+                baseline.stop_reason,
+                Some(StopReason::Length),
+                "baseline with no stop condition must exhaust max_new_tokens"
+            );
+
+            // "0" can never be produced by `single_char_vocab_tokenizer` (its
+            // vocab is only a-z/A-Z), so this stop string can never match.
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec!["0".to_string()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let out = state
+                .generate("a", &tokenizer, &stopped_cfg)
+                .expect("generate with unmatchable stop_strings");
+
+            assert_eq!(
+                out.text, baseline.text,
+                "an absent stop string must not alter generated text"
+            );
+            assert!(
+                !out.stopped,
+                "an absent stop string must not report an early stop"
+            );
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Length),
+                "an absent stop string must still exhaust max_new_tokens with Length"
+            );
+        }
+
+        /// #643: `generate_streaming_with_prefix_cache_inner` must honor
+        /// `GenerateConfig::stop_strings` with the same truncation/exclusion
+        /// semantics as the other Metal loops, AND must drop (not save) the
+        /// cross-turn prefix cache entry for the slot on a stop-string match —
+        /// CPU semantics can retain a generated token whose text was truncated
+        /// by the match, so caching the hidden state behind that token would
+        /// let a later turn resume from state representing text the caller
+        /// never received.
+        ///
+        /// Turn 1 (no `stop_strings`) first proves the slot's cache entry is
+        /// normally populated by a successful turn — establishing the
+        /// contrast the turn-2 assertion depends on (a cache that starts
+        /// empty would make an `is_none()` check trivially true regardless of
+        /// whether the stop-string removal code ran). Turn 2 uses a
+        /// different prompt (`"b"` vs turn 1's `"a"`) so the reuse planner
+        /// picks `PrefixReuseMode::FullRefill` — the one mode where
+        /// `restore_cross_turn_prefix` does NOT `take()` (and thus does not
+        /// already empty) the slot's map entry, so turn 1's stale entry is
+        /// still sitting in `cross_turn_prefix_cache` when turn 2's stop
+        /// check runs. Turn 2's `stop_strings: [""]` — because
+        /// `str::find("")` always matches at byte 0 — deterministically
+        /// triggers `generate_streaming_with_prefix_cache_inner`'s
+        /// first-token stop-check branch regardless of the tiny fixture's
+        /// sampled output. This isolates the exact removal call the design
+        /// added: without it, turn 1's stale entry would survive turn 2's
+        /// string-stop return and misrepresent turn 2's (truncated, FullRefill)
+        /// state to a later caller.
+        #[test]
+        fn metal_generate_streaming_with_prefix_cache_honors_stop_string_and_clears_cache_on_match()
+        {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::kv_cache::PrefixReuseMode;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot = crate::kv_cache::CrossTurnSlotId::new(1);
+
+            // Turn 1: no stop_strings, must complete normally and populate the
+            // slot's cross-turn cache entry.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache(slot, "a", &tokenizer, &base_cfg, |_, _| true)
+                .expect("turn 1 generate_streaming_with_prefix_cache (no stop_strings)");
+            assert!(
+                !turn1.output.stopped,
+                "turn 1 baseline must run to max_new_tokens, not stop early"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.get(slot).is_some(),
+                "a normal (non-string-stopped) turn must populate the slot's cross-turn cache entry \
+                 — this is the baseline the mutation check below contrasts against"
+            );
+
+            // Turn 2: same state/slot, a DIFFERENT prompt so the planner picks
+            // FullRefill (leaving turn 1's stale entry untouched by the
+            // restore step), and `stop_strings: [""]` matches at byte 0
+            // unconditionally, so this must stop on the very first generated
+            // token and clear the (now stale) cache entry left by turn 1.
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![String::new()];
+            let mut streamed = String::new();
+            let turn2 = state
+                .generate_streaming_with_prefix_cache(
+                    slot,
+                    "b",
+                    &tokenizer,
+                    &stopped_cfg,
+                    |d, _id| {
+                        streamed.push_str(d);
+                        true
+                    },
+                )
+                .expect("turn 2 generate_streaming_with_prefix_cache with stop_strings: [\"\"]");
+
+            assert_eq!(
+                turn2.cache.mode,
+                PrefixReuseMode::FullRefill,
+                "turn 2's mismatched prompt must force FullRefill, so the stale entry from turn 1 \
+                 is NOT already emptied by restore_cross_turn_prefix's take() before the stop check"
+            );
+            assert_eq!(
+                turn2.output.text, "",
+                "an empty-string stop must match at byte 0, excluding all generated text"
+            );
+            assert_eq!(
+                streamed, "",
+                "no text may be streamed before the byte-0 match"
+            );
+            assert!(turn2.output.stopped);
+            assert_eq!(turn2.output.stop_reason, Some(StopReason::Eos));
+            assert!(
+                state.cross_turn_prefix_cache.get(slot).is_none(),
+                "a stop-string match must drop the (now stale) cross-turn cache entry for the \
+                 slot, never leave turn 1's entry surviving a string-stopped turn 2"
+            );
+        }
+
+        /// #643: `generate_multimodal` must honor `GenerateConfig::stop_strings`
+        /// with the same semantics as the text-only Metal loops.
+        #[test]
+        fn metal_generate_multimodal_honors_stop_string() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+
+            let visual_tokens = 2usize;
+            let d_model = cfg.hidden_size;
+            let make_input = || crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0f32; visual_tokens * d_model],
+                raw_patches: 4,
+                visual_tokens,
+                d_model,
+                text_tokens: vec![1u32],
+            };
+
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate_multimodal(make_input(), &tokenizer, &base_cfg)
+                    .expect("baseline generate_multimodal (no stop_strings)")
+            };
+            assert!(
+                baseline.text.len() >= 3,
+                "need at least 3 generated chars to test a mid-generation stop, got {:?}",
+                baseline.text
+            );
+
+            let stop_char = baseline.text.chars().last().expect("non-empty baseline");
+            let hit = baseline
+                .text
+                .find(stop_char)
+                .expect("stop_char was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_char.to_string()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let out = state
+                .generate_multimodal(make_input(), &tokenizer, &stopped_cfg)
+                .expect("generate_multimodal with stop_strings");
+
+            assert_eq!(
+                out.text, expected_prefix,
+                "stop string must truncate text to the prefix before the earliest match \
+                 (stop text excluded from returned output)"
+            );
+            assert!(out.stopped, "stop-string match must set stopped = true");
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+            assert!(
+                !out.text.contains(stop_char),
+                "returned text must not contain the stop string"
+            );
         }
 
         /// `generate`'s prompt-too-long preflight (`prompt_len > max_context()`) must
