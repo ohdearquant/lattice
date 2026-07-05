@@ -326,10 +326,9 @@ codebase is Metal-only).
 `lattice doctor --model <dir> --tokenizer-dir <dir>` is a preflight check: it reports the detected
 format, weight memory footprint, KV-cache cost per token, and whether the checkpoint's tensors and
 your system's memory are actually sufficient to load it, without spending the time to load and run
-the model. Run it before `chat`/`serve` on any new Q4 output — **but see the `quantize_quarot`
-limitation immediately below before pointing it at a QuaRot output directory.**
+the model. Run it before `chat`/`serve` on any new Q4 output, including QuaRot outputs.
 
-exits 0 with `Result: OK` when the checkpoint is loadable and fits comfortably; exits 1 with
+`doctor` exits 0 with `Result: OK` when the checkpoint is loadable and fits comfortably; exits 1 with
 `Result: NOT READY` and a specific reason otherwise. **If `doctor` reports dozens or hundreds of
 "missing required tensors" with layer indices well beyond what you'd expect for your model size**
 (for example, layers in the 20s-40s for what you know is a small checkpoint), the near-certain
@@ -339,18 +338,17 @@ corrupted or incomplete conversion — `doctor` inherits the same Qwen3.6-27B co
 your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doctor` before assuming
 the conversion itself is broken.
 
-**Current limitation: `doctor` only understands `quantize_q4`'s bare-array manifest.**
-`lattice doctor` deserializes `quantize_index.json` as a plain JSON array of tensor entries
-(`Vec<Q4IndexEntry>` in `crates/inference/src/bin/lattice.rs`) — the shape `quantize_q4` writes.
-`quantize_quarot` writes a different, object-shaped manifest instead (`{"quarot_seed": ...,
-"tensors": [...]}`, see `crates/inference/src/quant/quarot/convert.rs`) so it can carry the
-rotation seed alongside the tensor list. Pointing `doctor` at a `quantize_quarot` output directory
-today does not produce a `Result: OK` or `Result: NOT READY` verdict at all — it fails at the
-manifest-parsing step with a JSON type-mismatch error (`invalid type: map, expected a sequence`),
-before any of the memory/tensor checks run. This is tracked as
-[issue #626](https://github.com/ohdearquant/lattice/issues/626); until it's resolved, treat
-`doctor` as `quantize_q4`-only, and verify a `quantize_quarot` checkpoint via `chat`/`serve`
-directly or `eval_perplexity --quarot-q4-dir` (Step 3 above) instead of `doctor`.
+`doctor` now accepts both `quantize_index.json` manifest shapes:
+
+- `quantize_q4` writes a bare JSON array of tensor entries.
+- `quantize_quarot` writes an object with a `tensors` array and metadata such as `quarot_seed`.
+
+For the doctor preflight, both shapes normalize to the same tensor inventory; the QuaRot seed is
+not needed for these checks. Older output captured before issues
+[#626](https://github.com/ohdearquant/lattice/issues/626) and
+[#627](https://github.com/ohdearquant/lattice/issues/627) may show an `invalid type: map, expected
+a sequence` manifest error for QuaRot directories. That failure mode is historical for current
+`lattice doctor` builds.
 
 ## Summary checklist
 
