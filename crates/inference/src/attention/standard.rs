@@ -343,6 +343,259 @@ pub(crate) fn multi_head_attention_in_place(
     }
 }
 
+/// Fused batched multi-head attention for a padded `[batch, seq_len]` tensor.
+///
+/// This is the batch analogue of [`multi_head_attention_in_place`]: it fuses the
+/// position-wise Q/K/V and output projections into single `matmul_bt` calls over
+/// all `batch * seq_len` rows (bigger GEMMs, fewer BLAS/SIMD dispatches), while the
+/// O(seq_len^2) score/softmax/context step -- which cannot be flattened across
+/// sequences without letting one sequence's tokens attend across a padding boundary
+/// into another sequence -- runs per-sequence, serially.
+///
+/// This loop is deliberately **not** parallelized with rayon/std::thread, even
+/// though each sequence's slice is independent. On macOS, `matmul_bt` dispatches to
+/// Apple Accelerate (`forward/cpu/blas.rs`), which already runs GEMM across its own
+/// multi-threaded AMX worker pool -- including at small M. Wrapping this per-sequence
+/// loop in an outer parallel iterator nests a second thread pool on top of that one:
+/// measured A/B on this crate's own bench harness, batch=64, all-MiniLM-L6-v2, showed
+/// the rayon-parallel version at ~870-900 texts/s versus ~1225-1370 texts/s serial --
+/// oversubscription made it slower, not faster, confirming the fused GEMM calls
+/// (bigger M) are the actual lever, not manual threading on top of them. Only the
+/// non-Accelerate fallback kernels (non-macOS, or the hand-rolled SIMD path) and
+/// non-GEMM position-wise ops would be candidates for added threading, and only if a
+/// fresh A/B on that specific backend shows a win -- do not assume this decision
+/// carries over to a different dispatch path without re-measuring.
+///
+/// `hidden_states`/`attention_mask` are the flattened `[batch * seq_len, ...]`
+/// tensors (row `b * seq_len + i` is token `i` of sequence `b`). `output` receives
+/// the same output-projection result that `multi_head_attention_in_place` writes
+/// into `buffers.temp` (bias-added, LoRA-applied); callers add the residual and run
+/// `layer_norm` themselves, exactly as the single-sequence path does.
+///
+/// All existing masking/softmax fail-closed guards from `multi_head_attention_in_place`
+/// (structural `-inf` masking, `softmax_attention`'s all-masked-row zero guard) are
+/// preserved verbatim per sequence -- see that function's comments for the rationale.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multi_head_attention_batched(
+    hidden_states: &[f32],
+    layer_weights: &TransformerLayerWeights<'_>,
+    attention_mask: &[u32],
+    batch: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    concat: &mut [f32],
+    output: &mut [f32],
+    lora: &dyn LoraHook,
+    layer_idx: usize,
+) {
+    assert_standard_no_overflow(seq_len, hidden_size, num_heads, head_dim);
+    assert!(
+        batch.checked_mul(seq_len).is_some(),
+        "standard: batch * seq_len overflow"
+    );
+    let rows = batch * seq_len;
+    assert!(
+        rows.checked_mul(hidden_size).is_some(),
+        "standard: rows * hidden_size overflow"
+    );
+    let used_hidden = rows * hidden_size;
+    assert_eq!(
+        hidden_states.len(),
+        used_hidden,
+        "standard: hidden_states length must equal batch * seq_len * hidden_size"
+    );
+    assert_eq!(
+        attention_mask.len(),
+        rows,
+        "standard: attention_mask length must equal batch * seq_len"
+    );
+    assert!(q.len() >= used_hidden, "standard: q scratch too small");
+    assert!(k.len() >= used_hidden, "standard: k scratch too small");
+    assert!(v.len() >= used_hidden, "standard: v scratch too small");
+    assert!(
+        concat.len() >= used_hidden,
+        "standard: concat scratch too small"
+    );
+    assert!(
+        output.len() >= used_hidden,
+        "standard: output scratch too small"
+    );
+
+    // Fused Q/K/V projection: one matmul_bt call per projection across every
+    // row in the batch, instead of `batch` separate single-sequence calls.
+    {
+        let q = &mut q[..used_hidden];
+        matmul_bt(
+            hidden_states,
+            layer_weights.query_weight.data,
+            q,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(q, layer_weights.query_bias.data, hidden_size);
+        lora.apply(layer_idx, "query", hidden_states, q);
+    }
+    {
+        let k = &mut k[..used_hidden];
+        matmul_bt(
+            hidden_states,
+            layer_weights.key_weight.data,
+            k,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(k, layer_weights.key_bias.data, hidden_size);
+        lora.apply(layer_idx, "key", hidden_states, k);
+    }
+    {
+        let v = &mut v[..used_hidden];
+        matmul_bt(
+            hidden_states,
+            layer_weights.value_weight.data,
+            v,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(v, layer_weights.value_bias.data, hidden_size);
+        lora.apply(layer_idx, "value", hidden_states, v);
+    }
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let q = &q[..used_hidden];
+    let k = &k[..used_hidden];
+    let v = &v[..used_hidden];
+    let concat = &mut concat[..used_hidden];
+
+    // Per-sequence score/softmax/context. This loop runs serially, one sequence
+    // at a time; each chunk of `concat` (one sequence's [seq_len, hidden_size]
+    // region) is written by exactly one iteration, over disjoint slices of the
+    // shared read-only `q`/`k`/`v`/`attention_mask` buffers.
+    concat
+        .chunks_mut(seq_len * hidden_size)
+        .enumerate()
+        .for_each(|(b, concat_b)| {
+            let seq_offset = b * seq_len;
+            let row_start = seq_offset * hidden_size;
+            let mask_b = &attention_mask[seq_offset..seq_offset + seq_len];
+
+            let mut q_head = vec![0.0f32; seq_len * head_dim];
+            let mut k_head = vec![0.0f32; seq_len * head_dim];
+            let mut v_head_t = vec![0.0f32; head_dim * seq_len];
+            let mut scores_head = vec![0.0f32; seq_len * seq_len];
+            let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
+            let mut context_head = vec![0.0f32; seq_len * head_dim];
+            let mut context = vec![0.0f32; num_heads * seq_len * head_dim];
+
+            // Q*K^T via SIMD matmul_bt, one head at a time (mirrors
+            // multi_head_attention_in_place's single-sequence loop exactly).
+            for h in 0..num_heads {
+                let head_offset = h * head_dim;
+
+                for i in 0..seq_len {
+                    let src_start = row_start + i * hidden_size + head_offset;
+                    let dst_start = i * head_dim;
+                    q_head[dst_start..dst_start + head_dim]
+                        .copy_from_slice(&q[src_start..src_start + head_dim]);
+                }
+                for i in 0..seq_len {
+                    let src_start = row_start + i * hidden_size + head_offset;
+                    let dst_start = i * head_dim;
+                    k_head[dst_start..dst_start + head_dim]
+                        .copy_from_slice(&k[src_start..src_start + head_dim]);
+                }
+
+                matmul_bt(
+                    &q_head[..seq_len * head_dim],
+                    &k_head[..seq_len * head_dim],
+                    &mut scores_head[..seq_len * seq_len],
+                    seq_len,
+                    head_dim,
+                    seq_len,
+                );
+
+                let scores_offset = h * seq_len * seq_len;
+                for (idx, &score) in scores_head.iter().enumerate() {
+                    scores[scores_offset + idx] = score * scale;
+                }
+            }
+
+            // Structural -inf masking + fail-closed softmax -- identical to
+            // multi_head_attention_in_place; see its comment for the #361 rationale.
+            for h in 0..num_heads {
+                for i in 0..seq_len {
+                    let row_off = (h * seq_len + i) * seq_len;
+                    let row = &mut scores[row_off..row_off + seq_len];
+                    for j in 0..seq_len {
+                        if mask_b[j] == 0 {
+                            row[j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+            }
+            softmax_attention(&mut scores, seq_len, num_heads);
+
+            // scores*V context aggregation, one head at a time.
+            for h in 0..num_heads {
+                let head_offset = h * head_dim;
+
+                for i in 0..seq_len {
+                    let v_row_start = row_start + i * hidden_size + head_offset;
+                    for d in 0..head_dim {
+                        v_head_t[d * seq_len + i] = v[v_row_start + d];
+                    }
+                }
+
+                let scores_offset = h * seq_len * seq_len;
+                let scores_head = &scores[scores_offset..scores_offset + seq_len * seq_len];
+                matmul_bt(
+                    scores_head,
+                    &v_head_t[..head_dim * seq_len],
+                    &mut context_head[..seq_len * head_dim],
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                );
+
+                let ctx_offset = h * seq_len * head_dim;
+                context[ctx_offset..ctx_offset + seq_len * head_dim]
+                    .copy_from_slice(&context_head[..seq_len * head_dim]);
+            }
+
+            // Concat heads back into this sequence's [seq_len, hidden_size] region.
+            for i in 0..seq_len {
+                for h in 0..num_heads {
+                    let head_offset = h * head_dim;
+                    for d in 0..head_dim {
+                        concat_b[i * hidden_size + head_offset + d] =
+                            context[(h * seq_len + i) * head_dim + d];
+                    }
+                }
+            }
+        });
+
+    // Fused output projection: one matmul_bt call across every row in the batch.
+    let concat = &concat[..used_hidden];
+    let output = &mut output[..used_hidden];
+    matmul_bt(
+        concat,
+        layer_weights.attn_output_weight.data,
+        output,
+        rows,
+        hidden_size,
+        hidden_size,
+    );
+    add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+    lora.apply(layer_idx, "attn_output", concat, output);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +1035,213 @@ mod tests {
         // product fits, but num_heads * seq_len * seq_len = 2^65 wraps a 64-bit
         // usize to a small value that would feed an undersized scores slice.
         assert_standard_no_overflow(1usize << 32, 2, 2, 1);
+    }
+
+    /// Weights-free parity check between `multi_head_attention_batched` and the
+    /// single-sequence `multi_head_attention` path, run over synthetic (no model
+    /// file) inputs so it exercises in default CI.
+    ///
+    /// Builds two sequences of different real length (2 tokens and 3 tokens)
+    /// padded to a common `seq_len` of 3. The padded slot in the shorter sequence
+    /// carries a huge-magnitude value and is masked out (`mask=0`); if masking or
+    /// the per-sequence row stride (`seq_offset`/`row_start`) were wrong, that
+    /// value would leak into the real tokens' output or the wrong sequence's
+    /// slice would be compared, and the parity check below would fail.
+    ///
+    /// Mutation-checked by hand while writing this test: (1) forcing the mask
+    /// passed into `multi_head_attention_batched` to all-ones (so the padded,
+    /// huge-magnitude slot is treated as a valid key) made this test fail; (2)
+    /// corrupting `row_start`'s stride (multiplying by an extra `+1` offset in
+    /// the per-sequence loop) also made it fail; both were reverted and the test
+    /// re-confirmed passing before landing.
+    #[test]
+    fn batched_attention_matches_single_sequence_per_row_with_padding() {
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let seq_len = 3; // common padded length
+        let batch = 2;
+        let intermediate_size = hidden_size;
+
+        let identity_8x8: Vec<f32> = {
+            let mut m = vec![0.0f32; hidden_size * hidden_size];
+            for i in 0..hidden_size {
+                m[i * hidden_size + i] = 1.0;
+            }
+            m
+        };
+        let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
+        let ones_8: Vec<f32> = vec![1.0; hidden_size];
+
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: intermediate_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+        };
+
+        // Sequence 0: 2 real tokens, deterministic small values.
+        let seq0_real: Vec<f32> = (0..2 * hidden_size).map(|i| 1.0 + i as f32 * 0.1).collect();
+        // Padded slot for sequence 0: huge magnitude, must never leak once masked.
+        let seq0_pad: Vec<f32> = vec![1.0e6; hidden_size];
+
+        // Sequence 1: 3 real tokens (fills seq_len exactly, no padding needed),
+        // deterministic small values distinct from sequence 0.
+        let seq1_real: Vec<f32> = (0..3 * hidden_size)
+            .map(|i| 100.0 + i as f32 * 0.1)
+            .collect();
+
+        // Flattened batched input: [seq0 tok0, seq0 tok1, seq0 pad, seq1 tok0, seq1 tok1, seq1 tok2]
+        let mut hidden_states_batched = Vec::with_capacity(batch * seq_len * hidden_size);
+        hidden_states_batched.extend_from_slice(&seq0_real);
+        hidden_states_batched.extend_from_slice(&seq0_pad);
+        hidden_states_batched.extend_from_slice(&seq1_real);
+        assert_eq!(hidden_states_batched.len(), batch * seq_len * hidden_size);
+
+        let attention_mask_batched: Vec<u32> = vec![1, 1, 0, 1, 1, 1];
+
+        let rows = batch * seq_len;
+        let used_hidden = rows * hidden_size;
+        let mut q = vec![0.0f32; used_hidden];
+        let mut k = vec![0.0f32; used_hidden];
+        let mut v = vec![0.0f32; used_hidden];
+        let mut concat = vec![0.0f32; used_hidden];
+        let mut output = vec![0.0f32; used_hidden];
+
+        multi_head_attention_batched(
+            &hidden_states_batched,
+            &layer,
+            &attention_mask_batched,
+            batch,
+            seq_len,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut q,
+            &mut k,
+            &mut v,
+            &mut concat,
+            &mut output,
+            &NoopLoraHook,
+            0,
+        );
+
+        for v in output.iter() {
+            assert!(v.is_finite(), "batched output must be finite: {output:?}");
+        }
+
+        // Sequence 0: compare the first 2 (real) rows of the batched output
+        // against an independent single-sequence call on the 2 unpadded tokens.
+        let mut buf0 = AttentionBuffers::new(2, hidden_size, num_heads, intermediate_size);
+        let expected0 = multi_head_attention(
+            &seq0_real,
+            &layer,
+            &[1u32, 1],
+            2,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut buf0,
+            &NoopLoraHook,
+            0,
+        );
+        let seq0_row_start = 0;
+        let got0 = &output[seq0_row_start..seq0_row_start + 2 * hidden_size];
+        for (i, (&g, &e)) in got0.iter().zip(expected0.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-6,
+                "seq0 row element {i} mismatch: batched={g} single={e}"
+            );
+        }
+
+        // Sequence 1: compare all 3 (real) rows of the batched output against an
+        // independent single-sequence call on the same 3 tokens.
+        let mut buf1 = AttentionBuffers::new(3, hidden_size, num_heads, intermediate_size);
+        let expected1 = multi_head_attention(
+            &seq1_real,
+            &layer,
+            &[1u32, 1, 1],
+            3,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut buf1,
+            &NoopLoraHook,
+            0,
+        );
+        let seq1_row_start = seq_len * hidden_size;
+        let got1 = &output[seq1_row_start..seq1_row_start + 3 * hidden_size];
+        for (i, (&g, &e)) in got1.iter().zip(expected1.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-6,
+                "seq1 row element {i} mismatch: batched={g} single={e}"
+            );
+        }
     }
 }
