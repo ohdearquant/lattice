@@ -1,4 +1,4 @@
-//! lattice_serve — OpenAI-compatible HTTP serving endpoint for Lattice.
+//! lattice_serve - OpenAI-compatible HTTP serving endpoint for Lattice. See [docs/capability-matrix.md](../../../../docs/capability-matrix.md).
 //!
 //! Exposes the Metal GPU engine over the same `/v1/chat/completions` API that
 //! ollama, llama.cpp's server, and most LLM benchmark harnesses already speak,
