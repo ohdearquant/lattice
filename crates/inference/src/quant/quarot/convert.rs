@@ -135,30 +135,54 @@ struct QuantizeIndex {
 
 /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
 ///
-/// Delegates the bounded read and shape-normalized parse to
-/// [`crate::quant::q4_manifest`] (issue #655 — the shared manifest reader
-/// also backs `lattice doctor`'s inventory and, transitively through this
-/// function, the Metal Q4 loader's QuaRot-flavor detection).
+/// Delegates only the bounded, fail-closed byte read to
+/// [`crate::quant::q4_manifest::read_manifest_bytes_bounded`] (issue #655 —
+/// the one shared reader also backs `lattice doctor`'s inventory). Shape
+/// normalization stays here, deliberately **not** unified with `doctor`'s
+/// tolerant [`crate::quant::q4_manifest::parse_manifest`]: this reader's
+/// accept/reject contract predates #655 and must not silently change.
+/// Specifically:
+///
+/// - A bare top-level JSON array (`quantize_q4`'s shape) genuinely carries
+///   no rotation seed. Its entries are **not validated** here — any array,
+///   however malformed its entries, is `Ok(None)`, matching the pre-#655
+///   reader exactly (a seed can only ever appear in the object form, so a
+///   malformed array entry is `doctor`'s concern, not this reader's).
+/// - An object form (`quantize_quarot`'s shape, `{"quarot_seed": ...,
+///   "tensors": [...]}`) is parsed strictly via [`QuantizeIndex`] /
+///   [`IndexEntry`]: every tensor entry must carry `name`, `file`,
+///   `quantized`, `shape`, and `numel`, or the whole manifest is rejected.
+///   A partially-formed object-form manifest is evidence of a corrupted or
+///   in-progress write, not a legitimate "no seed" state.
 ///
 /// Fail-closed contract (#504 remaining slice 2): a genuinely **absent**
 /// file is `Ok(None)` — pre-ADR-051 artifacts never had this file, and the
 /// caller falls back to the legacy `config.json` field
 /// (`quarot_rotation_seed`) for those. A **present** file that fails to
-/// read, exceeds the size cap, is not valid JSON, or does not match either
-/// manifest shape is `Err`. Previously all three of "absent", "malformed",
-/// and "present without the key" collapsed to the same silent `None` — but
-/// a file that exists and doesn't parse is evidence of
-/// truncation/corruption/tampering, not a legitimate "no rotation"
-/// artifact, and silently falling back to the legacy seed (or no rotation
-/// at all) would apply the wrong rotation to a checkpoint that was
-/// actually QuaRot-rotated, silently corrupting inference output instead
-/// of refusing to load. A bare-array (`quantize_q4`) manifest genuinely
-/// carries no rotation seed and normalizes to `Ok(None)` rather than an
-/// error (#630 end-to-end verification against the real
-/// qwen3.5-0.8b-q4 checkpoint).
+/// read, exceeds the size cap, is not valid JSON, or (for the object form)
+/// does not match the strict schema is `Err`. A file that exists and
+/// doesn't parse is evidence of truncation/corruption/tampering, not a
+/// legitimate "no rotation" artifact, and silently falling back to the
+/// legacy seed (or no rotation at all) would apply the wrong rotation to a
+/// checkpoint that was actually QuaRot-rotated, silently corrupting
+/// inference output instead of refusing to load (#630 end-to-end
+/// verification against the real qwen3.5-0.8b-q4 checkpoint).
 #[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn read_quarot_seed_from_index(q4_dir: &Path) -> Result<Option<u64>, String> {
-    Ok(crate::quant::q4_manifest::load_manifest(q4_dir)?.and_then(|m| m.quarot_seed))
+    let path = q4_dir.join("quantize_index.json");
+    let Some(bytes) = crate::quant::q4_manifest::read_manifest_bytes_bounded(&path)? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
+    if value.is_array() {
+        // Bare array (quantize_q4 shape): genuinely no seed. Entries are
+        // intentionally not validated here — see the doc comment above.
+        return Ok(None);
+    }
+    let index: QuantizeIndex = serde_json::from_value(value)
+        .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
+    Ok(index.quarot_seed)
 }
 
 fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
@@ -2307,8 +2331,58 @@ mod tests {
         let err = read_quarot_seed_from_index(tmp.path())
             .expect_err("malformed quantize_index.json must be rejected, not silently None");
         assert!(
-            err.contains("quantize_index.json") && err.contains("not valid JSON"),
+            err.contains("malformed quantize_index.json"),
             "error must name the malformed-index failure; got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_quarot_seed_from_index_rejects_incomplete_object_form_entry() {
+        // Regression test: unifying shape-normalization with `doctor`'s
+        // tolerant parser would incorrectly *accept* an object-form
+        // manifest whose tensor entries omit `quantized`/`shape`/`numel`
+        // (doctor's historical leniency, appropriate for a tensor
+        // inventory listing but not for the seed loader). The seed
+        // loader's object-form schema has always required every
+        // `IndexEntry` field; a partially formed entry here means
+        // "corrupted or in-progress write", not "no seed", and must be
+        // rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":42,"tensors":[{"name":"foo","file":"foo.q4"}]}"#,
+        )
+        .unwrap();
+        let err = read_quarot_seed_from_index(tmp.path()).expect_err(
+            "object-form manifest with an incomplete tensor entry must be rejected, \
+             not silently accepted",
+        );
+        assert!(
+            err.contains("malformed quantize_index.json"),
+            "error must name the malformed-index failure; got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_quarot_seed_from_index_bare_array_with_malformed_entries_is_none() {
+        // Regression test, opposite direction: unifying shape-normalization
+        // with `doctor`'s parser would incorrectly *reject* a bare-array
+        // manifest whose entries are missing required fields, because that
+        // parser validates array entries the same way `doctor` does. The
+        // seed loader has never validated array-shape entries at all — a
+        // bare array can never carry a rotation seed regardless of how
+        // malformed its entries are, so it must stay `Ok(None)`.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"foo"}, "not even an object", 42]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_quarot_seed_from_index(tmp.path()),
+            Ok(None),
+            "a bare array with malformed entries still carries no rotation seed \
+             and must yield Ok(None), not an error"
         );
     }
 

@@ -338,20 +338,32 @@ corrupted or incomplete conversion — `doctor` inherits the same Qwen3.6-27B co
 your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doctor` before assuming
 the conversion itself is broken.
 
-`quantize_index.json` parsing and validation is centralized in one place: the
+The bounded, fail-closed read of `quantize_index.json` is centralized in one place: the
 `lattice_inference::quant::q4_manifest` module (`crates/inference/src/quant/q4_manifest.rs`).
-`doctor`'s tensor inventory, QuaRot rotation-seed detection, and the Metal Q4 loader's
-QuaRot-flavor detection all go through this module's bounded reader (fail-closed on a
-missing, truncated, or oversized file) and shape-normalized parser, rather than each
-call site re-deriving its own copy of the contract. That module recognizes both
-`quantize_index.json` manifest shapes:
+`doctor`'s tensor inventory and QuaRot rotation-seed detection (used by both `doctor` and
+the Metal Q4 loader's QuaRot-flavor detection) both read the file through this module's
+bounded reader, rather than each call site re-deriving its own copy of the read contract.
+A genuinely **absent** manifest is `Ok(None)` — a legitimate legacy/no-manifest state that
+callers fall back from (a directory scan for `doctor`, the legacy `config.json` field for
+the rotation seed). A **present** manifest that is unreadable (including a dangling
+symlink), exceeds the size cap, or fails to parse fails closed as an error; it is never
+silently treated as absent, since doing so could load a QuaRot-rotated checkpoint under the
+wrong (or no) rotation.
+
+Shape normalization is deliberately _not_ fully unified, because `doctor`'s inventory and
+the QuaRot seed loader have different accept/reject contracts: `doctor` only ever reads
+`name`/`file` per tensor and tolerates a minimal entry; the seed loader requires every field
+of an object-form manifest and rejects a partial entry as corruption. The module recognizes
+both `quantize_index.json` manifest shapes for `doctor`'s tolerant inventory:
 
 - `quantize_q4` writes a bare JSON array of tensor entries.
 - `quantize_quarot` writes an object with a `tensors` array and metadata such as `quarot_seed`.
 
-Both shapes normalize to the same tensor inventory; the QuaRot seed field is populated only
-for the object form, and is `None` (not an error) when absent from either shape. Older output
-captured before issues [#626](https://github.com/ohdearquant/lattice/issues/626) and
+Both shapes normalize to the same tensor inventory for `doctor`; the QuaRot seed field is
+populated only for the object form, and is `None` (not an error) when absent from either
+shape. The seed loader keeps its own strict, shape-specific parse on top of the shared
+bounded reader. Older output captured before issues
+[#626](https://github.com/ohdearquant/lattice/issues/626) and
 [#627](https://github.com/ohdearquant/lattice/issues/627) may show an `invalid type: map, expected
 a sequence` manifest error for QuaRot directories. That failure mode is historical for current
 `lattice doctor` builds.
