@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity
 
 check:
 	cargo check --workspace
@@ -93,3 +93,10 @@ bench-agentic:
 # Fast sanity check: ctx=1000 only, 3 runs.
 bench-agentic-quick:
 	uv run python3 scripts/bench_compare_1k.py --ctx 1000 --runs 3
+
+# wasm embedding parity gate: builds lattice-embed for wasm32, runs it against
+# the same HF-reference goldens + native-lattice reference as the embed
+# parity test. Skip-graceful if node/wasm-bindgen/weights are absent; set
+# LATTICE_WASM_PARITY_ENFORCE=1 to fail closed instead (CI does this).
+wasm-parity:
+	./scripts/wasm-parity.sh

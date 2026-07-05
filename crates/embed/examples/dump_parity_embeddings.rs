@@ -5,6 +5,12 @@
 //! `NativeEmbeddingService`, and writes `{model_name: [[f32, ...], ...]}` JSON
 //! to the path specified by `DUMP_OUT` (default: `/tmp/emb_dump.json`).
 //!
+//! Also dumps a native reference embedding for the long-input MiniLM stress
+//! case (`long_input_case.json`, single `input` field, no HF golden) under the
+//! key `all_minilm_l6_v2_long_input`, when that fixture is present. This
+//! backs the wasm-vs-native fidelity check for inputs beyond the model's
+//! advisory token cap; see `crates/embed/tests/wasm/embed_parity_wasm.mjs`.
+//!
 //! Run:
 //!   DUMP_OUT=/tmp/emb_main.json \
 //!   cargo run -p lattice-embed --example dump_parity_embeddings --release
@@ -100,6 +106,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         results.insert(fixture.label.to_string(), embeddings);
+    }
+
+    // Long-input MiniLM stress case (optional: only present once the wasm
+    // parity harness has been set up). Single `input` field, no HF golden:
+    // this is a wasm-vs-native self-consistency reference, not a wasm-vs-HF one.
+    let long_input_path = fixture_dir.join("long_input_case.json");
+    if let Ok(raw) = std::fs::read_to_string(&long_input_path) {
+        let record: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("failed to parse long_input_case.json: {e}"));
+        let text = record["input"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing 'input' in long_input_case.json"))
+            .to_string();
+
+        println!("Embedding long-input stress case with model all_minilm_l6_v2...");
+        let service = NativeEmbeddingService::with_model(EmbeddingModel::AllMiniLmL6V2);
+        let embeddings = service
+            .embed(&[text], EmbeddingModel::AllMiniLmL6V2)
+            .await
+            .unwrap_or_else(|e| panic!("embed failed for long-input case: {e}"));
+        println!(
+            "  -> {} embedding(s) of dim {}",
+            embeddings.len(),
+            embeddings.first().map(Vec::len).unwrap_or(0)
+        );
+        results.insert("all_minilm_l6_v2_long_input".to_string(), embeddings);
     }
 
     let json = serde_json::to_string(&results).expect("serialization of embedding results failed");
