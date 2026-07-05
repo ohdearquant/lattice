@@ -24243,7 +24243,10 @@ kernel void decode_attention_reference(
                 "streamed chunks must concatenate to exactly the truncated text"
             );
             assert!(!streamed.contains(stop_string.as_str()));
-            assert!(out.stopped, "boundary-spanning stop-string match must set stopped = true");
+            assert!(
+                out.stopped,
+                "boundary-spanning stop-string match must set stopped = true"
+            );
             assert_eq!(out.stop_reason, Some(StopReason::Eos));
         }
 
@@ -24315,6 +24318,203 @@ kernel void decode_attention_reference(
                 out.stop_reason,
                 Some(StopReason::Length),
                 "an absent stop string must still exhaust max_new_tokens with Length"
+            );
+        }
+
+        /// #643: `generate_streaming_with_prefix_cache_inner` must honor
+        /// `GenerateConfig::stop_strings` with the same truncation/exclusion
+        /// semantics as the other Metal loops, AND must drop (not save) the
+        /// cross-turn prefix cache entry for the slot on a stop-string match —
+        /// CPU semantics can retain a generated token whose text was truncated
+        /// by the match, so caching the hidden state behind that token would
+        /// let a later turn resume from state representing text the caller
+        /// never received.
+        ///
+        /// Turn 1 (no `stop_strings`) first proves the slot's cache entry is
+        /// normally populated by a successful turn — establishing the
+        /// contrast the turn-2 assertion depends on (a cache that starts
+        /// empty would make an `is_none()` check trivially true regardless of
+        /// whether the stop-string removal code ran). Turn 2 uses a
+        /// different prompt (`"b"` vs turn 1's `"a"`) so the reuse planner
+        /// picks `PrefixReuseMode::FullRefill` — the one mode where
+        /// `restore_cross_turn_prefix` does NOT `take()` (and thus does not
+        /// already empty) the slot's map entry, so turn 1's stale entry is
+        /// still sitting in `cross_turn_prefix_cache` when turn 2's stop
+        /// check runs. Turn 2's `stop_strings: [""]` — because
+        /// `str::find("")` always matches at byte 0 — deterministically
+        /// triggers `generate_streaming_with_prefix_cache_inner`'s
+        /// first-token stop-check branch regardless of the tiny fixture's
+        /// sampled output. This isolates the exact removal call the design
+        /// added: without it, turn 1's stale entry would survive turn 2's
+        /// string-stop return and misrepresent turn 2's (truncated, FullRefill)
+        /// state to a later caller.
+        #[test]
+        fn metal_generate_streaming_with_prefix_cache_honors_stop_string_and_clears_cache_on_match()
+        {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::kv_cache::PrefixReuseMode;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot = crate::kv_cache::CrossTurnSlotId::new(1);
+
+            // Turn 1: no stop_strings, must complete normally and populate the
+            // slot's cross-turn cache entry.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache(slot, "a", &tokenizer, &base_cfg, |_, _| true)
+                .expect("turn 1 generate_streaming_with_prefix_cache (no stop_strings)");
+            assert!(
+                !turn1.output.stopped,
+                "turn 1 baseline must run to max_new_tokens, not stop early"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.get(slot).is_some(),
+                "a normal (non-string-stopped) turn must populate the slot's cross-turn cache entry \
+                 — this is the baseline the mutation check below contrasts against"
+            );
+
+            // Turn 2: same state/slot, a DIFFERENT prompt so the planner picks
+            // FullRefill (leaving turn 1's stale entry untouched by the
+            // restore step), and `stop_strings: [""]` matches at byte 0
+            // unconditionally, so this must stop on the very first generated
+            // token and clear the (now stale) cache entry left by turn 1.
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![String::new()];
+            let mut streamed = String::new();
+            let turn2 = state
+                .generate_streaming_with_prefix_cache(
+                    slot,
+                    "b",
+                    &tokenizer,
+                    &stopped_cfg,
+                    |d, _id| {
+                        streamed.push_str(d);
+                        true
+                    },
+                )
+                .expect("turn 2 generate_streaming_with_prefix_cache with stop_strings: [\"\"]");
+
+            assert_eq!(
+                turn2.cache.mode,
+                PrefixReuseMode::FullRefill,
+                "turn 2's mismatched prompt must force FullRefill, so the stale entry from turn 1 \
+                 is NOT already emptied by restore_cross_turn_prefix's take() before the stop check"
+            );
+            assert_eq!(
+                turn2.output.text, "",
+                "an empty-string stop must match at byte 0, excluding all generated text"
+            );
+            assert_eq!(
+                streamed, "",
+                "no text may be streamed before the byte-0 match"
+            );
+            assert!(turn2.output.stopped);
+            assert_eq!(turn2.output.stop_reason, Some(StopReason::Eos));
+            assert!(
+                state.cross_turn_prefix_cache.get(slot).is_none(),
+                "a stop-string match must drop the (now stale) cross-turn cache entry for the \
+                 slot, never leave turn 1's entry surviving a string-stopped turn 2"
+            );
+        }
+
+        /// #643: `generate_multimodal` must honor `GenerateConfig::stop_strings`
+        /// with the same semantics as the text-only Metal loops.
+        #[test]
+        fn metal_generate_multimodal_honors_stop_string() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+
+            let visual_tokens = 2usize;
+            let d_model = cfg.hidden_size;
+            let make_input = || crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0f32; visual_tokens * d_model],
+                raw_patches: 4,
+                visual_tokens,
+                d_model,
+                text_tokens: vec![1u32],
+            };
+
+            let base_cfg = GenerateConfig {
+                max_new_tokens: 6,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let baseline = {
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+                state
+                    .generate_multimodal(make_input(), &tokenizer, &base_cfg)
+                    .expect("baseline generate_multimodal (no stop_strings)")
+            };
+            assert!(
+                baseline.text.len() >= 3,
+                "need at least 3 generated chars to test a mid-generation stop, got {:?}",
+                baseline.text
+            );
+
+            let stop_char = baseline.text.chars().last().expect("non-empty baseline");
+            let hit = baseline
+                .text
+                .find(stop_char)
+                .expect("stop_char was taken from baseline.text");
+            let expected_prefix = baseline.text[..hit].to_string();
+
+            let mut stopped_cfg = base_cfg.clone();
+            stopped_cfg.stop_strings = vec![stop_char.to_string()];
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let out = state
+                .generate_multimodal(make_input(), &tokenizer, &stopped_cfg)
+                .expect("generate_multimodal with stop_strings");
+
+            assert_eq!(
+                out.text, expected_prefix,
+                "stop string must truncate text to the prefix before the earliest match \
+                 (stop text excluded from returned output)"
+            );
+            assert!(out.stopped, "stop-string match must set stopped = true");
+            assert_eq!(out.stop_reason, Some(StopReason::Eos));
+            assert!(
+                !out.text.contains(stop_char),
+                "returned text must not contain the stop string"
             );
         }
 
