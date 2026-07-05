@@ -1153,6 +1153,11 @@ pub mod bench_support {
                 mtp_num_hidden_layers: 0,
                 mtp_use_dedicated_embeddings: false,
                 quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
             };
 
             let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 32
@@ -1832,6 +1837,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         let rope_dim = cfg.rope_dim(); // = 16
@@ -2025,6 +2035,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 16
@@ -2292,6 +2307,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
         let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
 
@@ -2529,6 +2549,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         // All-zero packed weights: scale=0, all i8=0 → logits all 0 → greedy picks 0.
@@ -2632,6 +2657,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         // The negative gamma at dim-0 creates a "bounce" each decode step.

@@ -934,6 +934,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         let rope_dim = cfg.rope_dim(); // = 16
@@ -1204,6 +1209,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
@@ -1377,6 +1387,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         // embed_tokens is [vocab, hidden] and also serves as the tied LM head.
@@ -1620,6 +1635,11 @@ mod tests {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         };
 
         let rope_dim = (head_dim as f32 * cfg.partial_rotary_factor) as usize; // 16
