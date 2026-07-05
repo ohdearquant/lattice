@@ -28,7 +28,7 @@ Thumbs.db
 *.onnx
 *.gguf
 
-# Codex/review scratch artifacts (repo-root only)
+# Review scratch artifacts (repo-root only)
 /review*.md
 /pr_review*.md
 

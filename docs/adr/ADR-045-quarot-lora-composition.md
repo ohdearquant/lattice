@@ -2,7 +2,6 @@
 
 **Status**: Accepted
 **Date**: 2026-05-16
-**Author**: Ocean (HaiyangLi)
 **Depends on**: ADR-044 (QuaRot rotated quantization, v0 shipped in v0.2.0)
 
 ## Context

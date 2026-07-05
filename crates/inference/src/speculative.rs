@@ -1873,7 +1873,7 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 ///
 /// `target_logits[n - 1]` is reserved for the bonus token sampled after full
 /// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` is the
-/// off-by-one that codex round 1 flagged (Leviathan Algorithm 1 evaluates
+/// off-by-one flagged in review (Leviathan Algorithm 1 evaluates
 /// `p_i(x_i)`, not `p_{i+1}(x_i)`).
 ///
 /// For each position `i`:
@@ -4449,7 +4449,7 @@ mod tests {
     /// MtpVerifier::new rejects zero-width RoPE (partial_rotary_factor == 0.0,
     /// which the [0,1] scalar check accepts) before constructing a degenerate
     /// RopeTable whose max_positions() == 0 would reject every forward_one
-    /// position (codex #362 Major: position-bound exactness for zero-width RoPE).
+    /// position (#362 Major: position-bound exactness for zero-width RoPE).
     #[test]
     fn mtp_new_rejects_zero_partial_rotary_factor() {
         let mut cfg = tiny_mtp_config();
@@ -4469,7 +4469,7 @@ mod tests {
     /// MtpVerifier::new returns Err (not a debug overflow-panic / release wrap)
     /// when vocab_size * hidden_size overflows usize. Weights/embeds are tiny;
     /// the checked product fires before any tensor-shape comparison
-    /// (codex #362 Medium: unchecked dimension products).
+    /// (#362 Medium: unchecked dimension products).
     #[test]
     fn mtp_new_rejects_dimension_product_overflow() {
         let base = tiny_mtp_config();
@@ -4492,7 +4492,7 @@ mod tests {
     /// head_dim overflows. Reachable with TINY weights — only weights.layers.len()
     /// is checked before MtpScratch/cache construction, so an oversized
     /// num_attention_heads passes the scalar/divisibility checks (kv_heads=1)
-    /// yet overflows q_dim (codex #362 round-2 Medium: derived-dimension products).
+    /// yet overflows q_dim (#362 Medium: derived-dimension products).
     #[test]
     fn mtp_new_rejects_head_dim_product_overflow() {
         let base = tiny_mtp_config();

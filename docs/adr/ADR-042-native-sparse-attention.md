@@ -91,10 +91,10 @@ Public surface:
 
 | Alternative | Pros | Cons | Why Not |
 |---|---|---|---|
-| Mean-pooling compression (`fla-org` variant) | Parameter-free; no φ weights to supply | Explicitly *not* the paper; discards the learnable MLP φ | Ocean chose the faithful paper algorithm |
-| Selection-branch-only ("ship the seed") | Smallest; isolates the novel kernel piece | Not the full mechanism; defers the gated three-branch merge | Ocean chose the full faithful implementation |
-| Defer NSA entirely | Avoids building on a nonexistent checkpoint | Leaves the bench-oriented attention series at 2/3 | Ocean chose to build it |
-| Follow `lucidrains` exactly | One coherent reference to transcribe | Diverges from the paper (logits-as-scores, mean aggregation, mem-KV, left-pad) | Ocean asked for paper-faithful |
+| Mean-pooling compression (`fla-org` variant) | Parameter-free; no φ weights to supply | Explicitly *not* the paper; discards the learnable MLP φ | The faithful paper algorithm was chosen over the parameter-free variant |
+| Selection-branch-only ("ship the seed") | Smallest; isolates the novel kernel piece | Not the full mechanism; defers the gated three-branch merge | The full faithful implementation was chosen over the seed-only variant |
+| Defer NSA entirely | Avoids building on a nonexistent checkpoint | Leaves the bench-oriented attention series at 2/3 | Chosen: build the full mechanism rather than deferring it |
+| Follow `lucidrains` exactly | One coherent reference to transcribe | Diverges from the paper (logits-as-scores, mean aggregation, mem-KV, left-pad) | Paper-faithful implementation was the requirement |
 | Single Q/K/V set, RoPE'd by caller (ADR-010 convention) | Matches the other modules' signature | Paper §3.3.3 mandates independent K/V per branch, and compression needs non-RoPE Q/K | Faithfulness requires 8 activation buffers: `q`, `q_rope`, `k_cmp`, `k_slc`, `k_win`, `v_cmp`, `v_slc`, `v_win` |
 
 ---

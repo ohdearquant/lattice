@@ -20,7 +20,7 @@ Implemented additive changes in this run:
 3. `unwrap-in-lib-lint` observation job added to `.github/workflows/ci.yml` with
    `continue-on-error: true` at the job level. Not added to any required-status set.
 
-All new merge-blocking gates listed below remain proposed until founder sign-off. No proposed gate
+All new merge-blocking gates listed below remain proposed until maintainer sign-off. No proposed gate
 in this ADR should be treated as accepted branch-protection policy. The two observation jobs above
 are explicitly non-blocking and will show existing debt on first run.
 
@@ -70,7 +70,7 @@ The project is a pure-Rust inference engine. CI design must not add new dependen
 must not weaken or remove any existing gate. Additive observation gates can be introduced separately
 only when they are non-required or explicitly allowed to fail during their observation period.
 
-Any change that would make a new gate merge-blocking is not decided here. It requires founder
+Any change that would make a new gate merge-blocking is not decided here. It requires maintainer
 sign-off because it changes branch-protection policy, migration expectations, and merge risk.
 
 ### Verified absence ledger
@@ -164,10 +164,10 @@ The MSRV check candidate was evaluated and skipped for this run. No workspace cr
 - Pick an arbitrary older toolchain version that has no policy backing and could produce persistent
   noise if the codebase uses syntax unavailable on that version.
 
-Without a founder-approved minimum Rust version, a non-trivial MSRV job cannot be made cleanly
+Without a maintainer-approved minimum Rust version, a non-trivial MSRV job cannot be made cleanly
 non-blocking in spirit — it would be guessing at a policy rather than measuring against one. The
 absence of `rust-version` remains a verified gap (rank 2 in the verified absence ledger). It is
-recorded below as a founder-gated proposal where the required policy decision can be made explicitly.
+recorded below as an open proposal pending an explicit policy decision.
 
 ### D5: Remaining non-blocking additive candidates (not yet implemented)
 
@@ -175,12 +175,12 @@ recorded below as a founder-gated proposal where the required policy decision ca
 |---|---|---|---|
 | `publish-dry-run` | packaging | New non-required job invoking existing `scripts/publish.sh --dry-run`, path-filtered to Cargo and crate/package surfaces, allowed to fail initially. | Requires review of the publish script's environment expectations before CI wiring; deferred to a separate change. |
 
-### D6: Founder-gated proposals are not accepted changes
+### D6: Deferred proposals are not accepted changes
 
 The following proposals would create or promote a merge-blocking gate. They are explicitly proposed
-for founder sign-off and are not decided by this ADR.
+for maintainer sign-off and are not decided by this ADR.
 
-| proposal | protected property | founder decision needed |
+| proposal | protected property | maintainer decision needed |
 |---|---|---|
 | Make `unwrap-in-lib-lint` required, or encode unwrap and expect denial in workspace lint policy. | correctness | Blocks merges on existing or future panic-safety violations; requires agreement on tolerated exceptions and migration path. |
 | Define official MSRV, add `rust-version`, and make an MSRV compile check required. | build-hygiene | Establishes a compatibility contract that can constrain dependency and language-feature choices. |
@@ -197,7 +197,7 @@ A CI check may become merge-blocking only when all of the following are true:
 2. The trigger and path-filter behavior are explicit.
 3. The failure mode is documented.
 4. Existing failures are either fixed or covered by an accepted migration plan.
-5. Branch-protection impact is approved by the founder.
+5. Branch-protection impact is approved by the maintainers.
 
 This keeps new gates additive while preventing surprise merge blockage.
 
@@ -266,7 +266,7 @@ If accepted separately, add non-required jobs for rustdoc linting, unwrap/expect
 publish dry-run visibility, or MSRV telemetry. These jobs must not be added to branch protection in
 the same change.
 
-### Phase 3: Founder sign-off
+### Phase 3: Maintainer sign-off
 
 For any proposed merge-blocking gate, decide the exact protected property, failure mode, migration
 plan, and branch-protection context.

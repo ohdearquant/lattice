@@ -243,8 +243,8 @@ a turn. This is exactly the multi-session risk PR #619's description cites as th
 `lattice serve`/`lattice_serve` weren't wired up yet — a single shared worker with this cache
 behind a server handling several simultaneous chats would thrash.
 
-This single-entry design traces back to a real bug caught in review: PR #516's round-1 codex
-review rejected an earlier version that used an unbounded per-slot `HashMap`, because the
+This single-entry design traces back to a real bug caught in review: PR #516's review
+rejected an earlier version that used an unbounded per-slot `HashMap`, because the
 underlying full-attention KV buffer is one mutable live buffer shared by the whole process — a
 stale map entry could restore GDN state from one conversation while attention silently read KV
 rows another generation had since overwritten. The fix (documented as remediation items D1-D6)

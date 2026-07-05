@@ -1,6 +1,6 @@
 # Lattice Studio — Design Decision
 
-> **Status:** Decision doc for Ocean. Two refined finalists, head-to-head, with a recommendation and a build sequence.
+> **Status:** Decision doc. Two refined finalists, head-to-head, with a recommendation and a build sequence.
 > **Target:** macOS 26, SwiftUI, `swift build`. Toolchain verified: Apple Swift 6.3.2 / `arm64-apple-macosx26.0`.
 > **Backend:** the `lattice` pure-Rust engine, driven via CLI subprocesses (line-delimited JSON event stream).
 > **Brand law (governs both directions):** *measure first, the number is the truth.* Bold is spent on the **numbers**, not on chrome. Adaptive light + dark from day one.
@@ -37,7 +37,7 @@ Both directions adopt three shared laws, grafted from the design exploration:
 
 lattice owns hand-written Metal/AVX2/NEON kernels with zero framework — no Python, no ONNX, no CUDA, no runtime. The app should look like the **instrument panel of that engine**, not a wrapper around it. So every numeric quantity (loss, grad-norm, tok/s, PPL, MB, rank, lr) is a first-class citizen in tabular monospace that never reflows as digits change, on hairline-ruled opaque panels with almost no chrome — the way a DAW or a Bloomberg terminal trades whitespace for live truth.
 
-One accent (signal teal) is spent only on **movement** — the loss trace, the active token stream, the now-cursor — so the eye always lands on the thing that is actually changing. It honors Ocean's editorial/high-contrast lean by making **bold typography the hero** (a 56pt loss numeral, luminous data on ink) instead of illustration, and it beats a generic dashboard because it commits fully to the instrument metaphor: readouts, sweeps, gates — the literal visual translation of measure-first DNA.
+One accent (signal teal) is spent only on **movement** — the loss trace, the active token stream, the now-cursor — so the eye always lands on the thing that is actually changing. It follows an editorial/high-contrast design direction by making **bold typography the hero** (a 56pt loss numeral, luminous data on ink) instead of illustration, and it beats a generic dashboard because it commits fully to the instrument metaphor: readouts, sweeps, gates — the literal visual translation of measure-first DNA.
 
 The README is explicit that MLX is faster; lattice's edge is **capabilities + honesty**. So we sell the moat, not raw speed: QuaRot 4-bit, Q4+LoRA hot-swap with no reload, pure-Rust portability.
 
@@ -181,7 +181,7 @@ MAIN SHELL — 02 TRAIN (dark) ---------------------------------------
 
 lattice is an instrument, not an app. An oscilloscope doesn't decorate the waveform; it gets out of the way so the engineer trusts the trace. Console is near-monochrome so the one thing that earns color and movement — a live loss ticking down, a PPL delta, a parity PASS — is unmissable and pre-attentive. Everything is reachable from a single command bar (⌘K), because a tool that worships "measure first" should never make you hunt through menus for the measurement.
 
-It earns Ocean's editorial/bold lean by spending all of that boldness on the **numerals themselves**, not on chrome — the visual analog of pure-Rust with no Python, no ONNX, no runtime bloat. Same "numbers never touch glass" law; glass lives only on the navigation layer.
+It follows the editorial/bold design direction by spending all of that boldness on the **numerals themselves**, not on chrome — the visual analog of pure-Rust with no Python, no ONNX, no runtime bloat. Same "numbers never touch glass" law; glass lives only on the navigation layer.
 
 ## Visual Identity
 
@@ -313,7 +313,7 @@ CHAT split-compare — hot-swap fader (base vs +adapter)
 | **Feature surfacing** | 9 — dedicated comparator/quant-table screens, denser readouts | 8 — slightly thinner; config lists + right-rail metrics | Instrument |
 | **Feasibility** | 9 — all native APIs; density redraw is the only watch-item | 10 — least surface area, glass on nav only | Console |
 | **Distinctiveness** | 8 — instrument/Bloomberg metaphor is on-brand but not category-novel | 7 — risks "another dark dev tool" without an exceptional type pass | Instrument |
-| **Density posture** | High by default (with a comfortable toggle) | Lean by default (Cmd-K hides forms) | depends on Ocean |
+| **Density posture** | High by default (with a comfortable toggle) | Lean by default (Cmd-K hides forms) | open design choice |
 
 **When each wins.** Instrument wins when the user lives *inside* a run — watching loss, scrubbing the curve, reading six wells at once — and wants the screen to be a panel of live truth. It is the richer demo and the more defensible brand statement. Console wins on pure speed and minimal build risk: a power user who configures by keystroke and never wants to see a form, on the cheapest path to ship. Console's distinctiveness is its only soft spot — near-monochrome reads generic unless the hero numerals are genuinely authored.
 
@@ -329,9 +329,9 @@ Why:
 1. **Brand fit is the tiebreaker and Instrument wins it 10 vs 9.** lattice's identity is literally "the number is the truth," and Instrument is the most complete translation of that into UI — readout wells, the oscilloscope strip chart with scrub-to-freeze, GATE PILL verdicts. It sells the *moat* (QuaRot ContrastPair, hot-swap fader) rather than raw speed, exactly as the README demands.
 2. **The feasibility gap is small and closeable.** Instrument is a 9 to Console's 10. Its only real risk is 60fps redraw of the live curve under a fast step/token stream — mitigated by buffering points and throttling chart commits to ~20Hz, the same technique both directions already specify. Everything else maps to native APIs (`.monospacedDigit`, `.contentTransition(.numericText())`, Swift Charts `LineMark`+`RuleMark`+`chartOverlay`, `NavigationSplitView`). Verified buildable on the installed Swift 6.3.2 / macOS 26 toolchain.
 3. **Grafting closes the only thing Console wins on.** Adding the ⌘K spine to Instrument gives power users the keyboard-first launch path without sacrificing the dense readout panels. The comfortable-row toggle (32px) handles the density-too-cold risk Instrument self-flags. We get Console's speed *and* Instrument's brand depth.
-4. **Honors Ocean's editorial/bold lean correctly.** Both reject the literal display-serif reading (a streaming loss in a 96pt serif visibly jitters — it contradicts "the truth does not shimmer"). Instrument spends all its boldness on a 56pt tabular-mono hero numeral: editorial confidence without the jitter risk.
+4. **Honors the editorial/bold design lean correctly.** Both reject the literal display-serif reading (a streaming loss in a 96pt serif visibly jitters — it contradicts "the truth does not shimmer"). Instrument spends all its boldness on a 56pt tabular-mono hero numeral: editorial confidence without the jitter risk.
 
-The override on Ocean's "editorial/bold" lean is deliberate and stated: editorial is a *typographic posture*, not a literal magazine. We deliver it as **monospace-numeral boldness**, which is both more on-brand for an instrument and lower-risk to build. If Ocean specifically wants the magazine-cover feel, that is the genuine fork below.
+The override on the "editorial/bold" lean is deliberate and stated: editorial is a *typographic posture*, not a literal magazine. We deliver it as **monospace-numeral boldness**, which is both more on-brand for an instrument and lower-risk to build. If the magazine-cover feel is specifically wanted, that is the genuine fork below.
 
 ---
 
