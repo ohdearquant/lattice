@@ -21,7 +21,7 @@ The decode hot path on Apple Silicon depends on tight CPU SIMD kernels (NEON ele
 2. Restoring the `-128` validation scan on the public `dot_product_i8` entry point cost a measurable percentage of int8 throughput before being moved behind a `_dispatch` indirection.
 3. Tightening the polynomial `exp` upper clamp from 88.72 → 88.0 — no measurable impact, but easy to imagine a similar change costing 5% of softmax throughput.
 
-The end-to-end decode bench (`scripts/bench_apples_to_apples.sh`) catches macro regressions but is too noisy to attribute them: on a busy M2 Max with 5–10 concurrent `li play` processes, lattice decode throughput swings by 25% (issue #77). We cannot use noisy end-to-end numbers as a merge gate.
+The end-to-end decode bench (`scripts/bench_apples_to_apples.sh`) catches macro regressions but is too noisy to attribute them: on a busy M2 Max with 5–10 concurrent GPU-bench processes, lattice decode throughput swings by 25% (issue #77). We cannot use noisy end-to-end numbers as a merge gate.
 
 The GPU path cannot run on GitHub Actions runners (no Metal). But the CPU paths can — and they account for elementwise activations, normalization, the int8 embed path, decode attention reductions, and the entire CPU fallback for systems without GPU acceleration.
 
@@ -33,7 +33,7 @@ The GPU path cannot run on GitHub Actions runners (no Metal). But the CPU paths 
 - **Free GitHub-hosted runners only.** No self-hosted M-series runner for now (separate decision).
 - **GH Actions noise.** Shared runners exhibit run-to-run variance; threshold must be loose enough to not flake, tight enough to catch real regressions.
 - **Cross-architecture coverage.** Both NEON (aarch64 Linux via `ubuntu-24.04-arm`) and AVX2 (x86_64 Linux via `ubuntu-latest`) must be gated separately — a regression in only one path is still a regression.
-- **Trend visibility.** Ocean wants "very granular" tracking — not just "did this PR regress" but "how has performance evolved over time."
+- **Trend visibility.** The design requires "very granular" tracking — not just "did this PR regress" but "how has performance evolved over time."
 
 ## Decision
 
@@ -220,7 +220,7 @@ Just use `cargo bench --baseline previous` and rely on Criterion's built-in `reg
 
 ### A2: Bencher.dev or Codspeed (paid hosted services)
 
-Rejected by Ocean directive: "we can do it ourselves, no need to pay for these kinds of stuff."
+Rejected: building in-house avoids external cost and dependency.
 
 ### A3: Self-hosted Apple Silicon runner
 

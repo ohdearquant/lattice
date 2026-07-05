@@ -1,6 +1,6 @@
 # perf_governor — macOS Bench Resource Guardrail
 
-Hard gate that runs before (and during) any perf measurement on Ocean's Mac.
+Hard gate that runs before (and during) any perf measurement on this machine.
 Pure stdlib, no pip deps. macOS-only. No sudo required.
 
 The module lives at `scripts/perf_governor.py` (tracked, CI-reachable, survives a
@@ -28,7 +28,7 @@ python3 scripts/perf_governor.py --status
 # Gate check only (exit 0 = clear, exit 2 = blocked)
 python3 scripts/perf_governor.py --preflight
 
-# Demonstrate every guard tripping without a real bench (Leo's sanity demo)
+# Demonstrate every guard tripping without a real bench (sanity demo)
 python3 scripts/perf_governor.py --selftest
 
 # Full gate: preflight → run → cooldown (replace 'cargo bench ...' with your cmd)

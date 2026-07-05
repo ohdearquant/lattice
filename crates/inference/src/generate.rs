@@ -111,7 +111,7 @@ pub struct GenerateOutput {
 
 // ---------------------------------------------------------------------------
 // ForwardScratch: pre-allocated activation and logits buffers, reused across
-// all tokens in a request. Eliminates 204 allocations/token (Round 0 baseline).
+// all tokens in a request. Eliminates 204 allocations/token vs. the unoptimized baseline.
 // ---------------------------------------------------------------------------
 
 struct ForwardScratch {
@@ -1305,7 +1305,7 @@ mod tests {
     fn test_compute_max_seq_overflow_is_error_not_panic() {
         // A pathological max_new_tokens near usize::MAX must surface a clean
         // InvalidInput error rather than wrapping the addition and panicking
-        // later inside prefill_layer's capacity assertion (codex finding #2).
+        // later inside prefill_layer's capacity assertion (finding #2).
         let err = compute_max_seq(10, usize::MAX).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
         let err = compute_max_seq(usize::MAX, 1).unwrap_err();
@@ -1472,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_check_alloc_capacity_multiplication_overflow_is_error() {
-        // The codex review of PR #291 found that guarding only compute_max_seq's
+        // PR #291 found that guarding only compute_max_seq's
         // addition leaves the downstream `max_seq_len * kv_dim` multiplication
         // unchecked: a huge-yet-non-overflowing effective_cap (here usize::MAX/1024,
         // matching the reviewer's kv_dim=8*128 counterexample) wraps the cache/scratch
