@@ -3,7 +3,7 @@
 //! Supports temperature scaling, top-k filtering, top-p (nucleus) sampling,
 //! and repetition penalty.
 
-use crate::model::qwen35_config::{TokenLogprob, TopLogprob};
+use crate::model::qwen35_config::{GenerateConfig, TokenLogprob, TopLogprob};
 
 /// **Unstable**: sampling configuration for decoder-only generation; fields
 /// and defaults may change as the generation API evolves.
@@ -443,6 +443,139 @@ impl Sampler {
     }
 }
 
+thread_local! {
+    /// Reused scratch for [`sample_full_logits`], the shared engine behind the
+    /// stateless `(logits, cfg, previous_ids, rng_state)` call sites that have
+    /// no owning struct to hold per-generation buffers: the Metal CPU fallback
+    /// (`forward/metal_qwen35.rs`'s private `sample_token`) and the Qwen CPU
+    /// decode loops (`model/qwen35/sampling.rs::sample_token`, shared by the
+    /// f16/q8/NEON/batch-prefill forward paths). Kept thread-local instead of
+    /// per-call so vocab-sized buffers are allocated once per thread and
+    /// reused across every decode step, not just within one generation.
+    static FULL_LOGIT_SCRATCH: std::cell::RefCell<FullLogitScratch> =
+        std::cell::RefCell::new(FullLogitScratch::new());
+}
+
+struct FullLogitScratch {
+    logit_scratch: Vec<f32>,
+    candidate_scratch: Vec<Candidate>,
+    prob_scratch: Vec<f32>,
+    penalty_seen: std::collections::HashSet<u32>,
+}
+
+impl FullLogitScratch {
+    fn new() -> Self {
+        Self {
+            logit_scratch: Vec::new(),
+            candidate_scratch: Vec::new(),
+            prob_scratch: Vec::new(),
+            penalty_seen: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// Shared full-logit sampling engine for callers that receive the full token
+/// history and RNG state as plain arguments each step (rather than owning a
+/// [`Sampler`]). Implements the same pipeline as `Sampler::sample`'s non-greedy
+/// path: apply repetition penalty once per unique previously-seen id, check
+/// the degenerate-temperature greedy short-circuit, then a single fused
+/// temperature-scale + partial top-k select feeding a top-p softmax draw.
+///
+/// This replaces, at each of its two call sites, a per-call
+/// `CandidateSet::from_full_logits` (materializes every vocabulary entry as a
+/// `Candidate` before any filtering) plus a per-candidate repetition-penalty
+/// scan (`previous_ids.contains(&c.token_id)`, O(vocab * history length)) with:
+/// - repetition penalty applied only at the indices named by the unique ids in
+///   `previous_ids` (a context-id set, O(unique history length));
+/// - `select_top_k`'s streaming min-heap partial selection, so the top-p
+///   softmax below only ever runs over the surviving `k` candidates, never the
+///   full vocabulary;
+/// - thread-local `logit_scratch` / `candidate_scratch` / `prob_scratch` /
+///   `penalty_seen` buffers reused across decode steps instead of a fresh
+///   vocab-sized allocation per token.
+pub(crate) fn sample_full_logits(
+    logits: &[f32],
+    cfg: &GenerateConfig,
+    previous_ids: &[u32],
+    rng_state: &mut u64,
+) -> u32 {
+    FULL_LOGIT_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let FullLogitScratch {
+            logit_scratch,
+            candidate_scratch,
+            prob_scratch,
+            penalty_seen,
+        } = &mut *scratch;
+
+        logit_scratch.clear();
+        logit_scratch.extend_from_slice(logits);
+
+        if cfg.repetition_penalty != 1.0 {
+            // Penalize each unique previously-seen id exactly once (HF
+            // gather-once semantics), matching `Sampler::apply_penalty_to_logit_scratch`.
+            penalty_seen.clear();
+            for &tok in previous_ids {
+                let idx = tok as usize;
+                if idx < logit_scratch.len() && penalty_seen.insert(tok) {
+                    logit_scratch[idx] =
+                        penalized_logit(logit_scratch[idx], cfg.repetition_penalty);
+                }
+            }
+        }
+
+        // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
+        // reciprocal overflows) carries no valid scaling; the t -> 0+ limit is
+        // greedy argmax over the already-penalized logits.
+        if temperature_degenerate(cfg.temperature) {
+            return argmax_f32(logit_scratch);
+        }
+
+        let inv_temp = if cfg.temperature != 1.0 {
+            1.0 / cfg.temperature
+        } else {
+            1.0
+        };
+
+        // Fail-closed guard: `select_top_k`'s scalar/NEON seed phases rewrite a
+        // NaN scaled logit to NEG_INFINITY so the min-heap root is never NaN
+        // (a NaN root would reject every finite candidate in the NEON prefilter).
+        // That sanitization is correct for the heap's internal ordering, but it
+        // erases the NaN *before* the softmax degeneracy guard in
+        // `CandidateSet::sample_top_p_with_scratch` ever sees it, silently
+        // turning a "poisoned distribution" case into "normal sampling over a
+        // masked candidate" — exactly the regression this scan closes.
+        //
+        // Mirror the old full-logit contract (`build_softmax_probs` returning
+        // `None` on a non-finite max or a NaN-poisoned sum, both of which fall
+        // back to argmax) with a single pass over the pre-scaled logits: any
+        // NaN anywhere forces degeneracy (a NaN can never become the max, so it
+        // would otherwise poison the softmax sum from a non-max position,
+        // #322-class); a non-finite max (every logit `-inf`, or a `+inf` logit)
+        // also forces degeneracy, matching `sample_top_p_with_scratch`'s
+        // non-finite-max short-circuit. Scaling by a positive finite `inv_temp`
+        // (guaranteed by the `temperature_degenerate` check above) preserves
+        // both NaN-ness and finiteness, so scanning before the fused top-k scale
+        // is equivalent to scanning after it.
+        let (has_nan, max_logit) = scan_nan_or_nonfinite_max(logit_scratch);
+        if has_nan || !max_logit.is_finite() {
+            return argmax_f32(logit_scratch);
+        }
+
+        // Streaming min-heap top-k with fused temperature scaling — the softmax
+        // draw below runs only over these k survivors, never the full vocabulary.
+        select_top_k(logit_scratch, cfg.top_k, inv_temp, candidate_scratch);
+
+        let mut cs = CandidateSet {
+            candidates: std::mem::take(candidate_scratch),
+        };
+        let r = uniform_f32_from_u64(xorshift64_next(rng_state));
+        let token = cs.sample_top_p_with_scratch(cfg.top_p, r, prob_scratch);
+        *candidate_scratch = cs.candidates; // restore scratch capacity
+        token
+    })
+}
+
 /// A generous upper bound on the magnitude of a transformer lm_head logit. Real
 /// logits are O(10) (rarely past ~50); this 1e4 ceiling carries ~100-1000x of
 /// headroom. It defines the boundary below which a temperature is treated as
@@ -628,6 +761,76 @@ pub(crate) fn record_logprob(
         logprob,
         top,
     });
+}
+
+/// Fail-closed pre-scan for `sample_full_logits`: detects whether `logits`
+/// contains any NaN and computes the NaN-ignoring ("numeric") max in a
+/// single pass, so the caller can fall back to `argmax_f32` before
+/// `select_top_k`'s scalar/NEON seed phases sanitize a NaN to `NEG_INFINITY`
+/// and hide it from the softmax degeneracy guard (codex PR #651 round 1).
+/// Runtime-dispatch NEON on aarch64 (same 4-wide-plus-scalar-tail structure
+/// as `argmax_f32_neon`) with a scalar fallback.
+fn scan_nan_or_nonfinite_max(logits: &[f32]) -> (bool, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON is runtime-detected above; only loads aligned 4-f32 chunks.
+            return unsafe { scan_nan_or_nonfinite_max_neon(logits) };
+        }
+    }
+    scan_nan_or_nonfinite_max_scalar(logits)
+}
+
+fn scan_nan_or_nonfinite_max_scalar(logits: &[f32]) -> (bool, f32) {
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut has_nan = false;
+    for &v in logits {
+        has_nan |= v.is_nan();
+        // `f32::max` is IEEE-754 `maxNum`: NaN never wins, matching the old
+        // full-logit reference's `.fold(f32::NEG_INFINITY, f32::max)`.
+        max_logit = max_logit.max(v);
+    }
+    (has_nan, max_logit)
+}
+
+/// NEON 4-wide NaN-detect + numeric-max scan.  `vmaxnmq_f32` accumulates the
+/// NaN-ignoring max per lane (IEEE-754 `maxNum`, matching `f32::max`).
+/// `vceqq_f32(v, v)` is all-ones where `v` is non-NaN (self-equal) and
+/// all-zero where `v` is NaN (a NaN self-comparison is always false), so
+/// OR-accumulating its bitwise complement across every chunk flags any NaN
+/// in the array.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scan_nan_or_nonfinite_max_neon(logits: &[f32]) -> (bool, f32) {
+    use std::arch::aarch64::*;
+
+    let len = logits.len();
+    let mut i = 0usize;
+    let mut max_acc = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut nan_acc = vdupq_n_u32(0);
+
+    while i + 4 <= len {
+        // SAFETY: loop condition guarantees four valid f32 values are in-bounds.
+        let v = vld1q_f32(logits.as_ptr().add(i));
+        max_acc = vmaxnmq_f32(max_acc, v);
+        let is_non_nan_lane = vceqq_f32(v, v);
+        nan_acc = vorrq_u32(nan_acc, vmvnq_u32(is_non_nan_lane));
+        i += 4;
+    }
+
+    // Horizontal reduction: numeric (NaN-ignoring) max across the 4 lanes,
+    // and OR-reduce the NaN-flag lanes to a single bool.
+    let mut max_logit = vmaxnmvq_f32(max_acc);
+    let mut has_nan = vmaxvq_u32(nan_acc) != 0;
+
+    // Scalar tail for the final 0-3 elements.
+    while i < len {
+        let v = *logits.get_unchecked(i);
+        has_nan |= v.is_nan();
+        max_logit = max_logit.max(v);
+        i += 1;
+    }
+    (has_nan, max_logit)
 }
 
 fn argmax_f32(logits: &[f32]) -> u32 {
@@ -2118,5 +2321,193 @@ mod tests {
         assert_eq!(token_logprobs.len(), 2);
         assert_eq!(token_logprobs[1].token_id, 0);
         assert!(token_logprobs[1].top.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // CPU-side microbench (issue #650): before/after `sample_full_logits`.
+    //
+    // `#[ignore]`d so normal `cargo test` runs stay fast; run explicitly with:
+    //   cargo test -p lattice-inference --lib --release -- --ignored --nocapture \
+    //     sampling::tests::microbench_sample_full_logits_default_issue_config
+    // -------------------------------------------------------------------
+
+    /// Literal copy of the pre-optimization `sample_token` algorithm (full
+    /// vocab clone, fresh per-call `HashSet`, full `Vec<usize>` index
+    /// allocation, allocating softmax-probs `Vec`) — the "before" arm of the
+    /// microbench. Mirrors what both `model/qwen35/sampling.rs::sample_token`
+    /// and the Metal CPU fallback did before this change; kept local to the
+    /// microbench so it has no effect on any production or library code path.
+    fn old_full_vocab_sample(
+        logits: &[f32],
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        repetition_penalty: f32,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+    ) -> u32 {
+        let vocab_size = logits.len();
+        let mut adjusted = logits.to_vec();
+
+        if repetition_penalty != 1.0 {
+            let mut seen = std::collections::HashSet::with_capacity(previous_ids.len());
+            for &id in previous_ids {
+                let idx = id as usize;
+                if idx < vocab_size && seen.insert(id) {
+                    adjusted[idx] = penalized_logit(adjusted[idx], repetition_penalty);
+                }
+            }
+        }
+
+        if temperature_degenerate(temperature) {
+            return argmax_f32(&adjusted);
+        }
+
+        if temperature != 1.0 {
+            let inv_temp = 1.0 / temperature;
+            for v in &mut adjusted {
+                *v *= inv_temp;
+            }
+        }
+
+        let mut indices: Vec<usize> = (0..vocab_size).collect();
+        if top_k > 0 && top_k < vocab_size {
+            indices.select_nth_unstable_by(top_k - 1, |&a, &b| {
+                adjusted[b]
+                    .partial_cmp(&adjusted[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+            indices.truncate(top_k);
+        }
+        indices.sort_unstable_by(|&a, &b| {
+            adjusted[b]
+                .partial_cmp(&adjusted[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&b))
+        });
+
+        let max_logit = indices
+            .iter()
+            .map(|&i| adjusted[i])
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !max_logit.is_finite() {
+            return argmax_f32(&adjusted);
+        }
+        let mut probs: Vec<(usize, f32)> = indices
+            .iter()
+            .map(|&i| (i, (adjusted[i] - max_logit).exp()))
+            .collect();
+        let sum: f32 = probs.iter().map(|(_, p)| p).sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            return argmax_f32(&adjusted);
+        }
+        for (_, p) in &mut probs {
+            *p /= sum;
+        }
+
+        if top_p < 1.0 {
+            let mut cumsum = 0.0f32;
+            let mut cutoff = probs.len();
+            for (i, (_, p)) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= top_p {
+                    cutoff = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cutoff);
+            let new_sum: f32 = probs.iter().map(|(_, p)| p).sum();
+            for (_, p) in probs.iter_mut() {
+                *p /= new_sum;
+            }
+        }
+
+        let r = uniform_f32_from_u64(xorshift64_next(rng_state));
+        let mut cumsum = 0.0f32;
+        for &(idx, p) in &probs {
+            cumsum += p;
+            if r < cumsum {
+                return idx as u32;
+            }
+        }
+        probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "perf microbench, not a correctness check; run explicitly with --ignored"]
+    fn microbench_sample_full_logits_default_issue_config() {
+        const VOCAB_SIZE: usize = 248_320; // Qwen3.5 real vocab (issue #650).
+        const ITERS: usize = 300;
+
+        let logits: Vec<f32> = (0..VOCAB_SIZE as u64)
+            .map(|i| {
+                let h = i
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (h as f32 / u64::MAX as f32) * 20.0 - 10.0
+            })
+            .collect();
+        // A 64-token recent-history window, as a real decode loop would pass
+        // (previous_ids = prompt + generated-so-far), with duplicates.
+        let previous_ids: Vec<u32> = (0..64u32).map(|i| (i * 4099) % VOCAB_SIZE as u32).collect();
+
+        let cfg = SamplingConfig {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+        };
+        let gen_cfg = GenerateConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            repetition_penalty: cfg.repetition_penalty,
+            ..Default::default()
+        };
+
+        let mut rng_before = 0xDEAD_BEEFu64;
+        let before_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(old_full_vocab_sample(
+                &logits,
+                cfg.temperature,
+                cfg.top_k,
+                cfg.top_p,
+                cfg.repetition_penalty,
+                &previous_ids,
+                &mut rng_before,
+            ));
+        }
+        let before_elapsed = before_start.elapsed();
+
+        let mut rng_after = 0xDEAD_BEEFu64;
+        let after_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            std::hint::black_box(sample_full_logits(
+                &logits,
+                &gen_cfg,
+                &previous_ids,
+                &mut rng_after,
+            ));
+        }
+        let after_elapsed = after_start.elapsed();
+
+        let before_us_per_call = before_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+        let after_us_per_call = after_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+        eprintln!(
+            "microbench sample_full_logits @ vocab={VOCAB_SIZE}, iters={ITERS}, cfg=(temp=0.7,top_k=40,top_p=0.9,rep_penalty=1.1):\n\
+             before (old_full_vocab_sample): {before_elapsed:?} total, {before_us_per_call:.1} us/call, {:.1} tok/s\n\
+             after  (sample_full_logits):    {after_elapsed:?} total, {after_us_per_call:.1} us/call, {:.1} tok/s",
+            1e6 / before_us_per_call,
+            1e6 / after_us_per_call,
+        );
+
+        assert!(
+            after_elapsed < before_elapsed,
+            "optimized sample_full_logits ({after_elapsed:?}) must be faster than \
+             the old full-vocab-allocating algorithm ({before_elapsed:?}) at the \
+             issue's default config and vocab size"
+        );
     }
 }
