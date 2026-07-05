@@ -13,10 +13,53 @@ use crate::forward::cpu::{add_bias, add_bias_gelu, gelu, layer_norm, matmul_bt};
 use crate::lora_hook::{LoraHook, NoopLoraHook};
 use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
-use crate::weights::{BertWeights, SafetensorsFile};
+use crate::weights::{BertWeights, SafetensorsFile, TransformerLayerWeights};
 use std::fs;
 use std::path::Path;
 use tracing::warn;
+
+/// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
+/// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
+///
+/// Kept as its own private structure rather than a field on
+/// `TransformerLayerWeights` itself: that struct is an all-public,
+/// externally constructible API surface (`crate::weights::TransformerLayerWeights`),
+/// so adding a field there is a breaking change under SemVer (adding a public
+/// field to an all-public struct forces every downstream struct literal to
+/// change). See `crate::attention::standard::multi_head_attention_in_place`'s
+/// doc comment and PR #678.
+struct LayerFusedQkv {
+    weight: Vec<f32>,
+    bias: Vec<f32>,
+}
+
+impl LayerFusedQkv {
+    /// Concatenate `query`/`key`/`value` weight rows (and biases) vertically
+    /// into one `[3*hidden_size, hidden_size]` weight (`[3*hidden_size]`
+    /// bias), enabling one `matmul_bt` call per layer instead of three
+    /// (#674). Building this once per layer at load time, rather than per
+    /// forward call, keeps the perf win: the concat cost is amortized over
+    /// every subsequent `encode`/`encode_batch` call for this model.
+    fn build(layer: &TransformerLayerWeights<'_>) -> Self {
+        let mut weight = Vec::with_capacity(
+            layer.query_weight.data.len()
+                + layer.key_weight.data.len()
+                + layer.value_weight.data.len(),
+        );
+        weight.extend_from_slice(layer.query_weight.data);
+        weight.extend_from_slice(layer.key_weight.data);
+        weight.extend_from_slice(layer.value_weight.data);
+
+        let mut bias = Vec::with_capacity(
+            layer.query_bias.data.len() + layer.key_bias.data.len() + layer.value_bias.data.len(),
+        );
+        bias.extend_from_slice(layer.query_bias.data);
+        bias.extend_from_slice(layer.key_bias.data);
+        bias.extend_from_slice(layer.value_bias.data);
+
+        Self { weight, bias }
+    }
+}
 
 /// **Stable** (provisional): BERT model configuration; consumed by `lattice-embed`
 /// via `BertModel::config()`. Field additions are backward-compatible; field
@@ -118,6 +161,11 @@ pub struct BertModel {
     /// Pooling strategy used to reduce hidden states to a single embedding vector.
     /// Defaults to `BertPooling::Mean` for backwards compatibility.
     pooling: BertPooling,
+    /// Per-layer fused Q/K/V weight+bias (#674/#678), built once here at load
+    /// time from `weights.layers`. Not part of the self-referential
+    /// `weights`/`_safetensors` pair above: this is owned, copied data, so it
+    /// carries no lifetime/drop-order constraint.
+    fused_qkv: Vec<LayerFusedQkv>,
 }
 
 impl BertModel {
@@ -156,6 +204,11 @@ impl BertModel {
 
         let weights_tmp =
             safetensors.load_bert_weights(config.num_hidden_layers, config.hidden_size)?;
+        let fused_qkv: Vec<LayerFusedQkv> = weights_tmp
+            .layers
+            .iter()
+            .map(LayerFusedQkv::build)
+            .collect();
         // SAFETY: This transmute extends the lifetime of BertWeights from borrowing
         // `safetensors` to 'static. This is sound because:
         // 1. `_safetensors` is stored in the same struct as `weights`
@@ -172,6 +225,7 @@ impl BertModel {
             weights,
             _safetensors: safetensors,
             pooling: BertPooling::default(),
+            fused_qkv,
         })
     }
 
@@ -440,10 +494,13 @@ impl BertModel {
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
+            let fused = &self.fused_qkv[layer_idx];
 
             multi_head_attention_in_place(
                 &hidden,
                 layer,
+                &fused.weight,
+                &fused.bias,
                 attention_mask,
                 seq_len,
                 hidden_size,
@@ -647,10 +704,13 @@ impl BertModel {
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
+            let fused = &self.fused_qkv[layer_idx];
 
             multi_head_attention_batched(
                 &hidden,
                 layer,
+                &fused.weight,
+                &fused.bias,
                 attention_mask,
                 batch,
                 seq_len,

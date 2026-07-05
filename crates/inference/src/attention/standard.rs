@@ -10,15 +10,18 @@ pub struct AttentionBuffers {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
     pub scores: Vec<f32>,
+    pub context: Vec<f32>,
     pub concat: Vec<f32>,
     pub ffn_intermediate: Vec<f32>,
     pub temp: Vec<f32>,
 
     // Fused Q/K/V projection scratch: `[max_seq_len, 3*hidden_size]`. One
-    // `matmul_bt` against the layer's `fused_qkv` weight lands Q/K/V here
-    // interleaved per row; the result is split into the contiguous `q`/`k`/`v`
-    // buffers above before any per-head work, so the `LoraHook` contract (a
-    // plain `[seq_len, hidden_size]` slice per tensor) is preserved exactly.
+    // `matmul_bt` against the layer's fused QKV weight (built once at load
+    // time and threaded in alongside `TransformerLayerWeights`, see
+    // `crate::model::bert::LayerFusedQkv`) lands Q/K/V here interleaved per
+    // row; the result is split into the contiguous `q`/`k`/`v` buffers above
+    // before any per-head work, so the `LoraHook` contract (a plain
+    // `[seq_len, hidden_size]` slice per tensor) is preserved exactly.
     qkv: Vec<f32>,
 
     // Reshape buffers for SIMD matmul in attention scoring and context
@@ -47,6 +50,7 @@ impl AttentionBuffers {
             k: vec![0.0; max_seq_len * hidden_size],
             v: vec![0.0; max_seq_len * hidden_size],
             scores: vec![0.0; num_heads * max_seq_len * max_seq_len],
+            context: vec![0.0; num_heads * max_seq_len * head_dim],
             concat: vec![0.0; max_seq_len * hidden_size],
             ffn_intermediate: vec![0.0; max_seq_len * intermediate_size],
             temp: vec![0.0; max_seq_len * hidden_size],
@@ -60,6 +64,28 @@ impl AttentionBuffers {
             scores_head: vec![0.0; max_seq_len * max_seq_len],
             context_head: vec![0.0; max_seq_len * head_dim],
         }
+    }
+
+    /// Sum of every scratch buffer's element count. Used by
+    /// `crate::attention::flash::estimate_materialized_attention_buffer_bytes`'s
+    /// own test to keep that estimate honest against this struct's actual
+    /// field set (see PR #678 review finding 3).
+    #[cfg(test)]
+    pub(crate) fn total_scratch_len(&self) -> usize {
+        self.q.len()
+            + self.k.len()
+            + self.v.len()
+            + self.scores.len()
+            + self.context.len()
+            + self.concat.len()
+            + self.ffn_intermediate.len()
+            + self.temp.len()
+            + self.qkv.len()
+            + self.q_head.len()
+            + self.k_head.len()
+            + self.v_all_t.len()
+            + self.scores_head.len()
+            + self.context_head.len()
     }
 }
 
@@ -76,9 +102,33 @@ pub fn multi_head_attention(
     lora: &dyn LoraHook,
     layer_idx: usize,
 ) -> Vec<f32> {
+    // This wrapper is a test/bench convenience, not the model hot path (see
+    // `crate::model::bert::BertModel::forward_with_hook`, which calls
+    // `multi_head_attention_in_place` directly with a fused QKV blob built
+    // once at model-load time). Building the fused weight/bias here per call
+    // keeps this function's public signature stable across #678 while still
+    // exercising the single-fused-matmul code path.
+    let fused_qkv_weight: Vec<f32> = layer_weights
+        .query_weight
+        .data
+        .iter()
+        .chain(layer_weights.key_weight.data.iter())
+        .chain(layer_weights.value_weight.data.iter())
+        .copied()
+        .collect();
+    let fused_qkv_bias: Vec<f32> = layer_weights
+        .query_bias
+        .data
+        .iter()
+        .chain(layer_weights.key_bias.data.iter())
+        .chain(layer_weights.value_bias.data.iter())
+        .copied()
+        .collect();
     multi_head_attention_in_place(
         hidden_states,
         layer_weights,
+        &fused_qkv_weight,
+        &fused_qkv_bias,
         attention_mask,
         seq_len,
         hidden_size,
@@ -141,9 +191,19 @@ fn assert_standard_no_overflow(
 }
 
 /// Internal in-place attention kernel.
+///
+/// `fused_qkv_weight`/`fused_qkv_bias` are the layer's Q/K/V weight and bias
+/// concatenated vertically (`[3*hidden_size, hidden_size]` / `[3*hidden_size]`),
+/// built once per layer at model-load time and threaded in alongside
+/// `layer_weights` rather than stored on `TransformerLayerWeights` itself --
+/// that struct is a publicly constructible API surface and gaining fields
+/// there is a breaking change (#678).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_head_attention_in_place(
     hidden_states: &[f32],
     layer_weights: &TransformerLayerWeights<'_>,
+    fused_qkv_weight: &[f32],
+    fused_qkv_bias: &[f32],
     attention_mask: &[u32],
     seq_len: usize,
     hidden_size: usize,
@@ -181,13 +241,13 @@ pub(crate) fn multi_head_attention_in_place(
         let qkv = &mut qkv[..seq_len * 3 * hidden_size];
         matmul_bt(
             hidden_states,
-            &layer_weights.fused_qkv,
+            fused_qkv_weight,
             qkv,
             seq_len,
             hidden_size,
             3 * hidden_size,
         );
-        add_bias(qkv, &layer_weights.fused_qkv_bias, 3 * hidden_size);
+        add_bias(qkv, fused_qkv_bias, 3 * hidden_size);
 
         for i in 0..seq_len {
             let src = i * 3 * hidden_size;
@@ -402,6 +462,8 @@ pub(crate) fn multi_head_attention_in_place(
 pub(crate) fn multi_head_attention_batched(
     hidden_states: &[f32],
     layer_weights: &TransformerLayerWeights<'_>,
+    fused_qkv_weight: &[f32],
+    fused_qkv_bias: &[f32],
     attention_mask: &[u32],
     batch: usize,
     seq_len: usize,
@@ -465,13 +527,13 @@ pub(crate) fn multi_head_attention_batched(
         let qkv = &mut qkv[..used_hidden * 3];
         matmul_bt(
             hidden_states,
-            &layer_weights.fused_qkv,
+            fused_qkv_weight,
             qkv,
             rows,
             hidden_size,
             3 * hidden_size,
         );
-        add_bias(qkv, &layer_weights.fused_qkv_bias, 3 * hidden_size);
+        add_bias(qkv, fused_qkv_bias, 3 * hidden_size);
 
         for r in 0..rows {
             let src = r * 3 * hidden_size;
@@ -646,8 +708,6 @@ mod tests {
         // For this test we only care about the attention part, so make FFN
         // a passthrough too.  intermediate_size = hidden_size for simplicity.
         let intermediate_size = hidden_size;
-        let fused_qkv_4: Vec<f32> = identity_4x4.repeat(3);
-        let fused_qkv_bias_4: Vec<f32> = zero_bias_4.repeat(3);
 
         let layer = TransformerLayerWeights {
             query_weight: Tensor2D {
@@ -659,8 +719,6 @@ mod tests {
                 data: &zero_bias_4,
                 len: hidden_size,
             },
-            fused_qkv: fused_qkv_4,
-            fused_qkv_bias: fused_qkv_bias_4,
             key_weight: Tensor2D {
                 data: &identity_4x4,
                 rows: hidden_size,
@@ -788,8 +846,6 @@ mod tests {
         let ones_2: Vec<f32> = vec![1.0; 2];
 
         let intermediate_size = hidden_size;
-        let fused_qkv_2: Vec<f32> = identity_2x2.repeat(3);
-        let fused_qkv_bias_2: Vec<f32> = zero_bias_2.repeat(3);
 
         let layer = TransformerLayerWeights {
             query_weight: Tensor2D {
@@ -801,8 +857,6 @@ mod tests {
                 data: &zero_bias_2,
                 len: hidden_size,
             },
-            fused_qkv: fused_qkv_2,
-            fused_qkv_bias: fused_qkv_bias_2,
             key_weight: Tensor2D {
                 data: &identity_2x2,
                 rows: hidden_size,
@@ -934,11 +988,6 @@ mod tests {
         let zero_bias_2: Vec<f32> = vec![0.0; 2];
         let ones_2: Vec<f32> = vec![1.0; 2];
         let intermediate_size = hidden_size;
-        let mut fused_qkv_leak: Vec<f32> = Vec::with_capacity(3 * hidden_size * hidden_size);
-        fused_qkv_leak.extend_from_slice(&query_w);
-        fused_qkv_leak.extend_from_slice(&key_w);
-        fused_qkv_leak.extend_from_slice(&identity_2x2);
-        let fused_qkv_bias_leak: Vec<f32> = zero_bias_2.repeat(3);
 
         let layer = TransformerLayerWeights {
             query_weight: Tensor2D {
@@ -950,8 +999,6 @@ mod tests {
                 data: &zero_bias_2,
                 len: hidden_size,
             },
-            fused_qkv: fused_qkv_leak,
-            fused_qkv_bias: fused_qkv_bias_leak,
             key_weight: Tensor2D {
                 data: &key_w,
                 rows: hidden_size,
@@ -1084,6 +1131,19 @@ mod tests {
     /// corrupting `row_start`'s stride (multiplying by an extra `+1` offset in
     /// the per-sequence loop) also made it fail; both were reverted and the test
     /// re-confirmed passing before landing.
+    ///
+    /// Q, K, and V use DISTINCT scaled-identity weights and distinct per-dim
+    /// biases (not the shared identity block this test used before #678
+    /// review): with Q == K == V, a swapped or shifted QKV split offset keeps
+    /// the fused split self-consistent with the reference path, since both
+    /// sides read the same values regardless of which third of `qkv` each
+    /// buffer actually came from. With distinct Q/K/V this test additionally
+    /// asserts the produced `q`/`k`/`v` scratch against an INDEPENDENT
+    /// reference computed via a separate `matmul_bt` + `add_bias` per tensor
+    /// (i.e. not through the fused split at all), which does catch that
+    /// class: swapping the Q/K split offsets or shifting the V split by one
+    /// hidden block flips the corresponding scratch buffer against a
+    /// differently-scaled/biased reference and fails the assertion below.
     #[test]
     fn batched_attention_matches_single_sequence_per_row_with_padding() {
         let hidden_size = 8;
@@ -1100,44 +1160,60 @@ mod tests {
             }
             m
         };
-        let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
-        let ones_8: Vec<f32> = vec![1.0; hidden_size];
-        let fused_qkv_identity: Vec<f32> = {
-            let mut m = Vec::with_capacity(3 * hidden_size * hidden_size);
-            m.extend_from_slice(&identity_8x8);
-            m.extend_from_slice(&identity_8x8);
-            m.extend_from_slice(&identity_8x8);
+        let scaled_identity = |scale: f32| -> Vec<f32> {
+            let mut m = vec![0.0f32; hidden_size * hidden_size];
+            for i in 0..hidden_size {
+                m[i * hidden_size + i] = scale;
+            }
             m
         };
+        let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
+        let ones_8: Vec<f32> = vec![1.0; hidden_size];
+
+        // Distinct Q/K/V projections: different diagonal scale AND different
+        // per-dim bias, so Q != K != V and the split offsets are load-bearing.
+        let query_w: Vec<f32> = scaled_identity(1.0);
+        let key_w: Vec<f32> = scaled_identity(2.0);
+        let value_w: Vec<f32> = scaled_identity(3.0);
+        let query_bias_v: Vec<f32> = (0..hidden_size).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let key_bias_v: Vec<f32> = (0..hidden_size).map(|i| 1.0 + i as f32).collect();
+        let value_bias_v: Vec<f32> = (0..hidden_size).map(|i| 10.0 + i as f32).collect();
+
+        let mut fused_qkv_weight: Vec<f32> = Vec::with_capacity(3 * hidden_size * hidden_size);
+        fused_qkv_weight.extend_from_slice(&query_w);
+        fused_qkv_weight.extend_from_slice(&key_w);
+        fused_qkv_weight.extend_from_slice(&value_w);
+        let mut fused_qkv_bias: Vec<f32> = Vec::with_capacity(3 * hidden_size);
+        fused_qkv_bias.extend_from_slice(&query_bias_v);
+        fused_qkv_bias.extend_from_slice(&key_bias_v);
+        fused_qkv_bias.extend_from_slice(&value_bias_v);
 
         let layer = TransformerLayerWeights {
-            fused_qkv: fused_qkv_identity,
-            fused_qkv_bias: vec![0.0; 3 * hidden_size],
             query_weight: Tensor2D {
-                data: &identity_8x8,
+                data: &query_w,
                 rows: hidden_size,
                 cols: hidden_size,
             },
             query_bias: Tensor1D {
-                data: &zero_bias_8,
+                data: &query_bias_v,
                 len: hidden_size,
             },
             key_weight: Tensor2D {
-                data: &identity_8x8,
+                data: &key_w,
                 rows: hidden_size,
                 cols: hidden_size,
             },
             key_bias: Tensor1D {
-                data: &zero_bias_8,
+                data: &key_bias_v,
                 len: hidden_size,
             },
             value_weight: Tensor2D {
-                data: &identity_8x8,
+                data: &value_w,
                 rows: hidden_size,
                 cols: hidden_size,
             },
             value_bias: Tensor1D {
-                data: &zero_bias_8,
+                data: &value_bias_v,
                 len: hidden_size,
             },
             attn_output_weight: Tensor2D {
@@ -1217,6 +1293,8 @@ mod tests {
         multi_head_attention_batched(
             &hidden_states_batched,
             &layer,
+            &fused_qkv_weight,
+            &fused_qkv_bias,
             &attention_mask_batched,
             batch,
             seq_len,
@@ -1233,8 +1311,71 @@ mod tests {
             0,
         );
 
-        for v in output.iter() {
-            assert!(v.is_finite(), "batched output must be finite: {output:?}");
+        for out_val in output.iter() {
+            assert!(
+                out_val.is_finite(),
+                "batched output must be finite: {output:?}"
+            );
+        }
+
+        // Independent reference for the fused split: compute Q/K/V via a
+        // separate matmul_bt + add_bias per tensor (bypassing the fused
+        // matmul + split entirely) and compare against the scratch buffers
+        // multi_head_attention_batched actually produced. This is
+        // mutation-sensitive to the split offsets themselves -- swapping the
+        // Q/K split range, or shifting the V split by one hidden block,
+        // makes one of these three comparisons fail even though Q, K, and V
+        // share the same identity-derived shape, because their scale and
+        // bias differ.
+        let mut expected_q = vec![0.0f32; used_hidden];
+        matmul_bt(
+            &hidden_states_batched,
+            &query_w,
+            &mut expected_q,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(&mut expected_q, &query_bias_v, hidden_size);
+        for (i, (&got, &exp)) in q.iter().zip(expected_q.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() <= 1e-5,
+                "q scratch element {i} mismatch: batched={got} independent={exp}"
+            );
+        }
+
+        let mut expected_k = vec![0.0f32; used_hidden];
+        matmul_bt(
+            &hidden_states_batched,
+            &key_w,
+            &mut expected_k,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(&mut expected_k, &key_bias_v, hidden_size);
+        for (i, (&got, &exp)) in k.iter().zip(expected_k.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() <= 1e-5,
+                "k scratch element {i} mismatch: batched={got} independent={exp}"
+            );
+        }
+
+        let mut expected_v = vec![0.0f32; used_hidden];
+        matmul_bt(
+            &hidden_states_batched,
+            &value_w,
+            &mut expected_v,
+            rows,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(&mut expected_v, &value_bias_v, hidden_size);
+        for (i, (&got, &exp)) in v.iter().zip(expected_v.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() <= 1e-5,
+                "v scratch element {i} mismatch: batched={got} independent={exp}"
+            );
         }
 
         // Sequence 0: compare the first 2 (real) rows of the batched output

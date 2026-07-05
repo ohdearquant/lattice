@@ -227,19 +227,6 @@ fn synthetic_layer_weights_with_seed(
         random_bias_with_seed(hidden_size, seed ^ 0x0010),
     );
 
-    let fused_qkv: Vec<f32> = query_weight
-        .iter()
-        .chain(key_weight.iter())
-        .chain(value_weight.iter())
-        .copied()
-        .collect();
-    let fused_qkv_bias: Vec<f32> = query_bias
-        .iter()
-        .chain(key_bias.iter())
-        .chain(value_bias.iter())
-        .copied()
-        .collect();
-
     let layer = TransformerLayerWeights {
         query_weight: tensor2d(query_weight, hidden_size, hidden_size),
         query_bias: tensor1d(query_bias),
@@ -247,8 +234,6 @@ fn synthetic_layer_weights_with_seed(
         key_bias: tensor1d(key_bias),
         value_weight: tensor2d(value_weight, hidden_size, hidden_size),
         value_bias: tensor1d(value_bias),
-        fused_qkv,
-        fused_qkv_bias,
         attn_output_weight: tensor2d(attn_output_weight, hidden_size, hidden_size),
         attn_output_bias: tensor1d(attn_output_bias),
         attn_layer_norm_weight: tensor1d(attn_layer_norm_weight),
