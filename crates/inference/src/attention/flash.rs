@@ -349,7 +349,13 @@ fn write_head_to_interleaved(
 ///
 /// Estimate the bytes allocated by the legacy materialized attention buffers.
 ///
-/// This matches the current `AttentionBuffers::new` layout.
+/// This mirrors every field of `AttentionBuffers` (`crate::attention::standard`)
+/// as it exists today, including the fused-QKV projection scratch (`qkv`) and
+/// the full-layer V-transpose buffer (`v_all_t`) added by #674/#673: it is
+/// *not* the field set from before those changes. `estimate_matches_actual_attention_buffer_lengths`
+/// below cross-checks this estimate against `AttentionBuffers::new`'s real
+/// field lengths so this can't silently rot again the way it did across #678
+/// review finding 3.
 pub fn estimate_materialized_attention_buffer_bytes(
     max_seq_len: usize,
     hidden_size: usize,
@@ -365,9 +371,10 @@ pub fn estimate_materialized_attention_buffer_bytes(
         + max_seq_len * hidden_size // concat
         + max_seq_len * intermediate_size // ffn_intermediate
         + max_seq_len * hidden_size // temp
+        + max_seq_len * 3 * hidden_size // qkv
         + max_seq_len * head_dim // q_head
         + max_seq_len * head_dim // k_head
-        + head_dim * max_seq_len // v_head_t
+        + hidden_size * max_seq_len // v_all_t
         + max_seq_len * max_seq_len // scores_head
         + max_seq_len * head_dim; // context_head
     floats * size_of::<f32>()
@@ -838,6 +845,38 @@ mod tests {
     use crate::forward::cpu::{matmul_bt, softmax_attention};
     use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+
+    /// Keeps `estimate_materialized_attention_buffer_bytes` honest against the
+    /// real `AttentionBuffers` field set (#678 review finding 3): the helper's
+    /// formula is hand-maintained and previously drifted (it kept counting a
+    /// removed `context`/per-head `v_head_t` allocation and omitted the newer
+    /// `qkv` and full-layer `v_all_t` scratch). Covers the concrete BGE-small
+    /// and BGE-base shapes used by the bench harness.
+    #[test]
+    fn estimate_matches_actual_attention_buffer_lengths() {
+        let cases = [
+            // (max_seq_len, hidden_size, num_heads, intermediate_size)
+            (128, 384, 12, 1536), // BGE-small-en-v1.5
+            (128, 768, 12, 3072), // BGE-base-en-v1.5
+        ];
+        for (max_seq_len, hidden_size, num_heads, intermediate_size) in cases {
+            let buffers =
+                AttentionBuffers::new(max_seq_len, hidden_size, num_heads, intermediate_size);
+            let expected_bytes = buffers.total_scratch_len() * size_of::<f32>();
+            let estimated_bytes = estimate_materialized_attention_buffer_bytes(
+                max_seq_len,
+                hidden_size,
+                num_heads,
+                intermediate_size,
+            );
+            assert_eq!(
+                estimated_bytes, expected_bytes,
+                "estimate drifted from AttentionBuffers::new for \
+                 (max_seq_len={max_seq_len}, hidden_size={hidden_size}, \
+                 num_heads={num_heads}, intermediate_size={intermediate_size})"
+            );
+        }
+    }
 
     /// Legacy finite mask sentinel, retained only as the reference path's masking
     /// convention. The kernel itself now masks with `-inf` (see #361); for the
