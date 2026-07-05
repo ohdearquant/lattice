@@ -4,7 +4,9 @@
 //! boxed `dyn Tokenizer`, allowing WordPiece, BPE, and SentencePiece tokenizers
 //! to share a single inference path.
 
-use crate::attention::{AttentionBuffers, multi_head_attention_in_place};
+use crate::attention::{
+    AttentionBuffers, multi_head_attention_batched, multi_head_attention_in_place,
+};
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
 use crate::forward::cpu::{add_bias, gelu, layer_norm, matmul_bt};
@@ -233,36 +235,71 @@ impl BertModel {
     }
 
     /// **Stable**: batch-encode entry point; consumed by `lattice-embed`.
-    /// The sequential implementation detail may change without API breakage.
+    ///
+    /// Runs a single fused batched forward pass over all texts: the position-wise
+    /// stages (embedding lookup, Q/K/V projection, FFN, output projection) are each
+    /// one `matmul_bt`/`layer_norm` call over every `batch * seq_len` row, instead of
+    /// `batch` separate single-sequence forward passes. Only the O(seq_len^2)
+    /// attention score/context step loops per sequence (see
+    /// [`crate::attention::multi_head_attention_batched`]), and that loop runs in
+    /// parallel across sequences. The implementation detail may change without API
+    /// breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        if texts.len() == 1 {
+            // Single item: the batched path's flatten/scratch-allocation overhead
+            // buys nothing over the plain single-sequence path.
+            return Ok(vec![self.encode(texts[0])?]);
+        }
 
         let tokenized = self.tokenizer.tokenize_batch(texts);
-        let max_seq_len = tokenized
+        let batch = tokenized.len();
+        let hidden_size = self.config.hidden_size;
+
+        // `Tokenizer::tokenize_batch`'s documented contract is "pad to batch-local
+        // max," but that padding is produced by each tokenizer implementation
+        // independently (WordPiece/BPE/SentencePiece). Re-pad defensively here to
+        // one shared `seq_len` rather than trusting every implementation to agree,
+        // so a future tokenizer that pads inconsistently fails safe (extra zero
+        // rows, masked out) instead of producing a misaligned flat batch tensor.
+        let seq_len = tokenized
             .iter()
-            .map(|input| input.real_length)
+            .map(|input| input.input_ids.len())
             .max()
-            .unwrap_or(2);
-        let mut buffers = AttentionBuffers::new(
-            max_seq_len,
-            self.config.hidden_size,
-            self.config.num_attention_heads,
-            self.config.intermediate_size,
+            .unwrap_or(2)
+            .max(1);
+
+        let rows = batch * seq_len;
+        let mut input_ids = Vec::with_capacity(rows);
+        let mut attention_mask = Vec::with_capacity(rows);
+        let mut token_type_ids = Vec::with_capacity(rows);
+        for input in &tokenized {
+            let real = input.input_ids.len();
+            input_ids.extend_from_slice(&input.input_ids);
+            input_ids.extend(std::iter::repeat_n(0u32, seq_len - real));
+            attention_mask.extend_from_slice(&input.attention_mask);
+            attention_mask.extend(std::iter::repeat_n(0u32, seq_len - real));
+            token_type_ids.extend_from_slice(&input.token_type_ids);
+            token_type_ids.extend(std::iter::repeat_n(0u32, seq_len - real));
+        }
+
+        let hidden = self.forward_batch(
+            &input_ids,
+            &attention_mask,
+            &token_type_ids,
+            batch,
+            seq_len,
+            &NoopLoraHook,
         );
 
-        let mut outputs = Vec::with_capacity(tokenized.len());
-        for input in &tokenized {
-            let seq_len = input.real_length;
-            let hidden_states = self.forward(
-                &input.input_ids[..seq_len],
-                &input.attention_mask[..seq_len],
-                &input.token_type_ids[..seq_len],
-                seq_len,
-                &mut buffers,
-            );
-            let mut pooled = self.pool(&hidden_states, &input.attention_mask[..seq_len], seq_len);
+        let mut outputs = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let off = b * seq_len * hidden_size;
+            let hidden_b = &hidden[off..off + seq_len * hidden_size];
+            let mask_b = &attention_mask[b * seq_len..(b + 1) * seq_len];
+            let mut pooled = self.pool(hidden_b, mask_b, seq_len);
             l2_normalize(&mut pooled);
             outputs.push(pooled);
         }
@@ -463,6 +500,202 @@ impl BertModel {
 
         hidden
     }
+
+    /// Fused batched forward pass over `[batch, seq_len]` flattened, padded input.
+    ///
+    /// `input_ids`/`attention_mask`/`token_type_ids` are flat `batch * seq_len`
+    /// arrays (row `b * seq_len + i` is token `i` of sequence `b`); every sequence
+    /// must already be padded to the same `seq_len` (right-padded, so position 0 is
+    /// always the real leading token -- required by `cls_pool`). Returns a flat
+    /// `[batch * seq_len, hidden_size]` hidden-state tensor; callers slice out each
+    /// sequence's `[seq_len, hidden_size]` region and pool it individually with that
+    /// sequence's own mask.
+    ///
+    /// This is a new function, not a modification of [`Self::forward`]/
+    /// [`Self::forward_with_hook`] -- `encode()` and `forward_tokenized` (used by
+    /// `CrossEncoderModel`) are untouched and keep their existing single-sequence
+    /// behavior and performance.
+    fn forward_batch(
+        &self,
+        input_ids: &[u32],
+        attention_mask: &[u32],
+        token_type_ids: &[u32],
+        batch: usize,
+        padded_seq_len: usize,
+        lora: &dyn LoraHook,
+    ) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let intermediate_size = self.config.intermediate_size;
+        let num_heads = self.config.num_attention_heads;
+        let head_dim = self.config.head_dim();
+
+        debug_assert_eq!(input_ids.len(), batch * padded_seq_len);
+        debug_assert_eq!(attention_mask.len(), batch * padded_seq_len);
+        debug_assert_eq!(token_type_ids.len(), batch * padded_seq_len);
+
+        // Clamp exactly as the single-sequence path does (forward_with_hook), so a
+        // batch item longer than the model's position table degrades the same way
+        // encode()/encode_batch always have: excess trailing tokens are silently
+        // dropped from the forward pass (their embedding lookup and attention
+        // participation), not just truncated at the caller boundary. `padded_seq_len`
+        // remains the stride into the flat `input_ids`/`attention_mask` arrays;
+        // `seq_len` (post-clamp) is the number of positions actually computed.
+        let seq_len = padded_seq_len.min(self.config.max_position_embeddings);
+        let rows = batch * seq_len;
+
+        let used_hidden = rows * hidden_size;
+        let used_intermediate = rows * intermediate_size;
+
+        let mut hidden = vec![0.0f32; used_hidden];
+
+        // Embedding lookup: position id resets to `i` (the in-sequence index) for
+        // every sequence `b` -- the one correctness-critical detail of flattening a
+        // batch across this loop. Getting this wrong (using the flat row index
+        // instead) would give every sequence after the first wrong position
+        // embeddings.
+        for b in 0..batch {
+            let src_offset = b * padded_seq_len;
+            let dst_offset = b * seq_len;
+            for i in 0..seq_len {
+                let src_row = src_offset + i;
+                let dst_row = dst_offset + i;
+                let tok_id = input_ids[src_row] as usize;
+                let typ_id = token_type_ids[src_row] as usize;
+                let pos_id = i;
+
+                debug_assert!(tok_id < self.weights.word_embeddings.rows);
+                debug_assert!(typ_id < self.weights.token_type_embeddings.rows);
+                debug_assert!(pos_id < self.weights.position_embeddings.rows);
+
+                let tok_row = &self.weights.word_embeddings.data
+                    [tok_id * hidden_size..(tok_id + 1) * hidden_size];
+                let pos_row = &self.weights.position_embeddings.data
+                    [pos_id * hidden_size..(pos_id + 1) * hidden_size];
+                let typ_row = &self.weights.token_type_embeddings.data
+                    [typ_id * hidden_size..(typ_id + 1) * hidden_size];
+                let out_row = &mut hidden[dst_row * hidden_size..(dst_row + 1) * hidden_size];
+
+                for d in 0..hidden_size {
+                    out_row[d] = tok_row[d] + pos_row[d] + typ_row[d];
+                }
+            }
+        }
+
+        // Embedding LayerNorm: one call over every row in the batch -- unchanged,
+        // row-count-generic kernel (crate::forward::cpu::layer_norm).
+        layer_norm(
+            &mut hidden,
+            self.weights.embedding_layer_norm_weight.data,
+            self.weights.embedding_layer_norm_bias.data,
+            hidden_size,
+            self.config.layer_norm_eps,
+        );
+
+        // `attention_mask` is strided by `padded_seq_len`; the attention kernel
+        // below expects a `[batch * seq_len]` array strided by the (possibly
+        // clamped) `seq_len`. These are almost always equal (clamping only fires
+        // for a batch item longer than the model's position table), so avoid the
+        // copy on the common path.
+        let attention_mask_clamped: Vec<u32>;
+        let attention_mask: &[u32] = if seq_len == padded_seq_len {
+            attention_mask
+        } else {
+            attention_mask_clamped = (0..batch)
+                .flat_map(|b| {
+                    let off = b * padded_seq_len;
+                    attention_mask[off..off + seq_len].iter().copied()
+                })
+                .collect();
+            &attention_mask_clamped
+        };
+
+        let mut q = vec![0.0f32; used_hidden];
+        let mut k = vec![0.0f32; used_hidden];
+        let mut v = vec![0.0f32; used_hidden];
+        let mut concat = vec![0.0f32; used_hidden];
+        let mut attn_out = vec![0.0f32; used_hidden];
+        let mut ffn_intermediate = vec![0.0f32; used_intermediate];
+        let mut temp = vec![0.0f32; used_hidden];
+
+        for layer_idx in 0..self.config.num_hidden_layers {
+            let layer = &self.weights.layers[layer_idx];
+
+            multi_head_attention_batched(
+                &hidden,
+                layer,
+                attention_mask,
+                batch,
+                seq_len,
+                hidden_size,
+                num_heads,
+                head_dim,
+                &mut q,
+                &mut k,
+                &mut v,
+                &mut concat,
+                &mut attn_out,
+                lora,
+                layer_idx,
+            );
+
+            for i in 0..used_hidden {
+                temp[i] = attn_out[i] + hidden[i];
+            }
+            layer_norm(
+                &mut temp,
+                layer.attn_layer_norm_weight.data,
+                layer.attn_layer_norm_bias.data,
+                hidden_size,
+                self.config.layer_norm_eps,
+            );
+            hidden.copy_from_slice(&temp);
+
+            matmul_bt(
+                &hidden,
+                layer.ffn_intermediate_weight.data,
+                &mut ffn_intermediate,
+                rows,
+                hidden_size,
+                intermediate_size,
+            );
+            add_bias(
+                &mut ffn_intermediate,
+                layer.ffn_intermediate_bias.data,
+                intermediate_size,
+            );
+            lora.apply(
+                layer_idx,
+                "ffn_intermediate",
+                &hidden,
+                &mut ffn_intermediate,
+            );
+            gelu(&mut ffn_intermediate);
+
+            matmul_bt(
+                &ffn_intermediate,
+                layer.ffn_output_weight.data,
+                &mut temp,
+                rows,
+                intermediate_size,
+                hidden_size,
+            );
+            add_bias(&mut temp, layer.ffn_output_bias.data, hidden_size);
+            lora.apply(layer_idx, "ffn_output", &ffn_intermediate, &mut temp);
+            for i in 0..used_hidden {
+                temp[i] += hidden[i];
+            }
+            layer_norm(
+                &mut temp,
+                layer.ffn_layer_norm_weight.data,
+                layer.ffn_layer_norm_bias.data,
+                hidden_size,
+                self.config.layer_norm_eps,
+            );
+            hidden.copy_from_slice(&temp);
+        }
+
+        hidden
+    }
 }
 
 fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, InferenceError> {
@@ -604,6 +837,115 @@ mod tests {
         assert_eq!(embedding.len(), model.dimensions());
         let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
         assert_relative_eq!(norm, 1.0, epsilon = 1e-4);
+    }
+
+    // -------------------------------------------------------------------------
+    // Fused batched forward parity (mutation-sensitive)
+    //
+    // Guards the `encode_batch` rewrite: the fused batched forward path
+    // (`forward_batch` + `multi_head_attention_batched`) must produce the same
+    // per-text embeddings as looping `encode()` one text at a time. This catches
+    // the two correctness traps a naive batch-flattening introduces: cross-sequence
+    // attention leakage through the padding mask, and position-id drift for any
+    // sequence after the first (see forward_batch's embedding-lookup comment).
+    //
+    // Reverting `encode_batch` to loop per-item (or breaking the position-id /
+    // mask plumbing in `forward_batch`/`multi_head_attention_batched`) must make
+    // these tests fail, not just the CI bench numbers regress.
+    // -------------------------------------------------------------------------
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = (a.iter().map(|x| x * x).sum::<f32>()).sqrt();
+        let nb = (b.iter().map(|x| x * x).sum::<f32>()).sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        dot / (na * nb)
+    }
+
+    #[test]
+    #[ignore]
+    fn test_encode_batch_matches_per_item_encode_mixed_lengths() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
+
+        // Mixed lengths (short to long) force real padding across the batch.
+        let short = "hi";
+        let medium = "the quick brown fox jumps over the lazy dog";
+        let long_text = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod \
+            tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam quis \
+            nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis \
+            aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat \
+            nulla pariatur excepteur sint occaecat cupidatat non proident sunt in culpa qui \
+            officia deserunt mollit anim id est laborum";
+        let texts: Vec<&str> = vec![
+            short,
+            medium,
+            long_text,
+            "another sentence",
+            short,
+            medium,
+            "one more",
+            long_text,
+        ];
+
+        let batched = model.encode_batch(&texts).unwrap();
+        assert_eq!(batched.len(), texts.len());
+
+        for (i, text) in texts.iter().enumerate() {
+            let solo = model.encode(text).unwrap();
+            let cos = cosine(&batched[i], &solo);
+            let max_abs_diff = batched[i]
+                .iter()
+                .zip(solo.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                cos >= 0.99999,
+                "text[{i}] ({text:?}...): batched vs solo cosine {cos} < 0.99999"
+            );
+            assert!(
+                max_abs_diff <= 1e-4,
+                "text[{i}] ({text:?}...): max-abs-diff {max_abs_diff} > 1e-4"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_encode_batch_boundary_max_and_min_length() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
+
+        // One sequence at exactly the model's max position length, one at length 1
+        // (single real token beyond [CLS]/[SEP] framing) -- the widest padding gap
+        // this path can produce.
+        let max_len_text = "word ".repeat(model.config().max_position_embeddings);
+        let one_token_text = "a";
+        let texts: Vec<&str> = vec![&max_len_text, one_token_text];
+
+        let batched = model.encode_batch(&texts).unwrap();
+        assert_eq!(batched.len(), 2);
+
+        for (i, text) in texts.iter().enumerate() {
+            let solo = model.encode(text).unwrap();
+            let cos = cosine(&batched[i], &solo);
+            let max_abs_diff = batched[i]
+                .iter()
+                .zip(solo.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(cos >= 0.99999, "boundary text[{i}]: cosine {cos} < 0.99999");
+            assert!(
+                max_abs_diff <= 1e-4,
+                "boundary text[{i}]: max-abs-diff {max_abs_diff} > 1e-4"
+            );
+        }
     }
 
     // -------------------------------------------------------------------------
