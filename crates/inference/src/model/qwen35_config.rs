@@ -115,11 +115,21 @@ pub struct Qwen35Config {
 
     // --- Generation ---
     pub eos_token_id: u32,
+    /// Model's native context window. Missing from a `config.json` is
+    /// representable (defaults to 4096) so callers deriving the serve
+    /// context clamp (#551) can distinguish "no real value present" from a
+    /// present-but-small value rather than silently inheriting an unrelated
+    /// preset's context length.
+    #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
 }
 
 fn default_tie_word_embeddings() -> bool {
     true
+}
+
+fn default_max_position_embeddings() -> usize {
+    4096
 }
 
 // Nested rope_parameters in HF config.json (many models nest rope_theta and
@@ -1431,6 +1441,38 @@ mod tests {
             "Qwen3.5 mtp_num_hidden_layers must default to 0"
         );
         assert!(!cfg.mtp_use_dedicated_embeddings);
+    }
+
+    #[test]
+    fn qwen35_config_missing_max_position_embeddings_defaults_4096() {
+        // #551: a config.json without max_position_embeddings must not
+        // silently inherit the container-level Default's (qwen36_35b_a3b)
+        // 262_144 context — it must resolve to the documented 4096 fallback.
+        let json = r#"{
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "vocab_size": 248320,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rms_norm_eps": 0.000001,
+                "intermediate_size": 6144,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "full_attention_interval": 4,
+                "eos_token_id": 248044,
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25
+            }
+        }"#;
+
+        let cfg = Qwen35Config::from_config_json_str(json)
+            .expect("config without max_position_embeddings still parses");
+        assert_eq!(cfg.max_position_embeddings, 4096);
     }
 
     #[test]
