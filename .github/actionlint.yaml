@@ -1,0 +1,7 @@
+# actionlint config (docs: https://github.com/rhysd/actionlint/blob/main/docs/config.md).
+# actionlint has no way to know about self-hosted runner labels that only
+# exist in this repository's own runner fleet, so it flags them as unknown
+# by default; declaring them here is the documented fix.
+self-hosted-runner:
+  labels:
+    - m2max
