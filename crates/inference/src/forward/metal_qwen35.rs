@@ -27649,6 +27649,364 @@ kernel void decode_attention_reference(
             );
         }
 
+        /// Serve-boundary correctness gate: `lattice_serve` always calls the
+        /// cancel-aware prefix-cache API on the single `CrossTurnSlotId::DEFAULT`
+        /// slot regardless of which logical conversation issued the request.
+        /// Two interleaved conversations sharing that one slot (A1, B1, A2)
+        /// must therefore behave exactly like the plain slot-isolation case
+        /// above: A2's shared prefix with the retained entry (now B's) is not
+        /// a match, so the planner must fall back to `FullRefill`, and the
+        /// output must still be correct.
+        #[test]
+        fn cross_turn_cache_and_cancel_same_slot_interleave_falls_back_to_full_refill() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(23, 2);
+
+            // A1: establish a saved entry on the DEFAULT slot.
+            let a1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("A1 must succeed");
+            let mut conv_a = "ab".to_string();
+            conv_a.push_str(&a1.output.text);
+
+            // B1: an unrelated conversation on the SAME slot -- exactly what
+            // `lattice_serve` produces when two different clients' requests
+            // interleave through its single worker thread. Under the
+            // single-entry invariant this replaces A's retained entry.
+            state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "xyz",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("B1 must succeed");
+
+            // A2: append-only continuation of A's own conversation, issued
+            // right after B1 evicted the shared slot. Must miss cleanly and
+            // fall back to FullRefill -- never restore B's GDN/KV state.
+            let a2 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &conv_a,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("A2 must succeed");
+            assert_eq!(
+                a2.cache.reused_tokens, 0,
+                "A2 must not reuse state left by B1's interleaved generation"
+            );
+            assert_ne!(
+                a2.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "same-slot interleaving must force FullRefill for A2, never ExactAppend"
+            );
+
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out = reference_state
+                .generate_streaming(&conv_a, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("reference generate_streaming must not error");
+            assert_eq!(
+                a2.output.token_ids, reference_out.token_ids,
+                "after same-slot interleaved eviction, A2's output must still match \
+                 full re-prefill exactly -- this is the parity the plain (uncached) \
+                 path already guaranteed before #462"
+            );
+        }
+
+        /// Checkpoint 2 of the cancellation contract: a `should_cancel`
+        /// observed right after the suffix prefill returns (but before any
+        /// decode work) must stop with `Interrupt`, generate zero tokens, and
+        /// leave state usable for a later uncancelled call on the same
+        /// conversation.
+        #[test]
+        fn cross_turn_cache_and_cancel_after_prefill_leaves_state_usable() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(9, 3);
+
+            // Turn 1: establish a saved entry.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 1 must not error");
+            assert!(turn1.output.generated_tokens > 0);
+
+            // Turn 2: should_cancel is false on the first poll (checkpoint 1,
+            // before the suffix prefill) and true on the second (checkpoint 2,
+            // immediately after it returns) -- so the suffix prefill runs but
+            // no decode work ever does.
+            let poll_count = std::cell::Cell::new(0u32);
+            let turn2 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || {
+                        let n = poll_count.get() + 1;
+                        poll_count.set(n);
+                        n >= 2
+                    },
+                )
+                .expect("a checkpoint-2 cancel must not surface as an engine error");
+            assert!(
+                poll_count.get() >= 2,
+                "precondition: should_cancel must have been polled at least twice \
+                 (checkpoint 1 then checkpoint 2) for this test to exercise checkpoint 2"
+            );
+            assert_eq!(
+                turn2.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "a checkpoint-2 cancel (right after the suffix prefill) must stop \
+                 with Interrupt"
+            );
+            assert_eq!(
+                turn2.output.generated_tokens, 0,
+                "a checkpoint-2 cancel must not generate any tokens -- the suffix \
+                 prefill produced only the (unsampled) next-token logits"
+            );
+
+            // Turn 3: uncancelled call on the same conversation. If checkpoint
+            // 2's early return had left live KV/GDN state or the retained
+            // cache entry inconsistent, this would either error or diverge.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out = reference_state
+                .generate_streaming("ab", &tokenizer, &gen_cfg, |_, _| true)
+                .expect("reference generate_streaming must not error");
+            let turn3 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 3 must not error after a checkpoint-2-cancelled turn 2");
+            assert_eq!(
+                turn3.output.token_ids, reference_out.token_ids,
+                "post-checkpoint-2-cancel generation must still match full re-prefill exactly"
+            );
+        }
+
+        /// Checkpoint 3 of the cancellation contract: a `should_cancel`
+        /// observed at the top of a decode iteration, after at least one token
+        /// has already been forwarded, must stop with `Interrupt`, report
+        /// exactly the tokens actually forwarded before the cancel was
+        /// observed, and -- per the doc comment on
+        /// `generate_streaming_with_prefix_cache_and_cancel` -- this case is
+        /// state-consistent and safe to save: a later append onto exactly the
+        /// text produced so far must still hit `ExactAppend` and match a full
+        /// re-prefill of the same extended conversation.
+        #[test]
+        fn cross_turn_cache_and_cancel_mid_decode_leaves_state_usable() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(17, 4);
+
+            // should_cancel is polled once at checkpoint 1, once at checkpoint
+            // 2, then once per decode iteration at checkpoint 3. Cancel on the
+            // second decode-loop poll (the 4th poll overall) so exactly two
+            // tokens (the prefill-sampled one plus one decode-loop token) are
+            // forwarded before the cancelled iteration.
+            let poll_count = std::cell::Cell::new(0u32);
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || {
+                        let n = poll_count.get() + 1;
+                        poll_count.set(n);
+                        n >= 4
+                    },
+                )
+                .expect("a mid-decode cancel must not surface as an engine error");
+            assert_eq!(
+                turn1.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "a checkpoint-3 (mid-decode) cancel must stop with Interrupt"
+            );
+            assert!(
+                turn1.output.generated_tokens >= 1
+                    && turn1.output.generated_tokens < gen_cfg.max_new_tokens,
+                "a checkpoint-3 cancel must report exactly the tokens forwarded before \
+                 the cancel was observed, not zero and not the full cap: got {}",
+                turn1.output.generated_tokens
+            );
+
+            // The conversation through exactly the delivered text, plus a new
+            // suffix: resubmitting the cancelled turn's own history
+            // byte-for-byte with nothing new to append is itself a
+            // FullRefill case (see `cross_turn_cache_exact_equal_retry_full_refills`),
+            // so a real client turn always adds at least one new token before
+            // its next request.
+            let history = format!("ab{}", turn1.output.text);
+            let followup_prompt = format!("{history}q");
+
+            // Reference: the full uncancelled conversation through this exact
+            // point, on a fresh state.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out = reference_state
+                .generate_streaming(&followup_prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("reference generate_streaming must not error");
+
+            // A follow-up append onto exactly the delivered text must hit
+            // ExactAppend, proving the cancelled turn's save left a
+            // consistent, reusable boundary.
+            let turn2 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &followup_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("follow-up turn after mid-decode cancel must not error");
+            assert_eq!(
+                turn2.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a mid-decode cancel is state-consistent and safe to save -- the \
+                 follow-up append must reuse it, not fall back to FullRefill"
+            );
+            assert_eq!(
+                turn2.output.token_ids, reference_out.token_ids,
+                "post-mid-decode-cancel generation must still match full re-prefill exactly"
+            );
+        }
+
+        /// Client-disconnect contract, distinct from the `should_cancel` tests
+        /// above: `on_token` returning `false` mid-decode -- the SSE-send-failed
+        /// signal a real HTTP disconnect produces -- must never let a later
+        /// request be served text the client was never actually sent.
+        /// Re-issuing the ORIGINAL (pre-disconnect) prompt must reproduce the
+        /// reference output for that original prompt exactly, proving the
+        /// retained entry cannot silently graft the undelivered continuation
+        /// onto a request that never asked for it.
+        #[test]
+        fn cross_turn_cache_and_cancel_on_token_disconnect_never_serves_undelivered_tokens() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(31, 3);
+            let prompt = "ab".to_string();
+
+            // Simulate an SSE client that hangs up after its first delta: the
+            // callback returns `false` from then on, exactly like
+            // `run_worker_loop`'s `on_token` once `cb_tx.send` starts failing.
+            let sent_count = std::cell::Cell::new(0u32);
+            let disconnect = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        let n = sent_count.get() + 1;
+                        sent_count.set(n);
+                        n < 2
+                    },
+                    || false,
+                )
+                .expect("a disconnect must not surface as an engine error");
+            assert_eq!(
+                disconnect.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "on_token returning false must stop with Interrupt"
+            );
+
+            // The client only ever has the original prompt -- it never saw
+            // `disconnect.output.text`. Re-issuing exactly that original
+            // prompt must reproduce the same output a fresh full re-prefill
+            // of that prompt would: the planner's exact-prefix check can only
+            // ExactAppend when the shared length matches the represented
+            // length, so a shorter re-submitted prompt cannot silently
+            // inherit the undelivered suffix.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference_out = reference_state
+                .generate_streaming(&prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("reference generate_streaming must not error");
+            let replay = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("re-issuing the original prompt must not error");
+            assert_eq!(
+                replay.output.token_ids, reference_out.token_ids,
+                "re-issuing exactly the client's last-known prompt must reproduce the \
+                 same output a full re-prefill would -- the client can never receive \
+                 tokens generated after it disconnected"
+            );
+        }
+
         // -----------------------------------------------------------------------
         // Grammar fail-closed integration tests (#611)
         //

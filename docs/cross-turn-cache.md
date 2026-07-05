@@ -19,10 +19,20 @@ it** — it was infrastructure with zero consumers. PR #619 later wired the firs
 it wires exactly one: **`chat_metal`** (`crates/inference/src/bin/chat_metal.rs`), both its
 `--json` one-shot/`--serve` path and its interactive REPL.
 
-**Neither `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) nor `lattice_serve`
-(the separate HTTP daemon built for the macOS Studio app) call the cache-aware methods, even after
-PR #619.** Both still call the plain, non-cache-aware `generate_streaming`, or
-(for `lattice_serve`) unconditionally `reset_state()` before every request. Concretely:
+**`lattice_serve` (the separate HTTP daemon built for the macOS Studio app) now calls the
+cancel-aware cache methods** on a single sticky `CrossTurnSlotId::DEFAULT` slot, since it is a
+single-worker, single-model binary: its one Metal state, on its one worker thread, calling
+`chat_completion_streaming_with_prefix_cache_and_cancel` instead of unconditionally
+`reset_state()` + `chat_completion_streaming_with_cancel` before every request. A request whose
+messages are not an append onto the currently retained entry (a new conversation, edited history,
+or a second client's unrelated prompt interleaved onto the same slot) still falls back to
+`FullRefill` — honestly, never incorrectly — exactly like every other cache-miss case in this
+document. Cache stats (`slot`, `prompt_tokens`, `reused_tokens`, `mode`) are logged to stderr per
+request; there is no response-surface (HTTP header/JSON field/SSE event) telemetry yet.
+
+**`lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) does not call the
+cache-aware methods yet.** It still calls the plain, non-cache-aware `generate_streaming` on every
+request:
 
 - `lattice serve` → `POST /v1/chat/completions` re-prefills the entire `messages` array from
   scratch on every request, every time, regardless of how much of the conversation is unchanged
@@ -31,26 +41,26 @@ PR #619.** Both still call the plain, non-cache-aware `generate_streaming`, or
   whole conversation on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462)), a
   separate and larger cost than the decode slope, and the main reason a long chat feels
   progressively slower."
-- `lattice_serve` (the macOS Studio daemon) is the same: no cache-aware calls anywhere in that
-  binary as of this writing.
 
-That HTTP serve gap remains tracked by issue #462, which is currently open with state reason
-`reopened` after #619 because multi-session server wiring is still unresolved.
+That gap is tracked as `lattice serve`-specific follow-up work under issue #462.
 
 See [`docs/serve-http-api.md`](serve-http-api.md) for the full `lattice serve` HTTP API — this
 document is only about the library-level cache, not the HTTP surface.
 
-PR #619 deliberately stopped short of wiring the HTTP servers because
-the current cache is a **single-entry** store (see below) — safe for one interactive process
-talking to one conversation at a time, but wiring it into a multi-session server as-is would let
-one client's request evict another client's retained state, silently forcing that other client
-back to a full re-prefill. Making it safe for concurrent multi-session serving is called out
-explicitly as follow-up work, not something already done.
+The underlying cache remains a **single-entry** store (see below) — safe for one interactive
+process (or one sticky server slot) talking to one conversation at a time, but a server handling
+several simultaneous, genuinely interleaved conversations will still see the later ones evict the
+earlier ones' retained state, forcing a full re-prefill rather than corrupting anything. Making the
+cache itself safe for concurrent multi-session residency (a bounded multi-entry store with proven
+KV/GDN ownership) is called out explicitly as follow-up work, not something already done.
 
-So: if you're calling the HTTP API, this cache does not currently help you, full stop. If you're
-using `chat_metal` directly (or the underlying `MetalQwen35State` API in your own Rust code), it
-does, and the rest of this document covers exactly what "safely extends" means and where the
-sharp edges are.
+So: if you're calling `lattice_serve`'s HTTP API from one active conversation at a time, this cache
+now helps you; if several conversations interleave through it, expect honest fallback to full
+re-prefill for whichever conversation was not most recently active. If you're calling `lattice
+serve`'s HTTP API or using `chat_metal`/the underlying `MetalQwen35State` API directly, the
+cache-aware behavior described in the rest of this document applies (`chat_metal` and
+`MetalQwen35State` callers), and the rest of this document covers exactly what "safely extends"
+means and where the sharp edges are.
 
 ## The library API
 
@@ -232,9 +242,10 @@ slot A again, that third call is a full refill — slot B's generation evicted s
 did not get its own independent storage alongside it. If your process genuinely interleaves
 multiple concurrent conversations through one `MetalQwen35State`, only the most recently generated
 one benefits from caching at any given moment; the others pay full re-prefill every time they get
-a turn. This is the multi-session risk that kept `lattice serve`/`lattice_serve` unwired in #619:
-a single shared worker with this cache behind a server handling several simultaneous chats would
-thrash.
+a turn. This is the multi-session thrash a single shared worker sees when several simultaneous
+chats share one sticky slot, as `lattice_serve` now does: correct (a losing conversation just gets
+an honest full re-prefill) but not the multi-session residency a bounded multi-entry cache would
+give.
 
 PR #516 originally considered an unbounded per-slot map, but the underlying full-attention KV
 buffer is one mutable live buffer shared by the whole process. A stale map entry could restore GDN
@@ -250,7 +261,7 @@ leave the cache or live model state in a possibly-inconsistent condition for the
 trip over:
 
 ```rust
-match self.generate_streaming_with_prefix_cache_inner(slot_id, prompt, tokenizer, gen_cfg, on_token) {
+match self.generate_streaming_with_prefix_cache_and_cancel_inner(slot_id, prompt, tokenizer, gen_cfg, on_token, should_cancel) {
     Ok(out) => Ok(out),
     Err(e) => {
         // Fail-closed: state and cache may disagree after a
