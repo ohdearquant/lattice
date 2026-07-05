@@ -2388,13 +2388,34 @@ mod serve {
 
                 while let Some(job) = job_rx.blocking_recv() {
                     let mut on_token = job.on_token;
-                    let output = state.generate_streaming(
+                    // Cache-aware call (#462): reuses the previous turn's
+                    // shared token prefix instead of a full re-prefill on
+                    // every request. This worker thread owns one
+                    // `MetalQwen35State` for the whole process lifetime (one
+                    // thread = one session), so `CrossTurnSlotId::DEFAULT` is
+                    // the only slot that exists; the planner re-verifies the
+                    // retained prefix against this request's prompt on every
+                    // call and falls back to `PrefixReuseMode::FullRefill`
+                    // whenever they diverge, so correctness never depends on
+                    // distinguishing clients. Mirrors the wiring already
+                    // shipped in `lattice_serve.rs`.
+                    let cached = state.generate_streaming_with_prefix_cache(
+                        lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
                         &job.prompt,
                         &tokenizer,
                         &job.gen_cfg,
                         |delta, _token_id| on_token(delta),
                     );
-                    let _ = job.reply.send(output);
+                    if let Ok(c) = &cached {
+                        eprintln!(
+                            "[lattice serve] cross-turn cache: mode={:?} reused={} prefetched={} prompt={}",
+                            c.cache.mode,
+                            c.cache.reused_tokens,
+                            c.cache.prefetched_tokens,
+                            c.cache.prompt_tokens,
+                        );
+                    }
+                    let _ = job.reply.send(cached.map(|c| c.output));
                 }
             });
 

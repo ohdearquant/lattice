@@ -30,19 +30,16 @@ or a second client's unrelated prompt interleaved onto the same slot) still fall
 document. Cache stats (`slot`, `prompt_tokens`, `reused_tokens`, `mode`) are logged to stderr per
 request; there is no response-surface (HTTP header/JSON field/SSE event) telemetry yet.
 
-**`lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) does not call the
-cache-aware methods yet.** It still calls the plain, non-cache-aware `generate_streaming` on every
-request:
-
-- `lattice serve` → `POST /v1/chat/completions` re-prefills the entire `messages` array from
-  scratch on every request, every time, regardless of how much of the conversation is unchanged
-  from the previous request. This is not an oversight this document is pointing out for the first
-  time — the project's own README says so directly: "The serve path currently re-prefills the
-  whole conversation on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462)), a
-  separate and larger cost than the decode slope, and the main reason a long chat feels
-  progressively slower."
-
-That gap is tracked as `lattice serve`-specific follow-up work under issue #462.
+**`lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) now calls the cache-aware
+methods too**, on the same single sticky `CrossTurnSlotId::DEFAULT` slot as `lattice_serve`: its
+Metal worker thread calls `generate_streaming_with_prefix_cache` instead of the plain,
+non-cache-aware `generate_streaming` on every request. `POST /v1/chat/completions` no longer
+re-prefills the entire prompt from scratch when a turn is a safe append onto the previous one —
+the same `FullRefill` fallback applies for a new conversation, edited history, or an interleaved
+second client on the same slot. Cache stats (`mode`, `reused_tokens`, `prefetched_tokens`,
+`prompt_tokens`) are logged to stderr per request, matching `lattice_serve`'s telemetry. This path
+has no client-disconnect cancellation today (unlike `lattice_serve`'s
+`_and_cancel` variant), so it uses the plain `generate_streaming_with_prefix_cache` wrapper.
 
 See [`docs/serve-http-api.md`](serve-http-api.md) for the full `lattice serve` HTTP API — this
 document is only about the library-level cache, not the HTTP surface.
@@ -54,13 +51,10 @@ earlier ones' retained state, forcing a full re-prefill rather than corrupting a
 cache itself safe for concurrent multi-session residency (a bounded multi-entry store with proven
 KV/GDN ownership) is called out explicitly as follow-up work, not something already done.
 
-So: if you're calling `lattice_serve`'s HTTP API from one active conversation at a time, this cache
-now helps you; if several conversations interleave through it, expect honest fallback to full
-re-prefill for whichever conversation was not most recently active. If you're calling `lattice
-serve`'s HTTP API or using `chat_metal`/the underlying `MetalQwen35State` API directly, the
-cache-aware behavior described in the rest of this document applies (`chat_metal` and
-`MetalQwen35State` callers), and the rest of this document covers exactly what "safely extends"
-means and where the sharp edges are.
+So: if you're calling `lattice_serve`'s or `lattice serve`'s HTTP API from one active conversation
+at a time, this cache now helps you; if several conversations interleave through either, expect
+honest fallback to full re-prefill for whichever conversation was not most recently active. The
+rest of this document covers exactly what "safely extends" means and where the sharp edges are.
 
 ## The library API
 
@@ -243,9 +237,9 @@ did not get its own independent storage alongside it. If your process genuinely 
 multiple concurrent conversations through one `MetalQwen35State`, only the most recently generated
 one benefits from caching at any given moment; the others pay full re-prefill every time they get
 a turn. This is the multi-session thrash a single shared worker sees when several simultaneous
-chats share one sticky slot, as `lattice_serve` now does: correct (a losing conversation just gets
-an honest full re-prefill) but not the multi-session residency a bounded multi-entry cache would
-give.
+chats share one sticky slot, as `lattice_serve` and `lattice serve` both now do: correct (a losing
+conversation just gets an honest full re-prefill) but not the multi-session residency a bounded
+multi-entry cache would give.
 
 PR #516 originally considered an unbounded per-slot map, but the underlying full-attention KV
 buffer is one mutable live buffer shared by the whole process. A stale map entry could restore GDN
@@ -320,12 +314,9 @@ the fallback path alone, and a dedicated Criterion bench,
 
 ## Summary
 
-- The cache is reachable today through direct `MetalQwen35State` calls, `chat_metal`, and
-  `lattice_serve` (sticky `CrossTurnSlotId::DEFAULT` slot, honest full-refill fallback on any
-  mismatch). `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) does not call the
-  cache-aware methods yet — every request through it still re-prefills its entire conversation
-  history from scratch, a known and already-documented gap (README, issue #462) tracked as
-  follow-up work, not something this document is newly discovering.
+- The cache is reachable today through direct `MetalQwen35State` calls, `chat_metal`,
+  `lattice_serve`, and `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) — all on
+  a sticky `CrossTurnSlotId::DEFAULT` slot, with honest full-refill fallback on any mismatch.
 - Use `CrossTurnSlotId::DEFAULT` for a single local conversation; only one entry is ever retained
   process-wide, so multiplexing several conversations through distinct slot IDs on one
   `MetalQwen35State` does not give each of them independent caching — the most recent one wins and
