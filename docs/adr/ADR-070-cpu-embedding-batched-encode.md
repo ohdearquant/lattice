@@ -3,7 +3,7 @@
 **Status**: Proposed
 **Date**: 2026-07-05
 **Scope**: `crates/inference` BERT/embedding CPU forward path (`model/bert.rs`,
-`attention/standard.rs`, `forward/cpu/*`, `model/pool.rs`); `crates/embed` `encode_batch`
+`attention/standard.rs`, `forward/cpu/*`, `pool.rs`); `crates/embed` `encode_batch`
 consumers; embedding benchmarks
 **Depends on**: ADR-058 (measure-first performance workflow)
 
@@ -39,9 +39,14 @@ source rather than inferred from the numbers:
    size, which is exactly the signature of this structure. Notably, the WordPiece
    tokenizer already computes a correct padded batch and attention mask (`pad_batch` /
    `pad_ids`); the forward path discards them.
-2. **No intra-op parallelism.** The embedding CPU forward runs single-threaded. ONNX
-   Runtime dispatches its GEMMs across an intra-op thread pool, which is why it wins
-   even at batch size 1.
+2. **Thread-starved orchestration.** The BERT forward orchestration and the non-macOS
+   fallback kernels are single-threaded. On macOS, `matmul_bt` dispatches individual
+   GEMM calls to Apple Accelerate (`forward/cpu/matmul.rs:84`), whose `cblas_sgemm`
+   applies multi-threaded AMX tiling even at M=1 (`forward/cpu/blas.rs:74`), but the
+   per-sequence loop hands it many small GEMMs instead of one large one, and the
+   non-GEMM position-wise ops and the fallback path run on a single thread. ONNX
+   Runtime both batches its GEMMs and runs an intra-op thread pool across the whole
+   graph.
 
 The position-wise kernels (`matmul_bt`, `layer_norm`, bias/GELU) are already
 row-count-generic, so the bulk of the FLOPs (QKV projection and FFN) can be fused
@@ -62,10 +67,13 @@ attention score/context step is inherently per-sequence.
    per sequence; L2 normalization behavior is unchanged. All existing softmax
    fail-closed guards (NaN, +inf, all-masked) are preserved unweakened in the batched
    path.
-3. **Add intra-op thread parallelism to the embedding CPU forward.** Row-chunk the fused
-   GEMMs across a bounded thread pool (capped at min(available_parallelism, 8)), using
-   the crate's existing threading idioms and no new dependencies. This addresses the
-   single-text gap as well as the batch gap.
+3. **Add backend-aware intra-op thread parallelism.** Where a GEMM dispatches to a
+   threaded BLAS backend (Accelerate on macOS), no additional row threading is layered
+   on top: nesting a thread pool over BLAS worker threads oversubscribes cores. Bounded
+   row-chunking (capped at min(available_parallelism, 8), existing threading idioms, no
+   new dependencies) applies only to the non-BLAS fallback kernels and to non-GEMM
+   position-wise ops (layer norm, bias/GELU, pooling) where an A/B measurement shows a
+   win. Fusion first, threading only where measurement justifies it.
 4. **Adopt an ONNX parity gate for the hot-path claim.** The "default embedding hot
    path" positioning, and any external contribution built on it, is blocked until
    lattice meets or beats ONNX Runtime CPU on the same model at single-text p50 and at
@@ -104,8 +112,10 @@ attention score/context step is inherently per-sequence.
   mixed and boundary lengths), and it fails when the masking or pooling logic is
   deliberately broken (mutation check).
 - HF parity gate green; clippy `-D warnings`; fmt clean.
-- A/B bench on the same machine, same session: batch-64 throughput >= 2x the pre-change
-  baseline, and single-text p50 not regressed.
+- A/B bench on the same machine, same session: batch throughput at bs 8, 32, 64
+  materially above the pre-change baseline (expected roughly 1.5-2x from the fusion),
+  and single-text p50 not regressed. This is the merge bar for the implementation PR;
+  the binding external bar is the ONNX gate below.
 - Idle-machine comparison vs ONNX Runtime (same model, same corpus): lattice >= ORT on
   single-text p50 and on batch throughput at bs 8, 32, 64. This is the gate for any
   external "hot path" claim.
