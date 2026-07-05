@@ -2292,6 +2292,8 @@ mod serve {
     use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
     #[cfg(feature = "metal-gpu")]
+    use lattice_inference::forward::metal_qwen35::{ChatMessage, format_chat_template};
+    #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use serde::{Deserialize, Serialize};
@@ -2326,7 +2328,12 @@ mod serve {
     /// an innocuous-looking channel send.
     #[cfg(feature = "metal-gpu")]
     struct MetalJob {
-        prompt: String,
+        /// Validated conversation, rendered into a ChatML prompt by the
+        /// worker via the engine's `format_chat_template` (#661) — the same
+        /// renderer `lattice_serve.rs` and `chat_metal` use, so there is one
+        /// ChatML implementation behind every entry point instead of a
+        /// second one local to this file.
+        messages: Vec<ChatMessage>,
         gen_cfg: GenerateConfig,
         on_token: Box<dyn FnMut(&str) -> bool + Send>,
         /// `Err` when the worker's `generate_streaming` call fails closed
@@ -2388,6 +2395,10 @@ mod serve {
 
                 while let Some(job) = job_rx.blocking_recv() {
                     let mut on_token = job.on_token;
+                    // Render via the engine's canonical ChatML template
+                    // (#661) rather than a second, hand-rolled builder local
+                    // to this file — see the `MetalJob::messages` doc.
+                    let prompt = format_chat_template(&job.messages);
                     // Cache-aware call (#462): reuses the previous turn's
                     // shared token prefix instead of a full re-prefill on
                     // every request. This worker thread owns one
@@ -2401,7 +2412,7 @@ mod serve {
                     // shipped in `lattice_serve.rs`.
                     let cached = state.generate_streaming_with_prefix_cache(
                         lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
-                        &job.prompt,
+                        &prompt,
                         &tokenizer,
                         &job.gen_cfg,
                         |delta, _token_id| on_token(delta),
@@ -2440,13 +2451,13 @@ mod serve {
         /// Metal's HTTP error contract matches CPU's exactly.
         async fn generate_streaming(
             &self,
-            prompt: String,
+            messages: Vec<ChatMessage>,
             gen_cfg: GenerateConfig,
             on_token: impl FnMut(&str) -> bool + Send + 'static,
         ) -> Result<GenerateOutput, ApiError> {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let job = MetalJob {
-                prompt,
+                messages,
                 gen_cfg,
                 on_token: Box::new(on_token),
                 reply: reply_tx,
@@ -3069,6 +3080,50 @@ mod serve {
         }
     }
 
+    /// One of the three roles this server accepts on `POST /v1/chat/completions`.
+    ///
+    /// Both the CPU string renderer (`render_prompt`) and the Metal
+    /// `ChatMessage` conversion (`to_chat_messages`) validate through
+    /// `ValidatedRole::parse`, so a role that is invalid for one backend is
+    /// invalid for the other, by construction — see #661.
+    enum ValidatedRole {
+        System,
+        User,
+        Assistant,
+    }
+
+    impl ValidatedRole {
+        /// `tool` and `developer` are rejected as `"unsupported_feature"`
+        /// (a real OpenAI role this server doesn't implement yet); any other
+        /// value is rejected as `"invalid_role"` (not an OpenAI chat role at
+        /// all).
+        fn parse(role: &str) -> Result<Self, ApiError> {
+            match role {
+                "system" => Ok(ValidatedRole::System),
+                "user" => Ok(ValidatedRole::User),
+                "assistant" => Ok(ValidatedRole::Assistant),
+                "tool" | "developer" => Err(ApiError::BadRequest {
+                    message: format!("role '{role}' is not supported by this server"),
+                    code: "unsupported_feature",
+                }),
+                other => Err(ApiError::BadRequest {
+                    message: format!(
+                        "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
+                    ),
+                    code: "invalid_role",
+                }),
+            }
+        }
+
+        fn as_str(&self) -> &'static str {
+            match self {
+                ValidatedRole::System => "system",
+                ValidatedRole::User => "user",
+                ValidatedRole::Assistant => "assistant",
+            }
+        }
+    }
+
     /// Build a single prompt string from the full message list using Qwen ChatML format.
     ///
     /// Format (one block per message, in order):
@@ -3085,36 +3140,51 @@ mod serve {
     ///
     /// Only the roles `system`, `user`, and `assistant` are supported. Any other role
     /// returns `Err` so the handler can respond with HTTP 400.
+    ///
+    /// This is the CPU (safetensors) backend's renderer. The Metal backend
+    /// renders the same validated messages through the engine's own
+    /// `format_chat_template` instead (see `to_chat_messages` and the Metal
+    /// worker loop in `MetalHandle::spawn`) — the CPU model has no
+    /// `ChatMessage`-based API to converge onto, so this hand-rolled
+    /// template stays the CPU path's renderer. `render_prompt_matches_shared_chat_template`
+    /// pins the two renderers to identical output for the same messages.
     fn render_prompt(messages: &[Message]) -> Result<String, ApiError> {
         let mut buf = String::new();
         for msg in messages {
             let content = message_text(&msg.content)?;
-            match msg.role.as_str() {
-                "system" | "user" | "assistant" => {
-                    buf.push_str(&format!(
-                        "<|im_start|>{}\n{}<|im_end|>\n",
-                        msg.role, content
-                    ));
-                }
-                "tool" | "developer" => {
-                    return Err(ApiError::BadRequest {
-                        message: format!("role '{}' is not supported by this server", msg.role),
-                        code: "unsupported_feature",
-                    });
-                }
-                other => {
-                    return Err(ApiError::BadRequest {
-                        message: format!(
-                            "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
-                        ),
-                        code: "invalid_role",
-                    });
-                }
-            }
+            let role = ValidatedRole::parse(&msg.role)?;
+            buf.push_str(&format!(
+                "<|im_start|>{}\n{}<|im_end|>\n",
+                role.as_str(),
+                content
+            ));
         }
         // Open generation turn — model generates from here.
         buf.push_str("<|im_start|>assistant\n");
         Ok(buf)
+    }
+
+    /// Convert validated request messages into the engine's `ChatMessage`
+    /// list for the Metal generation path (#661). Applies the exact same
+    /// role and content-part validation as `render_prompt` (`ValidatedRole::parse`
+    /// and `message_text`), so a message list rejected for the CPU backend
+    /// is rejected identically for the Metal backend. The engine's
+    /// `format_chat_template` renders the result into the same ChatML
+    /// string `lattice_serve.rs` and `chat_metal` already produce for the
+    /// same messages — see the Metal worker loop in `MetalHandle::spawn`.
+    #[cfg(feature = "metal-gpu")]
+    fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
+        messages
+            .iter()
+            .map(|msg| {
+                let content = message_text(&msg.content)?;
+                Ok(match ValidatedRole::parse(&msg.role)? {
+                    ValidatedRole::System => ChatMessage::system(content),
+                    ValidatedRole::User => ChatMessage::user(content),
+                    ValidatedRole::Assistant => ChatMessage::assistant(content),
+                })
+            })
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -3414,6 +3484,16 @@ mod serve {
             ..Default::default()
         };
 
+        // Metal-only: the same validated messages as `prompt` above, in the
+        // engine's `ChatMessage` form. `to_chat_messages` applies identical
+        // role/content validation to `render_prompt` (both call
+        // `ValidatedRole::parse` and `message_text`), so this cannot fail
+        // here given `prepare_chat_request` already accepted `req.messages`
+        // above — the `?` exists for the type, not because failure is
+        // expected in practice.
+        #[cfg(feature = "metal-gpu")]
+        let chat_messages = to_chat_messages(&req.messages)?;
+
         let model = state.model.clone();
 
         // Compute shared response metadata before branching on stream flag.
@@ -3487,7 +3567,7 @@ mod serve {
                     tokio::spawn(async move {
                         let tx_delta = tx.clone();
                         let result = handle
-                            .generate_streaming(prompt, gen_cfg, move |delta| {
+                            .generate_streaming(chat_messages, gen_cfg, move |delta| {
                                 tx_delta
                                     .unbounded_send(StreamMsg::Delta(delta.to_string()))
                                     .is_ok()
@@ -3632,7 +3712,7 @@ mod serve {
                 }
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { handle, .. } => handle
-                    .generate_streaming(prompt, gen_cfg, |_delta| true)
+                    .generate_streaming(chat_messages, gen_cfg, |_delta| true)
                     .await
                     .map_err(|e| {
                         eprintln!("generation error (metal): {e:?}");
@@ -3707,6 +3787,8 @@ mod serve {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(feature = "metal-gpu")]
+        use lattice_inference::forward::metal_qwen35::ChatRole;
 
         #[test]
         fn validate_max_tokens_rejects_zero() {
@@ -4448,6 +4530,152 @@ mod serve {
                     ..
                 }
             ));
+        }
+
+        // -----------------------------------------------------------------------
+        // Metal ChatMessage conversion (#661) — mirrors render_prompt's
+        // validation behavior, and the anti-drift equivalence check that is
+        // the actual point of the unification.
+        // -----------------------------------------------------------------------
+
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn to_chat_messages_rejects_invalid_role() {
+            let messages = vec![Message {
+                role: "function".to_string(),
+                content: MessageContent::Text("data".to_string()),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_role",
+                    ..
+                }
+            ));
+        }
+
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn to_chat_messages_rejects_tool_role() {
+            let messages = vec![Message {
+                role: "tool".to_string(),
+                content: MessageContent::Text("result".to_string()),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
+        }
+
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn to_chat_messages_rejects_developer_role() {
+            let messages = vec![Message {
+                role: "developer".to_string(),
+                content: MessageContent::Text("system prompt".to_string()),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
+        }
+
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn to_chat_messages_rejects_non_text_content_part() {
+            let messages = vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_string(),
+                    text: None,
+                }]),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
+        }
+
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn to_chat_messages_accepts_valid_roles() {
+            let messages = vec![
+                Message {
+                    role: "system".to_string(),
+                    content: MessageContent::Text("Be helpful.".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Text("q1".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text("a1".to_string()),
+                },
+            ];
+            let chat_messages = to_chat_messages(&messages).unwrap();
+            assert_eq!(chat_messages.len(), 3);
+            assert_eq!(chat_messages[0].role, ChatRole::System);
+            assert_eq!(chat_messages[0].content, "Be helpful.");
+            assert_eq!(chat_messages[1].role, ChatRole::User);
+            assert_eq!(chat_messages[2].role, ChatRole::Assistant);
+        }
+
+        /// The anti-drift guard #661 exists for: `lattice serve`'s CPU-path
+        /// renderer (`render_prompt`) and the Metal-path renderer (the
+        /// engine's `format_chat_template`, fed by `to_chat_messages`) must
+        /// produce byte-identical ChatML for the same conversation. This
+        /// test fails the moment the two diverge — the whole point of
+        /// routing the Metal path through the shared template instead of a
+        /// second bespoke one.
+        #[cfg(feature = "metal-gpu")]
+        #[test]
+        fn render_prompt_matches_shared_chat_template() {
+            let messages = vec![
+                Message {
+                    role: "system".to_string(),
+                    content: MessageContent::Text("Be helpful.".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Text("q1".to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::Text("a1".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::Parts(vec![
+                        ContentPart {
+                            kind: "text".to_string(),
+                            text: Some("hello".to_string()),
+                        },
+                        ContentPart {
+                            kind: "text".to_string(),
+                            text: Some(" world".to_string()),
+                        },
+                    ]),
+                },
+            ];
+
+            let cpu_rendered = render_prompt(&messages).unwrap();
+            let metal_rendered = format_chat_template(&to_chat_messages(&messages).unwrap());
+
+            assert_eq!(cpu_rendered, metal_rendered);
         }
 
         // -----------------------------------------------------------------------

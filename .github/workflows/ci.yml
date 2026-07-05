@@ -211,11 +211,21 @@ jobs:
       # linted by the two steps above but never actually RUN by CI (#654: no
       # workflow step invoked `cargo test --bin lattice_serve`/`--bin chat_metal`
       # at all). A fixture nobody runs cannot catch drift. Run them here.
+      # The `lattice` binary's own metal-gpu `#[cfg(test)]` suite has the same
+      # gap: `render_prompt_matches_shared_chat_template` and the
+      # `to_chat_messages_*` fixtures (#661, crates/inference/src/bin/lattice.rs)
+      # pin the CPU (`render_prompt`) and Metal (`format_chat_template`) chat
+      # renderers to identical ChatML output for the same conversation, but
+      # nothing invoked `cargo test --bin lattice --features f16,metal-gpu`
+      # under this feature set, so a future divergence between the two
+      # renderers would compile and lint clean while the test that guards
+      # against it never ran. Run it alongside the other two serve binaries.
       - name: inference — serve-surface capability-matrix fixtures (macOS only)
         if: runner.os == 'macOS'
         run: |
           cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu
           cargo test -p lattice-inference --bin chat_metal --features f16,metal-gpu
+          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
       # were local-only — a green CI here verified compilation, not behavior.
