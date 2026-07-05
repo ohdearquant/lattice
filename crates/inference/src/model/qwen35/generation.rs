@@ -14,6 +14,37 @@ use crate::sampling::record_logprob;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
 
+/// Test-only toggle forcing the pre-delegation serial prefill path
+/// (`prefill_tokens`) instead of `prefill_tokens_batched_for_generate`.
+///
+/// Exists solely so `generate` / `generate_streaming` tests can reproduce the
+/// exact old-path token sequence in-process (no duplicated ~300-line copy of
+/// `generate`'s body) and assert it against the new batched-prefill path.
+/// Guarded by `#[cfg(test)]` end to end, so it does not exist in non-test
+/// builds; production behaviour is unaffected. Tests that use it must hold
+/// `SERIAL_PREFILL_TEST_LOCK` for the duration, since this is process-global
+/// mutable state and `cargo test` runs tests in parallel by default.
+#[cfg(test)]
+pub(crate) static FORCE_SERIAL_PREFILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes tests that toggle `FORCE_SERIAL_PREFILL`, so they never race
+/// against each other (racing against unrelated dense-model tests is
+/// harmless: both prefill paths are required to produce identical output,
+/// which is exactly the invariant this feature exists to preserve).
+#[cfg(test)]
+pub(crate) static SERIAL_PREFILL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn force_serial_prefill() -> bool {
+    FORCE_SERIAL_PREFILL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn force_serial_prefill() -> bool {
+    false
+}
+
 impl Qwen35Model {
     /// **Unstable**: autoregressive text generation with temperature/top-k/top-p sampling.
     pub fn generate(
@@ -91,14 +122,58 @@ impl Qwen35Model {
         // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
         let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-        prefill_tokens(
-            self,
-            &prompt_ids,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        kv_cache.seq_len = prompt_len;
+        // Prompt prefill: try the batched (dense-config) path first, which
+        // performs one layer pass over all prompt positions plus a single
+        // final-token vocab projection, instead of `prompt_len` full
+        // `forward_step` calls (each of which computes an unused vocab
+        // projection for every non-final prompt token). Falls back to the
+        // serial `prefill_tokens` loop for MoE (`UnsupportedModel`) *before*
+        // any `gdn_states` / `kv_cache` mutation, so the fallback always
+        // starts from pristine state. See
+        // `Qwen35Model::prefill_tokens_batched_for_generate` for the
+        // logits-equivalence argument.
+        let prefill_logits: Vec<f32> = if force_serial_prefill() {
+            // Test-only escape hatch (compiles to `false` unconditionally
+            // outside `#[cfg(test)]`; see `force_serial_prefill` below) used by
+            // the delegation parity test to reproduce the pre-delegation
+            // behaviour for a byte-for-byte token comparison against the
+            // batched path.
+            prefill_tokens(
+                self,
+                &prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            kv_cache.seq_len = prompt_len;
+            scratch.logits[..cfg.vocab_size].to_vec()
+        } else {
+            match self.prefill_tokens_batched_for_generate(
+                &prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+            ) {
+                Ok(logits) => logits,
+                Err(InferenceError::UnsupportedModel(_)) => {
+                    prefill_tokens(
+                        self,
+                        &prompt_ids,
+                        &mut gdn_states,
+                        &mut kv_cache,
+                        &mut scratch,
+                    );
+                    kv_cache.seq_len = prompt_len;
+                    scratch.logits[..cfg.vocab_size].to_vec()
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        // `scratch` may not have been touched by the batched path (it only
+        // mutates its own private `PrefillScratch`), so its `logits` buffer
+        // can still be its initial zero-length `Vec::new()`. Ensure capacity
+        // before copying the prefill result in, whichever path produced it.
+        scratch.ensure_capacity(cfg, prompt_len);
+        scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
 
         // Apply grammar mask on the post-prefill logit buffer before the first
         // sample. mask_logits sets every disallowed token to NEG_INFINITY in-place,
@@ -348,14 +423,58 @@ impl Qwen35Model {
         // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
         let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-        prefill_tokens(
-            self,
-            &prompt_ids,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-        );
-        kv_cache.seq_len = prompt_len;
+        // Prompt prefill: try the batched (dense-config) path first, which
+        // performs one layer pass over all prompt positions plus a single
+        // final-token vocab projection, instead of `prompt_len` full
+        // `forward_step` calls (each of which computes an unused vocab
+        // projection for every non-final prompt token). Falls back to the
+        // serial `prefill_tokens` loop for MoE (`UnsupportedModel`) *before*
+        // any `gdn_states` / `kv_cache` mutation, so the fallback always
+        // starts from pristine state. See
+        // `Qwen35Model::prefill_tokens_batched_for_generate` for the
+        // logits-equivalence argument.
+        let prefill_logits: Vec<f32> = if force_serial_prefill() {
+            // Test-only escape hatch (compiles to `false` unconditionally
+            // outside `#[cfg(test)]`; see `force_serial_prefill` below) used by
+            // the delegation parity test to reproduce the pre-delegation
+            // behaviour for a byte-for-byte token comparison against the
+            // batched path.
+            prefill_tokens(
+                self,
+                &prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+            );
+            kv_cache.seq_len = prompt_len;
+            scratch.logits[..cfg.vocab_size].to_vec()
+        } else {
+            match self.prefill_tokens_batched_for_generate(
+                &prompt_ids,
+                &mut gdn_states,
+                &mut kv_cache,
+            ) {
+                Ok(logits) => logits,
+                Err(InferenceError::UnsupportedModel(_)) => {
+                    prefill_tokens(
+                        self,
+                        &prompt_ids,
+                        &mut gdn_states,
+                        &mut kv_cache,
+                        &mut scratch,
+                    );
+                    kv_cache.seq_len = prompt_len;
+                    scratch.logits[..cfg.vocab_size].to_vec()
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        // `scratch` may not have been touched by the batched path (it only
+        // mutates its own private `PrefillScratch`), so its `logits` buffer
+        // can still be its initial zero-length `Vec::new()`. Ensure capacity
+        // before copying the prefill result in, whichever path produced it.
+        scratch.ensure_capacity(cfg, prompt_len);
+        scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
 
         // Grammar mask on the post-prefill logits, identical to the generate() path.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -1847,5 +1966,180 @@ mod tests {
              logprobs entries must be dropped; got {} entries",
             result.token_logprobs.len()
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Public-prefill-delegation token parity (perf_hunt public-prefill
+    // experiment). Requires a real dense Qwen3.5 checkpoint; set
+    // LATTICE_INFERENCE_MODEL_DIR to a safetensors directory (e.g.
+    // /Users/lion/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
+    // and plain `cargo test` runs never depend on local model files.
+    // -------------------------------------------------------------------
+
+    /// Runs greedy generation for `prompt` with both the pre-delegation
+    /// serial prefill path and the batched-prefill delegation path on the
+    /// same loaded model, asserting the generated token ids are identical.
+    /// Serialized on `SERIAL_PREFILL_TEST_LOCK` because `FORCE_SERIAL_PREFILL`
+    /// is process-global.
+    fn assert_batched_prefill_matches_serial(
+        model: &Qwen35Model,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) {
+        let _guard = SERIAL_PREFILL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        FORCE_SERIAL_PREFILL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let serial = model.generate(prompt, &gen_cfg);
+        FORCE_SERIAL_PREFILL.store(false, std::sync::atomic::Ordering::SeqCst);
+        let batched = model.generate(prompt, &gen_cfg);
+
+        let serial = serial.expect("serial-prefill generate must succeed");
+        let batched = batched.expect("batched-prefill generate must succeed");
+
+        assert_eq!(
+            serial.token_ids, batched.token_ids,
+            "batched-prefill delegation changed generated token ids for prompt {prompt:?}: \
+             serial={:?} batched={:?}",
+            serial.token_ids, batched.token_ids
+        );
+        assert_eq!(
+            serial.text, batched.text,
+            "batched-prefill delegation changed decoded text for prompt {prompt:?}"
+        );
+        assert_eq!(serial.stop_reason, batched.stop_reason);
+        assert_eq!(serial.stopped, batched.stopped);
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
+    fn generate_batched_prefill_matches_serial_for_seeded_dense_prompt() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
+            .expect("dense Qwen3.5 model should load successfully");
+
+        // 20 greedy tokens from a fixed prompt, per the perf_hunt experiment ask.
+        assert_batched_prefill_matches_serial(
+            &model,
+            "The quick brown fox jumps over the lazy dog. In a distant future,",
+            20,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
+    fn generate_streaming_batched_prefill_matches_nonstreaming_text() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
+            .expect("dense Qwen3.5 model should load successfully");
+
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens: 20,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let prompt = "The quick brown fox jumps over the lazy dog. In a distant future,";
+
+        let non_streaming = model
+            .generate(prompt, &gen_cfg)
+            .expect("non-streaming generate must succeed");
+
+        let mut streamed_text = String::new();
+        let streaming = model
+            .generate_streaming(prompt, &gen_cfg, |delta| streamed_text.push_str(delta))
+            .expect("streaming generate must succeed");
+
+        assert_eq!(
+            non_streaming.token_ids, streaming.token_ids,
+            "streaming batched-prefill delegation diverged from non-streaming"
+        );
+        assert_eq!(non_streaming.text, streaming.text);
+        assert_eq!(non_streaming.text, streamed_text);
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
+    fn generate_batched_prefill_matches_serial_across_prompt_lengths() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
+            .expect("dense Qwen3.5 model should load successfully");
+
+        for words in [8usize, 64, 256] {
+            let prompt = "hello ".repeat(words);
+            assert_batched_prefill_matches_serial(&model, prompt.trim_end(), 5);
+        }
+    }
+
+    /// A/B time-to-first-token sweep: serial (pre-delegation) prefill vs.
+    /// batched-prefill delegation, same loaded model, back-to-back, for a
+    /// range of prompt lengths. `max_new_tokens: 1` isolates prefill + first
+    /// sample. Prints `ms` per path so the perf_hunt experiment report can
+    /// quote the raw numbers; not a pass/fail gate (that's the parity tests
+    /// above) — run with `--release --features f16 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR; run --release"]
+    fn public_prefill_ttft_ab_sweep() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
+            .expect("dense Qwen3.5 model should load successfully");
+
+        let _guard = SERIAL_PREFILL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            max_new_tokens: 1,
+            temperature: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        println!("words\tprompt_tokens\tserial_ms\tbatched_ms\tspeedup");
+        for words in [64usize, 512, 2000] {
+            let prompt = "hello ".repeat(words);
+            let prompt = prompt.trim_end();
+
+            // Warm the model/tokenizer once outside the timed region.
+            FORCE_SERIAL_PREFILL.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = model.generate(prompt, &gen_cfg).unwrap();
+
+            FORCE_SERIAL_PREFILL.store(true, std::sync::atomic::Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            let serial = model.generate(prompt, &gen_cfg).expect("serial generate");
+            let serial_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            FORCE_SERIAL_PREFILL.store(false, std::sync::atomic::Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            let batched = model.generate(prompt, &gen_cfg).expect("batched generate");
+            let batched_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(
+                serial.token_ids, batched.token_ids,
+                "TTFT sweep: token mismatch at words={words}"
+            );
+
+            println!(
+                "{words}\t{}\t{serial_ms:.1}\t{batched_ms:.1}\t{:.3}",
+                serial.prompt_tokens,
+                serial_ms / batched_ms.max(1e-6),
+            );
+        }
     }
 }

@@ -324,6 +324,42 @@ impl Qwen35Model {
         Ok(scratch.logits[..cfg.vocab_size].to_vec())
     }
 
+    /// Batched-prefill entry point for the public `generate` / `generate_streaming`
+    /// prefill phase (ADR: public-prefill-delegation).
+    ///
+    /// Delegates to [`Self::prefill_prompt`] for dense (non-MoE) configs, filling
+    /// `gdn_states` and `kv_cache` for the whole prompt in one batched pass and
+    /// returning the logits for the final prompt position — the same value the
+    /// serial `prefill_tokens` loop leaves in `scratch.logits` after its last
+    /// iteration (see `prefill_prompt`'s doc comment for why the last-position
+    /// projection is equivalent).
+    ///
+    /// Returns `Err(InferenceError::UnsupportedModel(_))` for MoE configs
+    /// *before* mutating `gdn_states` or `kv_cache` (the `is_moe()` check runs
+    /// first), so callers can fall back to the serial path with untouched state.
+    pub(crate) fn prefill_tokens_batched_for_generate(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+    ) -> Result<Vec<f32>, InferenceError> {
+        if self.config.is_moe() {
+            return Err(InferenceError::UnsupportedModel(
+                "MoE batch prefill is not yet implemented".into(),
+            ));
+        }
+        let kv_dim = self.config.full_kv_dim();
+        kv_cache.reserve(prompt_ids.len(), kv_dim);
+        let mut scratch = PrefillScratch::new(&self.config);
+        self.prefill_prompt(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            &mut scratch,
+            self.lora.as_ref(),
+        )
+    }
+
     /// **Unstable**: batched prefill generate; API will stabilize once legacy generate is removed.
     ///
     /// Replacement generate body that uses `prefill_prompt()` for the prompt
