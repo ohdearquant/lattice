@@ -21,7 +21,7 @@ import SwiftUI
 // Completion detection:
 //   Each run carries an onComplete hook (set in send()/retryTurn()) that
 //   AppStore.finish() fires when the subprocess exits — independent of ChatScreen being
-//   mounted, so a turn still resolves if Ocean navigates away mid-generation.
+//   mounted, so a turn still resolves if the user navigates away mid-generation.
 
 // MARK: - Typing indicator dots
 
@@ -1426,7 +1426,7 @@ struct ChatScreen: View {
         // CPU path: keep using the one-shot generate_lora subprocess (unchanged).
         let run = useGPU ? store.runChatGPU(cfg) : store.runGenerate(cfg)
 
-        // Resolve via the run's own completion hook so the turn lands even if Ocean navigates
+        // Resolve via the run's own completion hook so the turn lands even if the user navigates
         // away from Chat before generation finishes (the .onChange handlers only fire while
         // ChatScreen is mounted). It also fires if another screen's launch() supersedes this
         // run — finish() runs onComplete with a failed status, so the turn shows a real reason

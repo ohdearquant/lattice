@@ -767,7 +767,7 @@ pub(crate) fn record_logprob(
 /// contains any NaN and computes the NaN-ignoring ("numeric") max in a
 /// single pass, so the caller can fall back to `argmax_f32` before
 /// `select_top_k`'s scalar/NEON seed phases sanitize a NaN to `NEG_INFINITY`
-/// and hide it from the softmax degeneracy guard (codex PR #651 round 1).
+/// and hide it from the softmax degeneracy guard (PR #651).
 /// Runtime-dispatch NEON on aarch64 (same 4-wide-plus-scalar-tail structure
 /// as `argmax_f32_neon`) with a scalar fallback.
 fn scan_nan_or_nonfinite_max(logits: &[f32]) -> (bool, f32) {
@@ -1359,8 +1359,8 @@ mod tests {
 
     /// A repetition penalty in (0, 1) BOOSTS recent tokens. The greedy fast path
     /// must not shortcut to the raw argmax when a boosted recent token would
-    /// overtake it, even though the raw argmax itself is not recent (codex
-    /// sampling discovery: the fast-path invariant only holds for penalty >= 1.0).
+    /// overtake it, even though the raw argmax itself is not recent (the
+    /// fast-path invariant only holds for penalty >= 1.0).
     #[test]
     fn test_greedy_sub_one_penalty_boosts_recent_token() {
         let config = SamplingConfig {

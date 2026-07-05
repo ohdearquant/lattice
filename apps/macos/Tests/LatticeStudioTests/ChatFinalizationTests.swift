@@ -8,7 +8,7 @@ final class ChatFinalizationTests: XCTestCase {
     /// Thinking-on prefills "<think>\n" into the PROMPT, so a truncated reasoning stream is
     /// tagless in genText. It must be treated as unfinished reasoning, NOT the answer — an empty
     /// response is the signal that renderChatML skips this turn from history (history gates on a
-    /// non-empty responseText). This is the exact regression codex flagged on PR #428 round-2.
+    /// non-empty responseText). This is the exact regression fixed in PR #428.
     func testThinkingOnTruncatedTaglessReasoningIsNotAnswer() {
         let (thinking, response) = ChatFinalization.finalize(
             "partial reasoning", prefilledOpenThink: true)

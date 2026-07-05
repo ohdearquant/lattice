@@ -5,7 +5,7 @@
 //!   f2 (array cardinality minItems/maxItems)   — FIXED in this session
 //!   f3 (prefixItems tuple arrays)              — FIXED in this session
 //!   f4 (string enum rule-name collision)       — previously fixed upstream
-//!   f5 (single-stack PDA common-prefix)        — Ocean-gated architectural, marked #[ignore]
+//!   f5 (single-stack PDA common-prefix)        — needs architectural redesign, marked #[ignore]
 //!   f6 (leading-zero integer rejection)        — previously fixed upstream
 //!   f7 (enum/const string escaping)            — FIXED in this session
 
@@ -25,7 +25,7 @@ fn full_accept(g: &CompiledGrammar, s: &[u8]) -> bool {
 }
 
 #[test]
-#[ignore = "issue #310 finding #5 (single-stack PDA cannot backtrack common prefixes) — Ocean-gated architectural redesign"]
+#[ignore = "issue #310 finding #5 (single-stack PDA cannot backtrack common prefixes) — needs architectural redesign"]
 fn f5_common_prefix_raw() {
     let mut b = GrammarBuilder::new();
     b.add_rule(
@@ -43,7 +43,7 @@ fn f5_common_prefix_raw() {
 }
 
 #[test]
-#[ignore = "issue #310 finding #5 (single-stack PDA cannot backtrack common prefixes) — Ocean-gated architectural redesign"]
+#[ignore = "issue #310 finding #5 (single-stack PDA cannot backtrack common prefixes) — needs architectural redesign"]
 fn f5_common_prefix_enum() {
     let g = compile_json_schema(&serde_json::json!({"type":"string","enum":["apple","apricot"]}))
         .unwrap();
@@ -182,7 +182,7 @@ fn f2_multi_array_no_collision() {
 
 #[test]
 fn f2_no_items_cardinality() {
-    // codex #1: cardinality must be enforced even without an `items` schema.
+    // Finding #1: cardinality must be enforced even without an `items` schema.
     let g0 = compile_json_schema(&serde_json::json!({"type":"array","maxItems":0})).unwrap();
     assert!(
         full_accept(&g0, b"[]"),
@@ -207,7 +207,7 @@ fn f2_no_items_cardinality() {
 
 #[test]
 fn f3_prefix_items_maxitems() {
-    // critic F1 / codex #2: prefixItems + items must honor maxItems.
+    // Finding #2: prefixItems + items must honor maxItems.
     let g = compile_json_schema(&serde_json::json!(
         {"type":"array","prefixItems":[{"type":"integer"}],"items":{"type":"integer"},"maxItems":2}
     ))
@@ -234,7 +234,7 @@ fn f3_prefix_maxitems_lt_prefixlen_error() {
 
 #[test]
 fn f3_empty_prefix_items_applies_items() {
-    // codex #3: empty prefixItems == no prefixItems; `items` must apply.
+    // Finding #3: empty prefixItems == no prefixItems; `items` must apply.
     let g = compile_json_schema(&serde_json::json!(
         {"type":"array","prefixItems":[],"items":{"type":"integer"}}
     ))

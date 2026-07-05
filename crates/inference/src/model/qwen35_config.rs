@@ -816,7 +816,7 @@ pub struct TokenLogprob {
 /// `stop_token_contract` test module for the cross-path regression sweep).
 /// `generated_tokens` always equals `token_ids.len()`.
 ///
-/// **`stop_strings` behave differently (codex round 1, #632).** A
+/// **`stop_strings` behave differently (#632).** A
 /// `stop_strings` match truncates `text` to the point where the match begins,
 /// but the token(s) whose decoded text completed the match are **not**
 /// removed from `token_ids`/`generated_tokens` — the implementation cannot
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn test_zero_linear_num_key_heads_errors() {
         // gdn_fused divides `value_heads / linear_num_key_heads`; a parseable 0 is a hard
-        // integer divide-by-zero panic deep in the GatedDeltaNet recurrence (codex #342 finding).
+        // integer divide-by-zero panic deep in the GatedDeltaNet recurrence (#342).
         let json = r#"{"text_config": {"linear_num_key_heads": 0}}"#;
         let err = Qwen35Config::from_config_json_str(json)
             .expect_err("linear_num_key_heads: 0 must yield an InferenceError, not divide-by-zero")

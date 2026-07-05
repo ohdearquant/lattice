@@ -1940,7 +1940,7 @@ mod imp {
             handle.join().expect("worker thread must not panic");
         }
 
-        /// Codex review of PR #606: cancellation was only observed through the
+        /// PR #606: cancellation was only observed through the
         /// `on_token` callback, so a generator phase that never calls it -- the
         /// real prefill pass has no callback point at all -- could run
         /// unbounded after the client already disconnected. This proves

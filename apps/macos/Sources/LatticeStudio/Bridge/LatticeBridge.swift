@@ -504,7 +504,7 @@ enum LatticeBridge {
     /// MODELS table, but those adapters carry no model association, so the per-model
     /// picker stayed empty. This bridges that gap.
     ///
-    /// Compatibility policy (Ocean, 2026-06-21 — "compatible-only"):
+    /// Compatibility policy (2026-06-21 — "compatible-only"):
     ///   - An adapter that declares a base model (MLX `model` field, e.g.
     ///     "Qwen/Qwen3.5-0.8B") attaches ONLY to the local model whose name equals the
     ///     normalized base (org prefix stripped + lowercased → "qwen3.5-0.8b"). This

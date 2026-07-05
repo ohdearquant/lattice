@@ -342,14 +342,14 @@ mod tests {
         );
     }
 
-    /// Regression test for the codex-review round-1 blocker on PR #651:
+    /// Regression test for a blocker found on PR #651:
     /// `sample_full_logits` always routes through `select_top_k`, whose
     /// scalar/NEON seed phases rewrite a NaN *scaled* logit to
     /// `f32::NEG_INFINITY` so the min-heap root is never NaN. That
     /// sanitization erases the NaN before
     /// `CandidateSet::sample_top_p_with_scratch`'s own poisoned-sum guard
     /// ever sees it, silently turning a fail-closed case into a normal
-    /// weighted draw. Proven counterexample (codex): `top_k=0`, logits
+    /// weighted draw. Proven counterexample: `top_k=0`, logits
     /// `[0.0, NaN, 0.0]`, seed `0x5eed_f00d_1234_5678` returned token 2
     /// pre-fix; the fail-closed contract requires the finite argmax, token 0.
     #[test]
@@ -659,7 +659,7 @@ mod tests {
     /// IDENTICAL token sequences when the logit set contains exact f32 ties, AND
     /// this test must FAIL if Path B breaks ties towards the higher token-id.
     ///
-    /// The earlier version of this test was vacuous (codex round-1 finding): it put
+    /// The earlier version of this test was vacuous (finding): it put
     /// the ties at low-probability positions (logit 25 of 64) and used top_p=0.95,
     /// so the nucleus truncated the tied tokens before they could affect a draw —
     /// a reversed tie-break still passed. The fix is to give the tied tokens real

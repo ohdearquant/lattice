@@ -65,7 +65,7 @@ fn enum_helper_names_do_not_collide() {
     );
 }
 
-// Finding #4 ($defs sub-case, raised by codex review): a generated
+// Finding #4 ($defs sub-case, raised in review): a generated
 // `str_enum_N` helper rule must not overwrite a user `$defs` rule that
 // happens to share the same name. Here `a` references a def literally named
 // `str_enum_0` (an integer), and `b`'s enum helper would otherwise reserve
@@ -92,7 +92,7 @@ fn enum_helper_does_not_clobber_user_defs_rule() {
     );
 }
 
-// Finding #4 (reverse $defs sub-case, raised by codex re-review): when an enum
+// Finding #4 (reverse $defs sub-case, raised in re-review): when an enum
 // property compiles BEFORE a `$ref` to a def of a colliding name, the `$ref`
 // must resolve to the DEF, not alias to the enum helper. Here `a` (enum, first)
 // would claim `str_enum_0`; `b` then references a def named `str_enum_0` that is

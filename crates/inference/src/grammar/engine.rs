@@ -438,7 +438,7 @@ mod tests {
         );
     }
 
-    /// Regression (issue #343, codex finding B): a long *acyclic* `$defs`
+    /// Regression (issue #343, finding B): a long *acyclic* `$defs`
     /// reference chain (`N0→N1→…→Nk`, each a distinct unseen ref) recurses
     /// `compile_schema` once per link. Without the depth cap this overflowed the
     /// stack at compile time, independent of the PDA cycle fix. A 2000-link
@@ -482,7 +482,7 @@ mod tests {
         assert!(result.is_ok(), "a 64-link $ref chain should compile");
     }
 
-    /// Boundary (issue #343, codex finding D): `maxItems` one past the cap is
+    /// Boundary (issue #343, finding D): `maxItems` one past the cap is
     /// rejected; a small in-range `maxItems` still compiles.
     #[test]
     fn array_maxitems_boundary() {
