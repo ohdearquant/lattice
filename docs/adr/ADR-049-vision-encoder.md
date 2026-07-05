@@ -1,6 +1,6 @@
 # ADR-049: Vision Encoder Integration (Qwen-VL Path)
 
-**Status**: Accepted
+**Status**: Accepted (vision geometry + R3 RoPE assumption revised by ADR-069)
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
