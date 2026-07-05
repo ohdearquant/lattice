@@ -3107,6 +3107,15 @@ mod serve {
             MessageContent::Parts(parts) => {
                 let mut out = String::new();
                 for part in parts {
+                    if part.kind == "image_url" {
+                        // #649: no vision tower exists yet — fail closed with
+                        // the same message lattice_serve uses, rather than
+                        // this server's generic "not supported" text.
+                        return Err(ApiError::BadRequest {
+                            message: "image input requires a vision-capable model".to_string(),
+                            code: "unsupported_feature",
+                        });
+                    }
                     if part.kind != "text" {
                         return Err(ApiError::BadRequest {
                             message: format!(
@@ -4485,13 +4494,32 @@ mod serve {
                 text: None,
             }]);
             let err = message_text(&content).unwrap_err();
-            assert!(matches!(
-                err,
-                ApiError::BadRequest {
-                    code: "unsupported_feature",
-                    ..
+            match err {
+                ApiError::BadRequest { message, code } => {
+                    assert_eq!(code, "unsupported_feature");
+                    assert_eq!(message, "image input requires a vision-capable model");
                 }
-            ));
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn message_text_parts_rejects_unknown_part_type() {
+            let content = MessageContent::Parts(vec![ContentPart {
+                kind: "file".to_string(),
+                text: None,
+            }]);
+            let err = message_text(&content).unwrap_err();
+            match err {
+                ApiError::BadRequest { message, code } => {
+                    assert_eq!(code, "unsupported_feature");
+                    assert_eq!(
+                        message,
+                        "content part type 'file' is not supported; only 'text' parts are accepted"
+                    );
+                }
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
         }
 
         // -----------------------------------------------------------------------
