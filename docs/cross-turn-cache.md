@@ -320,10 +320,12 @@ the fallback path alone, and a dedicated Criterion bench,
 
 ## Summary
 
-- The cache exists and works today only through direct `MetalQwen35State` calls and `chat_metal`.
-  It is not reachable from `lattice serve` or `lattice_serve` — every HTTP request re-prefills its
-  entire conversation history from scratch, a known and already-documented gap (README, issue #462,
-  currently open with state reason `reopened`), not something this document is newly discovering.
+- The cache is reachable today through direct `MetalQwen35State` calls, `chat_metal`, and
+  `lattice_serve` (sticky `CrossTurnSlotId::DEFAULT` slot, honest full-refill fallback on any
+  mismatch). `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) does not call the
+  cache-aware methods yet — every request through it still re-prefills its entire conversation
+  history from scratch, a known and already-documented gap (README, issue #462) tracked as
+  follow-up work, not something this document is newly discovering.
 - Use `CrossTurnSlotId::DEFAULT` for a single local conversation; only one entry is ever retained
   process-wide, so multiplexing several conversations through distinct slot IDs on one
   `MetalQwen35State` does not give each of them independent caching — the most recent one wins and

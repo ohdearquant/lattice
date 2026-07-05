@@ -17869,7 +17869,8 @@ kernel void gdn_chunk_norm_silu_c32(
             };
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
+                && gen_cfg.grammar.is_none()
+                && gen_cfg.logprobs.is_none();
             if use_compact {
                 self.session.compact_route = route;
                 self.session.compact_topk = match route {
@@ -18292,7 +18293,18 @@ kernel void gdn_chunk_norm_silu_c32(
                 // `forward_step` call. Run one silent step so the next turn can
                 // reuse through the full assistant output (design.md step 8,
                 // "Better v1"). This must not sample or emit anything.
-                if !generated_ids.is_empty() && !stopped {
+                //
+                // `stopped_by_caller` is excluded from this silent step
+                // deliberately: it means `on_token` returned false for
+                // `last_pushed_id` itself (the caller rejected delivery of, or
+                // disconnected on, exactly that token), and that token has not
+                // been forwarded into KV yet at this point (forwarding happens
+                // on the loop iteration that never ran). Running the silent
+                // step here would forward and then persist a boundary that
+                // includes a token the caller never received. Leaving
+                // `kv_cache.seq_len` where it is instead naturally excludes
+                // `last_pushed_id` from `represented_len` below.
+                if !generated_ids.is_empty() && !stopped && !stopped_by_caller {
                     let seq_len = self.session.kv_cache.seq_len;
                     if seq_len < self.session.kv_cache.max_cache_len {
                         let _ = self.forward_step(last_pushed_id, seq_len);
@@ -28004,6 +28016,145 @@ kernel void decode_attention_reference(
                 "re-issuing exactly the client's last-known prompt must reproduce the \
                  same output a full re-prefill would -- the client can never receive \
                  tokens generated after it disconnected"
+            );
+        }
+
+        /// Regression test: an `on_token` rejection mid-decode must exclude the
+        /// rejected token from the persisted cache boundary, not just leave a
+        /// safe-by-coincidence fallback. This is a stronger check than output
+        /// parity alone (re-submitting a *shorter*, already-fully-cached prompt
+        /// always falls back to `FullRefill` regardless of what garbage the
+        /// cache might hold underneath, which would silently mask this bug) --
+        /// it inspects the reuse *plan* the corrupted-vs-fixed cache entry
+        /// produces for a follow-up prompt that extends past exactly the
+        /// accepted tokens.
+        #[test]
+        fn cross_turn_cache_and_cancel_on_token_rejection_excludes_rejected_token_from_reuse_plan()
+        {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let prompt = "ab".to_string();
+            let prompt_len = tokenizer.tokenize(&prompt).real_length;
+            let gen_cfg = cross_turn_test_gen_cfg(41, 3);
+
+            // Deterministic (temperature 0, top_k 1): an independent, uncached
+            // run of the same prompt/config tells us exactly which token the
+            // decode loop's first iteration will reject below, without
+            // hardcoding a sampled char that could drift with the fixture.
+            let mut reference_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let reference = reference_state
+                .generate_streaming(&prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("reference generate_streaming must not error");
+            assert!(
+                reference.token_ids.len() >= 2,
+                "fixture must generate at least 2 tokens for this test to reach the \
+                 mid-decode on_token rejection branch"
+            );
+            let accepted_id = reference.token_ids[0];
+            let rejected_id = reference.token_ids[1];
+            let accepted_text = decode_tokens(&tokenizer, &[accepted_id]);
+            let rejected_text = decode_tokens(&tokenizer, &[rejected_id]);
+
+            // A follow-up suffix char guaranteed to diverge from whatever the
+            // (buggy or fixed) cache entry actually holds at the rejected
+            // token's position.
+            let diverging_char = ('a'..='z')
+                .chain('A'..='Z')
+                .map(|c| c.to_string())
+                .find(|c| c != &rejected_text)
+                .expect("single_char_vocab_tokenizer has 52 letters, at least one differs");
+
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let call_count = std::cell::Cell::new(0u32);
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_delta, _id| {
+                        let n = call_count.get() + 1;
+                        call_count.set(n);
+                        // Accept only the first generated token (the
+                        // pre-decode-loop prefill sample); reject the second,
+                        // which is produced inside the decode loop -- the
+                        // branch finding 1 patches.
+                        n < 2
+                    },
+                    || false,
+                )
+                .expect("on_token rejection must not surface as an engine error");
+            assert_eq!(
+                turn1.output.stop_reason,
+                Some(StopReason::Interrupt),
+                "on_token returning false must stop with Interrupt"
+            );
+            assert_eq!(
+                turn1.output.token_ids.first().copied(),
+                Some(accepted_id),
+                "the accepted token must match the deterministic reference"
+            );
+
+            // The client only ever received `accepted_text`; it never saw
+            // `rejected_text`. Its own next request extends the conversation
+            // from what it actually has, plus new content of its own.
+            let followup_prompt = format!("{prompt}{accepted_text}{diverging_char}");
+            let followup = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &followup_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("follow-up turn must not error");
+
+            // The reuse plan's own reported boundary is the direct check:
+            // it must reuse through exactly `prompt_len + 1` tokens (the
+            // prompt plus the one token the client actually received) and
+            // never through `prompt_len + 2` (prompt plus the rejected
+            // token). Without the finding-1 fix, the persisted entry's
+            // `represented_len` is `prompt_len + 2`, its trailing token is
+            // `rejected_id` (not `diverging_char`'s id), so the shared
+            // prefix against `followup_prompt`'s tokens stops at
+            // `prompt_len + 1` -- short of the (wrong) `represented_len` --
+            // and the planner falls back to `FullRefill` instead, with
+            // `reused_tokens == 0`.
+            assert_eq!(
+                followup.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "a follow-up that extends exactly past the tokens the client actually \
+                 received must reuse via ExactAppend; FullRefill here means the \
+                 persisted cache entry still includes the token on_token rejected"
+            );
+            assert_eq!(
+                followup.cache.reused_tokens,
+                prompt_len + 1,
+                "the reused boundary must cover the prompt plus exactly the one \
+                 accepted token -- not the rejected token"
+            );
+
+            // Output parity: the follow-up's result must match an independent
+            // full re-prefill of the same follow-up prompt.
+            let mut parity_state =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let parity_reference = parity_state
+                .generate_streaming(&followup_prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("parity reference generate_streaming must not error");
+            assert_eq!(
+                followup.output.token_ids, parity_reference.token_ids,
+                "ExactAppend reuse must reproduce exactly what a full re-prefill of the \
+                 follow-up prompt would produce"
             );
         }
 
