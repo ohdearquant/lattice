@@ -3,7 +3,9 @@ use super::cache::{ForwardScratch, KvCache};
 use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;
 use super::sampling::sample_token;
-use super::stop_strings::{StopStringMatcher, earliest_stop_match};
+use super::stop_strings::{
+    StopStringMatcher, earliest_stop_match, earliest_stop_match_from, floor_char_boundary,
+};
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
 use crate::grammar::pda::GrammarState;
@@ -898,6 +900,17 @@ fn decode_loop_with_stops(
         None
     };
     let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+    // Longest configured stop string, used to bound the per-token stop scan to
+    // the suffix that could contain a new match (see `earliest_stop_match_from`).
+    // `full` already reflects everything scanned before this function was
+    // called (the pre-loop first-token check), so its current length is the
+    // correct starting point for the "already scanned" prefix.
+    let max_stop = gen_cfg
+        .stop_strings
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(1);
     for _ in 1..cap {
         let pos = kv_cache.seq_len;
         let Some(&last_token) = all_ids.last() else {
@@ -972,6 +985,7 @@ fn decode_loop_with_stops(
             reasoning_end_len = Some(generated_ids.len());
         }
 
+        let prev_len = full.len();
         let delta = detok.push(&model.tokenizer, next_id);
         if !delta.is_empty() {
             full.push_str(&delta);
@@ -983,7 +997,13 @@ fn decode_loop_with_stops(
             token_logprob_end_offsets.push(full.len());
         }
 
-        if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
+        // Only the suffix that could contain a NEW match needs rescanning —
+        // any match fully inside `full[..prev_len]` would already have been
+        // found on a prior iteration (see `earliest_stop_match_from`'s doc
+        // comment). Bounds per-token work instead of rescanning all of `full`.
+        let search_start =
+            floor_char_boundary(full, prev_len.saturating_sub(max_stop.saturating_sub(1)));
+        if let Some(hit) = earliest_stop_match_from(full, &gen_cfg.stop_strings, search_start) {
             full.truncate(hit);
             truncate_token_logprobs_to_retained_text(
                 token_logprobs,
