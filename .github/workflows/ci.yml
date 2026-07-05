@@ -204,6 +204,18 @@ jobs:
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
+      # `lattice_serve` and `chat_metal` require the metal-gpu feature (see
+      # required-features in crates/inference/Cargo.toml), so their `#[cfg(test)]`
+      # modules — including the #654 capability-matrix fixtures that pin the
+      # request-validation contract of every serve surface — were built and
+      # linted by the two steps above but never actually RUN by CI (#654: no
+      # workflow step invoked `cargo test --bin lattice_serve`/`--bin chat_metal`
+      # at all). A fixture nobody runs cannot catch drift. Run them here.
+      - name: inference — serve-surface capability-matrix fixtures (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu
+          cargo test -p lattice-inference --bin chat_metal --features f16,metal-gpu
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
       # were local-only — a green CI here verified compilation, not behavior.

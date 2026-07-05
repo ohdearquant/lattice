@@ -3264,35 +3264,42 @@ mod serve {
         Json(HealthResponse { status: "ok" })
     }
 
-    pub async fn chat_completions(
-        State(state): State<AppState>,
-        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
-    ) -> Result<Response, ApiError> {
-        // Surface JSON extraction failures as structured 400 responses.
-        // Log the raw parser message server-side; never forward it to clients.
-        let Json(req) = result.map_err(|rejection| {
-            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                ApiError::PayloadTooLarge {
-                    message: "request body exceeds 1 MiB limit".to_string(),
-                }
-            } else {
-                eprintln!("invalid request body: {}", rejection.body_text());
-                ApiError::BadRequest {
-                    message: "invalid JSON request body".to_string(),
-                    code: "invalid_request_body",
-                }
-            }
-        })?;
+    /// Everything `chat_completions` must check about a request *before* it
+    /// touches the loaded model: unsupported-feature rejection, model-id
+    /// match, message-shape, sampling-parameter bounds, prompt rendering,
+    /// and stop-sequence parsing. Pulled out of the handler so the
+    /// capability-matrix fixtures (`mod tests`, below) can exercise this
+    /// exact validation cascade — including the `model_not_found` /
+    /// empty-messages / last-role checks that previously had no test
+    /// coverage at all — without constructing a real `ModelBackend`. Only
+    /// the context-window check stays in the handler: it needs
+    /// `state.model.tokenize_len`/`max_context`, which require a loaded
+    /// model. No behavior change versus the inline sequence this replaces.
+    #[derive(Debug)]
+    struct ValidatedChatRequest {
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        logprobs: Option<usize>,
+        prompt: String,
+        stop_strings: Vec<String>,
+    }
 
+    fn validate_chat_request(
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+    ) -> Result<ValidatedChatRequest, ApiError> {
         // Reject unsupported OpenAI features before any further processing.
-        reject_unsupported(&req)?;
+        reject_unsupported(req)?;
 
         // Validate that the caller targets the served model.
-        if req.model != state.model_id {
+        if req.model != model_id {
             return Err(ApiError::BadRequest {
                 message: format!(
                     "model '{}' is not loaded; this server serves '{}'",
-                    req.model, state.model_id
+                    req.model, model_id
                 ),
                 code: "model_not_found",
             });
@@ -3318,8 +3325,8 @@ mod serve {
         let max_tokens = validate_max_tokens(
             req.max_tokens,
             req.max_completion_tokens,
-            state.default_max_tokens,
-            state.max_tokens_cap,
+            default_max_tokens,
+            max_tokens_cap,
         )?;
         let temperature = validate_temperature(req.temperature)?;
         let top_p = validate_top_p(req.top_p)?;
@@ -3328,6 +3335,52 @@ mod serve {
         // Render the full conversation into a ChatML prompt.  Returns 400 for
         // any unsupported role or content-part type encountered.
         let prompt = render_prompt(&req.messages)?;
+
+        let stop_strings = parse_stop_strings(&req.stop)?;
+
+        Ok(ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+        })
+    }
+
+    pub async fn chat_completions(
+        State(state): State<AppState>,
+        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+    ) -> Result<Response, ApiError> {
+        // Surface JSON extraction failures as structured 400 responses.
+        // Log the raw parser message server-side; never forward it to clients.
+        let Json(req) = result.map_err(|rejection| {
+            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".to_string(),
+                }
+            } else {
+                eprintln!("invalid request body: {}", rejection.body_text());
+                ApiError::BadRequest {
+                    message: "invalid JSON request body".to_string(),
+                    code: "invalid_request_body",
+                }
+            }
+        })?;
+
+        let ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+            stop_strings,
+        } = validate_chat_request(
+            &req,
+            &state.model_id,
+            state.default_max_tokens,
+            state.max_tokens_cap,
+        )?;
 
         // Preflight: reject prompts that would overflow the model's context window
         // before entering the blocking generation path.  This converts what would
@@ -3343,8 +3396,6 @@ mod serve {
                 code: "context_length_exceeded",
             });
         }
-
-        let stop_strings = parse_stop_strings(&req.stop)?;
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
             max_new_tokens: max_tokens,
@@ -4717,6 +4768,143 @@ mod serve {
                 v["logprobs"]["content"][0]["top_logprobs"],
                 serde_json::json!([])
             );
+        }
+
+        // -----------------------------------------------------------------------
+        // Capability-matrix fixtures (#654) — `validate_chat_request` cascade.
+        //
+        // Each `#[test]` fn name below is a fixture ID cited from
+        // `docs/capability-matrix.md`'s Fixture column; `scripts/check-capability-
+        // matrix.sh` greps this file for `fn <fixture_id>` and fails the build if
+        // a matrix row cites an ID that no longer exists here. These three checks
+        // (model-id match, empty messages, last-role-must-be-user) previously ran
+        // only inline in `chat_completions` with no dedicated test at all.
+        // -----------------------------------------------------------------------
+
+        fn user_msg(text: &str) -> Message {
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text(text.to_string()),
+            }
+        }
+
+        #[test]
+        fn cm_serve_model_mismatch_rejected() {
+            let req = ChatCompletionRequest {
+                model: "some-other-model".to_string(),
+                messages: vec![user_msg("hi")],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "model_not_found",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_model_match_passes_model_check() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                ..bare_req()
+            };
+            assert!(validate_chat_request(&req, "served-model", 256, 4096).is_ok());
+        }
+
+        #[test]
+        fn cm_serve_empty_messages_rejected() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_messages",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_last_message_not_user_rejected() {
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![
+                    user_msg("hi"),
+                    Message {
+                        role: "assistant".to_string(),
+                        content: MessageContent::Text("hello".to_string()),
+                    },
+                ],
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "invalid_messages",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_unsupported_feature_rejected_before_model_check() {
+            // `reject_unsupported` (tools/n/response_format/stream+logprobs) runs
+            // first in the cascade: a request that both targets the wrong model
+            // AND asks for `tools` must fail on the tools rejection, not the
+            // model-mismatch check, so callers get the more specific error.
+            let req = ChatCompletionRequest {
+                model: "some-other-model".to_string(),
+                messages: vec![user_msg("hi")],
+                tools: Some(serde_json::json!([{"type": "function"}])),
+                ..bare_req()
+            };
+            let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "unsupported_feature",
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn cm_serve_stop_sequences_accepted_end_to_end() {
+            // Full-cascade check that a well-formed request carrying `stop`
+            // resolves through to `ValidatedChatRequest.stop_strings` — the
+            // capability matrix's "supported" claim for `stop` on this surface.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                stop: Some(serde_json::json!(["\n\n"])),
+                ..bare_req()
+            };
+            let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
+            assert_eq!(validated.stop_strings, vec!["\n\n".to_string()]);
+        }
+
+        #[test]
+        fn cm_serve_logprobs_resolved_end_to_end() {
+            // Full-cascade check backing the matrix's "supported, non-streaming
+            // only" `logprobs`/`top_logprobs` claim for `lattice serve`.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                logprobs: Some(true),
+                top_logprobs: Some(3),
+                ..bare_req()
+            };
+            let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
+            assert_eq!(validated.logprobs, Some(3));
         }
     }
 }
