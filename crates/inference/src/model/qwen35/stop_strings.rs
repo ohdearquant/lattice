@@ -7,10 +7,39 @@
 //! across a token boundary, UTF-8-safe emission (never split a codepoint), and the
 //! matched stop text excluded from returned/streamed output.
 
+// Test-only instrumentation: counts bytes actually handed to `str::find` across
+// `earliest_stop_match` / `earliest_stop_match_from` calls, regardless of which
+// of the two a caller uses. This lets a deterministic test observe the *real*
+// scan cost incurred by the production call site in `StopStringMatcher::push`
+// (crates/inference/src/model/qwen35/stop_strings.rs) and
+// `decode_loop_with_stops` (crates/inference/src/model/qwen35/generation.rs):
+// if either regresses back to the full-rescan `earliest_stop_match`, the
+// counter grows with `haystack.len()` on every call instead of with the
+// bounded window, and a linear-bound assertion over many pushes fails.
+#[cfg(test)]
+static SCAN_BYTES_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_scan_bytes_counter() {
+    SCAN_BYTES_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn scan_bytes_counter() -> usize {
+    SCAN_BYTES_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Returns the smallest byte index in `haystack` at which any stop string begins,
 /// or `None` if no stop string is present.
 pub(crate) fn earliest_stop_match(haystack: &str, stops: &[String]) -> Option<usize> {
-    stops.iter().filter_map(|s| haystack.find(s.as_str())).min()
+    stops
+        .iter()
+        .filter_map(|s| {
+            #[cfg(test)]
+            SCAN_BYTES_COUNTER.fetch_add(haystack.len(), std::sync::atomic::Ordering::SeqCst);
+            haystack.find(s.as_str())
+        })
+        .min()
 }
 
 /// Same as [`earliest_stop_match`] but only scans `haystack[start..]`, returning
@@ -36,7 +65,12 @@ pub(crate) fn earliest_stop_match_from(
     let start = start.min(haystack.len());
     stops
         .iter()
-        .filter_map(|s| haystack[start..].find(s.as_str()).map(|p| p + start))
+        .filter_map(|s| {
+            #[cfg(test)]
+            SCAN_BYTES_COUNTER
+                .fetch_add(haystack.len() - start, std::sync::atomic::Ordering::SeqCst);
+            haystack[start..].find(s.as_str()).map(|p| p + start)
+        })
         .min()
 }
 
@@ -51,6 +85,20 @@ pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+/// Shared by `StopStringMatcher::push` and `generation.rs`'s
+/// `decode_loop_with_stops` raw loop: the byte offset the next scan should
+/// start from, given `prev_len` (haystack length *before* this push's delta
+/// landed) and `max_stop` (the longest configured stop string). Both call
+/// sites must derive `search_start` through this one function — see
+/// `earliest_stop_match_from`'s doc comment for why bounding the scan to
+/// `[search_start..]` never misses a match.
+pub(crate) fn stop_scan_search_start(haystack: &str, prev_len: usize, max_stop: usize) -> usize {
+    floor_char_boundary(
+        haystack,
+        prev_len.saturating_sub(max_stop.saturating_sub(1)),
+    )
 }
 
 /// Stateful hold-back streamer for string-level stops (used by streaming generation
@@ -113,10 +161,7 @@ impl<'a> StopStringMatcher<'a> {
         if !delta.is_empty() {
             self.full.push_str(delta);
         }
-        let search_start = floor_char_boundary(
-            &self.full,
-            prev_len.saturating_sub(self.max_stop.saturating_sub(1)),
-        );
+        let search_start = stop_scan_search_start(&self.full, prev_len, self.max_stop);
 
         if let Some(hit) = earliest_stop_match_from(&self.full, self.stops, search_start) {
             let slice = &self.full[self.emitted..hit];
@@ -562,15 +607,15 @@ mod tests {
     // O(bytes^2) fix: bounded suffix scan (stop_suffix_scan / stop_string_scan)
     // -----------------------------------------------------------------------
 
-    /// Direct, deterministic proof that the search window handed to
-    /// `earliest_stop_match_from` is bounded by `max_stop - 1` plus the new
-    /// delta, not by the total accumulated text — the load-bearing invariant
-    /// the perf fix depends on. Computed the same way `StopStringMatcher::push`
-    /// computes it, so a regression that goes back to scanning from `0` (or
-    /// any unbounded value) fails this assertion immediately regardless of
-    /// timing noise.
+    /// Direct, deterministic proof that `stop_scan_search_start` (the helper
+    /// shared by `StopStringMatcher::push` and `decode_loop_with_stops`) is
+    /// bounded by `max_stop - 1`, independent of how large the haystack has
+    /// grown. This alone only guards the helper's own arithmetic, not
+    /// whether production code actually calls it — see
+    /// `push_scan_bytes_stay_linear_via_production_path` below for the
+    /// production-coupled guard.
     #[test]
-    fn push_search_start_stays_within_max_stop_bound_of_prev_len() {
+    fn search_start_helper_stays_within_max_stop_bound_of_prev_len() {
         let max_stop = 6usize; // len("needle")
         let mut full = String::new();
         // Simulate 5,000 non-matching one-byte pushes; after each, the window
@@ -580,7 +625,7 @@ mod tests {
         for i in 0..5_000usize {
             let prev_len = full.len();
             full.push('a');
-            let search_start = floor_char_boundary(&full, prev_len.saturating_sub(max_stop - 1));
+            let search_start = stop_scan_search_start(&full, prev_len, max_stop);
             let window = full.len() - search_start;
             assert!(
                 window <= max_stop,
@@ -591,15 +636,58 @@ mod tests {
         }
     }
 
-    /// Scaling proxy for the O(n^2) -> O(n) fix: push N and 4N non-matching
-    /// tokens through `StopStringMatcher` and assert the 4x-input run takes
-    /// well under 4x (let alone the ~16x an O(n^2) scan would produce) of the
-    /// N-input run's time. Uses a long single-character-repeated haystack
-    /// (worst case for `str::find` since every position is a partial match of
-    /// a longer stop) with an ABSENT stop string so the fast path never
-    /// short-circuits via an early match.
+    /// Deterministic, production-coupled proof that `StopStringMatcher::push`
+    /// (crates/inference/src/model/qwen35/stop_strings.rs) actually routes
+    /// through the bounded `earliest_stop_match_from` and not the full-rescan
+    /// `earliest_stop_match`. Both functions increment the same
+    /// `SCAN_BYTES_COUNTER` test instrumentation (by `haystack.len()` for the
+    /// unbounded function, by `haystack.len() - start` for the bounded one),
+    /// so this test observes the REAL number of bytes handed to `str::find`
+    /// across N real `push()` calls — not a recomputation of the formula.
+    ///
+    /// Mutation-verified: reverting `push`'s call at stop_strings.rs:121 from
+    /// `earliest_stop_match_from(&self.full, self.stops, search_start)` back
+    /// to the pre-fix `earliest_stop_match(&self.full, self.stops)` makes
+    /// this test FAIL deterministically (measured: 125,025,000 scanned bytes
+    /// over 5,000 pushes vs. the 340,000-byte linear bound below — the
+    /// counter still increments under the reverted form because
+    /// `earliest_stop_match` is instrumented too, so there is no way to
+    /// silently bypass this guard by reverting to the old function).
     #[test]
-    fn push_scaling_is_linear_not_quadratic() {
+    fn push_scan_bytes_stay_linear_via_production_path() {
+        reset_scan_bytes_counter();
+        let stops = vec!["ZZZZZZZZZZ_NEVER_MATCHES".to_string()]; // len 24, max_stop=24
+        let mut streamer = StopStringMatcher::new(&stops);
+        let delta = "aaaaaaaaaa"; // 10 non-matching bytes per push
+        let n = 5_000usize;
+        for _ in 0..n {
+            streamer.push(delta, &mut |_s| {});
+        }
+        let scanned = scan_bytes_counter();
+        // Bounded scan: each push examines at most (max_stop + delta.len())
+        // bytes for the single configured stop string. A generous 2x fudge
+        // factor over the theoretical per-push max keeps this robust to
+        // incidental off-by-a-few-bytes window sizing while still failing
+        // hard (by ~19x) against the O(n) per-push / O(n^2) total regression.
+        let per_push_max = 24 + delta.len();
+        let bound = n * per_push_max * 2;
+        assert!(
+            scanned <= bound,
+            "push() scanned {scanned} bytes over {n} calls (bound {bound}); \
+             production `push()` must route through the bounded \
+             `earliest_stop_match_from`, not a full O(full.len()) rescan"
+        );
+    }
+
+    /// Bench-style timing corroboration of the same claim as the deterministic
+    /// test above — kept as a wall-clock sanity check, not a CI gate (marked
+    /// `#[ignore]`: timing is inherently noisy on shared/loaded runners).
+    /// Push N and 4N non-matching tokens through `StopStringMatcher` and check
+    /// the 4x-input run takes well under 4x (let alone the ~16x an O(n^2)
+    /// scan would produce) of the N-input run's time.
+    #[test]
+    #[ignore = "wall-clock timing bench, not a deterministic CI gate — run with --ignored"]
+    fn push_scaling_is_linear_not_quadratic_bench() {
         use std::time::Instant;
 
         fn run(tokens: usize) -> std::time::Duration {
@@ -720,5 +808,79 @@ mod tests {
         assert!(stopped);
         assert_eq!(emitted.join(""), "");
         assert_eq!(streamer.into_text(), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Discriminating cases (codex review round on PR #679): overlapping stop
+    // candidates and repeated near-miss prefixes, arranged so a naive/wrong
+    // window bound would drop bytes a live match still needs.
+    // -----------------------------------------------------------------------
+
+    /// Two stop candidates ("abcab", len 5 => max_stop=5, and "cab", len 3)
+    /// where the earliest actual match ("abcab" at byte 3) straddles the
+    /// push boundary: bytes 3-4 ("ab") were appended by the FIRST push and
+    /// already sit outside the `emitted` cursor when the SECOND push's delta
+    /// ("cab") arrives and completes the match. The competing shorter
+    /// candidate "cab" also matches, later, entirely inside the new delta —
+    /// proving the scan picks the truly-earliest occurrence across both
+    /// candidates, not just whichever candidate happens to fit the new
+    /// delta alone.
+    #[test]
+    fn overlapping_stop_candidates_match_spans_push_boundary() {
+        let stops = vec!["abcab".to_string(), "cab".to_string()]; // max_stop = 5
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+
+        // full so far: "xxxab" (5 bytes). No match yet ("abcab" needs 5 more
+        // bytes than present at the only possible start; "cab" absent too).
+        let stopped1 = streamer.push("xxxab", &mut |s| emitted.push(s.to_string()));
+        assert!(!stopped1);
+
+        // full becomes "xxxabcab" (8 bytes). "abcab" matches at byte 3
+        // (spanning "ab" from push 1 + "cab" from push 2); "cab" also
+        // matches, later, at byte 5 (entirely inside push 2). Earliest wins.
+        let stopped2 = streamer.push("cab", &mut |s| emitted.push(s.to_string()));
+        assert!(
+            stopped2,
+            "the boundary-spanning \"abcab\" match must be found"
+        );
+
+        assert_eq!(
+            emitted.join(""),
+            "xxx",
+            "text before the EARLIEST match (byte 3, \"abcab\") must be emitted exactly \
+             once, not the text before the later \"cab\" match at byte 5"
+        );
+        assert_eq!(streamer.into_text(), "xxx");
+    }
+
+    /// Repeated near-miss prefix: 20 pushes of a single `'A'` byte, none of
+    /// which individually or cumulatively matches `"AAAAB"` (there is no
+    /// `'B'` yet), followed by a `'B'`-terminated push that completes the
+    /// match using the last 4 `'A'`s pushed one-at-a-time long before the
+    /// final push. Proves the bounded window still reaches back far enough
+    /// to include a live partial match assembled across many small pushes,
+    /// rather than a naive fixed-size window discarding it.
+    #[test]
+    fn repeated_near_miss_prefix_does_not_lose_live_partial_match() {
+        let stops = vec!["AAAAB".to_string()]; // max_stop = 5
+        let mut streamer = StopStringMatcher::new(&stops);
+        let mut emitted: Vec<String> = Vec::new();
+
+        for i in 0..20 {
+            let stopped = streamer.push("A", &mut |s| emitted.push(s.to_string()));
+            assert!(!stopped, "no 'B' pushed yet; iteration {i} must not match");
+        }
+        let stopped = streamer.push("B", &mut |s| emitted.push(s.to_string()));
+        assert!(
+            stopped,
+            "the last 4 'A's plus this 'B' must complete \"AAAAB\" even though \
+             the 'A's arrived one at a time, 16 pushes before this one"
+        );
+
+        // 20 'A's total; the match consumes the final 4 ("AAAA") + "B", so
+        // exactly 16 'A's precede the match.
+        assert_eq!(emitted.join(""), "A".repeat(16));
+        assert_eq!(streamer.into_text(), "A".repeat(16));
     }
 }

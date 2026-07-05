@@ -4,7 +4,7 @@ use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use super::stop_strings::{
-    StopStringMatcher, earliest_stop_match, earliest_stop_match_from, floor_char_boundary,
+    StopStringMatcher, earliest_stop_match, earliest_stop_match_from, stop_scan_search_start,
 };
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
@@ -1001,8 +1001,9 @@ fn decode_loop_with_stops(
         // any match fully inside `full[..prev_len]` would already have been
         // found on a prior iteration (see `earliest_stop_match_from`'s doc
         // comment). Bounds per-token work instead of rescanning all of `full`.
-        let search_start =
-            floor_char_boundary(full, prev_len.saturating_sub(max_stop.saturating_sub(1)));
+        // Shared with `StopStringMatcher::push` via `stop_scan_search_start`
+        // so both call sites derive the bound identically.
+        let search_start = stop_scan_search_start(full, prev_len, max_stop);
         if let Some(hit) = earliest_stop_match_from(full, &gen_cfg.stop_strings, search_start) {
             full.truncate(hit);
             truncate_token_logprobs_to_retained_text(
