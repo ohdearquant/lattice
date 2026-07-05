@@ -2,7 +2,7 @@
 # Quant-MATCHED apples-to-apple decode benchmark — slope (marginal) method, Q4.
 #
 # Companion to bench_apples_to_apples.sh (which does f16 Lattice vs Q8 MLX/Ollama).
-# This one is the honest quant-matched comparison Ocean asked for:
+# This one is the honest quant-matched comparison:
 #
 #   Lattice Q4 (plain per-row, ~/.lattice/models/qwen3.5-0.8b-q4)
 #   vs MLX Q4  (nn.quantize bits=4 group_size=64, same source weights)

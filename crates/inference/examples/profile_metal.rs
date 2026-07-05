@@ -87,7 +87,9 @@ fn main() {
             for run in 0..n_runs {
                 metal.reset_state();
                 let t = std::time::Instant::now();
-                let result = metal.generate(prompt, &tokenizer, &gen_cfg);
+                let result = metal
+                    .generate(prompt, &tokenizer, &gen_cfg)
+                    .expect("generation failed");
                 let elapsed = t.elapsed();
                 let tps = result.generated_tokens as f64 / elapsed.as_secs_f64();
                 if tps > best_tps {
@@ -132,7 +134,9 @@ fn main() {
         ..Default::default()
     };
     let t = std::time::Instant::now();
-    let result = metal.generate("The capital of France is", &tokenizer, &gen_cfg_50);
+    let result = metal
+        .generate("The capital of France is", &tokenizer, &gen_cfg_50)
+        .expect("generation failed");
     let total_ms = t.elapsed().as_secs_f64() * 1000.0;
     let avg_tps = result.generated_tokens as f64 / (total_ms / 1000.0);
     eprintln!(

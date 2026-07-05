@@ -115,11 +115,21 @@ pub struct Qwen35Config {
 
     // --- Generation ---
     pub eos_token_id: u32,
+    /// Model's native context window. Missing from a `config.json` is
+    /// representable (defaults to 4096) so callers deriving the serve
+    /// context clamp (#551) can distinguish "no real value present" from a
+    /// present-but-small value rather than silently inheriting an unrelated
+    /// preset's context length.
+    #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
 }
 
 fn default_tie_word_embeddings() -> bool {
     true
+}
+
+fn default_max_position_embeddings() -> usize {
+    4096
 }
 
 // Nested rope_parameters in HF config.json (many models nest rope_theta and
@@ -796,11 +806,34 @@ pub struct TokenLogprob {
 }
 
 /// **Unstable**: text generation output struct; fields may expand with streaming support.
+///
+/// # Stop-token contract (#613)
+///
+/// When generation ends because EOS or a configured `stop_token_ids` entry is
+/// hit, that terminating token is **excluded** from `token_ids` and `text` —
+/// it is never appended to the output. Every generation entry point across
+/// this crate (CPU and Metal) honours this contract (see the
+/// `stop_token_contract` test module for the cross-path regression sweep).
+/// `generated_tokens` always equals `token_ids.len()`.
+///
+/// **`stop_strings` behave differently (#632).** A
+/// `stop_strings` match truncates `text` to the point where the match begins,
+/// but the token(s) whose decoded text completed the match are **not**
+/// removed from `token_ids`/`generated_tokens` — the implementation cannot
+/// "un-generate" a token once it has been decoded and appended (see
+/// `decode_loop_with_stops` / `earliest_stop_match` in
+/// `crate::model::qwen35::generation`). So for a `stop_strings` stop,
+/// `token_ids.len()` (== `generated_tokens`) can exceed the number of tokens
+/// whose text actually survived in the truncated `text`. The EOS /
+/// `stop_token_ids` exclusion guarantee above does not extend to this case.
 #[derive(Debug, Clone)]
 pub struct GenerateOutput {
     /// Generated text (excluding prompt).
     pub text: String,
-    /// Generated token IDs.
+    /// Generated token IDs. Excludes the terminating token for EOS /
+    /// `stop_token_ids` stops (see the stop-token contract above), but a
+    /// `stop_strings` stop retains the token(s) that completed the match —
+    /// see the `stop_strings` note above.
     pub token_ids: Vec<u32>,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
@@ -1223,7 +1256,7 @@ mod tests {
     #[test]
     fn test_zero_linear_num_key_heads_errors() {
         // gdn_fused divides `value_heads / linear_num_key_heads`; a parseable 0 is a hard
-        // integer divide-by-zero panic deep in the GatedDeltaNet recurrence (codex #342 finding).
+        // integer divide-by-zero panic deep in the GatedDeltaNet recurrence (#342).
         let json = r#"{"text_config": {"linear_num_key_heads": 0}}"#;
         let err = Qwen35Config::from_config_json_str(json)
             .expect_err("linear_num_key_heads: 0 must yield an InferenceError, not divide-by-zero")
@@ -1408,6 +1441,38 @@ mod tests {
             "Qwen3.5 mtp_num_hidden_layers must default to 0"
         );
         assert!(!cfg.mtp_use_dedicated_embeddings);
+    }
+
+    #[test]
+    fn qwen35_config_missing_max_position_embeddings_defaults_4096() {
+        // #551: a config.json without max_position_embeddings must not
+        // silently inherit the container-level Default's (qwen36_35b_a3b)
+        // 262_144 context — it must resolve to the documented 4096 fallback.
+        let json = r#"{
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "vocab_size": 248320,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rms_norm_eps": 0.000001,
+                "intermediate_size": 6144,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "full_attention_interval": 4,
+                "eos_token_id": 248044,
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25
+            }
+        }"#;
+
+        let cfg = Qwen35Config::from_config_json_str(json)
+            .expect("config without max_position_embeddings still parses");
+        assert_eq!(cfg.max_position_embeddings, 4096);
     }
 
     #[test]

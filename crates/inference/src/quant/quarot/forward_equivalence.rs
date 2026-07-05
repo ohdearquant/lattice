@@ -1425,7 +1425,7 @@ mod tests {
     /// Per-tensor coverage helper: run the full pipeline correctly, then
     /// scale `victim_name` by `factor` in the rotated working set and
     /// assert the gate refuses. Covers the chain-probe-skipped planned
-    /// tensors that codex flagged in round 1.
+    /// tensors that were flagged in review.
     fn assert_corrupting_planned_tensor_refuses(victim_name: &str, factor: f64, seed: u64) {
         let cfg = tied_tiny_test_cfg();
         let original = build_working_set(&cfg, seed);
@@ -1481,7 +1481,7 @@ mod tests {
     /// Per-tensor coverage: corrupting `k_proj` is invisible to the chain
     /// probe (probe shortcuts through `q_proj` → `o_proj`) but must be
     /// caught by the per-tensor algebraic check. This regression case is
-    /// the specific gap codex flagged in PR #28 round-1 review.
+    /// the specific gap flagged in the PR #28 review.
     #[test]
     fn per_tensor_check_catches_corrupted_k_proj() {
         assert_corrupting_planned_tensor_refuses(
@@ -1576,7 +1576,7 @@ mod tests {
         );
     }
 
-    /// Matrix-equivalence vs single-vector: codex round 2 demonstrated
+    /// Matrix-equivalence vs single-vector: further review demonstrated
     /// that the single-probe-vector implementation would miss a row
     /// perturbation orthogonal to the probe direction. The current
     /// matrix-equivalence implementation compares every stored element,

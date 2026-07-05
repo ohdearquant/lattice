@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn compute_perplexity_rejects_stride_equal_window() {
-        // Round-1 codex finding: stride == window silently dropped every
+        // Finding: stride == window silently dropped every
         // window-boundary token (the first token of each disjoint window has
         // no predecessor inside its own window). The harness now errors
         // before that can happen.
@@ -948,7 +948,7 @@ mod tests {
 
     #[test]
     fn compute_perplexity_rejects_window_above_rope_capacity() {
-        // Round-1 codex finding: the public Result-returning API was able
+        // Finding: the public Result-returning API was able
         // to panic by indexing the precomputed RoPE table past its end.
         // The harness now validates window <= max_context up-front. After
         // the step-4b refactor the message comes from the shared aggregator
@@ -979,7 +979,7 @@ mod tests {
 
     #[test]
     fn compute_perplexity_accepts_long_window_on_short_corpus() {
-        // Round-2 codex finding: the long-window guard was rejecting safe
+        // Finding: the long-window guard was rejecting safe
         // short-corpus invocations. The effective slice length is
         // `min(window, tokens.len())`, so an oversized window with a small
         // corpus must succeed — the per-window clip keeps every slice

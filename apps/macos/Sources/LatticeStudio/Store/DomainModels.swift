@@ -211,7 +211,7 @@ struct ChatTurn: Identifiable {
     var responseTokens: Int? = nil
     var totalMs: Double? = nil
     /// Error message from the run log — set when the turn finishes with an empty response.
-    /// Shown instead of "(no output)" so Ocean knows WHY the engine produced nothing.
+    /// Shown instead of "(no output)" so the user knows WHY the engine produced nothing.
     var errorMessage: String? = nil
     /// The GenConfig used to produce this turn — stored so Retry can re-launch the identical run.
     var retryConfig: ChatGenConfig? = nil

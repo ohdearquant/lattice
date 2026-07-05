@@ -86,7 +86,9 @@ fn run() {
         for &user_msg in &user_prompts {
             history.push(ChatMessage::user(user_msg));
             let full_prompt = format_chat_template(&history);
-            let result = state.generate(&full_prompt, &tokenizer, &gen_cfg);
+            let result = state
+                .generate(&full_prompt, &tokenizer, &gen_cfg)
+                .expect("generation failed");
             history.push(ChatMessage::assistant(result.text.trim().to_string()));
         }
     }
@@ -118,7 +120,9 @@ fn run() {
             // Current behavior: generate() tokenizes, resets state, prefills from pos 0, decodes.
             // This is the full-replay cost we're optimizing away.
             let t_gen = Instant::now();
-            let result = state.generate(&full_prompt, &tokenizer, &gen_cfg);
+            let result = state
+                .generate(&full_prompt, &tokenizer, &gen_cfg)
+                .expect("generation failed");
             let gen_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
             let total_ms = fmt_ms + gen_ms;
 

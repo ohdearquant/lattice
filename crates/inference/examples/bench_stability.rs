@@ -121,15 +121,17 @@ fn run() {
         let mut prefill_done = false;
         let mut prefill_time_ms = 0.0;
 
-        state.generate_streaming(prompt, &tokenizer, &gen_cfg, |_text, tok_id| {
-            if !prefill_done {
-                prefill_time_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-                prefill_done = true;
-            }
-            token_ids.push(tok_id);
-            window_starts.push(Instant::now());
-            true
-        });
+        state
+            .generate_streaming(prompt, &tokenizer, &gen_cfg, |_text, tok_id| {
+                if !prefill_done {
+                    prefill_time_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+                    prefill_done = true;
+                }
+                token_ids.push(tok_id);
+                window_starts.push(Instant::now());
+                true
+            })
+            .expect("generation failed");
 
         let total_time = decode_start.elapsed().as_secs_f64();
         let n = token_ids.len();

@@ -25,7 +25,7 @@ PPL, greedy/top-k agreement, contention/KV-layout), and fails only on a confirme
 the CI lower bound, following the ADR-058 method.
 
 The self-hosted M2 Max runner referenced by issue #167 **does not exist yet** — provisioning it is
-a pending founder decision, tracked separately from this ADR. That means the nightly workflow
+a pending maintainer decision, tracked separately from this ADR. That means the nightly workflow
 described below is buildable and correct today, but cannot execute until the runner is
 provisioned. Scoping this ADR to "everything buildable now" keeps the harness, gate script, and
 workflow definition ready to go live the moment the runner lands, without inventing speculative
@@ -89,9 +89,9 @@ fabricated pass. The gate script treats any row depending on a null field as `IN
 ### What is explicitly NOT decided here
 
 - **The runner does not exist.** This ADR proposes the workflow shape; it does not request or
-  imply approval to provision `[self-hosted, m2max]`. That is a separate founder decision.
+  imply approval to provision `[self-hosted, m2max]`. That is a separate maintainer decision.
 - **No gate in this table is merge-blocking.** The nightly workflow is intentionally excluded from
-  any required-status-check set. Promoting any row to merge-blocking requires a separate founder
+  any required-status-check set. Promoting any row to merge-blocking requires a separate
   sign-off, per the ADR-064 taxonomy's promotion policy (ADR-064 §"gated vs. informational").
 - **Baseline publishing.** This workflow reads from the `perf-baselines` branch but does not push
   to it; wiring an automatic baseline-update step is left for a later change once the runner is
@@ -118,7 +118,7 @@ implemented, everything that does remains dormant and clearly marked as such.
    never silently passes and never masks a real `FAIL` elsewhere.
 3. This ADR document.
 
-**DORMANT — pending founder sign-off on the self-hosted runner:**
+**DORMANT — pending sign-off on the self-hosted runner:**
 
 1. `.github/workflows/adr064-gpu-decode-nightly.yml` — schedule-only, non-required, no PR trigger,
    targets `runs-on: [self-hosted, m2max]`. Committed now so it activates the moment the runner is
@@ -127,7 +127,7 @@ implemented, everything that does remains dormant and clearly marked as such.
    contention loss, KV-layout assertion) into `scripts/bench_decode_slopefit.py` — out of scope
    for this change; the gate script already handles their absence honestly via `INCOMPLETE`.
 3. Promoting any row in the gate table to a required, merge-blocking status check — explicitly not
-   done here; requires founder sign-off per the ADR-064 taxonomy's promotion policy.
+   done here; requires sign-off per the ADR-064 taxonomy's promotion policy.
 
 No existing gate (in this ADR or elsewhere in `.github/workflows`) was weakened, removed, or made
 merge-blocking by this change. Everything above is additive.

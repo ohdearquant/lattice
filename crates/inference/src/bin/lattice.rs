@@ -1,4 +1,4 @@
-//! `lattice` CLI — interactive chat, HTTP serve, and preflight subcommands.
+//! `lattice` CLI - interactive chat, HTTP serve, and preflight subcommands. See [docs/capability-matrix.md](../../../../docs/capability-matrix.md).
 //!
 //! # Usage
 //!
@@ -2240,7 +2240,10 @@ impl MetalChatBackend {
         &mut self,
         prompt: &str,
         gen_cfg: &lattice_inference::model::qwen35_config::GenerateConfig,
-    ) -> lattice_inference::model::qwen35_config::GenerateOutput {
+    ) -> Result<
+        lattice_inference::model::qwen35_config::GenerateOutput,
+        lattice_inference::error::InferenceError,
+    > {
         self.state.generate(prompt, &self.tokenizer, gen_cfg)
     }
 }
@@ -2338,15 +2341,19 @@ fn run_chat(model_path: &str, max_tokens: usize, temperature: f32, tokenizer_dir
                 }
             },
             #[cfg(feature = "metal-gpu")]
-            Backend::Metal(m) => {
-                let output = m.generate(trimmed, &gen_cfg);
-                let _ = writeln!(stdout, "{}", output.text);
-                let _ = writeln!(
-                    stdout,
-                    "[{} prompt tokens, {} generated]",
-                    output.prompt_tokens, output.generated_tokens
-                );
-            }
+            Backend::Metal(m) => match m.generate(trimmed, &gen_cfg) {
+                Ok(output) => {
+                    let _ = writeln!(stdout, "{}", output.text);
+                    let _ = writeln!(
+                        stdout,
+                        "[{} prompt tokens, {} generated]",
+                        output.prompt_tokens, output.generated_tokens
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Generation error: {e}");
+                }
+            },
         }
     }
 }
@@ -2406,7 +2413,12 @@ mod serve {
         prompt: String,
         gen_cfg: GenerateConfig,
         on_token: Box<dyn FnMut(&str) -> bool + Send>,
-        reply: tokio::sync::oneshot::Sender<GenerateOutput>,
+        /// `Err` when the worker's `generate_streaming` call fails closed
+        /// (#611: e.g. a grammar mask that blocks every token). Carries the
+        /// same `InferenceError` the CPU path already returns from `generate`.
+        reply: tokio::sync::oneshot::Sender<
+            Result<GenerateOutput, lattice_inference::error::InferenceError>,
+        >,
     }
 
     /// Handle to the Metal GPU worker thread. Cheaply `Clone` (an `mpsc`
@@ -2481,6 +2493,14 @@ mod serve {
         /// delta to `on_token`. Returns the full `GenerateOutput` (including
         /// `stopped`/`stop_reason`) so callers can compute `finish_reason`
         /// with the exact same `finish_reason_for` helper the CPU path uses.
+        ///
+        /// Returns `Err` if the worker thread is unreachable, or if the
+        /// underlying `generate_streaming` call itself fails closed (#611:
+        /// e.g. a grammar mask that blocks every candidate token). Both
+        /// cases collapse to `ApiError::Internal` here; the HTTP handlers
+        /// below re-wrap that into the same generic "inference failed" 500
+        /// the CPU path already returns for any `generate()` error, so
+        /// Metal's HTTP error contract matches CPU's exactly.
         async fn generate_streaming(
             &self,
             prompt: String,
@@ -2497,9 +2517,14 @@ mod serve {
             self.jobs.send(job).map_err(|_| ApiError::Internal {
                 message: "inference worker is not running".to_string(),
             })?;
-            reply_rx.await.map_err(|_| ApiError::Internal {
-                message: "inference worker dropped the request".to_string(),
-            })
+            reply_rx
+                .await
+                .map_err(|_| ApiError::Internal {
+                    message: "inference worker dropped the request".to_string(),
+                })?
+                .map_err(|e| ApiError::Internal {
+                    message: format!("generation failed: {e}"),
+                })
         }
     }
 
@@ -3082,6 +3107,15 @@ mod serve {
             MessageContent::Parts(parts) => {
                 let mut out = String::new();
                 for part in parts {
+                    if part.kind == "image_url" {
+                        // #649: no vision tower exists yet — fail closed with
+                        // the same message lattice_serve uses, rather than
+                        // this server's generic "not supported" text.
+                        return Err(ApiError::BadRequest {
+                            message: "image input requires a vision-capable model".to_string(),
+                            code: "unsupported_feature",
+                        });
+                    }
                     if part.kind != "text" {
                         return Err(ApiError::BadRequest {
                             message: format!(
@@ -4460,13 +4494,32 @@ mod serve {
                 text: None,
             }]);
             let err = message_text(&content).unwrap_err();
-            assert!(matches!(
-                err,
-                ApiError::BadRequest {
-                    code: "unsupported_feature",
-                    ..
+            match err {
+                ApiError::BadRequest { message, code } => {
+                    assert_eq!(code, "unsupported_feature");
+                    assert_eq!(message, "image input requires a vision-capable model");
                 }
-            ));
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn message_text_parts_rejects_unknown_part_type() {
+            let content = MessageContent::Parts(vec![ContentPart {
+                kind: "file".to_string(),
+                text: None,
+            }]);
+            let err = message_text(&content).unwrap_err();
+            match err {
+                ApiError::BadRequest { message, code } => {
+                    assert_eq!(code, "unsupported_feature");
+                    assert_eq!(
+                        message,
+                        "content part type 'file' is not supported; only 'text' parts are accepted"
+                    );
+                }
+                other => panic!("expected BadRequest, got {other:?}"),
+            }
         }
 
         // -----------------------------------------------------------------------

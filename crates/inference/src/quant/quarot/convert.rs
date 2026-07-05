@@ -216,7 +216,24 @@ pub(crate) fn read_quarot_seed_from_index(q4_dir: &Path) -> Result<Option<u64>, 
     let Some(bytes) = read_quantize_index_bytes_bounded(&path)? else {
         return Ok(None);
     };
-    let index: QuantizeIndex = serde_json::from_slice(&bytes)
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
+    // `quantize_q4` (plain, non-rotated Q4 checkpoints — see
+    // `crates/inference/src/bin/quantize_q4.rs`) writes `quantize_index.json`
+    // as a bare top-level tensor array, not the `{quarot_seed, tensors}`
+    // object `quantize_quarot` produces. That shape genuinely carries no
+    // rotation seed; it is not malformed. Without this check, serde's
+    // derived `Deserialize` for `QuantizeIndex` accepts a top-level JSON
+    // array too (treating positional elements as struct fields in
+    // declaration order), so the array's first tensor entry (a JSON object)
+    // would be deserialized as the `quarot_seed: Option<u64>` field and fail
+    // with a confusing "invalid type: map, expected u64" — turning a
+    // perfectly valid plain-Q4 checkpoint into a hard load failure (#630
+    // end-to-end verification against the real qwen3.5-0.8b-q4 checkpoint).
+    if value.is_array() {
+        return Ok(None);
+    }
+    let index: QuantizeIndex = serde_json::from_value(value)
         .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
     Ok(index.quarot_seed)
 }
@@ -1335,7 +1352,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Dry-run / real-write byte-count parity (codex finding fix gate)
+    // Dry-run / real-write byte-count parity
     // ------------------------------------------------------------------
 
     /// Correctness gate: dry_run=true and dry_run=false on the same model
@@ -1493,8 +1510,8 @@ mod tests {
     }
 
     /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
-    /// Includes an f16-subnormal regression: codex round-1 flagged that
-    /// the old local helper flushed every value below f16's smallest
+    /// Includes an f16-subnormal regression, since fixed: the old local
+    /// helper flushed every value below f16's smallest
     /// normal to zero, silently corrupting small-magnitude weights in
     /// kept tensors (e.g., `A_log`, `dt_bias`, GDN `linear_attn.norm`).
     #[test]
@@ -1511,8 +1528,7 @@ mod tests {
         let h = q4_f32_to_f16(1e-7_f32);
         assert_ne!(
             h, 0,
-            "1e-7 (an f16 subnormal range value) must not flush to zero \
-             — that was the codex round-1 Medium"
+            "1e-7 (an f16 subnormal range value) must not flush to zero"
         );
         // f32 subnormals (well below f16's subnormal range) DO round to zero
         // because there's no f16 representation for them.
@@ -1529,7 +1545,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Path-layout refuses (codex round-1 Majors 1 + 2)
+    // Path-layout refuses (review findings, Majors 1 + 2)
     // ------------------------------------------------------------------
 
     /// Major 1: when input and output paths resolve to the same canonical
@@ -2317,6 +2333,27 @@ mod tests {
             read_quarot_seed_from_index(tmp.path()),
             Ok(None),
             "index without quarot_seed key must yield Ok(None)"
+        );
+    }
+
+    #[test]
+    fn read_quarot_seed_from_index_bare_array_is_none() {
+        // `quantize_q4` (plain, non-rotated Q4 checkpoints) writes
+        // `quantize_index.json` as a bare top-level tensor array, not the
+        // `{quarot_seed, tensors}` object `quantize_quarot` produces. This
+        // must be recognized as "no seed", not rejected as malformed —
+        // reverting the array-shape check makes serde misparse the first
+        // array element as the `quarot_seed: Option<u64>` field and error.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"foo","file":"foo.q4","quantized":true,"shape":[2,2],"numel":4}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_quarot_seed_from_index(tmp.path()),
+            Ok(None),
+            "bare tensor-array quantize_index.json (plain quantize_q4 shape) must yield Ok(None)"
         );
     }
 

@@ -1,22 +1,99 @@
 name: CI
 
-# NOTE: no `paths-ignore`. Every job here is (or can be) a *required* status
-# check, and a required check that never runs leaves a PR stuck on "Expected —
-# waiting for status to be reported" forever. So CI always runs on every PR to
-# main; the cargo cache keeps doc-only re-runs cheap (nothing recompiles).
+# NOTE: no `paths-ignore` on the triggers below. Every job here is (or can be)
+# a *required* status check, and a required check whose workflow never even
+# runs leaves a PR stuck on "Expected, waiting for status to be reported"
+# forever. So this workflow always triggers on every PR to main. Docs-only
+# PRs are instead handled by gating `ci`, `feature-matrix`, `bench-compile`,
+# and `msrv` on the `changes` job below.
+#
+# `ci` and `feature-matrix` are matrix jobs, so their required-check contexts
+# come from matrix expansion ("CI (macos-latest)", "feature-matrix
+# (ubuntu-latest)", etc). `jobs.<id>.if` is evaluated BEFORE the matrix
+# expands, so a docs-only skip at job level never even creates those
+# per-combination check runs; a required context that never gets created
+# stays "Expected, waiting for status" forever, the exact trap this
+# workflow's triggers are already written to avoid. So the matrix-expanded
+# names are NOT the required contexts here: `ci-gate` at the bottom of this
+# file is, mirroring `parity-gate` in e2e-parity.yml and `app-binaries-gate`
+# in app-binaries.yml. It always runs, always reports, and fails closed if
+# change-detection itself failed. `cargo-deny`, `rustdoc-lint`, and
+# `unwrap-in-lib-lint` stay ungated and directly required: they are already
+# cheap ubuntu-only jobs, so gating them would save nothing.
+#
+# Rollout note: branch protection's required contexts were swapped on
+# 2026-07-04 from the seven heavy job/matrix names to `ci-gate` (plus the
+# unchanged cargo-deny, parity-gate, app-binaries-gate, and q4 composed
+# golden). PRs branched from a pre-ci-gate main must update their branch
+# (strict up-to-date protection forces this anyway) to produce the context.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+# Cancel a PR's own superseded runs so they stop occupying the shared
+# macOS runner pool (~5 concurrent, account-wide) while a newer push on the
+# same PR waits behind them. Never cancel a push to main: main has no "next
+# push" to fall back on if a run is killed mid-flight. The event_name segment
+# keeps a push run and a workflow_dispatch run on the same ref out of each
+# other's queue: GitHub cancels a PENDING run whenever another run enters its
+# group, even with cancel-in-progress false, so two different trigger kinds
+# sharing one group could still replace each other while queued.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   LATTICE_REQUIRE_FIXTURES: "1"
 
 jobs:
+  # Decide whether anything outside the docs set changed. A PR that only
+  # touches markdown, ADRs, LICENSE, or .gitignore cannot affect compilation,
+  # so it does not need the macOS/ARM compile matrix below.
+  changes:
+    name: detect-code-changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
+            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+              || git diff --name-only "HEAD~1...HEAD")
+          else
+            CHANGED=$(git diff --name-only "HEAD~1...HEAD" 2>/dev/null || true)
+          fi
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Docs set: **/*.md, docs/**, LICENSE*, .gitignore. Everything else
+          # counts as code, including workflow files, Cargo.*, Makefile*, and
+          # scripts/**. Conservative on purpose: when in doubt, run the matrix.
+          # Two single greps against here-strings, not a `grep | grep -q` pipe:
+          # a downstream `-q` can close its end of a pipe early and SIGPIPE the
+          # upstream producer, and under `pipefail` that reports as the
+          # pipeline's exit code instead of the match result (fail-open on a
+          # large diff).
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$)' <<<"$CHANGED" || true)
+          if grep -q . <<<"$NON_DOCS"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "→ non-docs files changed: full matrix REQUIRED"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "→ docs-only change: full matrix skipped"
+          fi
+
   ci:
     name: CI
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -56,6 +133,8 @@ jobs:
   # spending runner time executing.
   feature-matrix:
     name: feature-matrix
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -138,6 +217,48 @@ jobs:
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
+      # #611: Metal generation paths applied grammar masks via `mask_logits`
+      # but never checked for a surviving finite logit before sampling — a
+      # grammar that blocked every token silently emitted token 0 instead of
+      # failing closed, unlike the CPU paths (`crate::generate` /
+      # `model::qwen35::generation`), which have always guarded every
+      # `mask_logits` call this way. These three hardware-gated integration
+      # tests prove each real public Metal generation entry point (`generate`,
+      # `generate_streaming`, `generate_streaming_with_prefix_cache`) now
+      # returns `Err(InvalidInput)` rather than a token when a real
+      # `GrammarEngine` blocks every vocab entry. The exact "3 passed; 0
+      # failed" grep guards against a silently zero-matching filter, the same
+      # failure mode the Q4 and f16-KV steps above already guard against.
+      # #611 (major): without LATTICE_METAL_TEST_ENFORCE,
+      # each test early-returns (asserted as "passed" by cargo) when
+      # `Device::system_default()` is absent, so a runner without a Metal
+      # device would silently green this gate without ever exercising the
+      # Metal path. LATTICE_METAL_TEST_ENFORCE=1 makes the tests panic instead
+      # of returning in that case, matching the Q4/f16-KV steps' convention.
+      - name: inference — Metal grammar fail-closed gate (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-test.log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_all_blocking_grammar -- --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #611 (medium): the three tests above only reach
+      # the post-prefill masking site (their fixture blocks every vocab entry
+      # from step 0), so removing a DECODE-LOOP `has_finite_logit` guard left
+      # them green. These three companion tests use a grammar that allows
+      # exactly one token then blocks every continuation, so they exercise
+      # the second, decode-loop guard site in each of the three functions.
+      - name: inference — Metal grammar fail-closed decode-loop gate (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-decode-test.log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_blocking_second_token -- --nocapture 2>&1 | tee "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
       # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
       # exposes a PARAVIRTUAL Metal GPU, not a real Apple7 device — a test
@@ -169,6 +290,8 @@ jobs:
   # on x86 they are cfg'd out and the gate would be vacuous.
   bench-compile:
     name: bench-compile
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -195,6 +318,8 @@ jobs:
   # "compiles at MSRV", behavior is covered by the 1.94.1 jobs above.
   msrv:
     name: msrv (1.93, f16+metal-gpu)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -278,3 +403,107 @@ jobs:
       - name: clippy — unwrap/expect in library targets (informational)
         continue-on-error: true
         run: cargo clippy --workspace --lib -- -D clippy::unwrap_used -D clippy::expect_used
+
+  # Cheap ubuntu spell-check. Comments, docs, and error-message strings have
+  # no compiler or test to catch a typo, so this is the only gate that reads
+  # prose at all. Ungated: the tool itself takes well under a minute.
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.48.0
+
+  # Cheap ubuntu workflow lint. Catches malformed expressions, unknown
+  # contexts/inputs, and shellcheck-level issues inside `run:` steps before
+  # they only surface as a confusing failure on a live runner. Ungated for the
+  # same reason as `typos`: it is a fast, dependency-light static check.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2.2.0
+        with:
+          version: '1.7.12'
+
+  # cargo-semver-checks against the latest published crates.io release for
+  # every internal path-dependency crate, so a breaking public API change is
+  # flagged before it ships unversioned, the way #634 was not. Gated through
+  # ci-gate below (it is docs-gated, so it cannot be a direct required
+  # context). The v0.5.0 publish reset the baseline: all five crates pass
+  # against the published 0.5.0, so this is a real gate, not informational.
+  semver-checks:
+    name: semver-checks
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: semver-checks
+      # metal-gpu does not compile on Linux and must stay off; default-features
+      # keeps the check to each crate's own `[features] default = [...]` set
+      # rather than the action's heuristic all-features-ish default, which
+      # would otherwise try to turn on optional platform-gated features.
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
+          feature-group: default-features
+
+  # REQUIRED status check (see the rollout note at the top of this file).
+  # Always runs, always reports. `ci`, `feature-matrix`, `bench-compile`, and
+  # `msrv` are matrix and/or docs-gated, so none of them is individually a
+  # safe required context: a matrix job skipped at job level never creates
+  # its per-combination check runs at all, and a plain gated job that skips
+  # reports success even if `changes` itself blew up. This job passes when
+  # there is nothing to check (docs-only) and mirrors the five gated jobs'
+  # results when there is, exactly like `parity-gate` in e2e-parity.yml and
+  # `app-binaries-gate` in app-binaries.yml.
+  ci-gate:
+    name: ci-gate
+    needs: [changes, ci, feature-matrix, bench-compile, msrv, semver-checks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve gate
+        run: |
+          CHANGES_RESULT="${{ needs.changes.result }}"
+          CODE="${{ needs.changes.outputs.code }}"
+          CI_RESULT="${{ needs.ci.result }}"
+          FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
+          BENCH_COMPILE_RESULT="${{ needs.bench-compile.result }}"
+          MSRV_RESULT="${{ needs.msrv.result }}"
+          SEMVER_RESULT="${{ needs.semver-checks.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::change-detection did not succeed, failing closed."
+            exit 1
+          fi
+          if [ "$CODE" != "true" ]; then
+            echo "Docs-only change, heavy compile jobs not required. PASS."
+            exit 0
+          fi
+          if [ "$CI_RESULT" != "success" ]; then
+            echo "::error::ci did not succeed (result=$CI_RESULT)."
+            exit 1
+          fi
+          if [ "$FEATURE_MATRIX_RESULT" != "success" ]; then
+            echo "::error::feature-matrix did not succeed (result=$FEATURE_MATRIX_RESULT)."
+            exit 1
+          fi
+          if [ "$BENCH_COMPILE_RESULT" != "success" ]; then
+            echo "::error::bench-compile did not succeed (result=$BENCH_COMPILE_RESULT)."
+            exit 1
+          fi
+          if [ "$MSRV_RESULT" != "success" ]; then
+            echo "::error::msrv did not succeed (result=$MSRV_RESULT)."
+            exit 1
+          fi
+          if [ "$SEMVER_RESULT" != "success" ]; then
+            echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
+            exit 1
+          fi
+          echo "Code changed; ci, feature-matrix, bench-compile, msrv, and semver-checks all PASSED."
+          exit 0

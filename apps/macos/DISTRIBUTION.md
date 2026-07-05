@@ -57,7 +57,7 @@ This is a one-time step. The app will open normally on subsequent launches.
 
 ## Upgrading to Developer ID signing (for App Store or notarized distribution)
 
-When Ocean has a $99/year Apple Developer Program membership, replace the
+When a $99/year Apple Developer Program membership is available, replace the
 ad-hoc step in `package-app.sh` with a full Developer ID workflow:
 
 ```bash

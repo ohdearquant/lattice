@@ -15,18 +15,13 @@ as important — what does **not** call it yet, since that gap is easy to assume
 
 The underlying cache (`crate::kv_cache::cross_turn` plus the Metal runtime hooks in
 `MetalQwen35State`) shipped in PR #516 (merged). At that point, **nothing in the codebase called
-it** — it was infrastructure with zero consumers. PR #619 is the first to wire a real caller, and
+it** — it was infrastructure with zero consumers. PR #619 later wired the first real caller, and
 it wires exactly one: **`chat_metal`** (`crates/inference/src/bin/chat_metal.rs`), both its
 `--json` one-shot/`--serve` path and its interactive REPL.
 
-As of this writing, PR #619 is still open in draft. The behavior described in this document under
-"Using it from `chat_metal`" reflects that PR's diff, not code on `main` yet — check its status
-(`gh pr view 619`) before relying on it, and treat this document as provisional on that PR's
-content until it merges.
-
 **Neither `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) nor `lattice_serve`
-(the separate HTTP daemon built for the macOS Studio app) call the cache-aware methods, and PR
-#619 does not add them.** Both still call the plain, non-cache-aware `generate_streaming`, or
+(the separate HTTP daemon built for the macOS Studio app) call the cache-aware methods, even after
+PR #619.** Both still call the plain, non-cache-aware `generate_streaming`, or
 (for `lattice_serve`) unconditionally `reset_state()` before every request. Concretely:
 
 - `lattice serve` → `POST /v1/chat/completions` re-prefills the entire `messages` array from
@@ -39,10 +34,13 @@ content until it merges.
 - `lattice_serve` (the macOS Studio daemon) is the same: no cache-aware calls anywhere in that
   binary as of this writing.
 
+That HTTP serve gap remains tracked by issue #462, which is currently open with state reason
+`reopened` after #619 because multi-session server wiring is still unresolved.
+
 See [`docs/serve-http-api.md`](serve-http-api.md) for the full `lattice serve` HTTP API — this
 document is only about the library-level cache, not the HTTP surface.
 
-PR #619's own description explains why it deliberately stopped short of wiring the HTTP servers:
+PR #619 deliberately stopped short of wiring the HTTP servers because
 the current cache is a **single-entry** store (see below) — safe for one interactive process
 talking to one conversation at a time, but wiring it into a multi-session server as-is would let
 one client's request evict another client's retained state, silently forcing that other client
@@ -134,10 +132,9 @@ pub struct CachedGenerateOutput {
 
 This is your "did it actually reuse anything" signal — check `cache.mode` and
 `cache.reused_tokens` rather than assuming caching happened just because you called the
-`_with_prefix_cache` method. `chat_metal` (once PR #619 lands — still an open draft as of this
-writing, so treat the lines below as a representative example, not a verbatim quote; exact wording
-may change before it merges) prints a line like this to stderr after every turn. The `--json` path
-(`--json --prompt` / `--json --serve`) and the interactive REPL use two different shapes:
+`_with_prefix_cache` method. `chat_metal` prints a line like this to stderr after every turn. The
+`--json` path (`--json --prompt` / `--json --serve`) and the interactive REPL use two different
+shapes:
 
 ```
 # --json mode
@@ -226,11 +223,7 @@ Practical implications for structuring a conversation to actually benefit:
 
 This is the sharpest edge in the current design, and it's easy to misread from "distinct slots
 never share state" alone. The Metal-side cache (`MetalCrossTurnPrefixCache`) retains **at most one
-entry, for one slot, at a time** — it is not an unbounded per-slot map:
-
-> Worker-local, single-live-entry cross-turn prefix cache (#516 round-1 remediation, finding 1 +
-> 5). Ownership invariant: at most ONE `MetalCrossTurnPrefixEntry` is ever retained, bounded by
-> design (never an unbounded per-slot map).
+entry, for one slot, at a time** — it is deliberately not an unbounded per-slot map.
 
 `get`/`take` both check the slot ID on the one entry that exists, so a lookup for a _different_
 slot than the one currently retained is always a clean miss (never a stale or wrong-slot hit) —
@@ -239,18 +232,16 @@ slot A again, that third call is a full refill — slot B's generation evicted s
 did not get its own independent storage alongside it. If your process genuinely interleaves
 multiple concurrent conversations through one `MetalQwen35State`, only the most recently generated
 one benefits from caching at any given moment; the others pay full re-prefill every time they get
-a turn. This is exactly the multi-session risk PR #619's description cites as the reason
-`lattice serve`/`lattice_serve` weren't wired up yet — a single shared worker with this cache
-behind a server handling several simultaneous chats would thrash.
+a turn. This is the multi-session risk that kept `lattice serve`/`lattice_serve` unwired in #619:
+a single shared worker with this cache behind a server handling several simultaneous chats would
+thrash.
 
-This single-entry design traces back to a real bug caught in review: PR #516's round-1 codex
-review rejected an earlier version that used an unbounded per-slot `HashMap`, because the
-underlying full-attention KV buffer is one mutable live buffer shared by the whole process — a
-stale map entry could restore GDN state from one conversation while attention silently read KV
-rows another generation had since overwritten. The fix (documented as remediation items D1-D6)
-was to cap retention at one entry and make any other mutation of live state — a different slot's
-generation, the plain non-cache-aware generate path, an explicit `reset_state()`, or a LoRA
-load/unload — invalidate the entry before that mutation proceeds.
+PR #516 originally considered an unbounded per-slot map, but the underlying full-attention KV
+buffer is one mutable live buffer shared by the whole process. A stale map entry could restore GDN
+state from one conversation while attention silently read KV rows another generation had since
+overwritten. The implemented fix caps retention at one entry and makes any other mutation of live
+state — a different slot's generation, the plain non-cache-aware generate path, an explicit
+`reset_state()`, or a LoRA load/unload — invalidate the entry before that mutation proceeds.
 
 ## Failure handling
 
@@ -279,10 +270,10 @@ on exactly this: on a generation failure it just surfaces an error event (or, in
 the unanswered turn) and continues, because it knows the engine already put itself back into a
 consistent state.
 
-## Using it from `chat_metal` (once PR #619 merges)
+## Using it from `chat_metal`
 
-`chat_metal`'s interactive REPL builds a growing `Vec<ChatMessage>` history and, per PR #619's
-diff, now calls the cache-aware entry point instead of resetting state on every turn:
+`chat_metal`'s interactive REPL builds a growing `Vec<ChatMessage>` history and now calls the
+cache-aware entry point instead of resetting state on every turn:
 
 ```rust
 let cache_result = metal.chat_completion_streaming_with_prefix_cache(
@@ -318,10 +309,10 @@ the fallback path alone, and a dedicated Criterion bench,
 
 ## Summary
 
-- The cache exists and works today only through direct `MetalQwen35State` calls and (once #619
-  merges) `chat_metal`. It is not reachable from `lattice serve` or `lattice_serve` — every HTTP
-  request re-prefills its entire conversation history from scratch, a known and already-documented
-  gap (README, issue #462), not something this document is newly discovering.
+- The cache exists and works today only through direct `MetalQwen35State` calls and `chat_metal`.
+  It is not reachable from `lattice serve` or `lattice_serve` — every HTTP request re-prefills its
+  entire conversation history from scratch, a known and already-documented gap (README, issue #462,
+  currently open with state reason `reopened`), not something this document is newly discovering.
 - Use `CrossTurnSlotId::DEFAULT` for a single local conversation; only one entry is ever retained
   process-wide, so multiplexing several conversations through distinct slot IDs on one
   `MetalQwen35State` does not give each of them independent caching — the most recent one wins and

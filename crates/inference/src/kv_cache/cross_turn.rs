@@ -8,9 +8,13 @@
 //! `crate::forward::metal_qwen35`.
 //!
 //! See design.md step 4 (ADR: latest-boundary GDN snapshot + live KV logical
-//! reuse for v1). Reuse is only ever claimed for an exact token prefix that
-//! is already fully represented by retained state; any divergence falls
-//! back to `PrefixReuseMode::FullRefill`.
+//! reuse for v1). Three reuse modes exist: an exact token prefix that is
+//! already fully represented by retained state plans
+//! `PrefixReuseMode::ExactAppend`; a mid-history divergence at or after a
+//! retained sparse GDN checkpoint boundary plans
+//! `PrefixReuseMode::ReplayFromCheckpoint` (#590, deepest valid boundary
+//! wins); divergence with no usable checkpoint falls back to
+//! `PrefixReuseMode::FullRefill`.
 
 use crate::kv_cache::AdapterId;
 
@@ -81,8 +85,9 @@ pub enum PrefixReuseMode {
     /// snapshot is taken at that same boundary — reuse it verbatim.
     ExactAppend,
     /// Reuse only up to an earlier exact GDN checkpoint, then replay/prefill
-    /// forward. v2: no v1 caller currently supplies checkpoints, so this
-    /// variant is never produced by the current Metal integration.
+    /// forward. Produced when the Metal integration retains sparse GDN
+    /// checkpoints at prior turn boundaries (#590) and the new prompt
+    /// diverges mid-history at or after one of them.
     ReplayFromCheckpoint { checkpoint_len: usize },
 }
 
@@ -176,6 +181,29 @@ pub fn plan_prefix_reuse(
     }
 
     full_refill(shared, entry.represented_len)
+}
+
+/// Whether a retained sparse checkpoint at `len` remains valid when the
+/// slot's entry is replaced by a save at `new_represented_len` whose token
+/// history shares `common_prefix_len` tokens with the old entry's history
+/// (#590).
+///
+/// A checkpoint survives iff:
+/// - `len > 0` — a zero-length boundary is just `FullRefill`, never worth
+///   retaining a snapshot for;
+/// - `len <= common_prefix_len` — the live KV rows below `len` still
+///   represent exactly the tokens the checkpoint's GDN snapshot was taken
+///   against (rows at or above the divergence point were overwritten by
+///   the new suffix prefill);
+/// - `len < new_represented_len` — the new entry's own boundary snapshot
+///   already covers `len == new_represented_len`; a duplicate would waste
+///   a ring slot.
+pub fn checkpoint_survives_save(
+    len: usize,
+    common_prefix_len: usize,
+    new_represented_len: usize,
+) -> bool {
+    len > 0 && len <= common_prefix_len && len < new_represented_len
 }
 
 #[cfg(test)]
@@ -368,5 +396,24 @@ mod tests {
             plan.mode,
             PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 3 }
         );
+    }
+
+    // #590: the survival predicate is the single source of truth for which
+    // ring checkpoints carry over across a save. Mutation sensitivity: each
+    // case below fails if one of the three conjuncts is dropped.
+    #[test]
+    fn checkpoint_survival_requires_all_three_conditions() {
+        // Survives: positive, within the shared prefix, below the new boundary.
+        assert!(checkpoint_survives_save(3, 5, 8));
+        // Boundary-inclusive on the shared prefix.
+        assert!(checkpoint_survives_save(5, 5, 8));
+        // Zero-length boundary never survives.
+        assert!(!checkpoint_survives_save(0, 5, 8));
+        // Past the divergence point: KV rows above lcp were overwritten.
+        assert!(!checkpoint_survives_save(6, 5, 8));
+        // Equal to the new boundary: duplicate of the entry's own snapshot.
+        assert!(!checkpoint_survives_save(8, 8, 8));
+        // Degenerate save at len 0 retains nothing.
+        assert!(!checkpoint_survives_save(1, 5, 0));
     }
 }

@@ -23,6 +23,18 @@ on:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
   workflow_dispatch:
 
+# Cancel a PR's own superseded runs so they stop occupying the shared macOS
+# runner pool (~5 concurrent, account-wide) while a newer push on the same PR
+# waits behind them. Never cancel a push to main, a schedule, or a manual
+# dispatch: none of those has a "next run" to fall back on if killed mid-flight.
+# The event_name segment keeps a scheduled run and a main-push run from
+# sharing one queue: GitHub cancels a PENDING run whenever another run enters
+# its group, even with cancel-in-progress false, so a schedule/push/dispatch
+# trio sharing github.ref could replace each other while queued.
+concurrency:
+  group: e2e-parity-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   pull-requests: write
@@ -168,7 +180,7 @@ jobs:
   # `[self-hosted, macOS, ARM64, metal]` and document why.
   #
   # Deliberately NOT added to parity-gate.needs below: this is an informational
-  # signal only. Making it required is a founder decision (repo branch
+  # signal only. Making it required is a maintainer decision (repo branch
   # protection), out of scope for this change.
   metal-parity:
     name: metal attention parity (informational)
@@ -267,7 +279,7 @@ jobs:
   #
   # NOTE: once this job has gone green on CI once, add "embed-drift" to the
   # repository's required status checks (Settings → Branches → main protection
-  # rule).  That governance step is done by the founder; it is intentionally
+  # rule).  That governance step is done by the maintainers; it is intentionally
   # not automated here.
   embed-drift:
     name: embed drift gate
@@ -328,7 +340,7 @@ jobs:
   # change that must carry rationale + mutation evidence.
   #
   # NOTE: once this job has gone green on CI once, add "q4-composed" to the
-  # repository's required status checks alongside embed-drift. That founder
+  # repository's required status checks alongside embed-drift. That
   # governance step is intentionally not automated here.
   q4-composed:
     name: q4 composed golden

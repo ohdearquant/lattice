@@ -1,6 +1,6 @@
 # ADR-066: Output-Correctness Gate Architecture
 
-- Status: Accepted (founder resolved F-1 through F-4 on 2026-07-01; dispositions recorded in D6)
+- Status: Accepted (F-1 through F-4 resolved on 2026-07-01; dispositions recorded in D6)
 - Date: 2026-07-01
 - Depends on: ADR-064 (CI gate taxonomy), ADR-065 (feature promotion gates), ADR-063 (serving architecture)
 - Supersedes: nothing (fills the gap ADR-064's verified-absence ledger and D6 table point at)
@@ -11,7 +11,7 @@ ADR-064 classified every *existing* gate and established the promotion policy (D
 governs *new feature admission*. Neither answers the question this ADR answers: **what output
 invariants must the engine hold, and which gate layer enforces each one?**
 
-Ground truth as of 2026-07-01 (full inventory: `.khive/workspaces/20260701/f1-gates/gate_inventory.md`):
+Ground truth as of 2026-07-01:
 
 - Branch protection is ruleset `16354934`: exactly 8 required status contexts (`CI` ×3,
   `feature-matrix` ×2, `bench-compile`, `cargo-deny`, `parity-gate`), **zero required PR
@@ -23,8 +23,7 @@ Ground truth as of 2026-07-01 (full inventory: `.khive/workspaces/20260701/f1-ga
   `bench-update.yml` (no `pull_request` trigger at all), `embed-parity-release.yml`
   (release-cadence only).
 
-Ten shipped-and-fixed bug classes were mapped against this gate set
-(`.khive/workspaces/20260701/f1-gates/gap_corpus.md`). Every one of them merged clean through
+Ten shipped-and-fixed bug classes were mapped against this gate set. Every one of them merged clean through
 the gates above. They do not miss randomly — they cluster into five structural blind spots of
 the current architecture:
 
@@ -83,7 +82,7 @@ contract test (this is enforceable in review by grepping the catalog):
    convention (stride-half max-diff ~1e-6 vs interleaved ~67 — rejects in seconds).
 9. **Recurrent-state indexing**: decay/gate parameters index by the reference architecture's
    cardinality (per-value-head for asymmetric GDN); verified against HF indexing, not
-   self-consistency. (Full closure founder-gated on an asymmetric checkpoint — #262.)
+   self-consistency. (Full closure blocked on an asymmetric checkpoint — #262.)
 10. **Fail-closed context bounds**: forward paths return errors, never assert-panic, when
     `prompt_len > max_context()`.
 
@@ -95,7 +94,7 @@ contract test (this is enforceable in review by grepping the catalog):
 2. **The aggregator pattern is canonical.** Any path-filtered required check must follow
    `parity-gate`'s always-report aggregator design (e2e-parity.yml:205-238). `app-binaries.yml`
    currently violates this: it runs on nearly every engine PR, can show red, and blocks nothing.
-   It gets an aggregator job; making that aggregator *required* is founder-gated (D6).
+   It gets an aggregator job; making that aggregator *required* is deferred pending sign-off (D6).
 3. **Compare rendered text, not only token IDs.** `e2e_parity_check.py`'s `compare()` gains a
    decoded-text equality check alongside `hf_ids`/`lat_ids`. This single change makes the
    existing required gate structurally able to see bug classes #430 and (with a CJK prompt
@@ -132,16 +131,16 @@ contract test (this is enforceable in review by grepping the catalog):
 | Serve DoS (#435) | 7, 10 | L4/L1 | Partial — clamps shipped; no CI abuse-path test |
 | Metal under-dispatch (#384) | 6 | L1 | Partial — fixed site tested; no canary-test convention for new kernels |
 | Paravirtual false-green | D3.1 | signal | No — one opt-in env var on one test |
-| GDN decay indexing (#262/#427) | 9 | L3 | No — needs long-horizon gate + asymmetric checkpoint (founder-gated) |
+| GDN decay indexing (#262/#427) | 9 | L3 | No — needs long-horizon gate + asymmetric checkpoint (deferred) |
 | Streaming UTF-8 (#196) | 5 | L1 + D3.3 | Partial — unit tests yes; no CJK prompt in the required gate |
 
 Open issues #239 (Metal parity leg), #320 (rotated+Q4 composed golden), #252 (kv_f16 parity
 run), #167 (self-hosted perf/quality gates), #153 (per-kernel micro-bench gate) are all
 instances of this ADR's L2/L3 layers and inherit its design rather than each re-deciding shape.
 
-### D6. Rollout — founder-gated vs immediately actionable
+### D6. Rollout — deferred vs immediately actionable
 
-**Founder-gated** (each changes merge-blocking behavior or spends money; per ADR-064 D7 rule 5):
+**Deferred** (each changes merge-blocking behavior or spends money; per ADR-064 D7 rule 5):
 
 | # | Proposal | Cost/impact |
 |---|---|---|
@@ -150,7 +149,7 @@ instances of this ADR's L2/L3 layers and inherit its design rather than each re-
 | F-3 | Self-hosted M2 Max runner for L3 nightly (PPL tiers, long-generation, #167 perf gates) | Hardware + maintenance; the only path to non-paravirtual Metal signal |
 | F-4 | Any change to review requirements or bypass actors (`required_approving_review_count: 0`, RepositoryRole bypass) | Governance; out of automated hands entirely |
 
-**Founder dispositions (2026-07-01, approved as recommended):**
+**Dispositions (2026-07-01, approved as recommended):**
 
 - F-1: **Approved.** `app-binaries` aggregator becomes a required context once the
   non-required job (item 5 below) exists and is green.
@@ -159,11 +158,11 @@ instances of this ADR's L2/L3 layers and inherit its design rather than each re-
   (review checkpoint 2026-07-15).
 - F-3: **Approved, schedule-only.** The self-hosted runner workflow runs on `schedule` against
   `main` only, never on pull requests (public-repo fork-PR code execution risk). The workflow
-  ships dormant; runner registration waits on founder-designated hardware.
+  ships dormant; runner registration waits on designated hardware.
 - F-4: **Keep as is.** Zero required approvals and RepositoryRole bypass remain while the repo
   is effectively solo; revisit when outside contributors arrive.
 
-**Immediately actionable without founder sign-off** (no required-context changes, no spend):
+**Immediately actionable without further sign-off** (no required-context changes, no spend):
 
 1. `e2e_parity_check.py`: add rendered-text comparison to `compare()` + 1 CJK/emoji prompt (D3.3).
 2. Regenerate `docs/bench_results/perplexity.tsv` on current main; commit the command (D3.4).
@@ -188,7 +187,6 @@ instances of this ADR's L2/L3 layers and inherit its design rather than each re-
 
 ## Verification
 
-- Inventory and corpus artifacts with file:line citations:
-  `.khive/workspaces/20260701/f1-gates/{gate_inventory,gap_corpus}.md` (recon 2026-07-01,
-  primary sources only — live ruleset JSON, workflow files, `git log`, `gh issue view`).
+- Inventory and corpus recon (2026-07-01) built from primary sources only — live ruleset
+  JSON, workflow files, `git log`, `gh issue view`.
 - Every "fixed in" claim in D5 maps to a merge commit verified in git history during recon.

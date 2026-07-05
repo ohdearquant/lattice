@@ -72,7 +72,7 @@ def find_baseline_estimates(bench_dir: Path, baseline_name: str) -> Path | None:
     bench-compare.sh's `compare-base` leg) writes under `<name>/` instead —
     `base/` is never created in that flow. Prefer the caller-supplied baseline
     name FIRST: Criterion computed change/ against that baseline, so a stale
-    `base/` left in a dirty local tree must not shadow it (codex review of
+    `base/` left in a dirty local tree must not shadow it (review of
     PR #548 reproduced exactly that wrong-baseline report). Then try the
     default `base/` (covers CI's default-rotation runs). As a last resort,
     accept a sibling directory holding an estimates.json that isn't
@@ -208,7 +208,7 @@ def run_selftest() -> int:
     Regression coverage for #545: a default-rotation `base/` layout, a named-baseline
     `compare-base/` layout (what bench-compare.sh actually produces), and a `change/`
     dir with no resolvable baseline at all (must WARN by bench name, not silently skip).
-    Plus the codex findings on PR #548: when BOTH base/ and the named baseline exist,
+    Plus the findings on PR #548: when BOTH base/ and the named baseline exist,
     the named baseline must win (dirty local tree with stale base/); when multiple
     unrelated sibling baselines exist and none match, the gate must refuse to guess.
     """
@@ -238,7 +238,7 @@ def run_selftest() -> int:
                      "confidence_interval": {"lower_bound": 0.05, "upper_bound": 0.15}}
         }))
 
-        # Codex finding 1: both base/ and compare-base/ present with different
+        # Finding 1: both base/ and compare-base/ present with different
         # values — the named baseline must win over stale base/.
         both_dir = root / "grp_d" / "bench_both"
         _fabricate_bench(both_dir, "compare-base", base_ns=100.0)
@@ -246,7 +246,7 @@ def run_selftest() -> int:
         (both_dir / "base" / "estimates.json").write_text(
             json.dumps({"mean": {"point_estimate": 1.0}}))  # stale decoy
 
-        # Codex finding 2: multiple unrelated sibling baselines, none matching
+        # Finding 2: multiple unrelated sibling baselines, none matching
         # the requested name — must skip loudly, not guess.
         multi_dir = root / "grp_e" / "bench_multi"
         _fabricate_bench(multi_dir, "old-run-1")
