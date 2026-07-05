@@ -133,109 +133,32 @@ struct QuantizeIndex {
     tensors: Vec<IndexEntry>,
 }
 
-/// Bounded size cap for `quantize_index.json` reads (#504 remaining slice 2).
-/// The index is a small per-tensor manifest (name/file/quantized/shape/numel
-/// per output tensor); even a multi-thousand-tensor checkpoint stays well
-/// under this cap. Bounding the read (stat-then-take, not a bare
-/// `fs::read`) prevents an unbounded allocation if the file is swapped for
-/// something huge between stat and read.
-#[cfg(any(test, feature = "metal-gpu"))]
-const MAX_QUANTIZE_INDEX_LEN: u64 = 16 * 1024 * 1024; // 16 MiB
-
-/// Read `quantize_index.json` under `dir`, bounded to
-/// [`MAX_QUANTIZE_INDEX_LEN`]. Returns `Ok(None)` only when the file is
-/// genuinely absent; any other failure (oversized, unreadable) is `Err`.
-///
-/// The only caller (`read_quarot_seed_from_index`, and in turn
-/// `MetalQwen35State::from_q4_dir`) is `metal-gpu`-gated; this is `#[cfg(any(test, ...))]`
-/// so the CPU-only test suite can exercise the real fail-closed logic
-/// without requiring a Metal GPU build (mirrors the slice-1 pattern in
-/// `weights/q4_weights.rs`).
-#[cfg(any(test, feature = "metal-gpu"))]
-fn read_quantize_index_bytes_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    use std::io::Read;
-    let metadata = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "{}: failed to stat quantize_index.json: {e}",
-                path.display()
-            ));
-        }
-    };
-    if metadata.len() > MAX_QUANTIZE_INDEX_LEN {
-        return Err(format!(
-            "{}: quantize_index.json too large: {} bytes exceeds cap of {MAX_QUANTIZE_INDEX_LEN} bytes",
-            path.display(),
-            metadata.len()
-        ));
-    }
-    let file = fs::File::open(path).map_err(|e| {
-        format!(
-            "{}: failed to open quantize_index.json: {e}",
-            path.display()
-        )
-    })?;
-    let mut buf = Vec::new();
-    file.take(MAX_QUANTIZE_INDEX_LEN.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|e| {
-            format!(
-                "{}: failed to read quantize_index.json: {e}",
-                path.display()
-            )
-        })?;
-    if buf.len() as u64 > MAX_QUANTIZE_INDEX_LEN {
-        return Err(format!(
-            "{}: quantize_index.json too large: read exceeds cap of {MAX_QUANTIZE_INDEX_LEN} bytes",
-            path.display()
-        ));
-    }
-    Ok(Some(buf))
-}
-
 /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
+///
+/// Delegates the bounded read and shape-normalized parse to
+/// [`crate::quant::q4_manifest`] (issue #655 — the shared manifest reader
+/// also backs `lattice doctor`'s inventory and, transitively through this
+/// function, the Metal Q4 loader's QuaRot-flavor detection).
 ///
 /// Fail-closed contract (#504 remaining slice 2): a genuinely **absent**
 /// file is `Ok(None)` — pre-ADR-051 artifacts never had this file, and the
 /// caller falls back to the legacy `config.json` field
 /// (`quarot_rotation_seed`) for those. A **present** file that fails to
-/// read, exceeds the size cap, is not valid JSON, or does not match the
-/// `QuantizeIndex` schema is `Err`. Previously all three of "absent",
-/// "malformed", and "present without the key" collapsed to the same silent
-/// `None` — but a file that exists and doesn't parse is evidence of
+/// read, exceeds the size cap, is not valid JSON, or does not match either
+/// manifest shape is `Err`. Previously all three of "absent", "malformed",
+/// and "present without the key" collapsed to the same silent `None` — but
+/// a file that exists and doesn't parse is evidence of
 /// truncation/corruption/tampering, not a legitimate "no rotation"
 /// artifact, and silently falling back to the legacy seed (or no rotation
 /// at all) would apply the wrong rotation to a checkpoint that was
 /// actually QuaRot-rotated, silently corrupting inference output instead
-/// of refusing to load.
+/// of refusing to load. A bare-array (`quantize_q4`) manifest genuinely
+/// carries no rotation seed and normalizes to `Ok(None)` rather than an
+/// error (#630 end-to-end verification against the real
+/// qwen3.5-0.8b-q4 checkpoint).
 #[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn read_quarot_seed_from_index(q4_dir: &Path) -> Result<Option<u64>, String> {
-    let path = q4_dir.join("quantize_index.json");
-    let Some(bytes) = read_quantize_index_bytes_bounded(&path)? else {
-        return Ok(None);
-    };
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
-    // `quantize_q4` (plain, non-rotated Q4 checkpoints — see
-    // `crates/inference/src/bin/quantize_q4.rs`) writes `quantize_index.json`
-    // as a bare top-level tensor array, not the `{quarot_seed, tensors}`
-    // object `quantize_quarot` produces. That shape genuinely carries no
-    // rotation seed; it is not malformed. Without this check, serde's
-    // derived `Deserialize` for `QuantizeIndex` accepts a top-level JSON
-    // array too (treating positional elements as struct fields in
-    // declaration order), so the array's first tensor entry (a JSON object)
-    // would be deserialized as the `quarot_seed: Option<u64>` field and fail
-    // with a confusing "invalid type: map, expected u64" — turning a
-    // perfectly valid plain-Q4 checkpoint into a hard load failure (#630
-    // end-to-end verification against the real qwen3.5-0.8b-q4 checkpoint).
-    if value.is_array() {
-        return Ok(None);
-    }
-    let index: QuantizeIndex = serde_json::from_value(value)
-        .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
-    Ok(index.quarot_seed)
+    Ok(crate::quant::q4_manifest::load_manifest(q4_dir)?.and_then(|m| m.quarot_seed))
 }
 
 fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
@@ -2384,7 +2307,7 @@ mod tests {
         let err = read_quarot_seed_from_index(tmp.path())
             .expect_err("malformed quantize_index.json must be rejected, not silently None");
         assert!(
-            err.contains("malformed quantize_index.json"),
+            err.contains("quantize_index.json") && err.contains("not valid JSON"),
             "error must name the malformed-index failure; got: {err}"
         );
     }
@@ -2431,7 +2354,8 @@ mod tests {
         // One byte over the cap; write sparsely via set_len to avoid
         // actually allocating/writing 16 MiB+1 in the test.
         let f = fs::File::create(&path).unwrap();
-        f.set_len(MAX_QUANTIZE_INDEX_LEN + 1).unwrap();
+        f.set_len(crate::quant::q4_manifest::MAX_QUANTIZE_INDEX_LEN + 1)
+            .unwrap();
         drop(f);
         let err = read_quarot_seed_from_index(tmp.path())
             .expect_err("oversized quantize_index.json must be rejected");

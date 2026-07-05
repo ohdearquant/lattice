@@ -338,14 +338,20 @@ corrupted or incomplete conversion — `doctor` inherits the same Qwen3.6-27B co
 your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doctor` before assuming
 the conversion itself is broken.
 
-`doctor` now accepts both `quantize_index.json` manifest shapes:
+`quantize_index.json` parsing and validation is centralized in one place: the
+`lattice_inference::quant::q4_manifest` module (`crates/inference/src/quant/q4_manifest.rs`).
+`doctor`'s tensor inventory, QuaRot rotation-seed detection, and the Metal Q4 loader's
+QuaRot-flavor detection all go through this module's bounded reader (fail-closed on a
+missing, truncated, or oversized file) and shape-normalized parser, rather than each
+call site re-deriving its own copy of the contract. That module recognizes both
+`quantize_index.json` manifest shapes:
 
 - `quantize_q4` writes a bare JSON array of tensor entries.
 - `quantize_quarot` writes an object with a `tensors` array and metadata such as `quarot_seed`.
 
-For the doctor preflight, both shapes normalize to the same tensor inventory; the QuaRot seed is
-not needed for these checks. Older output captured before issues
-[#626](https://github.com/ohdearquant/lattice/issues/626) and
+Both shapes normalize to the same tensor inventory; the QuaRot seed field is populated only
+for the object form, and is `None` (not an error) when absent from either shape. Older output
+captured before issues [#626](https://github.com/ohdearquant/lattice/issues/626) and
 [#627](https://github.com/ohdearquant/lattice/issues/627) may show an `invalid type: map, expected
 a sequence` manifest error for QuaRot directories. That failure mode is historical for current
 `lattice doctor` builds.

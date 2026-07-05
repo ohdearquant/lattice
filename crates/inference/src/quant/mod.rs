@@ -6,4 +6,5 @@
 //!   primitives. No quantization integration yet; future PRs will wire these
 //!   into [`crate::weights::q4_weights`] (see ADR-044).
 
+pub mod q4_manifest;
 pub mod quarot;
