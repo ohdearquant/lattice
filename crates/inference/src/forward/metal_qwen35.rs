@@ -10530,7 +10530,7 @@ kernel void gdn_chunk_norm_silu_c32(
                         generated_ids.extend_from_slice(&tokens[..emit_len]);
                         // Stop-token contract (#613): `tokens` holds only the committed
                         // (non-stop) tokens for this round — the stop token itself is
-                        // never in it. Codex round-1 (#632): `emit_len == tokens.len()`
+                        // never in it. #632: `emit_len == tokens.len()`
                         // alone is not sufficient — if the committed payload exactly
                         // fills `remaining`, the excluded stop token would have landed
                         // one position *beyond* `max_new_tokens`, so plain greedy would
@@ -20346,7 +20346,7 @@ kernel void decode_attention_reference(
             // Round-1 MAJOR integration coverage: a mixed/stale QuaRot
             // directory (both .q4 and .f16 for a projection, is_quarot=true)
             // must be a hard `Err`, not a gracefully-disabled `None` — this
-            // is the exact failure-open scenario codex flagged.
+            // is the exact failure-open scenario this guard closes.
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(device) = Device::system_default() else {
                 assert!(
@@ -20383,7 +20383,7 @@ kernel void decode_attention_reference(
         }
 
         // -------------------------------------------------------------------
-        // from_q4_dir refuse-on-misconfig (round-1 codex findings on PR #32)
+        // from_q4_dir refuse-on-misconfig (PR #32)
         // -------------------------------------------------------------------
         //
         // `read_quarot_seed_from_index` itself (the `quantize_index.json`
@@ -20394,7 +20394,7 @@ kernel void decode_attention_reference(
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
-            // Round-1 codex Major: `from_q4_dir` was missing the
+            // `from_q4_dir` was missing the
             // `max_cache_len <= cfg.max_position_embeddings` guard that
             // `new_session` enforces. Without it, `--max-cache-len 999999
             // --window 999999` would slip past the strided-PPL aggregator
@@ -20442,7 +20442,7 @@ kernel void decode_attention_reference(
 
         #[test]
         fn from_q4_dir_rejects_tied_config_with_lm_head_artifact() {
-            // Round-2 codex Blocker: the round-1 fix only caught the
+            // The prior fix only caught the
             // `tie_word_embeddings=false` + missing `lm_head.q4` half of
             // the artifact contract. The opposite mismatch —
             // `tie_word_embeddings=true` but a `lm_head_weight.q4`
@@ -20485,7 +20485,7 @@ kernel void decode_attention_reference(
 
         #[test]
         fn from_q4_dir_rejects_untied_config_without_lm_head_artifact() {
-            // Round-1 codex Blocker: the loader silently fell back to
+            // The loader silently fell back to
             // `embed_tokens` when `tie_word_embeddings=false` and
             // `lm_head.q4` was missing. That is exactly the contamination
             // ADR-044 step 3c forbids — a QuaRot artifact missing its
@@ -21100,7 +21100,7 @@ kernel void decode_attention_reference(
             }
         }
 
-        /// Regression for the Q4 decode dispatch-geometry bug (codex 2026-06-26).
+        /// Regression for the Q4 decode dispatch-geometry bug (2026-06-26).
         ///
         /// `gemv_q4_decode` writes NR=2 output rows per threadgroup, so
         /// `dispatch_matmul_q4` MUST launch `ceil(N/2)` groups. The prior `ceil(N/4)`
@@ -21182,7 +21182,7 @@ kernel void decode_attention_reference(
                 assert!(
                     val.to_bits() != SENTINEL.to_bits(),
                     "row {row} of {n} never written — dispatch grid under-covers \
-                     gemv_q4_decode (NR=2 rows/group). This is the codex P0 decode-geometry bug."
+                     gemv_q4_decode (NR=2 rows/group). This is the P0 decode-geometry bug."
                 );
             }
             let diff = max_abs_diff(y, &y_ref);
@@ -21633,7 +21633,7 @@ kernel void decode_attention_reference(
                  half-tile staging may be saturating or accumulating in f16"
             );
 
-            // ── Isolated near-zero block (codex #272 review) ────────────────
+            // ── Isolated near-zero block (#272) ────────────────
             // The mixed-block assertion above is dominated by the near-unit block, so it
             // cannot isolate the near-zero claim. Zero the near-unit block and keep only the
             // near-zero one, so the output magnitude IS the near-zero block's contribution.
@@ -23872,7 +23872,7 @@ kernel void decode_attention_reference(
 
         #[test]
         fn metal_generate_multimodal_excludes_stop_token() {
-            // Codex round 1 (#632) flagged `generate_multimodal` as a public
+            // #632: `generate_multimodal` is a public
             // entry point with its own sampling loop, missing from both the
             // `stop_token_contract` manifest and this test module's #613
             // sweep. It already implements the EXCLUDE contract (checks
@@ -25793,7 +25793,7 @@ kernel void decode_attention_reference(
             assert_eq!(p.num_chunks, 2); // ceil(33/32) = 2
         }
 
-        /// Regression for the chunked log-decay NaN edge (codex review of PR #235).
+        /// Regression for the chunked log-decay NaN edge (PR #235).
         ///
         /// `gdn_chunk_materialize_c32` stores each token's log-decay `-a*sp` and
         /// `gdn_chunk_solve_c32` forms decay ratios as `exp(cumsum[j] - cumsum[k])`.
@@ -26925,9 +26925,8 @@ kernel void decode_attention_reference(
         }
 
         // -------------------------------------------------------------------
-        // #516 round-1 remediation (codex REJECT) — regression coverage for
-        // findings 1/2/3/4. See
-        // .khive/codex_reviews/codex_review_pr516.md.
+        // #516 remediation — regression coverage for
+        // findings 1/2/3/4.
         // -------------------------------------------------------------------
 
         /// Finding 1 (slot isolation): a divergent-prompt call on a
@@ -27232,7 +27231,7 @@ kernel void decode_attention_reference(
             );
         }
 
-        /// Round-2 D7 (codex blocker): a public raw-forward call
+        /// D7: a public raw-forward call
         /// (`forward_step`) interleaved between two cache-aware calls on the
         /// SAME slot must invalidate the retained entry, exactly like
         /// `generate_streaming`'s `reset_state()` does for finding 2's
@@ -27287,7 +27286,7 @@ kernel void decode_attention_reference(
             );
 
             // Interleave a raw public forward call on an unrelated token
-            // stream. This is the exact stale path codex named: `forward_step`
+            // stream. This is the exact stale path: `forward_step`
             // advances `self.session.kv_cache` / GDN state directly, bypassing
             // both `reset_state()` (D3's guard) and the cache-aware save path.
             let _ = state.forward_step(0, 0);
@@ -27437,8 +27436,8 @@ kernel void decode_attention_reference(
         // of the three functions (`generate`, `generate_streaming_with_cancel`,
         // `generate_streaming_with_prefix_cache_inner`) — is reachable only
         // from step 2 onward and needs a grammar that allows exactly one
-        // token and then blocks everything. #611 round-1 codex review (medium
-        // finding) flagged that gap: it is covered separately by the
+        // token and then blocks everything. #611 (medium
+        // finding): that gap is covered separately by the
         // "DECODE-LOOP integration tests" block below this one, which builds
         // exactly that allow-then-block fixture.
         //
@@ -27648,7 +27647,7 @@ kernel void decode_attention_reference(
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611 round-1 codex
+        // Grammar fail-closed DECODE-LOOP integration tests (#611
         // finding, medium)
         //
         // The three tests above only reach the post-prefill masking site: their
@@ -29833,7 +29832,7 @@ mod mtp_greedy_round_tests {
     }
 
     // -----------------------------------------------------------------------
-    // CAP-EDGE REGRESSION (codex finding #1 on PR #287):
+    // CAP-EDGE REGRESSION (PR #287):
     // A round can emit up to 2 non-stop tokens (case B, #613). When
     // max_new_tokens lands mid-emission, the call site must clip so MTP
     // never exceeds the cap — plain greedy `generate()` stops at the cap
@@ -30042,7 +30041,7 @@ mod mtp_greedy_round_tests {
     // *meaning* of "every token in tokens was emitted" shifts, since `tokens`
     // is shorter now (see the budget=2 test below for the concrete effect).
     //
-    // Codex round-1 (#632): `emit_len == tokens.len()` alone under-counts one
+    // #632: `emit_len == tokens.len()` alone under-counts one
     // more boundary — when the committed payload exactly *fills* `remaining`
     // (`remaining == tokens.len()`), the excluded stop token itself would sit
     // one position beyond `max_new_tokens`. Plain greedy never reaches that
@@ -30117,7 +30116,7 @@ mod mtp_greedy_round_tests {
                     // FIX 1: stopped only when every committed token was actually
                     // emitted (not clipped) — tokens never includes the stop itself
                     // — AND at least one more slot remained beyond the committed
-                    // payload for that excluded stop token (codex round-1, #632):
+                    // payload for that excluded stop token (#632):
                     // an exact-fill payload (remaining == tokens.len()) means the
                     // stop token itself sits beyond the budget, so plain greedy
                     // would report Length there, not Eos.
@@ -30157,8 +30156,8 @@ mod mtp_greedy_round_tests {
         // payload exactly fills the budget, so the excluded bonus stop token
         // would have landed one position beyond `max_new_tokens`.
         //
-        // Codex round-1 (#632) flagged the prior expectation here
-        // (`stopped=true`) as wrong: plain greedy's decode loop caps at
+        // #632: the prior expectation here
+        // (`stopped=true`) was wrong: plain greedy's decode loop caps at
         // exactly `max_new_tokens` steps and never samples that extra
         // position, so it would report `Length`, not `Eos`, in this exact
         // scenario. `stopped=false` is the correct value — the emitted
@@ -30182,7 +30181,7 @@ mod mtp_greedy_round_tests {
         // argmax at pos+1 agrees) → EmitAndStop([pending]) = [10] (draft
         // excluded, #613). Budget=1: remaining=1 == tokens.len()=1 (exact
         // fill) → the excluded stop token would sit one position beyond the
-        // budget → stopped=false (codex round-1, #632 boundary case).
+        // budget → stopped=false (#632 boundary case).
         let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
         let draft_seq = vec![EOS];
         let (tokens, stopped) = simulate_mtp_with_stopped(&logit_rows, &draft_seq, 1);
@@ -30214,7 +30213,7 @@ mod mtp_greedy_round_tests {
         // disagrees with the proposed draft), and the target's replacement
         // (bonus_token) is itself the stop → EmitAndStop([pending]) = [10]
         // (replacement excluded, #613). Budget=1: remaining=1 ==
-        // tokens.len()=1 (exact fill) → stopped=false (codex round-1, #632).
+        // tokens.len()=1 (exact fill) → stopped=false (#632).
         let logit_rows = vec![make_logit(10, 5), make_logit(EOS, 5)];
         // draft_seq deliberately does not match argmax(logit_rows[1])=EOS,
         // forcing rejection; the target's replacement (EOS) becomes bonus_token.

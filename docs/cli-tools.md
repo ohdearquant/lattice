@@ -8,7 +8,7 @@ one is for, what it needs on disk, and a verified command sequence with real out
 Every command below was actually run against a local `qwen3.5-0.8b` checkpoint (and its Q4
 variants) in this repository: the flags, the failure messages, and the output shapes are copied
 from that terminal, not reconstructed from memory. Metal-GPU-touching runs went through the
-fleet-wide `/tmp/lion-metal-gpu-test.lock` advisory flock (see `CLAUDE.md`) so they never
+machine-wide `/tmp/lion-metal-gpu-test.lock` advisory flock (see `CLAUDE.md`) so they never
 overlapped another process's GPU work.
 
 **A note on the numbers below.** Every `tok/s`, latency, timing, and perplexity figure in this

@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Dry-run / real-write byte-count parity (codex finding fix gate)
+    // Dry-run / real-write byte-count parity
     // ------------------------------------------------------------------
 
     /// Correctness gate: dry_run=true and dry_run=false on the same model
@@ -1510,8 +1510,8 @@ mod tests {
     }
 
     /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
-    /// Includes an f16-subnormal regression: codex round-1 flagged that
-    /// the old local helper flushed every value below f16's smallest
+    /// Includes an f16-subnormal regression, since fixed: the old local
+    /// helper flushed every value below f16's smallest
     /// normal to zero, silently corrupting small-magnitude weights in
     /// kept tensors (e.g., `A_log`, `dt_bias`, GDN `linear_attn.norm`).
     #[test]
@@ -1528,8 +1528,7 @@ mod tests {
         let h = q4_f32_to_f16(1e-7_f32);
         assert_ne!(
             h, 0,
-            "1e-7 (an f16 subnormal range value) must not flush to zero \
-             — that was the codex round-1 Medium"
+            "1e-7 (an f16 subnormal range value) must not flush to zero"
         );
         // f32 subnormals (well below f16's subnormal range) DO round to zero
         // because there's no f16 representation for them.
@@ -1546,7 +1545,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Path-layout refuses (codex round-1 Majors 1 + 2)
+    // Path-layout refuses (review findings, Majors 1 + 2)
     // ------------------------------------------------------------------
 
     /// Major 1: when input and output paths resolve to the same canonical

@@ -6,7 +6,7 @@
 /// Pruned-8  mask: GDN layers 12,16,20,24,28,32,36,40 removed (every 4th GDN in middle).
 /// Pruned-12 mask: GDN layers 8,12,16,20,24,28,32,36,40,44,48,52 removed (evenly spread).
 ///
-/// Gate (from critic spec): mean_cos >= 0.95 AND min_cos >= 0.85.
+/// Quality gate: mean_cos >= 0.95 AND min_cos >= 0.85.
 ///
 /// Usage:
 ///   LATTICE_MODEL_DIR=~/.lattice/models/qwen3.6-27b-q4 \
@@ -83,7 +83,7 @@ fn run() {
         .collect();
 
     // Pruning masks — GDN layers only, type-balanced is not needed since both configs
-    // are pure-GDN and the critic requested these specific indices
+    // are pure-GDN and the pruning benchmark uses these specific indices
     let pruned_8_layers: Vec<usize> = vec![12, 16, 20, 24, 28, 32, 36, 40];
     let pruned_12_layers: Vec<usize> = vec![8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52];
 

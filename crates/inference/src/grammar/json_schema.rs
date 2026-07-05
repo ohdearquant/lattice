@@ -53,7 +53,7 @@ const MAX_ARRAY_CARDINALITY: usize = 4096;
 /// it. A parseable schema with a long `$defs` reference chain
 /// (`A→B→C→…`, each a distinct unseen ref) or deeply nested objects therefore
 /// recurses once per link with no natural bound — a compile-time stack overflow
-/// reachable from untrusted schema input (issue #343, codex finding B). Cap the
+/// reachable from untrusted schema input (issue #343, finding B). Cap the
 /// depth: `serde_json` itself rejects JSON nested beyond 128, and no legitimate
 /// schema chains references or nests anywhere near 512 levels.
 const MAX_SCHEMA_DEPTH: usize = 512;
@@ -600,8 +600,8 @@ impl<'a> CompileCtx<'a> {
     /// would re-materialize the (sibling-dropped) non-string target and
     /// over-accept it. The string-forcing check spans the WHOLE chain, not just
     /// the outer `sub`, so an intermediate `$defs` node such as
-    /// `{"$ref":<integer def>,"type":"string"}` is caught (issue #473, codex
-    /// review). This lookup never touches `self.depth` and never registers a
+    /// `{"$ref":<integer def>,"type":"string"}` is caught (issue #473). This
+    /// lookup never touches `self.depth` and never registers a
     /// rule; `compile_ref` / `compile_schema` remain the authoritative recursion
     /// guard (issue #343) for the `other_subs` path.
     fn ref_string_contribution(&self, sub: &'a Value) -> Result<RefStr, SchemaError> {
@@ -1118,7 +1118,7 @@ impl<'a> CompileCtx<'a> {
             id
         };
 
-        // issue #310 #2 (codex review): honor cardinality even with no `items` schema.
+        // issue #310 #2: honor cardinality even with no `items` schema.
         if min_items > 0 || max_items.is_some() {
             let n = self.array_counter;
             self.array_counter += 1;
@@ -2758,7 +2758,7 @@ mod tests {
     /// A typed mixed `enum` sibling `{"type":"string","enum":["abe",1]}`: the
     /// `type:"string"` makes the integer member unsatisfiable, so the branch's
     /// language is exactly {"abe"} and `string_class_of` folds it into the
-    /// literal trie (issue #310 / PR #472, codex round-3 offered fix). The trie
+    /// literal trie (issue #310 / PR #472). The trie
     /// then accepts both the const "abc" and the folded "abe". Mutation guard:
     /// dropping the typed-mixed fold (classifying the enum as an "other") strands
     /// "abe" behind the const trie and over-rejects it.
@@ -2788,8 +2788,8 @@ mod tests {
     /// must be a string AND equal a numeric enum member, so it accepts no string.
     /// `string_class_of` must classify it as the empty literal set (a dead
     /// branch), NOT `None` — `None` routes it through `compile_string_type`'s
-    /// `json_string` fallback and over-accepts arbitrary strings (issue #472
-    /// codex round-4 blocker 2). Mutation guard: returning `None` accepts "zzz".
+    /// `json_string` fallback and over-accepts arbitrary strings (issue #472,
+    /// finding 2). Mutation guard: returning `None` accepts "zzz".
     #[test]
     fn anyof_typed_enum_no_string_members_rejected() {
         let g = compile_ok(r#"{"anyOf":[{"type":"integer"},{"type":"string","enum":[1,2]}]}"#);
@@ -2803,8 +2803,8 @@ mod tests {
     /// `const` and `enum` are conjunctive, so `{"type":"string","const":"x","enum":["y"]}`
     /// accepts no value (nothing equals both "x" and "y"). `string_class_of` must
     /// fold the const only when a present enum contains it, classifying this
-    /// conflicting branch as the empty literal set (issue #472 codex round-4
-    /// blocker 1). Mutation guard: folding the const before checking the enum
+    /// conflicting branch as the empty literal set (issue #472,
+    /// finding 1). Mutation guard: folding the const before checking the enum
     /// accepts "x"; folding the enum before checking the const accepts "y".
     #[test]
     fn anyof_const_conflicting_enum_rejected() {
@@ -2824,7 +2824,7 @@ mod tests {
 
     /// `{"type":"string","const":"x","enum":["x","y"]}`: the const narrows the
     /// enum to the intersection {"x"}, so only "x" is accepted, NOT "y" (issue
-    /// #472 codex round-4). Mutation guard: ignoring the const and folding the
+    /// #472). Mutation guard: ignoring the const and folding the
     /// whole enum accepts "y".
     #[test]
     fn anyof_const_compatible_enum_folds_to_const() {
@@ -2885,7 +2885,7 @@ mod tests {
 
     /// Edge cases for typed string enums: an empty `enum` is the empty language
     /// (reject all), and a duplicate member folds to a single trie path without
-    /// error (issue #472 codex round-4 next-round focus).
+    /// error (issue #472).
     #[test]
     fn typed_string_enum_empty_and_duplicate_members() {
         let empty = compile_ok(r#"{"type":"string","enum":[]}"#);
@@ -3048,7 +3048,7 @@ mod tests {
         );
     }
 
-    /// FIXED (issue #473, codex REJECT): the string-forcing keyword sits on an
+    /// FIXED (issue #473): the string-forcing keyword sits on an
     /// INTERMEDIATE `$defs` node, not the outer `anyOf` sub. `S` is
     /// `{$ref: N-integer, type/const/enum-string}`, so `S`'s language is the
     /// empty conjunction (integer ∧ string); the outer branch `{$ref: S}` is a
@@ -3108,7 +3108,7 @@ mod tests {
         );
     }
 
-    /// FIXED (issue #473, codex round-2 REJECT): draft-2020-12 §6.1.1 lets `type`
+    /// FIXED (issue #473): draft-2020-12 §6.1.1 lets `type`
     /// be an ARRAY of type names. A string-ONLY type array (`["string"]`, or any
     /// non-empty all-`"string"` array) is string-forcing, exactly like the scalar
     /// `type:"string"`. On a `$ref`->integer terminal — DIRECT sibling or an
@@ -4514,8 +4514,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #474 (round-4 follow-up) — anyOf branch-count cap and byte
-    // budgets that were checked late (or not at all) before this round.
+    // Issue #474 (follow-up) — anyOf branch-count cap and byte
+    // budgets that were checked late (or not at all) previously.
     // -----------------------------------------------------------------------
 
     /// anyOf/oneOf branch-count cap (issue #474, finding 2): a schema whose
@@ -4655,13 +4655,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #474 (round-6 follow-up) — single-oversized-literal byte cap.
-    // Rounds 1-5 capped cardinality (many literals); this closes the
+    // Issue #474 (follow-up) — single-oversized-literal byte cap.
+    // The earlier fixes capped cardinality (many literals); this closes the
     // distinct sub-class where ONE literal's own byte length exceeds
     // MAX_STRING_LITERAL_BYTES before any prior guard sees it.
     // -----------------------------------------------------------------------
 
-    /// Top-level const byte cap (issue #474, round 6): a top-level `const`
+    /// Top-level const byte cap (issue #474): a top-level `const`
     /// whose byte length exceeds MAX_STRING_LITERAL_BYTES is rejected by the
     /// `guard_literal_bytes` check in `json_value_to_alt`, which has no other
     /// byte guard upstream of it.
@@ -4683,7 +4683,7 @@ mod tests {
         );
     }
 
-    /// Object property key byte cap (issue #474, round 6): an object property
+    /// Object property key byte cap (issue #474): an object property
     /// whose KEY (not value) exceeds MAX_STRING_LITERAL_BYTES is rejected by
     /// the `guard_literal_bytes` checks in `compile_object` (raw key) and
     /// `json_string_literal` (JSON-encoded key), before the key reaches the
@@ -4708,15 +4708,15 @@ mod tests {
         );
     }
 
-    /// anyOf const single-byte cap (issue #474, round 6): an `anyOf` branch
+    /// anyOf const single-byte cap (issue #474): an `anyOf` branch
     /// with a single oversized `const` is rejected by the `guard_literal_bytes`
     /// check in `string_class_of`'s const arm.
     ///
-    /// Backstopped: the round-5 incremental byte-budget guard inside
+    /// Backstopped: the earlier incremental byte-budget guard inside
     /// `compile_any_of`'s classification loop (Fix 4) also catches this input,
-    /// so this test stays green even if the round-6 guard alone is reverted.
-    /// It is defense-in-depth for the transient ~1x copy at the exact line
-    /// codex named, not independently mutation-sensitive — see
+    /// so this test stays green even if this guard alone is reverted.
+    /// It is defense-in-depth for the transient ~1x copy at the exact line,
+    /// not independently mutation-sensitive — see
     /// `object_key_byte_capped` / `const_literal_byte_capped` for the
     /// mutation-pinned guards.
     #[test]
@@ -4732,11 +4732,11 @@ mod tests {
         );
     }
 
-    /// anyOf enum member single-byte cap (issue #474, round 6): an `anyOf`
+    /// anyOf enum member single-byte cap (issue #474): an `anyOf`
     /// branch with a single oversized `enum` member is rejected by the
     /// `guard_literal_bytes` checks in `string_class_of`'s enum arms.
     ///
-    /// Backstopped: same as `anyof_const_single_byte_capped` — the round-5
+    /// Backstopped: same as `anyof_const_single_byte_capped` — the earlier
     /// incremental byte-budget guard in `compile_any_of` also catches this
     /// input, so this test is defense-in-depth, not independently
     /// mutation-sensitive.
@@ -4815,7 +4815,7 @@ mod tests {
         );
     }
 
-    /// `$defs` name CUMULATIVE byte cap (issue #474, round 8): the schema-wide
+    /// `$defs` name CUMULATIVE byte cap (issue #474): the schema-wide
     /// entry guard is per-string, so many definition names each UNDER the
     /// per-string cap can still sum past it while `CompileCtx::new` clones every
     /// key into the `defs` map (and `$defs` has no cardinality cap). The
@@ -4849,7 +4849,7 @@ mod tests {
         );
     }
 
-    /// Object property key CUMULATIVE byte cap (issue #474, round 8): the
+    /// Object property key CUMULATIVE byte cap (issue #474): the
     /// per-key `guard_literal_bytes` cap and `MAX_OBJECT_PROPERTIES` count cap
     /// each bound one dimension, but their product (many near-cap keys) still
     /// drives the per-byte `json_string_literal` Symbol expansion and the

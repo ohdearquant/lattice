@@ -901,7 +901,7 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
-/// parser cannot honestly model (#330 codex round-2 finding 1).
+/// parser cannot honestly model (#330 finding 1).
 ///
 /// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
 /// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
@@ -928,8 +928,8 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 ///   the trailing `ByteLevel(use_regex:false)` is just "don't split again".
 ///   Any other/unsupported sibling (e.g. `Metaspace`, `Whitespace`) rejects
 ///   the whole sequence even when another child is a regex `Split` — a
-///   `Split` does not honestly dominate later pre-tokenizers (codex round-3,
-///   #330 residual finding).
+///   `Split` does not honestly dominate later pre-tokenizers (#330 residual
+///   finding).
 /// - Bare top-level `ByteLevel` with `use_regex` absent or `true` -> accept
 ///   (HF's default `use_regex=true` is exactly what `Gpt4Regex`
 ///   approximates; this is the common gpt2/roberta Hub shape).
@@ -973,7 +973,7 @@ fn is_regex_split_node(pt: &JsonValue) -> bool {
 /// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
 /// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
 /// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
-/// `Gpt4Regex` (codex round-3, #330 residual finding).
+/// `Gpt4Regex` (#330 residual finding).
 fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
     if is_regex_split_node(pt) {
         return true;
@@ -1265,8 +1265,8 @@ mod tests {
     }
 
     /// Vocab/merges for the cross-space-merge discriminator used by the
-    /// `validate_bpe_pretokenizer` fail-closed tests below (codex round-2,
-    /// #330 finding 1). Byte-level maps a literal space to `Ġ` (U+0120), so
+    /// `validate_bpe_pretokenizer` fail-closed tests below (#330 finding 1).
+    /// Byte-level maps a literal space to `Ġ` (U+0120), so
     /// `"a b"` byte-encodes to `"aĠb"`. Base single-byte tokens (`a`, `Ġ`,
     /// `b`) plus staged merges `Ġ`+`b` -> `Ġb` -> (with `a`) `aĠb` let a
     /// SINGLE merged id (2) only be reachable if "a" and " b" land in the
@@ -1274,7 +1274,7 @@ mod tests {
     /// always splits on word boundaries, so "a" and " b" land in different
     /// pieces and the cross-space merge can never fire, giving `[0, 1]`
     /// (the "a" and "Ġb" ids from separate pieces) instead. This is a
-    /// direct id-level proxy for the silent-wrong-ids failure mode codex's
+    /// direct id-level proxy for the silent-wrong-ids failure mode a
     /// review flagged for explicit `use_regex:false` metadata that fell
     /// through to the `Gpt4Regex` default unchecked.
     fn cross_space_merge_json(pre_tokenizer: &str) -> String {
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_bytelevel_use_regex_false_rejected_without_supporting_split() {
-        // codex round-2 (#330 finding 1, major/fail-open): a tokenizer.json
+        // #330 finding 1 (major/fail-open): a tokenizer.json
         // that explicitly declares `ByteLevel(use_regex:false)` with no
         // preceding regex `Split` must be REJECTED, not silently tokenized
         // with the `Gpt4Regex` default. HF's ByteLevel `use_regex=false`
@@ -1311,7 +1311,7 @@ mod tests {
 
     #[test]
     fn test_unknown_pretokenizer_type_rejected() {
-        // codex round-2 (#330 finding 1): an unrecognized pre_tokenizer type
+        // #330 finding 1: an unrecognized pre_tokenizer type
         // (Metaspace, Whitespace, BertPreTokenizer, ...) on a BPE model must
         // also fail closed rather than silently defaulting to `Gpt4Regex`.
         let json = cross_space_merge_json(r#"{"type": "Metaspace", "replacement": "_"}"#);
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn test_bare_bytelevel_use_regex_true_or_absent_accepted() {
-        // codex round-2 (#330 finding 1): bare `ByteLevel` with `use_regex`
+        // #330 finding 1: bare `ByteLevel` with `use_regex`
         // absent or `true` is the common gpt2/roberta Hub shape and must
         // keep working exactly as the #330 fix intended — HF's own default
         // for `use_regex` is `true`, which is what `Gpt4Regex` approximates.
@@ -1344,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
-        // codex round-2 (#330 finding 1): the real Qwen/Qwen3-Embedding
+        // #330 finding 1: the real Qwen/Qwen3-Embedding
         // shape is `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`
         // — a regex Split establishes the correct segmentation, and the
         // trailing `ByteLevel(use_regex:false)` just means "don't split
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_sequence_split_then_metaspace_rejected() {
-        // codex round-3 (#330 residual finding): before this fix,
+        // #330 residual finding: before this fix,
         // `is_supported_bpe_pretokenizer` returned `true` as soon as
         // `has_regex_split` found ANY descendant regex `Split`, so
         // `Sequence[Split{pattern.Regex}, Metaspace]` was wrongly accepted
@@ -1396,7 +1396,7 @@ mod tests {
     #[test]
     fn test_sequence_split_then_whitespace_rejected() {
         // Same class as `test_sequence_split_then_metaspace_rejected` above,
-        // with `Whitespace` (also named explicitly in codex round-2's
+        // with `Whitespace` (also named explicitly in the #330 finding 1
         // reject list) as the unsupported sibling instead of `Metaspace`.
         let pre_tokenizer = r#"{
             "type": "Sequence",

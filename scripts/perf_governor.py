@@ -41,7 +41,7 @@ _THIS_FILE = Path(__file__).resolve()
 _SCRIPTS_DIR = _THIS_FILE.parent       # scripts/ (tracked)
 _REPO_ROOT = _SCRIPTS_DIR.parent       # one level up: repo root
 
-# Kill-switch sentinel. DECOUPLED from this module's own location (Leo f5aa3305):
+# Kill-switch sentinel. DECOUPLED from this module's own location (see commit f5aa3305):
 # the emergency-stop path must stay at a stable, repo-rooted location even if
 # this script moves. Resolution precedence (applied in PerfGovernor.__init__):
 #   --sentinel arg  >  $PERF_GOVERNOR_SENTINEL env  >  this default.
@@ -90,7 +90,7 @@ def _read_thermal() -> dict:
         # DELIBERATE fail-OPEN: a pmset read error assumes nominal so a flaky
         # thermal probe never blocks a run. Safe because BOUNDED + AFK-ONLY +
         # KILL-SWITCH still bound every run (AC and AFK readers fail CLOSED).
-        # Verified + accepted by Leo (f5aa3305).
+        # Verified in commit f5aa3305.
         _log(f"WARNING: pmset -g therm failed ({exc}); assuming nominal")
         return {"speed_limit": 100, "nominal": True}
 
@@ -770,7 +770,7 @@ def _cmd_selftest(gov: PerfGovernor) -> int:
         g_afk = PerfGovernor(afk_only=True, afk_threshold_s=300)
         g_afk._thermal_reader = lambda: {"speed_limit": 100, "nominal": True}
         g_afk._ac_reader = lambda: True
-        g_afk._idle_reader = lambda: 10.0  # fake: Ocean is typing
+        g_afk._idle_reader = lambda: 10.0  # fake: user is actively typing
         try:
             g_afk.preflight()
             raise AssertionError("preflight should have raised on AFK-ONLY")

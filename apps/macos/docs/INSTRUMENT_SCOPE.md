@@ -9,7 +9,7 @@
 
 Lattice Instrument is a zero-dependency macOS 14 SwiftUI application (Swift 6.0 tools,
 Package.swift line 7) that wraps the Rust `lattice-tune` and `lattice-inference` engine
-binaries as subprocess instruments. Its purpose is to let Ocean run LoRA fine-tuning,
+binaries as subprocess instruments. Its purpose is to let the user run LoRA fine-tuning,
 model quantization, chat testing, and training-data inspection without leaving a macOS
 window — while the Rust binaries remain the single source of correctness.
 

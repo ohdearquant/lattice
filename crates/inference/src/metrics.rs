@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_entropy_f32_max_uniform() {
-        // Codex finding: uniform f32::MAX logits must produce ln(N), not 0.
+        // Regression guard: uniform f32::MAX logits must produce ln(N), not 0.
         let mut acc = OnlineSoftmaxEntropy::new();
         acc.update(f32::MAX);
         acc.update(f32::MAX);

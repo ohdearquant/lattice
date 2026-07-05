@@ -180,7 +180,7 @@ jobs:
   # `[self-hosted, macOS, ARM64, metal]` and document why.
   #
   # Deliberately NOT added to parity-gate.needs below: this is an informational
-  # signal only. Making it required is a founder decision (repo branch
+  # signal only. Making it required is a maintainer decision (repo branch
   # protection), out of scope for this change.
   metal-parity:
     name: metal attention parity (informational)
@@ -279,7 +279,7 @@ jobs:
   #
   # NOTE: once this job has gone green on CI once, add "embed-drift" to the
   # repository's required status checks (Settings → Branches → main protection
-  # rule).  That governance step is done by the founder; it is intentionally
+  # rule).  That governance step is done by the maintainers; it is intentionally
   # not automated here.
   embed-drift:
     name: embed drift gate
@@ -340,7 +340,7 @@ jobs:
   # change that must carry rationale + mutation evidence.
   #
   # NOTE: once this job has gone green on CI once, add "q4-composed" to the
-  # repository's required status checks alongside embed-drift. That founder
+  # repository's required status checks alongside embed-drift. That
   # governance step is intentionally not automated here.
   q4-composed:
     name: q4 composed golden

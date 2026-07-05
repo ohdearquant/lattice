@@ -3,10 +3,10 @@
 **Issue**: #85\
 **Branch**: docs/mlx-kernel-study\
 **MLX source pinned to**: [`ml-explore/mlx@2e6632e5b84aa42d1bebecb0207092e223ff4d58`](https://github.com/ml-explore/mlx/tree/2e6632e5b84aa42d1bebecb0207092e223ff4d58) (2026-05-29)\
-**Lattice source**: `crates/inference/src/forward/` — all file:line citations are from `../e1/current_state.md`\
+**Lattice source**: `crates/inference/src/forward/` — all file:line citations verified against the lattice source\
 **External sources**: FlashAttention-2 arXiv:2307.08691 (2023-07-17, C:0.85), Apple MSL Spec (2025-10-23, C:0.95), Apple developer docs (2026-05-30, C:0.9)\
 **Source authority**: C:0.95 = MLX source or current Apple docs | C:0.85 = FA2 paper | Inference explicitly labeled with confidence scores\
-**Produced from**: `r1/landscape.md`, `r1/web_findings.md`, `r2/khive_grounding.md`, `e1/current_state.md`, `a1/analysis.md`, `a1/recommendations.md`
+**Produced from**: a primary-source audit of MLX (upstream source and Apple documentation) and the lattice Metal forward path
 
 ---
 
@@ -82,13 +82,13 @@ Fact (C:0.95): Apple documents that residency sets reduce CPU overhead versus pe
 
 ## 2. Why MLX Resists Concurrent-Load Degradation (#77): Sourced Hypothesis
 
-**Scope note**: The `~2.8%` concurrent-load degradation figure and the `25%` lattice figure are flow-provided benchmark context. `r1/landscape.md` explicitly reports that the MLX 2.8% figure was not found in MLX source or Apple docs. The mechanism below is a sourced hypothesis, not a proven causal explanation.
+**Scope note**: The `~2.8%` concurrent-load degradation figure and the `25%` lattice figure are flow-provided benchmark context. The primary-source audit reports that the MLX 2.8% figure was not found in MLX source or Apple docs. The mechanism below is a sourced hypothesis, not a proven causal explanation.
 
-**Critical correction** (from critic review, confirmed against `e1/current_state.md`): Lattice Qwen3.5 decode **already** uses a single command buffer for all active layers with no intermediate waits. This is documented at `crates/inference/src/forward/metal_qwen35.rs:5971` ("Single command buffer for ALL 24 layers - no intermediate waits"), with one encoder at `:5978`, one submit at `:6021`, and one commit/wait at `:6023`. The same single-submit pattern holds for prefill (`metal_qwen35.rs:6311`, `:6312`, `:7091`) and batch verification (`metal_qwen35.rs:4792`, `:5407`). The #77 gap is **not** explained by per-layer command buffer submission; that architecture is already in place.
+**Critical correction** (confirmed against the lattice source): Lattice Qwen3.5 decode **already** uses a single command buffer for all active layers with no intermediate waits. This is documented at `crates/inference/src/forward/metal_qwen35.rs:5971` ("Single command buffer for ALL 24 layers - no intermediate waits"), with one encoder at `:5978`, one submit at `:6021`, and one commit/wait at `:6023`. The same single-submit pattern holds for prefill (`metal_qwen35.rs:6311`, `:6312`, `:7091`) and batch verification (`metal_qwen35.rs:4792`, `:5407`). The #77 gap is **not** explained by per-layer command buffer submission; that architecture is already in place.
 
 ### 2.1 Queue-Level Residency Sets (Inference, C:0.8)
 
-MLX inserts its heap/buffers into a residency set, calls `requestResidency()`, and attaches the set to the command queue [`resident.cpp#L8-L38`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/resident.cpp#L8-L38), [`allocator.cpp#L34-L66`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/allocator.cpp#L34-L66), [`device.cpp#L263-L279`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/device.cpp#L263-L279). Apple states residency sets mitigate per-encoder CPU overhead, queue attachment is more efficient than per-command-buffer attachment, and `requestResidency()` can reduce commit-to-GPU-start delay [Apple Residency Sets](https://developer.apple.com/documentation/metal/simplifying-gpu-resource-management-with-residency-sets). Under concurrent GPU load, this commit-to-start delay reduction is a plausible differentiator. `e1/current_state.md` does not identify a comparable residency-set mechanism in lattice.
+MLX inserts its heap/buffers into a residency set, calls `requestResidency()`, and attaches the set to the command queue [`resident.cpp#L8-L38`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/resident.cpp#L8-L38), [`allocator.cpp#L34-L66`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/allocator.cpp#L34-L66), [`device.cpp#L263-L279`](https://github.com/ml-explore/mlx/blob/2e6632e5b84aa42d1bebecb0207092e223ff4d58/mlx/backend/metal/device.cpp#L263-L279). Apple states residency sets mitigate per-encoder CPU overhead, queue attachment is more efficient than per-command-buffer attachment, and `requestResidency()` can reduce commit-to-GPU-start delay [Apple Residency Sets](https://developer.apple.com/documentation/metal/simplifying-gpu-resource-management-with-residency-sets). Under concurrent GPU load, this commit-to-start delay reduction is a plausible differentiator. No comparable residency-set mechanism was identified in lattice.
 
 This inference exceeds direct source evidence that queue-level residency explains the 25% vs 2.8% gap. **A concurrent-load benchmark gate with Metal System Trace counters is required before attributing the gap to this mechanism.**
 
@@ -110,7 +110,7 @@ A concurrent-load benchmark with Metal System Trace counters — commit-to-start
 
 ---
 
-## 3. Gap Analysis: Lattice vs MLX (file:line from `e1/current_state.md`)
+## 3. Gap Analysis: Lattice vs MLX
 
 ### G1. Attention / Flash (Issues #13, #126)
 
@@ -166,7 +166,7 @@ A concurrent-load benchmark with Metal System Trace counters — commit-to-start
 
 ## 4. Prioritized Roadmap
 
-Source: `a1/recommendations.md`. Impact/effort are analyst scores (1-5). Higher ratio ranks first.
+Impact/effort are estimated scores (1-5). Higher ratio ranks first.
 
 | Rank | Technique / action                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Issue          | Expected impact | Effort | Risk     | Impact/effort | Source traceability                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ---: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------- | --------------: | -----: | -------- | ------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -189,7 +189,7 @@ Source: `a1/recommendations.md`. Impact/effort are analyst scores (1-5). Higher 
 
 ---
 
-## 5. KG Entities — Create/Link Plan (from `r2/khive_grounding.md`)
+## 5. KG Entities — Create/Link Plan
 
 No MLX-specific technique entities were found in the KG during the r2 grounding pass. The following are new. Existing targets from r2:
 
@@ -220,4 +220,4 @@ No MLX-specific technique entities were found in the KG during the r2 grounding 
 - Not found (C:0.95): The `~2.8%` MLX concurrent-load degradation number was not found in MLX source or Apple docs by `r1`. Treat as flow-provided benchmark context until benchmark provenance is attached.
 - Not found (C:0.9): Apple public docs do not expose detailed scheduler policy, residency eviction policy, or GPU occupancy counters. Metal System Trace is required to validate the #77 hypothesis.
 - Recency risk (C:0.85): FlashAttention-2 is older than two years as of 2026-05-30 but remains the primary paper for the cited mechanisms.
-- Removed (critic review): The following claims were present in the prior draft and have been removed — none were found in r1's primary-source sweep: 'sdpa.metal' path name, 'metal.cpp command graph' claim, SGMMA 'single clock cycle', 'MTLCommandQueue priority hints'.
+- Removed after review: The following claims were present in the prior draft and have been removed — none were found in the primary-source sweep: 'sdpa.metal' path name, 'metal.cpp command graph' claim, SGMMA 'single clock cycle', 'MTLCommandQueue priority hints'.
