@@ -70,7 +70,12 @@ jobs:
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
           # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
           # would silently skip the gate on large diffs (fail-open).
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$' <<<"$CHANGED" >/dev/null; then
+          # The wasm gate's own inputs (driver, harness, fixtures, the native
+          # dump example) are included below so a PR that touches only those
+          # still triggers wasm-parity. Without them, engine stays false and the
+          # required parity-gate could pass green without the wasm path ever
+          # running, a fail-open on the gate itself.
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
