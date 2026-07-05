@@ -537,6 +537,31 @@ pub(crate) fn sample_full_logits(
             1.0
         };
 
+        // Fail-closed guard: `select_top_k`'s scalar/NEON seed phases rewrite a
+        // NaN scaled logit to NEG_INFINITY so the min-heap root is never NaN
+        // (a NaN root would reject every finite candidate in the NEON prefilter).
+        // That sanitization is correct for the heap's internal ordering, but it
+        // erases the NaN *before* the softmax degeneracy guard in
+        // `CandidateSet::sample_top_p_with_scratch` ever sees it, silently
+        // turning a "poisoned distribution" case into "normal sampling over a
+        // masked candidate" — exactly the regression this scan closes.
+        //
+        // Mirror the old full-logit contract (`build_softmax_probs` returning
+        // `None` on a non-finite max or a NaN-poisoned sum, both of which fall
+        // back to argmax) with a single pass over the pre-scaled logits: any
+        // NaN anywhere forces degeneracy (a NaN can never become the max, so it
+        // would otherwise poison the softmax sum from a non-max position,
+        // #322-class); a non-finite max (every logit `-inf`, or a `+inf` logit)
+        // also forces degeneracy, matching `sample_top_p_with_scratch`'s
+        // non-finite-max short-circuit. Scaling by a positive finite `inv_temp`
+        // (guaranteed by the `temperature_degenerate` check above) preserves
+        // both NaN-ness and finiteness, so scanning before the fused top-k scale
+        // is equivalent to scanning after it.
+        let (has_nan, max_logit) = scan_nan_or_nonfinite_max(logit_scratch);
+        if has_nan || !max_logit.is_finite() {
+            return argmax_f32(logit_scratch);
+        }
+
         // Streaming min-heap top-k with fused temperature scaling — the softmax
         // draw below runs only over these k survivors, never the full vocabulary.
         select_top_k(logit_scratch, cfg.top_k, inv_temp, candidate_scratch);
@@ -736,6 +761,76 @@ pub(crate) fn record_logprob(
         logprob,
         top,
     });
+}
+
+/// Fail-closed pre-scan for `sample_full_logits`: detects whether `logits`
+/// contains any NaN and computes the NaN-ignoring ("numeric") max in a
+/// single pass, so the caller can fall back to `argmax_f32` before
+/// `select_top_k`'s scalar/NEON seed phases sanitize a NaN to `NEG_INFINITY`
+/// and hide it from the softmax degeneracy guard (codex PR #651 round 1).
+/// Runtime-dispatch NEON on aarch64 (same 4-wide-plus-scalar-tail structure
+/// as `argmax_f32_neon`) with a scalar fallback.
+fn scan_nan_or_nonfinite_max(logits: &[f32]) -> (bool, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            // SAFETY: NEON is runtime-detected above; only loads aligned 4-f32 chunks.
+            return unsafe { scan_nan_or_nonfinite_max_neon(logits) };
+        }
+    }
+    scan_nan_or_nonfinite_max_scalar(logits)
+}
+
+fn scan_nan_or_nonfinite_max_scalar(logits: &[f32]) -> (bool, f32) {
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut has_nan = false;
+    for &v in logits {
+        has_nan |= v.is_nan();
+        // `f32::max` is IEEE-754 `maxNum`: NaN never wins, matching the old
+        // full-logit reference's `.fold(f32::NEG_INFINITY, f32::max)`.
+        max_logit = max_logit.max(v);
+    }
+    (has_nan, max_logit)
+}
+
+/// NEON 4-wide NaN-detect + numeric-max scan.  `vmaxnmq_f32` accumulates the
+/// NaN-ignoring max per lane (IEEE-754 `maxNum`, matching `f32::max`).
+/// `vceqq_f32(v, v)` is all-ones where `v` is non-NaN (self-equal) and
+/// all-zero where `v` is NaN (a NaN self-comparison is always false), so
+/// OR-accumulating its bitwise complement across every chunk flags any NaN
+/// in the array.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scan_nan_or_nonfinite_max_neon(logits: &[f32]) -> (bool, f32) {
+    use std::arch::aarch64::*;
+
+    let len = logits.len();
+    let mut i = 0usize;
+    let mut max_acc = vdupq_n_f32(f32::NEG_INFINITY);
+    let mut nan_acc = vdupq_n_u32(0);
+
+    while i + 4 <= len {
+        // SAFETY: loop condition guarantees four valid f32 values are in-bounds.
+        let v = vld1q_f32(logits.as_ptr().add(i));
+        max_acc = vmaxnmq_f32(max_acc, v);
+        let is_non_nan_lane = vceqq_f32(v, v);
+        nan_acc = vorrq_u32(nan_acc, vmvnq_u32(is_non_nan_lane));
+        i += 4;
+    }
+
+    // Horizontal reduction: numeric (NaN-ignoring) max across the 4 lanes,
+    // and OR-reduce the NaN-flag lanes to a single bool.
+    let mut max_logit = vmaxnmvq_f32(max_acc);
+    let mut has_nan = vmaxvq_u32(nan_acc) != 0;
+
+    // Scalar tail for the final 0-3 elements.
+    while i < len {
+        let v = *logits.get_unchecked(i);
+        has_nan |= v.is_nan();
+        max_logit = max_logit.max(v);
+        i += 1;
+    }
+    (has_nan, max_logit)
 }
 
 fn argmax_f32(logits: &[f32]) -> u32 {

@@ -342,6 +342,77 @@ mod tests {
         );
     }
 
+    /// Regression test for the codex-review round-1 blocker on PR #651:
+    /// `sample_full_logits` always routes through `select_top_k`, whose
+    /// scalar/NEON seed phases rewrite a NaN *scaled* logit to
+    /// `f32::NEG_INFINITY` so the min-heap root is never NaN. That
+    /// sanitization erases the NaN before
+    /// `CandidateSet::sample_top_p_with_scratch`'s own poisoned-sum guard
+    /// ever sees it, silently turning a fail-closed case into a normal
+    /// weighted draw. Proven counterexample (codex): `top_k=0`, logits
+    /// `[0.0, NaN, 0.0]`, seed `0x5eed_f00d_1234_5678` returned token 2
+    /// pre-fix; the fail-closed contract requires the finite argmax, token 0.
+    #[test]
+    fn test_full_logit_nan_fails_closed_topk_disabled() {
+        let logits = [0.0_f32, f32::NAN, 0.0];
+        let mut rng = 0x5eed_f00d_1234_5678_u64;
+        let token = sample_token(&logits, &cfg(1.0, 0), &[], &mut rng);
+        assert_eq!(
+            token, 0,
+            "top_k=0 (disabled): a NaN anywhere in the vocab must fail closed \
+             to argmax, not a weighted draw over the sanitized candidates"
+        );
+    }
+
+    /// Same counterexample as `test_full_logit_nan_fails_closed_topk_disabled`,
+    /// but with `top_k` larger than the vocab (`select_top_k` clamps `k` to
+    /// `logits.len()`, taking the identical full-vocab code path).
+    #[test]
+    fn test_full_logit_nan_fails_closed_topk_exceeds_vocab() {
+        let logits = [0.0_f32, f32::NAN, 0.0];
+        let mut rng = 0x5eed_f00d_1234_5678_u64;
+        let token = sample_token(&logits, &cfg(1.0, 100), &[], &mut rng);
+        assert_eq!(
+            token, 0,
+            "top_k > vocab: a NaN anywhere in the vocab must fail closed to argmax"
+        );
+    }
+
+    /// Same counterexample again with `top_k` strictly smaller than the
+    /// vocab, so `select_top_k` runs its genuine partial-selection path
+    /// (rather than the `k == 0`/`k >= len` full-vocab shortcut). The
+    /// fail-closed scan in `sample_full_logits` runs over the *full*
+    /// pre-top-k logits, so it must still catch this NaN and return the
+    /// global argmax even though top-k would otherwise discard the NaN slot
+    /// as the min-heap's worst (sanitized) candidate.
+    #[test]
+    fn test_full_logit_nan_fails_closed_topk_partial() {
+        let logits = [0.0_f32, f32::NAN, 0.0];
+        let mut rng = 0x5eed_f00d_1234_5678_u64;
+        let token = sample_token(&logits, &cfg(1.0, 2), &[], &mut rng);
+        assert_eq!(
+            token, 0,
+            "top_k < vocab: a NaN anywhere in the vocab must fail closed to \
+             argmax, not a partial-selection weighted draw"
+        );
+    }
+
+    /// All-`-inf` logits (a fully-masked distribution, e.g. every token
+    /// repetition-penalized to the floor) must fail closed to the first
+    /// token, matching `greedy_token`'s / `argmax_f32`'s documented
+    /// first-wins-on-a-degenerate-array contract (#280) rather than
+    /// panicking or producing a NaN-poisoned draw.
+    #[test]
+    fn test_full_logit_all_neg_inf_fails_closed_to_first_token() {
+        let logits = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut rng = 7u64;
+        let token = sample_token(&logits, &cfg(1.0, 0), &[], &mut rng);
+        assert_eq!(
+            token, 0,
+            "all-(-inf) logits must fail closed to the first token"
+        );
+    }
+
     #[test]
     fn test_empty_logits_returns_zero_without_panic() {
         let logits: [f32; 0] = [];
