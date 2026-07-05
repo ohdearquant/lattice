@@ -1,4 +1,4 @@
-//! `lattice` CLI — interactive chat, HTTP serve, and preflight subcommands.
+//! `lattice` CLI - interactive chat, HTTP serve, and preflight subcommands. See [docs/capability-matrix.md](../../../../docs/capability-matrix.md).
 //!
 //! # Usage
 //!
