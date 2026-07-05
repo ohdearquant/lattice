@@ -241,9 +241,9 @@ impl BertModel {
     /// one `matmul_bt`/`layer_norm` call over every `batch * seq_len` row, instead of
     /// `batch` separate single-sequence forward passes. Only the O(seq_len^2)
     /// attention score/context step loops per sequence (see
-    /// [`crate::attention::multi_head_attention_batched`]), and that loop runs in
-    /// parallel across sequences. The implementation detail may change without API
-    /// breakage.
+    /// [`crate::attention::multi_head_attention_batched`]) are run serially, one
+    /// sequence at a time, over disjoint output slices. The implementation detail
+    /// may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if texts.is_empty() {
             return Ok(Vec::new());

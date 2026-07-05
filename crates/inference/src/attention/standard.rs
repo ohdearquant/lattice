@@ -474,10 +474,10 @@ pub(crate) fn multi_head_attention_batched(
     let v = &v[..used_hidden];
     let concat = &mut concat[..used_hidden];
 
-    // Per-sequence score/softmax/context. Each chunk of `concat` (one sequence's
-    // [seq_len, hidden_size] region) is written by exactly one task, so this is a
-    // safe disjoint-mutation parallel loop; the shared `q`/`k`/`v`/`attention_mask`
-    // are read-only from every task's perspective.
+    // Per-sequence score/softmax/context. This loop runs serially, one sequence
+    // at a time; each chunk of `concat` (one sequence's [seq_len, hidden_size]
+    // region) is written by exactly one iteration, over disjoint slices of the
+    // shared read-only `q`/`k`/`v`/`attention_mask` buffers.
     concat
         .chunks_mut(seq_len * hidden_size)
         .enumerate()
@@ -1035,5 +1035,213 @@ mod tests {
         // product fits, but num_heads * seq_len * seq_len = 2^65 wraps a 64-bit
         // usize to a small value that would feed an undersized scores slice.
         assert_standard_no_overflow(1usize << 32, 2, 2, 1);
+    }
+
+    /// Weights-free parity check between `multi_head_attention_batched` and the
+    /// single-sequence `multi_head_attention` path, run over synthetic (no model
+    /// file) inputs so it exercises in default CI.
+    ///
+    /// Builds two sequences of different real length (2 tokens and 3 tokens)
+    /// padded to a common `seq_len` of 3. The padded slot in the shorter sequence
+    /// carries a huge-magnitude value and is masked out (`mask=0`); if masking or
+    /// the per-sequence row stride (`seq_offset`/`row_start`) were wrong, that
+    /// value would leak into the real tokens' output or the wrong sequence's
+    /// slice would be compared, and the parity check below would fail.
+    ///
+    /// Mutation-checked by hand while writing this test: (1) forcing the mask
+    /// passed into `multi_head_attention_batched` to all-ones (so the padded,
+    /// huge-magnitude slot is treated as a valid key) made this test fail; (2)
+    /// corrupting `row_start`'s stride (multiplying by an extra `+1` offset in
+    /// the per-sequence loop) also made it fail; both were reverted and the test
+    /// re-confirmed passing before landing.
+    #[test]
+    fn batched_attention_matches_single_sequence_per_row_with_padding() {
+        let hidden_size = 8;
+        let num_heads = 2;
+        let head_dim = 4;
+        let seq_len = 3; // common padded length
+        let batch = 2;
+        let intermediate_size = hidden_size;
+
+        let identity_8x8: Vec<f32> = {
+            let mut m = vec![0.0f32; hidden_size * hidden_size];
+            for i in 0..hidden_size {
+                m[i * hidden_size + i] = 1.0;
+            }
+            m
+        };
+        let zero_bias_8: Vec<f32> = vec![0.0; hidden_size];
+        let ones_8: Vec<f32> = vec![1.0; hidden_size];
+
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: intermediate_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity_8x8,
+                rows: intermediate_size,
+                cols: hidden_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones_8,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_8,
+                len: hidden_size,
+            },
+        };
+
+        // Sequence 0: 2 real tokens, deterministic small values.
+        let seq0_real: Vec<f32> = (0..2 * hidden_size).map(|i| 1.0 + i as f32 * 0.1).collect();
+        // Padded slot for sequence 0: huge magnitude, must never leak once masked.
+        let seq0_pad: Vec<f32> = vec![1.0e6; hidden_size];
+
+        // Sequence 1: 3 real tokens (fills seq_len exactly, no padding needed),
+        // deterministic small values distinct from sequence 0.
+        let seq1_real: Vec<f32> = (0..3 * hidden_size)
+            .map(|i| 100.0 + i as f32 * 0.1)
+            .collect();
+
+        // Flattened batched input: [seq0 tok0, seq0 tok1, seq0 pad, seq1 tok0, seq1 tok1, seq1 tok2]
+        let mut hidden_states_batched = Vec::with_capacity(batch * seq_len * hidden_size);
+        hidden_states_batched.extend_from_slice(&seq0_real);
+        hidden_states_batched.extend_from_slice(&seq0_pad);
+        hidden_states_batched.extend_from_slice(&seq1_real);
+        assert_eq!(hidden_states_batched.len(), batch * seq_len * hidden_size);
+
+        let attention_mask_batched: Vec<u32> = vec![1, 1, 0, 1, 1, 1];
+
+        let rows = batch * seq_len;
+        let used_hidden = rows * hidden_size;
+        let mut q = vec![0.0f32; used_hidden];
+        let mut k = vec![0.0f32; used_hidden];
+        let mut v = vec![0.0f32; used_hidden];
+        let mut concat = vec![0.0f32; used_hidden];
+        let mut output = vec![0.0f32; used_hidden];
+
+        multi_head_attention_batched(
+            &hidden_states_batched,
+            &layer,
+            &attention_mask_batched,
+            batch,
+            seq_len,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut q,
+            &mut k,
+            &mut v,
+            &mut concat,
+            &mut output,
+            &NoopLoraHook,
+            0,
+        );
+
+        for v in output.iter() {
+            assert!(v.is_finite(), "batched output must be finite: {output:?}");
+        }
+
+        // Sequence 0: compare the first 2 (real) rows of the batched output
+        // against an independent single-sequence call on the 2 unpadded tokens.
+        let mut buf0 = AttentionBuffers::new(2, hidden_size, num_heads, intermediate_size);
+        let expected0 = multi_head_attention(
+            &seq0_real,
+            &layer,
+            &[1u32, 1],
+            2,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut buf0,
+            &NoopLoraHook,
+            0,
+        );
+        let seq0_row_start = 0;
+        let got0 = &output[seq0_row_start..seq0_row_start + 2 * hidden_size];
+        for (i, (&g, &e)) in got0.iter().zip(expected0.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-6,
+                "seq0 row element {i} mismatch: batched={g} single={e}"
+            );
+        }
+
+        // Sequence 1: compare all 3 (real) rows of the batched output against an
+        // independent single-sequence call on the same 3 tokens.
+        let mut buf1 = AttentionBuffers::new(3, hidden_size, num_heads, intermediate_size);
+        let expected1 = multi_head_attention(
+            &seq1_real,
+            &layer,
+            &[1u32, 1, 1],
+            3,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut buf1,
+            &NoopLoraHook,
+            0,
+        );
+        let seq1_row_start = seq_len * hidden_size;
+        let got1 = &output[seq1_row_start..seq1_row_start + 3 * hidden_size];
+        for (i, (&g, &e)) in got1.iter().zip(expected1.iter()).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-6,
+                "seq1 row element {i} mismatch: batched={g} single={e}"
+            );
+        }
     }
 }
