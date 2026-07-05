@@ -11,17 +11,17 @@ RoPE assumption for image tokens).
 
 ADR-049 (Accepted 2026-05-19) built the vision scaffold in `crates/inference/src/vision/`
 (`preprocess.rs`, `vit.rs`, `merger.rs`, `mod.rs`, `multimodal.rs`) plus a tested
-`generate_multimodal` entry point at `metal_qwen35.rs:11145`. That scaffold was written against a
+`generate_multimodal` entry point at `metal_qwen35.rs:11318`. That scaffold was written against a
 hypothetical 7B Qwen3-VL and is **inert**: no `model.visual.*` weights are loaded, the config parser
 drops every vision field, and the decoder discards the supplied patch embeddings
-(`metal_qwen35.rs:11319-11325` steps token id 0 at each visual position and drops the patch
+(`metal_qwen35.rs:11492-11498` steps token id 0 at each visual position and drops the patch
 embedding, marked "v0 limitation / v1 Metal injection point"). There is real scaffolding and zero
 live image capability; the gap is entirely engine-side.
 
 Meanwhile the checkpoint the engine actually runs — `Qwen3.5-0.8B`, arch class
 `Qwen3_5ForConditionalGeneration`, `model_type: qwen3_5` — is a **native unified vision-language
-model** in both its fp16 and lattice-q4 forms. This is verified two ways against the on-disk
-checkpoint:
+model** in both its fp16 and lattice-q4 forms. This is verified two ways against the checkpoint's
+public config and weight index:
 
 - `config.json`: `vision_config` present (`depth 12`, `hidden_size 768`, `num_heads 12`,
   `patch_size 16`, `spatial_merge_size 2`, `out_hidden_size 1024`, `temporal_patch_size 2`,
@@ -32,10 +32,9 @@ checkpoint:
   under `model.language_model.*`. The lattice-q4 build **retains** all 153 quantized visual files;
   the 27B-q4 dump dropped them, which is why 27B is text-only at rest.
 
-The 0.8B checkpoint is Apache-2.0, ~1.6 GB fp16 / ~0.5 GB q4, already on disk in both forms. It is
-the smallest vision-capable member of the family; a sibling `2b` directory on disk is an empty stub
-(tokenizer only, no weights). Building image input on the 0.8B checkpoint therefore needs no new
-model acquisition — only engine work.
+The 0.8B checkpoint is Apache-2.0, roughly 1.6 GB fp16 and 0.5 GB q4, and is the smallest
+vision-capable member of the family; no larger checkpoint is required for this plan. Building image
+input on the 0.8B checkpoint therefore needs no new model architecture, only engine work.
 
 Because the ViT geometry, weight-key schema, memory tier, and the decoder RoPE decision all differ
 from ADR-049's assumptions, this is a material specification change rather than a code detail, and it
@@ -83,7 +82,7 @@ The blast radius is bounded by two facts:
 - **Only the 6 GQA (`full_attention`) layers consume position embeddings.** In the layer dispatch
   (lines 761–797), `full_attention` layers pass `position_embeddings=position_embeddings`, while the
   18 `linear_attention` (GatedDeltaNet) layers do **not** touch them. The checkpoint's
-  `text_config.layer_types` (verified on-disk) places the `full_attention` layers at indices
+  `text_config.layer_types` places the `full_attention` layers at indices
   **[3, 7, 11, 15, 19, 23]** (stride 4, offset 3) out of 24. So the M-RoPE work is confined to those
   6 layers.
 - **Text-only prompts are unaffected.** `mrope_section` sums to 32, which equals the half-rotary
@@ -121,7 +120,8 @@ content-part schema are pinned in this ADR's Scope S6 rather than decided during
 ## Scope
 
 S0 (the M-RoPE differential question) is **resolved** and its answer is Decision §2 above; it
-produced no engine code. The remaining stages are each Metal-GPU and independently verifiable:
+produced no engine code. The remaining stages are independently verifiable; S1 and S2 are CPU-side
+config and weight-loading preparation, and the runtime compute stages S3-S5 execute on Metal GPU:
 
 - **S1 — Config parsing.** Parse `vision_config`, the four image/vision token ids, and
   `text_config.rope_parameters.{mrope_section, mrope_interleaved}` in `qwen35_config.rs` (stop
@@ -135,7 +135,7 @@ produced no engine code. The remaining stages are each Metal-GPU and independent
   `image_token_id` placeholder spans in the input pipeline to the merged `visual_tokens` count.
   Gate: token-stream shape matches the HF processor for the same image + prompt.
 - **S5 — Metal visual-embedding injection + decoder M-RoPE.** Replace the
-  `forward_step(0, …)`-and-discard stub (`metal_qwen35.rs:11319-11325`) with residual-stream
+  `forward_step(0, …)`-and-discard stub (`metal_qwen35.rs:11492-11498`) with residual-stream
   injection of merged patch embeddings at image positions, and add the 3-axis M-RoPE from
   Decision §2 to the 6 GQA layers. Gate: end-to-end greedy first-N token parity vs HF Qwen3.5-0.8B
   on a fixed image + prompt (the e2e-parity discipline).
@@ -195,6 +195,6 @@ load-bearing points; on acceptance, ADR-049's Status line gains a pointer
   (`apply_interleaved_mrope`, `get_vision_position_ids`, `get_rope_index`).
 - Checkpoint: `Qwen3.5-0.8B` `config.json` (`vision_config`, `text_config.rope_parameters`) and
   `model.safetensors.index.json` (153 `model.visual.*` tensors).
-- Lattice code: `crates/inference/src/vision/`, `metal_qwen35.rs:11145` (`generate_multimodal`),
-  `metal_qwen35.rs:11319-11325` (injection point), `qwen35_config.rs` (config parser),
+- Lattice code: `crates/inference/src/vision/`, `metal_qwen35.rs:11318` (`generate_multimodal`),
+  `metal_qwen35.rs:11492-11498` (injection point), `qwen35_config.rs` (config parser),
   `forward.rs:417-422` (1-D partial RoPE).
