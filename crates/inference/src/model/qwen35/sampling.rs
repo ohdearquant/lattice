@@ -2,7 +2,32 @@
 use crate::model::qwen35_config::GenerateConfig;
 
 /// Sample a token from logits using temperature, top-k, top-p, and repetition penalty.
+///
+/// Delegates to `crate::sampling::sample_full_logits`, the shared engine also
+/// used by the Metal CPU fallback (`forward/metal_qwen35.rs`'s private
+/// `sample_token`). See that function's doc comment for the three
+/// optimization levers (context-id-set repetition penalty, partial-select
+/// top-k with softmax over the surviving k only, thread-local buffer reuse
+/// across decode steps) applied here relative to the old per-call allocating
+/// implementation, preserved below as `sample_token_reference` for the
+/// mutation-sensitive parity tests.
 pub(crate) fn sample_token(
+    logits: &[f32],
+    cfg: &GenerateConfig,
+    previous_ids: &[u32],
+    rng_state: &mut u64,
+) -> u32 {
+    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+}
+
+/// Reference oracle: the original allocating implementation of `sample_token`,
+/// kept byte-for-byte so a fixed-seed decode stream can be checked against it
+/// for regressions introduced by the `sample_full_logits` optimization. Not
+/// used on any production call path — test-only, so it (and the helpers below
+/// it now exclusively calls) do not trip `-D warnings` dead-code lints in a
+/// plain (non-test) `cargo check` / `cargo clippy` pass.
+#[cfg(test)]
+pub(crate) fn sample_token_reference(
     logits: &[f32],
     cfg: &GenerateConfig,
     previous_ids: &[u32],
@@ -75,6 +100,7 @@ pub(crate) fn sample_token(
     draw_from_distribution(&probs, rng_state)
 }
 
+#[cfg(test)]
 fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty: f32) {
     let vocab_size = adjusted.len();
     // previous_ids is the full token history and routinely repeats ids. Penalize each
@@ -106,6 +132,7 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
 /// form of the engine-wide first-in-set contract, so a fully-masked
 /// distribution yields the first in-vocabulary token deterministically and
 /// never panics.
+#[cfg(test)]
 fn greedy_token(adjusted: &[f32]) -> u32 {
     let mut best_idx = 0u32;
     let mut best_val = f32::NEG_INFINITY;
@@ -118,6 +145,7 @@ fn greedy_token(adjusted: &[f32]) -> u32 {
     best_idx
 }
 
+#[cfg(test)]
 fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize, f32)>> {
     let max_logit = indices
         .iter()
@@ -146,6 +174,7 @@ fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize
     Some(probs)
 }
 
+#[cfg(test)]
 fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
     let mut cumsum = 0.0f32;
     let mut cutoff = probs.len();
@@ -163,6 +192,7 @@ fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
     }
 }
 
+#[cfg(test)]
 fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
     draw_index(probs, xorshift64(rng_state))
 }
@@ -180,6 +210,7 @@ fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
 /// past c_{n-1} lies in that final interval, so the correct token is the LAST
 /// iterated one. This matches `CandidateSet::sample_top_p_with_scratch` (Path A),
 /// which also returns `candidates.last()` for the same reason.
+#[cfg(test)]
 fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
     let mut cumsum = 0.0f32;
     for &(idx, p) in probs {
@@ -206,6 +237,7 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
 /// token-identical streams for the same (logits, config, seed) — including inputs
 /// with exact logit ties at the top-k boundary, which the matched ascending
 /// token-id tie-break now resolves identically in both paths.
+#[cfg(test)]
 pub(crate) fn xorshift64(state: &mut u64) -> f32 {
     let x = crate::sampling::xorshift64_next(state);
     crate::sampling::uniform_f32_from_u64(x)
@@ -626,6 +658,114 @@ mod tests {
              the pre-softmax sort changes which token wins the contested rank or the \
              order of the two max-probability buckets, flipping dozens of the 200 \
              draws and failing this assertion."
+        );
+    }
+
+    /// Mutation-sensitive proof that the optimized `sample_token`
+    /// (`crate::sampling::sample_full_logits`: context-id-set repetition
+    /// penalty, partial-select top-k, thread-local scratch reuse) produces a
+    /// BYTE-IDENTICAL token stream to `sample_token_reference` (the original
+    /// full-clone / full-sort / fresh-HashSet implementation) under the
+    /// issue's default production config — temperature 0.7, top_p 0.9,
+    /// top_k 40, repetition_penalty 1.1 — over 256 decode steps with a
+    /// realistic, growing history that contains duplicate ids and an
+    /// out-of-vocabulary id (mirroring a stop-token id beyond the sampled
+    /// vocabulary). If either path's optimization changes the sampled
+    /// distribution, this test fails.
+    #[test]
+    fn optimized_sampler_matches_reference_default_issue_config() {
+        let vocab_size = 2048usize;
+        let logits: Vec<f32> = (0..vocab_size as u64)
+            .map(|i| {
+                let h = i
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (h as f32 / u64::MAX as f32) * 20.0 - 10.0
+            })
+            .collect();
+
+        let cfg = GenerateConfig {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            ..Default::default()
+        };
+        let seed = 0x5eed_f00d_1234_5678_u64;
+        let steps = 256usize;
+
+        // Seed history with a few prompt tokens, including a duplicate and an
+        // out-of-vocabulary id (both must be handled identically by both paths).
+        let seed_history: Vec<u32> = vec![3, 7, 3, vocab_size as u32 + 5];
+        let mut history_opt = seed_history.clone();
+        let mut history_ref = seed_history;
+        let mut rng_opt = seed;
+        let mut rng_ref = seed;
+
+        for step in 0..steps {
+            let token_opt = sample_token(&logits, &cfg, &history_opt, &mut rng_opt);
+            let token_ref = sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref);
+            assert_eq!(
+                token_opt, token_ref,
+                "optimized sample_token diverged from sample_token_reference at step {step}"
+            );
+            history_opt.push(token_opt);
+            history_ref.push(token_ref);
+        }
+    }
+
+    /// Mutation-sensitive proof that repetition penalty is applied BEFORE
+    /// top-k selection in the optimized path, not after. Constructs logits
+    /// where a previously-seen token sits inside the raw top-k window but
+    /// drops below the top-k boundary once its penalty is applied. If an
+    /// implementation applied top-k before the penalty, the seen token would
+    /// still occupy its raw-rank slot and the optimized stream would diverge
+    /// from the reference (which always penalizes first).
+    #[test]
+    fn optimized_sampler_penalty_before_topk_boundary() {
+        // top_k = 4. Raw ranks (descending): 0 (10.0), 1 (9.9), 2 (9.8), 3 (9.7),
+        // 4 (9.6), ... Token 3 is seen in history; with repetition_penalty=1.1 its
+        // penalized logit (9.7 / 1.1 ≈ 8.818) drops below token 4's unpenalized
+        // 9.6? No -- pick values so the drop crosses the boundary explicitly:
+        // token 3's raw logit is barely inside the top-4 window; after penalty it
+        // must fall below the raw rank-4 logit (token 4), swapping who survives.
+        let logits: Vec<f32> = vec![10.0, 9.9, 9.8, 9.7, 9.6, 1.0, 0.5, 0.1];
+        let cfg = GenerateConfig {
+            temperature: 1.0,
+            top_k: 4,
+            top_p: 1.0,
+            repetition_penalty: 1.1,
+            ..Default::default()
+        };
+        let previous_ids = [3u32];
+        let seed = 0xabad_1dea_dead_beefu64;
+        let n = 200usize;
+
+        let mut rng_opt = seed;
+        let tokens_opt: Vec<u32> = (0..n)
+            .map(|_| sample_token(&logits, &cfg, &previous_ids, &mut rng_opt))
+            .collect();
+
+        let mut rng_ref = seed;
+        let tokens_ref: Vec<u32> = (0..n)
+            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref))
+            .collect();
+
+        assert_eq!(
+            tokens_opt, tokens_ref,
+            "optimized sample_token must apply repetition penalty before top-k \
+             selection, exactly like sample_token_reference; a top-k-before-penalty \
+             regression would keep token 3 in the surviving set instead of token 4 \
+             and diverge this stream"
+        );
+
+        // Sanity: token 4 (not in `previous_ids`, unpenalized 9.6) must actually be
+        // reachable in the surviving set now that token 3's penalized logit
+        // (9.7 / 1.1 ≈ 8.818) drops below it -- otherwise this test is vacuous.
+        assert!(
+            tokens_opt.contains(&4),
+            "token 4 must be selectable once the penalty pushes token 3 below it \
+             in the top-k ranking (test would be vacuous otherwise)"
         );
     }
 }

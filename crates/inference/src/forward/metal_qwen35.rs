@@ -14851,28 +14851,25 @@ kernel void gdn_chunk_norm_silu_c32(
     }
 
     /// Full-logit sampling fallback (used when top_k == 0 or top_k > MAX_TOP_K).
-    /// Implements the same pipeline as sample_from_candidates but builds the
-    /// CandidateSet from raw logits.
+    ///
+    /// Delegates to `crate::sampling::sample_full_logits`, the shared engine
+    /// also used by the Qwen CPU decode loops
+    /// (`model/qwen35/sampling.rs::sample_token`). See that function's doc
+    /// comment for the three optimization levers applied here relative to the
+    /// old per-call `CandidateSet::from_full_logits` implementation: repetition
+    /// penalty over the unique-id set from `previous_ids` (not a per-candidate
+    /// `.contains()` scan over the full vocabulary), a streaming min-heap
+    /// partial top-k select feeding the top-p softmax draw (so softmax only
+    /// ever runs over the surviving k candidates), and thread-local scratch
+    /// buffers reused across decode steps instead of a fresh vocab-sized
+    /// `CandidateSet` per token.
     fn sample_token(
         logits: &[f32],
         cfg: &GenerateConfig,
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        use crate::sampling::CandidateSet;
-        let mut cs = CandidateSet::from_full_logits(logits);
-        cs.apply_repetition_penalty(previous_ids, cfg.repetition_penalty);
-        // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so 1/t
-        // overflows) has no valid scaling; the t -> 0+ limit is argmax.
-        if crate::sampling::temperature_degenerate(cfg.temperature) {
-            return cs.argmax();
-        }
-        cs.apply_temperature(cfg.temperature);
-        cs.retain_top_k(cfg.top_k);
-        // #351: see sample_from_candidates — avoid the r == 1.0 worst-token bug
-        // by routing through the canonical [0, 1) helper (provably < 1.0).
-        let r = crate::sampling::uniform_f32_from_u64(xorshift64(rng_state));
-        cs.sample_top_p(cfg.top_p, r)
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
