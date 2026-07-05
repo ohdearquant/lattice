@@ -83,10 +83,12 @@ over the entire KV cache:
 - The linear-attention (gated-delta) layers are constant-time in context and do not contribute to the
   slope.
 
-In an interactive chat this compounds with prompt prefill. The serve path currently re-prefills the
-whole conversation on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462)), a
-separate and larger cost than the decode slope, and the main reason a long chat feels progressively
-slower.
+In an interactive chat this compounds with prompt prefill, a separate and larger cost than the
+decode slope and historically the main reason a long chat felt progressively slower. Both serve
+binaries now reuse the previous turn's shared token prefix instead of re-prefilling the whole
+conversation from scratch on every turn ([#462](https://github.com/ohdearquant/lattice/issues/462),
+see [`docs/cross-turn-cache.md`](docs/cross-turn-cache.md)); a request whose history is not a safe
+append onto the retained state still falls back to a full re-prefill.
 
 MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal compute API,
 the same tier as Ollama. MLX decodes faster than Lattice at raw throughput. Lattice's edge is
