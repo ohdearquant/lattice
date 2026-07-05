@@ -121,12 +121,44 @@ impl CrossEncoderWeights {
     }
 }
 
-/// **Unstable**: memory-mapped safetensors file reader; internal representation may change.
+/// Backing storage for a parsed safetensors file: either a memory-mapped file
+/// (the `open()` path) or an owned byte buffer (the `from_bytes()` path).
 ///
-/// Memory-mapped safetensors file.
+/// The owned variant exists for targets without real file-descriptor/mmap
+/// support (`wasm32-unknown-unknown`: `memmap2`'s wasm fallback compiles but
+/// every `Mmap::map` call returns `io::ErrorKind::Unsupported` at runtime) and
+/// for hosts that receive model weights as an in-memory buffer rather than a
+/// filesystem path (e.g. bytes handed in from JavaScript).
+enum SafetensorsBacking {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl SafetensorsBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            SafetensorsBacking::Mapped(m) => &m[..],
+            SafetensorsBacking::Owned(v) => v.as_slice(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SafetensorsBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SafetensorsBacking::Mapped(m) => f.debug_tuple("Mapped").field(m).finish(),
+            // Vec<u8>'s derived Debug would dump every byte; report the length instead.
+            SafetensorsBacking::Owned(v) => f.debug_struct("Owned").field("len", &v.len()).finish(),
+        }
+    }
+}
+
+/// **Unstable**: memory-mapped (or in-memory) safetensors file reader; internal representation may change.
+///
+/// Parsed safetensors file, backed by either a memory map or an owned byte buffer.
 #[derive(Debug)]
 pub struct SafetensorsFile {
-    mmap: Mmap,
+    data: SafetensorsBacking,
     /// Byte offset where tensor data starts (8 + header_length).
     data_offset: usize,
     /// Parsed tensor metadata.
@@ -148,14 +180,30 @@ impl SafetensorsFile {
             InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
         })?;
 
-        if mmap.len() < 8 {
+        Self::from_backing(SafetensorsBacking::Mapped(mmap))
+    }
+
+    /// **Unstable**: parse a safetensors file already resident in memory.
+    ///
+    /// Unlike `open()`, this never touches `std::fs` or `mmap`, so it works on
+    /// targets without real file-descriptor support (`wasm32-unknown-unknown`)
+    /// and for callers that already have the model bytes in hand (e.g. bytes
+    /// handed in from JavaScript across a wasm boundary).
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, InferenceError> {
+        Self::from_backing(SafetensorsBacking::Owned(bytes))
+    }
+
+    fn from_backing(data: SafetensorsBacking) -> Result<Self, InferenceError> {
+        let bytes = data.as_slice();
+
+        if bytes.len() < 8 {
             return Err(InferenceError::InvalidSafetensors(
                 "file too small to contain safetensors header".into(),
             ));
         }
 
         let header_len = u64::from_le_bytes(
-            mmap[0..8]
+            bytes[0..8]
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
         ) as usize;
@@ -163,20 +211,20 @@ impl SafetensorsFile {
             .checked_add(header_len)
             .ok_or_else(|| InferenceError::InvalidSafetensors("header length overflow".into()))?;
 
-        if data_offset > mmap.len() {
+        if data_offset > bytes.len() {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "header extends past end of file: header_end={}, file_len={}",
                 data_offset,
-                mmap.len()
+                bytes.len()
             )));
         }
 
-        let header = std::str::from_utf8(&mmap[8..data_offset]).map_err(|e| {
+        let header = std::str::from_utf8(&bytes[8..data_offset]).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("header is not valid UTF-8: {e}"))
         })?;
         let tensors = parse_safetensors_header(header)?;
 
-        let data_len = mmap.len() - data_offset;
+        let data_len = bytes.len() - data_offset;
         for (name, meta) in &tensors {
             if meta.start > meta.end {
                 return Err(InferenceError::InvalidSafetensors(format!(
@@ -215,7 +263,7 @@ impl SafetensorsFile {
         }
 
         Ok(Self {
-            mmap,
+            data,
             data_offset,
             tensors,
         })
@@ -259,7 +307,7 @@ impl SafetensorsFile {
             .data_offset
             .checked_add(meta.end)
             .ok_or_else(|| InferenceError::InvalidSafetensors("tensor end overflow".into()))?;
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.data.as_slice()[start..end];
 
         let slice: &[f32] = match meta.dtype {
             DType::F32 => {

@@ -126,6 +126,19 @@ impl BertConfig {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
+
+    /// **Unstable**: parse a `BertConfig` from `config.json` text, without
+    /// touching the filesystem; signature may change as the from-bytes model
+    /// loading API matures.
+    ///
+    /// This is the string counterpart to the file-based `config.json` parsing
+    /// `from_directory` performs internally. Used by
+    /// [`BertModel::from_bytes`]; unlike `from_directory`, there is no
+    /// fallback to inferring the config from safetensors tensor shapes when a
+    /// required key is missing.
+    pub fn from_json_str(config_json: &str) -> Result<Self, InferenceError> {
+        parse_config_json_str(config_json)
+    }
 }
 
 /// **Stable**: primary BERT model type consumed by `lattice-embed`; the
@@ -194,6 +207,57 @@ impl BertModel {
             None => infer_config_from_safetensors(&safetensors)?,
         };
 
+        Self::assemble(config, tokenizer, safetensors)
+    }
+
+    /// **Stable** (provisional): load from default cache dir, downloading if needed.
+    pub fn from_pretrained(model_name: &str) -> Result<Self, InferenceError> {
+        let cache_dir = crate::default_cache_dir()?;
+        let model_dir = ensure_model_files(model_name, &cache_dir)?;
+        Self::from_directory(&model_dir)
+    }
+
+    /// **Unstable**: construct a model from in-memory bytes, without touching the
+    /// filesystem; signature may change as this from-bytes loading API matures.
+    ///
+    /// This is the in-memory counterpart to [`from_directory`](Self::from_directory):
+    /// it takes the same three logical inputs a model directory provides
+    /// (safetensors weights, `config.json`, `tokenizer.json`) as owned/borrowed
+    /// bytes instead of a path. Intended for hosts with no real filesystem:
+    /// wasm32-unknown-unknown has no working `mmap` (see
+    /// [`SafetensorsFile::from_bytes`]), and for callers that already hold the
+    /// model bytes in memory (e.g. bytes handed in from JavaScript).
+    ///
+    /// `config_json` and `tokenizer_json` must be the UTF-8 text of
+    /// `config.json` and `tokenizer.json` respectively. Unlike
+    /// `from_directory`, there is no config-from-safetensors-shape inference
+    /// fallback and no support for the legacy tokenizer formats
+    /// (`vocab.json`+`merges.txt`, `vocab.txt`, `tokenizer.model`), both
+    /// require a config and a `tokenizer.json` to be supplied explicitly.
+    pub fn from_bytes(
+        weights_bytes: Vec<u8>,
+        config_json: &str,
+        tokenizer_json: &str,
+    ) -> Result<Self, InferenceError> {
+        let safetensors = Box::new(SafetensorsFile::from_bytes(weights_bytes)?);
+        let config = BertConfig::from_json_str(config_json)?;
+        // The tokenizer's own sequence-length cap has no `tokenizer_config.json`
+        // to read here (see `tokenizer_from_json_str`'s doc comment), so derive
+        // it from the config we already have, mirroring `infer_model_max_seq_len`'s
+        // 2048 embedding-workload cap.
+        let max_seq_len = config.max_position_embeddings.min(2048);
+        let tokenizer = crate::tokenizer::tokenizer_from_json_str(tokenizer_json, max_seq_len)?;
+
+        Self::assemble(config, tokenizer, safetensors)
+    }
+
+    /// Shared tail of [`from_directory`](Self::from_directory) and
+    /// [`from_bytes`](Self::from_bytes): validate, load weights, and assemble `Self`.
+    fn assemble(
+        config: BertConfig,
+        tokenizer: Box<dyn Tokenizer>,
+        safetensors: Box<SafetensorsFile>,
+    ) -> Result<Self, InferenceError> {
         if tokenizer.vocab_size() != config.vocab_size {
             warn!(
                 tokenizer_vocab_size = tokenizer.vocab_size(),
@@ -227,13 +291,6 @@ impl BertModel {
             pooling: BertPooling::default(),
             fused_qkv,
         })
-    }
-
-    /// **Stable** (provisional): load from default cache dir, downloading if needed.
-    pub fn from_pretrained(model_name: &str) -> Result<Self, InferenceError> {
-        let cache_dir = crate::default_cache_dir()?;
-        let model_dir = ensure_model_files(model_name, &cache_dir)?;
-        Self::from_directory(&model_dir)
     }
 
     /// **Stable**: returns model configuration; used by embed service.
@@ -791,20 +848,27 @@ fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, Infer
     }
 
     let text = fs::read_to_string(path)?;
+    parse_config_json_str(&text).map(Some)
+}
+
+/// Parse `config.json` text into a `BertConfig`. Shared by the file-based
+/// `parse_config_json_if_present` and the public `BertConfig::from_json_str`
+/// (used by [`BertModel::from_bytes`]).
+fn parse_config_json_str(text: &str) -> Result<BertConfig, InferenceError> {
     let get_usize = |key: &str| {
-        extract_json_scalar(&text, key)
+        extract_json_scalar(text, key)
             .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?
             .parse::<usize>()
             .map_err(|e| InferenceError::Inference(format!("invalid usize for {key}: {e}")))
     };
     let get_f32 = |key: &str| {
-        extract_json_scalar(&text, key)
+        extract_json_scalar(text, key)
             .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?
             .parse::<f32>()
             .map_err(|e| InferenceError::Inference(format!("invalid f32 for {key}: {e}")))
     };
 
-    Ok(Some(BertConfig {
+    Ok(BertConfig {
         vocab_size: get_usize("vocab_size")?,
         hidden_size: get_usize("hidden_size")?,
         num_hidden_layers: get_usize("num_hidden_layers")?,
@@ -813,7 +877,7 @@ fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, Infer
         max_position_embeddings: get_usize("max_position_embeddings")?,
         type_vocab_size: get_usize("type_vocab_size")?,
         layer_norm_eps: get_f32("layer_norm_eps")?,
-    }))
+    })
 }
 
 fn extract_json_scalar<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -924,6 +988,50 @@ mod tests {
         assert_eq!(embedding.len(), model.dimensions());
         let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
         assert_relative_eq!(norm, 1.0, epsilon = 1e-4);
+    }
+
+    /// Guards `BertModel::from_bytes` against real model files: a directory
+    /// with `model.safetensors` + `config.json` + `tokenizer.json` (unlike
+    /// `LATTICE_INFERENCE_MODEL_DIR` above, `from_bytes` needs both JSON files
+    /// explicitly since it has no config-from-shape inference or vocab.txt
+    /// fallback). Asserts the from-bytes embedding matches `from_directory`'s
+    /// output for the same model bit-for-bit within float tolerance.
+    #[test]
+    #[ignore]
+    fn test_from_bytes_matches_from_directory() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_BYTES_MODEL_DIR") else {
+            return;
+        };
+        let dir = Path::new(&model_dir);
+
+        let weights_bytes = fs::read(dir.join("model.safetensors")).unwrap();
+        let config_json = fs::read_to_string(dir.join("config.json")).unwrap();
+        let tokenizer_json = fs::read_to_string(dir.join("tokenizer.json")).unwrap();
+
+        let mut model = BertModel::from_bytes(weights_bytes, &config_json, &tokenizer_json)
+            .expect("from_bytes should load a real BGE-family model directory");
+        // BGE v1.5 uses CLS pooling per its model card; from_bytes has no
+        // per-model pooling table (that lives in lattice-embed's
+        // `EmbeddingModel::bert_pooling`), so the test sets it explicitly.
+        model.set_pooling(BertPooling::CLS);
+
+        let embedding = model.encode("hello world").unwrap();
+        assert_eq!(embedding.len(), model.dimensions());
+        let norm = (embedding.iter().map(|x| x * x).sum::<f32>()).sqrt();
+        assert_relative_eq!(norm, 1.0, epsilon = 1e-4);
+
+        let mut reference = BertModel::from_directory(dir)
+            .expect("from_directory should also load the same model directory");
+        reference.set_pooling(BertPooling::CLS);
+        let reference_embedding = reference.encode("hello world").unwrap();
+
+        assert_eq!(embedding.len(), reference_embedding.len());
+        for (a, b) in embedding.iter().zip(reference_embedding.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "from_bytes and from_directory embeddings diverge: {a} vs {b}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------------
