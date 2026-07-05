@@ -65,11 +65,14 @@ mod imp {
         },
         routing::{get, post},
     };
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+    use lattice_inference::forward::metal_qwen35::{
+        ChatMessage, MetalQwen35State, format_chat_template,
+    };
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
     };
+    use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
     use serde_json::{Value, json};
@@ -93,6 +96,14 @@ mod imp {
         /// non-streaming handlers below decide separately how much (if any)
         /// of it is safe to surface to the HTTP client.
         Failed {
+            message: String,
+        },
+        /// The request itself cannot fit the model's KV window (#656: prompt
+        /// length was unknown to `build_cfg`, so this is only checked once
+        /// the worker tokenizes the prompt). Client-caused, so it maps to
+        /// HTTP 400 rather than the 500 `Failed` uses -- distinct from a
+        /// generation-time failure, never a server-side problem.
+        Rejected {
             message: String,
         },
     }
@@ -214,6 +225,76 @@ mod imp {
         repetition_penalty: Option<f32>,
         #[serde(default)]
         reasoning_budget: Option<usize>,
+        // #656: known-but-unsupported OpenAI fields, modeled explicitly (not
+        // left to serde's default silent-drop of unknown fields) so
+        // `reject_unsupported` can name the exact offending field and
+        // return HTTP 400 rather than quietly running a tool-calling/
+        // JSON-mode/multi-completion request as a plain text completion.
+        #[serde(default)]
+        max_completion_tokens: Option<usize>,
+        #[serde(default)]
+        tools: Option<Value>,
+        #[serde(default)]
+        tool_choice: Option<Value>,
+        #[serde(default)]
+        response_format: Option<ResponseFormat>,
+        #[serde(default)]
+        n: Option<usize>,
+        #[serde(default)]
+        logprobs: Option<bool>,
+        #[serde(default)]
+        top_logprobs: Option<usize>,
+        #[serde(default)]
+        stop: Option<Value>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ResponseFormat {
+        r#type: String,
+    }
+
+    /// #656: reject known-but-unsupported OpenAI request fields with HTTP
+    /// 400 instead of silently ignoring them -- the same fail-closed
+    /// philosophy `MessageRole::parse`/`content_text` already apply to
+    /// roles and content parts. Mirrors `lattice.rs`'s `reject_unsupported`,
+    /// scoped to this minimal server's narrower surface: unlike
+    /// `lattice.rs`, this server has no `logprobs`/`stop` implementation at
+    /// all, so both are rejected outright rather than conditionally.
+    fn reject_unsupported(req: &ChatReq) -> Result<(), RequestError> {
+        if req.tools.is_some() || req.tool_choice.is_some() {
+            return Err(RequestError::bad_request(
+                "tools and tool_choice are not supported by this server",
+            ));
+        }
+        if req.n.unwrap_or(1) > 1 {
+            return Err(RequestError::bad_request("n > 1 is not supported"));
+        }
+        if let Some(fmt) = &req.response_format
+            && fmt.r#type != "text"
+        {
+            return Err(RequestError::bad_request(format!(
+                "response_format.type '{}' is not supported; use 'text'",
+                fmt.r#type
+            )));
+        }
+        if req.logprobs.unwrap_or(false) || req.top_logprobs.is_some() {
+            return Err(RequestError::bad_request(
+                "logprobs/top_logprobs are not supported by this server",
+            ));
+        }
+        if req.stop.is_some() {
+            return Err(RequestError::bad_request(
+                "stop is not supported by this server",
+            ));
+        }
+        if let (Some(a), Some(b)) = (req.max_tokens, req.max_completion_tokens)
+            && a != b
+        {
+            return Err(RequestError::bad_request(format!(
+                "max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"
+            )));
+        }
+        Ok(())
     }
 
     #[derive(Debug, Deserialize)]
@@ -528,18 +609,25 @@ mod imp {
             {
                 let mut part_index = 0usize;
                 loop {
-                    if part_index >= MAX_CONTENT_PARTS_PER_MESSAGE {
-                        let msg = too_many_parts_message(self.message_index);
-                        *self.violation.borrow_mut() = Some(RequestError::bad_request(msg.clone()));
-                        return Err(A::Error::custom(msg));
-                    }
                     let seed = PartSeed {
                         violation: self.violation,
                         message_index: self.message_index,
                         part_index,
                     };
                     match seq.next_element_seed(seed)? {
-                        Some(()) => part_index += 1,
+                        Some(()) => {
+                            part_index += 1;
+                            // #656: reject only once MORE than the documented
+                            // maximum has actually been consumed, so an array
+                            // of exactly `MAX_CONTENT_PARTS_PER_MESSAGE` parts
+                            // is accepted and only the (MAX+1)-th is rejected.
+                            if part_index > MAX_CONTENT_PARTS_PER_MESSAGE {
+                                let msg = too_many_parts_message(self.message_index);
+                                *self.violation.borrow_mut() =
+                                    Some(RequestError::bad_request(msg.clone()));
+                                return Err(A::Error::custom(msg));
+                            }
+                        }
                         None => break,
                     }
                 }
@@ -751,6 +839,11 @@ mod imp {
         // window even when `reasoning_budget` is absent/zero.
         let max_new_tokens = req
             .max_tokens
+            // #656: `max_completion_tokens` is the current OpenAI field name;
+            // `reject_unsupported` already rejected the two being present
+            // and disagreeing, so whichever is set here is the caller's
+            // single, unambiguous intent.
+            .or(req.max_completion_tokens)
             .unwrap_or(d.max_tokens)
             .min(model_max_context.saturating_sub(1));
         // The worst-case decode cap is `reasoning_budget + max_new_tokens + 1`
@@ -778,11 +871,50 @@ mod imp {
             grammar: None,
             stop_strings: vec![],
             reasoning_budget,
-            // ChatReq has no logprobs/top_logprobs fields (#585) — this minimal
-            // server does not expose them, same as the rest of the OpenAI
-            // surface it does not implement (tools, response_format, etc.).
+            // ChatReq models `logprobs`/`top_logprobs` (#656) only so
+            // `reject_unsupported` can fail closed with HTTP 400 -- this
+            // minimal server has no logprobs implementation at all, so a
+            // `logprobs: true` request never reaches here (see below).
             logprobs: None,
         }
+    }
+
+    /// Prefix marker used only by the KV-window pre-check in `spawn_worker`'s
+    /// `generate` closure: distinguishes a client-caused window-overflow
+    /// rejection (HTTP 400, `Ev::Rejected`) from a genuine generation
+    /// failure (HTTP 500, `Ev::Failed`) without changing `run_worker_loop`'s
+    /// generic `Result<(usize, usize), String>` contract, which every other
+    /// caller and test fake still uses unchanged.
+    const PROMPT_EXCEEDS_WINDOW_PREFIX: &str = "prompt-exceeds-window: ";
+
+    /// #656: `build_cfg` only clamps `max_new_tokens`/`reasoning_budget`
+    /// against `model_max_context` *in isolation* -- it has no visibility
+    /// into `prompt_len` (unknown until the worker tokenizes the prompt).
+    /// The invariant that must actually hold is the full-window one:
+    /// `prompt_len + max_new_tokens + reasoning_budget + 1 <= model_max_context`.
+    /// Called by the worker right after tokenizing, before generation
+    /// starts, so a request that would overrun the KV cache is rejected up
+    /// front instead of silently hitting `StopReason::KvFull` mid-generation
+    /// while the response still claims `finish_reason: "stop"`.
+    fn check_prompt_fits_window(
+        model_max_context: usize,
+        prompt_len: usize,
+        cfg: &GenerateConfig,
+    ) -> Result<(), String> {
+        let decode_cap = cfg
+            .max_new_tokens
+            .saturating_add(cfg.reasoning_budget.unwrap_or(0));
+        let required = prompt_len.saturating_add(decode_cap).saturating_add(1);
+        if required > model_max_context {
+            let available = model_max_context.saturating_sub(prompt_len);
+            return Err(format!(
+                "prompt has {prompt_len} tokens, leaving {available} of the \
+                 {model_max_context}-token context window for generation, but this \
+                 request needs {decode_cap} generated tokens plus 1 (total {required}); \
+                 reduce max_tokens/reasoning_budget or shorten the prompt"
+            ));
+        }
+        Ok(())
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
@@ -825,6 +957,16 @@ mod imp {
             }));
 
             run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                // #656: verify the FULL window invariant (prompt included)
+                // before doing any GPU work -- `cfg` alone was already
+                // clamped by `build_cfg`, but only against the window in
+                // isolation, not against this specific prompt's length.
+                let prompt_len = tokenizer
+                    .tokenize(&format_chat_template(messages))
+                    .real_length;
+                if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
+                    return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
+                }
                 metal.reset_state();
                 metal
                     .chat_completion_streaming_with_cancel(
@@ -897,8 +1039,15 @@ mod imp {
                     });
                 }
                 Err(message) => {
-                    eprintln!("generation error: {message}");
-                    let _ = job.tx.send(Ev::Failed { message });
+                    if let Some(client_message) = message.strip_prefix(PROMPT_EXCEEDS_WINDOW_PREFIX)
+                    {
+                        let _ = job.tx.send(Ev::Rejected {
+                            message: client_message.to_string(),
+                        });
+                    } else {
+                        eprintln!("generation error: {message}");
+                        let _ = job.tx.send(Ev::Failed { message });
+                    }
                 }
             }
         }
@@ -1057,6 +1206,17 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message());
             }
         };
+        if let Err(err) = reject_unsupported(&req) {
+            emit_serve_event(
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+            );
+            return err_response(StatusCode::BAD_REQUEST, err.message());
+        }
         if req.messages.is_empty() {
             emit_serve_event(
                 "POST",
@@ -1187,6 +1347,26 @@ mod imp {
                                         (rx, Phase::Done(0), cancel_guard),
                                     ))
                                 }
+                                Some(Ev::Rejected { message }) => {
+                                    // #656: the request cannot fit the model's KV
+                                    // window (prompt + requested generation). The
+                                    // status code is already committed to 200 SSE,
+                                    // so this cannot become the 400 the
+                                    // non-streaming path returns; report it as
+                                    // `finish_reason: "length"` instead of "stop"
+                                    // so a client can at least tell no content was
+                                    // actually generated for this reason.
+                                    eprintln!("request rejected (streaming): {message}");
+                                    let chunk = json!({
+                                        "id": id, "object": "chat.completion.chunk",
+                                        "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(chunk.to_string())),
+                                        (rx, Phase::Done(0), cancel_guard),
+                                    ))
+                                }
                                 None => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1252,6 +1432,23 @@ mod imp {
                             false,
                         );
                         return err_response(StatusCode::INTERNAL_SERVER_ERROR, "inference failed");
+                    }
+                    Ev::Rejected { message } => {
+                        // #656: client-caused request-contract violation (the
+                        // prompt plus requested generation does not fit the
+                        // model's KV window), caught before any generation
+                        // ran -- unlike `Ev::Failed`, the response has not
+                        // been committed yet, so this surfaces as a real 400
+                        // with the specific reason, not a generic 500.
+                        emit_serve_event(
+                            "POST",
+                            "/v1/chat/completions",
+                            400,
+                            None,
+                            timer.elapsed().as_secs_f64() * 1000.0,
+                            false,
+                        );
+                        return err_response(StatusCode::BAD_REQUEST, &message);
                     }
                 }
             }
@@ -1716,6 +1913,9 @@ mod imp {
                     Some(Ev::Failed { message }) => {
                         panic!("fake_generate never fails; unexpected Ev::Failed: {message}")
                     }
+                    Some(Ev::Rejected { message }) => {
+                        panic!("fake_generate never rejects; unexpected Ev::Rejected: {message}")
+                    }
                     None => panic!("job 1's reply channel closed before a Done event"),
                 }
             }
@@ -1785,6 +1985,9 @@ mod imp {
                 }
                 Some(Ev::Failed { message }) => panic!(
                     "fake_generate_with_prefill_gap never fails; unexpected Ev::Failed: {message}"
+                ),
+                Some(Ev::Rejected { message }) => panic!(
+                    "fake_generate_with_prefill_gap never rejects; unexpected Ev::Rejected: {message}"
                 ),
                 None => panic!("job 1's reply channel closed before a Done event"),
             }
@@ -1873,6 +2076,9 @@ mod imp {
                 ),
                 Some(Ev::Delta(_)) => {
                     panic!("a generator that fails on its first call must never emit a Delta first")
+                }
+                Some(Ev::Rejected { message }) => {
+                    panic!("this fake generator never rejects; unexpected Ev::Rejected: {message}")
                 }
                 None => panic!("job 1's reply channel closed with no event at all"),
             }
@@ -1976,6 +2182,23 @@ mod imp {
             );
         }
 
+        /// #656 boundary fix: exactly `MAX_CONTENT_PARTS_PER_MESSAGE` (64)
+        /// parts is the documented maximum and MUST be accepted — only
+        /// MAX+1 (covered above) is rejected.
+        #[test]
+        fn parse_chat_req_accepts_max_parts_boundary() {
+            assert_eq!(MAX_CONTENT_PARTS_PER_MESSAGE, 64);
+            let parts: Vec<String> = (0..MAX_CONTENT_PARTS_PER_MESSAGE)
+                .map(|i| format!(r#"{{"type":"text","text":"p{i}"}}"#))
+                .collect();
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":[{}]}}]}}"#,
+                parts.join(",")
+            );
+            let req = parse_chat_req(body.as_bytes()).expect("exactly 64 parts must be accepted");
+            assert_eq!(req.messages.len(), 1);
+        }
+
         #[test]
         fn parse_chat_req_rejects_oversized_text_part_before_typed_parse() {
             let big_text = "x".repeat(MAX_CONTENT_PART_BYTES + 1);
@@ -2007,11 +2230,153 @@ mod imp {
                 stream: None,
                 repetition_penalty: None,
                 reasoning_budget: Some(50),
+                max_completion_tokens: None,
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                n: None,
+                logprobs: None,
+                top_logprobs: None,
+                stop: None,
             };
             let cfg = build_cfg(&req, &defaults, 8);
             assert!(cfg.max_new_tokens <= 8);
             let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
             assert!(reasoning_budget + cfg.max_new_tokens < 8);
+        }
+
+        // ── #656: prompt-aware KV-window invariant ────────────────────────
+        //
+        // `build_cfg` alone only clamps `max_new_tokens`/`reasoning_budget`
+        // against the window in isolation; `check_prompt_fits_window` is the
+        // second half that accounts for `prompt_len`, which is only known
+        // once the worker tokenizes the prompt (see `spawn_worker`).
+
+        #[test]
+        fn check_prompt_fits_window_rejects_when_prompt_plus_decode_overflows() {
+            // model_max_context=8, prompt_len=2, max_tokens=7, reasoning_budget=None:
+            // build_cfg clamps max_new_tokens to min(7, 8-1)=7 in isolation, but
+            // 2 (prompt) + 7 (decode) + 1 (delimiter) = 10 > 8 -- must reject.
+            let defaults = Defaults {
+                max_tokens: 7,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: None,
+            };
+            let req = ChatReq {
+                model: None,
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: Some(7),
+                seed: None,
+                stream: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
+                max_completion_tokens: None,
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                n: None,
+                logprobs: None,
+                top_logprobs: None,
+                stop: None,
+            };
+            let cfg = build_cfg(&req, &defaults, 8);
+            let err = check_prompt_fits_window(8, 2, &cfg).unwrap_err();
+            assert!(
+                err.contains("2 tokens") && err.contains("8-token"),
+                "error must name the actual prompt length and window: {err}"
+            );
+        }
+
+        #[test]
+        fn check_prompt_fits_window_accepts_exact_boundary_no_needless_truncation() {
+            // model_max_context=8, prompt_len=1, max_tokens=6, reasoning_budget=1:
+            // build_cfg clamps max_new_tokens to min(6, 7)=6, reasoning_room=8-6-1=1,
+            // reasoning_budget=min(1,1)=1. 1 (prompt) + 6 (max_new_tokens) +
+            // 1 (reasoning_budget) + 1 (delimiter) = 9 > 8 -- the "+1 delimiter"
+            // edge case from the review: still overflows by exactly one slot,
+            // so it must ALSO reject, proving the check catches the boundary
+            // exactly rather than off-by-one under-rejecting.
+            let defaults = Defaults {
+                max_tokens: 6,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: None,
+            };
+            let req = ChatReq {
+                model: None,
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: Some(6),
+                seed: None,
+                stream: None,
+                repetition_penalty: None,
+                reasoning_budget: Some(1),
+                max_completion_tokens: None,
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                n: None,
+                logprobs: None,
+                top_logprobs: None,
+                stop: None,
+            };
+            let cfg = build_cfg(&req, &defaults, 8);
+            assert!(check_prompt_fits_window(8, 1, &cfg).is_err());
+
+            // Same request, but the window has one more slot of room (9):
+            // 1 + 6 + 1 + 1 = 9 <= 9 -- must be ACCEPTED, and `max_new_tokens`
+            // must be the full requested 6, not needlessly truncated.
+            let cfg2 = build_cfg(&req, &defaults, 9);
+            assert_eq!(cfg2.max_new_tokens, 6, "must not needlessly truncate");
+            assert!(check_prompt_fits_window(9, 1, &cfg2).is_ok());
+        }
+
+        #[test]
+        fn check_prompt_fits_window_accepts_ordinary_prompt_unclamped() {
+            // A near-window but comfortably-fitting prompt must generate its
+            // full requested budget -- no needless truncation in the common case.
+            let defaults = Defaults {
+                max_tokens: 50,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: None,
+            };
+            let req = ChatReq {
+                model: None,
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: Some(50),
+                seed: None,
+                stream: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
+                max_completion_tokens: None,
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                n: None,
+                logprobs: None,
+                top_logprobs: None,
+                stop: None,
+            };
+            let cfg = build_cfg(&req, &defaults, 4096);
+            assert_eq!(cfg.max_new_tokens, 50);
+            // prompt_len=100: 100 + 50 + 0 + 1 = 151 <= 4096.
+            assert!(check_prompt_fits_window(4096, 100, &cfg).is_ok());
         }
 
         #[test]
@@ -2101,6 +2466,146 @@ mod imp {
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, "messages[0].content[0] exceeds 65536 bytes");
+        }
+
+        // ── #656: known-but-unsupported OpenAI field rejection ────────────
+        //
+        // Same fail-closed contract as the three tests above: these fields
+        // are parsed (not silently dropped by serde's unknown-field
+        // default), so a client asking for tool calls / JSON mode / N
+        // completions / stop sequences gets an explicit 400 naming the
+        // unsupported field instead of a plain-text completion that quietly
+        // ignored the request's actual contract.
+
+        #[tokio::test]
+        async fn chat_completions_tools_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "tools":[{"type":"function","function":{"name":"f"}}]}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "tools and tool_choice are not supported by this server"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_tool_choice_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#.to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "tools and tool_choice are not supported by this server"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_json_response_format_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_object"}}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "response_format.type 'json_object' is not supported; use 'text'"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_n_greater_than_one_400() {
+            let body =
+                Body::from(r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#.to_string());
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "n > 1 is not supported");
+        }
+
+        #[tokio::test]
+        async fn chat_completions_logprobs_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"logprobs":true}"#.to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "logprobs/top_logprobs are not supported by this server"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_stop_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "stop is not supported by this server");
+        }
+
+        #[tokio::test]
+        async fn chat_completions_conflicting_max_tokens_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "max_tokens":10,"max_completion_tokens":20}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "max_tokens (10) and max_completion_tokens (20) differ; supply only one"
+            );
+        }
+
+        #[test]
+        fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
+            let defaults = Defaults {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: None,
+            };
+            let req = ChatReq {
+                model: None,
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: None,
+                seed: None,
+                stream: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
+                max_completion_tokens: Some(42),
+                tools: None,
+                tool_choice: None,
+                response_format: None,
+                n: None,
+                logprobs: None,
+                top_logprobs: None,
+                stop: None,
+            };
+            let cfg = build_cfg(&req, &defaults, 4096);
+            assert_eq!(cfg.max_new_tokens, 42);
         }
     }
 }
