@@ -191,7 +191,7 @@ mod imp {
         }
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     struct ChatReq {
         #[serde(default)]
         model: Option<String>,
@@ -216,7 +216,7 @@ mod imp {
         reasoning_budget: Option<usize>,
     }
 
-    #[derive(Deserialize)]
+    #[derive(Debug, Deserialize)]
     struct InMsg {
         role: String,
         content: MessageContent,
@@ -259,11 +259,17 @@ mod imp {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Part {
-        Text { text: String },
-        ImageUrl { image_url: ImageUrl },
+        Text {
+            text: String,
+        },
+        ImageUrl {
+            image_url: ImageUrl,
+        },
         /// Any part `type` other than `text`/`image_url` (#641/#649): kept
         /// instead of dropped so it can be rejected with its real type name.
-        Unsupported { kind: String },
+        Unsupported {
+            kind: String,
+        },
     }
 
     #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -292,7 +298,9 @@ mod imp {
             match raw.kind.as_deref() {
                 Some("text") => {
                     let text = raw.text.ok_or_else(|| {
-                        serde::de::Error::custom("text content part must include string field 'text'")
+                        serde::de::Error::custom(
+                            "text content part must include string field 'text'",
+                        )
                     })?;
                     Ok(Self::Text { text })
                 }
@@ -315,7 +323,9 @@ mod imp {
     }
 
     fn part_too_large_message(message_index: usize, part_index: usize) -> String {
-        format!("messages[{message_index}].content[{part_index}] exceeds {MAX_CONTENT_PART_BYTES} bytes")
+        format!(
+            "messages[{message_index}].content[{part_index}] exceeds {MAX_CONTENT_PART_BYTES} bytes"
+        )
     }
 
     fn too_many_parts_message(message_index: usize) -> String {
@@ -332,7 +342,10 @@ mod imp {
     /// shape mismatch is left for the authoritative typed parse below —
     /// this function only ever raises the two size/count errors above.
     fn validate_content_part_limits(body: &[u8]) -> Result<(), RequestError> {
-        use serde::de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
+        use serde::Deserializer as _;
+        use serde::de::{
+            DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor,
+        };
         use std::cell::RefCell;
         use std::fmt;
 
@@ -733,16 +746,27 @@ mod imp {
     fn build_cfg(req: &ChatReq, d: &Defaults, model_max_context: usize) -> GenerateConfig {
         // Clamp like `max_tokens`: a budget past the KV window is meaningless and
         // would let a future `with_capacity(decode_cap(..))` abort on overflow.
+        // Reserve one slot of headroom so the worst-case decode cap below
+        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
+        // window even when `reasoning_budget` is absent/zero.
+        let max_new_tokens = req
+            .max_tokens
+            .unwrap_or(d.max_tokens)
+            .min(model_max_context.saturating_sub(1));
+        // The worst-case decode cap is `reasoning_budget + max_new_tokens + 1`
+        // (#551): keep it at or below the KV window the worker actually
+        // allocated, not just below `model_max_context` in isolation.
+        let reasoning_room = model_max_context
+            .saturating_sub(max_new_tokens)
+            .saturating_sub(1);
         let reasoning_budget = req
             .reasoning_budget
             .filter(|&n| n > 0)
             .or(d.reasoning_budget)
-            .map(|n| n.min(model_max_context));
+            .map(|n| n.min(reasoning_room))
+            .filter(|&n| n > 0);
         GenerateConfig {
-            max_new_tokens: req
-                .max_tokens
-                .unwrap_or(d.max_tokens)
-                .min(model_max_context),
+            max_new_tokens,
             temperature: req.temperature.unwrap_or(d.temperature),
             top_k: req.top_k.unwrap_or(d.top_k),
             top_p: req.top_p.unwrap_or(d.top_p),
@@ -911,13 +935,9 @@ mod imp {
             } else {
                 model_context_from_config(None)
             };
-            let metal = MetalQwen35State::from_q4_dir(
-                model_dir,
-                tokenizer_path,
-                &cfg,
-                requested_context,
-            )
-            .map_err(|e| format!("Q4 model load failed: {e}"))?;
+            let metal =
+                MetalQwen35State::from_q4_dir(model_dir, tokenizer_path, &cfg, requested_context)
+                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
             let model_max_context = metal.max_context();
             Ok(LoadedModel {
                 metal,
@@ -1009,22 +1029,19 @@ mod imp {
 
     async fn chat_completions(State(s): State<AppState>, body: Body) -> Response {
         let timer = Instant::now();
-        let body = match to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
-            Ok(body) => body,
-            Err(_) => {
-                emit_serve_event(
-                    "POST",
-                    "/v1/chat/completions",
-                    400,
-                    None,
-                    timer.elapsed().as_secs_f64() * 1000.0,
-                    false,
-                );
-                return err_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
-                );
-            }
+        let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
+            emit_serve_event(
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+            );
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+            );
         };
         let req = match parse_chat_req(&body) {
             Ok(req) => req,
@@ -1428,9 +1445,7 @@ mod imp {
             .and_then(|n| n.to_str())
             .unwrap_or("lattice")
             .into();
-        eprintln!(
-            "[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})"
-        );
+        eprintln!("[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})");
 
         let state = AppState {
             jobs,
@@ -1968,10 +1983,7 @@ mod imp {
                 r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{big_text}"}}]}}]}}"#,
             );
             let err = parse_chat_req(body.as_bytes()).unwrap_err();
-            assert_eq!(
-                err.message(),
-                "messages[0].content[0] exceeds 65536 bytes"
-            );
+            assert_eq!(err.message(), "messages[0].content[0] exceeds 65536 bytes");
         }
 
         #[test]
@@ -1999,7 +2011,7 @@ mod imp {
             let cfg = build_cfg(&req, &defaults, 8);
             assert!(cfg.max_new_tokens <= 8);
             let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
-            assert!(reasoning_budget + cfg.max_new_tokens + 1 <= 8);
+            assert!(reasoning_budget + cfg.max_new_tokens < 8);
         }
 
         #[test]
@@ -2012,6 +2024,83 @@ mod imp {
         #[test]
         fn model_context_falls_back_to_4096_when_absent() {
             assert_eq!(model_context_from_config(None), FALLBACK_MODEL_MAX_CONTEXT);
+        }
+
+        // ── HTTP-level 400 tests ──────────────────────────────────────────
+        //
+        // All three failure modes below (`#641` unknown role, `#649` image
+        // part, `#649` oversized part) return from `chat_completions` before
+        // a `Job` is ever sent to `s.jobs`, so a fake unbounded sender with no
+        // running worker is a faithful stand-in: no GPU, no model load.
+
+        fn test_app_state() -> AppState {
+            let (jobs, _rx) = mpsc::unbounded_channel::<Job>();
+            AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+            }
+        }
+
+        async fn error_message_of(response: Response) -> (StatusCode, String) {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("error response must be valid JSON");
+            let message = value["error"]["message"]
+                .as_str()
+                .expect("error response must carry error.message")
+                .to_string();
+            (status, message)
+        }
+
+        #[tokio::test]
+        async fn chat_completions_unknown_role_400() {
+            let body =
+                Body::from(r#"{"messages":[{"role":"developer","content":"hi"}]}"#.to_string());
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(
+                message,
+                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_image_url_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":[
+                    {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+                ]}]}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
+        }
+
+        #[tokio::test]
+        async fn chat_completions_oversized_part_400() {
+            let big_text = "x".repeat(MAX_CONTENT_PART_BYTES + 1);
+            let body = Body::from(format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{big_text}"}}]}}]}}"#,
+            ));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "messages[0].content[0] exceeds 65536 bytes");
         }
     }
 }
