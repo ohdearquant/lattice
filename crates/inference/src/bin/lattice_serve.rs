@@ -56,6 +56,7 @@ fn main() {
 mod imp {
     use axum::{
         Json, Router,
+        body::{Body, to_bytes},
         extract::State,
         http::StatusCode,
         response::{
@@ -146,9 +147,49 @@ mod imp {
         jobs: mpsc::UnboundedSender<Job>,
         model_id: Arc<str>,
         defaults: Defaults,
+        /// Runtime context window derived from the loaded model (#551): the
+        /// exact KV cache length `load_model` allocated, never a hard-coded
+        /// constant. See `model_context_from_config` and `build_cfg`.
+        model_max_context: usize,
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
+
+    /// Request body cap applied before any JSON parsing (serve DoS-hardening
+    /// rule: every size field clamps before allocation).
+    const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+    /// Maximum number of content parts accepted per message (#649). Enforced
+    /// by `validate_content_part_limits` before the typed `ChatReq` is parsed.
+    const MAX_CONTENT_PARTS_PER_MESSAGE: usize = 64;
+    /// Maximum byte length of a single content string / part payload (#649).
+    const MAX_CONTENT_PART_BYTES: usize = 65_536;
+    /// #551 fallback when the loaded model's config has no derivable context.
+    const FALLBACK_MODEL_MAX_CONTEXT: usize = 4096;
+
+    /// #649: image input is accepted in the OpenAI wire shape but this server
+    /// has no vision tower, so it must fail closed with a clear message
+    /// rather than silently dropping the part or coercing it to text.
+    const IMAGE_REQUIRES_VISION_MESSAGE: &str = "image input requires a vision-capable model";
+
+    /// A request-validation failure that must surface as HTTP 400 (#641,
+    /// #649). Fail-closed: unknown roles and unsupported content parts are
+    /// never coerced or dropped, they always produce one of these.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RequestError {
+        BadRequest(String),
+    }
+
+    impl RequestError {
+        fn bad_request(message: impl Into<String>) -> Self {
+            Self::BadRequest(message.into())
+        }
+
+        fn message(&self) -> &str {
+            match self {
+                Self::BadRequest(message) => message,
+            }
+        }
+    }
 
     #[derive(Deserialize)]
     struct ChatReq {
@@ -178,55 +219,530 @@ mod imp {
     #[derive(Deserialize)]
     struct InMsg {
         role: String,
+        content: MessageContent,
+    }
+
+    /// Fail-closed chat role (#641): only these three roles are accepted.
+    /// Anything else — `tool`, `developer`, a typo, an empty string — is
+    /// rejected with HTTP 400 rather than silently coerced to `user`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MessageRole {
+        System,
+        User,
+        Assistant,
+    }
+
+    impl MessageRole {
+        fn parse(raw: &str) -> Result<Self, RequestError> {
+            match raw {
+                "system" => Ok(Self::System),
+                "user" => Ok(Self::User),
+                "assistant" => Ok(Self::Assistant),
+                other => Err(RequestError::bad_request(format!(
+                    "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
+                ))),
+            }
+        }
+    }
+
+    /// OpenAI message content: either a plain string or an array of typed
+    /// parts (`[{"type":"text","text":"..."}]`). Both forms deserialize
+    /// successfully here; rejection of unsupported part types happens in
+    /// `content_text` so the exact offending part is available for the error
+    /// message.
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    #[serde(untagged)]
+    enum MessageContent {
+        Text(String),
+        Parts(Vec<Part>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Part {
+        Text { text: String },
+        ImageUrl { image_url: ImageUrl },
+        /// Any part `type` other than `text`/`image_url` (#641/#649): kept
+        /// instead of dropped so it can be rejected with its real type name.
+        Unsupported { kind: String },
+    }
+
+    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+    struct ImageUrl {
+        url: String,
         #[serde(default)]
-        content: Value,
+        detail: Option<String>,
     }
 
-    /// OpenAI message content is either a string or an array of typed parts
-    /// (`[{"type":"text","text":"..."}]`). Flatten both to plain text.
-    fn content_text(v: &Value) -> String {
-        match v {
-            Value::String(s) => s.clone(),
-            Value::Array(parts) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(""),
-            Value::Null => String::new(),
-            other => other.to_string(),
+    #[derive(Deserialize)]
+    struct RawPart {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        image_url: Option<ImageUrl>,
+    }
+
+    impl<'de> Deserialize<'de> for Part {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let raw = RawPart::deserialize(deserializer)?;
+            match raw.kind.as_deref() {
+                Some("text") => {
+                    let text = raw.text.ok_or_else(|| {
+                        serde::de::Error::custom("text content part must include string field 'text'")
+                    })?;
+                    Ok(Self::Text { text })
+                }
+                Some("image_url") => {
+                    let image_url = raw.image_url.ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "image_url content part must include object field 'image_url'",
+                        )
+                    })?;
+                    Ok(Self::ImageUrl { image_url })
+                }
+                Some(kind) => Ok(Self::Unsupported {
+                    kind: kind.to_string(),
+                }),
+                None => Ok(Self::Unsupported {
+                    kind: "<missing>".to_string(),
+                }),
+            }
         }
     }
 
-    fn to_chat_message(m: &InMsg) -> ChatMessage {
-        let content = content_text(&m.content);
-        match m.role.as_str() {
-            "system" => ChatMessage::system(content),
-            "assistant" => ChatMessage::assistant(content),
-            _ => ChatMessage::user(content),
+    fn part_too_large_message(message_index: usize, part_index: usize) -> String {
+        format!("messages[{message_index}].content[{part_index}] exceeds {MAX_CONTENT_PART_BYTES} bytes")
+    }
+
+    fn too_many_parts_message(message_index: usize) -> String {
+        format!(
+            "messages[{message_index}].content has too many parts; maximum is {MAX_CONTENT_PARTS_PER_MESSAGE}"
+        )
+    }
+
+    /// Borrowed serde preflight over the raw request body: walks only
+    /// `messages[*].content` and checks part counts / payload byte lengths
+    /// *before* the typed `ChatReq` is deserialized, so an oversized or
+    /// part-flooded body is rejected before its strings/arrays are ever
+    /// allocated (serve DoS-hardening rule: clamp before alloc). Any other
+    /// shape mismatch is left for the authoritative typed parse below —
+    /// this function only ever raises the two size/count errors above.
+    fn validate_content_part_limits(body: &[u8]) -> Result<(), RequestError> {
+        use serde::de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
+        use std::cell::RefCell;
+        use std::fmt;
+
+        let violation: RefCell<Option<RequestError>> = RefCell::new(None);
+
+        struct StringLenSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+            part_index: usize,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for StringLenSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct V<'v> {
+                    violation: &'v RefCell<Option<RequestError>>,
+                    message_index: usize,
+                    part_index: usize,
+                }
+                impl<'de, 'v> Visitor<'de> for V<'v> {
+                    type Value = ();
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("a string")
+                    }
+                    fn visit_str<E: DeError>(self, v: &str) -> Result<(), E> {
+                        if v.len() > MAX_CONTENT_PART_BYTES {
+                            *self.violation.borrow_mut() = Some(RequestError::bad_request(
+                                part_too_large_message(self.message_index, self.part_index),
+                            ));
+                        }
+                        Ok(())
+                    }
+                    fn visit_string<E: DeError>(self, v: String) -> Result<(), E> {
+                        self.visit_str(&v)
+                    }
+                    fn visit_unit<E: DeError>(self) -> Result<(), E> {
+                        Ok(())
+                    }
+                }
+                deserializer.deserialize_any(V {
+                    violation: self.violation,
+                    message_index: self.message_index,
+                    part_index: self.part_index,
+                })
+            }
+        }
+
+        struct ImageUrlLenSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+            part_index: usize,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for ImageUrlLenSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct V<'v> {
+                    violation: &'v RefCell<Option<RequestError>>,
+                    message_index: usize,
+                    part_index: usize,
+                }
+                impl<'de, 'v> Visitor<'de> for V<'v> {
+                    type Value = ();
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("an image_url object")
+                    }
+                    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        while let Some(key) = map.next_key::<&str>()? {
+                            if key == "url" {
+                                map.next_value_seed(StringLenSeed {
+                                    violation: self.violation,
+                                    message_index: self.message_index,
+                                    part_index: self.part_index,
+                                })?;
+                            } else {
+                                map.next_value::<IgnoredAny>()?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    fn visit_unit<E: DeError>(self) -> Result<(), E> {
+                        Ok(())
+                    }
+                }
+                deserializer.deserialize_any(V {
+                    violation: self.violation,
+                    message_index: self.message_index,
+                    part_index: self.part_index,
+                })
+            }
+        }
+
+        struct PartSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+            part_index: usize,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for PartSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct V<'v> {
+                    violation: &'v RefCell<Option<RequestError>>,
+                    message_index: usize,
+                    part_index: usize,
+                }
+                impl<'de, 'v> Visitor<'de> for V<'v> {
+                    type Value = ();
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("a content part object")
+                    }
+                    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        while let Some(key) = map.next_key::<&str>()? {
+                            match key {
+                                "text" => {
+                                    map.next_value_seed(StringLenSeed {
+                                        violation: self.violation,
+                                        message_index: self.message_index,
+                                        part_index: self.part_index,
+                                    })?;
+                                }
+                                "image_url" => {
+                                    map.next_value_seed(ImageUrlLenSeed {
+                                        violation: self.violation,
+                                        message_index: self.message_index,
+                                        part_index: self.part_index,
+                                    })?;
+                                }
+                                _ => {
+                                    map.next_value::<IgnoredAny>()?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+                deserializer.deserialize_any(V {
+                    violation: self.violation,
+                    message_index: self.message_index,
+                    part_index: self.part_index,
+                })
+            }
+        }
+
+        struct ContentVisitor<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+        }
+        impl<'de, 'v> Visitor<'de> for ContentVisitor<'v> {
+            type Value = ();
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or array of content parts")
+            }
+            fn visit_str<E: DeError>(self, v: &str) -> Result<(), E> {
+                if v.len() > MAX_CONTENT_PART_BYTES {
+                    *self.violation.borrow_mut() = Some(RequestError::bad_request(
+                        part_too_large_message(self.message_index, 0),
+                    ));
+                }
+                Ok(())
+            }
+            fn visit_string<E: DeError>(self, v: String) -> Result<(), E> {
+                self.visit_str(&v)
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut part_index = 0usize;
+                loop {
+                    if part_index >= MAX_CONTENT_PARTS_PER_MESSAGE {
+                        let msg = too_many_parts_message(self.message_index);
+                        *self.violation.borrow_mut() = Some(RequestError::bad_request(msg.clone()));
+                        return Err(A::Error::custom(msg));
+                    }
+                    let seed = PartSeed {
+                        violation: self.violation,
+                        message_index: self.message_index,
+                        part_index,
+                    };
+                    match seq.next_element_seed(seed)? {
+                        Some(()) => part_index += 1,
+                        None => break,
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        struct MessageVisitor<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+        }
+        impl<'de, 'v> Visitor<'de> for MessageVisitor<'v> {
+            type Value = ();
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a message object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<&str>()? {
+                    if key == "content" {
+                        map.next_value_seed(ContentSeed {
+                            violation: self.violation,
+                            message_index: self.message_index,
+                        })?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        struct ContentSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for ContentSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(ContentVisitor {
+                    violation: self.violation,
+                    message_index: self.message_index,
+                })
+            }
+        }
+
+        struct MessageSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+            message_index: usize,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for MessageSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_map(MessageVisitor {
+                    violation: self.violation,
+                    message_index: self.message_index,
+                })
+            }
+        }
+
+        struct MessagesVisitor<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+        }
+        impl<'de, 'v> Visitor<'de> for MessagesVisitor<'v> {
+            type Value = ();
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an array of messages")
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut message_index = 0usize;
+                while seq
+                    .next_element_seed(MessageSeed {
+                        violation: self.violation,
+                        message_index,
+                    })?
+                    .is_some()
+                {
+                    message_index += 1;
+                }
+                Ok(())
+            }
+        }
+
+        struct TopVisitor<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+        }
+        impl<'de, 'v> Visitor<'de> for TopVisitor<'v> {
+            type Value = ();
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a chat completion request object")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while let Some(key) = map.next_key::<&str>()? {
+                    if key == "messages" {
+                        map.next_value_seed(MessagesSeed {
+                            violation: self.violation,
+                        })?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        struct MessagesSeed<'v> {
+            violation: &'v RefCell<Option<RequestError>>,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for MessagesSeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_seq(MessagesVisitor {
+                    violation: self.violation,
+                })
+            }
+        }
+
+        let mut de = serde_json::Deserializer::from_slice(body);
+        // Any error other than a captured violation is left for the typed
+        // `ChatReq` parse below to report authoritatively.
+        let _ = de.deserialize_any(TopVisitor {
+            violation: &violation,
+        });
+        match violation.into_inner() {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
-    /// KV-cache length the worker allocates (see `load_model`). A request's
-    /// `max_tokens` is clamped to this so an absurd value cannot drive
-    /// `Vec::with_capacity(max_new_tokens)` in the Metal decode path to a
-    /// capacity-overflow abort (which would kill the GPU worker thread, a
-    /// persistent DoS). The prompt+completion-exceeds-window case is handled
-    /// fail-closed inside the Metal generate path.
-    const MODEL_MAX_CONTEXT: usize = 4096;
+    /// Clamp-then-parse entry point (#649 DoS hardening): validates part
+    /// counts/sizes against the raw bytes first, then deserializes the typed
+    /// request. Never allocates the request's strings/arrays before the
+    /// clamp has run.
+    fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
+        validate_content_part_limits(body)?;
+        serde_json::from_slice::<ChatReq>(body)
+            .map_err(|_| RequestError::bad_request("invalid JSON request body"))
+    }
 
-    fn build_cfg(req: &ChatReq, d: &Defaults) -> GenerateConfig {
+    /// Flatten message content to plain text (#641, #649). Fails closed:
+    /// an `image_url` part returns the vision-model message, any other
+    /// unsupported part type names itself in the error rather than being
+    /// silently dropped.
+    fn content_text(content: &MessageContent) -> Result<String, RequestError> {
+        match content {
+            MessageContent::Text(text) => Ok(text.clone()),
+            MessageContent::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        Part::Text { text } => out.push_str(text),
+                        Part::ImageUrl { .. } => {
+                            return Err(RequestError::bad_request(IMAGE_REQUIRES_VISION_MESSAGE));
+                        }
+                        Part::Unsupported { kind } => {
+                            return Err(RequestError::bad_request(format!(
+                                "unsupported content part type '{kind}'; only 'text' parts are accepted"
+                            )));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn to_chat_message(m: &InMsg) -> Result<ChatMessage, RequestError> {
+        let role = MessageRole::parse(&m.role)?;
+        let content = content_text(&m.content)?;
+        Ok(match role {
+            MessageRole::System => ChatMessage::system(content),
+            MessageRole::User => ChatMessage::user(content),
+            MessageRole::Assistant => ChatMessage::assistant(content),
+        })
+    }
+
+    /// Derive the model's usable context window from its config (#551):
+    /// `max_position_embeddings` when a real `config.json` was loaded,
+    /// otherwise (or when the field is non-positive) the documented
+    /// fallback. Never a hard-coded constant divorced from the loaded model.
+    fn model_context_from_config(cfg: Option<&Qwen35Config>) -> usize {
+        cfg.map(|cfg| cfg.max_position_embeddings)
+            .filter(|&n| n > 0)
+            .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
+    }
+
+    fn build_cfg(req: &ChatReq, d: &Defaults, model_max_context: usize) -> GenerateConfig {
         // Clamp like `max_tokens`: a budget past the KV window is meaningless and
         // would let a future `with_capacity(decode_cap(..))` abort on overflow.
         let reasoning_budget = req
             .reasoning_budget
             .filter(|&n| n > 0)
             .or(d.reasoning_budget)
-            .map(|n| n.min(MODEL_MAX_CONTEXT));
+            .map(|n| n.min(model_max_context));
         GenerateConfig {
             max_new_tokens: req
                 .max_tokens
                 .unwrap_or(d.max_tokens)
-                .min(MODEL_MAX_CONTEXT),
+                .min(model_max_context),
             temperature: req.temperature.unwrap_or(d.temperature),
             top_k: req.top_k.unwrap_or(d.top_k),
             top_p: req.top_p.unwrap_or(d.top_p),
@@ -250,23 +766,39 @@ mod imp {
     /// Spawn the dedicated thread that owns the `!Send` Metal state. Loads the
     /// model, signals readiness (or a load error) over `ready`, then serves jobs
     /// serially until all `Job` senders drop.
+    /// Worker readiness payload (#551): carries the actual KV context the
+    /// worker allocated so `run()` can store it in `AppState` instead of a
+    /// hard-coded constant.
+    struct WorkerReady {
+        format: String,
+        model_max_context: usize,
+    }
+
     fn spawn_worker(
         model_dir: std::path::PathBuf,
         tokenizer_path: std::path::PathBuf,
         is_q4: bool,
-        ready: std::sync::mpsc::Sender<Result<String, String>>,
+        ready: std::sync::mpsc::Sender<Result<WorkerReady, String>>,
     ) -> mpsc::UnboundedSender<Job> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         std::thread::spawn(move || {
             let loaded = load_model(&model_dir, &tokenizer_path, is_q4);
-            let (mut metal, tokenizer, fmt) = match loaded {
+            let LoadedModel {
+                mut metal,
+                tokenizer,
+                format,
+                model_max_context,
+            } = match loaded {
                 Ok(t) => t,
                 Err(e) => {
                     let _ = ready.send(Err(e));
                     return;
                 }
             };
-            let _ = ready.send(Ok(fmt));
+            let _ = ready.send(Ok(WorkerReady {
+                format,
+                model_max_context,
+            }));
 
             run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
                 metal.reset_state();
@@ -348,32 +880,65 @@ mod imp {
         }
     }
 
+    /// Everything the worker thread needs after a successful model load,
+    /// including the actual KV context (#551) so request clamping never
+    /// drifts from what was actually allocated.
+    struct LoadedModel {
+        metal: MetalQwen35State,
+        tokenizer: BpeTokenizer,
+        format: String,
+        model_max_context: usize,
+    }
+
     fn load_model(
         model_dir: &std::path::Path,
         tokenizer_path: &std::path::Path,
         is_q4: bool,
-    ) -> Result<(MetalQwen35State, BpeTokenizer, String), String> {
+    ) -> Result<LoadedModel, String> {
         let tokenizer = BpeTokenizer::from_tokenizer_json(tokenizer_path)
             .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?;
 
         if is_q4 {
-            let cfg = if model_dir.join("config.json").exists() {
+            let has_config_json = model_dir.join("config.json").exists();
+            let cfg = if has_config_json {
                 Qwen35Config::from_config_json(&model_dir.join("config.json"))
                     .map_err(|e| format!("config.json parse failed: {e}"))?
             } else {
                 Qwen35Config::qwen36_27b()
             };
-            let metal =
-                MetalQwen35State::from_q4_dir(model_dir, tokenizer_path, &cfg, MODEL_MAX_CONTEXT)
-                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
-            Ok((metal, tokenizer, "q4".to_string()))
+            let requested_context = if has_config_json {
+                model_context_from_config(Some(&cfg))
+            } else {
+                model_context_from_config(None)
+            };
+            let metal = MetalQwen35State::from_q4_dir(
+                model_dir,
+                tokenizer_path,
+                &cfg,
+                requested_context,
+            )
+            .map_err(|e| format!("Q4 model load failed: {e}"))?;
+            let model_max_context = metal.max_context();
+            Ok(LoadedModel {
+                metal,
+                tokenizer,
+                format: "q4".to_string(),
+                model_max_context,
+            })
         } else {
             let model = Qwen35Model::from_safetensors(model_dir)
                 .map_err(|e| format!("safetensors load failed: {e}"))?;
             let cfg = model.config().clone();
-            let metal = MetalQwen35State::new(model.weights(), &cfg, MODEL_MAX_CONTEXT)
+            let requested_context = model_context_from_config(Some(&cfg));
+            let metal = MetalQwen35State::new(model.weights(), &cfg, requested_context)
                 .map_err(|e| format!("Metal init failed: {e}"))?;
-            Ok((metal, tokenizer, "bf16".to_string()))
+            let model_max_context = metal.max_context();
+            Ok(LoadedModel {
+                metal,
+                tokenizer,
+                format: "bf16".to_string(),
+                model_max_context,
+            })
         }
     }
 
@@ -442,8 +1007,39 @@ mod imp {
         End(usize),  // holds completion_tokens; emits telemetry then stream ends
     }
 
-    async fn chat_completions(State(s): State<AppState>, Json(req): Json<ChatReq>) -> Response {
+    async fn chat_completions(State(s): State<AppState>, body: Body) -> Response {
         let timer = Instant::now();
+        let body = match to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
+            Ok(body) => body,
+            Err(_) => {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+                );
+            }
+        };
+        let req = match parse_chat_req(&body) {
+            Ok(req) => req,
+            Err(err) => {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                return err_response(StatusCode::BAD_REQUEST, err.message());
+            }
+        };
         if req.messages.is_empty() {
             emit_serve_event(
                 "POST",
@@ -456,8 +1052,21 @@ mod imp {
             return err_response(StatusCode::BAD_REQUEST, "`messages` must not be empty");
         }
 
-        let messages: Vec<ChatMessage> = req.messages.iter().map(to_chat_message).collect();
-        let cfg = build_cfg(&req, &s.defaults);
+        let messages: Vec<ChatMessage> = match req.messages.iter().map(to_chat_message).collect() {
+            Ok(messages) => messages,
+            Err(err) => {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                return err_response(StatusCode::BAD_REQUEST, err.message());
+            }
+        };
+        let cfg = build_cfg(&req, &s.defaults, s.model_max_context);
         let model_id = req.model.clone().unwrap_or_else(|| s.model_id.to_string());
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -805,8 +1414,11 @@ mod imp {
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let jobs = spawn_worker(model_dir.clone(), tokenizer_path, is_q4, ready_tx);
-        let fmt = match ready_rx.recv() {
-            Ok(Ok(fmt)) => fmt,
+        let WorkerReady {
+            format: fmt,
+            model_max_context,
+        } = match ready_rx.recv() {
+            Ok(Ok(ready)) => ready,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => return Err("worker thread exited during model load".into()),
         };
@@ -816,12 +1428,15 @@ mod imp {
             .and_then(|n| n.to_str())
             .unwrap_or("lattice")
             .into();
-        eprintln!("[lattice_serve] model '{model_id}' ({fmt}) ready");
+        eprintln!(
+            "[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})"
+        );
 
         let state = AppState {
             jobs,
             model_id,
             defaults,
+            model_max_context,
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1266,6 +1881,137 @@ mod imp {
             handle
                 .join()
                 .expect("worker thread must not panic on a generation error");
+        }
+
+        // ── #641 / #649 request parsing and clamp tests ──────────────────
+
+        #[test]
+        fn message_content_plain_string_to_chat_message() {
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Text("hi".to_string()),
+            };
+            let chat_message = to_chat_message(&msg).expect("plain string content must parse");
+            assert_eq!(
+                chat_message.role,
+                lattice_inference::forward::metal_qwen35::ChatRole::User
+            );
+            assert_eq!(chat_message.content, "hi");
+        }
+
+        #[test]
+        fn message_content_parts_concatenate_in_order() {
+            let content = MessageContent::Parts(vec![
+                Part::Text {
+                    text: "a".to_string(),
+                },
+                Part::Text {
+                    text: "b".to_string(),
+                },
+            ]);
+            assert_eq!(content_text(&content).unwrap(), "ab");
+        }
+
+        #[test]
+        fn message_content_image_url_rejected() {
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.png".to_string(),
+                    detail: None,
+                },
+            }]);
+            let err = content_text(&content).unwrap_err();
+            assert_eq!(err.message(), IMAGE_REQUIRES_VISION_MESSAGE);
+        }
+
+        #[test]
+        fn message_content_unknown_part_rejected() {
+            let content = MessageContent::Parts(vec![Part::Unsupported {
+                kind: "file".to_string(),
+            }]);
+            let err = content_text(&content).unwrap_err();
+            assert_eq!(
+                err.message(),
+                "unsupported content part type 'file'; only 'text' parts are accepted"
+            );
+        }
+
+        #[test]
+        fn message_role_unknown_rejected() {
+            let err = MessageRole::parse("developer").unwrap_err();
+            assert_eq!(
+                err.message(),
+                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+            );
+        }
+
+        #[test]
+        fn parse_chat_req_rejects_too_many_parts_before_typed_parse() {
+            let parts: Vec<String> = (0..65)
+                .map(|i| format!(r#"{{"type":"text","text":"p{i}"}}"#))
+                .collect();
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":[{}]}}]}}"#,
+                parts.join(",")
+            );
+            let err = parse_chat_req(body.as_bytes()).unwrap_err();
+            assert_eq!(
+                err.message(),
+                "messages[0].content has too many parts; maximum is 64"
+            );
+        }
+
+        #[test]
+        fn parse_chat_req_rejects_oversized_text_part_before_typed_parse() {
+            let big_text = "x".repeat(MAX_CONTENT_PART_BYTES + 1);
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{big_text}"}}]}}]}}"#,
+            );
+            let err = parse_chat_req(body.as_bytes()).unwrap_err();
+            assert_eq!(
+                err.message(),
+                "messages[0].content[0] exceeds 65536 bytes"
+            );
+        }
+
+        #[test]
+        fn build_cfg_clamps_to_runtime_context() {
+            let defaults = Defaults {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: Some(50),
+            };
+            let req = ChatReq {
+                model: None,
+                messages: vec![],
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: None,
+                seed: None,
+                stream: None,
+                repetition_penalty: None,
+                reasoning_budget: Some(50),
+            };
+            let cfg = build_cfg(&req, &defaults, 8);
+            assert!(cfg.max_new_tokens <= 8);
+            let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
+            assert!(reasoning_budget + cfg.max_new_tokens + 1 <= 8);
+        }
+
+        #[test]
+        fn model_context_uses_config_max_position_embeddings() {
+            let mut cfg = Qwen35Config::qwen35_2b();
+            cfg.max_position_embeddings = 12345;
+            assert_eq!(model_context_from_config(Some(&cfg)), 12345);
+        }
+
+        #[test]
+        fn model_context_falls_back_to_4096_when_absent() {
+            assert_eq!(model_context_from_config(None), FALLBACK_MODEL_MAX_CONTEXT);
         }
     }
 }
