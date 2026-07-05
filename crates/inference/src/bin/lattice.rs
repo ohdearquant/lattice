@@ -3266,15 +3266,17 @@ mod serve {
 
     /// Everything `chat_completions` must check about a request *before* it
     /// touches the loaded model: unsupported-feature rejection, model-id
-    /// match, message-shape, sampling-parameter bounds, prompt rendering,
-    /// and stop-sequence parsing. Pulled out of the handler so the
-    /// capability-matrix fixtures (`mod tests`, below) can exercise this
-    /// exact validation cascade — including the `model_not_found` /
-    /// empty-messages / last-role checks that previously had no test
-    /// coverage at all — without constructing a real `ModelBackend`. Only
-    /// the context-window check stays in the handler: it needs
-    /// `state.model.tokenize_len`/`max_context`, which require a loaded
-    /// model. No behavior change versus the inline sequence this replaces.
+    /// match, message-shape, sampling-parameter bounds, and prompt
+    /// rendering. Pulled out of the handler so the capability-matrix
+    /// fixtures (`mod tests`, below) can exercise this exact validation
+    /// cascade — including the `model_not_found` / empty-messages /
+    /// last-role checks that previously had no test coverage at all —
+    /// without constructing a real `ModelBackend`. No behavior change
+    /// versus the inline sequence this replaces.
+    ///
+    /// The context-window check and `stop`-sequence parsing are not part of
+    /// this function — see `prepare_chat_request`, which composes this with
+    /// both in the exact order the original inline cascade used.
     #[derive(Debug)]
     struct ValidatedChatRequest {
         max_tokens: usize,
@@ -3282,7 +3284,6 @@ mod serve {
         top_p: f32,
         logprobs: Option<usize>,
         prompt: String,
-        stop_strings: Vec<String>,
     }
 
     fn validate_chat_request(
@@ -3336,9 +3337,91 @@ mod serve {
         // any unsupported role or content-part type encountered.
         let prompt = render_prompt(&req.messages)?;
 
+        Ok(ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+        })
+    }
+
+    /// Reject prompts that would overflow the model's context window,
+    /// before entering the blocking generation path. This converts what
+    /// would otherwise be a panic inside `spawn_blocking` into a clean 400
+    /// response. Pulled out of `prepare_chat_request` as a pure function
+    /// (given already-computed token counts, not `state.model` itself)
+    /// purely so its precedence relative to `parse_stop_strings` is
+    /// directly testable; behavior is unchanged from the original inline
+    /// check.
+    fn check_context_window(
+        prompt_token_count: usize,
+        max_tokens: usize,
+        max_context: usize,
+    ) -> Result<(), ApiError> {
+        if prompt_token_count == 0 || prompt_token_count.saturating_add(max_tokens) > max_context {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "prompt ({prompt_token_count} tokens) plus max_tokens ({max_tokens}) \
+                     exceeds model context window ({max_context})"
+                ),
+                code: "context_length_exceeded",
+            });
+        }
+        Ok(())
+    }
+
+    /// Output of the full pre-generation validation cascade, ready for
+    /// `gen_cfg` construction.
+    #[derive(Debug)]
+    struct PreparedChatRequest {
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        logprobs: Option<usize>,
+        prompt: String,
+        stop_strings: Vec<String>,
+    }
+
+    /// Composes `validate_chat_request`, the context-window preflight, and
+    /// `stop`-sequence parsing in the exact order the original inline
+    /// `chat_completions` cascade used: `stop` is validated *last*, after
+    /// both the served-model hard requirements and the context-window
+    /// check that guards against a panic in the blocking generation path.
+    /// A request that is both over-context and carries a malformed `stop`
+    /// field must fail with `context_length_exceeded`, not a stop-parsing
+    /// error — pinned by `cm_serve_context_window_checked_before_stop_parsing`.
+    ///
+    /// `tokenize_len`/`max_context` are threaded through as thunks (rather
+    /// than a `&ModelBackend`) so this whole cascade — including the
+    /// ordering — is testable without constructing a real model: the
+    /// rendered `prompt` that `tokenize_len` needs only exists once
+    /// `validate_chat_request` has already run, so the thunk form lets a
+    /// test control the token count `check_context_window` sees without
+    /// having to fake a tokenizer.
+    fn prepare_chat_request(
+        req: &ChatCompletionRequest,
+        model_id: &str,
+        default_max_tokens: usize,
+        max_tokens_cap: usize,
+        tokenize_len: impl FnOnce(&str) -> usize,
+        max_context: impl FnOnce() -> usize,
+    ) -> Result<PreparedChatRequest, ApiError> {
+        let ValidatedChatRequest {
+            max_tokens,
+            temperature,
+            top_p,
+            logprobs,
+            prompt,
+        } = validate_chat_request(req, model_id, default_max_tokens, max_tokens_cap)?;
+
+        let prompt_token_count = tokenize_len(&prompt);
+        let max_context = max_context();
+        check_context_window(prompt_token_count, max_tokens, max_context)?;
+
         let stop_strings = parse_stop_strings(&req.stop)?;
 
-        Ok(ValidatedChatRequest {
+        Ok(PreparedChatRequest {
             max_tokens,
             temperature,
             top_p,
@@ -3368,34 +3451,21 @@ mod serve {
             }
         })?;
 
-        let ValidatedChatRequest {
+        let PreparedChatRequest {
             max_tokens,
             temperature,
             top_p,
             logprobs,
             prompt,
             stop_strings,
-        } = validate_chat_request(
+        } = prepare_chat_request(
             &req,
             &state.model_id,
             state.default_max_tokens,
             state.max_tokens_cap,
+            |p| state.model.tokenize_len(p),
+            || state.model.max_context(),
         )?;
-
-        // Preflight: reject prompts that would overflow the model's context window
-        // before entering the blocking generation path.  This converts what would
-        // otherwise be a panic inside spawn_blocking into a clean 400 response.
-        let prompt_token_count = state.model.tokenize_len(&prompt);
-        let max_context = state.model.max_context();
-        if prompt_token_count == 0 || prompt_token_count.saturating_add(max_tokens) > max_context {
-            return Err(ApiError::BadRequest {
-                message: format!(
-                    "prompt ({prompt_token_count} tokens) plus max_tokens ({max_tokens}) \
-                     exceeds model context window ({max_context})"
-                ),
-                code: "context_length_exceeded",
-            });
-        }
 
         let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
             max_new_tokens: max_tokens,
@@ -4880,7 +4950,7 @@ mod serve {
         #[test]
         fn cm_serve_stop_sequences_accepted_end_to_end() {
             // Full-cascade check that a well-formed request carrying `stop`
-            // resolves through to `ValidatedChatRequest.stop_strings` — the
+            // resolves through to `PreparedChatRequest.stop_strings` — the
             // capability matrix's "supported" claim for `stop` on this surface.
             let req = ChatCompletionRequest {
                 model: "served-model".to_string(),
@@ -4888,8 +4958,45 @@ mod serve {
                 stop: Some(serde_json::json!(["\n\n"])),
                 ..bare_req()
             };
-            let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
-            assert_eq!(validated.stop_strings, vec!["\n\n".to_string()]);
+            let prepared =
+                prepare_chat_request(&req, "served-model", 256, 4096, |_| 1, || 4096).unwrap();
+            assert_eq!(prepared.stop_strings, vec!["\n\n".to_string()]);
+        }
+
+        #[test]
+        fn cm_serve_context_window_checked_before_stop_parsing() {
+            // Regression fixture for a refactor bug: extracting stop-sequence
+            // parsing into the pre-model validation cascade moved it ahead of
+            // the context-window check. The pre-refactor inline sequence
+            // (verified directly against `crates/inference/src/bin/lattice.rs`
+            // at commit 3e0f74155, the base this PR built on) checked the
+            // context window BEFORE parsing `stop`. A request that is both
+            // over-context and carries a malformed `stop` field must
+            // therefore fail with `context_length_exceeded`, not a
+            // stop-parsing error.
+            //
+            // This drives `prepare_chat_request` itself (not just its
+            // sub-functions in isolation), with a `tokenize_len` thunk that
+            // reports the whole context window as already consumed by the
+            // prompt — so it is sensitive to a future reordering of the
+            // `check_context_window` / `parse_stop_strings` calls inside
+            // `prepare_chat_request`, not just to whether each sub-function
+            // works in isolation.
+            let req = ChatCompletionRequest {
+                model: "served-model".to_string(),
+                messages: vec![user_msg("hi")],
+                stop: Some(serde_json::json!([])), // malformed: empty array is rejected
+                ..bare_req()
+            };
+            let err = prepare_chat_request(&req, "served-model", 256, 4096, |_| 4096, || 4096)
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                }
+            ));
         }
 
         #[test]
