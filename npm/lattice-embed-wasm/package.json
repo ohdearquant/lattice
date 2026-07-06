@@ -1,0 +1,46 @@
+{
+  "name": "lattice-embed-wasm",
+  "version": "0.1.0",
+  "description": "Pure-Rust BERT-family text embeddings compiled to WebAssembly, with a small Node adapter for model resolution, caching, and pooling.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Ocean <ocean@lionagi.ai>",
+  "homepage": "https://github.com/ohdearquant/lattice/tree/main/npm/lattice-embed-wasm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ohdearquant/lattice.git",
+    "directory": "npm/lattice-embed-wasm"
+  },
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "registry.mjs",
+    "resolve.mjs",
+    "wasm/lattice_embed.js",
+    "wasm/lattice_embed.d.ts",
+    "wasm/lattice_embed_bg.wasm",
+    "wasm/lattice_embed_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "bash scripts/build-wasm.sh",
+    "prepack": "bash scripts/build-wasm.sh",
+    "smoke": "node smoke.mjs"
+  },
+  "keywords": [
+    "embeddings",
+    "wasm",
+    "webassembly",
+    "bert",
+    "sentence-embeddings",
+    "vector-search",
+    "rust"
+  ],
+  "dependencies": {}
+}
