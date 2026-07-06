@@ -9,7 +9,7 @@ use crate::attention::{
 };
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
-use crate::forward::cpu::{add_bias, add_bias_gelu, gelu, layer_norm, matmul_bt};
+use crate::forward::cpu::{add_bias, add_bias_gelu, layer_norm, matmul_bt};
 use crate::lora_hook::{LoraHook, NoopLoraHook};
 use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
@@ -452,10 +452,11 @@ impl BertModel {
     ) -> Vec<f32> {
         let seq_len = input.real_length;
         // `lora` here is caller-supplied and may be a real adapter (see
-        // `CrossEncoderModel::score_with_hook`), so the FFN fast path (#675)
-        // is not taken: LoRA's `apply` call must run between the bias-add and
-        // GELU exactly as before, which the fused `add_bias_gelu` kernel has
-        // no hook for.
+        // `CrossEncoderModel::score_with_hook`). The FFN fast path (#675) is
+        // still safe to take: `LoraHook::apply` only ever adds a delta that
+        // depends on the pre-FFN hidden state, not on the bias-add's output,
+        // so doing the adapter add-in before the fused bias+GELU pass gives
+        // the same result as adding it in between (addition commutes).
         self.forward_with_hook(
             &input.input_ids[..seq_len],
             &input.attention_mask[..seq_len],
@@ -463,7 +464,6 @@ impl BertModel {
             seq_len,
             buffers,
             lora,
-            false,
         )
     }
 
@@ -476,8 +476,6 @@ impl BertModel {
         seq_len: usize,
         buffers: &mut AttentionBuffers,
     ) -> Vec<f32> {
-        // `NoopLoraHook` is a literal here, so the FFN fast path (#675) is
-        // always correct and safe to take.
         self.forward_with_hook(
             input_ids,
             attention_mask,
@@ -485,19 +483,19 @@ impl BertModel {
             seq_len,
             buffers,
             &NoopLoraHook,
-            true,
         )
     }
 
     /// Hook-aware internal full transformer forward pass.
     ///
-    /// `fuse_ffn_gelu`: when `true`, the FFN intermediate stage uses the fused
-    /// `add_bias_gelu` kernel (#675) instead of separate `add_bias`/`gelu`
-    /// passes. Only safe when `lora` is definitely a no-op for
-    /// `"ffn_intermediate"` (`LoraHook::apply` normally runs *between* the
-    /// bias-add and GELU, and the fused kernel has no hook for that), so
-    /// callers that may pass a real adapter (`forward_tokenized_with_hook`)
-    /// must pass `false`.
+    /// The FFN intermediate stage always uses the fused `add_bias_gelu`
+    /// kernel (#675) instead of separate `add_bias`/`gelu` passes. This is
+    /// safe with a real `lora` adapter too: `LoraHook::apply` only adds
+    /// `scale * B @ (A @ x)` into the buffer, a delta that depends on the
+    /// pre-FFN hidden state (`x`) rather than on the bias-add's output, so
+    /// applying it before the fused bias+GELU pass is equivalent (up to
+    /// negligible f32 summation-order rounding) to the previous
+    /// bias-add-then-adapter-then-GELU ordering.
     fn forward_with_hook(
         &self,
         input_ids: &[u32],
@@ -506,7 +504,6 @@ impl BertModel {
         seq_len: usize,
         buffers: &mut AttentionBuffers,
         lora: &dyn LoraHook,
-        fuse_ffn_gelu: bool,
     ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
@@ -594,22 +591,16 @@ impl BertModel {
                     hidden_size,
                     intermediate_size,
                 );
-                if fuse_ffn_gelu {
-                    // #675: one fused pass instead of add_bias + gelu.
-                    add_bias_gelu(
-                        ffn_intermediate,
-                        layer.ffn_intermediate_bias.data,
-                        intermediate_size,
-                    );
-                } else {
-                    add_bias(
-                        ffn_intermediate,
-                        layer.ffn_intermediate_bias.data,
-                        intermediate_size,
-                    );
-                    lora.apply(layer_idx, "ffn_intermediate", &hidden, ffn_intermediate);
-                    gelu(ffn_intermediate);
-                }
+                // #675: adapter add-in before the fused bias+GELU pass (see
+                // `forward_with_hook`'s doc comment for why this ordering is
+                // equivalent to the previous add_bias-then-adapter-then-gelu
+                // sequence).
+                lora.apply(layer_idx, "ffn_intermediate", &hidden, ffn_intermediate);
+                add_bias_gelu(
+                    ffn_intermediate,
+                    layer.ffn_intermediate_bias.data,
+                    intermediate_size,
+                );
             }
 
             {
@@ -805,10 +796,9 @@ impl BertModel {
                 intermediate_size,
             );
             // #675: `forward_batch` is only ever called by `encode_batch` with
-            // `NoopLoraHook` (a literal at that call site), so the fused
-            // add_bias_gelu fast path is always correct here -- unlike
-            // `forward_with_hook`, which is also reachable with a real LoRA
-            // adapter via `CrossEncoderModel::score_with_hook`.
+            // `NoopLoraHook` (a literal at that call site), so there is no
+            // `"ffn_intermediate"` adapter add-in to order around here; the
+            // fused add_bias_gelu pass is a direct swap for add_bias+gelu.
             add_bias_gelu(
                 &mut ffn_intermediate,
                 layer.ffn_intermediate_bias.data,
