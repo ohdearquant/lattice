@@ -963,8 +963,10 @@ fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::cpu::gelu;
     use crate::pool::{cls_pool, l2_normalize, mean_pool};
     use approx::assert_relative_eq;
+    use std::sync::Mutex;
 
     #[test]
     #[ignore]
@@ -1131,6 +1133,177 @@ mod tests {
                 "boundary text[{i}]: max-abs-diff {max_abs_diff} > 1e-4"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // FFN-intermediate LoRA-adapter reorder correctness (#675, mutation-sensitive)
+    //
+    // `forward_with_hook` runs `lora.apply("ffn_intermediate", ...)` before the
+    // fused `add_bias_gelu` kernel on the argument that the bias-add and the
+    // adapter delta are both additions into the same buffer ahead of a single
+    // GELU, so their relative order does not matter as long as both land
+    // before GELU. This test exercises that path with a real (non no-op)
+    // adapter and must fail if the ordering regresses to
+    // add_bias_gelu-then-adapter (delta landing after GELU instead of before).
+    // -------------------------------------------------------------------------
+
+    /// `LoraHook` that captures the FFN block's input activation (`x`) for one
+    /// target module and adds a constant delta to that projection's output.
+    ///
+    /// Capturing `x` rather than `output` keeps the reference computation in
+    /// the test below independent of where the hook actually fires relative
+    /// to bias/GELU: `x` is produced before the FFN block starts, so its
+    /// value does not depend on the ordering under test.
+    struct CapturingDeltaHook {
+        target_module: &'static str,
+        delta: f32,
+        captured_x: Mutex<Option<Vec<f32>>>,
+    }
+
+    impl LoraHook for CapturingDeltaHook {
+        fn apply(&self, _layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+            if module != self.target_module {
+                return;
+            }
+            *self.captured_x.lock().unwrap() = Some(x.to_vec());
+            for o in output.iter_mut() {
+                *o += self.delta;
+            }
+        }
+    }
+
+    /// Build a `TokenizedInput` + fresh `AttentionBuffers` for one text, the
+    /// same way `BertModel::encode` does internally.
+    fn tokenize_and_buffers(
+        model: &BertModel,
+        text: &str,
+    ) -> (crate::tokenizer::TokenizedInput, AttentionBuffers) {
+        let input = model.tokenizer.tokenize(text);
+        let seq_len = input.real_length;
+        let buffers = AttentionBuffers::new(
+            seq_len,
+            model.config.hidden_size,
+            model.config.num_attention_heads,
+            model.config.intermediate_size,
+        );
+        (input, buffers)
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ffn_intermediate_lora_delta_lands_before_gelu() {
+        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
+            return;
+        };
+        let mut model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
+
+        // Truncate to a single transformer layer so the adapter's effect does
+        // not cascade through further layers: the reference below is then a
+        // direct, checkable reconstruction of exactly one FFN block.
+        model.weights.layers.truncate(1);
+        model.fused_qkv.truncate(1);
+        model.config.num_hidden_layers = 1;
+
+        let text = "the quick brown fox jumps over the lazy dog";
+        let delta = 0.05_f32;
+
+        // Baseline: no adapter.
+        let (input, mut buffers) = tokenize_and_buffers(&model, text);
+        let baseline = model.forward_tokenized_with_hook(&input, &mut buffers, &NoopLoraHook);
+
+        // With adapter: a constant delta added to the ffn_intermediate
+        // projection, capturing its input activation as it flows through.
+        let hook = CapturingDeltaHook {
+            target_module: "ffn_intermediate",
+            delta,
+            captured_x: Mutex::new(None),
+        };
+        let (input2, mut buffers2) = tokenize_and_buffers(&model, text);
+        let with_delta = model.forward_tokenized_with_hook(&input2, &mut buffers2, &hook);
+
+        // (a) The adapter must actually reach the result -- otherwise this
+        // whole path is dead and the rest of the test proves nothing.
+        let max_abs_diff_vs_baseline = with_delta
+            .iter()
+            .zip(baseline.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff_vs_baseline > 1e-3,
+            "an active ffn_intermediate adapter must move the output; \
+             max-abs-diff vs no-op baseline was only {max_abs_diff_vs_baseline}"
+        );
+
+        // (b) Build a reference that hardcodes "delta lands before GELU"
+        // using separate, unfused kernel calls (matmul_bt / add_bias / gelu
+        // one at a time), so it does not just replay whatever internal order
+        // forward_with_hook happens to use.
+        let seq_len = input2.real_length;
+        let hidden_size = model.config.hidden_size;
+        let intermediate_size = model.config.intermediate_size;
+        let used_hidden = seq_len * hidden_size;
+        let used_intermediate = seq_len * intermediate_size;
+        let layer = &model.weights.layers[0];
+
+        let captured_x = hook
+            .captured_x
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("hook must have been invoked for ffn_intermediate");
+        assert_eq!(captured_x.len(), used_hidden);
+
+        let mut raw = vec![0.0f32; used_intermediate];
+        matmul_bt(
+            &captured_x,
+            layer.ffn_intermediate_weight.data,
+            &mut raw,
+            seq_len,
+            hidden_size,
+            intermediate_size,
+        );
+        add_bias(
+            &mut raw,
+            layer.ffn_intermediate_bias.data,
+            intermediate_size,
+        );
+        for v in raw.iter_mut() {
+            *v += delta;
+        }
+        gelu(&mut raw); // separate, unfused gelu -- independent of add_bias_gelu
+
+        let mut reference = vec![0.0f32; used_hidden];
+        matmul_bt(
+            &raw,
+            layer.ffn_output_weight.data,
+            &mut reference,
+            seq_len,
+            intermediate_size,
+            hidden_size,
+        );
+        add_bias(&mut reference, layer.ffn_output_bias.data, hidden_size);
+        for i in 0..used_hidden {
+            reference[i] += captured_x[i];
+        }
+        layer_norm(
+            &mut reference,
+            layer.ffn_layer_norm_weight.data,
+            layer.ffn_layer_norm_bias.data,
+            hidden_size,
+            model.config.layer_norm_eps,
+        );
+
+        assert_eq!(reference.len(), with_delta.len());
+        let max_abs_diff_vs_reference = reference
+            .iter()
+            .zip(with_delta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff_vs_reference < 1e-4,
+            "forward_with_hook's ffn_intermediate output does not match the \
+             delta-lands-before-gelu reference: max-abs-diff {max_abs_diff_vs_reference}"
+        );
     }
 
     // -------------------------------------------------------------------------
