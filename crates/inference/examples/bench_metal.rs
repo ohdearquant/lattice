@@ -1,7 +1,7 @@
 //! Benchmark: Direct Metal forward pass for Qwen3-Embedding-0.6B vs CPU.
 //!
 //! Usage:
-//!   cargo run --release --features "f16,metal-gpu" --bin bench_metal -p lattice-inference
+//!   cargo run --release -p lattice-inference --example bench_metal --features "f16,metal-gpu"
 
 use std::path::Path;
 use std::time::Instant;
