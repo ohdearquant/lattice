@@ -1,7 +1,7 @@
 //! Benchmark: GPU forward pass for Qwen3-Embedding-0.6B vs CPU.
 //!
 //! Usage:
-//!   cargo run --release --features "f16,wgpu-gpu" --bin bench_gpu -p lattice-inference
+//!   cargo run --release -p lattice-inference --example bench_gpu --features "f16,wgpu-gpu"
 
 use std::path::Path;
 use std::time::Instant;
@@ -31,7 +31,9 @@ fn run_bench() {
 
     if !dir.join("model.safetensors").exists() {
         eprintln!("Model not found at {model_dir}");
-        eprintln!("Run: cargo run --release --features 'f16,download' --bin bench_embedding");
+        eprintln!(
+            "Download: huggingface-cli download Qwen/Qwen3-Embedding-0.6B --local-dir {model_dir}"
+        );
         std::process::exit(1);
     }
 
