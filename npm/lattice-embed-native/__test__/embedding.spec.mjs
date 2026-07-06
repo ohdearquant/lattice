@@ -6,10 +6,10 @@
 // One test in this file is explicitly MUTATION-SENSITIVE (see the test
 // named "...mutation-sensitive" below): its assertions are only satisfiable
 // because src/lib.rs's `encode_many` derives `EmbeddingBatch.dimensions`
-// from the same value used to size the flat buffer. See the delivery
-// report for the actual revert -> fail -> restore -> pass demonstration
-// (requires rebuilding the native binary between steps, so it is not
-// re-run automatically here).
+// from the same value used to size the flat buffer. Verified once by
+// reverting that field construction, rebuilding, and watching the test
+// fail, then restoring and watching it pass; that cycle requires rebuilding
+// the native binary between steps, so it is not re-run automatically here.
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { homedir } from 'node:os'
@@ -108,9 +108,9 @@ test('embedBatch (async) agrees with embedBatchSync', async () => {
 // `data` buffer. If that field construction is corrupted (e.g.
 // `dimensions: dimension + 1`), `batch.data.length` (still the real
 // flattened row count * true per-row length) stops equaling
-// `batch.rows * batch.dimensions`, and this assertion fails. See the
-// delivery report for the actual revert/rebuild/fail, restore/rebuild/pass
-// cycle.
+// `batch.rows * batch.dimensions`, and this assertion fails. Verified by
+// the revert/rebuild/fail then restore/rebuild/pass cycle (manual, since it
+// requires rebuilding the native binary between steps).
 test('embedBatchSync batch metadata matches real buffer length (mutation-sensitive)', () => {
   const texts = ['a dog runs in the park', 'a puppy runs in the park', 'quarterly financial report']
   const batch = minilm.embedBatchSync(texts)

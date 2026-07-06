@@ -41,8 +41,8 @@ lattice-embed = { path = "../../crates/embed", default-features = false, feature
 # `BertModel` itself (only its own `EmbeddingModel`/`ModelConfig` types, see
 # crates/embed/src/lib.rs). `default-features = false, features = ["std",
 # "f16"]` requests the same trimmed CPU-compute cut `crates/embed/Cargo.toml`
-# uses for its wasm32 target table (no `download`/`serve`). NOTE (flagged in
-# the delivery report): `lattice-embed`'s own Cargo.toml depends on
+# uses for its wasm32 target table (no `download`/`serve`). NOTE:
+# `lattice-embed`'s own Cargo.toml depends on
 # `lattice-inference` for native targets WITHOUT `default-features = false`,
 # so Cargo feature unification still compiles `lattice-inference`'s full
 # default feature set (`std` + `download` + `serve`, i.e. axum/tokio/ureq)

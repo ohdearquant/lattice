@@ -6,8 +6,8 @@
 // entry point `lattice_embed::service::native::NativeEmbeddingService` itself
 // calls for BERT-family models (see that module's `load_model_sync`).
 //
-// v0 scope (see the design note for the full rationale): local-directory
-// loading only, no remote model-id resolution/download tier (that is the
+// v0 scope: local-directory loading only, no remote model-id
+// resolution/download tier (that is the
 // wasm package's `resolve.mjs` job, not this one, and is explicitly
 // deferred here). Pooling (CLS for BGE, mean for E5/MiniLM) is resolved
 // automatically from the model family, exactly as
@@ -16,7 +16,7 @@
 // `crates/embed/src/wasm.rs`'s `LatticeEmbedder::use_cls_pooling()`, which
 // requires the JS caller to opt in to CLS explicitly).
 //
-// Known v0 limitation (flagged loudly here and in the delivery report):
+// Known v0 limitation (flagged loudly here):
 // `BertModel::encode`/`encode_batch` unconditionally L2-normalize their
 // output (see crates/inference/src/model/bert.rs; the `pool()` doc comment
 // confirms normalization always happens in the caller, i.e. `encode`/
