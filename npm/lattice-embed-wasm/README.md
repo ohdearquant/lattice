@@ -76,22 +76,39 @@ typical npm package sizes and are shared across every consumer, not just
 this one). Each model's `model.safetensors` / `config.json` / `tokenizer.json`
 are resolved in this order:
 
-1. A local directory override: `LATTICE_EMBED_MODELS_DIR` (default
-   `~/.lattice/models`), one subdirectory per model, e.g.
-   `~/.lattice/models/all-minilm-l6-v2/`.
+1. A local directory override: `LATTICE_EMBED_MODELS_DIR`, or
+   `LATTICE_MODEL_CACHE` (the same cache-directory environment variable the
+   native `lattice-embed` CLI reads), or `~/.lattice/models` by default; one
+   subdirectory per model, e.g. `~/.lattice/models/all-minilm-l6-v2/`. This
+   tier is **wasm-specific**: it requires `model.safetensors`, `config.json`,
+   and `tokenizer.json` in that subdirectory. It is not automatic reuse of
+   whatever the native CLI happens to have cached: a directory populated by
+   a native download of a WordPiece model (BGE or MiniLM) contains
+   `vocab.txt`, not `tokenizer.json`, and is not directly usable here until
+   a `tokenizer.json` is also present. This package does not synthesize a
+   `tokenizer.json` from `vocab.txt`.
 2. This package's own on-disk cache: `LATTICE_EMBED_WASM_CACHE_DIR` (default
    `~/.cache/lattice-embed-wasm/models`).
-3. A pinned download: each model's three files are fetched from a specific
-   GitHub release of this repository and checked against a pinned sha256
-   hash before use. A verified download is written into the cache directory
-   from step 2 so later calls are cache hits.
+3. A pinned download, once enabled: each model's three files are fetched
+   from a specific GitHub release of this repository and checked against a
+   pinned sha256 hash before use. This tier is a **publish step**, gated
+   separately from this package's code: it activates only once the model
+   weight assets have been uploaded as release assets and
+   `WEIGHTS_RELEASE_TAG` (in `registry.mjs`) is set to that release's tag.
+   Until then this tier is skipped (with a one-time warning explaining why,
+   not spammed per call), and a model not found via steps 1-2 resolves to
+   `null`. A verified download is written into the cache directory from
+   step 2 so later calls are cache hits.
 
-Every candidate, from any of the three sources, is checked against its
-pinned hash before its bytes are used. A candidate that fails verification
-is discarded, and resolution falls through to the next source; if none of
-the three sources produce a verified result, the model is treated as
-unavailable (`embed()` returns `null`) rather than risking a wrong or
-tampered vector.
+Every candidate, from any of the three tiers, is checked against its pinned
+hash before its bytes are used. A **missing** pinned hash for any file a
+model declares counts as a verification failure too, never a skip: the
+registry itself enforces this at module load, refusing to register a model
+entry that lacks a pinned hash for one of its declared files. A candidate
+that fails verification is discarded, and resolution falls through to the
+next source; if none of the tiers produce a verified result, the model is
+treated as unavailable (`embed()` returns `null`) rather than risking a
+wrong or tampered vector.
 
 ## Integration note
 

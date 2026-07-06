@@ -4,7 +4,7 @@
   "description": "Pure-Rust BERT-family text embeddings compiled to WebAssembly, with a small Node adapter for model resolution, caching, and pooling.",
   "type": "module",
   "license": "Apache-2.0",
-  "author": "Ocean <ocean@lionagi.ai>",
+  "author": "lattice contributors",
   "homepage": "https://github.com/ohdearquant/lattice/tree/main/npm/lattice-embed-wasm",
   "repository": {
     "type": "git",

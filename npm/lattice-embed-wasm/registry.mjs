@@ -7,17 +7,24 @@
 //
 // Weight hosting: GitHub release assets on this repository, pinned by
 // content hash so a compromised or edited release asset is rejected before
-// use (see resolve.mjs). `WEIGHTS_RELEASE_TAG` is publish-time config: it is
-// set once the model weights are actually uploaded as release assets, and
-// every consumer of this package picks it up automatically once it lands
-// here (no code change needed downstream).
+// use (see resolve.mjs). `WEIGHTS_RELEASE_TAG` is publish-time config, and
+// deliberately UNSET here: uploading the model weights as release assets is
+// a later, separately-gated publish step, not something this package's code
+// can do on its own. Until that step lands and this constant is set to the
+// real tag, `releaseUrl` below returns null for every asset, and
+// resolve.mjs's remote-fetch tier skips itself entirely rather than build a
+// request against a release that does not exist (see that file's
+// `fetchTierConfigured`). Once the publish step lands and this is set,
+// every consumer of this package picks it up automatically (no code change
+// needed downstream).
 
-export const WEIGHTS_RELEASE_TAG = 'embed-weights-v1';
+export const WEIGHTS_RELEASE_TAG = '';
 
 const RELEASE_ASSET_BASE =
   'https://github.com/ohdearquant/lattice/releases/download';
 
 function releaseUrl(assetName) {
+  if (!WEIGHTS_RELEASE_TAG) return null;
   return `${RELEASE_ASSET_BASE}/${WEIGHTS_RELEASE_TAG}/${assetName}`;
 }
 
@@ -102,6 +109,35 @@ export const MODEL_REGISTRY = {
     },
   },
 };
+
+// Fail-closed registry validation, run once at module load: a model entry
+// is only usable if it has a pinned sha256 hex digest for every file it
+// declares in `files`. resolve.mjs independently treats a missing pinned
+// hash as a verification failure on every tier (local override, cache, and
+// download), but that is a last-resort guard; the real gate is here, so a
+// registry entry added later without a pinned hash for one of its files is
+// never even reachable through `MODEL_REGISTRY` -- it is deleted below and
+// a caller sees the same "unknown model" degrade (see `getEmbedder` in
+// index.mjs) as any other unrecognized name, never a path to unverified
+// bytes.
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+function hasPinnedHashForEveryFile(entry) {
+  return Object.values(entry.files).every((fileName) => {
+    const hash = entry.sha256[fileName];
+    return typeof hash === 'string' && SHA256_HEX_RE.test(hash);
+  });
+}
+
+for (const [name, entry] of Object.entries(MODEL_REGISTRY)) {
+  if (!hasPinnedHashForEveryFile(entry)) {
+    console.error(
+      `lattice-embed-wasm: registry entry "${name}" is missing a pinned sha256 for one or ` +
+        'more of its declared files; refusing to register it as a usable model',
+    );
+    delete MODEL_REGISTRY[name];
+  }
+}
 
 // Models this package is aware of but does not serve over the wasm channel,
 // along with why. The wasm core wraps a BERT encoder (see

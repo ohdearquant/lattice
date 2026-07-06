@@ -1,21 +1,37 @@
 // Resolves a model's three source files (model weights, config, tokenizer)
 // to bytes, in priority order:
 //
-//   (a) explicit local-dir override: LATTICE_EMBED_MODELS_DIR (or
-//       ~/.lattice/models by default), the directory layout the native
-//       lattice-embed CLI already uses, so a machine that has run that CLI
-//       has these files for free.
+//   (a) explicit local-dir override: LATTICE_EMBED_MODELS_DIR, or
+//       LATTICE_MODEL_CACHE (the cache-directory env var the native
+//       lattice-embed CLI reads, see crates/inference/src/lib.rs's
+//       `default_cache_dir`), or ~/.lattice/models by default. This tier is
+//       wasm-specific: it requires model.safetensors, config.json, AND
+//       tokenizer.json in the model's subdirectory. A native download of a
+//       WordPiece model (BGE/MiniLM) only fetches vocab.txt, not
+//       tokenizer.json (see crates/inference/src/download.rs), so a
+//       native-CLI cache populated that way is not directly usable here
+//       unless a tokenizer.json is also present; this package does not
+//       synthesize one from vocab.txt.
 //   (b) this package's own on-disk cache (~/.cache/lattice-embed-wasm/models
 //       by default, override with LATTICE_EMBED_WASM_CACHE_DIR).
 //   (c) fetch from the pinned GitHub release asset URL in the registry and
 //       verify sha256 before use; a verified download is written into the
 //       cache directory from (b) so the next resolution is a cache hit.
+//       Skipped entirely while `WEIGHTS_RELEASE_TAG` (registry.mjs) is
+//       unset; see that file's comment for why.
 //
 // Every candidate is checked against the registry's pinned sha256 before its
-// bytes are handed back. A candidate that fails verification is discarded
-// (not used, not trusted) and resolution continues to the next tier; if
-// every tier is exhausted without a verified candidate, resolution fails
-// closed: the caller gets `null`; it never gets a wrong or partial vector.
+// bytes are handed back. A MISSING pinned hash for any file an entry
+// declares is itself a verification failure, never a skip; see
+// registry.mjs, which refuses to register a model entry at module load if
+// it lacks a pinned hash for one of its declared files, so `entry.sha256`
+// is guaranteed complete by the time it reaches this module; this file's
+// own per-file check is a second, independent guard against ever treating
+// an unpinned file as verified. A candidate that fails verification is
+// discarded (not used, not trusted) and resolution continues to the next
+// tier; if every tier is exhausted without a verified candidate, resolution
+// fails closed: the caller gets `null`; it never gets a wrong or partial
+// vector.
 
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -26,8 +42,50 @@ function sha256Hex(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-function localModelsDir() {
-  return process.env.LATTICE_EMBED_MODELS_DIR || path.join(homedir(), '.lattice', 'models');
+// Checks `actual` (the sha256 hex of a candidate file's bytes) against the
+// registry's pinned hash for `fileName`. A MISSING pinned hash is treated as
+// a verification FAILURE, never a silent skip: an entry reaching this
+// function is expected to have already passed the module-load registry
+// validation (see registry.mjs) that guarantees a pinned hash for every
+// declared file, so a missing hash here would mean that guarantee was
+// bypassed somehow -- fail closed rather than trust unverified bytes on any
+// path (local override, cache, or download). Shared by both verify sites
+// below so the fail-closed rule can't drift between them.
+function verifyHash(fileName, actual, entry, sourceLabel) {
+  const expected = entry.sha256[fileName];
+  if (!expected) {
+    console.error(
+      `lattice-embed-wasm: no pinned sha256 for ${fileName} in the registry; refusing to ` +
+        `trust ${fileName} from ${sourceLabel} without a pinned hash`,
+    );
+    return false;
+  }
+  if (actual !== expected) {
+    console.error(
+      `lattice-embed-wasm: sha256 mismatch for ${fileName} from ${sourceLabel} ` +
+        `(expected ${expected}, got ${actual}); discarding this candidate`,
+    );
+    return false;
+  }
+  return true;
+}
+
+// Local-override search directories, in priority order: an explicit wasm-
+// specific override, then the native lattice-embed CLI's cache-directory
+// env var (so a directory already populated by the native CLI is checked
+// too, though see the module doc comment above about which files it needs
+// to actually contain), then the shared default both env vars fall back to.
+// Deduplicated so a shared default or identically-set env vars aren't
+// checked twice.
+function localModelsDirs() {
+  const dirs = [];
+  const fromEmbedVar = process.env.LATTICE_EMBED_MODELS_DIR;
+  const fromNativeVar = process.env.LATTICE_MODEL_CACHE;
+  if (fromEmbedVar && !dirs.includes(fromEmbedVar)) dirs.push(fromEmbedVar);
+  if (fromNativeVar && !dirs.includes(fromNativeVar)) dirs.push(fromNativeVar);
+  const fallback = path.join(homedir(), '.lattice', 'models');
+  if (!dirs.includes(fallback)) dirs.push(fallback);
+  return dirs;
 }
 
 function cacheModelsDir() {
@@ -61,21 +119,40 @@ function readAndVerify(dir, entry, sourceLabel) {
   };
 
   for (const [key, fileName] of Object.entries(names)) {
-    const expected = entry.sha256[fileName];
     const actual = sha256Hex(bytes[key]);
-    if (expected && actual !== expected) {
-      console.error(
-        `lattice-embed-wasm: sha256 mismatch for ${fileName} from ${sourceLabel} ` +
-          `(expected ${expected}, got ${actual}); discarding this candidate`,
-      );
-      return null;
-    }
+    if (!verifyHash(fileName, actual, entry, sourceLabel)) return null;
   }
 
   return bytes;
 }
 
+// Module-level guard so the "remote-fetch tier skipped" notice is emitted
+// once per process, not once per resolution attempt (a caller may try many
+// models across a session; the reason is the same every time).
+let fetchTierSkipWarned = false;
+
+// True only if every declared file has a release-asset URL configured (see
+// registry.mjs's `releaseUrl`, which returns null for every asset while
+// `WEIGHTS_RELEASE_TAG` is unset). Used to skip the fetch tier entirely
+// rather than build a request against a release that does not exist.
+function fetchTierConfigured(entry) {
+  return Object.values(entry.files).every((fileName) => Boolean(entry.releaseAssets[fileName]));
+}
+
 async function fetchAndVerify(entry) {
+  if (!fetchTierConfigured(entry)) {
+    if (!fetchTierSkipWarned) {
+      fetchTierSkipWarned = true;
+      console.warn(
+        'lattice-embed-wasm: remote-fetch tier skipped -- WEIGHTS_RELEASE_TAG (registry.mjs) is ' +
+          'unset because the model weight release assets have not been published yet; a model ' +
+          'not found via the local override or cache tier resolves to null until that publish ' +
+          'step lands and the tag is set',
+      );
+    }
+    return null;
+  }
+
   const names = entry.files;
   const bytes = {};
 
@@ -93,15 +170,8 @@ async function fetchAndVerify(entry) {
       return null;
     }
     const buf = new Uint8Array(await response.arrayBuffer());
-    const expected = entry.sha256[fileName];
     const actual = sha256Hex(buf);
-    if (expected && actual !== expected) {
-      console.error(
-        `lattice-embed-wasm: sha256 mismatch for downloaded ${fileName} ` +
-          `(expected ${expected}, got ${actual}); discarding download`,
-      );
-      return null;
-    }
+    if (!verifyHash(fileName, actual, entry, `download (${url})`)) return null;
     bytes[key] = buf;
   }
 
@@ -119,9 +189,11 @@ function writeToCache(entry, bytes) {
 // Resolves `entry` (a MODEL_REGISTRY value) to verified {model, config,
 // tokenizer} byte arrays, or null if no tier produced a verified result.
 export async function resolveModelBytes(entry) {
-  const localDir = path.join(localModelsDir(), entry.localDir);
-  const fromLocal = readAndVerify(localDir, entry, `local override (${localDir})`);
-  if (fromLocal) return fromLocal;
+  for (const dir of localModelsDirs()) {
+    const localDir = path.join(dir, entry.localDir);
+    const fromLocal = readAndVerify(localDir, entry, `local override (${localDir})`);
+    if (fromLocal) return fromLocal;
+  }
 
   const cacheDir = path.join(cacheModelsDir(), entry.localDir);
   const fromCache = readAndVerify(cacheDir, entry, `cache (${cacheDir})`);
