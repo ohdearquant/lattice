@@ -21,6 +21,14 @@ const MODELS_DIR = process.env.LATTICE_MODEL_CACHE || join(homedir(), '.lattice'
 const MINILM_DIR = join(MODELS_DIR, 'all-minilm-l6-v2')
 const BGE_DIR = join(MODELS_DIR, 'bge-small-en-v1.5')
 
+// Input-size guardrails mirror crates/embed/src/service/mod.rs's
+// MAX_TEXT_CHARS (32768, measured as UTF-8 byte length -- see
+// src/lib.rs's validate_text) and DEFAULT_MAX_BATCH_SIZE (1000), enforced
+// at the native binding boundary in validate_text/validate_texts BEFORE
+// tokenization or model execution.
+const MAX_TEXT_CHARS = 32768
+const DEFAULT_MAX_BATCH_SIZE = 1000
+
 const minilm = loadModelSync({ modelPath: MINILM_DIR })
 const bge = loadModelSync({ modelPath: BGE_DIR })
 
@@ -159,6 +167,88 @@ test('loadModelSync rejects missing modelPath with FL_EMBED_BAD_OPTIONS', () => 
   assert.throws(
     () => loadModelSync({}),
     (err) => err.code === 'FL_EMBED_BAD_OPTIONS',
+  )
+})
+
+// Malformed optional fields must fail with our own stable FL_EMBED_BAD_OPTIONS
+// code, not a napi-native argument-conversion code (e.g. "StringExpected",
+// "BooleanExpected"). This is only true because index.js's normalizeOptions()
+// validates modelId/normalize BEFORE calling native code -- napi-rs converts
+// the options object into Rust's typed LoadOptions struct as part of the
+// native call itself, which would otherwise throw first with its own code.
+test('loadModelSync rejects a non-string modelId with FL_EMBED_BAD_OPTIONS', () => {
+  assert.throws(
+    () => loadModelSync({ modelPath: MINILM_DIR, modelId: 123 }),
+    (err) => err.code === 'FL_EMBED_BAD_OPTIONS',
+  )
+})
+
+test('loadModel (async) rejects a non-string modelId with FL_EMBED_BAD_OPTIONS', async () => {
+  await assert.rejects(
+    () => loadModel({ modelPath: MINILM_DIR, modelId: 123 }),
+    (err) => err.code === 'FL_EMBED_BAD_OPTIONS',
+  )
+})
+
+test('loadModelSync rejects a non-boolean normalize with FL_EMBED_BAD_OPTIONS', () => {
+  assert.throws(
+    () => loadModelSync({ modelPath: MINILM_DIR, normalize: 'false' }),
+    (err) => err.code === 'FL_EMBED_BAD_OPTIONS',
+  )
+})
+
+test('loadModel (async) rejects a non-boolean normalize with FL_EMBED_BAD_OPTIONS', async () => {
+  await assert.rejects(
+    () => loadModel({ modelPath: MINILM_DIR, normalize: 'false' }),
+    (err) => err.code === 'FL_EMBED_BAD_OPTIONS',
+  )
+})
+
+test('embedSync rejects a text longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', () => {
+  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+  assert.throws(
+    () => minilm.embedSync(oversized),
+    (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
+  )
+})
+
+test('embed (async) rejects a text longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', async () => {
+  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+  await assert.rejects(
+    () => minilm.embed(oversized),
+    (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
+  )
+})
+
+test('embedBatchSync rejects a batch item longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', () => {
+  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+  assert.throws(
+    () => minilm.embedBatchSync(['ok', oversized]),
+    (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
+  )
+})
+
+test('embedBatch (async) rejects a batch item longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', async () => {
+  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+  await assert.rejects(
+    () => minilm.embedBatch(['ok', oversized]),
+    (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
+  )
+})
+
+test('embedBatchSync rejects a batch larger than DEFAULT_MAX_BATCH_SIZE with FL_EMBED_BAD_BATCH', () => {
+  const tooManyTexts = Array.from({ length: DEFAULT_MAX_BATCH_SIZE + 1 }, () => 'x')
+  assert.throws(
+    () => minilm.embedBatchSync(tooManyTexts),
+    (err) => err.code === 'FL_EMBED_BAD_BATCH',
+  )
+})
+
+test('embedBatch (async) rejects a batch larger than DEFAULT_MAX_BATCH_SIZE with FL_EMBED_BAD_BATCH', async () => {
+  const tooManyTexts = Array.from({ length: DEFAULT_MAX_BATCH_SIZE + 1 }, () => 'x')
+  await assert.rejects(
+    () => minilm.embedBatch(tooManyTexts),
+    (err) => err.code === 'FL_EMBED_BAD_BATCH',
   )
 })
 

@@ -28,7 +28,13 @@
 // binding rejects `normalize: false` with `FL_EMBED_BAD_OPTIONS` so the
 // caller gets an honest, actionable error instead of a lie.
 
-use lattice_embed::EmbeddingModel as ModelFamily;
+// Import, rather than redefine, the production service's own OOM
+// guardrails (`crates/embed/src/service/mod.rs`) so this binding and
+// `NativeEmbeddingService`/`CachedEmbeddingService` stay a single source of
+// truth for what "too large" means -- both are `pub` and re-exported
+// unconditionally at the `lattice_embed` crate root (not gated behind the
+// `native` feature), so this crate can depend on them directly.
+use lattice_embed::{DEFAULT_MAX_BATCH_SIZE, EmbeddingModel as ModelFamily, MAX_TEXT_CHARS};
 use lattice_inference::BertModel;
 use napi::bindgen_prelude::{AsyncTask, Float32Array, Task};
 use napi::{Env, Error, Result, Status};
@@ -52,6 +58,17 @@ use std::sync::Arc;
 /// `all-minilm-l6-v2`, `bge-small-en-v1.5` -- exactly the directory names
 /// `lattice-inference`'s own model cache convention uses, see
 /// `default_cache_dir` in crates/inference/src/lib.rs).
+// A wrong JS type for `modelId`/`normalize` (e.g. a number or a stringified
+// boolean) never reaches `from_options` below: napi-rs converts the JS
+// object into this struct's typed fields as part of argument marshalling,
+// before any function body runs, and rejects a type mismatch with its own
+// napi status ("StringExpected", "BooleanExpected") rather than our stable
+// `FL_EMBED_*` codes. There is no Rust-side hook earlier than this to
+// intercept that conversion, so the authoritative guard for malformed
+// optional-field *types* lives in JS (`normalizeOptions()` in index.js),
+// which validates before ever calling into native code. This struct (and
+// `from_options`) still validates *values* that survive conversion with the
+// right type but a bad value (e.g. `normalize: false`, an empty `modelPath`).
 #[derive(Clone)]
 #[napi(object)]
 #[allow(non_snake_case)]
@@ -361,6 +378,23 @@ fn validate_text(text: &str, index: usize) -> Result<()> {
     ));
   }
 
+  // `MAX_TEXT_CHARS`'s own doc comment says "characters", but the
+  // production enforcement point this binding mirrors
+  // (`crates/embed/src/service/native.rs`, `if text.len() > MAX_TEXT_CHARS`)
+  // actually measures `str::len()`, i.e. UTF-8 BYTE length, not
+  // `chars().count()`. Match that exactly -- not the doc comment -- so a
+  // multi-byte string near the boundary is accepted/rejected identically
+  // by this binding and by `NativeEmbeddingService`/`CachedEmbeddingService`.
+  if text.len() > MAX_TEXT_CHARS {
+    return Err(invalid_arg(
+      "FL_EMBED_INPUT_TOO_LARGE",
+      format!(
+        "text at index {index} is {} bytes, exceeding the maximum of {MAX_TEXT_CHARS} bytes",
+        text.len()
+      ),
+    ));
+  }
+
   Ok(())
 }
 
@@ -369,6 +403,18 @@ fn validate_texts(texts: &[String]) -> Result<()> {
     return Err(invalid_arg(
       "FL_EMBED_BAD_BATCH",
       "texts must contain at least one item",
+    ));
+  }
+
+  // Checked before per-item validation below so an oversized batch fails
+  // fast on item count alone, without walking every item first.
+  if texts.len() > DEFAULT_MAX_BATCH_SIZE {
+    return Err(invalid_arg(
+      "FL_EMBED_BAD_BATCH",
+      format!(
+        "batch has {} items, exceeding the maximum of {DEFAULT_MAX_BATCH_SIZE}",
+        texts.len()
+      ),
     ));
   }
 

@@ -63,10 +63,11 @@ Errors thrown by this package carry a stable `.code`:
 
 | Code | Meaning |
 |---|---|
-| `FL_EMBED_BAD_OPTIONS` | Malformed `loadModel`/`loadModelSync` options (missing `modelPath`, or an unsupported `normalize: false`). |
+| `FL_EMBED_BAD_OPTIONS` | Malformed `loadModel`/`loadModelSync` options: missing/empty `modelPath`, a non-string `modelId`, a non-boolean `normalize`, or the unsupported value `normalize: false`. |
 | `FL_EMBED_BAD_MODEL` | `modelPath` does not exist, the model family could not be determined, the family is not BERT-family (e.g. Qwen), or the engine failed to load/encode. |
-| `FL_EMBED_EMPTY_INPUT` | `embed`/`embedSync` called with an empty string. |
-| `FL_EMBED_BAD_BATCH` | `embedBatch`/`embedBatchSync` called with an empty array or an array containing an empty string. |
+| `FL_EMBED_EMPTY_INPUT` | `embed`/`embedSync` called with an empty string, or an empty string anywhere in an `embedBatch`/`embedBatchSync` array. |
+| `FL_EMBED_BAD_BATCH` | `embedBatch`/`embedBatchSync` called with a non-array, an empty array, or a batch of more than 1,000 items. |
+| `FL_EMBED_INPUT_TOO_LARGE` | A single text (or a batch item) is longer than 32,768 bytes. |
 | `FL_EMBED_UNSUPPORTED_PLATFORM` | No native binary exists for the current `process.platform`/`process.arch`. |
 | `FL_EMBED_NATIVE_LOAD_FAILED` | A native binary should exist for this platform but failed to load (missing optional dependency, ABI mismatch, etc). |
 
@@ -78,6 +79,16 @@ non-normalizing path. Rather than silently return a normalized vector when a
 caller explicitly asks for `normalize: false`, this package rejects that
 option with `FL_EMBED_BAD_OPTIONS`. `model.normalized` is always `true`.
 
+## Input size limits
+
+`embed`/`embedSync` reject a text longer than 32,768 bytes, and
+`embedBatch`/`embedBatchSync` reject a batch of more than 1,000 items or any
+item longer than 32,768 bytes, both with a stable error code
+(`FL_EMBED_INPUT_TOO_LARGE` or `FL_EMBED_BAD_BATCH`) before the text is
+tokenized or run through the model. These limits mirror the ones the
+`lattice-embed` crate's own embedding service enforces, so a caller within
+this package's limits is also within the service's limits.
+
 ## Development
 
 ```sh
@@ -86,6 +97,8 @@ npm run build:debug   # faster iteration build
 npm test              # node --test __test__/*.mjs
 npm run smoke         # node smoke.mjs (requires local model directories)
 npm run packlist      # pack-list guard: main package must not ship a .node binary
+npm run artifacts     # copy the locally built .node into npm/<platform>/
+npm run packlist:darwin-arm64  # pack-list guard: darwin-arm64 subpackage ships exactly one .node
 ```
 
 ## License

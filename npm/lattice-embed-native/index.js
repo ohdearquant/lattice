@@ -34,6 +34,29 @@ function normalizeOptions(options) {
     throw error
   }
 
+  // napi-rs converts a JS options object into the Rust `LoadOptions` struct
+  // (`modelId: Option<String>`, `normalize: Option<bool>`) as part of its own
+  // argument-marshalling step, BEFORE any of our Rust code runs. A wrong JS
+  // type here (e.g. a number for modelId, a string for normalize) fails
+  // during that native conversion with napi's own status code
+  // ("StringExpected", "BooleanExpected"), not our stable FL_EMBED_* code --
+  // verified empirically against the built native binary. There is no Rust
+  // guard that can intercept this, since the conversion happens before the
+  // function body is even entered. This JS-side guard is therefore the
+  // ONLY, and authoritative, place that can turn a malformed optional field
+  // into FL_EMBED_BAD_OPTIONS, so it must run before any native.* call.
+  if (options.modelId !== undefined && typeof options.modelId !== 'string') {
+    const error = new TypeError('FL_EMBED_BAD_OPTIONS: options.modelId must be a string')
+    error.code = 'FL_EMBED_BAD_OPTIONS'
+    throw error
+  }
+
+  if (options.normalize !== undefined && typeof options.normalize !== 'boolean') {
+    const error = new TypeError('FL_EMBED_BAD_OPTIONS: options.normalize must be a boolean')
+    error.code = 'FL_EMBED_BAD_OPTIONS'
+    throw error
+  }
+
   return { ...options }
 }
 

@@ -27,13 +27,14 @@
   "scripts": {
     "build": "napi build --release --platform --no-js --dts native.d.ts",
     "build:debug": "napi build --platform --no-js --dts native.d.ts",
-    "artifacts": "napi artifacts --npm-dir npm",
+    "artifacts": "napi artifacts --output-dir . --npm-dir npm",
     "create-npm-dirs": "napi create-npm-dirs --npm-dir npm",
     "version:native": "napi version --npm-dir npm",
     "test": "node --test __test__/*.mjs",
     "smoke": "node smoke.mjs",
     "packlist": "npm pack --dry-run --json | node scripts/assert-packlist.mjs",
-    "prepublishOnly": "npm test"
+    "packlist:darwin-arm64": "cd npm/darwin-arm64 && npm pack --dry-run --json | node ../../scripts/assert-platform-packlist.mjs",
+    "prepublishOnly": "npm run artifacts && npm test"
   },
   "napi": {
     "binaryName": "lattice-embed-native",
