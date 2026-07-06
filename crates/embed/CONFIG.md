@@ -79,7 +79,7 @@ Runtime configuration pairing a model with an optional MRL truncation dimension.
 | `is_remote()`            | `bool`         | Only `TextEmbedding3Small` — `model.rs:186`                              |
 | `max_input_tokens()`     | `usize`        | Token limit for chunking/truncation — `model.rs:200`                     |
 | `supports_output_dim()`  | `bool`         | Only Qwen3 variants — `model.rs:263`                                     |
-| `query_instruction()`    | `Option<&str>` | Qwen3 requires instruction prefix — `model.rs:227`                       |
+| `query_instruction()`    | `Option<&str>` | Query prefix for asymmetric retrieval; BGE/E5/Qwen3 `Some`, MiniLM `None` — `model.rs:227`                       |
 | `document_instruction()` | `Option<&str>` | Currently `None` for all — `model.rs:242`                                |
 | `model_id()`             | `&str`         | HuggingFace ID — `model.rs:248`                                          |
 | `key_version()`          | `&str`         | `"v3"` for Qwen3/OpenAI, `"v1.5"` for BGE/E5 — `model.rs:272`            |
@@ -277,14 +277,14 @@ let config = ModelConfig::new(EmbeddingModel::TextEmbedding3Small);
 
 ---
 
-## Decoder-Only Model Query Instructions
+## Model Query Instructions (Asymmetric Retrieval)
 
-Qwen3 models require instruction-prefixed queries for asymmetric retrieval. The `query_instruction()` method (`model.rs:227`) returns the prefix:
+Several models prepend an instruction to queries (but not passages) for asymmetric retrieval. The `query_instruction()` method (`model.rs:227`) returns the prefix. For Qwen3-Embedding it is:
 
 ```
 "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
 ```
 
-This is applied automatically by `NativeEmbeddingService`. BERT/BGE/E5 models return `None` (no prefix needed — trained with contrastive objectives on raw text).
+This is applied automatically by `NativeEmbeddingService`. BGE-v1.5 and E5 models also return a query-side prefix for asymmetric retrieval; MiniLM returns `None` (genuinely symmetric — trained with contrastive objectives on raw text).
 
 `document_instruction()` returns `None` for all models — documents are embedded as-is.
