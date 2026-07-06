@@ -57,13 +57,13 @@ These require model weights to be already cached:
 
 ```sh
 # Full embedding pipeline: tokenize → forward → pool → normalize
-cargo run -p lattice-inference --example bench_embedding --release
+cargo run -p lattice-inference --example bench_embedding --release --features f16
 
 # Metal GPU path on Apple Silicon
-cargo run -p lattice-inference --example bench_metal --release --features metal-gpu
+cargo run -p lattice-inference --example bench_metal --release --features f16,metal-gpu
 
 # Concurrent embedding throughput
-cargo run -p lattice-inference --example bench_concurrent --release
+cargo run -p lattice-inference --example bench_concurrent --release --features f16,metal-gpu
 ```
 
 ## What the Benchmarks Cover
