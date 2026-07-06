@@ -22,7 +22,7 @@ pub use arch_kernels::{matmul_avx2, matmul_avx512};
 pub use blas::{sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided};
 pub use elementwise::{elementwise_mul, rms_norm, silu_inplace};
 pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
-pub use norm::layer_norm;
+pub use norm::{layer_norm, residual_add_layer_norm};
 pub(crate) use simd::simd_config;
 pub use softmax::softmax_attention;
 

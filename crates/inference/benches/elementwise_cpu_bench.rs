@@ -9,7 +9,8 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use lattice_inference::forward::cpu::{
-    add_bias_gelu, elementwise_mul, gelu, layer_norm, rms_norm, silu_inplace, softmax_attention,
+    add_bias_gelu, elementwise_mul, gelu, layer_norm, residual_add_layer_norm, rms_norm,
+    silu_inplace, softmax_attention,
 };
 use std::time::Duration;
 
@@ -136,6 +137,55 @@ fn bench_softmax_attention(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_residual_add_layer_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("residual_add_layer_norm");
+    // BERT sublayer epilogue shapes this fusion actually runs at inside
+    // `BertModel::forward`/`forward_with_hook`: bge-small (hidden=384) and
+    // bert-base (hidden=768), both at a 128-token sequence length.
+    for (hidden, seq_len) in [(384usize, 128usize), (768, 128)] {
+        let total = hidden * seq_len;
+        let gamma = random_vec(hidden, 20);
+        let beta = random_vec(hidden, 21);
+        let out_proto = random_vec(total, 22);
+        let dense = random_vec(total, 23);
+        let label = format!("hidden{hidden}_seq{seq_len}");
+
+        group.throughput(Throughput::Elements(total as u64));
+        group.bench_with_input(BenchmarkId::new("fused", &label), &hidden, |b, &h| {
+            let mut out = out_proto.clone();
+            b.iter(|| {
+                residual_add_layer_norm(
+                    black_box(&mut out),
+                    black_box(&dense),
+                    black_box(&gamma),
+                    black_box(&beta),
+                    h,
+                    1e-6,
+                );
+            });
+        });
+        // Unfused reference: the current pre-#676 epilogue shape (add loop
+        // then layer_norm), minus the trailing buffer copy -- so this isolates
+        // the kernel-level delta; the copy elimination is separate upside.
+        group.bench_with_input(BenchmarkId::new("unfused", &label), &hidden, |b, &h| {
+            let mut out = out_proto.clone();
+            b.iter(|| {
+                for i in 0..total {
+                    out[i] += dense[i];
+                }
+                layer_norm(
+                    black_box(&mut out),
+                    black_box(&gamma),
+                    black_box(&beta),
+                    h,
+                    1e-6,
+                );
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_elementwise_mul(c: &mut Criterion) {
     let mut group = c.benchmark_group("elementwise_mul");
     let hidden = 4096usize;
@@ -173,5 +223,6 @@ criterion_group! {
         bench_add_bias_gelu,
         bench_softmax_attention,
         bench_elementwise_mul,
+        bench_residual_add_layer_norm,
 }
 criterion_main!(elementwise_cpu);

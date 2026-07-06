@@ -9,7 +9,9 @@ use crate::attention::{
 };
 use crate::download::ensure_model_files;
 use crate::error::InferenceError;
-use crate::forward::cpu::{add_bias, add_bias_gelu, layer_norm, matmul_bt};
+use crate::forward::cpu::{
+    add_bias, add_bias_gelu, layer_norm, matmul_bt, residual_add_layer_norm,
+};
 use crate::lora_hook::{LoraHook, NoopLoraHook};
 use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
@@ -585,18 +587,15 @@ impl BertModel {
             );
 
             {
-                let temp = &mut buffers.temp[..used_hidden];
-                for i in 0..used_hidden {
-                    temp[i] += hidden[i];
-                }
-                layer_norm(
+                let temp = &buffers.temp[..used_hidden];
+                residual_add_layer_norm(
+                    &mut hidden,
                     temp,
                     layer.attn_layer_norm_weight.data,
                     layer.attn_layer_norm_bias.data,
                     hidden_size,
                     self.config.layer_norm_eps,
                 );
-                hidden.copy_from_slice(temp);
             }
 
             let used_intermediate = seq_len * intermediate_size;
@@ -640,17 +639,15 @@ impl BertModel {
                 );
                 add_bias(temp, layer.ffn_output_bias.data, hidden_size);
                 lora.apply(layer_idx, "ffn_output", ffn_intermediate, temp);
-                for i in 0..used_hidden {
-                    temp[i] += hidden[i];
-                }
-                layer_norm(
+                let temp = &buffers.temp[..used_hidden];
+                residual_add_layer_norm(
+                    &mut hidden,
                     temp,
                     layer.ffn_layer_norm_weight.data,
                     layer.ffn_layer_norm_bias.data,
                     hidden_size,
                     self.config.layer_norm_eps,
                 );
-                hidden.copy_from_slice(temp);
             }
         }
 
@@ -799,17 +796,14 @@ impl BertModel {
                 layer_idx,
             );
 
-            for i in 0..used_hidden {
-                temp[i] = attn_out[i] + hidden[i];
-            }
-            layer_norm(
-                &mut temp,
+            residual_add_layer_norm(
+                &mut hidden,
+                &attn_out,
                 layer.attn_layer_norm_weight.data,
                 layer.attn_layer_norm_bias.data,
                 hidden_size,
                 self.config.layer_norm_eps,
             );
-            hidden.copy_from_slice(&temp);
 
             matmul_bt(
                 &hidden,
@@ -843,17 +837,14 @@ impl BertModel {
             );
             add_bias(&mut temp, layer.ffn_output_bias.data, hidden_size);
             lora.apply(layer_idx, "ffn_output", &ffn_intermediate, &mut temp);
-            for i in 0..used_hidden {
-                temp[i] += hidden[i];
-            }
-            layer_norm(
-                &mut temp,
+            residual_add_layer_norm(
+                &mut hidden,
+                &temp,
                 layer.ffn_layer_norm_weight.data,
                 layer.ffn_layer_norm_bias.data,
                 hidden_size,
                 self.config.layer_norm_eps,
             );
-            hidden.copy_from_slice(&temp);
         }
 
         hidden
