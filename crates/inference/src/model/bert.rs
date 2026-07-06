@@ -453,10 +453,14 @@ impl BertModel {
         let seq_len = input.real_length;
         // `lora` here is caller-supplied and may be a real adapter (see
         // `CrossEncoderModel::score_with_hook`). The FFN fast path (#675) is
-        // still safe to take: `LoraHook::apply` only ever adds a delta that
+        // still taken here: `LoraHook::apply` only ever adds a delta that
         // depends on the pre-FFN hidden state, not on the bias-add's output,
         // so doing the adapter add-in before the fused bias+GELU pass gives
-        // the same result as adding it in between (addition commutes).
+        // the same value as adding it in between, up to floating-point
+        // summation-order rounding (f32 addition is not associative, so this
+        // is a reassociation, not an exact-value guarantee). See
+        // `forward_with_hook`'s doc comment for why that reassociation is
+        // accepted here.
         self.forward_with_hook(
             &input.input_ids[..seq_len],
             &input.attention_mask[..seq_len],
@@ -489,13 +493,28 @@ impl BertModel {
     /// Hook-aware internal full transformer forward pass.
     ///
     /// The FFN intermediate stage always uses the fused `add_bias_gelu`
-    /// kernel (#675) instead of separate `add_bias`/`gelu` passes. This is
-    /// safe with a real `lora` adapter too: `LoraHook::apply` only adds
+    /// kernel (#675) instead of separate `add_bias`/`gelu` passes, including
+    /// when a real `lora` adapter is active: `LoraHook::apply` only adds
     /// `scale * B @ (A @ x)` into the buffer, a delta that depends on the
-    /// pre-FFN hidden state (`x`) rather than on the bias-add's output, so
-    /// applying it before the fused bias+GELU pass is equivalent (up to
-    /// negligible f32 summation-order rounding) to the previous
-    /// bias-add-then-adapter-then-GELU ordering.
+    /// pre-FFN hidden state (`x`) rather than on the bias-add's output, so it
+    /// can be applied before the fused bias+GELU pass instead of between the
+    /// bias-add and GELU as before.
+    ///
+    /// This reorder changes floating-point summation order. Adding the bias
+    /// then the delta, versus adding the delta then the bias, is not
+    /// guaranteed to produce a bit-identical result, because f32 addition is
+    /// not associative (this can matter under extreme cancellation, e.g.
+    /// terms differing by many orders of magnitude). We accept this as a
+    /// reassociation, not a bit-exact equivalence, for these reasons:
+    ///
+    /// - Real BERT FFN pre-activations are O(10-100) with O(1) biases and
+    ///   small LoRA deltas, well outside any cancellation regime.
+    /// - There is no exact-output consumer on this adapter path.
+    /// - The `embed_parity_vs_hf` test empirically confirms parity against
+    ///   the reference implementation (cosine similarity at least 0.9998) on
+    ///   every shipping BERT-family model.
+    /// - lattice's SIMD kernels already reassociate f32 sums routinely
+    ///   elsewhere in this crate.
     fn forward_with_hook(
         &self,
         input_ids: &[u32],
@@ -592,11 +611,16 @@ impl BertModel {
                     intermediate_size,
                 );
                 // #675: adapter add-in before the fused bias+GELU pass (see
-                // `forward_with_hook`'s doc comment for why this ordering is
-                // equivalent to the previous add_bias-then-adapter-then-gelu
-                // sequence).
-                lora.apply(layer_idx, "ffn_intermediate", &hidden, ffn_intermediate);
-                add_bias_gelu(
+                // `forward_with_hook`'s doc comment for the accepted
+                // f32-reassociation argument versus the previous
+                // add_bias-then-adapter-then-gelu ordering). Extracted into
+                // `apply_ffn_intermediate_lora_and_activation` so this
+                // ordering can be unit-tested directly, without a model
+                // (see that function's doc comment).
+                apply_ffn_intermediate_lora_and_activation(
+                    lora,
+                    layer_idx,
+                    &hidden,
                     ffn_intermediate,
                     layer.ffn_intermediate_bias.data,
                     intermediate_size,
@@ -830,6 +854,29 @@ impl BertModel {
 
         hidden
     }
+}
+
+/// Apply the `"ffn_intermediate"` LoRA adapter delta, then the fused
+/// bias+GELU pass, in that order (#675).
+///
+/// Extracted out of `BertModel::forward_with_hook` as a free function so the
+/// ordering invariant it encodes (the adapter delta must land before GELU,
+/// not after) can be unit-tested directly against small synthetic buffers,
+/// without needing a full model
+/// (`test_ffn_intermediate_stage_lora_delta_lands_before_gelu`). The
+/// model-backed `test_ffn_intermediate_lora_delta_lands_before_gelu` test
+/// covers the same invariant end to end through a real `BertModel`, gated
+/// behind `LATTICE_INFERENCE_MODEL_DIR` since it needs a downloaded model.
+fn apply_ffn_intermediate_lora_and_activation(
+    lora: &dyn LoraHook,
+    layer_idx: usize,
+    hidden: &[f32],
+    ffn_intermediate: &mut [f32],
+    bias: &[f32],
+    intermediate_size: usize,
+) {
+    lora.apply(layer_idx, "ffn_intermediate", hidden, ffn_intermediate);
+    add_bias_gelu(ffn_intermediate, bias, intermediate_size);
 }
 
 fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, InferenceError> {
@@ -1138,14 +1185,115 @@ mod tests {
     // -------------------------------------------------------------------------
     // FFN-intermediate LoRA-adapter reorder correctness (#675, mutation-sensitive)
     //
-    // `forward_with_hook` runs `lora.apply("ffn_intermediate", ...)` before the
-    // fused `add_bias_gelu` kernel on the argument that the bias-add and the
+    // `forward_with_hook` calls `apply_ffn_intermediate_lora_and_activation`,
+    // which runs `lora.apply("ffn_intermediate", ...)` before the fused
+    // `add_bias_gelu` kernel, on the argument that the bias-add and the
     // adapter delta are both additions into the same buffer ahead of a single
     // GELU, so their relative order does not matter as long as both land
-    // before GELU. This test exercises that path with a real (non no-op)
-    // adapter and must fail if the ordering regresses to
-    // add_bias_gelu-then-adapter (delta landing after GELU instead of before).
+    // before GELU (see that function's and `forward_with_hook`'s doc comments
+    // for the accepted-reassociation argument).
+    //
+    // Two tests cover this, both of which must fail if the ordering regresses
+    // to add_bias_gelu-then-adapter (delta landing after GELU instead of
+    // before):
+    //   - `test_ffn_intermediate_stage_lora_delta_lands_before_gelu` runs by
+    //     default (no `#[ignore]`): it calls
+    //     `apply_ffn_intermediate_lora_and_activation` directly against small
+    //     synthetic buffers, so it needs no downloaded model and always runs
+    //     in CI.
+    //   - `test_ffn_intermediate_lora_delta_lands_before_gelu` is the
+    //     end-to-end version through a real `BertModel` and a real adapter
+    //     hook reachable the way `CrossEncoderModel::score_with_hook` reaches
+    //     it; it is `#[ignore]`d and gated on `LATTICE_INFERENCE_MODEL_DIR`
+    //     because building a real BERT-family model in-process needs a
+    //     downloaded checkpoint (safetensors weights, config, and tokenizer),
+    //     which this crate does not synthesize for tests.
     // -------------------------------------------------------------------------
+
+    /// Default (non-`#[ignore]`) unit test: exercises
+    /// `apply_ffn_intermediate_lora_and_activation` directly against small,
+    /// fixed synthetic buffers, with no model required, so this runs in CI
+    /// by default.
+    #[test]
+    fn test_ffn_intermediate_stage_lora_delta_lands_before_gelu() {
+        // Small, fixed sizes and values -- deterministic, no RNG dependency.
+        let seq_len = 2;
+        let hidden_size = 3;
+        let intermediate_size = 4;
+        let used_hidden = seq_len * hidden_size;
+        let used_intermediate = seq_len * intermediate_size;
+
+        let hidden: Vec<f32> = (0..used_hidden).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+        let weight: Vec<f32> = (0..intermediate_size * hidden_size)
+            .map(|i| 0.05 * (i as f32 + 1.0))
+            .collect();
+        let bias: Vec<f32> = (0..intermediate_size)
+            .map(|i| 0.01 * (i as f32 + 1.0))
+            .collect();
+        let delta = 0.05_f32;
+
+        let mut raw = vec![0.0f32; used_intermediate];
+        matmul_bt(
+            &hidden,
+            &weight,
+            &mut raw,
+            seq_len,
+            hidden_size,
+            intermediate_size,
+        );
+
+        // Production composition under test: the same function
+        // `forward_with_hook` calls.
+        let hook = CapturingDeltaHook {
+            target_module: "ffn_intermediate",
+            delta,
+            captured_x: Mutex::new(None),
+        };
+        let mut produced = raw.clone();
+        apply_ffn_intermediate_lora_and_activation(
+            &hook,
+            0,
+            &hidden,
+            &mut produced,
+            &bias,
+            intermediate_size,
+        );
+
+        // (a) The adapter must actually reach the result.
+        let mut without_delta = raw.clone();
+        add_bias(&mut without_delta, &bias, intermediate_size);
+        gelu(&mut without_delta);
+        let max_abs_diff_vs_no_delta = produced
+            .iter()
+            .zip(without_delta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff_vs_no_delta > 1e-3,
+            "an active ffn_intermediate adapter must move the output; \
+             max-abs-diff vs no-delta was only {max_abs_diff_vs_no_delta}"
+        );
+
+        // (b) Independent reference that hardcodes "delta lands before gelu"
+        // via separate, unfused matmul_bt/add_bias/gelu calls.
+        let mut reference = raw;
+        add_bias(&mut reference, &bias, intermediate_size);
+        for v in reference.iter_mut() {
+            *v += delta;
+        }
+        gelu(&mut reference); // separate, unfused gelu -- independent of add_bias_gelu
+
+        let max_abs_diff_vs_reference = produced
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff_vs_reference < 1e-5,
+            "apply_ffn_intermediate_lora_and_activation does not match the \
+             delta-lands-before-gelu reference: max-abs-diff {max_abs_diff_vs_reference}"
+        );
+    }
 
     /// `LoraHook` that captures the FFN block's input activation (`x`) for one
     /// target module and adds a constant delta to that projection's output.
