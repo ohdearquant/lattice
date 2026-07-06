@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity
 
 check:
 	cargo check --workspace
@@ -33,6 +33,13 @@ publish-dry:
 
 publish:
 	./scripts/publish.sh
+
+# npm embedding packages (@khive-ai/lattice-embed + @khive-ai/lattice-embed-wasm).
+publish-npm-dry:
+	./scripts/publish-npm.sh --dry-run
+
+publish-npm:
+	./scripts/publish-npm.sh
 
 # ADR-058: run the same CPU benches CI does, save as new baseline.
 bench-ci:

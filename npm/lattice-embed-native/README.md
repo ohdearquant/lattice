@@ -1,10 +1,10 @@
-# @lattice-embed/native
+# @khive-ai/lattice-embed
 
 Native (napi-rs) Node.js bindings for [`lattice-embed`](../../crates/embed):
 local BERT-family text embeddings (MiniLM, BGE, E5) loaded directly from a
 model directory on disk, with no WebAssembly overhead.
 
-This is the native counterpart to [`lattice-embed-wasm`](../lattice-embed-wasm),
+This is the native counterpart to [`@khive-ai/lattice-embed-wasm`](../lattice-embed-wasm),
 which loads model weights as in-memory byte buffers instead (no local
 filesystem access, portable to any JS runtime including browsers). Use this
 package when your Node process can read model files from disk directly and
@@ -25,13 +25,13 @@ or tested. Package manager support tested: npm and pnpm.
 ## Install
 
 ```sh
-npm install @lattice-embed/native
+npm install @khive-ai/lattice-embed
 ```
 
 ## Usage
 
 ```js
-const { loadModelSync } = require('@lattice-embed/native')
+const { loadModelSync } = require('@khive-ai/lattice-embed')
 
 const model = loadModelSync({ modelPath: '/path/to/all-minilm-l6-v2' })
 console.log(model.dimension) // 384
@@ -47,7 +47,7 @@ console.log(batch.rows, batch.dimensions) // 2 384
 console.log(batch.vector(0)) // Float32Array view into batch.data
 
 // Async variants (napi AsyncTask, run off the JS event loop thread):
-const { loadModel } = require('@lattice-embed/native')
+const { loadModel } = require('@khive-ai/lattice-embed')
 const asyncModel = await loadModel({ modelPath: '/path/to/bge-small-en-v1.5' })
 const asyncVec = await asyncModel.embed('quarterly financial report')
 ```

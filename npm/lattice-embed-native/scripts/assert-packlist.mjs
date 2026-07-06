@@ -1,7 +1,7 @@
 // Pack-list guard: asserts the main package tarball (`npm pack --dry-run
 // --json`, piped in on stdin) contains the JS-facing surface but none of
 // the Rust build inputs or the platform-specific `.node` binary -- those
-// ship only in the per-platform `@lattice-embed/native-<target>` packages
+// ship only in the per-platform `@khive-ai/lattice-embed-<target>` packages
 // (npm/<target>/package.json), never in this package. Run via `npm run
 // packlist` (see package.json).
 import assert from 'node:assert/strict'
