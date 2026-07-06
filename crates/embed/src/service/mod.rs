@@ -110,9 +110,9 @@ pub trait EmbeddingService: Send + Sync {
 
     /// **Stable**: embed query texts with model-specific query prompt prefix applied.
     ///
-    /// For models that use asymmetric prompts (E5, Qwen3-Embedding), this prepends the
+    /// For models that use asymmetric prompts (BGE, E5, Qwen3-Embedding), this prepends the
     /// `query_instruction()` prefix before calling the model forward.  For models with
-    /// no query prefix (BGE, MiniLM), this is equivalent to `embed()`.
+    /// no query prefix (MiniLM), this is equivalent to `embed()`.
     ///
     /// Cache keys produced by this method are distinct from those produced by
     /// `embed_passage()` and `embed()` even when the raw text is identical.
