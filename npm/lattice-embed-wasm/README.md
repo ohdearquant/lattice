@@ -1,4 +1,4 @@
-# lattice-embed-wasm
+# @khive-ai/lattice-embed-wasm
 
 Text embeddings from a pure-Rust BERT-family encoder, compiled to
 WebAssembly, wrapped in a small Node adapter that resolves a model name to
@@ -14,13 +14,13 @@ same whether the weights are already on disk or need to be fetched first.
 ## Install
 
 ```
-npm install lattice-embed-wasm
+npm install @khive-ai/lattice-embed-wasm
 ```
 
 ## Usage
 
 ```js
-import { embed, embedText, Embedder } from 'lattice-embed-wasm';
+import { embed, embedText, Embedder } from '@khive-ai/lattice-embed-wasm';
 
 // Primary form: pick a model explicitly.
 const vec = await embed('a sentence to embed', 'minilm');
@@ -118,7 +118,7 @@ variables it defines on its own side:
 
 - one that names which npm package to load as the wasm-embedding provider
   (so it can be swapped without a code change), pointing at
-  `lattice-embed-wasm`;
+  `@khive-ai/lattice-embed-wasm`;
 - one that selects which model name to pass into `embed(text, model)`.
 
 Neither variable is read by this package itself; the model name is always

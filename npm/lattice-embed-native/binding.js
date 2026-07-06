@@ -5,7 +5,7 @@ const { join } = require('node:path')
 const { execFileSync } = require('node:child_process')
 
 const BINARY_NAME = 'lattice-embed-native'
-const PACKAGE_PREFIX = '@lattice-embed/native'
+const PACKAGE_PREFIX = '@khive-ai/lattice-embed'
 const loadErrors = []
 
 function requireCandidate(candidate) {

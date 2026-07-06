@@ -1,7 +1,7 @@
 {
-  "name": "@lattice-embed/native-darwin-arm64",
+  "name": "@khive-ai/lattice-embed-darwin-arm64",
   "version": "0.1.0",
-  "description": "Native binary for @lattice-embed/native on darwin-arm64.",
+  "description": "Native binary for @khive-ai/lattice-embed on darwin-arm64.",
   "license": "Apache-2.0",
   "main": "lattice-embed-native.darwin-arm64.node",
   "files": [
@@ -17,7 +17,6 @@
     "node": ">=18"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   }
 }
