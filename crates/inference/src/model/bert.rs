@@ -819,11 +819,15 @@ impl BertModel {
                 hidden_size,
                 intermediate_size,
             );
-            // #675: `forward_batch` is only ever called by `encode_batch` with
-            // `NoopLoraHook` (a literal at that call site), so there is no
-            // `"ffn_intermediate"` adapter add-in to order around here; the
-            // fused add_bias_gelu pass is a direct swap for add_bias+gelu.
-            add_bias_gelu(
+            // #675: route through the shared `apply_ffn_intermediate_lora_and_activation`
+            // helper so this batched path and `forward_with_hook` cannot drift.
+            // `encode_batch` only ever supplies `NoopLoraHook`, so the adapter
+            // add-in is a no-op here and this stays a direct swap for the old
+            // add_bias + gelu pair.
+            apply_ffn_intermediate_lora_and_activation(
+                lora,
+                layer_idx,
+                &hidden,
                 &mut ffn_intermediate,
                 layer.ffn_intermediate_bias.data,
                 intermediate_size,
