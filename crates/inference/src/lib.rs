@@ -150,3 +150,6 @@ pub use crate::tokenizer::Tokenizer;
 pub use crate::tokenizer::WordPieceTokenizer;
 /// Model-directory tokenizer auto-loader. See [`Tokenizer`] and [`tokenizer`].
 pub use crate::tokenizer::load_tokenizer;
+/// `tokenizer.json`-text tokenizer loader (no filesystem access). See
+/// [`Tokenizer`], [`tokenizer`], and [`BertModel::from_bytes`].
+pub use crate::tokenizer::tokenizer_from_json_str;

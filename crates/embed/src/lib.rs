@@ -93,6 +93,13 @@ mod model;
 pub mod service;
 pub mod simd;
 pub mod types;
+// Gated on BOTH the `wasm` feature and the wasm32 target: `wasm-bindgen` is
+// only ever a dependency on the wasm32 target table (see Cargo.toml), so if
+// this module were feature-gated alone, enabling `--features wasm` on a
+// native build would fail to find the `wasm_bindgen` crate. Gating on both
+// makes enabling `wasm` on a non-wasm target a no-op instead of a build error.
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+pub mod wasm;
 
 pub use cache::{CacheStats, DEFAULT_CACHE_CAPACITY, EmbeddingCache, ShardStats};
 pub use error::{EmbedError, Result};

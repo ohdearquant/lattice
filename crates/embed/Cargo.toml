@@ -8,17 +8,20 @@ license.workspace = true
 repository.workspace = true
 description = "SIMD-accelerated vector operations and embedding generation"
 
+# `rlib` keeps existing native consumers (crates depending on this as a Rust
+# library) working unchanged. `cdylib` additionally produces a linkable
+# dynamic library, which is what makes `wasm-bindgen`'s wasm output loadable
+# by a JS host: an `rlib` alone cannot be linked into a standalone `.wasm`
+# module.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-# Async
-tokio = { workspace = true, features = ["sync", "rt"] }
 async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# Embedding generation (native, pure Rust)
-lattice-inference = { version = "0.5.0", path = "../inference", optional = true, features = ["f16"] }
 
 # Time
 chrono = { workspace = true }
@@ -34,6 +37,49 @@ thiserror = { workspace = true }
 # Logging
 tracing = "0.1"
 
+# `tokio` and `lattice-inference` are split into target-specific tables below.
+# Reason: this workspace's `[workspace.dependencies] tokio` entry sets
+# `features = ["full"]`, and Cargo's workspace-dependency inheritance ADDS a
+# package's `features = [...]` on top of that base list rather than replacing
+# it, so `tokio = { workspace = true, features = ["sync", "rt"] }` still
+# resolves to the full feature set (verified via `cargo metadata`: the
+# resolved feature list is `["full", "sync", "rt"]`). `full` pulls in
+# `net`, which pulls in `mio`, which does not support wasm32-unknown-unknown.
+# A single unconditional `[dependencies]` entry can't avoid this because
+# Cargo unions features across every matching table for a given target, so
+# the only way to give wasm a trimmed `tokio` is to have no unconditional
+# entry at all: one table for wasm, one for everything else. The same
+# reasoning applies to `lattice-inference`, whose default features pull in
+# axum/ureq (HTTP serving + downloads), neither of which is wasm-compatible
+# or needed for the embedding compute path.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync", "rt"] }
+# Embedding generation (native, pure Rust)
+lattice-inference = { version = "0.5.0", path = "../inference", optional = true, features = ["f16"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.0", default-features = false, features = ["sync", "rt"] }
+# Same crate, trimmed to the CPU compute path: `std` + `f16`, without
+# `download` (ureq) or `serve` (axum/tokio-net/mio), none of which compile to
+# wasm32-unknown-unknown.
+lattice-inference = { version = "0.5.0", path = "../inference", optional = true, default-features = false, features = [
+    "std",
+    "f16",
+] }
+# JS bindings for the `wasm` feature. Target-gated (this table only applies to
+# wasm32) AND feature-gated (`optional = true`, enabled only by the `wasm`
+# feature below), so a plain non-wasm feature build of this crate, native or
+# wasm32, never pulls these in. `js-sys`/`web-sys` are not needed: the
+# bindings surface (constructor + `embed`) is plain data in and Vec<f32>/
+# JsValue out, both of which `wasm-bindgen` converts natively without an
+# extra JS-API-binding crate.
+# Pinned exactly (not just "0.2") to match the `wasm-bindgen` CLI version used
+# for the JS-glue generation step (`wasm-bindgen-cli`): the crate and CLI
+# embed a schema version that must match exactly, or `wasm-bindgen` (the CLI)
+# refuses to process the `.wasm` with a version-mismatch error.
+wasm-bindgen = { version = "=0.2.105", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -45,6 +91,12 @@ serde_json = { workspace = true }
 [features]
 default = ["native"]
 native = ["dep:lattice-inference"]
+# wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable
+# `.wasm` module. Only meaningful together with `native` (it wraps
+# `lattice_inference::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`
+# dependencies it activates are additionally target-gated to wasm32 above, so
+# enabling this feature on a non-wasm target is a no-op rather than a build error.
+wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
 metal-gpu = ["lattice-inference/metal-gpu"]
 avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
 # Deprecated no-op: gated a bench module for a service removed long ago, but the

@@ -280,6 +280,49 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceE
     )))
 }
 
+/// **Unstable**: build a tokenizer directly from `tokenizer.json` text, without
+/// touching the filesystem; signature may change as the from-bytes model
+/// loading API matures.
+///
+/// This covers the primary (and by far most common) branch of
+/// [`load_tokenizer`]'s auto-detection: models that ship a `tokenizer.json`.
+/// The legacy fallback formats `load_tokenizer` also understands
+/// (`vocab.json`+`merges.txt`, `vocab.txt`, `tokenizer.model`) are file-based
+/// constructions with no in-memory equivalent here: a caller with only those
+/// formats in hand cannot use this function.
+///
+/// `max_seq_len` is taken as an explicit parameter rather than inferred from
+/// `tokenizer_config.json`/`config.json` (as `load_tokenizer` does via
+/// `infer_model_max_seq_len`) because callers using this path already have
+/// the model's config in hand (that is how they got here without a
+/// filesystem) and can pass its `max_position_embeddings` directly.
+pub fn tokenizer_from_json_str(
+    tokenizer_json: &str,
+    max_seq_len: usize,
+) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    let root = parse_json(tokenizer_json)?;
+    let model_type = json_path(&root, &["model", "type"])
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+
+    match model_type {
+        "WordPiece" => Ok(Box::new(
+            WordPieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
+                .with_max_seq_len(max_seq_len),
+        )),
+        "BPE" => Ok(Box::new(
+            BpeTokenizer::from_tokenizer_json_str(tokenizer_json)?.with_max_seq_len(max_seq_len),
+        )),
+        "Unigram" | "SentencePieceUnigram" => Ok(Box::new(
+            SentencePieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
+                .with_max_seq_len(max_seq_len),
+        )),
+        other => Err(InferenceError::UnsupportedModel(format!(
+            "unsupported or missing tokenizer model type {other:?} in tokenizer.json"
+        ))),
+    }
+}
+
 /// **Unstable**: internal JSON representation for tokenizer metadata parsing;
 /// not intended for direct use outside this crate.
 #[derive(Debug, Clone, PartialEq)]

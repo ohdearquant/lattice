@@ -70,7 +70,12 @@ jobs:
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
           # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
           # would silently skip the gate on large diffs (fail-open).
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$' <<<"$CHANGED" >/dev/null; then
+          # The wasm gate's own inputs (driver, harness, fixtures, the native
+          # dump example) are included below so a PR that touches only those
+          # still triggers wasm-parity. Without them, engine stays false and the
+          # required parity-gate could pass green without the wasm path ever
+          # running, a fail-open on the gate itself.
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -319,6 +324,84 @@ jobs:
           cargo test --release -p lattice-embed --test embed_drift_baseline \
             -- --nocapture
 
+  # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
+  # `LatticeEmbedder` binding (crates/embed/src/wasm.rs) produces output that
+  # matches both the committed HF-reference goldens and the native lattice
+  # forward pass, for both a CLS-pooling model (bge-small-en-v1.5) and a
+  # mean-pooling model (all-MiniLM-L6-v2), including a long-input MiniLM case
+  # that exercises tokenizer-truncation behavior beyond the model's advisory
+  # token cap. E5 and the multilingual paraphrase model are release-cadence
+  # only, not gated per-PR. See scripts/wasm-parity.sh for the local driver
+  # and crates/embed/tests/wasm/embed_parity_wasm.mjs for the harness.
+  wasm-parity:
+    name: wasm embedding parity gate
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-parity
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-0.2.105-${{ runner.os }}
+
+      # Pinned exactly to match the `wasm-bindgen` crate dependency version in
+      # crates/embed/Cargo.toml (the CLI and crate embed a schema version that
+      # must match exactly). Skips the (slow) reinstall if the cached binary
+      # is already the right version.
+      - name: Install wasm-bindgen-cli
+        run: |
+          if command -v wasm-bindgen >/dev/null 2>&1 && [ "$(wasm-bindgen --version)" = "wasm-bindgen 0.2.105" ]; then
+            echo "wasm-bindgen 0.2.105 already present (cache hit)"
+          else
+            cargo install wasm-bindgen-cli --version 0.2.105
+          fi
+
+      - name: Cache bge-small-en-v1.5 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-wasm-v1
+
+      - name: Cache all-minilm-l6-v2 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models/all-minilm-l6-v2
+          key: all-minilm-l6-v2-wasm-v1
+
+      # --download-only fetches model.safetensors + vocab.txt; it does not
+      # fetch config.json or tokenizer.json (native from_directory doesn't
+      # need them from this exact spot; see download.rs). wasm-parity.sh
+      # fetches those two directly from the HF repo into the same directory.
+      - name: Provision bge-small-en-v1.5 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model bge-small-en-v1.5 --download-only
+
+      - name: Provision all-minilm-l6-v2 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model all-minilm-l6-v2 --download-only
+
+      - name: Run wasm parity gate
+        # LATTICE_WASM_PARITY_ENFORCE=1 makes the driver fail closed if any
+        # prerequisite (tool or model file) is still missing at this point:
+        # a provisioning failure must not masquerade as a skipped, green job.
+        env:
+          LATTICE_WASM_PARITY_ENFORCE: '1'
+        run: ./scripts/wasm-parity.sh
+
   # Composed rotated(QuaRot)+Q4 forward-path gate (issue #320). The converter's
   # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
   # the rotation-fusion math PRE-quantization; nothing previously exercised the
@@ -419,13 +502,13 @@ jobs:
             -- --nocapture
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
-  # did not change (nothing to verify); mirrors the parity, embed-drift, and
-  # q4-composed verdicts when it did. Fails closed if change-detection itself
-  # errored. metal-parity is deliberately excluded (informational — see its
-  # comment above).
+  # did not change (nothing to verify); mirrors the parity, embed-drift,
+  # wasm-parity, and q4-composed verdicts when it did. Fails closed if
+  # change-detection itself errored. metal-parity is deliberately excluded
+  # (informational — see its comment above).
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift, q4-composed]
+    needs: [changes, parity, embed-drift, wasm-parity, q4-composed]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -435,8 +518,9 @@ jobs:
           ENGINE="${{ needs.changes.outputs.engine }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
+          WASM_RESULT="${{ needs.wasm-parity.result }}"
           Q4_RESULT="${{ needs.q4-composed.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT q4-composed=$Q4_RESULT"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -453,9 +537,13 @@ jobs:
             echo "::error::Engine changed and embed-drift gate did not succeed (result=$DRIFT_RESULT)."
             exit 1
           fi
+          if [ "$WASM_RESULT" != "success" ]; then
+            echo "::error::Engine changed and wasm-parity gate did not succeed (result=$WASM_RESULT)."
+            exit 1
+          fi
           if [ "$Q4_RESULT" != "success" ]; then
             echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, and q4-composed all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, and q4-composed all PASSED."
           exit 0
