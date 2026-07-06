@@ -31,7 +31,8 @@
   "scripts": {
     "build": "bash scripts/build-wasm.sh",
     "prepack": "bash scripts/build-wasm.sh",
-    "smoke": "node smoke.mjs"
+    "smoke": "node smoke.mjs",
+    "test:init": "node init-race.test.mjs"
   },
   "keywords": [
     "embeddings",

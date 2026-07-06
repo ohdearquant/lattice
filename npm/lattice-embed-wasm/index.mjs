@@ -22,23 +22,61 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import init, { initSync, initPanicHook, LatticeEmbedder } from './wasm/lattice_embed.js';
+import { initSync as rawInitSync, initPanicHook, LatticeEmbedder } from './wasm/lattice_embed.js';
 import { DEFAULT_MODEL, MODEL_REGISTRY, UNSUPPORTED_MODELS } from './registry.mjs';
 import { resolveModelBytes } from './resolve.mjs';
 
-export { initSync, init };
-
-// wasm instantiation itself is synchronous (initSync loads local bytes; no
-// fetch involved), so this needs no promise, just an idempotency guard.
+// The wasm bytes are bundled with this package (wasm/lattice_embed_bg.wasm,
+// see package.json "files") and never fetched over the network, so loading
+// them is inherently synchronous and deterministic: there is exactly one
+// wasm instance for this module's lifetime. The raw wasm-bindgen glue also
+// exports an async `init` meant for fetch-based (browser) loading; this
+// package deliberately never imports or calls it, because its finalize step
+// runs after an internal await and can land after a second, unrelated
+// initSync has already installed a different instance, silently swapping
+// the module-global instance so a cached LatticeEmbedder's pointer no
+// longer matches. Every init path below funnels through the single guard in
+// `ensureWasmInit`, so that race cannot occur.
 let wasmInitialized = false;
 
 function ensureWasmInit() {
   if (wasmInitialized) return;
   const wasmPath = fileURLToPath(new URL('./wasm/lattice_embed_bg.wasm', import.meta.url));
   const wasmBytes = readFileSync(wasmPath);
-  initSync({ module: wasmBytes });
+  rawInitSync({ module: wasmBytes });
   initPanicHook();
   wasmInitialized = true;
+}
+
+/**
+ * Initialize the wasm core synchronously from the bytes bundled with this
+ * package. Idempotent: calling this more than once, or calling it after the
+ * core has already auto-initialized on first `embed()`, is a no-op and
+ * never creates a second wasm instance. Accepts and ignores an argument for
+ * call-shape compatibility with the raw wasm-bindgen `initSync`; this
+ * package always loads its own bundled bytes, never a caller-supplied
+ * module.
+ *
+ * @param {unknown} [_input]
+ */
+export function initSync(_input) {
+  ensureWasmInit();
+}
+
+/**
+ * Initialize the wasm core. Exists for call-shape compatibility with the
+ * raw wasm-bindgen async `init` (including the `{ module_or_path }`
+ * convention some callers pass), but performs the same synchronous,
+ * idempotent, bundled-bytes init as `initSync` underneath: this package's
+ * wasm bytes ship locally, so there is never a fetch to await and never
+ * more than one instance. Safe to call concurrently with `embed()` or with
+ * itself.
+ *
+ * @param {unknown} [_input]
+ * @returns {Promise<void>}
+ */
+export async function init(_input) {
+  ensureWasmInit();
 }
 
 // modelName -> Promise<LatticeEmbedder | null>, one entry per model actually
