@@ -235,6 +235,33 @@ fn test_e5_document_instruction() {
     );
 }
 
+/// BGE-v1.5 query_instruction returns the documented retrieval instruction
+/// (asymmetric retrieval — queries get the prefix, passages do not). Guards
+/// against a future over-correction that adds the prefix to the passage side.
+#[test]
+fn test_bge_query_instruction() {
+    assert_eq!(
+        EmbeddingModel::BgeSmallEnV15.query_instruction(),
+        Some("Represent this sentence for searching relevant passages: "),
+        "BGE small must return the retrieval query instruction"
+    );
+    assert_eq!(
+        EmbeddingModel::BgeBaseEnV15.query_instruction(),
+        Some("Represent this sentence for searching relevant passages: "),
+        "BGE base must return the retrieval query instruction"
+    );
+    assert_eq!(
+        EmbeddingModel::BgeLargeEnV15.query_instruction(),
+        Some("Represent this sentence for searching relevant passages: "),
+        "BGE large must return the retrieval query instruction"
+    );
+    assert_eq!(
+        EmbeddingModel::BgeSmallEnV15.document_instruction(),
+        None,
+        "BGE passages must stay unprefixed"
+    );
+}
+
 /// BGE and MiniLM models must NOT have document_instruction (they use raw text).
 #[test]
 fn test_bge_minilm_no_document_instruction() {

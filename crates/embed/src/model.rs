@@ -240,8 +240,13 @@ impl EmbeddingModel {
     /// - **Qwen3-Embedding** models: require an instruction prompt to align the
     ///   decoder embedding space for retrieval tasks.
     ///
-    /// - **BGE / MiniLM** models: trained with contrastive objectives on raw text;
-    ///   no prefix needed.
+    /// - **BGE** models (`BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`): also
+    ///   asymmetric-retrieval — queries need the BGE-v1.5 retrieval instruction
+    ///   prefix, passages do not (see `document_instruction()`, which stays
+    ///   `None` for BGE). Omitting the prefix degrades retrieval quality.
+    ///
+    /// - **MiniLM** models: trained with contrastive objectives on raw text;
+    ///   genuinely symmetric, no prefix needed on either side.
     ///
     /// Returns `Some(prefix)` if the query text should be wrapped as
     /// `"{prefix}{query}"` before embedding. Returns `None` for models that
@@ -257,6 +262,14 @@ impl EmbeddingModel {
             EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => Some(
                 "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
             ),
+            EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => {
+                // BGE-v1.5 asymmetric retrieval: queries get the documented
+                // retrieval instruction, passages stay raw text (see
+                // document_instruction()).
+                Some("Represent this sentence for searching relevant passages: ")
+            }
             _ => None,
         }
     }
