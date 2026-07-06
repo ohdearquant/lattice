@@ -1,7 +1,7 @@
 //! Benchmark: Pure Rust inference vs ONNX Runtime for Qwen3-Embedding-0.6B.
 //!
 //! Usage:
-//!   cargo run --release --features "f16,bench-ort" --bin bench_embedding
+//!   cargo run --release -p lattice-inference --example bench_embedding --features "f16,bench-ort"
 
 use std::time::Instant;
 
