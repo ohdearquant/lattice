@@ -1,0 +1,68 @@
+{
+  "name": "@lattice-embed/native",
+  "version": "0.1.0",
+  "description": "Native (napi-rs) Node.js bindings for lattice-embed: local BERT-family text embeddings (MiniLM, BGE) loaded directly from disk, no WASM overhead.",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "binding.js",
+    "index.js",
+    "index.d.ts",
+    "package.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --release --platform --no-js --dts native.d.ts",
+    "build:debug": "napi build --platform --no-js --dts native.d.ts",
+    "artifacts": "napi artifacts --npm-dir npm",
+    "create-npm-dirs": "napi create-npm-dirs --npm-dir npm",
+    "version:native": "napi version --npm-dir npm",
+    "test": "node --test __test__/*.mjs",
+    "smoke": "node smoke.mjs",
+    "packlist": "npm pack --dry-run --json | node scripts/assert-packlist.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "napi": {
+    "binaryName": "lattice-embed-native",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "optionalDependencies": {
+    "@lattice-embed/native-darwin-arm64": "0.1.0",
+    "@lattice-embed/native-darwin-x64": "0.1.0",
+    "@lattice-embed/native-linux-x64-gnu": "0.1.0",
+    "@lattice-embed/native-linux-x64-musl": "0.1.0",
+    "@lattice-embed/native-linux-arm64-gnu": "0.1.0",
+    "@lattice-embed/native-linux-arm64-musl": "0.1.0",
+    "@lattice-embed/native-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.7.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

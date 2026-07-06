@@ -1,0 +1,6 @@
+node_modules/
+target/
+*.node
+native.d.ts
+package-lock.json
+Cargo.lock

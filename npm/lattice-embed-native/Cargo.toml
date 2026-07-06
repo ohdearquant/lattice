@@ -1,0 +1,71 @@
+# Detaches this crate from the parent `lattice-napi` Cargo workspace (whose
+# `[workspace] members` list does not include this directory). An empty
+# `[workspace]` table declares this directory as the root of its OWN
+# single-crate workspace, so `cargo build`/`napi build` run from here get
+# their own `Cargo.lock` and `target/` without any edit to the parent
+# workspace's manifest. See ../lattice-embed-wasm for the equivalent
+# wasm-bindgen package, which is a plain member of `crates/embed` instead
+# (a different crate shape, since wasm-bindgen output lives inside the
+# `lattice-embed` crate itself via `src/wasm.rs`).
+[workspace]
+
+[package]
+name = "lattice-embed-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+authors = ["Ocean <ocean@lionagi.ai>"]
+license = "Apache-2.0"
+repository = "https://github.com/ohdearquant/lattice"
+description = "Native Node.js (napi-rs) bindings for lattice-embed: local BERT-family text embeddings (MiniLM, BGE) with no WASM overhead."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+# The real engine. `default-features = false, features = ["native"]` mirrors
+# the CPU-only cut `crates/embed/src/wasm.rs`'s own crate takes: no `wasm`
+# feature (irrelevant here, this is a native binding, not wasm-bindgen), no
+# `metal-gpu` (BERT-family forward pass is CPU-only in this package; nothing
+# in this crate ever touches Metal, so no GPU test lock is needed).
+lattice-embed = { path = "../../crates/embed", default-features = false, features = [
+    "native",
+] }
+# Needed directly (not just transitively via lattice-embed) because this
+# crate calls `lattice_inference::BertModel::from_directory` / `set_pooling`
+# / `encode` / `encode_batch` directly — `lattice-embed` does not re-export
+# `BertModel` itself (only its own `EmbeddingModel`/`ModelConfig` types, see
+# crates/embed/src/lib.rs). `default-features = false, features = ["std",
+# "f16"]` requests the same trimmed CPU-compute cut `crates/embed/Cargo.toml`
+# uses for its wasm32 target table (no `download`/`serve`). NOTE (flagged in
+# the delivery report): `lattice-embed`'s own Cargo.toml depends on
+# `lattice-inference` for native targets WITHOUT `default-features = false`,
+# so Cargo feature unification still compiles `lattice-inference`'s full
+# default feature set (`std` + `download` + `serve`, i.e. axum/tokio/ureq)
+# into the final binary regardless of what this crate requests here — this
+# request narrows nothing on its own, it only avoids requesting MORE than
+# needed from this crate's own manifest.
+lattice-inference = { path = "../../crates/inference", default-features = false, features = [
+    "std",
+    "f16",
+] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+
+[lints.clippy]
+# This crate is intentionally NOT a member of the parent workspace (see the
+# `[workspace]` comment above), so it does not inherit `workspace.lints`.
+# `unwrap()` is nonetheless forbidden here by hand (`cargo clippy`-enforced)
+# to keep the "no unwrap in library code" rule (see ../../CLAUDE.md) even
+# though this crate is not lint-inherited from the main workspace.
+unwrap_used = "deny"
