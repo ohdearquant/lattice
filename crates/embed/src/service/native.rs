@@ -306,9 +306,9 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
         Ok(dir)
     } else {
         Err(EmbedError::ModelInitialization(format!(
-            "Qwen3 model not found at {}. Download from {}",
-            dir.display(),
-            model_type.model_id()
+            "Qwen3 model not found at {dir}. Download it with:\n  huggingface-cli download {repo} --local-dir {dir}",
+            dir = dir.display(),
+            repo = model_type.model_id()
         )))
     }
 }
