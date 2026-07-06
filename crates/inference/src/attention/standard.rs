@@ -1,5 +1,5 @@
 //! Standard attention buffers, multi-head attention, and in-place attention helpers.
-use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
+use crate::forward::cpu::{add_bias, matmul_bt, matmul_bt_attention, softmax_attention};
 use crate::lora_hook::LoraHook;
 use crate::weights::TransformerLayerWeights;
 
@@ -311,11 +311,14 @@ pub(crate) fn multi_head_attention_in_place(
                     .copy_from_slice(&buffers.k[src_start..src_start + head_dim]);
             }
 
-            // matmul_bt: scores_head[seq_len, seq_len] = q_head[seq_len, head_dim] @ k_head[seq_len, head_dim]^T
+            // scores_head[seq_len, seq_len] = q_head[seq_len, head_dim] @ k_head[seq_len, head_dim]^T.
+            // `matmul_bt_attention`, not `matmul_bt`: this is one of `num_heads` tiny
+            // per-head GEMMs per layer (see that function's doc comment for why it
+            // bypasses Accelerate's per-call dispatch cost at this size on macOS).
             let q_head = &buffers.q_head[..seq_len * head_dim];
             let k_head = &buffers.k_head[..seq_len * head_dim];
             let scores_head = &mut buffers.scores_head[..seq_len * seq_len];
-            matmul_bt(q_head, k_head, scores_head, seq_len, head_dim, seq_len);
+            matmul_bt_attention(q_head, k_head, scores_head, seq_len, head_dim, seq_len);
 
             // Scale and copy into the full scores array at head h's offset
             let scores_offset = h * seq_len * seq_len;
@@ -391,9 +394,10 @@ pub(crate) fn multi_head_attention_in_place(
             let v_head_t = &v_all_t[head_offset * seq_len..(head_offset + head_dim) * seq_len];
             let context_head = &mut context_head[..seq_len * head_dim];
 
-            // matmul_bt: context_head[seq_len, head_dim] = scores[seq_len, seq_len] @ v_head_t[head_dim, seq_len]^T
-            //          = scores @ V_head
-            matmul_bt(
+            // context_head[seq_len, head_dim] = scores[seq_len, seq_len] @ v_head_t[head_dim, seq_len]^T
+            //                                 = scores @ V_head
+            // `matmul_bt_attention`: same tiny per-head-GEMM regime as the Q@K^T call above.
+            matmul_bt_attention(
                 scores_head,
                 v_head_t,
                 context_head,
@@ -591,7 +595,11 @@ pub(crate) fn multi_head_attention_batched(
                         .copy_from_slice(&k[src_start..src_start + head_dim]);
                 }
 
-                matmul_bt(
+                // Same tiny per-head GEMM regime as `multi_head_attention_in_place`'s
+                // Q@K^T call: `matmul_bt_attention` bypasses Accelerate at this size on
+                // macOS instead of paying its per-call dispatch cost `num_heads` times
+                // per sequence per layer.
+                matmul_bt_attention(
                     &q_head[..seq_len * head_dim],
                     &k_head[..seq_len * head_dim],
                     &mut scores_head[..seq_len * seq_len],
@@ -641,7 +649,9 @@ pub(crate) fn multi_head_attention_batched(
                 let scores_offset = h * seq_len * seq_len;
                 let scores_head = &scores[scores_offset..scores_offset + seq_len * seq_len];
                 let v_head_t = &v_all_t[head_offset * seq_len..(head_offset + head_dim) * seq_len];
-                matmul_bt(
+                // Same tiny per-head GEMM regime as the context@V call in
+                // `multi_head_attention_in_place`.
+                matmul_bt_attention(
                     scores_head,
                     v_head_t,
                     &mut context_head[..seq_len * head_dim],

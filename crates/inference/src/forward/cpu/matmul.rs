@@ -4,12 +4,21 @@ use super::simd::simd_config;
 
 #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
 use super::arch_kernels::matmul_neon;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::arch_kernels::matmul_neon;
 #[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
 use super::arch_kernels::{matmul_avx2, matmul_avx512};
 #[cfg(target_os = "macos")]
 use super::blas::{accelerate_matmul, accelerate_matmul_bt};
 #[cfg(not(target_os = "macos"))]
 use super::tiled::matmul_bt_tiled;
+
+/// Total multiply-add elements (`m*n*k`) below which a GEMM is "small": too little
+/// work for a platform GEMM backend's fixed per-call dispatch cost (Apple Accelerate's
+/// AMX setup on macOS, this crate's own cache-blocking decision elsewhere) to pay for
+/// itself against a direct unrolled dot-product loop. Shared by `matmul_bt`'s own
+/// tiled-vs-SIMD choice below and by [`matmul_bt_attention`]'s macOS small-GEMM bypass.
+const SMALL_GEMM_ELEMENTS: u64 = 1024 * 1024;
 
 /// **Unstable**: general matmul C = A*B; dispatches to platform BLAS or SIMD fallback.
 ///
@@ -98,7 +107,7 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
         //      128 bytes and fits in L1 without tiling. Tiling would only change the
         //      accumulation order and introduce unnecessary numerical differences.
         let total_work = (m as u64) * (n as u64) * (k as u64);
-        if total_work >= 1024 * 1024 && k >= super::tiled::TILE_K {
+        if total_work >= SMALL_GEMM_ELEMENTS && k >= super::tiled::TILE_K {
             matmul_bt_tiled(a, b, c, m, k, n);
             return;
         }
@@ -134,6 +143,85 @@ pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usi
             }
         }
 
+        matmul_bt_scalar(a, b, c, m, k, n);
+    }
+}
+
+/// **Unstable**: dispatch for multi-head attention's per-head GEMMs (`Q @ K^T` and
+/// `scores @ V`), distinct from `matmul_bt`'s general dispatch.
+///
+/// `matmul_bt` always routes through the platform GEMM backend (Apple Accelerate's
+/// `cblas_sgemm` on macOS), which is the right choice for the FFN/QKV/output-projection
+/// GEMMs that dominate a transformer layer's FLOPs: their `m*n*k` is large enough that
+/// the backend's per-call dispatch cost is negligible next to its throughput advantage.
+/// Multi-head attention's per-head score and context steps are a different regime: a
+/// short-text encoder call makes `num_heads` separate `matmul_bt`-shaped calls per
+/// layer, each only `seq_len * seq_len * head_dim` multiply-adds (a few thousand for a
+/// handful of tokens), so the *same* backend dispatch cost is now paid `num_heads`
+/// times per layer for work that is individually tiny. On macOS this routes calls below
+/// `SMALL_GEMM_ELEMENTS` to a direct kernel that never leaves this process instead of
+/// invoking Accelerate; above that size (long sequences, where each head's GEMM is
+/// large in its own right) it defers to `matmul_bt` unchanged.
+///
+/// On non-macOS platforms this is a pure passthrough to `matmul_bt`: that function
+/// already makes this same small-vs-large split internally (see its cache-blocking
+/// condition above), so there is nothing additional to bypass.
+pub(crate) fn matmul_bt_attention(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let total_work = (m as u64) * (n as u64) * (k as u64);
+        if total_work < SMALL_GEMM_ELEMENTS {
+            matmul_bt_small(a, b, c, m, k, n);
+            return;
+        }
+    }
+    matmul_bt(a, b, c, m, k, n);
+}
+
+/// macOS-only small-GEMM kernel backing [`matmul_bt_attention`]: computes `C = A @ B^T`
+/// directly, without Apple Accelerate, for GEMMs known to be below `SMALL_GEMM_ELEMENTS`.
+///
+/// Guarded with the same release-active bounds checks as `matmul_bt` (#368 precedent)
+/// since callers may pass reused scratch buffers longer than the exact footprint.
+#[cfg(target_os = "macos")]
+fn matmul_bt_small(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    assert!(
+        m.checked_mul(k).is_some(),
+        "matmul_bt_small shape overflow: m*k"
+    );
+    assert!(
+        n.checked_mul(k).is_some(),
+        "matmul_bt_small shape overflow: n*k"
+    );
+    assert!(
+        m.checked_mul(n).is_some(),
+        "matmul_bt_small shape overflow: m*n"
+    );
+    assert!(a.len() >= m * k, "matmul_bt_small: a too short for m*k");
+    assert!(b.len() >= n * k, "matmul_bt_small: b too short for n*k");
+    assert!(c.len() >= m * n, "matmul_bt_small: c too short for m*n");
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON (Advanced SIMD) is a mandatory baseline feature of every AArch64
+        // core, unlike x86_64's AVX2/AVX-512 which vary by CPU and need a runtime
+        // feature check. The bounds asserted above satisfy matmul_neon's own contract.
+        unsafe {
+            matmul_neon(a, b, c, m, k, n);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Conservative fallback for macOS on non-aarch64 (older Intel Macs): a safe
+        // scalar kernel needs no runtime feature detection. Still strictly bypasses
+        // Accelerate's per-call dispatch cost for these small GEMMs.
         matmul_bt_scalar(a, b, c, m, k, n);
     }
 }

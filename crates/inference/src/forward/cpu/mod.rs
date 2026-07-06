@@ -21,6 +21,7 @@ pub use arch_kernels::matmul_neon;
 pub use arch_kernels::{matmul_avx2, matmul_avx512};
 pub use blas::{sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided};
 pub use elementwise::{elementwise_mul, rms_norm, silu_inplace};
+pub(crate) use matmul::matmul_bt_attention;
 pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
 pub use norm::layer_norm;
 pub(crate) use simd::simd_config;

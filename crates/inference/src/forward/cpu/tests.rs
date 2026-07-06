@@ -40,6 +40,57 @@ fn test_matmul_bt_simd_matches_scalar_large() {
 }
 
 #[test]
+fn test_matmul_bt_attention_matches_scalar_for_per_head_shapes() {
+    // Shapes mirror multi_head_attention_in_place/_batched's per-head Q@K^T and
+    // scores@V calls for a short-text BERT-style encoder pass (see
+    // crate::attention::standard): head_dim in the tens, seq_len in the tens for a
+    // short sentence, which is the regime matmul_bt_attention's small-GEMM bypass targets.
+    // matmul_bt_attention must agree with the scalar reference exactly at these
+    // sizes, regardless of which kernel it dispatches to internally.
+    for &(m, k, n) in &[
+        (15, 32, 15), // Q @ K^T: [seq_len, head_dim] @ [seq_len, head_dim]^T
+        (15, 15, 32), // scores @ V: [seq_len, seq_len] @ [head_dim, seq_len]^T
+        (1, 32, 1),   // single-token edge case
+        (60, 64, 60), // longer sentence, larger head_dim (e.g. a bge-large head)
+    ] {
+        let a = make_deterministic_vec(m * k, 0x0F0F);
+        let b = make_deterministic_vec(n * k, 0xF0F0);
+        let mut expected = vec![0.0f32; m * n];
+        matmul_bt_scalar(&a, &b, &mut expected, m, k, n);
+
+        let mut actual = vec![0.0f32; m * n];
+        matmul_bt_attention(&a, &b, &mut actual, m, k, n);
+
+        for i in 0..(m * n) {
+            assert_relative_eq!(expected[i], actual[i], epsilon = 1e-3);
+        }
+    }
+}
+
+#[test]
+fn test_matmul_bt_attention_matches_scalar_above_small_gemm_threshold() {
+    // Above SMALL_GEMM_ELEMENTS, matmul_bt_attention must fall through to the
+    // ordinary matmul_bt dispatch unchanged (not the small-GEMM bypass kernel), for
+    // example a single very long document's per-head attention math, where each
+    // head's own GEMM is large enough that the platform backend is still the right
+    // choice.
+    let m = 512;
+    let k = 64;
+    let n = 512; // 512*512*64 = 16,777,216, well above the 1,048,576 threshold.
+    let a = make_deterministic_vec(m * k, 0x1A2B);
+    let b = make_deterministic_vec(n * k, 0x2B1A);
+    let mut expected = vec![0.0f32; m * n];
+    matmul_bt_scalar(&a, &b, &mut expected, m, k, n);
+
+    let mut actual = vec![0.0f32; m * n];
+    matmul_bt_attention(&a, &b, &mut actual, m, k, n);
+
+    for i in 0..(m * n) {
+        assert_relative_eq!(expected[i], actual[i], epsilon = 1e-3);
+    }
+}
+
+#[test]
 fn test_matmul_bt_tiled_ffn_up() {
     // FFN up-projection: 16×384 @ (1536×384)^T = 16×1536
     // This exercises the tiled path (16*384*1536 = 9,437,184 >> 1M)
