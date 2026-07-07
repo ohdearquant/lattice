@@ -1,0 +1,1 @@
+{"group_id":"residual_add_layer_norm","function_id":"unfused","value_str":"hidden768_seq128","throughput":{"Elements":98304},"full_id":"residual_add_layer_norm/unfused/hidden768_seq128","directory_name":"residual_add_layer_norm/unfused/hidden768_seq128","title":"residual_add_layer_norm/unfused/hidden768_seq128"}
