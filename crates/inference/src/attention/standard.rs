@@ -1334,14 +1334,13 @@ mod tests {
     /// slice of `q`/`k`/`v` would be attended over, or the wrong sequence's
     /// output would be compared below, and the parity check would fail.
     ///
-    /// Mutation-checked by hand while writing this test: shifting sequence 1's
-    /// `cu_seqlens` entry by `+1` (so its window silently absorbs one of
-    /// sequence 0's rows) made this test fail; the corruption was reverted and
-    /// the test re-confirmed passing before landing.
+    /// This check is mutation-sensitive: shifting sequence 1's `cu_seqlens`
+    /// entry by `+1` (so its window silently absorbs one of sequence 0's rows)
+    /// makes the parity assertion fail.
     ///
     /// Q, K, and V use DISTINCT scaled-identity weights and distinct per-dim
-    /// biases (not the shared identity block this test used before #678
-    /// review): with Q == K == V, a swapped or shifted QKV split offset keeps
+    /// biases (not a shared identity block): with Q == K == V, a swapped or
+    /// shifted QKV split offset keeps
     /// the fused split self-consistent with the reference path, since both
     /// sides read the same values regardless of which third of `qkv` each
     /// buffer actually came from. With distinct Q/K/V this test additionally
