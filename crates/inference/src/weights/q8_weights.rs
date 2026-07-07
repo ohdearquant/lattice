@@ -136,6 +136,14 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
 /// The activation input remains f32, so the inner product is accumulated in f32 and the
 /// per-row scale is applied once per output element.
 pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    // Guard the dimension products against usize overflow BEFORE any `m * k` /
+    // `n * k` / `m * n` is evaluated below: in release those multiplies wrap
+    // silently, so an overflowing shape could pass a length check and drive an
+    // out-of-bounds access. Mirrors the same guards in `matmul_bt`
+    // (forward/cpu/matmul.rs); `matmul_bt_q8` was missing them.
+    assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
+    assert!(n.checked_mul(k).is_some(), "matmul shape overflow: n*k");
+    assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
     assert_eq!(a.len(), m * k, "A length does not match m * k");
     assert_eq!(b_q.rows, n, "B_q rows do not match n");
     assert_eq!(b_q.cols, k, "B_q cols do not match k");
@@ -823,6 +831,50 @@ mod tests {
         assert!(approx_eq(c[1], expected1, 1e-6));
         assert!(approx_eq(c[0], -0.01, 1e-6));
         assert!(approx_eq(c[1], -3.82, 1e-6));
+    }
+
+    /// Tiny valid Q8Matrix for the overflow-guard tests: the guards fire before
+    /// `b_q` is inspected, so shape need only be self-consistent.
+    fn dummy_q8_1x1() -> Q8Matrix {
+        Q8Matrix {
+            data: vec![0i8],
+            scales: vec![0.0f32],
+            rows: 1,
+            cols: 1,
+        }
+    }
+
+    /// Overflow guard: `m * k` must be rejected before the length `assert_eq!`
+    /// wraps it. Mutation-sensitive — dropping the `m*k` guard makes this fall
+    /// through to the `A length does not match m * k` assert (m*k wraps in
+    /// release), changing the panic message and failing this `expected`.
+    #[test]
+    #[should_panic(expected = "matmul shape overflow: m*k")]
+    fn test_matmul_bt_q8_rejects_mk_overflow() {
+        let q = dummy_q8_1x1();
+        let mut c = vec![0.0f32; 1];
+        // m*k overflows; n*k and m*n do not.
+        matmul_bt_q8(&[], &q, &mut c, usize::MAX, 2, 1);
+    }
+
+    /// Overflow guard: `n * k` (m*k passes first).
+    #[test]
+    #[should_panic(expected = "matmul shape overflow: n*k")]
+    fn test_matmul_bt_q8_rejects_nk_overflow() {
+        let q = dummy_q8_1x1();
+        let mut c = vec![0.0f32; 1];
+        // m*k = 1*2 ok; n*k = MAX*2 overflows.
+        matmul_bt_q8(&[0.0, 0.0], &q, &mut c, 1, 2, usize::MAX);
+    }
+
+    /// Overflow guard: `m * n` (m*k and n*k pass first).
+    #[test]
+    #[should_panic(expected = "matmul shape overflow: m*n")]
+    fn test_matmul_bt_q8_rejects_mn_overflow() {
+        let q = dummy_q8_1x1();
+        let mut c = vec![0.0f32; 1];
+        // m*k = MAX*1 ok; n*k = 2*1 ok; m*n = MAX*2 overflows.
+        matmul_bt_q8(&[], &q, &mut c, usize::MAX, 1, 2);
     }
 
     #[test]
