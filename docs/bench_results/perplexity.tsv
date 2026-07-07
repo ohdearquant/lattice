@@ -1,6 +1,19 @@
-lattice	q4	19.266338	2048
-lattice	q4-quarot	19.950512	2048
-  q8: PPL = 15.8218 (2041 tokens)
-  q4: PPL = 18.1839 (2041 tokens)
+# perplexity.tsv — Q4 quantization quality, lattice tiers vs MLX cross-check
+# Regenerated 2026-07-07T03:22Z from ae1f91cfc (real GPU). Qwen3.5-0.8B, WikiText-2 raw test,
+#   window=512 stride=256 max_tokens=2048, QuaRot seed=0xC0FFEE.
+#   PPL is deterministic over a fixed corpus + window schedule (one run is canonical).
+# ADR-044 reconciliation: ADR-044 step-4 recorded QuaRot Q4 as -1.61 PPL BETTER than
+#   unrotated Q4 (full corpus). That was measured on a PRE-RoPE-fix forward path (May 2026).
+#   A code-bisection on identical corpus/slice/seed shows the delta sign is set by code
+#   version, not corpus: ADR-044-era binary = -0.81 (QuaRot better), current binary = +1.90
+#   (QuaRot worse). Forward-path fixes improved the unrotated baseline ~4.5 PPL but QuaRot
+#   only ~1.8 — QuaRot was compensating for baseline bugs since fixed. Offline QuaRot v0 is
+#   net-negative by design (Hadamard forces symmetric Q4, worse fidelity floor); the missing
+#   mechanism is online R3/R4 (issue #703). See also #616. Columns: engine<TAB>tier<TAB>ppl<TAB>tokens
+lattice	q4	16.589166	2048
+lattice	q4-quarot	19.007144	2048
+# informational: quarot-unrotated delta = +2.4180 at max_tokens=2048 (offline v0 net-negative, #703)
+# mlx rows carried from prior reference run (mlx-lm has a transformers-version incompat in this venv,
+#   out of scope for #616; re-run scripts/bench_quality.sh once mlx-lm is fixed to refresh these).
 mlx	q8	15.8218	2041
 mlx	q4	18.1839	2041
