@@ -638,13 +638,14 @@ jobs:
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
-  # wasm-parity, and q4-composed verdicts when it did. Fails closed if
-  # change-detection itself errored. metal-parity is deliberately excluded
-  # (informational — see its comment above). q4-ppl-quality is excluded until
-  # its golden is armed (see that job's comment).
+  # wasm-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality verdicts when
+  # it did. Fails closed if change-detection itself errored. metal-parity is
+  # deliberately excluded (informational — see its comment above). q4-ppl-quality
+  # is now armed (golden captured on run 28841919096) and gates the shipping Q4
+  # tier for regressions.
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest]
+    needs: [changes, parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest, q4-ppl-quality]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -657,7 +658,8 @@ jobs:
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           Q4_RESULT="${{ needs.q4-composed.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT"
+          Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -686,5 +688,9 @@ jobs:
             echo "::error::Engine changed and ppl-gate self-test did not succeed (result=$PPL_SELFTEST_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, q4-composed, and ppl-gate-selftest all PASSED."
+          if [ "$Q4PPL_RESULT" != "success" ]; then
+            echo "::error::Engine changed and q4-ppl-quality regression gate did not succeed (result=$Q4PPL_RESULT)."
+            exit 1
+          fi
+          echo "Engine changed; parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality all PASSED."
           exit 0

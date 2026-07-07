@@ -9,8 +9,9 @@
   "stride": 256,
   "max_tokens": 2048,
 
-  "ppl": null,
+  "ppl": 16.589111,
   "tolerance": 0.05,
+  "_captured_from": "GitHub Actions run 28841919096 (RECORD mode, macos-latest paravirtual Metal, head 66d45fcf5), 2026-07-07. https://github.com/ohdearquant/lattice/actions/runs/28841919096 . Notable: this paravirtual value matches a real-GPU M2 Max measurement (16.589166) to 5.5e-5 for THIS Q4 eval path — see kg note. Runner-capture stays the default for new paths regardless.",
 
   "_capture": "The `ppl` value MUST be captured on the CI runner (GitHub macos-latest, PARAVIRTUAL Metal), NOT on a real Apple GPU. The Q4 forward path is numerically correct on paravirtual (proven by the q4-composed token-ID gate) but absolute PPL differs from real-GPU, so a real-GPU number would false-fail here. Bootstrap: the first CI run executes in RECORD mode (ppl==null) and prints the paravirtual PPL as a PR comment; commit that value here, then arm the gate (add q4-ppl-quality to parity-gate.needs + repo required checks).",
 
