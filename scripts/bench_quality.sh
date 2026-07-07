@@ -19,18 +19,36 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 EVAL_BIN="$REPO/target/release/eval_perplexity"
-Q4_DIR="$HOME/.lattice/models/qwen3.5-0.8b-q4"
-QUAROT_DIR="$HOME/.lattice/models/qwen3.5-0.8b-q4-quarot"
-TOK_DIR="$HOME/.lattice/models/qwen3.5-0.8b"
+Q4_DIR="${Q4_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4}"
+QUAROT_DIR="${QUAROT_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4-quarot}"
+TOK_DIR="${TOK_DIR:-$HOME/.lattice/models/qwen3.5-0.8b}"
 OUT="$REPO/docs/bench_results"
 CORPUS="$OUT/wiki.test.raw"
 DATA="$OUT/perplexity.tsv"
 MAX_TOKENS="${MAX_TOKENS:-2048}"   # ~20s on Metal Q4 (107 tok/s scoring rate)
 WINDOW="${WINDOW:-512}"            # Buffer is window*vocab*4 = ~508MB at vocab=248K
 STRIDE="${STRIDE:-256}"            # 2x stride overlap → adequate context coverage
+SEED="${SEED:-0xC0FFEE}"           # QuaRot rotation seed (artifacts not interchangeable across seeds)
+SKIP_MLX="${SKIP_MLX:-0}"          # set 1 to skip the MLX cross-check (no mlx-lm / offline)
 
 mkdir -p "$OUT"
 : > "$DATA"
+SHA="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+STAMP="$(date -u +%Y-%m-%dT%H:%MZ)"
+{
+  echo "# perplexity.tsv — Q4 quantization quality, lattice tiers vs MLX cross-check"
+  echo "# Regenerated $STAMP from $SHA (real GPU). Qwen3.5-0.8B, WikiText-2 raw test,"
+  echo "#   window=$WINDOW stride=$STRIDE max_tokens=$MAX_TOKENS, QuaRot seed=$SEED."
+  echo "#   PPL is deterministic over a fixed corpus + window schedule (one run is canonical)."
+  echo "# ADR-044 reconciliation: ADR-044 step-4 recorded QuaRot Q4 as -1.61 PPL BETTER than"
+  echo "#   unrotated Q4 (full corpus). That was measured on a PRE-RoPE-fix forward path (May 2026)."
+  echo "#   A code-bisection on identical corpus/slice/seed shows the delta sign is set by code"
+  echo "#   version, not corpus: ADR-044-era binary = -0.81 (QuaRot better), current binary = +1.90"
+  echo "#   (QuaRot worse). Forward-path fixes improved the unrotated baseline ~4.5 PPL but QuaRot"
+  echo "#   only ~1.8 — QuaRot was compensating for baseline bugs since fixed. Offline QuaRot v0 is"
+  echo "#   net-negative by design (Hadamard forces symmetric Q4, worse fidelity floor); the missing"
+  echo "#   mechanism is online R3/R4 (issue #703). See also #616. Columns: engine<TAB>tier<TAB>ppl<TAB>tokens"
+} >> "$DATA"
 echo "=== Perplexity bench | Qwen3.5-0.8B | WikiText-2 test | window=$WINDOW stride=$STRIDE max_tokens=$MAX_TOKENS ==="
 
 # ---- Corpus check ----
@@ -54,6 +72,7 @@ if [[ -d "$Q4_DIR" ]] && [[ -x "$EVAL_BIN" ]]; then
     --max-tokens "$MAX_TOKENS" 2>&1)
   PPL=$(echo "$OUT_TXT" | extract_ppl | head -1)
   echo "  PPL: ${PPL:-PARSE_FAILED}"
+  Q4PPL="$PPL"
   [[ -n "$PPL" ]] && printf "lattice\tq4\t%s\t%s\n" "$PPL" "$MAX_TOKENS" >> "$DATA"
 else
   echo "  lattice/q4: SKIP (no $Q4_DIR; quantize via target/release/quantize_q4 to enable)"
@@ -67,14 +86,28 @@ if [[ -d "$QUAROT_DIR" ]] && [[ -x "$EVAL_BIN" ]]; then
     --max-tokens "$MAX_TOKENS" 2>&1)
   PPL=$(echo "$OUT_TXT" | extract_ppl | head -1)
   echo "  PPL: ${PPL:-PARSE_FAILED}"
+  QRPPL="$PPL"
   [[ -n "$PPL" ]] && printf "lattice\tq4-quarot\t%s\t%s\n" "$PPL" "$MAX_TOKENS" >> "$DATA"
 else
   echo "  lattice/q4-quarot: SKIP (no $QUAROT_DIR)"
 fi
 
+# ---- QuaRot delta (INFORMATIONAL, not a gate — offline v0 is net-negative, see header/#703) ----
+if [[ -n "${Q4PPL:-}" ]] && [[ -n "${QRPPL:-}" ]]; then
+  DELTA=$(awk -v q="$Q4PPL" -v r="$QRPPL" 'BEGIN{printf "%+.4f", r-q}')
+  echo "  QuaRot delta (quarot-unrotated): $DELTA  [informational; positive = QuaRot worse]"
+  echo "# informational: quarot-unrotated delta = $DELTA at max_tokens=$MAX_TOKENS (offline v0 net-negative, #703)" >> "$DATA"
+fi
+
 # ---- MLX Q8 + Q4 (cross-check) ----
+if [[ "$SKIP_MLX" == "1" ]]; then
+  echo "─── MLX cross-check: SKIP (SKIP_MLX=1) ───"
+else
 echo "─── MLX (Q8 + Q4 cross-check) ───"
-uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" <<'PY' >> "$DATA" 2>&1 | tee /tmp/mlx_ppl.log
+# Capture stdout to a temp; only clean "mlx<TAB>..." rows are appended to $DATA so a
+# broken mlx-lm (import/tokenizer errors) can never pollute the data file. stderr → log.
+MLX_TMP="$(mktemp)"
+uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" > "$MLX_TMP" 2>/tmp/mlx_ppl.log <<'PY'
 import sys, math
 mdir, corpus, window, stride, max_tokens = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 import mlx.core as mx
@@ -115,13 +148,16 @@ def ppl_at_bits(bits, label):
 ppl_at_bits(8, "q8")
 ppl_at_bits(4, "q4")
 PY
+grep -E '^mlx	' "$MLX_TMP" >> "$DATA" || echo "  MLX cross-check produced no rows (see /tmp/mlx_ppl.log)"
+rm -f "$MLX_TMP"
+fi
 
 echo ""
 echo "═══ Perplexity Summary ═══"
 if [[ -s "$DATA" ]]; then
   printf "  %-10s %-10s %10s %10s\n" "engine" "tier" "PPL ↓" "tokens"
   printf "  %s\n" "----------------------------------------"
-  awk -F'\t' '{printf "  %-10s %-10s %10s %10s\n", $1, $2, $3, $4}' "$DATA"
+  awk -F'\t' '/^#/{next} NF>=4{printf "  %-10s %-10s %10s %10s\n", $1, $2, $3, $4}' "$DATA"
 else
   echo "  (no measurements completed)"
 fi
