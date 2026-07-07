@@ -5,6 +5,8 @@
 **Crate**: lattice-inference
 **Amendment (2026-05-27)**: ADR-060 generalizes the rotation abstraction into an `OrthogonalBasis` trait with `BasisKind` enum (HadamardRandomSign, PcaCalibration, BlockHadamard, DenseOrthogonal). ADR-044's v0 `RandomizedHadamard` remains the shipped path and is the first `BasisKind` implementor. The v1 question of non-power-of-two dimension support is partially addressed by ADR-060's `BlockHadamard` variant. Composition order: SliceGPT PCA first → slice → QuaRot Hadamard second (ADR-060 D3).
 
+**Amendment (2026-07-06) — step-4 conclusion SUPERSEDED**: the measured result below (QuaRot Q4 *better* than unrotated Q4 by 1.61 PPL) no longer holds on the current forward path. That number was taken in May 2026 on a pre-RoPE-fix forward path where the Hadamard rotation was compensating for baseline bugs. On today's numerically-correct forward path, offline QuaRot v0 is a **net negative** versus unrotated asymmetric Q4. The original measurement is preserved below for history; the corrected conclusion and the controlled code-bisection that establishes it are in §"Conclusion superseded (2026-07-06)". The decision *to build QuaRot* stands; only the quality claim is superseded.
+
 ## Context
 
 Existing 4-bit quantization in `lattice-inference` (`weights::q4_weights`) is naïve per-block symmetric round-to-nearest (RTN). RTN works for weight-only Q4 on well-behaved layers, but two failure modes are well-documented in the literature and present in Qwen3 weights:
@@ -144,6 +146,25 @@ These are consequences of accepting v0 as the design (across all 4 PRs), not of 
 - **Runtime LoRA injection is incompatible with QuaRot-converted models.** The forward path at `forward.rs:249, 467` and `gdn_fused.rs:385` adds LoRA delta to base matmul output using the same activation. Rotated base produces output in a different basis than an un-rotated adapter delta — sum is invalid. v0 marks QuaRot models as LoRA-runtime-incompatible. Mitigation: the saved `.q4` artifact must include rotation-seed metadata so a future LoRA-aware path can (a) rotate adapter weights on load using the stored seed, or (b) refuse-on-compose at adapter-load time when the base is QuaRot-converted. Neither is in v0.
 
 - **Conversion-binary public-API surface (step 3c).** The `RotationPlan` exposed in PR #19 is rotation-rule data; the broader conversion contract (RMSNorm fusion, config flip, lm_head materialization) is NOT in the plan structure. Step 3c will introduce a `ConversionPlan` (or similar) wrapping the rotation plan plus the required mutations; only that combined structure is the correctness gate. Documented in `plan.rs` §Known gaps to prevent cargo-culting `RotationPlan::is_complete()` as a "ready to ship" check.
+
+## Conclusion superseded (2026-07-06)
+
+The step-4 measurement recorded above — "QuaRot Q4 PPL 23.958276 vs unrotated Q4 PPL 25.572589, delta −1.614313, QuaRot materially better" — was taken on 2026-05-16 (commit `642d64305`), which predates the RoPE stride-half pairing fix (shipped 2026-05-24, v0.2.3) and roughly six subsequent weeks of forward-path and quantizer correctness work. It does not describe the current engine.
+
+**Controlled code-bisection.** Same corpus (WikiText-2 raw test), same 32K-token slice, same window 512 / stride 256, same QuaRot seed `0xC0FFEE` — the only variable is the code version:
+
+| Code | Unrotated Q4 PPL | QuaRot Q4 PPL | Delta (quarot − unrotated) |
+|------|------------------|---------------|----------------------------|
+| ADR-044-era (`642d64305`, pre-RoPE-fix) | 20.72 | 19.91 | **−0.81** (QuaRot better) |
+| Current | 16.25 | 18.15 | **+1.90** (QuaRot worse) |
+
+Full-corpus (310,033 tokens) on current code: unrotated 15.73 / QuaRot 17.63 / delta **+1.90**, consistent with the slice.
+
+The sign flip is entirely code, not corpus (the old binary reproduces "QuaRot better" on the identical file). The mechanism is visible in the numbers: the forward-path fixes improved the *unrotated* baseline by 4.47 PPL (20.72 → 16.25) but improved *QuaRot* by only 1.76 (19.91 → 18.15). QuaRot's May advantage was propping up a broken unrotated path; once that path was corrected, the baseline recovered most of the gap and passed it.
+
+**Root cause (why offline QuaRot v0 is net-negative by design).** The Hadamard rotation zero-centers weight distributions, which forces *symmetric* Q4 quantization. Symmetric Q4 has a worse per-block fidelity floor than the asymmetric Q4 that is now the default (measured relRMS ≈ 0.100 vs ≈ 0.080). Offline-only conversion (R1/R2 absorbed into weights) has no runtime rotation to recover that loss on a numerically-correct forward path.
+
+**Forward condition.** Offline QuaRot v0 stays net-negative until the QuaRot paper's *online* rotations (R3 in attention, R4 before the down-projection) are implemented — that is the mechanism that suppresses activation outliers at inference time and lets rotated low-bit quantization win, especially at larger scale. Tracked in issue #703. Until then, unrotated asymmetric Q4 is the shipping default, and the CI quality gate (#616) guards the unrotated path against a frozen baseline while reporting the QuaRot delta as informational.
 
 ## References
 
