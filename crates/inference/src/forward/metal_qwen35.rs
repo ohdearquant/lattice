@@ -3302,7 +3302,10 @@ kernel void copy_kv_cache_batch_f16(
 // One threadgroup per (kv_head, query_token) processes all Q heads in the GQA group.
 //
 // KVT is the KV cache element type (float for f32 path, half for f16 path).
-#define DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(NAME, KVT) \
+// GRP is the compile-time MAX_GRP specialization (4/6/8) — see the Rust-side
+// `prefill_maxgrp_suffix` helper for how a loaded model's group_size selects
+// among the g4/g6/g8 instantiations below.
+#define DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(NAME, KVT, GRP) \
 kernel void NAME( \
     device const float* q          [[buffer(0)]], \
     device const KVT*   k_cache    [[buffer(1)]], \
@@ -3322,7 +3325,7 @@ kernel void NAME( \
     uint3 tgs3 [[threads_per_threadgroup]]) \
 { \
     constexpr uint HEAD_DIM    = 256; \
-    constexpr uint MAX_GRP     = 8; \
+    constexpr uint MAX_GRP     = GRP; \
     constexpr uint TILE_TOKENS = 256; \
     const uint lid = lid3.x; \
     const uint tgs = tgs3.x; \
@@ -3425,8 +3428,18 @@ kernel void NAME( \
     } \
 }
 
-DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal,     float)
-DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_f16, half)
+// g4/g6/g8: MAX_GRP specializations selected at pipeline-build time by the
+// Rust-side `prefill_maxgrp_suffix(group_size)` helper. g8 is byte-for-byte
+// equivalent to the pre-specialization kernel (MAX_GRP=8 was the fleet-max
+// hardcode this replaces); g4/g6 trade unreachable-for-that-model MAX_GRP
+// rows for more threadgroup-memory occupancy (measured -17.4% TTFT@4096 on
+// the 0.8b model at MAX_GRP=4).
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g4,     float, 4)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g4_f16, half,  4)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g6,     float, 6)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g6_f16, half,  6)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g8,     float, 8)
+DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL(prefill_attention_batched_causal_g8_f16, half,  8)
 
 // ===== GDN Chunked Prefill Scan (C=32 specialized) =====
 // Implements chunked-parallel WY/UT scan for GatedDeltaNet prefill.
@@ -5557,6 +5570,39 @@ kernel void gdn_chunk_norm_silu_c32(
         Ok(())
     }
 
+    /// Maps a model's GQA `group_size` (`num_attention_heads / num_key_value_heads`)
+    /// to the smallest specialized `prefill_attention_batched_causal_{suffix}[_f16]`
+    /// kernel variant whose compile-time `MAX_GRP` can hold it.
+    ///
+    /// Each variant sizes its threadgroup arrays (`q_s`/`score_s`/`m_s`/`l_s`/`alpha_s`)
+    /// and per-thread `acc[MAX_GRP]` register array to a fixed `MAX_GRP` (see
+    /// `DEFINE_PREFILL_ATTENTION_BATCHED_CAUSAL` in `MSL_SOURCE`), so smaller-group
+    /// models (e.g. gs=4) get more threadgroup-memory occupancy by picking the g4
+    /// variant instead of paying for MAX_GRP=8-sized arrays whose rows above
+    /// group_size were always idle.
+    ///
+    /// SHIP-SAFETY GUARD: the kernel body itself is defense-in-depth
+    /// (`if group_size == 0 || group_size > MAX_GRP { return; }`), but that guard
+    /// makes the failure mode *silent* (zeroed/never-written attention output for
+    /// the affected rows), not a compile error or panic. This mapping must always
+    /// round UP to a variant whose `MAX_GRP >= group_size` — picking `g4` for a
+    /// `group_size=6` model would silently drop attention output for 2 of every 6
+    /// query heads in the group. `group_size` is validated to be in
+    /// `1..=METAL_FLASH_MAX_GQA_GROUP` (8) by `validate_flash_decode_shape` before
+    /// either pipeline-construction call site (`new`, `from_q4_dir`) reaches this
+    /// function, so the `> 6` arm below always resolves to `g8` in practice; it is
+    /// kept as an explicit fallback rather than an unreachable!() so this helper
+    /// stays correct if a caller is ever added that skips that validation.
+    fn prefill_maxgrp_suffix(group_size: usize) -> &'static str {
+        if group_size <= 4 {
+            "g4"
+        } else if group_size <= 6 {
+            "g6"
+        } else {
+            "g8"
+        }
+    }
+
     /// Create a Metal buffer holding f32 data in shared (unified) memory.
     fn make_buffer(device: &Device, data: &[f32], label: &str) -> Buffer {
         let byte_len = std::mem::size_of_val(data) as u64;
@@ -6166,6 +6212,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
+            // Group-size-specialized prefill attention kernel (occupancy win):
+            // group_size is fixed for a loaded model, so selection happens once
+            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
+            // comment for the ship-safety rounding-up guarantee — validated
+            // in-range by `validate_flash_decode_shape` above.
+            let prefill_grp_suffix =
+                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads);
+
             // Compile shaders
             let opts = CompileOptions::new();
             let library = device
@@ -6281,14 +6335,16 @@ kernel void gdn_chunk_norm_silu_c32(
                 per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
                 partial_rope_batch: make_pipeline("partial_rope_batch")?,
                 copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
+                prefill_attention_batched: make_pipeline(&format!(
+                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
+                ))?,
                 copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
                 copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
                 decode_attention_f16: make_pipeline("decode_attention_f16")?,
                 decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(
-                    "prefill_attention_batched_causal_f16",
-                )?,
+                prefill_attention_batched_f16: make_pipeline(&format!(
+                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
+                ))?,
                 lm_head_block_topk_f16: make_lm_head_block_pipelines(
                     &device,
                     &library,
@@ -16102,6 +16158,14 @@ kernel void gdn_chunk_norm_silu_c32(
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
+            // Group-size-specialized prefill attention kernel (occupancy win):
+            // group_size is fixed for a loaded model, so selection happens once
+            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
+            // comment for the ship-safety rounding-up guarantee — validated
+            // in-range by `validate_flash_decode_shape` above.
+            let prefill_grp_suffix =
+                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads);
+
             // Cache-capacity validation, matching `new_session` so a
             // `from_q4_dir` call cannot construct a runtime whose KV cap
             // outruns the RoPE table (`partial_rope_interleaved` indexes
@@ -16282,14 +16346,16 @@ kernel void gdn_chunk_norm_silu_c32(
                 per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
                 partial_rope_batch: make_pipeline("partial_rope_batch")?,
                 copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline("prefill_attention_batched_causal")?,
+                prefill_attention_batched: make_pipeline(&format!(
+                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
+                ))?,
                 copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
                 copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
                 decode_attention_f16: make_pipeline("decode_attention_f16")?,
                 decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(
-                    "prefill_attention_batched_causal_f16",
-                )?,
+                prefill_attention_batched_f16: make_pipeline(&format!(
+                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
+                ))?,
                 lm_head_block_topk_f16: make_lm_head_block_pipelines(
                     &device,
                     &library,
@@ -23434,6 +23500,179 @@ kernel void decode_attention_reference(
             let cfg = Qwen35Config::from_config_json(&config_path)
                 .expect("parse qwen3.5-0.8b-q4 config.json");
             Some((q4_dir, cfg))
+        }
+
+        /// Test-only: recompile `MSL_SOURCE` and build the pipeline for a single
+        /// named kernel, bypassing the group_size-based variant selection that
+        /// `MetalQwen35Engine::new`/`from_q4_dir` perform at load time. Used to
+        /// force the pre-specialization-equivalent g8 (`MAX_GRP=8`) prefill
+        /// attention variant onto an already-constructed state's pipeline table,
+        /// so a live in-session reference is available without a second model
+        /// checkpoint (see `prefill_g4_variant_matches_g8_reference_argmax_topk`).
+        fn force_prefill_pipeline_variant(
+            device: &Device,
+            kernel_name: &str,
+        ) -> ComputePipelineState {
+            let opts = CompileOptions::new();
+            let library = device
+                .new_library_with_source(MSL_SOURCE, &opts)
+                .expect("recompile MSL_SOURCE for forced prefill variant");
+            let func = library
+                .get_function(kernel_name, None)
+                .expect("find forced prefill kernel variant");
+            device
+                .new_compute_pipeline_state_with_function(&func)
+                .expect("build forced prefill pipeline")
+        }
+
+        /// Ship-safety guard for the group_size -> MAX_GRP variant mapping
+        /// (rung-0 prefill-attention occupancy change). The kernel's own
+        /// `group_size > MAX_GRP` guard makes an under-sized variant pick
+        /// *silent* (zeroed/unwritten attention rows for the excess query
+        /// heads), not a compile error or panic — so this mapping is the only
+        /// thing standing between "occupancy win" and "silent correctness bug"
+        /// for models whose group_size falls between the specialized sizes.
+        /// MUTATION-SENSITIVE: a mapping that rounded DOWN (e.g. gs=6 -> g4)
+        /// would pass a naive "returns a valid suffix" check but fail this one.
+        #[test]
+        fn prefill_maxgrp_suffix_rounds_up_never_down() {
+            assert_eq!(prefill_maxgrp_suffix(1), "g4");
+            assert_eq!(prefill_maxgrp_suffix(2), "g4");
+            assert_eq!(prefill_maxgrp_suffix(4), "g4");
+            assert_eq!(
+                prefill_maxgrp_suffix(5),
+                "g6",
+                "group_size=5 must round UP to g6 (a g4 pipeline would silently \
+                 drop 1 of every 5 query heads' attention output)"
+            );
+            assert_eq!(prefill_maxgrp_suffix(6), "g6");
+            assert_eq!(
+                prefill_maxgrp_suffix(7),
+                "g8",
+                "group_size=7 must round UP to g8 (a g6 pipeline would silently \
+                 drop 1 of every 7 query heads' attention output)"
+            );
+            assert_eq!(prefill_maxgrp_suffix(8), "g8");
+        }
+
+        /// Rung-0 occupancy change (group_size-specialized `MAX_GRP` prefill
+        /// attention kernel, measured -17.4% TTFT@4096 on the 0.8b model at
+        /// `MAX_GRP=4`): a PURE occupancy change — the `MAX_GRP` rows above a
+        /// model's `group_size` were always idle in the old fleet-max-8 kernel,
+        /// so specializing `MAX_GRP` to `group_size` must not change any
+        /// computed value, only threadgroup-memory occupancy.
+        ///
+        /// qwen3.5-0.8b-q4 has group_size=4 (8 attention heads / 2 KV heads),
+        /// so production loading now selects the g4 variant. This test builds
+        /// a second, independently-loaded state and forces its prefill
+        /// pipeline fields to the g8 variant (byte-for-byte equivalent to the
+        /// pre-change `MAX_GRP=8` kernel) as a live in-session reference, then
+        /// asserts the two variants agree exactly on a fixed synthetic prompt.
+        /// Any divergence is a wiring bug (wrong variant name, broken
+        /// selection) — NOT expected numeric drift, per the task's bit-identical
+        /// claim: the real per-row compute (`group_size`-bounded loops) indexes
+        /// threadgroup arrays by `HEAD_DIM`/`TILE_TOKENS` strides, not `MAX_GRP`,
+        /// so shrinking `MAX_GRP` only shrinks array allocation, never the
+        /// values or operation order for the rows that are actually used.
+        #[test]
+        fn prefill_g4_variant_matches_g8_reference_argmax_topk() {
+            let Some(_) = Device::system_default() else {
+                eprintln!("skipping prefill g4-vs-g8 parity test: no Metal device");
+                return;
+            };
+            let Some((q4_dir, cfg)) = load_real_qwen35_0_8b_q4_dir_or_skip() else {
+                return;
+            };
+            let tokenizer_path =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b/tokenizer.json");
+            if !tokenizer_path.exists() {
+                eprintln!(
+                    "skipping prefill g4-vs-g8 parity test: tokenizer missing at {}",
+                    tokenizer_path.display()
+                );
+                return;
+            }
+            assert_eq!(
+                cfg.num_attention_heads / cfg.num_key_value_heads,
+                4,
+                "this test's g4-vs-g8 comparison assumes qwen3.5-0.8b-q4 group_size=4 \
+                 (8 attention heads / 2 KV heads); re-check the on-disk config if this fails"
+            );
+
+            let _guard = gpu_test_lock();
+            let max_cache_len = 1024usize;
+
+            // Path A: production selection — group_size=4 picks the g4 variant.
+            let mut state_g4 = MetalQwen35State::from_q4_dir(
+                &q4_dir,
+                tokenizer_path.as_path(),
+                &cfg,
+                max_cache_len,
+            )
+            .expect("load qwen3.5-0.8b-q4 (g4 production selection)");
+
+            // Path B: independently-loaded state with its prefill pipelines
+            // forced to the g8 (pre-change-equivalent) variant.
+            let mut state_g8 = MetalQwen35State::from_q4_dir(
+                &q4_dir,
+                tokenizer_path.as_path(),
+                &cfg,
+                max_cache_len,
+            )
+            .expect("load qwen3.5-0.8b-q4 (forced g8 reference)");
+            state_g8.engine.pipelines.prefill_attention_batched = force_prefill_pipeline_variant(
+                &state_g8.engine.device,
+                "prefill_attention_batched_causal_g8",
+            );
+            state_g8.engine.pipelines.prefill_attention_batched_f16 =
+                force_prefill_pipeline_variant(
+                    &state_g8.engine.device,
+                    "prefill_attention_batched_causal_g8_f16",
+                );
+
+            let seq_len = 512usize;
+            let tokens: Vec<u32> = (0..seq_len as u32).map(|i| 100 + i % 1000).collect();
+            assert!(
+                tokens.iter().all(|&t| (t as usize) < cfg.vocab_size),
+                "synthetic prompt token ids must be within vocab_size"
+            );
+
+            let logits_g4 = state_g4.forward_prefill(&tokens);
+            let logits_g8 = state_g8.forward_prefill(&tokens);
+
+            assert_eq!(logits_g4.len(), cfg.vocab_size);
+            assert_eq!(logits_g8.len(), cfg.vocab_size);
+
+            let top4_g4 = cpu_topk_token_ids(&logits_g4, 4);
+            let top4_g8 = cpu_topk_token_ids(&logits_g8, 4);
+
+            let max_abs_diff = logits_g4
+                .iter()
+                .zip(logits_g8.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+
+            eprintln!(
+                "prefill g4-vs-g8 parity: argmax_g4={}, argmax_g8={}, top4_g4={top4_g4:?}, \
+                 top4_g8={top4_g8:?}, max_abs_diff={max_abs_diff:.8}",
+                top4_g4[0], top4_g8[0],
+            );
+
+            assert_eq!(
+                top4_g4[0], top4_g8[0],
+                "argmax diverged between g4 and g8 prefill attention variants — this is a bug \
+                 in variant selection or macro parameterization, not expected numeric drift"
+            );
+            assert_eq!(
+                top4_g4, top4_g8,
+                "top-4 token ids diverged between g4 and g8 prefill attention variants"
+            );
+            assert_eq!(
+                max_abs_diff, 0.0,
+                "g4 and g8 prefill attention variants must be BIT-IDENTICAL (pure occupancy \
+                 change): max_abs_diff={max_abs_diff}"
+            );
         }
 
         /// Q4 counterpart of `lm_head_real_checkpoint_greedy_agreement_10k_positions`
