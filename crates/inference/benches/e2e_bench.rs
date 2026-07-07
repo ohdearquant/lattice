@@ -120,5 +120,59 @@ fn e2e_encode_batch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, e2e_encode, e2e_encode_batch);
+/// Padding-fraction comparison for the packed batched-encode path (#677): a
+/// high length-variance batch (5/30/100 real tokens) exercises the padding
+/// the packed layout removes, while a uniform batch (three copies of the
+/// same 100-token text) has no padding to remove and should land ~neutral.
+fn e2e_encode_batch_padding_variance(c: &mut Criterion) {
+    let Some(dir) = model_dir() else { return };
+
+    let model = BertModel::from_directory(&dir).expect("Failed to load model");
+    let _ = model.encode("warmup");
+
+    let short = "Hello world test";
+    let medium = "The quick brown fox jumps over the lazy dog. \
+        This sentence is designed to be roughly thirty tokens long for benchmarking.";
+    let long = "Artificial intelligence and machine learning have transformed the way we process \
+        information and make decisions. From natural language processing to computer vision, \
+        these technologies enable systems to understand, learn, and interact with the world \
+        in increasingly sophisticated ways. The development of transformer architectures has \
+        been particularly impactful, enabling models to capture long-range dependencies in \
+        sequential data with unprecedented effectiveness and efficiency.";
+
+    let mixed: Vec<&str> = vec![short, medium, long];
+    let uniform: Vec<&str> = vec![long, long, long];
+
+    let mut group = c.benchmark_group("e2e_encode_batch_padding_variance");
+    group.measurement_time(Duration::from_secs(15));
+    group.warm_up_time(Duration::from_secs(3));
+
+    group.bench_function("mixed_5_30_100", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                model
+                    .encode_batch(std::hint::black_box(mixed.as_slice()))
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("uniform_100", |b| {
+        b.iter(|| {
+            std::hint::black_box(
+                model
+                    .encode_batch(std::hint::black_box(uniform.as_slice()))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    e2e_encode,
+    e2e_encode_batch,
+    e2e_encode_batch_padding_variance
+);
 criterion_main!(benches);
