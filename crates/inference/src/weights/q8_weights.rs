@@ -165,6 +165,20 @@ pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize
     #[cfg(target_os = "macos")]
     {
         const TILE_N: usize = 64;
+        // The tile scratch buffers are sized by `TILE_N * k` and `m * TILE_N`,
+        // which are NOT covered by the `m*k` / `n*k` / `m*n` guards above: when
+        // `n < TILE_N` (including `n == 0`) these products can overflow while the
+        // guarded ones do not, and a wrapped size would under-allocate the
+        // scratch and drive an OOB scatter below. Guard them on the same
+        // fail-closed contract.
+        assert!(
+            TILE_N.checked_mul(k).is_some(),
+            "matmul shape overflow: TILE_N*k"
+        );
+        assert!(
+            m.checked_mul(TILE_N).is_some(),
+            "matmul shape overflow: m*TILE_N"
+        );
         let mut b_f32 = vec![0.0f32; TILE_N * k];
         let mut c_tile = vec![0.0f32; m * TILE_N];
 
@@ -875,6 +889,42 @@ mod tests {
         let mut c = vec![0.0f32; 1];
         // m*k = MAX*1 ok; n*k = 2*1 ok; m*n = MAX*2 overflows.
         matmul_bt_q8(&[], &q, &mut c, usize::MAX, 1, 2);
+    }
+
+    /// Overflow guard for the macOS tile-scratch size `TILE_N * k`. With
+    /// `m=0, k=MAX, n=0` every earlier product (`m*k`, `n*k`, `m*n`) and every
+    /// length assert is zero/empty, so control reaches the tile block; `TILE_N*k`
+    /// then overflows. Mutation-sensitive: dropping this guard makes the
+    /// `vec![0.0f32; TILE_N * k]` allocation panic with "capacity overflow"
+    /// instead, failing this `expected`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "matmul shape overflow: TILE_N*k")]
+    fn test_matmul_bt_q8_rejects_tile_nk_overflow() {
+        let q = Q8Matrix {
+            data: vec![],
+            scales: vec![],
+            rows: 0,
+            cols: usize::MAX,
+        };
+        matmul_bt_q8(&[], &q, &mut [], 0, usize::MAX, 0);
+    }
+
+    /// Overflow guard for the macOS tile-scratch size `m * TILE_N`. With
+    /// `m=MAX, k=0, n=0` the earlier products and length asserts are all
+    /// zero/empty, so control reaches the tile block; `m*TILE_N` then overflows.
+    /// Mutation-sensitive by the same "capacity overflow" message mismatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "matmul shape overflow: m*TILE_N")]
+    fn test_matmul_bt_q8_rejects_m_tile_n_overflow() {
+        let q = Q8Matrix {
+            data: vec![],
+            scales: vec![],
+            rows: 0,
+            cols: 0,
+        };
+        matmul_bt_q8(&[], &q, &mut [], usize::MAX, 0, 0);
     }
 
     #[test]
