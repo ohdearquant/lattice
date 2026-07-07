@@ -1,0 +1,22 @@
+{
+  "_purpose": "Frozen Q4 perplexity golden for the #616 regression gate. Consumed by scripts/ppl_gate_check.py, run by the q4-ppl-quality job in .github/workflows/e2e-parity.yml.",
+  "_gate": "Fails closed if |measured - ppl| > tolerance, where `measured` is unrotated Metal Q4 PPL over the corpus slice below. Catches a regression in the SHIPPING quantization tier. NOT the QuaRot delta gate (offline QuaRot v0 is net-negative by design; see ADR-044 conclusion-superseded amendment + #703).",
+
+  "model": "Qwen3.5-0.8B",
+  "tier": "q4-unrotated",
+  "corpus": "docs/bench_results/wiki.test.raw",
+  "window": 512,
+  "stride": 256,
+  "max_tokens": 2048,
+
+  "ppl": null,
+  "tolerance": 0.05,
+
+  "_capture": "The `ppl` value MUST be captured on the CI runner (GitHub macos-latest, PARAVIRTUAL Metal), NOT on a real Apple GPU. The Q4 forward path is numerically correct on paravirtual (proven by the q4-composed token-ID gate) but absolute PPL differs from real-GPU, so a real-GPU number would false-fail here. Bootstrap: the first CI run executes in RECORD mode (ppl==null) and prints the paravirtual PPL as a PR comment; commit that value here, then arm the gate (add q4-ppl-quality to parity-gate.needs + repo required checks).",
+
+  "_corpus_slice_sensitivity": "max_tokens=2048 scores ~2047 tokens across ~7 windows of 512 (stride 256), ~20s on the runner — chosen as the wall-time knee. PPL on this fixed slice reads ABOVE the full-corpus canonical because shorter context accumulation biases per-token NLL upward: real-GPU measured 16.59 on this 2048-token slice vs 15.73 on the full 310K-token corpus (~+0.86). That bias is CONSTANT for a fixed slice+window schedule, so it does not affect a regression gate comparing against a golden captured on the identical slice. Enlarging the slice lowers absolute PPL and tightens run-to-run variance, at ~linear wall-cost. The slice bias is a property of the corpus+schedule (roughly env-independent); the absolute golden itself is env-specific (paravirtual) and comes from CI.",
+
+  "_tolerance_rationale": "0.05 is conservative: >> expected run-to-run Metal reduction-ordering variance (PPL is deterministic over a fixed corpus+schedule in exact arithmetic; GPU float-reduction reorder wobble is ~1e-3), and << the smallest meaningful quantization regression (llama.cpp community: Q4 PPL deltas start ~0.1). Confirm the observed variance on the first few CI runs and tighten if the runner proves tighter than 0.05.",
+
+  "_regenerate": "Deliberate + reviewable, never auto-done by CI. Re-run the q4-ppl-quality job (or eval_perplexity --q4-dir <ephemeral> --tokenizer-dir <model> --corpus-file docs/bench_results/wiki.test.raw --window 512 --stride 256 --max-tokens 2048 --json) on the target runner, read the measured PPL, update `ppl`, and note the commit SHA it was captured on in the PR."
+}

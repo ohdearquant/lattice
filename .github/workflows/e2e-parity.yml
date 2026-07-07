@@ -75,7 +75,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -501,11 +501,122 @@ jobs:
             --features "f16,metal-gpu" \
             -- --nocapture
 
+  # Q4 perplexity regression gate (issue #616). Measures the UNROTATED Metal Q4
+  # tier (the actually-shipping quantization) over a fixed WikiText-2 slice and
+  # compares against a frozen golden PPL.
+  #
+  # Why unrotated Q4 and not the QuaRot delta: the original ADR-044 gate asserted
+  # `quarot - unrotated < 0.5`. On the current forward path offline QuaRot v0 is
+  # net-NEGATIVE (+1.9 PPL worse than unrotated asymmetric Q4) by design — Hadamard
+  # forces symmetric Q4 (worse fidelity floor) and offline v0 has no online R3/R4
+  # rotation to recover it. A "quarot must win" gate would red main on a known,
+  # accepted limitation. So #616 repoints the gate to catch a REGRESSION in the
+  # shipping tier. See ADR-044 "Conclusion superseded (2026-07-06)" + issue #703.
+  #
+  # Why an absolute golden captured on THIS runner (paravirtual Metal): the Q4
+  # forward path is numerically correct on the hosted runner (proven by q4-composed)
+  # but absolute PPL differs from real Apple-GPU, so the golden must be captured
+  # here. Bootstrap: golden.json ships `ppl: null`, so the first run executes in
+  # RECORD mode (scripts/ppl_gate_check.py) — it PRINTS + PR-comments the measured
+  # paravirtual PPL and does NOT fail. A maintainer commits that value into
+  # crates/inference/tests/fixtures/ppl_gate_v1/golden.json, after which the gate
+  # enforces fail-closed (|measured - golden| > tolerance). Corpus-slice size and
+  # tolerance rationale are documented in golden.json.
+  #
+  # Deliberately NOT in parity-gate.needs below yet: while the golden is null the
+  # gate is fail-OPEN (record mode), so wiring it into the required gate now would
+  # add a fail-open leg. Once the golden is armed, add `q4-ppl-quality` to
+  # parity-gate.needs AND to the repo's required status checks (same maintainer
+  # step as embed-drift / wasm-parity / q4-composed).
+  q4-ppl-quality:
+    name: q4 ppl regression gate
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: q4-composed-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          "
+
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: q4-ppl-quality
+
+      - name: Build eval_perplexity + quantize_q4
+        run: |
+          cargo build --release -p lattice-inference \
+            --bin eval_perplexity --bin quantize_q4 --features "f16,metal-gpu"
+
+      # Regenerate the ephemeral unrotated Q4 artifact (NOT committed) from the
+      # real weights. Deterministic: quantize_q4 has no random seed.
+      - name: Generate ephemeral Q4 artifact
+        run: |
+          target/release/quantize_q4 \
+            --model-dir ~/.lattice/models/qwen3.5-0.8b \
+            --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-q4"
+
+      - name: Run Q4 PPL regression gate
+        env:
+          LATTICE_PPL_Q4_DIR: ${{ runner.temp }}/qwen3.5-0.8b-q4
+          LATTICE_PPL_TOKENIZER_DIR: ~/.lattice/models/qwen3.5-0.8b
+          PPL_GATE_REPORT: ppl-gate-report.md
+        run: python3 scripts/ppl_gate_check.py
+
+      - name: Ensure report exists
+        if: always()
+        run: |
+          test -s ppl-gate-report.md || {
+            printf '## Q4 perplexity regression gate (#616)\n\nNo report produced. Check job logs.\n' > ppl-gate-report.md
+          }
+
+      - name: Post PPL gate report
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: q4-ppl-gate
+          path: ppl-gate-report.md
+
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
   # wasm-parity, and q4-composed verdicts when it did. Fails closed if
   # change-detection itself errored. metal-parity is deliberately excluded
-  # (informational — see its comment above).
+  # (informational — see its comment above). q4-ppl-quality is excluded until
+  # its golden is armed (see that job's comment).
   parity-gate:
     name: parity-gate
     needs: [changes, parity, embed-drift, wasm-parity, q4-composed]
