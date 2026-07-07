@@ -5590,16 +5590,21 @@ kernel void gdn_chunk_norm_silu_c32(
     /// query heads in the group. `group_size` is validated to be in
     /// `1..=METAL_FLASH_MAX_GQA_GROUP` (8) by `validate_flash_decode_shape` before
     /// either pipeline-construction call site (`new`, `from_q4_dir`) reaches this
-    /// function, so the `> 6` arm below always resolves to `g8` in practice; it is
-    /// kept as an explicit fallback rather than an unreachable!() so this helper
-    /// stays correct if a caller is ever added that skips that validation.
-    fn prefill_maxgrp_suffix(group_size: usize) -> &'static str {
-        if group_size <= 4 {
-            "g4"
-        } else if group_size <= 6 {
-            "g6"
-        } else {
-            "g8"
+    /// function. This helper re-checks that invariant and returns `Err` for any
+    /// out-of-range input rather than rounding it: there is no variant with
+    /// `MAX_GRP > 8`, so a `group_size >= 9` could only be mapped to `g8`, whose
+    /// kernel guard would then silently write no attention. Failing closed here
+    /// keeps the "never select `MAX_GRP < group_size`" guarantee true even if a
+    /// future caller reaches this without validating first.
+    fn prefill_maxgrp_suffix(group_size: usize) -> Result<&'static str, String> {
+        match group_size {
+            1..=4 => Ok("g4"),
+            5..=6 => Ok("g6"),
+            7..=8 => Ok("g8"),
+            _ => Err(format!(
+                "prefill attention supports GQA group size 1..={METAL_FLASH_MAX_GQA_GROUP}; \
+                 got {group_size} (no kernel variant has MAX_GRP > {METAL_FLASH_MAX_GQA_GROUP})"
+            )),
         }
     }
 
@@ -6218,7 +6223,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // comment for the ship-safety rounding-up guarantee — validated
             // in-range by `validate_flash_decode_shape` above.
             let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads);
+                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
 
             // Compile shaders
             let opts = CompileOptions::new();
@@ -16164,7 +16169,7 @@ kernel void gdn_chunk_norm_silu_c32(
             // comment for the ship-safety rounding-up guarantee — validated
             // in-range by `validate_flash_decode_shape` above.
             let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads);
+                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
 
             // Cache-capacity validation, matching `new_session` so a
             // `from_q4_dir` call cannot construct a runtime whose KV cap
@@ -23536,23 +23541,35 @@ kernel void decode_attention_reference(
         /// would pass a naive "returns a valid suffix" check but fail this one.
         #[test]
         fn prefill_maxgrp_suffix_rounds_up_never_down() {
-            assert_eq!(prefill_maxgrp_suffix(1), "g4");
-            assert_eq!(prefill_maxgrp_suffix(2), "g4");
-            assert_eq!(prefill_maxgrp_suffix(4), "g4");
+            assert_eq!(prefill_maxgrp_suffix(1).unwrap(), "g4");
+            assert_eq!(prefill_maxgrp_suffix(2).unwrap(), "g4");
+            assert_eq!(prefill_maxgrp_suffix(4).unwrap(), "g4");
             assert_eq!(
-                prefill_maxgrp_suffix(5),
+                prefill_maxgrp_suffix(5).unwrap(),
                 "g6",
                 "group_size=5 must round UP to g6 (a g4 pipeline would silently \
                  drop 1 of every 5 query heads' attention output)"
             );
-            assert_eq!(prefill_maxgrp_suffix(6), "g6");
+            assert_eq!(prefill_maxgrp_suffix(6).unwrap(), "g6");
             assert_eq!(
-                prefill_maxgrp_suffix(7),
+                prefill_maxgrp_suffix(7).unwrap(),
                 "g8",
                 "group_size=7 must round UP to g8 (a g6 pipeline would silently \
                  drop 1 of every 7 query heads' attention output)"
             );
-            assert_eq!(prefill_maxgrp_suffix(8), "g8");
+            assert_eq!(prefill_maxgrp_suffix(8).unwrap(), "g8");
+            // Out-of-range fails CLOSED (Err), never silently maps to g8: there
+            // is no MAX_GRP > 8 variant, so a group_size >= 9 mapped to g8 would
+            // hit the kernel's silent no-attention guard. Rounding down/up-to-a-
+            // too-small variant is the exact corruption this guards.
+            assert!(
+                prefill_maxgrp_suffix(0).is_err(),
+                "group_size=0 must be an error, not a suffix"
+            );
+            assert!(
+                prefill_maxgrp_suffix(9).is_err(),
+                "group_size=9 must be an error, not silently rounded to g8"
+            );
         }
 
         /// Rung-0 occupancy change (group_size-specialized `MAX_GRP` prefill
