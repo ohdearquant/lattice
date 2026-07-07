@@ -75,7 +75,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -501,6 +501,27 @@ jobs:
             --features "f16,metal-gpu" \
             -- --nocapture
 
+  # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
+  # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
+  # unlike q4-ppl-quality, whose PPL golden bootstraps on the runner — this has
+  # no bootstrap and is wired into parity-gate.needs as a REQUIRED guard from day
+  # one. It locks the gate's fail-closed contract (RECORD-on-null, ENFORCE
+  # pass/fail, hard-fail on every provisioning/parse error, env-record cannot
+  # mask an armed golden, non-finite golden rejected) against future regressions.
+  ppl-gate-selftest:
+    name: ppl-gate selftest
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run ppl-gate control-flow self-test
+        run: bash scripts/ppl_gate_check_selftest.sh
+
   # Q4 perplexity regression gate (issue #616). Measures the UNROTATED Metal Q4
   # tier (the actually-shipping quantization) over a fixed WikiText-2 slice and
   # compares against a frozen golden PPL.
@@ -619,7 +640,7 @@ jobs:
   # its golden is armed (see that job's comment).
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift, wasm-parity, q4-composed]
+    needs: [changes, parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -631,7 +652,8 @@ jobs:
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           Q4_RESULT="${{ needs.q4-composed.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT"
+          PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -656,5 +678,9 @@ jobs:
             echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, and q4-composed all PASSED."
+          if [ "$PPL_SELFTEST_RESULT" != "success" ]; then
+            echo "::error::Engine changed and ppl-gate self-test did not succeed (result=$PPL_SELFTEST_RESULT)."
+            exit 1
+          fi
+          echo "Engine changed; parity, embed-drift, wasm-parity, q4-composed, and ppl-gate-selftest all PASSED."
           exit 0

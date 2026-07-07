@@ -28,12 +28,13 @@ so it catches regressions while the env-specific offset is baked into the golden
 
 Modes
 -----
-  RECORD  (LATTICE_PPL_GATE_RECORD=1, or golden `ppl` is null): measure and print
-          the PPL, DO NOT fail on value. Used to bootstrap the golden — the first
-          CI run on the runner prints the paravirtual PPL, a maintainer commits it
-          into golden.json, and the gate goes live. Loud banner marks this as an
-          UNARMED (fail-open) state.
-  ENFORCE (default when golden `ppl` is numeric): fail-closed if
+  RECORD  (entered iff golden `ppl` is null): measure and print the PPL, DO NOT
+          fail on value. Used to bootstrap the golden — the first CI run on the
+          runner prints the paravirtual PPL, a maintainer commits it into
+          golden.json, and the gate goes live. Loud banner marks this UNARMED
+          (fail-open) state. LATTICE_PPL_GATE_RECORD=1 is ignored once the golden
+          is numeric — an env flag can never suppress enforcement.
+  ENFORCE (whenever golden `ppl` is numeric): fail-closed if
           |measured - golden| > tolerance.
 
 Fail-closed contract: any provisioning/execution failure (binary missing, no PPL
@@ -42,6 +43,7 @@ a skip-as-green — a broken run must not masquerade as a passing gate.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -67,12 +69,20 @@ def main() -> None:
     if not eval_bin.exists():
         fail(f"eval_perplexity not built at {eval_bin}")
 
-    q4_dir = os.environ.get("LATTICE_PPL_Q4_DIR")
-    tok_dir = os.environ.get("LATTICE_PPL_TOKENIZER_DIR")
-    if not q4_dir or not Path(q4_dir).is_dir():
-        fail(f"LATTICE_PPL_Q4_DIR unset or not a directory: {q4_dir!r}")
-    if not tok_dir or not Path(tok_dir).is_dir():
-        fail(f"LATTICE_PPL_TOKENIZER_DIR unset or not a directory: {tok_dir!r}")
+    def resolve_dir(var: str) -> str:
+        # GitHub Actions `env:` values are NOT shell-expanded, so a `~` or
+        # `$HOME` reaches us literally. Expand both here so the caller can use
+        # either form; a still-unresolved path fails closed below.
+        raw = os.environ.get(var)
+        if not raw:
+            fail(f"{var} unset")
+        resolved = os.path.expanduser(os.path.expandvars(raw))
+        if not Path(resolved).is_dir():
+            fail(f"{var} is not a directory: {raw!r} (resolved: {resolved!r})")
+        return resolved
+
+    q4_dir = resolve_dir("LATTICE_PPL_Q4_DIR")
+    tok_dir = resolve_dir("LATTICE_PPL_TOKENIZER_DIR")
 
     corpus = REPO / spec["corpus"]
     if not corpus.exists():
@@ -115,9 +125,24 @@ def main() -> None:
         sys.stderr.write(proc.stdout)
         fail("no @@lattice perplexity event parsed from eval_perplexity output")
 
-    golden_ppl = spec.get("ppl")
+    # Validate golden numerics: a non-finite tolerance (e.g. "1e999" -> inf) or
+    # golden ppl would make enforcement a fail-open no-op. Reject, fail closed.
     tol = float(spec["tolerance"])
-    record = os.environ.get("LATTICE_PPL_GATE_RECORD") == "1" or golden_ppl is None
+    if not (math.isfinite(tol) and tol > 0):
+        fail(f"golden tolerance must be a finite positive number, got {spec['tolerance']!r}")
+    golden_ppl = spec.get("ppl")
+    if golden_ppl is not None:
+        golden_ppl = float(golden_ppl)
+        if not (math.isfinite(golden_ppl) and golden_ppl > 0):
+            fail(f"golden ppl must be null or a finite positive number, got {spec.get('ppl')!r}")
+
+    # RECORD mode (measure-only, no value enforcement) is entered ONLY when the
+    # golden is unarmed (ppl is null). A numeric golden ALWAYS enforces — an env
+    # flag cannot suppress enforcement, otherwise a regression could be forced to
+    # exit 0. The env flag only makes the *unarmed* state explicit locally.
+    record = golden_ppl is None
+    if os.environ.get("LATTICE_PPL_GATE_RECORD") == "1" and not record:
+        print("::warning::LATTICE_PPL_GATE_RECORD ignored: golden is armed (numeric); enforcing.")
 
     report = REPO / os.environ.get("PPL_GATE_REPORT", "ppl-gate-report.md")
     lines = [
