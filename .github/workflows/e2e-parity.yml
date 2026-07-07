@@ -537,18 +537,17 @@ jobs:
   # Why an absolute golden captured on THIS runner (paravirtual Metal): the Q4
   # forward path is numerically correct on the hosted runner (proven by q4-composed)
   # but absolute PPL differs from real Apple-GPU, so the golden must be captured
-  # here. Bootstrap: golden.json ships `ppl: null`, so the first run executes in
-  # RECORD mode (scripts/ppl_gate_check.py) — it PRINTS + PR-comments the measured
-  # paravirtual PPL and does NOT fail. A maintainer commits that value into
-  # crates/inference/tests/fixtures/ppl_gate_v1/golden.json, after which the gate
+  # here. The golden was captured via a null-sentinel RECORD bootstrap (run
+  # 28841919096) and is now ARMED (golden.json `ppl` = 16.589111). The gate
   # enforces fail-closed (|measured - golden| > tolerance). Corpus-slice size and
   # tolerance rationale are documented in golden.json.
   #
-  # Deliberately NOT in parity-gate.needs below yet: while the golden is null the
-  # gate is fail-OPEN (record mode), so wiring it into the required gate now would
-  # add a fail-open leg. Once the golden is armed, add `q4-ppl-quality` to
-  # parity-gate.needs AND to the repo's required status checks (same maintainer
-  # step as embed-drift / wasm-parity / q4-composed).
+  # ARMED + REQUIRED: this job is wired into parity-gate.needs (the required
+  # status check). To keep the required leg from being silently de-armed, the run
+  # step below sets LATTICE_PPL_GATE_REQUIRE_ARMED=1 — if a future change reverts
+  # `ppl` to null, the gate fails CLOSED here instead of re-entering the fail-open
+  # RECORD mode. Deliberate re-capture (per golden.json `_regenerate`) runs the
+  # binary/script WITHOUT that flag.
   q4-ppl-quality:
     name: q4 ppl regression gate
     needs: changes
@@ -620,6 +619,9 @@ jobs:
           LATTICE_PPL_Q4_DIR: ${{ runner.temp }}/qwen3.5-0.8b-q4
           LATTICE_PPL_TOKENIZER_DIR: ~/.lattice/models/qwen3.5-0.8b
           PPL_GATE_REPORT: ppl-gate-report.md
+          # Required gate: refuse to pass green if the golden is ever de-armed
+          # (ppl reverted to null). RECORD-mode re-capture runs without this flag.
+          LATTICE_PPL_GATE_REQUIRE_ARMED: "1"
         run: python3 scripts/ppl_gate_check.py
 
       - name: Ensure report exists

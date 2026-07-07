@@ -8,7 +8,8 @@
 #
 # Guards, in order: RECORD-on-null, ENFORCE pass, ENFORCE fail, and every
 # fail-closed path (binary error even in RECORD, missing corpus/dir, unparsed
-# output, env-record cannot mask an armed golden, non-finite golden/tolerance).
+# output, env-record cannot mask an armed golden, require-armed rejects a null
+# golden on the required leg, non-finite golden/tolerance).
 set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/scripts/ppl_gate_check.py"
@@ -63,6 +64,8 @@ golden 16.60;  stub 17.00 0; run;                          check "ENFORCE out of
 golden null;   stub 16.60 3; run;                          check "ERROR binary rc=3 in RECORD -> exit1"       1 $? "eval_perplexity exited 3"
 golden 16.60;  stub 16.61 0; run LATTICE_PPL_GATE_RECORD=1; check "env-record cannot mask armed golden (pass)" 0 $? "verdict: **PASS**"
 golden 16.60;  stub 17.00 0; run LATTICE_PPL_GATE_RECORD=1; check "env-record cannot mask armed regression"    1 $? "Q4 PPL regressed"
+golden null;   stub 16.60 0; run LATTICE_PPL_GATE_REQUIRE_ARMED=1; check "require-armed + null golden -> exit1" 1 $? "required gate and must be armed"
+golden 16.60;  stub 16.61 0; run LATTICE_PPL_GATE_REQUIRE_ARMED=1; check "require-armed + armed golden enforces" 0 $? "verdict: **PASS**"
 golden 16.60 1e999; stub 17.00 0; run;                     check "non-finite tolerance rejected -> exit1"     1 $? "finite positive"
 golden -1 0.05; stub 16.60 0; run;                         check "non-positive golden ppl rejected -> exit1"  1 $? "finite positive"
 

@@ -144,6 +144,19 @@ def main() -> None:
     if os.environ.get("LATTICE_PPL_GATE_RECORD") == "1" and not record:
         print("::warning::LATTICE_PPL_GATE_RECORD ignored: golden is armed (numeric); enforcing.")
 
+    # When this gate is wired as a REQUIRED status check, an unarmed golden must
+    # NOT pass green: reverting `ppl` to null would otherwise silently de-arm the
+    # gate while branch protection still sees a success. The required CI job sets
+    # LATTICE_PPL_GATE_REQUIRE_ARMED=1 so a null/missing golden fails closed here.
+    # RECORD mode stays available for the deliberate re-capture bootstrap (run
+    # without this flag), and the sandbox self-test still exercises the null path.
+    if record and os.environ.get("LATTICE_PPL_GATE_REQUIRE_ARMED") == "1":
+        fail(
+            "golden ppl is null/missing but LATTICE_PPL_GATE_REQUIRE_ARMED=1: this "
+            "is a required gate and must be armed. Commit a numeric `ppl` into the "
+            "golden fixture, or run without the flag to re-capture in RECORD mode."
+        )
+
     report = REPO / os.environ.get("PPL_GATE_REPORT", "ppl-gate-report.md")
     lines = [
         "## Q4 perplexity regression gate (#616)",
