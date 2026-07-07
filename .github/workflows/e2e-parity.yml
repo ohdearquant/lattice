@@ -605,11 +605,15 @@ jobs:
 
       # Regenerate the ephemeral unrotated Q4 artifact (NOT committed) from the
       # real weights. Deterministic: quantize_q4 has no random seed.
+      # quantize_q4 writes .q4/.f16/quantize_index.json but NOT config.json, and
+      # eval_perplexity's load_cfg_for_q4 reads config.json from the Q4 dir — so
+      # copy it in (the tokenizer is supplied separately via --tokenizer-dir).
       - name: Generate ephemeral Q4 artifact
         run: |
           target/release/quantize_q4 \
             --model-dir ~/.lattice/models/qwen3.5-0.8b \
             --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-q4"
+          cp ~/.lattice/models/qwen3.5-0.8b/config.json "$RUNNER_TEMP/qwen3.5-0.8b-q4/config.json"
 
       - name: Run Q4 PPL regression gate
         env:
