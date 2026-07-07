@@ -9544,7 +9544,8 @@ kernel void gdn_chunk_norm_silu_c32(
             );
             let max_prefill = self.session.max_prefill;
             if n <= max_prefill {
-                return self.forward_prefill_batched_chunk(token_ids, 0, all_positions);
+                // Only/last chunk — its logits are always the caller's answer.
+                return self.forward_prefill_batched_chunk(token_ids, 0, all_positions, true);
             }
             // Chunked batched prefill: each chunk is one command buffer (preserving the
             // n≤512 fast path within each chunk). GDN recurrent state threads across
@@ -9554,7 +9555,9 @@ kernel void gdn_chunk_norm_silu_c32(
                 let mut all_logits = Vec::with_capacity(n * vocab);
                 let mut start_pos = 0usize;
                 for chunk in token_ids.chunks(max_prefill) {
-                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, start_pos, true));
+                    // Perplexity needs every chunk's per-position logits.
+                    all_logits
+                        .extend(self.forward_prefill_batched_chunk(chunk, start_pos, true, true));
                     start_pos += chunk.len();
                 }
                 all_logits
@@ -9562,7 +9565,12 @@ kernel void gdn_chunk_norm_silu_c32(
                 let mut last_logits = Vec::new();
                 let mut start_pos = 0usize;
                 for chunk in token_ids.chunks(max_prefill) {
-                    last_logits = self.forward_prefill_batched_chunk(chunk, start_pos, false);
+                    // Only the LAST chunk's tail (RMSNorm+lm_head+MTP+top-k) is ever kept —
+                    // intermediate chunks still commit their layer work and advance
+                    // set_position, they just skip the terminal tail (Experiment B).
+                    let is_last = start_pos + chunk.len() == n;
+                    last_logits =
+                        self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last);
                     start_pos += chunk.len();
                 }
                 last_logits
@@ -9576,11 +9584,21 @@ kernel void gdn_chunk_norm_silu_c32(
         /// recurrent state in the session GPU buffers. Called by `forward_prefill_impl`
         /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
         /// buffer, all 24 layers, final logits).
+        ///
+        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, MTP-capture/readback,
+        /// and top-k tail, which is purely terminal (it does not feed the residual
+        /// stream, KV cache, or GDN recurrent state — those are fully advanced by the
+        /// per-layer loop above it). When `false`, the layer command buffer for this
+        /// chunk still commits and `set_position` still advances; only the wasted tail
+        /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
+        /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
+        /// always discarded — pass `false`; every other caller passes `true`.
         fn forward_prefill_batched_chunk(
             &mut self,
             token_ids: &[u32],
             start_pos: usize,
             all_positions: bool,
+            emit_logits: bool,
         ) -> Vec<f32> {
             let n = token_ids.len();
             debug_assert!(
@@ -10241,6 +10259,21 @@ kernel void gdn_chunk_norm_silu_c32(
 
                     full_idx += 1;
                 }
+            }
+
+            if !emit_logits {
+                // Intermediate chunk of a chunked, `!all_positions` prefill: the caller
+                // only ever keeps the LAST chunk's logits, so the terminal tail below
+                // (MTP capture, RMSNorm, lm_head, top-k, and their GPU readback) is pure
+                // waste here — it does not feed the residual stream, KV cache, or GDN
+                // recurrent state, which the per-layer loop above has already fully
+                // advanced. Still commit this chunk's layer command buffer and advance
+                // the session cursor exactly as the emit_logits==true path does below.
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                self.session.set_position(start_pos + n);
+                return vec![];
             }
 
             // ---------- Final: RMSNorm + lm_head ----------
@@ -17511,21 +17544,32 @@ kernel void gdn_chunk_norm_silu_c32(
             }
             let max_prefill = self.session.max_prefill;
             if token_ids.len() <= max_prefill {
-                return Ok(self.forward_prefill_batched_chunk(token_ids, start_pos, all_positions));
+                // Only/last chunk — its logits are always the caller's answer.
+                return Ok(self.forward_prefill_batched_chunk(
+                    token_ids,
+                    start_pos,
+                    all_positions,
+                    true,
+                ));
             }
             if all_positions {
                 let mut all_logits = Vec::with_capacity(token_ids.len() * vocab);
                 let mut pos = start_pos;
                 for chunk in token_ids.chunks(max_prefill) {
-                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, pos, true));
+                    // Perplexity needs every chunk's per-position logits.
+                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, pos, true, true));
                     pos += chunk.len();
                 }
                 Ok(all_logits)
             } else {
+                let total = token_ids.len();
                 let mut last_logits = Vec::new();
                 let mut pos = start_pos;
                 for chunk in token_ids.chunks(max_prefill) {
-                    last_logits = self.forward_prefill_batched_chunk(chunk, pos, false);
+                    // Only the LAST chunk's tail is ever kept — see
+                    // forward_prefill_batched_chunk's doc comment (Experiment B).
+                    let is_last = pos + chunk.len() == start_pos + total;
+                    last_logits = self.forward_prefill_batched_chunk(chunk, pos, false, is_last);
                     pos += chunk.len();
                 }
                 Ok(last_logits)
@@ -26077,6 +26121,101 @@ kernel void decode_attention_reference(
                 argmax_f32(&prefill_logits),
                 "argmax mismatch on length-1 final chunk"
             );
+            assert_eq!(state.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(state.session.position, tokens.len());
+        }
+
+        /// Experiment B regression gate: `forward_prefill_batched_chunk` now gates its
+        /// terminal RMSNorm+lm_head+MTP+top-k tail behind `emit_logits`, skipping it on
+        /// intermediate chunks of a chunked, last-token-only (`!all_positions`) prefill —
+        /// only the LAST chunk emits it. This asserts the skip is correctness-preserving:
+        /// `forward_prefill` on a prompt spanning multiple chunks must still return
+        /// `vocab_size` logits, whose argmax agrees with the final-position row of a
+        /// `forward_prefill_all_logits` run (which emits every chunk's tail and so is
+        /// unaffected by the emit_logits gate), and the session cursor must still have
+        /// advanced through every chunk — including the ones whose tail was skipped.
+        /// Mutation-sensitive: if `is_last` in `forward_prefill_impl`'s `!all_positions`
+        /// loop is computed wrong (e.g. always `false`), `forward_prefill` returns an
+        /// empty `Vec` and the length assertion below fails; if `set_position` were
+        /// dropped from the `!emit_logits` branch, the position assertion fails.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn metal_qwen35_chunked_prefill_emit_logits_skip_correctness() {
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists()
+                || !model_dir.join("config.json").exists()
+                || !model_dir.join("tokenizer.json").exists()
+            {
+                eprintln!(
+                    "skipping emit_logits skip-correctness test: model files missing at {}",
+                    model_dir.display()
+                );
+                return;
+            }
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            let Some(device) = Device::system_default() else {
+                eprintln!("skipping emit_logits skip-correctness test: no Metal device");
+                return;
+            };
+            let _ = device;
+            let _gpu = gpu_test_lock();
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal qwen3.5-0.8b state");
+            let vocab = model.config().vocab_size;
+
+            let tokens = long_real_text_tokens(model.tokenizer());
+            assert!(
+                tokens.len() > state.session.max_prefill,
+                "prompt ({} tokens) must exceed max_prefill ({}) to exercise the \
+                 chunked, emit_logits-gated path",
+                tokens.len(),
+                state.session.max_prefill
+            );
+
+            // Reference: all_positions=true emits the tail on EVERY chunk (unaffected by
+            // the emit_logits gate) — its final-position row is what an unskipped last
+            // chunk would have produced.
+            state.reset_state();
+            let all_logits = state.forward_prefill_all_logits(&tokens);
+            assert_eq!(
+                all_logits.len(),
+                tokens.len() * vocab,
+                "all-position reference length mismatch"
+            );
+            let ref_last = &all_logits[(tokens.len() - 1) * vocab..tokens.len() * vocab];
+
+            // Under test: the `!all_positions` chunked path, where every non-last chunk
+            // now runs with emit_logits=false.
+            state.reset_state();
+            let last_logits = state.forward_prefill(&tokens);
+
+            assert_eq!(
+                last_logits.len(),
+                vocab,
+                "chunked !all_positions prefill must still return a full vocab_size logit \
+                 vector — an empty result means the tail was (wrongly) skipped on the LAST \
+                 chunk too"
+            );
+            eprintln!(
+                "emit_logits skip-correctness: argmax_ref={}, argmax_chunked={}, tokens={}",
+                argmax_f32(ref_last),
+                argmax_f32(&last_logits),
+                tokens.len()
+            );
+            assert_eq!(
+                argmax_f32(&last_logits),
+                argmax_f32(ref_last),
+                "argmax mismatch between chunked (tail-skipping) prefill and the \
+                 all-positions reference's final-position row"
+            );
+
+            // The session cursor must have advanced through every chunk, including the
+            // intermediate ones whose terminal tail was skipped.
             assert_eq!(state.session.kv_cache.seq_len, tokens.len());
             assert_eq!(state.session.position, tokens.len());
         }
