@@ -4,6 +4,10 @@ pub mod bitnet_kernel;
 pub mod cpu;
 pub mod cpu_f16;
 pub mod cpu_q8;
+// Host-side f32 chunkwise GDN parity oracle (issue #175). Test/bench-only —
+// adds zero production surface to the default build.
+#[cfg(any(test, feature = "bench-internals"))]
+pub mod gdn_chunk_ref;
 pub mod gpu;
 pub mod gpu_gemm;
 pub mod metal;

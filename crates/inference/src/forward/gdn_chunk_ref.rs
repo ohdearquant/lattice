@@ -1,0 +1,489 @@
+//! Host-side f32 reference oracle for the chunkwise WY/DPLR Gated-DeltaNet
+//! (GDN) prefill recurrence.
+//!
+//! This is a line-by-line transcription of a validated NumPy reference
+//! (`sequential_gdn` / `chunkwise_gdn`, see
+//! `tests/fixtures/gdn_chunk/generate.py`) that already asserts chunkwise ==
+//! sequential to <= 1e-5. It exists purely as a parity oracle: the B=64 and
+//! B=128 Metal chunked-prefill kernels are validated against it (and,
+//! transitively, against the committed NumPy-generated fixtures), never a
+//! production path itself.
+//!
+//! Matrices are flat row-major `Vec<f32>` / `&[f32]` with explicit
+//! `(rows, cols)` passed alongside — no `ndarray`/`nalgebra` dependency.
+//!
+//! Lattice's GDN state `H` is value-major, `[d_v, d_k]` (Lattice's
+//! `H = S^T` relative to the more common key-major convention). Every
+//! function below keeps that layout end to end; nothing here transposes to
+//! key-major.
+//!
+//! Two DISTINCT `tril` semantics appear in `chunkwise_gdn` and must not be
+//! conflated: `a_plain` / `a_gamma` use strictly-lower (`k=-1`, diagonal
+//! excluded — the unit diagonal comes from the `I +` in the NumPy
+//! reference), while `lqk` uses lower-INCLUDING-diagonal (`k=0`).
+
+#[inline]
+fn idx(row: usize, col: usize, cols: usize) -> usize {
+    row * cols + col
+}
+
+/// Row L2 normalization: `x / sqrt(sum(x^2, axis=1) + eps)`.
+///
+/// `x` is `rows x cols` row-major. Returns a new `rows x cols` buffer.
+pub fn l2_normalize_rows(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+        let denom = (sum_sq + eps).sqrt();
+        for c in 0..cols {
+            out[idx(r, c, cols)] = row[c] / denom;
+        }
+    }
+    out
+}
+
+/// Forward substitution for a unit-lower-triangular system `A X = B`.
+///
+/// `a` is `c x c` row-major; only its strictly-lower entries (`j < i`) are
+/// read — the diagonal is implicitly 1 and is never referenced. `b` is
+/// `c x d` row-major. Returns `x`, `c x d` row-major.
+pub fn solve_unit_lower(a: &[f32], b: &[f32], c: usize, d: usize) -> Vec<f32> {
+    let mut x = b.to_vec();
+    for i in 1..c {
+        for col in 0..d {
+            let mut acc = 0.0f32;
+            for (j, xj) in x.chunks_exact(d).enumerate().take(i) {
+                acc += a[idx(i, j, c)] * xj[col];
+            }
+            x[idx(i, col, d)] -= acc;
+        }
+    }
+    x
+}
+
+/// Sequential gated-delta recurrence in Lattice's value-major `H = S^T`
+/// layout.
+///
+/// Shapes: `q`, `k` are `[t, dk]`; `v` is `[t, dv]`; `beta`, `alpha` are
+/// `[t]`; `h0` is `[dv, dk]` (value-major state).
+///
+/// Recurrence, per token `i`:
+/// ```text
+/// h_decayed = alpha[i] * h                 // [dv, dk]
+/// kv        = h_decayed @ k[i]             // [dv]
+/// r         = beta[i] * (v[i] - kv)        // [dv]
+/// h         = h_decayed + outer(r, k[i])   // [dv, dk]
+/// out[i]    = (h @ q[i]) * scale           // [dv]
+/// ```
+///
+/// Returns `(out [t, dv], h [dv, dk])`.
+#[allow(clippy::too_many_arguments)]
+pub fn sequential_gdn(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    h0: &[f32],
+    t: usize,
+    dk: usize,
+    dv: usize,
+    apply_scale: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let scale = if apply_scale {
+        1.0 / (dk as f32).sqrt()
+    } else {
+        1.0
+    };
+    let mut h = h0.to_vec(); // [dv, dk]
+    let mut out = vec![0.0f32; t * dv];
+
+    for i in 0..t {
+        let qi = &q[i * dk..(i + 1) * dk];
+        let ki = &k[i * dk..(i + 1) * dk];
+        let vi = &v[i * dv..(i + 1) * dv];
+        let a = alpha[i];
+        let b = beta[i];
+
+        // h_decayed = alpha[i] * h
+        let mut h_decayed = vec![0.0f32; dv * dk];
+        for (hd, hv) in h_decayed.iter_mut().zip(h.iter()) {
+            *hd = a * hv;
+        }
+
+        // kv = h_decayed @ k[i]  -> [dv]
+        let mut kv = vec![0.0f32; dv];
+        for row in 0..dv {
+            let hrow = &h_decayed[row * dk..(row + 1) * dk];
+            kv[row] = hrow.iter().zip(ki).map(|(hv, kv_)| hv * kv_).sum();
+        }
+
+        // r = beta[i] * (v[i] - kv)
+        let mut r = vec![0.0f32; dv];
+        for row in 0..dv {
+            r[row] = b * (vi[row] - kv[row]);
+        }
+
+        // h = h_decayed + outer(r, k[i])
+        for row in 0..dv {
+            for col in 0..dk {
+                h_decayed[idx(row, col, dk)] += r[row] * ki[col];
+            }
+        }
+        h = h_decayed;
+
+        // out[i] = (h @ q[i]) * scale
+        let out_row = &mut out[i * dv..(i + 1) * dv];
+        for (row, out_val) in out_row.iter_mut().enumerate() {
+            let hrow = &h[row * dk..(row + 1) * dk];
+            let dot: f32 = hrow.iter().zip(qi).map(|(hv, qv)| hv * qv).sum();
+            *out_val = dot * scale;
+        }
+    }
+
+    (out, h)
+}
+
+/// Exact chunkwise WY/DPLR formulation of the same recurrence, processing
+/// `chunk_size` tokens at a time. See module docs for the value-major `H`
+/// convention and the two distinct `tril` semantics.
+///
+/// For one chunk of `c` tokens (`gamma_j = prod_{r<=j} alpha_r`):
+/// ```text
+/// g       = k_c @ k_c^T                                    // [c, c]
+/// a_plain = I + tril(diag(beta_c) * g, k=-1)                // strictly lower
+/// w       = solve_unit_lower(a_plain, diag(beta_c) @ k_c)   // [c, dk]
+/// a_gamma = I + tril(diag(beta_c)*g * (gamma[:,None]*gamma_inv[None,:]), k=-1)
+/// u       = solve_unit_lower(a_gamma, diag(beta_c) @ v_c)   // [c, dv]
+/// r       = u - gamma[:,None] * (w @ h^T)                   // [c, dv]
+/// lqk     = tril(gamma[:,None] * (q_c @ k_c^T) * gamma_inv[None,:], k=0)  // includes diag
+/// out_c   = (gamma[:,None] * (q_c @ h^T) + lqk @ r) * scale
+/// h       = gamma_end * h + r^T @ ((gamma_end * gamma_inv)[:,None] * k_c)
+/// ```
+///
+/// Returns `(out [t_total, dv], h [dv, dk])`.
+#[allow(clippy::too_many_arguments)]
+pub fn chunkwise_gdn(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: &[f32],
+    alpha: &[f32],
+    h0: &[f32],
+    t_total: usize,
+    dk: usize,
+    dv: usize,
+    chunk_size: usize,
+    apply_scale: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(chunk_size > 0, "chunk_size must be positive");
+    let scale = if apply_scale {
+        1.0 / (dk as f32).sqrt()
+    } else {
+        1.0
+    };
+    let mut h = h0.to_vec(); // [dv, dk]
+    let mut out = vec![0.0f32; t_total * dv];
+
+    let mut start = 0usize;
+    while start < t_total {
+        let end = (start + chunk_size).min(t_total);
+        let c = end - start;
+
+        let q_c = &q[start * dk..end * dk];
+        let k_c = &k[start * dk..end * dk];
+        let v_c = &v[start * dv..end * dv];
+        let b_c = &beta[start..end];
+        let a_c = &alpha[start..end];
+
+        // gamma = cumprod(alpha_c)
+        let mut gamma = vec![0.0f32; c];
+        let mut running = 1.0f32;
+        for (i, gi) in gamma.iter_mut().enumerate() {
+            running *= a_c[i];
+            *gi = running;
+        }
+        let gamma_inv: Vec<f32> = gamma.iter().map(|g| 1.0 / g).collect();
+        let gamma_end = gamma[c - 1];
+
+        // g = k_c @ k_c^T  -> [c, c]
+        let mut g = vec![0.0f32; c * c];
+        for i in 0..c {
+            let ki = &k_c[i * dk..(i + 1) * dk];
+            for j in 0..c {
+                let kj = &k_c[j * dk..(j + 1) * dk];
+                g[idx(i, j, c)] = ki.iter().zip(kj).map(|(a, b)| a * b).sum();
+            }
+        }
+
+        // a_plain = I + tril(diag(beta_c) * g, k=-1)  (STRICTLY lower; diag
+        // is implicit-1 from the `I +`, never written explicitly here since
+        // solve_unit_lower never reads the diagonal — but we still set it
+        // to 1.0 to keep `a_plain` a faithful, inspectable transcription).
+        let mut a_plain = vec![0.0f32; c * c];
+        for i in 0..c {
+            a_plain[idx(i, i, c)] = 1.0;
+            for j in 0..i {
+                a_plain[idx(i, j, c)] = b_c[i] * g[idx(i, j, c)];
+            }
+        }
+
+        // rhs_k = beta_c[:,None] * k_c ; rhs_v = beta_c[:,None] * v_c
+        let mut rhs_k = vec![0.0f32; c * dk];
+        for i in 0..c {
+            for col in 0..dk {
+                rhs_k[idx(i, col, dk)] = b_c[i] * k_c[idx(i, col, dk)];
+            }
+        }
+        let mut rhs_v = vec![0.0f32; c * dv];
+        for i in 0..c {
+            for col in 0..dv {
+                rhs_v[idx(i, col, dv)] = b_c[i] * v_c[idx(i, col, dv)];
+            }
+        }
+
+        let w = solve_unit_lower(&a_plain, &rhs_k, c, dk); // [c, dk]
+
+        // a_gamma = I + tril((diag(beta_c)*g) * (gamma[:,None]*gamma_inv[None,:]), k=-1)
+        // (STRICTLY lower, same as a_plain — NOT the k=0 semantics used by lqk below.)
+        let mut a_gamma = vec![0.0f32; c * c];
+        for i in 0..c {
+            a_gamma[idx(i, i, c)] = 1.0;
+            for j in 0..i {
+                a_gamma[idx(i, j, c)] = b_c[i] * g[idx(i, j, c)] * gamma[i] * gamma_inv[j];
+            }
+        }
+        let u = solve_unit_lower(&a_gamma, &rhs_v, c, dv); // [c, dv]
+
+        // w_h0 = w @ h^T  -> [c, dv]  (h is [dv, dk])
+        let mut w_h0 = vec![0.0f32; c * dv];
+        for i in 0..c {
+            let wi = &w[i * dk..(i + 1) * dk];
+            for row in 0..dv {
+                let hrow = &h[row * dk..(row + 1) * dk];
+                w_h0[idx(i, row, dv)] = wi.iter().zip(hrow).map(|(a, b)| a * b).sum();
+            }
+        }
+
+        // r = u - gamma[:,None] * w_h0
+        let mut r = vec![0.0f32; c * dv];
+        for i in 0..c {
+            for col in 0..dv {
+                r[idx(i, col, dv)] = u[idx(i, col, dv)] - gamma[i] * w_h0[idx(i, col, dv)];
+            }
+        }
+
+        // q_h0 = q_c @ h^T  -> [c, dv]
+        let mut q_h0 = vec![0.0f32; c * dv];
+        for i in 0..c {
+            let qi = &q_c[i * dk..(i + 1) * dk];
+            for row in 0..dv {
+                let hrow = &h[row * dk..(row + 1) * dk];
+                q_h0[idx(i, row, dv)] = qi.iter().zip(hrow).map(|(a, b)| a * b).sum();
+            }
+        }
+
+        // qk = q_c @ k_c^T  -> [c, c]
+        let mut qk = vec![0.0f32; c * c];
+        for i in 0..c {
+            let qi = &q_c[i * dk..(i + 1) * dk];
+            for j in 0..c {
+                let kj = &k_c[j * dk..(j + 1) * dk];
+                qk[idx(i, j, c)] = qi.iter().zip(kj).map(|(a, b)| a * b).sum();
+            }
+        }
+
+        // lqk = tril(gamma[:,None] * qk * gamma_inv[None,:], k=0)
+        // NOTE: k=0 — this INCLUDES the diagonal, unlike a_plain/a_gamma above.
+        let mut lqk = vec![0.0f32; c * c];
+        for i in 0..c {
+            for j in 0..=i {
+                lqk[idx(i, j, c)] = gamma[i] * qk[idx(i, j, c)] * gamma_inv[j];
+            }
+        }
+
+        // out[start:end] = (gamma[:,None]*q_h0 + lqk @ r) * scale
+        for i in 0..c {
+            let mut lqk_r_row = vec![0.0f32; dv];
+            for j in 0..=i {
+                let lij = lqk[idx(i, j, c)];
+                for col in 0..dv {
+                    lqk_r_row[col] += lij * r[idx(j, col, dv)];
+                }
+            }
+            for col in 0..dv {
+                let val = gamma[i] * q_h0[idx(i, col, dv)] + lqk_r_row[col];
+                out[(start + i) * dv + col] = val * scale;
+            }
+        }
+
+        // k_right = (gamma_end * gamma_inv)[:,None] * k_c
+        let mut k_right = vec![0.0f32; c * dk];
+        for i in 0..c {
+            let scale_i = gamma_end * gamma_inv[i];
+            for col in 0..dk {
+                k_right[idx(i, col, dk)] = scale_i * k_c[idx(i, col, dk)];
+            }
+        }
+
+        // h = gamma_end * h + r^T @ k_right  -> [dv, dk]
+        let mut h_next = vec![0.0f32; dv * dk];
+        for (hn, hv) in h_next.iter_mut().zip(h.iter()) {
+            *hn = gamma_end * hv;
+        }
+        for i in 0..c {
+            for row in 0..dv {
+                let rv = r[idx(i, row, dv)];
+                for col in 0..dk {
+                    h_next[idx(row, col, dk)] += rv * k_right[idx(i, col, dk)];
+                }
+            }
+        }
+        h = h_next;
+
+        start = end;
+    }
+
+    (out, h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::path::PathBuf;
+
+    /// Fixture format written by `tests/fixtures/gdn_chunk/generate.py`.
+    #[derive(Deserialize)]
+    struct Fixture {
+        length: usize,
+        dk: usize,
+        dv: usize,
+        chunk_size: usize,
+        q: Vec<Vec<f32>>,
+        k: Vec<Vec<f32>>,
+        v: Vec<Vec<f32>>,
+        beta: Vec<f32>,
+        alpha: Vec<f32>,
+        h0: Vec<Vec<f32>>,
+        out_seq: Vec<Vec<f32>>,
+        h_seq: Vec<Vec<f32>>,
+        out_chk: Vec<Vec<f32>>,
+        h_chk: Vec<Vec<f32>>,
+    }
+
+    fn flatten(rows: &[Vec<f32>]) -> Vec<f32> {
+        rows.iter().flat_map(|r| r.iter().copied()).collect()
+    }
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("gdn_chunk")
+    }
+
+    fn load_fixture(name: &str) -> Fixture {
+        let path = fixtures_dir().join(name);
+        let data = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        serde_json::from_str(&data)
+            .unwrap_or_else(|e| panic!("bad JSON in {}: {e}", path.display()))
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "length mismatch in max_abs_diff");
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    const TOL: f32 = 1.0e-5;
+
+    fn run_case(fixture_name: &str) {
+        let fx = load_fixture(fixture_name);
+        let q = flatten(&fx.q);
+        let k = flatten(&fx.k);
+        let v = flatten(&fx.v);
+        let h0 = flatten(&fx.h0);
+        let expected_out_seq = flatten(&fx.out_seq);
+        let expected_h_seq = flatten(&fx.h_seq);
+        let expected_out_chk = flatten(&fx.out_chk);
+        let expected_h_chk = flatten(&fx.h_chk);
+
+        let (rust_out_seq, rust_h_seq) = sequential_gdn(
+            &q, &k, &v, &fx.beta, &fx.alpha, &h0, fx.length, fx.dk, fx.dv, true,
+        );
+        let (rust_out_chk, rust_h_chk) = chunkwise_gdn(
+            &q,
+            &k,
+            &v,
+            &fx.beta,
+            &fx.alpha,
+            &h0,
+            fx.length,
+            fx.dk,
+            fx.dv,
+            fx.chunk_size,
+            true,
+        );
+
+        let d_seq_out = max_abs_diff(&rust_out_seq, &expected_out_seq);
+        let d_seq_h = max_abs_diff(&rust_h_seq, &expected_h_seq);
+        let d_chk_out = max_abs_diff(&rust_out_chk, &expected_out_chk);
+        let d_chk_h = max_abs_diff(&rust_h_chk, &expected_h_chk);
+        let d_internal_out = max_abs_diff(&rust_out_chk, &rust_out_seq);
+        let d_internal_h = max_abs_diff(&rust_h_chk, &rust_h_seq);
+
+        println!(
+            "gdn_chunk_ref fixture={fixture_name} \
+             rust_seq_vs_numpy_seq(out={d_seq_out:.3e}, h={d_seq_h:.3e}) \
+             rust_chk_vs_numpy_chk(out={d_chk_out:.3e}, h={d_chk_h:.3e}) \
+             rust_chk_vs_rust_seq(out={d_internal_out:.3e}, h={d_internal_h:.3e})"
+        );
+
+        assert!(
+            d_seq_out <= TOL,
+            "{fixture_name}: rust sequential_gdn out diverged from NumPy: max_abs={d_seq_out}"
+        );
+        assert!(
+            d_seq_h <= TOL,
+            "{fixture_name}: rust sequential_gdn h diverged from NumPy: max_abs={d_seq_h}"
+        );
+        assert!(
+            d_chk_out <= TOL,
+            "{fixture_name}: rust chunkwise_gdn out diverged from NumPy: max_abs={d_chk_out}"
+        );
+        assert!(
+            d_chk_h <= TOL,
+            "{fixture_name}: rust chunkwise_gdn h diverged from NumPy: max_abs={d_chk_h}"
+        );
+        assert!(
+            d_internal_out <= TOL,
+            "{fixture_name}: rust chunkwise_gdn out diverged from rust sequential_gdn (the \
+             equivalence gate the Metal kernels rely on): max_abs={d_internal_out}"
+        );
+        assert!(
+            d_internal_h <= TOL,
+            "{fixture_name}: rust chunkwise_gdn h diverged from rust sequential_gdn (the \
+             equivalence gate the Metal kernels rely on): max_abs={d_internal_h}"
+        );
+    }
+
+    #[test]
+    fn gdn_chunk_ref_parity_seed7_chunk64() {
+        run_case("case_seed7_len191_chunk64.json");
+    }
+
+    #[test]
+    fn gdn_chunk_ref_parity_seed11_chunk128() {
+        run_case("case_seed11_len384_chunk128.json");
+    }
+
+    #[test]
+    fn gdn_chunk_ref_parity_seed23_uneven_tail() {
+        run_case("case_seed23_len130_chunk64.json");
+    }
+}
