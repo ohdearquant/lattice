@@ -158,10 +158,19 @@ pub fn normalize_log_weights(log_weights: &mut [f32]) -> f32 {
 /// Maximum absolute difference between two same-length slices.
 ///
 /// **Unstable**: barycenter convergence helper; may be inlined.
+///
+/// Fails closed on a non-finite difference: a NaN or Inf `delta` compares
+/// `false` against every running max under plain `>`, so a naive
+/// accumulate-the-max loop silently reports the non-finite input as `0.0`.
+/// This returns the first non-finite `delta` immediately instead, so a
+/// catastrophically wrong input can never read back as a clean small value.
 pub fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut max_delta = 0.0;
     for (&left, &right) in lhs.iter().zip(rhs.iter()) {
         let delta = abs(left - right);
+        if !delta.is_finite() {
+            return delta;
+        }
         if delta > max_delta {
             max_delta = delta;
         }
@@ -257,4 +266,34 @@ pub fn kl_term(x: f32, y: f32, floor: f32) -> f32 {
     let x_clamped = x.max(floor);
     let y_clamped = y.max(floor);
     x_clamped * (safe_ln(x_clamped, floor) - safe_ln(y_clamped, floor)) - x_clamped + y_clamped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mutation-sensitivity proof: a plain accumulate-the-max loop with no
+    /// finiteness check silently reports `0.0` for a NaN or Inf difference, so
+    /// a catastrophically wrong input would read as a clean small value and
+    /// pass a tolerance gate. This asserts the fixed helper surfaces the
+    /// non-finite value instead; if this ever fails, the gate is decoration
+    /// again.
+    #[test]
+    fn max_abs_diff_is_nan_and_inf_honest() {
+        let clean = [1.0f32, 2.0, 3.0];
+
+        let nan_side = [1.0f32, f32::NAN, 3.0];
+        let d = max_abs_diff(&clean, &nan_side);
+        assert!(
+            !d.is_finite(),
+            "max_abs_diff silently dropped a NaN operand (got {d}); the gate is blind"
+        );
+
+        let inf_side = [1.0f32, f32::INFINITY, 3.0];
+        let di = max_abs_diff(&clean, &inf_side);
+        assert!(
+            !di.is_finite(),
+            "max_abs_diff silently dropped an Inf operand (got {di}); the gate is blind"
+        );
+    }
 }
