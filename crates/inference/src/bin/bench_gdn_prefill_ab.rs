@@ -181,13 +181,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[bench] mode=interleaved (per-prefill arm toggling)");
     }
 
-    // --- SCOPE GUARD: 0.8B path only. ---
+    // --- SCOPE GUARD: 0.8B path only (name check is advisory; the hard check is
+    // the config-shape assert after Metal init below). ---
     if !model_dir_str.contains("0.8b") && !model_dir_str.contains("0_8b") {
         eprintln!(
             "[bench] WARNING: LATTICE_MODEL_DIR={model_dir_str} does not look like the 0.8B \
-             checkpoint. This harness is 0.8B-ONLY per its scope guard (the 27B path is \
-             founder-gated) — refusing to proceed unless the shape check below also happens \
-             to match 0.8B's GDN dims."
+             checkpoint. This harness only measures configs supporting the chunked GDN \
+             prefill path; the shape check below hard-fails otherwise."
         );
     }
 
@@ -204,6 +204,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = BpeTokenizer::from_tokenizer_json(
         &std::path::Path::new(&tokenizer_dir_str).join("tokenizer.json"),
     )?;
+
+    // HARD scope check: the chunked arm must actually be the chunked path. Without
+    // this, an unsupported config would fall back to the serial recurrence while the
+    // harness labels the arm "chunked" — the isolated forward also asserts this, but
+    // failing here is earlier and names the cause.
+    if !bench_support::gdn_chunked_prefill_supported(&state) {
+        return Err(format!(
+            "model at {model_dir_str} does not support the chunked GDN prefill path — \
+             this harness would mislabel a serial measurement as 'chunked'; refusing to run"
+        )
+        .into());
+    }
 
     let mp = bench_support::max_prefill(&state);
     eprintln!("[bench] max_prefill (session chunk cap) = {mp}");
@@ -253,6 +265,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         ids
     };
+    // Validate every token id against the model vocab BEFORE any forward call: the
+    // bench-support entry points bypass the public path's token-id validation, and
+    // the embedding copy is an unsafe read indexed by token id. A mismatched
+    // LATTICE_TOKENIZER_DIR must fail loudly here, not corrupt the first warmup.
+    // (`tokens_for`'s padding id 1 is trivially in-vocab.)
+    let vocab = bench_support::vocab_size(&state);
+    if let Some((i, id)) = bench_support::first_out_of_vocab(&base_tokens, vocab) {
+        return Err(format!(
+            "token id {id} at base_tokens[{i}] is >= vocab_size {vocab} — tokenizer/model \
+             mismatch (check LATTICE_TOKENIZER_DIR vs LATTICE_MODEL_DIR)"
+        )
+        .into());
+    }
     let tokens_for = |n: usize| -> Vec<u32> {
         if n <= base_tokens.len() {
             base_tokens[..n].to_vec()
@@ -670,15 +695,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let non_gdn_flag = non_gdn_diff_pct > 15.0;
 
         // Self-validation check 2: cross-check (serial_total - chunked_total) ≈
-        // (serial_GDN - chunked_GDN).
+        // (serial_GDN - chunked_GDN). A near-zero GDN delta does NOT make the check
+        // pass: if the isolated measurement breaks in a way that zeroes both arms'
+        // GDN time while the totals still differ, that is exactly a broken
+        // instrument, so the undefined-ratio case flags unless the total delta is
+        // also negligible (1ms absolute). Non-finite inputs always flag.
         let total_diff = serial.total.median - chunked.total.median;
         let gdn_diff = serial.gdn.median - chunked.gdn.median;
-        let cross_check_diff_pct = if gdn_diff.abs() > 1e-9 {
-            (total_diff - gdn_diff).abs() / gdn_diff.abs() * 100.0
-        } else {
+        let cross_check_undefined = gdn_diff.abs() <= 1e-9;
+        let cross_check_diff_pct = if cross_check_undefined {
             0.0
+        } else {
+            (total_diff - gdn_diff).abs() / gdn_diff.abs() * 100.0
         };
-        let cross_check_flag = cross_check_diff_pct > 20.0;
+        let cross_check_flag = if !total_diff.is_finite() || !gdn_diff.is_finite() {
+            true
+        } else if cross_check_undefined {
+            total_diff.abs() > 1.0
+        } else {
+            cross_check_diff_pct > 20.0
+        };
 
         // Self-validation check 3: isolated-ratio sanity bound. This is NOT a
         // calibration against any historical prior — no isolated-recurrence-only
@@ -760,11 +796,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
         if cross_check_flag {
-            length_flags.push(format!(
-                "FLAG[cross_check]: (serial_total-chunked_total)={total_diff:.2}ms vs \
-                 (serial_GDN-chunked_GDN)={gdn_diff:.2}ms differ by {cross_check_diff_pct:.1}% \
-                 at len={length}."
-            ));
+            if cross_check_undefined {
+                length_flags.push(format!(
+                    "FLAG[cross_check]: undefined cross-check ratio at len={length} — \
+                     (serial_GDN-chunked_GDN)={gdn_diff:.4}ms is ~zero (or non-finite) while \
+                     (serial_total-chunked_total)={total_diff:.2}ms is not: the isolated GDN \
+                     measurement is not accounting for the arms' total-time difference."
+                ));
+            } else {
+                length_flags.push(format!(
+                    "FLAG[cross_check]: (serial_total-chunked_total)={total_diff:.2}ms vs \
+                     (serial_GDN-chunked_GDN)={gdn_diff:.2}ms differ by \
+                     {cross_check_diff_pct:.1}% at len={length}."
+                ));
+            }
         }
         if anchor_flag {
             length_flags.push(format!(

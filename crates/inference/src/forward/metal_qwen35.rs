@@ -7065,6 +7065,16 @@ mod inner {
 
             let chunked_requested = self.use_gdn_chunked;
             let chunked_supported = Self::supports_gdn_chunked_prefill(&cfg);
+            // Bench-internals path: fail LOUD instead of falling back. The
+            // production path degrades gracefully to the serial recurrence, but a
+            // bench that did the same would measure the serial path while the
+            // harness labels the arm "chunked" — a silent instrument corruption.
+            assert!(
+                !chunked_requested || chunked_supported,
+                "GDN chunked prefill requested (set_gdn_chunked(true)) but this config \
+                 does not support the chunked path — refusing to silently measure the \
+                 serial recurrence under a 'chunked' label"
+            );
             let chunked_enabled = chunked_requested && chunked_supported;
 
             let mut timing = bench_support::GdnIsolatedChunkTiming::default();
@@ -26582,7 +26592,72 @@ mod inner {
             token_ids: &[u32],
             start_pos: usize,
         ) -> GdnIsolatedChunkTiming {
+            assert_token_ids_in_vocab(state, token_ids);
             state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos)
+        }
+
+        /// The model's vocab size, exposed so harness bins can validate token ids
+        /// BEFORE the first forward call: the entry points in this module bypass
+        /// the public `forward_prefill_impl` path and its token-id validation, and
+        /// the embedding copy is an unsafe read indexed by token id.
+        pub fn vocab_size(state: &MetalQwen35State) -> usize {
+            state.engine.config.vocab_size
+        }
+
+        /// First out-of-vocab token id, if any: `Some((index, id))` where
+        /// `id as usize >= vocab`. Pure scan, factored out for testability.
+        pub fn first_out_of_vocab(token_ids: &[u32], vocab: usize) -> Option<(usize, u32)> {
+            token_ids
+                .iter()
+                .enumerate()
+                .find(|&(_, &id)| id as usize >= vocab)
+                .map(|(i, &id)| (i, id))
+        }
+
+        /// Both bench entry points bypass the public path's token-id validation,
+        /// so they re-validate here: the first forward would otherwise read
+        /// outside `embed_tokens` in the unsafe embedding copy instead of failing
+        /// loudly before measurement.
+        fn assert_token_ids_in_vocab(state: &MetalQwen35State, token_ids: &[u32]) {
+            let vocab = state.engine.config.vocab_size;
+            if let Some((i, id)) = first_out_of_vocab(token_ids, vocab) {
+                panic!(
+                    "token id {id} at index {i} is out of vocab range ({vocab}) — refusing \
+                     to run the unsafe embedding copy on unvalidated ids (tokenizer/model \
+                     mismatch?)"
+                );
+            }
+        }
+
+        /// True iff this state's config supports the chunked GDN prefill path.
+        /// Harness bins must hard-fail when this is false rather than proceed: a
+        /// state with `set_gdn_chunked(true)` but no support would otherwise run
+        /// the serial recurrence while the harness labels the arm "chunked".
+        pub fn gdn_chunked_prefill_supported(state: &MetalQwen35State) -> bool {
+            MetalQwen35State::supports_gdn_chunked_prefill(&state.engine.config)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::first_out_of_vocab;
+
+            #[test]
+            fn first_out_of_vocab_accepts_in_range() {
+                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
+                assert_eq!(first_out_of_vocab(&[], 100), None);
+            }
+
+            #[test]
+            fn first_out_of_vocab_finds_first_offender() {
+                // Two offenders; the FIRST (index 1) must be reported.
+                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
+            }
+
+            #[test]
+            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
+                // vocab_size itself is out of range (valid ids are 0..vocab_size).
+                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
+            }
         }
 
         /// The session's `max_prefill` (single-command-buffer chunk cap; 512 for all
@@ -26621,6 +26696,7 @@ mod inner {
             token_ids: &[u32],
             start_pos: usize,
         ) {
+            assert_token_ids_in_vocab(state, token_ids);
             let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false);
         }
     }
