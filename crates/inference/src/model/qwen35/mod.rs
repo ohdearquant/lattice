@@ -19,6 +19,7 @@ mod loading;
 mod model;
 mod moe;
 mod norm;
+mod rerank;
 mod sampling;
 pub(crate) mod stop_strings;
 mod weights;
