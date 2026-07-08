@@ -126,7 +126,7 @@ All three can be used on their own.
 
 ```toml
 [dependencies]
-lattice-embed = "0.4"
+lattice-embed = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -165,13 +165,13 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 ### GPU acceleration (macOS)
 
 ```toml
-lattice-embed = { version = "0.4", features = ["metal-gpu"] }
+lattice-embed = { version = "0.5", features = ["metal-gpu"] }
 ```
 
 ### Cross-platform GPU
 
 ```toml
-lattice-embed = { version = "0.4", features = ["wgpu-gpu"] }
+lattice-embed = { version = "0.5", features = ["wgpu-gpu"] }
 ```
 
 ---
@@ -243,6 +243,25 @@ With Metal GPU (macOS only):
 
 ```bash
 cargo build --release -p lattice-inference --bin lattice --features metal-gpu,f16
+```
+
+### Get a model
+
+The embedding models above download automatically on first use. Generation
+checkpoints for `lattice chat` and `lattice serve` are not auto-fetched yet, so
+download one into the model cache before your first chat:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download Qwen/Qwen3.5-0.8B --local-dir ~/.lattice/models/qwen3.5-0.8b
+```
+
+`huggingface_hub` is only the download transport — it is not a runtime
+dependency, and the engine itself runs no Python. Then point `--model` at that
+directory:
+
+```bash
+lattice chat --model ~/.lattice/models/qwen3.5-0.8b
 ```
 
 Beyond the unified `lattice` binary, several standalone tools live in

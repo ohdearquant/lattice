@@ -36,6 +36,7 @@ git status  # must be clean
 # 2. Version already bumped? Verify:
 grep '^version' Cargo.toml               # should show {VERSION}
 grep 'version = "' crates/*/Cargo.toml   # internal path deps match the workspace version
+grep -nE 'lattice-embed = ' README.md    # README Quick Start pins track the release major.minor — bump on a minor release
 
 # 3. Full CI
 make ci  # fmt + clippy + doc lint + test + release build
