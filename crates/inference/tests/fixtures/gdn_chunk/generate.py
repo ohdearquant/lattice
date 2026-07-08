@@ -122,7 +122,7 @@ def chunkwise_gdn(
     Exact chunkwise WY/DPLR formulation for scalar-gated DeltaNet.
 
     For one chunk of C tokens, let
-        gamma_j = prod_{r=0}^j alpha_r
+        gamma_log_j = sum_{r=0}^j ln(alpha_r)   (log-space cumulative decay)
         G       = K K^T
         A       = I + tril(diag(beta) G, -1)
         T       = A^{-1} diag(beta)
@@ -134,6 +134,17 @@ def chunkwise_gdn(
     Then
         O_chunk = Gamma (Q H0^T) + LQK R
         H_next  = gamma_end H0 + R^T (gamma_end Gamma^{-1} K)
+
+    Every `Gamma`/`Gamma^{-1}` factor above is, algebraically, the ratio
+    `gamma_i / gamma_j` (i>=j) or a bare `gamma_i`, all bounded in `[0, 1]`.
+    Rather than materializing `gamma = cumprod(alpha)` and `gamma_inv =
+    1/gamma` in LINEAR space (which underflows to `0.0` / `inf` within a
+    single chunk on strongly-decaying real GDN heads, poisoning the chunk
+    with `0*inf = NaN`), every factor here is computed as `exp` of a
+    difference of `gamma_log` — a pure numerical-stability reformulation
+    that keeps the Rust port (`gdn_chunk_ref::chunkwise_gdn`) and this
+    generator byte-consistent; the values are identical to the linear-space
+    ratios up to f32 rounding.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
@@ -161,9 +172,15 @@ def chunkwise_gdn(
         a_c = alpha[start:end]
         c = end - start
 
-        gamma = np.cumprod(a_c, dtype=np.float32).astype(np.float32)
-        gamma_inv = (np.float32(1.0) / gamma).astype(np.float32)
-        gamma_end = gamma[-1]
+        # gamma_log[i] = sum_{r<=i} ln(alpha_c[r]); alpha_c is always in
+        # (0, 1] by construction so ln is finite. The tiny-positive clamp
+        # only guards a degenerate exact-zero input (keeps ln finite, near
+        # the kernel's own -88 log-alpha floor, instead of -inf).
+        tiny = np.float32(np.finfo(np.float32).tiny)
+        ln_a_c = np.log(np.maximum(a_c, tiny)).astype(np.float32)
+        gamma_log = np.cumsum(ln_a_c, dtype=np.float32).astype(np.float32)
+        gamma_log_end = gamma_log[-1]
+        gamma = np.exp(gamma_log, dtype=np.float32).astype(np.float32)
 
         # 1. Intra-chunk key Gram and unit-lower triangular solve.
         g = (k_c @ k_c.T).astype(np.float32)  # [C, C]
@@ -175,10 +192,20 @@ def chunkwise_gdn(
         w = solve_unit_lower(a_plain, rhs_k)  # W = T K, [C, d_k]
 
         # U = Gamma T Gamma^{-1} V, built as a directly gamma-scaled
-        # unit-lower system (l_jk = gamma_j/gamma_k).
+        # unit-lower system (l_jk = exp(gamma_log_j - gamma_log_k) =
+        # gamma_j/gamma_k, computed without ever forming 1/gamma). The
+        # upper-triangle entries of this full [C,C] difference matrix (i<j)
+        # can legitimately overflow `exp` on a strongly-decaying head — they
+        # are discarded by `np.tril`'s literal-zero masking below (not a
+        # multiply-by-zero), so an `inf`/`nan` there never reaches the
+        # result; suppress the resulting benign RuntimeWarning locally.
+        with np.errstate(over="ignore", invalid="ignore"):
+            decay_ratio = np.exp(
+                gamma_log[:, None] - gamma_log[None, :], dtype=np.float32
+            ).astype(np.float32)
+            a_gamma_full = ((b_c[:, None] * g) * decay_ratio).astype(np.float32)
         a_gamma = (np.eye(c, dtype=np.float32)
-                   + np.tril(((b_c[:, None] * g) * (gamma[:, None] * gamma_inv[None, :])).astype(np.float32),
-                             k=-1)).astype(np.float32)
+                   + np.tril(a_gamma_full, k=-1)).astype(np.float32)
         u = solve_unit_lower(a_gamma, rhs_v)  # [C, d_v]
 
         # 2. Decayed incoming-state contribution and pseudo-value residual.
@@ -188,11 +215,15 @@ def chunkwise_gdn(
         # 3. Within-chunk output: Gamma QH0^T + tril(Gamma QK^T Gamma^-1) R.
         q_h0 = (q_c @ h.T).astype(np.float32)  # [C, d_v]
         qk = (q_c @ k_c.T).astype(np.float32)  # [C, C]
-        lqk = np.tril(((gamma[:, None] * qk) * gamma_inv[None, :]).astype(np.float32), k=0)
+        with np.errstate(over="ignore", invalid="ignore"):
+            lqk_full = (qk * decay_ratio).astype(np.float32)
+        lqk = np.tril(lqk_full, k=0)
         out[start:end] = ((gamma[:, None] * q_h0 + lqk @ r) * scale).astype(np.float32)
 
         # 4. Cross-chunk state carry.
-        k_right = ((gamma_end * gamma_inv)[:, None] * k_c).astype(np.float32)  # [C, d_k]
+        k_right_scale = np.exp(gamma_log_end - gamma_log, dtype=np.float32).astype(np.float32)
+        k_right = (k_right_scale[:, None] * k_c).astype(np.float32)  # [C, d_k]
+        gamma_end = np.exp(gamma_log_end, dtype=np.float32)
         h = (gamma_end * h + r.T @ k_right).astype(np.float32)  # [d_v, d_k]
 
     return out, h
@@ -204,12 +235,19 @@ def chunkwise_gdn(
 
 FIXTURE_DIR = Path(__file__).resolve().parent
 
-# (seed, length, dk, dv, chunk_size) — lengths chosen to exercise both an
-# even chunk split and an uneven tail chunk.
+# (seed, length, dk, dv, chunk_size, alpha_range, tag) — lengths chosen to
+# exercise both an even chunk split and an uneven tail chunk. `tag`, when
+# non-empty, is appended to the output filename (`..._{tag}.json`).
 CASES = [
-    (7, 191, 128, 128, 64),   # 3 chunks: 64, 64, 63
-    (11, 384, 128, 128, 128),  # 3 chunks: 128, 128, 128
-    (23, 130, 128, 128, 64),  # uneven tail: 64, 64, 2
+    (7, 191, 128, 128, 64, (0.82, 0.999), ""),   # 3 chunks: 64, 64, 63
+    (11, 384, 128, 128, 128, (0.82, 0.999), ""),  # 3 chunks: 128, 128, 128
+    (23, 130, 128, 128, 64, (0.82, 0.999), ""),  # uneven tail: 64, 64, 2
+    # gdn175 S1 fix: strongly-decaying head (alpha as low as 1e-4) so
+    # cumprod(alpha) underflows to 0.0 in LINEAR space within one C=64
+    # chunk on the pre-fix oracle; the log-space reformulation must still
+    # reproduce sequential_gdn to <= 1e-5 here (regression fixture for the
+    # oracle gamma-underflow NaN this case was added to catch).
+    (31, 160, 128, 128, 64, (1.0e-4, 0.4), "strongdecay"),
 ]
 
 TOL = 1.0e-5
@@ -229,14 +267,21 @@ def to_json_array(arr: np.ndarray) -> list:
     return _round_nested(arr.astype(np.float64).tolist())
 
 
-def generate_case(seed: int, length: int, dk: int, dv: int, chunk_size: int) -> Dict[str, object]:
+def generate_case(
+    seed: int,
+    length: int,
+    dk: int,
+    dv: int,
+    chunk_size: int,
+    alpha_range: Tuple[float, float] = (0.82, 0.999),
+) -> Dict[str, object]:
     rng = np.random.default_rng(seed)
     q = l2_normalize_rows(rng.normal(size=(length, dk)).astype(np.float32))
     k = l2_normalize_rows(rng.normal(size=(length, dk)).astype(np.float32))
     # Keep magnitudes modest so f32 associativity, not ill-conditioning, dominates.
     v = (0.15 * rng.normal(size=(length, dv))).astype(np.float32)
     beta = rng.uniform(0.02, 0.98, size=(length,)).astype(np.float32)
-    alpha = rng.uniform(0.82, 0.999, size=(length,)).astype(np.float32)
+    alpha = rng.uniform(alpha_range[0], alpha_range[1], size=(length,)).astype(np.float32)
     h0 = (0.03 * rng.normal(size=(dv, dk))).astype(np.float32)
 
     out_seq, h_seq = sequential_gdn(q, k, v, beta, alpha, h0)
@@ -270,9 +315,10 @@ def generate_case(seed: int, length: int, dk: int, dv: int, chunk_size: int) -> 
 
 
 def main() -> None:
-    for seed, length, dk, dv, chunk_size in CASES:
-        case = generate_case(seed, length, dk, dv, chunk_size)
-        out_path = FIXTURE_DIR / f"case_seed{seed}_len{length}_chunk{chunk_size}.json"
+    for seed, length, dk, dv, chunk_size, alpha_range, tag in CASES:
+        case = generate_case(seed, length, dk, dv, chunk_size, alpha_range=alpha_range)
+        suffix = f"_{tag}" if tag else ""
+        out_path = FIXTURE_DIR / f"case_seed{seed}_len{length}_chunk{chunk_size}{suffix}.json"
         with out_path.open("w") as f:
             json.dump(case, f)
         print(f"wrote {out_path} (seed={seed}, length={length}, chunk_size={chunk_size})")

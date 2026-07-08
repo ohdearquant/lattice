@@ -149,17 +149,28 @@ pub fn sequential_gdn(
 /// `chunk_size` tokens at a time. See module docs for the value-major `H`
 /// convention and the two distinct `tril` semantics.
 ///
-/// For one chunk of `c` tokens (`gamma_j = prod_{r<=j} alpha_r`):
+/// For one chunk of `c` tokens (`gamma_j = prod_{r<=j} alpha_r`), every decay
+/// factor below is algebraically a ratio `gamma_i / gamma_j` (i>=j) or a bare
+/// `gamma_i`, all bounded in `[0, 1]` since `alpha` is bounded in `(0, 1]`.
+/// Rather than materializing `gamma` and `gamma_inv = 1/gamma` in linear
+/// space (which underflows to `0.0` and `inf` respectively within a single
+/// chunk on strongly-decaying real heads, poisoning the chunk with `0*inf =
+/// NaN`), every factor is computed as `exp` of a difference of the
+/// log-cumulative decay `gamma_log_i = sum_{r<=i} ln(alpha_r)` — the same
+/// log-space formulation the Metal kernel already uses. This is a pure
+/// numerical-stability reformulation: the values computed are identical (up
+/// to f32 rounding) to the linear-space ratios; nothing about the
+/// recurrence's math changes.
 /// ```text
 /// g       = k_c @ k_c^T                                    // [c, c]
 /// a_plain = I + tril(diag(beta_c) * g, k=-1)                // strictly lower
 /// w       = solve_unit_lower(a_plain, diag(beta_c) @ k_c)   // [c, dk]
-/// a_gamma = I + tril(diag(beta_c)*g * (gamma[:,None]*gamma_inv[None,:]), k=-1)
+/// a_gamma = I + tril(diag(beta_c)*g * exp(gamma_log[:,None] - gamma_log[None,:]), k=-1)
 /// u       = solve_unit_lower(a_gamma, diag(beta_c) @ v_c)   // [c, dv]
-/// r       = u - gamma[:,None] * (w @ h^T)                   // [c, dv]
-/// lqk     = tril(gamma[:,None] * (q_c @ k_c^T) * gamma_inv[None,:], k=0)  // includes diag
-/// out_c   = (gamma[:,None] * (q_c @ h^T) + lqk @ r) * scale
-/// h       = gamma_end * h + r^T @ ((gamma_end * gamma_inv)[:,None] * k_c)
+/// r       = u - exp(gamma_log)[:,None] * (w @ h^T)          // [c, dv]
+/// lqk     = tril((q_c @ k_c^T) * exp(gamma_log[:,None] - gamma_log[None,:]), k=0)  // includes diag
+/// out_c   = (exp(gamma_log)[:,None] * (q_c @ h^T) + lqk @ r) * scale
+/// h       = exp(gamma_log_end) * h + r^T @ (exp(gamma_log_end - gamma_log)[:,None] * k_c)
 /// ```
 ///
 /// Returns `(out [t_total, dv], h [dv, dk])`.
@@ -197,15 +208,18 @@ pub fn chunkwise_gdn(
         let b_c = &beta[start..end];
         let a_c = &alpha[start..end];
 
-        // gamma = cumprod(alpha_c)
-        let mut gamma = vec![0.0f32; c];
-        let mut running = 1.0f32;
-        for (i, gi) in gamma.iter_mut().enumerate() {
-            running *= a_c[i];
-            *gi = running;
+        // gamma_log[i] = sum_{r<=i} ln(alpha_c[r]) (log-space cumulative decay).
+        // `alpha_c[i]` is always in `(0, 1]` by construction (a decay gate),
+        // so `ln` is finite; the `max(f32::MIN_POSITIVE, ..)` guard only
+        // fires on a degenerate exact-zero input and keeps `ln` finite (near
+        // the kernel's own -88 log-alpha floor) instead of producing -inf.
+        let mut gamma_log = vec![0.0f32; c];
+        let mut running_log = 0.0f32;
+        for (i, gl) in gamma_log.iter_mut().enumerate() {
+            running_log += a_c[i].max(f32::MIN_POSITIVE).ln();
+            *gl = running_log;
         }
-        let gamma_inv: Vec<f32> = gamma.iter().map(|g| 1.0 / g).collect();
-        let gamma_end = gamma[c - 1];
+        let gamma_log_end = gamma_log[c - 1];
 
         // g = k_c @ k_c^T  -> [c, c]
         let mut g = vec![0.0f32; c * c];
@@ -245,13 +259,17 @@ pub fn chunkwise_gdn(
 
         let w = solve_unit_lower(&a_plain, &rhs_k, c, dk); // [c, dk]
 
-        // a_gamma = I + tril((diag(beta_c)*g) * (gamma[:,None]*gamma_inv[None,:]), k=-1)
+        // a_gamma = I + tril((diag(beta_c)*g) * exp(gamma_log[i]-gamma_log[j]), k=-1)
         // (STRICTLY lower, same as a_plain — NOT the k=0 semantics used by lqk below.)
+        // exp(gamma_log[i]-gamma_log[j]) replaces the linear-space
+        // gamma[i]*gamma_inv[j]; for i>j this is the same ratio gamma_i/gamma_j
+        // bounded in (0,1], computed without ever forming 1/gamma.
         let mut a_gamma = vec![0.0f32; c * c];
         for i in 0..c {
             a_gamma[idx(i, i, c)] = 1.0;
             for j in 0..i {
-                a_gamma[idx(i, j, c)] = b_c[i] * g[idx(i, j, c)] * gamma[i] * gamma_inv[j];
+                a_gamma[idx(i, j, c)] =
+                    b_c[i] * g[idx(i, j, c)] * (gamma_log[i] - gamma_log[j]).exp();
             }
         }
         let u = solve_unit_lower(&a_gamma, &rhs_v, c, dv); // [c, dv]
@@ -266,11 +284,12 @@ pub fn chunkwise_gdn(
             }
         }
 
-        // r = u - gamma[:,None] * w_h0
+        // r = u - exp(gamma_log)[:,None] * w_h0
         let mut r = vec![0.0f32; c * dv];
         for i in 0..c {
+            let gamma_i = gamma_log[i].exp();
             for col in 0..dv {
-                r[idx(i, col, dv)] = u[idx(i, col, dv)] - gamma[i] * w_h0[idx(i, col, dv)];
+                r[idx(i, col, dv)] = u[idx(i, col, dv)] - gamma_i * w_h0[idx(i, col, dv)];
             }
         }
 
@@ -294,16 +313,17 @@ pub fn chunkwise_gdn(
             }
         }
 
-        // lqk = tril(gamma[:,None] * qk * gamma_inv[None,:], k=0)
-        // NOTE: k=0 — this INCLUDES the diagonal, unlike a_plain/a_gamma above.
+        // lqk = tril(qk * exp(gamma_log[i]-gamma_log[j]), k=0)
+        // NOTE: k=0 — this INCLUDES the diagonal, unlike a_plain/a_gamma above
+        // (i==j => exp(0) == 1, matching the linear-space gamma[i]/gamma[i]).
         let mut lqk = vec![0.0f32; c * c];
         for i in 0..c {
             for j in 0..=i {
-                lqk[idx(i, j, c)] = gamma[i] * qk[idx(i, j, c)] * gamma_inv[j];
+                lqk[idx(i, j, c)] = qk[idx(i, j, c)] * (gamma_log[i] - gamma_log[j]).exp();
             }
         }
 
-        // out[start:end] = (gamma[:,None]*q_h0 + lqk @ r) * scale
+        // out[start:end] = (exp(gamma_log)[:,None]*q_h0 + lqk @ r) * scale
         for i in 0..c {
             let mut lqk_r_row = vec![0.0f32; dv];
             for j in 0..=i {
@@ -312,22 +332,24 @@ pub fn chunkwise_gdn(
                     lqk_r_row[col] += lij * r[idx(j, col, dv)];
                 }
             }
+            let gamma_i = gamma_log[i].exp();
             for col in 0..dv {
-                let val = gamma[i] * q_h0[idx(i, col, dv)] + lqk_r_row[col];
+                let val = gamma_i * q_h0[idx(i, col, dv)] + lqk_r_row[col];
                 out[(start + i) * dv + col] = val * scale;
             }
         }
 
-        // k_right = (gamma_end * gamma_inv)[:,None] * k_c
+        // k_right = exp(gamma_log_end - gamma_log)[:,None] * k_c
         let mut k_right = vec![0.0f32; c * dk];
         for i in 0..c {
-            let scale_i = gamma_end * gamma_inv[i];
+            let scale_i = (gamma_log_end - gamma_log[i]).exp();
             for col in 0..dk {
                 k_right[idx(i, col, dk)] = scale_i * k_c[idx(i, col, dk)];
             }
         }
 
-        // h = gamma_end * h + r^T @ k_right  -> [dv, dk]
+        // h = exp(gamma_log_end) * h + r^T @ k_right  -> [dv, dk]
+        let gamma_end = gamma_log_end.exp();
         let mut h_next = vec![0.0f32; dv * dk];
         for (hn, hv) in h_next.iter_mut().zip(h.iter()) {
             *hn = gamma_end * hv;
@@ -392,12 +414,30 @@ mod tests {
             .unwrap_or_else(|e| panic!("bad JSON in {}: {e}", path.display()))
     }
 
+    /// NaN/Inf-honest `max|a-b|`. A plain `.fold(0.0, f32::max)` silently drops
+    /// a NaN operand (IEEE `maxNum` returns the non-NaN side), so a
+    /// catastrophically non-finite output can read as a clean `0.0` and slip
+    /// through a `<= TOL` tolerance gate. This surfaces any non-finite
+    /// difference instead, so the gate fails closed on it. (This is exactly the
+    /// failure the strong-decay fixture exists to catch: the pre-fix linear
+    /// oracle produced NaN, which a max-fold gate reported as `0.0`.)
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "length mismatch in max_abs_diff");
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
+        let mut max = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (x - y).abs();
+            if !d.is_finite() {
+                return d;
+            }
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    fn count_nonfinite(v: &[f32]) -> usize {
+        v.iter().filter(|x| !x.is_finite()).count()
     }
 
     const TOL: f32 = 1.0e-5;
@@ -429,6 +469,20 @@ mod tests {
             fx.chunk_size,
             true,
         );
+
+        for (label, buf) in [
+            ("rust_out_seq", &rust_out_seq),
+            ("rust_h_seq", &rust_h_seq),
+            ("rust_out_chk", &rust_out_chk),
+            ("rust_h_chk", &rust_h_chk),
+        ] {
+            let n = count_nonfinite(buf);
+            assert_eq!(
+                n, 0,
+                "{fixture_name}: {label} contains {n} non-finite (NaN/Inf) values — \
+                 a decay-underflow regression the max-fold gate would silently pass"
+            );
+        }
 
         let d_seq_out = max_abs_diff(&rust_out_seq, &expected_out_seq);
         let d_seq_h = max_abs_diff(&rust_h_seq, &expected_h_seq);
@@ -485,5 +539,74 @@ mod tests {
     #[test]
     fn gdn_chunk_ref_parity_seed23_uneven_tail() {
         run_case("case_seed23_len130_chunk64.json");
+    }
+
+    /// gdn175 S1 fix regression: a strongly-decaying head (alpha as low as
+    /// 1e-4) whose linear-space `cumprod(alpha)` underflows to exactly
+    /// `0.0f32` within one C=64 chunk on the pre-fix oracle (`gamma_inv =
+    /// 1/0.0 = inf`, `gamma[i]*gamma_inv[j] = 0*inf = NaN`). The log-space
+    /// reformulation must still reproduce `sequential_gdn` to <= 1e-5 here.
+    #[test]
+    fn gdn_chunk_ref_parity_seed31_strong_decay() {
+        run_case("case_seed31_len160_chunk64_strongdecay.json");
+    }
+
+    /// Gate-integrity proof: `max_abs_diff` must never let a non-finite
+    /// difference read as a small in-tolerance value. A `.fold(0.0, f32::max)`
+    /// silently drops the NaN/Inf operand and returns `0.0` here, which would
+    /// pass a `<= TOL` assert on a catastrophically wrong output.
+    #[test]
+    fn max_abs_diff_is_nan_and_inf_honest() {
+        let clean = [1.0f32, 2.0, 3.0];
+
+        let nan_side = [1.0f32, f32::NAN, 3.0];
+        let d = max_abs_diff(&clean, &nan_side);
+        assert!(
+            !d.is_finite(),
+            "max_abs_diff silently dropped a NaN operand (got {d}); the gate is blind"
+        );
+
+        let inf_side = [1.0f32, f32::INFINITY, 3.0];
+        let di = max_abs_diff(&clean, &inf_side);
+        assert!(
+            !di.is_finite(),
+            "max_abs_diff silently dropped an Inf operand (got {di}); the gate is blind"
+        );
+    }
+
+    /// Mutation-sensitivity proof for the strong-decay fixture: on the pre-fix
+    /// linear-space oracle, `cumprod(alpha)` underflows to exactly `0.0f32`
+    /// within the first C=64 chunk, so `1.0/gamma` is `+inf` and the decay
+    /// factor `gamma[i] * gamma_inv[j]` becomes `0*inf = NaN`. The log-space
+    /// reformulation shipped in this PR never forms `1.0/gamma`. If this assert
+    /// ever fails, the fixture no longer exercises the regression and the
+    /// `gdn_chunk_ref_parity_seed31_strong_decay` gate is decoration.
+    #[test]
+    fn seed31_fixture_triggers_linear_gamma_underflow() {
+        let fx = load_fixture("case_seed31_len160_chunk64_strongdecay.json");
+        let c = fx.chunk_size;
+        let mut gamma = 1.0f32;
+        let mut underflowed = false;
+        for i in 0..c {
+            gamma *= fx.alpha[i];
+            if gamma == 0.0 {
+                underflowed = true;
+                break;
+            }
+        }
+        assert!(
+            underflowed,
+            "seed31 strong-decay fixture no longer underflows the linear cumprod within a \
+             chunk; it no longer guards the gamma-underflow regression this PR fixes"
+        );
+        let gamma_inv = 1.0f32 / gamma;
+        assert!(
+            !gamma_inv.is_finite(),
+            "expected 1/0 = inf, got {gamma_inv}"
+        );
+        assert!(
+            (0.0f32 * gamma_inv).is_nan(),
+            "expected the pre-fix decay factor 0*inf to be NaN"
+        );
     }
 }
