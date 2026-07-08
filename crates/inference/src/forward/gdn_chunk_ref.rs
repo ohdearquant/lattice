@@ -414,12 +414,30 @@ mod tests {
             .unwrap_or_else(|e| panic!("bad JSON in {}: {e}", path.display()))
     }
 
+    /// NaN/Inf-honest `max|a-b|`. A plain `.fold(0.0, f32::max)` silently drops
+    /// a NaN operand (IEEE `maxNum` returns the non-NaN side), so a
+    /// catastrophically non-finite output can read as a clean `0.0` and slip
+    /// through a `<= TOL` tolerance gate. This surfaces any non-finite
+    /// difference instead, so the gate fails closed on it. (This is exactly the
+    /// failure the strong-decay fixture exists to catch: the pre-fix linear
+    /// oracle produced NaN, which a max-fold gate reported as `0.0`.)
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len(), "length mismatch in max_abs_diff");
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, f32::max)
+        let mut max = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (x - y).abs();
+            if !d.is_finite() {
+                return d;
+            }
+            if d > max {
+                max = d;
+            }
+        }
+        max
+    }
+
+    fn count_nonfinite(v: &[f32]) -> usize {
+        v.iter().filter(|x| !x.is_finite()).count()
     }
 
     const TOL: f32 = 1.0e-5;
@@ -451,6 +469,20 @@ mod tests {
             fx.chunk_size,
             true,
         );
+
+        for (label, buf) in [
+            ("rust_out_seq", &rust_out_seq),
+            ("rust_h_seq", &rust_h_seq),
+            ("rust_out_chk", &rust_out_chk),
+            ("rust_h_chk", &rust_h_chk),
+        ] {
+            let n = count_nonfinite(buf);
+            assert_eq!(
+                n, 0,
+                "{fixture_name}: {label} contains {n} non-finite (NaN/Inf) values — \
+                 a decay-underflow regression the max-fold gate would silently pass"
+            );
+        }
 
         let d_seq_out = max_abs_diff(&rust_out_seq, &expected_out_seq);
         let d_seq_h = max_abs_diff(&rust_h_seq, &expected_h_seq);
@@ -517,5 +549,64 @@ mod tests {
     #[test]
     fn gdn_chunk_ref_parity_seed31_strong_decay() {
         run_case("case_seed31_len160_chunk64_strongdecay.json");
+    }
+
+    /// Gate-integrity proof: `max_abs_diff` must never let a non-finite
+    /// difference read as a small in-tolerance value. A `.fold(0.0, f32::max)`
+    /// silently drops the NaN/Inf operand and returns `0.0` here, which would
+    /// pass a `<= TOL` assert on a catastrophically wrong output.
+    #[test]
+    fn max_abs_diff_is_nan_and_inf_honest() {
+        let clean = [1.0f32, 2.0, 3.0];
+
+        let nan_side = [1.0f32, f32::NAN, 3.0];
+        let d = max_abs_diff(&clean, &nan_side);
+        assert!(
+            !d.is_finite(),
+            "max_abs_diff silently dropped a NaN operand (got {d}); the gate is blind"
+        );
+
+        let inf_side = [1.0f32, f32::INFINITY, 3.0];
+        let di = max_abs_diff(&clean, &inf_side);
+        assert!(
+            !di.is_finite(),
+            "max_abs_diff silently dropped an Inf operand (got {di}); the gate is blind"
+        );
+    }
+
+    /// Mutation-sensitivity proof for the strong-decay fixture: on the pre-fix
+    /// linear-space oracle, `cumprod(alpha)` underflows to exactly `0.0f32`
+    /// within the first C=64 chunk, so `1.0/gamma` is `+inf` and the decay
+    /// factor `gamma[i] * gamma_inv[j]` becomes `0*inf = NaN`. The log-space
+    /// reformulation shipped in this PR never forms `1.0/gamma`. If this assert
+    /// ever fails, the fixture no longer exercises the regression and the
+    /// `gdn_chunk_ref_parity_seed31_strong_decay` gate is decoration.
+    #[test]
+    fn seed31_fixture_triggers_linear_gamma_underflow() {
+        let fx = load_fixture("case_seed31_len160_chunk64_strongdecay.json");
+        let c = fx.chunk_size;
+        let mut gamma = 1.0f32;
+        let mut underflowed = false;
+        for i in 0..c {
+            gamma *= fx.alpha[i];
+            if gamma == 0.0 {
+                underflowed = true;
+                break;
+            }
+        }
+        assert!(
+            underflowed,
+            "seed31 strong-decay fixture no longer underflows the linear cumprod within a \
+             chunk; it no longer guards the gamma-underflow regression this PR fixes"
+        );
+        let gamma_inv = 1.0f32 / gamma;
+        assert!(
+            !gamma_inv.is_finite(),
+            "expected 1/0 = inf, got {gamma_inv}"
+        );
+        assert!(
+            (0.0f32 * gamma_inv).is_nan(),
+            "expected the pre-fix decay factor 0*inf to be NaN"
+        );
     }
 }
