@@ -6969,6 +6969,728 @@ mod inner {
             }
         }
 
+        /// GDN-recurrence-isolating variant of [`Self::forward_prefill_batched_chunk`],
+        /// built for the #175 bench harness (`bin/bench_gdn_prefill_ab.rs`).
+        ///
+        /// Structurally identical to `forward_prefill_batched_chunk`: same op sequence,
+        /// same buffers, same dispatch calls, same per-layer branch (GDN vs full
+        /// attention). The ONLY difference is *where command-buffer boundaries fall*:
+        /// immediately before and after each GDN layer's recurrence dispatch (either
+        /// `dispatch_gdn_chunked_prefill_layer`'s C32 family, or the serial
+        /// conv1d+recurrence per-token loop) the current encoder is ended and its
+        /// command buffer committed + `wait_until_completed`, a fresh command buffer
+        /// is opened for the GDN dispatch alone, then another fresh one for the rest of
+        /// the layer. This isolates the GDN segment's CPU wall-clock time from the
+        /// surrounding GEMMs/norms so the two scans' recurrence cost can be compared
+        /// without the O(n^2) attention layers (or the GDN layers' own non-recurrence
+        /// GEMMs) swamping the signal.
+        ///
+        /// No GDN kernel, dispatch argument, threadgroup geometry, or buffer differs
+        /// from the production path — only the encoder/command-buffer boundaries
+        /// change. This cannot introduce a new GDN-state race: within one encoder,
+        /// Metal already serializes same-buffer read/write hazards between
+        /// consecutive dispatches (the production path's correctness already depends
+        /// on this), and an explicit `commit` + `wait_until_completed` between two
+        /// *separate* command buffers on the same StorageModeShared buffers is a
+        /// strictly stronger ordering guarantee than that. Splitting into more,
+        /// smaller command buffers can only add synchronization stalls, never change
+        /// what a kernel reads or writes.
+        ///
+        /// Always skips the terminal RMSNorm/lm_head/top-k tail (mirrors
+        /// `forward_prefill_batched_chunk`'s `emit_logits = false` path) — logits are
+        /// never needed for a dispatch-timing measurement, skipping the tail removes a
+        /// large amount of code unrelated to GDN isolation, and the tail's cost is
+        /// identical between the serial and chunked paths regardless (it depends on
+        /// neither), so omitting it does not bias the serial-vs-chunked comparison.
+        ///
+        /// Handles exactly one `max_prefill`-sized chunk starting at `start_pos`
+        /// (`n = token_ids.len() <= self.session.max_prefill`, asserted below); the
+        /// caller drives the `max_prefill`-sized chunking loop for prompts longer than
+        /// `max_prefill`, exactly as `forward_prefill_impl` does for the production
+        /// path, threading GDN recurrent state across chunk boundaries via the
+        /// session's GPU buffers (unchanged by this method).
+        ///
+        /// Gated on `bench-internals` (like `bench_support` itself, which owns this
+        /// method's return type) — this is bench-only isolation plumbing, not part of
+        /// the production dispatch path, so it stays out of the default `metal-gpu`
+        /// build the way `bench_support`'s other helpers do.
+        #[cfg(feature = "bench-internals")]
+        fn forward_prefill_chunk_gdn_isolated(
+            &mut self,
+            token_ids: &[u32],
+            start_pos: usize,
+        ) -> bench_support::GdnIsolatedChunkTiming {
+            let n = token_ids.len();
+            assert!(
+                n <= self.session.max_prefill,
+                "forward_prefill_chunk_gdn_isolated: n={n} exceeds max_prefill={}",
+                self.session.max_prefill
+            );
+            assert!(
+                start_pos + n <= self.session.kv_cache.max_cache_len,
+                "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
+                self.session.kv_cache.max_cache_len
+            );
+            let cfg = self.engine.config.clone();
+            let m = n as u32;
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let kv_dim = cfg.full_kv_dim();
+            let q_dim = cfg.full_q_dim();
+            let num_q_heads = cfg.num_attention_heads;
+            let num_kv_heads = cfg.num_key_value_heads;
+            let head_dim = cfg.head_dim;
+            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
+
+            // Batch embedding: f16 -> f32 for all N tokens. Identical to
+            // forward_prefill_batched_chunk; embedding is CPU-side memcpy work, held
+            // fixed across serial/chunked and excluded from both timing buckets below
+            // (it happens before the first command buffer opens).
+            //
+            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight; token
+            // ids are validated by the harness bin before this is ever called.
+            unsafe {
+                let src_base = self.engine.embed_tokens.contents() as *const u16;
+                let dst_base = self.session.activations.hidden.contents() as *mut f32;
+                for (t, &id) in token_ids.iter().enumerate() {
+                    let src = src_base.add(id as usize * hidden);
+                    let dst = dst_base.add(t * hidden);
+                    convert_f16_row(src, dst, hidden);
+                }
+            }
+
+            let mut active_layer_idx = 0usize;
+            let mut linear_idx = 0usize;
+            let mut full_idx = 0usize;
+
+            let chunked_requested = self.use_gdn_chunked;
+            let chunked_supported = Self::supports_gdn_chunked_prefill(&cfg);
+            // Bench-internals path: fail LOUD instead of falling back. The
+            // production path degrades gracefully to the serial recurrence, but a
+            // bench that did the same would measure the serial path while the
+            // harness labels the arm "chunked" — a silent instrument corruption.
+            assert!(
+                !chunked_requested || chunked_supported,
+                "GDN chunked prefill requested (set_gdn_chunked(true)) but this config \
+                 does not support the chunked path — refusing to silently measure the \
+                 serial recurrence under a 'chunked' label"
+            );
+            let chunked_enabled = chunked_requested && chunked_supported;
+
+            let mut timing = bench_support::GdnIsolatedChunkTiming::default();
+
+            let mut cmd = self.engine.queue.new_command_buffer();
+            let mut enc = cmd.new_compute_command_encoder();
+            let mut seg_start = std::time::Instant::now();
+
+            for layer_i in 0..cfg.num_hidden_layers {
+                if !cfg.is_layer_active(layer_i) {
+                    continue;
+                }
+                let compact_idx = active_layer_idx;
+                active_layer_idx += 1;
+                let is_linear = matches!(
+                    &self.engine.layer_weights[compact_idx].0,
+                    MetalLayerAttnWeights::Linear(_)
+                );
+
+                // Extract weight pointers (avoids borrow conflict with &mut self) --
+                // identical pattern to forward_prefill_batched_chunk.
+                let (_, common_w) = &self.engine.layer_weights[compact_idx];
+                let w_in_norm = &common_w.input_layernorm as *const Buffer;
+                let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
+                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
+                    MetalFfnWeights::Dense {
+                        gate_up_proj,
+                        down_proj,
+                    } => {
+                        let byte_size: u64 = match self.engine.quant_format {
+                            QuantFormat::Q8_0 => {
+                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
+                            }
+                            QuantFormat::Q4_0 => {
+                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
+                            }
+                        };
+                        (
+                            gate_up_proj as *const Q4WeightBuf,
+                            down_proj as *const Q4WeightBuf,
+                            byte_size,
+                        )
+                    }
+                    MetalFfnWeights::Moe(_) => {
+                        panic!(
+                            "forward_prefill_chunk_gdn_isolated: MoE layers are not \
+                             supported in batch prefill (M>1); the #175 harness is \
+                             0.8B-only (dense), this branch is unreachable there."
+                        );
+                    }
+                };
+
+                if is_linear {
+                    // ========= GDN layer: batch projections + isolated recurrence =========
+                    let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
+                        let MetalLayerAttnWeights::Linear(gdn_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
+                        };
+                        (
+                            &gdn_w.in_proj_qkv as *const Q4WeightBuf,
+                            &gdn_w.in_proj_z as *const Q4WeightBuf,
+                            &gdn_w.in_proj_b as *const Buffer,
+                            &gdn_w.in_proj_a as *const Buffer,
+                            &gdn_w.a_log as *const Buffer,
+                            &gdn_w.dt_bias as *const Buffer,
+                            &gdn_w.conv1d_weight as *const Buffer,
+                            &gdn_w.norm_weight as *const Buffer,
+                            &gdn_w.out_proj as *const Q4WeightBuf,
+                        )
+                    };
+                    let qkv_d = cfg.linear_qkv_dim();
+                    let out_d = cfg.linear_output_dim();
+                    let num_h = cfg.linear_num_key_heads;
+                    let key_d = cfg.linear_key_head_dim;
+                    let val_d = cfg.linear_value_head_dim;
+                    let ks = cfg.linear_conv_kernel_dim as u32;
+
+                    // Batch: fused copy hidden -> residual + norm hidden in-place.
+                    unsafe {
+                        self.dispatch_copy_and_rms_norm_batch(
+                            enc,
+                            &self.session.activations.hidden,
+                            &self.session.activations.residual,
+                            &*w_in_norm,
+                            hidden as u32,
+                            m,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+
+                    // Batch: QKV + Z projections (GEMM) -- non-GDN, stays in this segment.
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_qkv,
+                            &self.session.activations.gdn_qkv,
+                            0,
+                            m,
+                            qkv_d as u32,
+                            hidden as u32,
+                        );
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_z,
+                            &self.session.activations.gdn_z,
+                            0,
+                            m,
+                            out_d as u32,
+                            hidden as u32,
+                        );
+                    }
+
+                    // ---- GDN isolation boundary: close the pre-GDN (non-GDN) segment ----
+                    enc.end_encoding();
+                    cmd.commit();
+                    cmd.wait_until_completed();
+                    timing.non_gdn_ms += seg_start.elapsed().as_secs_f64() * 1000.0;
+
+                    let gdn_cmd = self.engine.queue.new_command_buffer();
+                    let gdn_enc = gdn_cmd.new_compute_command_encoder();
+                    let gdn_start = std::time::Instant::now();
+
+                    // GDN recurrence: chunked-parallel path or serial per-token --
+                    // dispatch calls/args are byte-identical to
+                    // forward_prefill_batched_chunk, only the target encoder differs.
+                    let chunk_params = if chunked_enabled {
+                        Self::make_gdn_chunk_params(&cfg, n)
+                    } else {
+                        None
+                    };
+                    if let Some(params) = chunk_params {
+                        let weights = unsafe {
+                            GdnChunkedWeights {
+                                conv1d_weight: &*w_conv,
+                                in_proj_b: &*w_b,
+                                in_proj_a: &*w_a,
+                                a_log: &*w_alog,
+                                dt_bias: &*w_dtb,
+                                norm_weight: &*w_norm,
+                            }
+                        };
+                        self.dispatch_gdn_chunked_prefill_layer(
+                            gdn_enc, linear_idx, weights, params,
+                        );
+                    } else {
+                        for t in 0..n {
+                            let qkv_off = (t * qkv_d) as u64 * 4;
+                            let z_off = (t * out_d) as u64 * 4;
+                            let h_off = (t * hidden) as u64 * 4;
+
+                            unsafe {
+                                gdn_enc
+                                    .set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
+                                gdn_enc.set_buffer(
+                                    0,
+                                    Some(&self.session.gdn_gpu_conv_bufs[linear_idx]),
+                                    0,
+                                );
+                                gdn_enc.set_buffer(
+                                    1,
+                                    Some(&self.session.activations.gdn_qkv),
+                                    qkv_off,
+                                );
+                                gdn_enc.set_buffer(2, Some(&*w_conv), 0);
+                                gdn_enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
+                                let qd = qkv_d as u32;
+                                gdn_enc.set_bytes(4, 4, &qd as *const u32 as *const _);
+                                gdn_enc.set_bytes(5, 4, &ks as *const u32 as *const _);
+                                let wg = 256u64;
+                                gdn_enc.dispatch_threads(
+                                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
+                                    MTLSize::new(wg, 1, 1),
+                                );
+                            }
+
+                            unsafe {
+                                #[repr(C)]
+                                struct GdnRecurParams {
+                                    key_dim: u32,
+                                    value_dim: u32,
+                                    num_key_heads: u32,
+                                    num_value_heads: u32,
+                                    hidden_size: u32,
+                                    q_total: u32,
+                                    v_offset: u32,
+                                    scale: f32,
+                                    eps: f32,
+                                }
+                                let num_vh = cfg.linear_num_value_heads();
+                                let q_total = (num_h * key_d) as u32;
+                                let params = GdnRecurParams {
+                                    key_dim: key_d as u32,
+                                    value_dim: val_d as u32,
+                                    num_key_heads: num_h as u32,
+                                    num_value_heads: num_vh as u32,
+                                    hidden_size: hidden as u32,
+                                    q_total,
+                                    v_offset: q_total * 2,
+                                    scale: 1.0 / (key_d as f32).sqrt(),
+                                    eps: cfg.rms_norm_eps,
+                                };
+                                gdn_enc.set_compute_pipeline_state(
+                                    &self.engine.pipelines.gdn_recurrence,
+                                );
+                                gdn_enc.set_buffer(
+                                    0,
+                                    Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
+                                    0,
+                                );
+                                gdn_enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
+                                gdn_enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
+                                gdn_enc.set_buffer(
+                                    3,
+                                    Some(&self.session.activations.hidden),
+                                    h_off,
+                                );
+                                gdn_enc.set_buffer(4, Some(&*w_b), 0);
+                                gdn_enc.set_buffer(5, Some(&*w_a), 0);
+                                gdn_enc.set_buffer(6, Some(&*w_alog), 0);
+                                gdn_enc.set_buffer(7, Some(&*w_dtb), 0);
+                                gdn_enc.set_buffer(8, Some(&*w_norm), 0);
+                                gdn_enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
+                                gdn_enc.set_bytes(
+                                    10,
+                                    std::mem::size_of::<GdnRecurParams>() as u64,
+                                    &params as *const GdnRecurParams as *const _,
+                                );
+                                gdn_enc.dispatch_thread_groups(
+                                    MTLSize::new(num_vh as u64, 1, 1),
+                                    MTLSize::new(32, 4, 1),
+                                );
+                            }
+                        }
+                    }
+
+                    gdn_enc.end_encoding();
+                    gdn_cmd.commit();
+                    gdn_cmd.wait_until_completed();
+                    timing.gdn_ms += gdn_start.elapsed().as_secs_f64() * 1000.0;
+                    timing.num_gdn_layers += 1;
+
+                    // ---- reopen a fresh segment for the rest of this layer + subsequent layers ----
+                    cmd = self.engine.queue.new_command_buffer();
+                    enc = cmd.new_compute_command_encoder();
+                    seg_start = std::time::Instant::now();
+
+                    // Batch: out_proj -- non-GDN, in the fresh post-GDN segment.
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.gdn_z,
+                            0,
+                            &*w_out,
+                            &self.session.activations.attn_out,
+                            0,
+                            m,
+                            hidden as u32,
+                            out_d as u32,
+                        );
+                    }
+
+                    // Batch: fused residual-add + norm for MLP.
+                    unsafe {
+                        self.dispatch_fused_residual_add_norm_batch(
+                            enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.attn_out,
+                            &self.session.activations.residual,
+                            &self.session.activations.hidden,
+                            &*w_post_norm,
+                            hidden as u32,
+                            m,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+
+                    // Batch: MLP (gate + up + silu_mul + down)
+                    unsafe {
+                        self.dispatch_gemm_at(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_gate_up,
+                            0,
+                            &self.session.activations.gate,
+                            0,
+                            m,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                        self.dispatch_gemm_at(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_gate_up,
+                            gate_byte_size,
+                            &self.session.activations.up,
+                            0,
+                            m,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_silu_mul(enc, m * inter as u32);
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.gate,
+                            0,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            0,
+                            m,
+                            hidden as u32,
+                            inter as u32,
+                        );
+                    }
+
+                    // Batch: fused end-of-layer residual add + copy.
+                    self.dispatch_add_and_copy(
+                        enc,
+                        &self.session.activations.ffn_out,
+                        &self.session.activations.residual,
+                        &self.session.activations.hidden,
+                        m * hidden as u32,
+                    );
+
+                    linear_idx += 1;
+                } else {
+                    // ========= Full attention layer: byte-identical to
+                    // forward_prefill_batched_chunk's else-branch. No GDN work here,
+                    // so it just dispatches into whichever segment is currently open
+                    // (never split). =========
+                    let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
+                        let MetalLayerAttnWeights::Full(full_w) =
+                            &self.engine.layer_weights[compact_idx].0
+                        else {
+                            unreachable!()
+                        };
+                        (
+                            &full_w.q_proj as *const Q4WeightBuf,
+                            &full_w.k_proj as *const Q4WeightBuf,
+                            &full_w.v_proj as *const Q4WeightBuf,
+                            &full_w.o_proj as *const Q4WeightBuf,
+                            &full_w.q_norm as *const Buffer,
+                            &full_w.k_norm as *const Buffer,
+                        )
+                    };
+                    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+                    unsafe {
+                        self.dispatch_copy_and_rms_norm_batch(
+                            enc,
+                            &self.session.activations.hidden,
+                            &self.session.activations.residual,
+                            &*w_in_norm,
+                            hidden as u32,
+                            m,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_q,
+                            &self.session.activations.q,
+                            0,
+                            m,
+                            (2 * q_dim) as u32,
+                            hidden as u32,
+                        );
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_k,
+                            &self.session.activations.k,
+                            0,
+                            m,
+                            kv_dim as u32,
+                            hidden as u32,
+                        );
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_v,
+                            &self.session.activations.v,
+                            0,
+                            m,
+                            kv_dim as u32,
+                            hidden as u32,
+                        );
+                    }
+
+                    {
+                        let base_pos = start_pos as u32;
+                        let num_tok = m;
+                        let nqh = num_q_heads as u32;
+                        let nkh = num_kv_heads as u32;
+                        let hd = head_dim as u32;
+                        let kvd = kv_dim as u32;
+                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
+
+                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
+                        self.dispatch_per_head_rms_norm_batch(
+                            enc,
+                            &self.session.activations.q_separated,
+                            qn_ref,
+                            num_tok,
+                            nqh,
+                            hd,
+                            cfg.rms_norm_eps,
+                        );
+                        self.dispatch_per_head_rms_norm_batch(
+                            enc,
+                            &self.session.activations.k,
+                            kn_ref,
+                            num_tok,
+                            nkh,
+                            hd,
+                            cfg.rms_norm_eps,
+                        );
+                        self.dispatch_partial_rope_batch(
+                            enc,
+                            &self.session.activations.q_separated,
+                            num_tok,
+                            nqh,
+                            hd,
+                            half_rope_dim,
+                            base_pos,
+                        );
+                        self.dispatch_partial_rope_batch(
+                            enc,
+                            &self.session.activations.k,
+                            num_tok,
+                            nkh,
+                            hd,
+                            half_rope_dim,
+                            base_pos,
+                        );
+                        self.dispatch_copy_kv_cache_batch(
+                            enc,
+                            &self.session.activations.k,
+                            &self.session.activations.v,
+                            &self.session.kv_cache.k_bufs[full_idx],
+                            &self.session.kv_cache.v_bufs[full_idx],
+                            num_tok,
+                            kvd,
+                            base_pos,
+                        );
+                    }
+
+                    if self
+                        .dispatch_prefill_attention_batched(
+                            enc,
+                            &self.session.kv_cache.k_bufs[full_idx],
+                            &self.session.kv_cache.v_bufs[full_idx],
+                            start_pos as u32,
+                            m,
+                            head_dim as u32,
+                            num_q_heads as u32,
+                            num_kv_heads as u32,
+                            q_dim as u32,
+                            kv_dim as u32,
+                            scale,
+                        )
+                        .is_err()
+                    {
+                        for t in 0..n {
+                            let abs_pos = start_pos + t;
+                            let qs_off = (t * q_dim) as u64 * 4;
+                            let ao_off = (t * q_dim) as u64 * 4;
+                            let cache_len = (abs_pos + 1) as u32;
+                            let hd = head_dim as u32;
+                            let nqh = num_q_heads as u32;
+                            let nkh = num_kv_heads as u32;
+                            let qd = q_dim as u32;
+                            let kvd = kv_dim as u32;
+                            {
+                                if self.use_kv_f16 {
+                                    enc.set_compute_pipeline_state(
+                                        &self.engine.pipelines.decode_attention_f16,
+                                    );
+                                } else {
+                                    enc.set_compute_pipeline_state(
+                                        &self.engine.pipelines.decode_attention,
+                                    );
+                                }
+                                enc.set_buffer(
+                                    0,
+                                    Some(&self.session.activations.q_separated),
+                                    qs_off,
+                                );
+                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
+                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
+                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
+                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
+                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
+                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
+                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
+                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
+                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                                enc.dispatch_thread_groups(
+                                    MTLSize::new(nkh as u64, 1, 1),
+                                    MTLSize::new(256, 1, 1),
+                                );
+                            }
+                        }
+                    }
+
+                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
+
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.attn_out,
+                            0,
+                            &*w_o,
+                            &self.session.activations.ffn_out,
+                            0,
+                            m,
+                            hidden as u32,
+                            q_dim as u32,
+                        );
+                    }
+
+                    unsafe {
+                        self.dispatch_fused_residual_add_norm_batch(
+                            enc,
+                            &self.session.activations.residual,
+                            &self.session.activations.ffn_out,
+                            &self.session.activations.residual,
+                            &self.session.activations.hidden,
+                            &*w_post_norm,
+                            hidden as u32,
+                            m,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+
+                    unsafe {
+                        self.dispatch_gemm_at(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_gate_up,
+                            0,
+                            &self.session.activations.gate,
+                            0,
+                            m,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                        self.dispatch_gemm_at(
+                            enc,
+                            &self.session.activations.hidden,
+                            0,
+                            &*w_gate_up,
+                            gate_byte_size,
+                            &self.session.activations.up,
+                            0,
+                            m,
+                            inter as u32,
+                            hidden as u32,
+                        );
+                    }
+                    self.dispatch_silu_mul(enc, m * inter as u32);
+                    unsafe {
+                        self.dispatch_gemm(
+                            enc,
+                            &self.session.activations.gate,
+                            0,
+                            &*w_down,
+                            &self.session.activations.ffn_out,
+                            0,
+                            m,
+                            hidden as u32,
+                            inter as u32,
+                        );
+                    }
+
+                    self.dispatch_add_and_copy(
+                        enc,
+                        &self.session.activations.ffn_out,
+                        &self.session.activations.residual,
+                        &self.session.activations.hidden,
+                        m * hidden as u32,
+                    );
+
+                    full_idx += 1;
+                }
+            }
+
+            // Close the trailing non-GDN segment (mirrors the emit_logits=false early
+            // return in forward_prefill_batched_chunk: still commit + advance the
+            // session cursor, just never compute logits).
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            timing.non_gdn_ms += seg_start.elapsed().as_secs_f64() * 1000.0;
+
+            self.session.set_position(start_pos + n);
+            timing
+        }
+
         /// MTP greedy decode loop (LATTICE_MTP=1, greedy only).
         ///
         /// Each round: draft one extra token via MTP, verify 2 tokens with the target
@@ -25817,6 +26539,165 @@ mod inner {
                 };
                 LmHeadBenchOutput { marker }
             }
+        }
+
+        /// Per-chunk GDN/non-GDN wall-clock dispatch time, in milliseconds, for the
+        /// #175 harness (`bin/bench_gdn_prefill_ab.rs`). `gdn_ms` covers only the
+        /// isolated recurrence dispatch (chunked C32 family or serial
+        /// conv1d+recurrence); `non_gdn_ms` covers everything else in the same
+        /// `max_prefill`-sized chunk (embedding excluded — see
+        /// [`forward_prefill_gdn_isolated_chunk`]'s doc comment).
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct GdnIsolatedChunkTiming {
+            pub gdn_ms: f64,
+            pub non_gdn_ms: f64,
+            pub num_gdn_layers: usize,
+        }
+
+        impl GdnIsolatedChunkTiming {
+            pub fn total_ms(&self) -> f64 {
+                self.gdn_ms + self.non_gdn_ms
+            }
+
+            pub fn accumulate(&mut self, other: &GdnIsolatedChunkTiming) {
+                self.gdn_ms += other.gdn_ms;
+                self.non_gdn_ms += other.non_gdn_ms;
+                self.num_gdn_layers += other.num_gdn_layers;
+            }
+        }
+
+        /// #175 harness entry point. Runs ONE `max_prefill`-sized prefill chunk
+        /// (`token_ids.len() <= max_prefill(state)`) with GDN recurrence dispatch
+        /// isolated into its own command buffer(s) (see
+        /// `MetalQwen35State::forward_prefill_chunk_gdn_isolated`'s doc comment for
+        /// exactly what changed vs the production dispatch path — nothing GDN-kernel
+        /// -related). Returns wall-clock GDN vs non-GDN dispatch time for this chunk.
+        ///
+        /// For prompts longer than `max_prefill`, the caller must drive the chunking
+        /// loop itself (mirrors `forward_prefill_impl`'s production chunking):
+        ///
+        /// ```ignore
+        /// state.set_gdn_chunked(chunked);
+        /// state.reset_state();
+        /// let mut total = GdnIsolatedChunkTiming::default();
+        /// let mp = max_prefill(&state);
+        /// let mut start = 0usize;
+        /// for chunk in token_ids.chunks(mp) {
+        ///     total.accumulate(&forward_prefill_gdn_isolated_chunk(&mut state, chunk, start));
+        ///     start += chunk.len();
+        /// }
+        /// ```
+        pub fn forward_prefill_gdn_isolated_chunk(
+            state: &mut MetalQwen35State,
+            token_ids: &[u32],
+            start_pos: usize,
+        ) -> GdnIsolatedChunkTiming {
+            assert_token_ids_in_vocab(state, token_ids);
+            state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos)
+        }
+
+        /// The model's vocab size, exposed so harness bins can validate token ids
+        /// BEFORE the first forward call: the entry points in this module bypass
+        /// the public `forward_prefill_impl` path and its token-id validation, and
+        /// the embedding copy is an unsafe read indexed by token id.
+        pub fn vocab_size(state: &MetalQwen35State) -> usize {
+            state.engine.config.vocab_size
+        }
+
+        /// First out-of-vocab token id, if any: `Some((index, id))` where
+        /// `id as usize >= vocab`. Pure scan, factored out for testability.
+        pub fn first_out_of_vocab(token_ids: &[u32], vocab: usize) -> Option<(usize, u32)> {
+            token_ids
+                .iter()
+                .enumerate()
+                .find(|&(_, &id)| id as usize >= vocab)
+                .map(|(i, &id)| (i, id))
+        }
+
+        /// Both bench entry points bypass the public path's token-id validation,
+        /// so they re-validate here: the first forward would otherwise read
+        /// outside `embed_tokens` in the unsafe embedding copy instead of failing
+        /// loudly before measurement.
+        fn assert_token_ids_in_vocab(state: &MetalQwen35State, token_ids: &[u32]) {
+            let vocab = state.engine.config.vocab_size;
+            if let Some((i, id)) = first_out_of_vocab(token_ids, vocab) {
+                panic!(
+                    "token id {id} at index {i} is out of vocab range ({vocab}) — refusing \
+                     to run the unsafe embedding copy on unvalidated ids (tokenizer/model \
+                     mismatch?)"
+                );
+            }
+        }
+
+        /// True iff this state's config supports the chunked GDN prefill path.
+        /// Harness bins must hard-fail when this is false rather than proceed: a
+        /// state with `set_gdn_chunked(true)` but no support would otherwise run
+        /// the serial recurrence while the harness labels the arm "chunked".
+        pub fn gdn_chunked_prefill_supported(state: &MetalQwen35State) -> bool {
+            MetalQwen35State::supports_gdn_chunked_prefill(&state.engine.config)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::first_out_of_vocab;
+
+            #[test]
+            fn first_out_of_vocab_accepts_in_range() {
+                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
+                assert_eq!(first_out_of_vocab(&[], 100), None);
+            }
+
+            #[test]
+            fn first_out_of_vocab_finds_first_offender() {
+                // Two offenders; the FIRST (index 1) must be reported.
+                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
+            }
+
+            #[test]
+            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
+                // vocab_size itself is out of range (valid ids are 0..vocab_size).
+                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
+            }
+        }
+
+        /// The session's `max_prefill` (single-command-buffer chunk cap; 512 for all
+        /// current configs, `max_cache_len.min(512)`) — the caller-side chunking loop
+        /// for [`forward_prefill_gdn_isolated_chunk`] must split prompts on this
+        /// boundary exactly as the production `forward_prefill_impl` does.
+        pub fn max_prefill(state: &MetalQwen35State) -> usize {
+            state.session.max_prefill
+        }
+
+        /// Production-path calibration entry point for the #175 harness. Runs ONE
+        /// `max_prefill`-sized prefill chunk through the real, unmodified
+        /// [`MetalQwen35State::forward_prefill_batched_chunk`] dispatch — single
+        /// command buffer, no per-layer command-buffer splits — the same path
+        /// `forward_prefill_impl` uses in production. This exists so the isolated
+        /// harness's per-layer-split measurement can be anchored against an
+        /// unmodified-dispatch total, rather than against a stale prior number: the
+        /// isolated method's own command-buffer splits add CPU<->GPU sync overhead
+        /// that a total-vs-total comparison must not include.
+        ///
+        /// `all_positions=true` (writes full-attention K/V rows and advances GDN
+        /// state for every token in `token_ids`, matching
+        /// `forward_prefill_chunk_gdn_isolated`'s contract) and `emit_logits=false`
+        /// (skips the terminal RMSNorm/lm_head/top-k tail, again matching the
+        /// isolated path, so the two measurements cover comparable work — see
+        /// `forward_prefill_chunk_gdn_isolated`'s doc comment for why omitting the
+        /// tail does not bias a serial-vs-chunked ratio).
+        ///
+        /// Returns nothing: unlike the isolated path, production dispatch is a
+        /// single command buffer per chunk (one commit + `wait_until_completed`
+        /// already inside `forward_prefill_batched_chunk`), so the caller times the
+        /// call from outside with a plain CPU `Instant` — no internal
+        /// instrumentation is needed or added.
+        pub fn forward_prefill_production_chunk(
+            state: &mut MetalQwen35State,
+            token_ids: &[u32],
+            start_pos: usize,
+        ) {
+            assert_token_ids_in_vocab(state, token_ids);
+            let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false);
         }
     }
 }
