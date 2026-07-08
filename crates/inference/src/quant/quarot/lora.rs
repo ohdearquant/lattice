@@ -235,11 +235,21 @@ mod tests {
             .collect()
     }
 
+    // NaN-honest max|a-b|: a `.fold(0.0, f32::max)` silently drops a NaN/Inf
+    // operand (IEEE maxNum keeps the non-NaN side), letting a catastrophically
+    // wrong output read as 0.0 and slip past a `<= tol` gate. Surface it instead.
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0_f32, f32::max)
+        let mut max = 0.0_f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (x - y).abs();
+            if !d.is_finite() {
+                return d;
+            }
+            if d > max {
+                max = d;
+            }
+        }
+        max
     }
 
     // --- Input-side tests (A counter-rotation) ---
