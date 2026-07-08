@@ -7014,12 +7014,26 @@ mod inner {
         /// method's return type) — this is bench-only isolation plumbing, not part of
         /// the production dispatch path, so it stays out of the default `metal-gpu`
         /// build the way `bench_support`'s other helpers do.
+        ///
+        /// `capture`: optional read-only revalidation hooks (gdn175 S1b). For every
+        /// entry whose `linear_idx` matches the GDN layer currently being processed,
+        /// immediately after that layer's GDN command buffer has completed (and
+        /// before the next GDN layer's materialize kernel can overwrite the shared
+        /// scratch buffers), this reads back that entry's `value_head`'s per-token
+        /// q/k/v/beta/log_alpha straight off the session's `gdn_chunk` scratch —
+        /// see `capture_gdn_chunk_scratch`. Pass `&[]` for the normal timing-only
+        /// path (unchanged behavior/dispatch either way; this never perturbs what
+        /// gets dispatched, only what gets read back afterward).
         #[cfg(feature = "bench-internals")]
         fn forward_prefill_chunk_gdn_isolated(
             &mut self,
             token_ids: &[u32],
             start_pos: usize,
-        ) -> bench_support::GdnIsolatedChunkTiming {
+            capture: &[bench_support::GdnCaptureRequest],
+        ) -> (
+            bench_support::GdnIsolatedChunkTiming,
+            Vec<bench_support::GdnLayerCapture>,
+        ) {
             let n = token_ids.len();
             assert!(
                 n <= self.session.max_prefill,
@@ -7078,6 +7092,7 @@ mod inner {
             let chunked_enabled = chunked_requested && chunked_supported;
 
             let mut timing = bench_support::GdnIsolatedChunkTiming::default();
+            let mut captured: Vec<bench_support::GdnLayerCapture> = Vec::new();
 
             let mut cmd = self.engine.queue.new_command_buffer();
             let mut enc = cmd.new_compute_command_encoder();
@@ -7321,6 +7336,22 @@ mod inner {
                     gdn_cmd.wait_until_completed();
                     timing.gdn_ms += gdn_start.elapsed().as_secs_f64() * 1000.0;
                     timing.num_gdn_layers += 1;
+
+                    // gdn175 S1b: read-only capture, right after this layer's GDN
+                    // command buffer completed and before the next GDN layer's
+                    // materialize kernel can overwrite the shared gdn_chunk scratch
+                    // (see capture_gdn_chunk_scratch's doc comment for the safety
+                    // argument). `linear_idx` here is still this layer's index —
+                    // it only increments at the bottom of this branch.
+                    for req in capture {
+                        if req.linear_idx == linear_idx {
+                            captured.push(self.capture_gdn_chunk_scratch(
+                                linear_idx,
+                                req.value_head,
+                                n,
+                            ));
+                        }
+                    }
 
                     // ---- reopen a fresh segment for the rest of this layer + subsequent layers ----
                     cmd = self.engine.queue.new_command_buffer();
@@ -7688,7 +7719,111 @@ mod inner {
             timing.non_gdn_ms += seg_start.elapsed().as_secs_f64() * 1000.0;
 
             self.session.set_position(start_pos + n);
-            timing
+            (timing, captured)
+        }
+
+        /// gdn175 S1b: read-only capture of one (GDN layer, value head)'s
+        /// materialized per-token chunkwise-scan inputs — q/k/v/beta/log_alpha —
+        /// off the session's shared `gdn_chunk` scratch buffers, de-chunked from
+        /// `[chunks, heads, C, dim]` back to `[n_tokens, dim]` token order.
+        ///
+        /// SAFETY / correctness argument (verified against
+        /// `forward/shaders/qwen35.metal`): `sc.q`/`sc.k`/`sc.v`/`sc.beta_log_alpha`
+        /// are written ONLY by `gdn_chunk_materialize_c32` and read (`device const`,
+        /// never written) by `gdn_chunk_solve_c32` and
+        /// `gdn_chunk_residual_output_c32`; `gdn_chunk_conv_buf_update_c32`,
+        /// `gdn_chunk_state_update_c32`, and `gdn_chunk_norm_silu_c32` never touch
+        /// them at all. So once this layer's `gdn_cmd.wait_until_completed()` has
+        /// returned (the call site, immediately before this method runs), these
+        /// four buffers hold their final values for this layer and stay untouched
+        /// until the NEXT GDN layer's own materialize dispatch reuses the same
+        /// session-owned scratch. Reading them here is a pure CPU-side copy off a
+        /// StorageModeShared buffer with no GPU work in flight — it cannot perturb
+        /// the dispatch this call is capturing.
+        ///
+        /// De-chunking: `dispatch_gdn_chunk_materialize_c32` writes row
+        /// `((chunk*num_value_heads + head)*GDN_CHUNK_SIZE + j)*dim + d` for token
+        /// `chunk*GDN_CHUNK_SIZE + j` (see `qwen35.metal`'s `head_row` computation);
+        /// only the LAST active chunk is short (materialize's `ci = min(chunk_size,
+        /// n_tokens - chunk_base)` loop bound leaves the tail rows at their
+        /// zero-initialized default). Reading exactly `rows_in_chunk * dim`
+        /// contiguous elements per chunk therefore already skips the zero-padded
+        /// tail rows and yields the valid tokens in order — no separate reshuffle
+        /// needed after concatenating the per-chunk reads.
+        ///
+        /// `log_alpha` is returned RAW (natural-log, per-token, NOT cumulative) —
+        /// the S1b spec's `alpha[t] = exp(log_alpha[t])` transform is left to the
+        /// caller so the oracle-feeding step stays visibly separate from capture.
+        #[cfg(feature = "bench-internals")]
+        fn capture_gdn_chunk_scratch(
+            &self,
+            linear_idx: usize,
+            value_head: usize,
+            n_tokens: usize,
+        ) -> bench_support::GdnLayerCapture {
+            let cfg = &self.engine.config;
+            let num_vh = cfg.linear_num_value_heads();
+            let kd = cfg.linear_key_head_dim;
+            let vd = cfg.linear_value_head_dim;
+            assert!(
+                value_head < num_vh,
+                "capture_gdn_chunk_scratch: value_head={value_head} out of range \
+                 (num_value_heads={num_vh})"
+            );
+            assert!(
+                n_tokens > 0,
+                "capture_gdn_chunk_scratch: n_tokens must be > 0"
+            );
+
+            let num_chunks_active = n_tokens.div_ceil(GDN_CHUNK_SIZE);
+            let tail = n_tokens - (num_chunks_active - 1) * GDN_CHUNK_SIZE;
+
+            let sc = &self.session.activations.gdn_chunk;
+            let mut q = Vec::with_capacity(n_tokens * kd);
+            let mut k = Vec::with_capacity(n_tokens * kd);
+            let mut v = Vec::with_capacity(n_tokens * vd);
+            let mut beta = Vec::with_capacity(n_tokens);
+            let mut log_alpha = Vec::with_capacity(n_tokens);
+
+            for chunk in 0..num_chunks_active {
+                let rows = if chunk + 1 == num_chunks_active {
+                    tail
+                } else {
+                    GDN_CHUNK_SIZE
+                };
+                let base_row = (chunk * num_vh + value_head) * GDN_CHUNK_SIZE;
+                // SAFETY: see this method's doc comment — GPU completed, read-only,
+                // no concurrent write to sc.q/k/v/beta_log_alpha at this point.
+                unsafe {
+                    q.extend_from_slice(&read_buffer_offset(&sc.q, base_row * kd, rows * kd));
+                    k.extend_from_slice(&read_buffer_offset(&sc.k, base_row * kd, rows * kd));
+                    v.extend_from_slice(&read_buffer_offset(&sc.v, base_row * vd, rows * vd));
+                    let bla = read_buffer_offset(&sc.beta_log_alpha, base_row * 2, rows * 2);
+                    for pair in bla.chunks_exact(2) {
+                        beta.push(pair[0]);
+                        log_alpha.push(pair[1]);
+                    }
+                }
+            }
+
+            debug_assert_eq!(q.len(), n_tokens * kd);
+            debug_assert_eq!(k.len(), n_tokens * kd);
+            debug_assert_eq!(v.len(), n_tokens * vd);
+            debug_assert_eq!(beta.len(), n_tokens);
+            debug_assert_eq!(log_alpha.len(), n_tokens);
+
+            bench_support::GdnLayerCapture {
+                linear_idx,
+                value_head,
+                length: n_tokens,
+                dk: kd,
+                dv: vd,
+                q,
+                k,
+                v,
+                beta,
+                log_alpha,
+            }
         }
 
         /// MTP greedy decode loop (LATTICE_MTP=1, greedy only).
@@ -23970,6 +24105,342 @@ mod inner {
             }
         }
 
+        /// gdn175 S1b: revalidate the chunkwise WY/DPLR GDN oracle
+        /// (`gdn_chunk_ref::{sequential_gdn, chunkwise_gdn}`, validated to <=1e-5 on
+        /// synthetic fixtures in S1a / PR #715) against REAL Qwen3.5-0.8B GDN-layer
+        /// recurrence inputs captured from a live prefill. Synthetic fixtures draw
+        /// i.i.d. random keys; real activations have correlated keys, which
+        /// conditions the chunkwise triangular solve differently — this is the last
+        /// S1 gate before any kernel work (S2).
+        ///
+        /// KILL criterion: any real-input max_abs > 1e-5 means the math has a
+        /// conditioning problem the synthetic fixtures missed. This test does NOT
+        /// loosen the tolerance to compensate — a failure here must be reported,
+        /// not patched around.
+        ///
+        /// `(max_abs, nan_count, inf_count)` over `|a[i]-b[i]|`. Deliberately NOT a
+        /// plain `.fold(0.0, f32::max)`: `f32::max` implements IEEE-754 maxNum,
+        /// which SILENTLY returns the non-NaN operand when one side is NaN — a
+        /// diff array containing NaNs would report a possibly-tiny max_abs while
+        /// hiding the NaNs entirely. `nan_count`/`inf_count` make that failure mode
+        /// visible instead of swallowed.
+        #[cfg(feature = "bench-internals")]
+        fn diff_stats(a: &[f32], b: &[f32]) -> (f32, usize, usize) {
+            let mut max_abs = 0.0f32;
+            let mut nan_count = 0usize;
+            let mut inf_count = 0usize;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let d = (x - y).abs();
+                if d.is_nan() {
+                    nan_count += 1;
+                } else if d.is_infinite() {
+                    inf_count += 1;
+                    max_abs = f32::INFINITY;
+                } else if d > max_abs {
+                    max_abs = d;
+                }
+            }
+            (max_abs, nan_count, inf_count)
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn175_s1b_chunkwise_oracle_real_activations() {
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            if !model_dir.join("model.safetensors").exists() {
+                eprintln!("skipping gdn175_s1b_chunkwise_oracle_real_activations: model missing");
+                return;
+            }
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load qwen3.5-0.8b");
+            let Some(_device) = Device::system_default() else {
+                eprintln!("skipping: no Metal device");
+                return;
+            };
+            let _gpu = gpu_test_lock();
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct Metal state");
+            assert!(
+                bench_support::gdn_chunked_prefill_supported(&state),
+                "qwen3.5-0.8b checkpoint at {} does not support the chunked GDN prefill path",
+                model_dir.display()
+            );
+
+            // ~300 real tokens: ceil(300/32)=10 chunks incl. a partial 12-token tail
+            // (S1b spec: ~200-400 tokens so there are 6-12 chunks incl. a partial tail).
+            let tokens = {
+                let mut t = long_real_text_tokens(model.tokenizer());
+                assert!(
+                    t.len() >= 300,
+                    "long_real_text_tokens produced only {} tokens, need >=300",
+                    t.len()
+                );
+                t.truncate(300);
+                t
+            };
+            let length = tokens.len();
+
+            // Early/mid/late GDN ("linear_attention") layer indices — `linear_idx` is
+            // the 0-based index among GDN layers only, computed from the checkpoint's
+            // own layer_types rather than hardcoded, so this stays correct if a future
+            // checkpoint changes the hybrid layer pattern.
+            let num_linear = model
+                .config()
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::LinearAttention)
+                .count();
+            assert!(
+                num_linear >= 3,
+                "need >=3 GDN layers for early/mid/late targets, found {num_linear}"
+            );
+            let layer_targets = [0usize, num_linear / 2, num_linear - 1];
+            let head_targets = [0usize, 8usize];
+            let num_vh = model.config().linear_num_value_heads();
+            for &h in &head_targets {
+                assert!(
+                    h < num_vh,
+                    "head target {h} out of range (num_value_heads={num_vh})"
+                );
+            }
+
+            let capture_requests: Vec<bench_support::GdnCaptureRequest> = layer_targets
+                .iter()
+                .flat_map(|&linear_idx| {
+                    head_targets
+                        .iter()
+                        .map(move |&value_head| bench_support::GdnCaptureRequest {
+                            linear_idx,
+                            value_head,
+                        })
+                })
+                .collect();
+
+            state.use_gdn_chunked = true;
+            state.reset_state();
+            let (_timing, captures) = bench_support::forward_prefill_gdn_isolated_chunk_capture(
+                &mut state,
+                &tokens,
+                0,
+                &capture_requests,
+            );
+            assert_eq!(
+                captures.len(),
+                capture_requests.len(),
+                "capture count mismatch — a requested (layer, head) target never matched a \
+                 processed GDN layer (layer_targets={layer_targets:?})"
+            );
+
+            const TOL: f32 = 1.0e-5;
+            const D4_WATCH: f32 = 0.5 * TOL; // near-but-under-tolerance watch threshold
+
+            let mut round_trip_report: Vec<(usize, usize, usize, f32, f32)> = Vec::new();
+            // (layer, head, C, max_abs_out, max_abs_h, nan_out, inf_out, nan_h, inf_h)
+            #[allow(clippy::type_complexity)]
+            let mut table: Vec<(
+                usize,
+                usize,
+                usize,
+                f32,
+                f32,
+                usize,
+                usize,
+                usize,
+                usize,
+            )> = Vec::new();
+            // (layer, head, log_alpha_min, log_alpha_max, alpha_min, alpha_max,
+            // gamma_at_c32_min) — diagnostic evidence for whether a real-input
+            // divergence is decay-underflow conditioning (KILL-relevant) vs a
+            // capture/transcription bug.
+            let mut alpha_stats: Vec<(usize, usize, f32, f32, f32, f32, f32)> = Vec::new();
+            let mut any_d4_watch = false;
+            let mut failures: Vec<String> = Vec::new();
+
+            for cap in &captures {
+                assert_eq!(cap.length, length);
+                let dk = cap.dk;
+                let dv = cap.dv;
+
+                // Round-trip sanity (S1b spec): ln(alpha[t]) must equal the captured
+                // log_alpha[t] within 1e-6, sampled at a few tokens across the sequence.
+                let sample_idx = [0usize, length / 2, length - 1];
+                for &t in &sample_idx {
+                    let la = cap.log_alpha[t];
+                    let alpha = la.exp();
+                    let round_trip = alpha.ln();
+                    let diff = (round_trip - la).abs();
+                    round_trip_report.push((cap.linear_idx, cap.value_head, t, la, diff));
+                    if diff.is_nan() || diff > 1e-6 {
+                        failures.push(format!(
+                            "ROUND-TRIP: layer={} head={} t={}: ln(exp(log_alpha))={} vs \
+                             log_alpha={} diff={} exceeds 1e-6 round-trip bound",
+                            cap.linear_idx, cap.value_head, t, round_trip, la, diff
+                        ));
+                    }
+                }
+
+                // The oracle feed transform (S1b spec): per-token alpha[t] =
+                // exp(log_alpha[t]) — NEVER the gamma buffer or a cumulative
+                // log-alpha; chunkwise_gdn recomputes gamma = cumprod(alpha) itself.
+                let alpha: Vec<f32> = cap.log_alpha.iter().map(|x| x.exp()).collect();
+                let h0 = vec![0.0f32; dv * dk];
+                let (seq_out, seq_h) = crate::forward::gdn_chunk_ref::sequential_gdn(
+                    &cap.q, &cap.k, &cap.v, &cap.beta, &alpha, &h0, length, dk, dv, true,
+                );
+
+                // Diagnostic: min/max of log_alpha and alpha, plus the smallest
+                // per-chunk cumulative product gamma would reach at C=32 (the
+                // kernel's own chunk size) — a near-zero gamma means the LINEAR-
+                // space cumprod the CPU oracle computes (`chunkwise_gdn`'s
+                // `running *= a_c[i]`) is underflowing, which is a fundamentally
+                // different failure mode than a solve-conditioning error: the
+                // kernel's log-alpha floor (-88, see qwen35.metal
+                // gdn_chunk_materialize_c32) only keeps ITS OWN log-space
+                // cumulative scan finite; it says nothing about a linear-space
+                // cumprod reference computing 1.0/gamma downstream.
+                let log_alpha_min = cap.log_alpha.iter().copied().fold(f32::INFINITY, f32::min);
+                let log_alpha_max = cap
+                    .log_alpha
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let alpha_min = alpha.iter().copied().fold(f32::INFINITY, f32::min);
+                let alpha_max = alpha.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut gamma32_min = f32::INFINITY;
+                for chunk_start in (0..length).step_by(32) {
+                    let chunk_end = (chunk_start + 32).min(length);
+                    let mut running = 1.0f32;
+                    for &a in &alpha[chunk_start..chunk_end] {
+                        running *= a;
+                    }
+                    gamma32_min = gamma32_min.min(running);
+                }
+                alpha_stats.push((
+                    cap.linear_idx,
+                    cap.value_head,
+                    log_alpha_min,
+                    log_alpha_max,
+                    alpha_min,
+                    alpha_max,
+                    gamma32_min,
+                ));
+
+                for &chunk_size in &[32usize, 64, 128] {
+                    let (chk_out, chk_h) = crate::forward::gdn_chunk_ref::chunkwise_gdn(
+                        &cap.q, &cap.k, &cap.v, &cap.beta, &alpha, &h0, length, dk, dv, chunk_size,
+                        true,
+                    );
+                    let (max_abs_out, nan_out, inf_out) = diff_stats(&chk_out, &seq_out);
+                    let (max_abs_h, nan_h, inf_h) = diff_stats(&chk_h, &seq_h);
+
+                    table.push((
+                        cap.linear_idx,
+                        cap.value_head,
+                        chunk_size,
+                        max_abs_out,
+                        max_abs_h,
+                        nan_out,
+                        inf_out,
+                        nan_h,
+                        inf_h,
+                    ));
+
+                    let worst = max_abs_out.max(max_abs_h);
+                    if worst.is_finite()
+                        && worst > D4_WATCH
+                        && worst <= TOL
+                        && nan_out == 0
+                        && nan_h == 0
+                    {
+                        any_d4_watch = true;
+                        eprintln!(
+                            "D4-WATCH: layer={} head={} C={} max_abs_out={:.3e} \
+                             max_abs_h={:.3e} is near (>{:.1e}) but under the {:.1e} KILL \
+                             tolerance — candidate evidence for the D4 f32-accumulator \
+                             mandate.",
+                            cap.linear_idx,
+                            cap.value_head,
+                            chunk_size,
+                            max_abs_out,
+                            max_abs_h,
+                            D4_WATCH,
+                            TOL
+                        );
+                    }
+
+                    if max_abs_out > TOL || nan_out > 0 {
+                        failures.push(format!(
+                            "KILL: layer={} head={} C={} chunkwise_gdn out diverged from \
+                             sequential_gdn on REAL activations: max_abs={:.3e} > {:.1e} \
+                             (nan_count={nan_out}, inf_count={inf_out})",
+                            cap.linear_idx, cap.value_head, chunk_size, max_abs_out, TOL
+                        ));
+                    }
+                    if max_abs_h > TOL || nan_h > 0 {
+                        failures.push(format!(
+                            "KILL: layer={} head={} C={} chunkwise_gdn h diverged from \
+                             sequential_gdn on REAL activations: max_abs={:.3e} > {:.1e} \
+                             (nan_count={nan_h}, inf_count={inf_h})",
+                            cap.linear_idx, cap.value_head, chunk_size, max_abs_h, TOL
+                        ));
+                    }
+                }
+            }
+
+            eprintln!(
+                "gdn175 S1b: real-activation chunkwise-vs-sequential oracle parity \
+                 (length={length}, {} layers x {} heads x 3 chunk sizes):",
+                layer_targets.len(),
+                head_targets.len()
+            );
+            eprintln!(
+                "  layer | head | C   | max_abs_out | max_abs_h  | nan_out | inf_out | nan_h | inf_h"
+            );
+            for (layer, head, c, out, h, nan_out, inf_out, nan_h, inf_h) in &table {
+                eprintln!(
+                    "  {layer:5} | {head:4} | {c:3} | {out:.3e}    | {h:.3e}   | \
+                     {nan_out:7} | {inf_out:7} | {nan_h:5} | {inf_h:5}"
+                );
+            }
+            eprintln!(
+                "gdn175 S1b: per-(layer,head) decay diagnostics (log_alpha/alpha range, \
+                 min cumulative gamma over any C=32 window):"
+            );
+            eprintln!(
+                "  layer | head | log_alpha_min | log_alpha_max | alpha_min  | alpha_max | gamma32_min"
+            );
+            for (layer, head, lamin, lamax, amin, amax, g32) in &alpha_stats {
+                eprintln!(
+                    "  {layer:5} | {head:4} | {lamin:.6e}   | {lamax:.6e}   | {amin:.3e} | {amax:.3e} | {g32:.3e}"
+                );
+            }
+            eprintln!("gdn175 S1b: log_alpha round-trip sanity (ln(exp(log_alpha)) vs log_alpha):");
+            eprintln!("  layer | head | t   | log_alpha    | diff");
+            for (layer, head, t, la, diff) in &round_trip_report {
+                eprintln!("  {layer:5} | {head:4} | {t:3} | {la:.6e} | {diff:.3e}");
+            }
+            if any_d4_watch {
+                eprintln!(
+                    "gdn175 S1b: one or more cells landed near (but under) the 1e-5 KILL \
+                     tolerance — see D4-WATCH lines above; report as a D4 f32-accumulator \
+                     finding."
+                );
+            } else {
+                eprintln!("gdn175 S1b: no cells near the 1e-5 tolerance boundary.");
+            }
+
+            assert!(
+                failures.is_empty(),
+                "gdn175 S1b: {} failing cell(s) — conditioning problem the synthetic \
+                 fixtures missed, do NOT loosen tolerance:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
         /// Localization probe: run the SERIAL token-by-token path twice and diff the final GDN
         /// state.  If the serial reference is itself nondeterministic, the chunked-vs-serial state
         /// diff cannot isolate the chunked kernels — the race lives in shared input producers
@@ -26593,7 +27064,59 @@ mod inner {
             start_pos: usize,
         ) -> GdnIsolatedChunkTiming {
             assert_token_ids_in_vocab(state, token_ids);
-            state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos)
+            state
+                .forward_prefill_chunk_gdn_isolated(token_ids, start_pos, &[])
+                .0
+        }
+
+        /// One (GDN layer, value head) target for a [`GdnLayerCapture`] read —
+        /// gdn175 S1b real-activation revalidation of the chunkwise WY/DPLR oracle
+        /// (`gdn_chunk_ref.rs`) against a real Qwen3.5-0.8B prefill. `linear_idx` is
+        /// the 0-based index among GDN ("linear_attention") layers ONLY — the same
+        /// counter `forward_prefill_chunk_gdn_isolated` increments once per GDN
+        /// layer it processes, NOT the absolute index into `layer_types`.
+        #[derive(Clone, Copy, Debug)]
+        pub struct GdnCaptureRequest {
+            pub linear_idx: usize,
+            pub value_head: usize,
+        }
+
+        /// Captured per-token chunkwise-scan inputs for one (GDN layer, value
+        /// head), de-chunked to `[length, dim]` token order (see
+        /// `MetalQwen35State::capture_gdn_chunk_scratch`'s doc comment for the
+        /// read-site safety argument and the de-chunking layout proof). `log_alpha`
+        /// is RAW (per-token, natural-log, NOT cumulative) — the S1b oracle feed
+        /// transform `alpha[t] = exp(log_alpha[t])` is the caller's job, never
+        /// `gamma`/cumulative log-alpha (see gdn175 S1b spec: feeding either would
+        /// double-apply the decay the oracle's own `chunkwise_gdn` recomputes
+        /// internally).
+        #[derive(Clone, Debug)]
+        pub struct GdnLayerCapture {
+            pub linear_idx: usize,
+            pub value_head: usize,
+            pub length: usize,
+            pub dk: usize,
+            pub dv: usize,
+            pub q: Vec<f32>,         // [length, dk]
+            pub k: Vec<f32>,         // [length, dk]
+            pub v: Vec<f32>,         // [length, dv]
+            pub beta: Vec<f32>,      // [length]
+            pub log_alpha: Vec<f32>, // [length], raw natural-log per-token decay
+        }
+
+        /// S1b variant of [`forward_prefill_gdn_isolated_chunk`]: identical
+        /// dispatch, plus a read-only capture of real per-token GDN-layer
+        /// recurrence inputs for each requested (layer, head) target. Capture
+        /// cannot perturb the measured/production dispatch — see
+        /// `MetalQwen35State::capture_gdn_chunk_scratch`'s doc comment.
+        pub fn forward_prefill_gdn_isolated_chunk_capture(
+            state: &mut MetalQwen35State,
+            token_ids: &[u32],
+            start_pos: usize,
+            capture: &[GdnCaptureRequest],
+        ) -> (GdnIsolatedChunkTiming, Vec<GdnLayerCapture>) {
+            assert_token_ids_in_vocab(state, token_ids);
+            state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos, capture)
         }
 
         /// The model's vocab size, exposed so harness bins can validate token ids
