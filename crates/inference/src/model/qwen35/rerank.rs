@@ -30,6 +30,13 @@ impl Qwen35Model {
     /// sampling anywhere on this path, and each candidate gets a fresh KV
     /// cache / GDN state (see [`Self::compute_token_nlls`]).
     ///
+    /// Scores are comparable *only within a single call*. Each score is a mean
+    /// per-token NLL (negated), so its magnitude depends on the query's length
+    /// and token distribution; the same absolute value means different things
+    /// for different queries. Rank order within one call is the only stable
+    /// signal — callers must not threshold or compare absolute scores across
+    /// calls.
+    ///
     /// `candidates` empty returns `Ok(vec![])`. If a candidate's tokens would
     /// push `[candidate, query]` past [`Self::max_context`], the candidate is
     /// left-truncated (earliest tokens dropped, keeping the tokens nearest the
