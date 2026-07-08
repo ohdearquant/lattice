@@ -92,6 +92,11 @@ path = "src/bin/bench_decode_ab.rs"
 required-features = ["f16", "metal-gpu"]
 
 [[bin]]
+name = "bench_gdn_prefill_ab"
+path = "src/bin/bench_gdn_prefill_ab.rs"
+required-features = ["f16", "metal-gpu", "bench-internals"]
+
+[[bin]]
 name = "bench_lora_mixture"
 path = "src/bin/bench_lora_mixture.rs"
 required-features = ["f16", "metal-gpu"]
