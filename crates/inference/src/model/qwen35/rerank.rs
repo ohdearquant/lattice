@@ -373,8 +373,9 @@ mod tests {
     /// sequence instead of just the query positions), the score computed for
     /// each candidate stops being "how well does this candidate predict the
     /// query" and the identity-token/random-model signal this test relies on
-    /// breaks — see `rerank_mutation_sensitive_to_query_slice_bounds` below,
-    /// which proves this by perturbing the same bounds directly.
+    /// breaks — see `rerank_score_matches_direct_query_position_nll_reference`,
+    /// which pins the exact contract by recomputing the query-position-only NLL
+    /// average independently and asserting equality.
     #[test]
     fn rerank_ranks_matching_candidate_first() {
         let model = build_model(test_config(), 0xA55A);
