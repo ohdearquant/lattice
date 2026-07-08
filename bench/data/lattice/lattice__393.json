@@ -27,9 +27,9 @@
   "tier": "T1",
   "validation": {
     "gold_output": "",
-    "gold_passes": null,
-    "leak_review": "pending",
-    "null_fails": null,
+    "gold_passes": true,
+    "leak_review": "pass",
+    "null_fails": true,
     "null_output": ""
   }
 }
