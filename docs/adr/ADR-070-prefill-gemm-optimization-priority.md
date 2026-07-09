@@ -32,7 +32,7 @@ PPL delta budget (≤0.3 conservative, ≤1.0 aggressive).
 
 ## Measured evidence (this engine, this hardware)
 
-Each row is a runtime measurement (M2/M3/M5/M6/M7), an internal profiler result
+Each row is a runtime measurement (M2/M3/M5/M6/M7/M10), an internal profiler result
 (M1/M8/M9), or a source-level finding (M4) from this repo, tagged with its most durable
 pointer. Rows backed only by internal profiling say so and cite a tracking issue where one
 exists rather than a merged artifact. Hardware unless noted: M2 Max, Qwen3.5-0.8B, steady-state.
