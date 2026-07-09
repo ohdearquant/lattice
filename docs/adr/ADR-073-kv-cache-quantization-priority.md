@@ -107,8 +107,8 @@ gated behind an experiment because no lattice quality/throughput data exists for
 
 1. **P1 — f16 KV default-flip (#154).** Rankable on measured evidence exactly as ADR-072 ranked
    MLP-only W3 #1: on an already-measured, already-shipped-but-gated result. KV3 proved correctness
-   (Δ≈4e-6) and decode-neutrality, with a real memory win at long context (48→24 MiB @4096 on the
-   0.8B, 512→256 MiB on the 27B). The only blocker is KV5 (the CI parity-test gap) — an engineering
+   (Δ≈4e-6) and decode-neutrality, with a real memory win at long context (96→48 MiB @4096 on the
+   0.8B, 512→256 MiB on the 27B — the f32→f16 halving; int8 would halve the 0.8B figure again to 24 MiB). The only blocker is KV5 (the CI parity-test gap) — an engineering
    completeness gate, **not** an open empirical question; close it by extending #558's existing probe
    into the first-N greedy-parity test #252 originally specified, then flip `use_kv_f16` default to
    ON. Validate: the existing f32-vs-f16 A/B (`ppl_metal` / `bench_decode_ab`) already produces the
