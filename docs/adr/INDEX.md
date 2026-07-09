@@ -107,6 +107,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [069](ADR-069-vision-encoder-qwen35-recalibration.md) | Vision Encoder Recalibration for Qwen3.5-0.8B                 | Proposed     | none         |
 | [070](ADR-070-cpu-embedding-batched-encode.md)     | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate | Proposed | ADR-058 |
 | [079](ADR-079-adaptive-micro-lora-brain.md)        | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop | Proposed | ADR-008/031/043/045/054/056/057 |
+| [080](ADR-080-consolidation-duplicated-contracts.md) | Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation) | Proposed | ADR-058, ADR-064, ADR-066 |
 
 ## informational
 
