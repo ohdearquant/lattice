@@ -1,0 +1,133 @@
+# ADR-072: Weight Quantization Priority (Metal)
+
+**Status**: Proposed
+**Date**: 2026-07-09
+**Crate**: lattice-inference
+
+> **Evidence basis**: The Decision below is grounded in this engine's own shipped source and
+> measured perplexity results (the **Measured / source-verified reality** table). The core
+> weight-quant machinery — group-wise Q4, per-row Q8, and the full offline QuaRot rotation
+> pipeline — is already shipped, so this ADR ranks the *open* levers rather than proposing a
+> greenfield quantizer. A parallel external prior-art survey (W3/SpinQuant/FP4/FP8/online-Hadamard
+> literature) is folded as the **[prior, unvalidated on our hardware]** section; where its
+> arithmetic assumed a different Q4 block size it is corrected against the shipped format. The
+> ranking is fixed by the measured decode profile and the measured QuaRot quality result, not by
+> the survey.
+
+## Context
+
+Decode on this engine is weight-bandwidth-bound: each generated token streams the full weight set
+through the GPU, so weight bit-width is the primary decode-throughput lever (distinct from the KV
+and GDN-state traffic addressed in ADR-071). Two quantization tiers already ship (Q4, Q8), and a
+rotation-based tier (offline QuaRot) ships as infrastructure but measures as a net-negative on
+quality. This ADR **ranks the open weight-quant levers** — W3 (#420), online-Hadamard rotation
+(#703), FP4/FP8 load formats (#683/#684), SpinQuant (#421), and the role-aware precision policy
+(#423) — so effort lands on the one the measured decode profile and the measured quality data say
+matters, and records which paths are closed so they are not re-tried.
+
+Target is Metal-only (no CUDA). Apple GPUs expose `simdgroup_matrix` but **no low-precision matrix
+unit**, so sub-8-bit and FP4/FP8 formats are storage/bandwidth plays that dequantize to f16 for
+compute — they cut weight traffic, not compute cost. Any new tier is gated by the armed Q4 PPL
+quality gate (golden 16.589, tolerance 0.05) plus a per-tier PPL delta budget (≤0.3 conservative,
+≤1.0 aggressive) and, per the repo's perf-PR rule, a `make bench-compare` decode-throughput A/B.
+
+## Measured / source-verified reality (this engine)
+
+Each row is tagged **runtime-measured** (a bench/eval on this hardware), **unit-test / gate-pinned**
+(a value asserted by a committed test or CI gate), or **source-read** (a structural fact read from
+merged code on `origin/main`), with its most durable public pointer. Internal profiling with no
+merged artifact says so.
+
+| # | Finding | How known | Pointer |
+|---|---------|-----------|---------|
+| W1 | **Q4 is shipped**: group-32, v2 format **20 B/block (16 B packed nibbles + f16 scale + f16 bias) = 5.0 effective bits/weight** (not the 4.25–4.5 of 64/128-size blocks), asymmetric by default; symmetric mode only for rotated tensors. Metal `gemm_q4_tiled` / `gemv_q4_decode`. | source-read | `weights/q4_weights.rs:3-71`; kernels `forward/shaders/gemm_q4_tiled.metal` |
+| W2 | **Q8 is shipped**: per-row symmetric int8, one f32 scale per output row (near-zero metadata vs per-block int4). Metal `gemm_q8_tiled` / `gemv_q8_decode`. | source-read | `weights/q8_weights.rs` |
+| W3 | **Offline QuaRot v0 (randomized Hadamard R1/R2) is shipped and wired into the serving path**: full convert/fuse/absorb pipeline, and the same `from_q4_dir` loader used for plain Q4 accepts QuaRot dirs via `ManifestFlavor::QuaRot`. CI exact-token composed-golden gate. | source-read | ADR-044/045; `quant/quarot/*`, `bin/quantize_quarot.rs`; `forward/metal_qwen35.rs:13546`; `tests/quarot_q4_composed_golden.rs` |
+| W4 | **Offline QuaRot v0 is a measured NET-NEGATIVE quality tier**: unrotated Q4 **16.589** vs QuaRot Q4 **19.007** PPL, delta **+2.418** @2048 tok (real GPU, WikiText-2). The ADR-044-era "−1.61 QuaRot better" was a pre-RoPE-fix artifact — forward-path fixes lifted the unrotated baseline ~4.5 PPL but QuaRot only ~1.8, so the old "win" was QuaRot compensating for since-fixed bugs. | runtime-measured | `docs/bench_results/perplexity.tsv` (commit `ae1f91cfc`); #616 (closed) |
+| W5 | **The Q4 PPL quality gate is armed and required**: golden **16.589111** (q4-unrotated tier), tolerance 0.05, captured on CI paravirtual Metal; `q4-ppl-quality` → `parity-gate.needs` → repo required checks. | gate-pinned | `tests/fixtures/ppl_gate_v1/golden.json`; `.github/workflows/e2e-parity.yml:551-660` |
+| W6 | **A runtime Hadamard-rotation call-site already exists**: `quarot_rotation: Option<RandomizedHadamard>` on the Metal state counter-rotates MTP-head activations (ADR-051). Not general R3/R4, but a working runtime `RandomizedHadamard::apply` precedent — #703 is an extension, not a greenfield wire-up. | source-read | `forward/metal_qwen35.rs:1481` (field), `:4952,:4982,:5330` (uses) |
+| W7 | Decode is weight-bandwidth-bound; **MLP weight GEMMs are ≈35% of decode time**, GQA projections next, GDN cheapest. So MLP-weight bit-width is the decode-bandwidth lever. | internal profiling, no merged artifact | prior decode-bandwidth profiling; a `make bench-compare` on any W3 PR is the public gate |
+
+## Prior / unvalidated on our hardware
+
+Folded from the external survey as **data**. Adopted where it matches the measured result;
+corrected where its arithmetic assumed a different block size.
+
+- **Offline-only rotation as a production quality path — REFUTED**, and this *matches* the measured
+  W4 net-negative (cross-validated, not just asserted). **Online Hadamard rotation** is the survey's
+  proposed mechanism to recover rotation's benefit at runtime.
+- **W3 (3-bit), MLP-only — highest leverage.** The survey's weight-traffic arithmetic assumed 64/128
+  blocks; corrected to the shipped **group-32**: W3@32 ≈ 4.0 bpw vs Q4's 5.0 → ~20% weight-traffic
+  cut on the quantized tensors (the survey's 22–24% at larger blocks — direction holds, magnitude
+  adjusts). MLP-only keeps the sensitive attention path at Q4.
+- **FP8 (E4M3) / FP4 (MXFP4/NVFP4) — mechanical load formats**, dequant-on-read to f16. No compute
+  speedup on Apple GPUs (no low-precision matrix unit); value is checkpoint compatibility + weight
+  traffic, only when a target model ships in these formats.
+- **SpinQuant (learned rotation) — last.** Only worth it if online rotation first proves rotation
+  beats unrotated at all.
+- **Role-aware mixed-precision policy — a framework layer** (which layers get which precision) that
+  MLP-only W3 is the first concrete instance of.
+- **Breadth surveys** (calibration-corpus sizing, fp16 failure modes, KV-cache compression) —
+  tangential to weight quant; the KV points fold into a future KV-quant ADR, not this one.
+
+## Decision
+
+Rank the open weight-quant levers by *measured decode leverage × quality risk*, leading with the
+lever the decode profile (W7) points at and gating the rotation question on a cheap equivalence check
+before any kernel work.
+
+1. **P1 — MLP-only W3 (#420).** Highest leverage: decode is weight-bandwidth-bound and MLP GEMMs are
+   ~35% of it (W7); W3@group-32 ≈ 4.0 bpw vs Q4's 5.0 → ~20% MLP weight-traffic cut. It is
+   **independent of the QuaRot net-negative** — it proceeds on the shipping unrotated-asymmetric-Q4
+   baseline (W1). Validate: a `Q3Block` at the real group-32 (not 64/128) + the existing
+   `eval_perplexity --q4-dir` harness (the #616 gate path), PPL delta budget < 0.2–0.25 vs the 16.589
+   golden (W5), plus `make bench-compare` for the decode-time claim. *Build.*
+2. **P2 — Online R3/R4 Hadamard rotation (#703).** This lever *decides whether QuaRot is worth
+   shipping at all*: offline v0 is a measured net-negative (W4), so the shipped rotation
+   infrastructure (W3) is dead weight as a quality tier until online rotation recovers it. Lower-risk
+   than a greenfield wire-up given the runtime `RandomizedHadamard::apply` precedent (W6). Validate:
+   **CPU/f16 rotation-equivalence first** (mean-abs ≤ 5e-4 vs unrotated) *before* any Metal kernel,
+   then the PPL matrix — offline+online must land within ~+0.1 of the 16.589 unrotated baseline. Gate:
+   if it cannot recover to within ~+0.1, offline QuaRot stays a research artifact, not a serving tier.
+   *Build, gated on the equivalence check.*
+3. **P3 — FP8 (E4M3) / FP4 (MXFP4/NVFP4) dequant-on-read loaders (#684/#683).** Lowest research risk
+   (mechanical, golden-vector correctness, no PPL judgment) but **zero decode-throughput payoff on
+   their own** — Apple GPUs dequant to f16 for compute, so these are load-format compatibility, not a
+   speed lever. **Demand-gated**: implement when a target checkpoint actually ships in these formats
+   (e.g. the DeepSeek-V4 line per the issue bodies), not speculatively. *Build, demand-gated.*
+
+**Deferred — SpinQuant / learned rotation (#421).** Last; gated on #703 proving rotation beats
+unrotated. If online Hadamard cannot recover QuaRot, learned rotations chase a refuted premise.
+
+**Enabler (light framework) — role-aware mixed-precision policy table (#423).** The per-layer
+precision-selection framework that "MLP-only W3" (P1) is the first instance of. P1 can ship
+standalone; seeding the policy table as part of it keeps per-role precision clean. Not a separate
+priority tier.
+
+**Closed by measurement — offline QuaRot v0 as a quality tier** (W4, +2.418). The rotation pipeline
+and loader stay shipped infrastructure (correct and gated, and still serving the ADR-051 MTP path),
+but offline QuaRot is **not a recommended serving tier** until #703 recovers it — the ADR-044
+conclusion is amended to this at the priority level (already reflected in the W5 gate's note).
+
+## Consequences
+
+- **Positive.** The ADR leads with the single lever the measured decode profile says matters
+  (MLP-only W3), and puts the QuaRot-recovery question (#703) behind a cheap CPU-equivalence gate
+  before committing Metal kernel work. FP4/FP8 are correctly demand-gated, so no speculative kernel
+  effort lands for formats no target checkpoint uses yet.
+- **Cost.** W3 needs a new `Q3Block` format plus Metal `gemm_q3`/`gemv_q3` kernels — real work, and
+  its PPL must be defended against the armed 16.589 gate (W5). Online rotation (#703) adds a runtime
+  rotation apply on the decode hot path that must not regress decode throughput measurably.
+- **Risk.** If W3-MLP PPL delta exceeds ~0.25, the ~20% bandwidth win is not worth the quality loss —
+  the eval gate catches this before merge, so the downside is a closed experiment, not a shipped
+  regression. If #703 cannot recover QuaRot to within ~+0.1, the rotation infrastructure stays unused
+  as a quality tier (but is cheap to keep for the MTP path it already serves).
+
+## Follow-ups
+
+- #420 (W3 MLP-only) → **P1**; `Q3Block` at group-32 + the #616 `eval_perplexity` gate path + `make bench-compare`.
+- #703 (online R3/R4 Hadamard) → **P2**; CPU/f16 equivalence gate first (W6 precedent), then the recovery PPL matrix.
+- #684 / #683 (FP8 / FP4 loaders) → **P3**, demand-gated on a target checkpoint shipping in-format.
+- #421 (SpinQuant) → deferred, gated on #703.
+- #423 (role-aware precision policy) → light framework, seeded by P1.
+- ADR-044 / 045 / 051 (QuaRot family) → offline v0's quality-tier conclusion amended by W4; this ADR records the amendment at the priority level.
