@@ -106,6 +106,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [068](ADR-068-grammar-wire-contract.md)            | Pluggable Custom-Grammar Wire Contract for the OpenAI-Compatible Serving Surface | Proposed | ADR-046, 063 |
 | [069](ADR-069-vision-encoder-qwen35-recalibration.md) | Vision Encoder Recalibration for Qwen3.5-0.8B                 | Proposed     | none         |
 | [070](ADR-070-cpu-embedding-batched-encode.md)     | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate | Proposed | ADR-058 |
+| [079](ADR-079-adaptive-micro-lora-brain.md)        | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop | Proposed | ADR-008/031/043/045/054/056/057 |
 
 ## informational
 
