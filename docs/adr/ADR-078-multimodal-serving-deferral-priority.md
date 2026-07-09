@@ -26,8 +26,8 @@ Every load-bearing row below is source-read or issue-state against `origin/main 
 | # | Reality | Tag | Pointer |
 |---|---------|-----|---------|
 | R1 | **Serving fails closed on image input.** An OpenAI-style `image_url` content part returns HTTP 400 `"image input requires a vision-capable model"` — a truthful capability error, not a silent text-only degradation or a schema error. Tested at both unit and HTTP levels. Shipped via PR #656 (closing bug #641). | source-read + test-pinned | `crates/inference/src/bin/lattice_serve.rs:183` (message const), `:791,:799-800` (`content_text` reject arm), tests `:2169` (`message_content_image_url_rejected`), `:2478` (`chat_completions_image_url_400`); mirrored in the chat binary `lattice.rs:3063,:4786` |
-| R2 | **The vision module is compiled but inert.** `pub mod vision` is unconditional (not feature-gated), but `VisionEncoder`/`generate_multimodal` are constructed and called **only** from their own `#[cfg(test)]` modules — no binary and no non-test library path builds a vision encoder, loads `model.visual.*` weights, or calls a real image encode. | source-read + absence(exhaustive-grep) | `crates/inference/src/lib.rs:44`; `generate_multimodal` at `metal_qwen35.rs:8788`, live callers only at `:20700,:21694` (test modules); `vision/mod.rs` `VisionEncoder::new` sole call site is a test helper |
-| R3 | **The vision path is a CPU-only v0 scaffold.** Zero Metal references anywhere in the six `vision/*.rs` files; the only mentions state the Metal path is *not yet implemented*. | absence(exhaustive-grep) | `crates/inference/src/vision/vit.rs:12-14` (doc: "ADR-049 plans a Metal GPU forward pass; v0 implements the CPU path") |
+| R2 | **The vision module is compiled but inert.** `pub mod vision` is unconditional (not feature-gated), but `VisionEncoder`/`generate_multimodal` are constructed and called **only** from `#[cfg(test)]` test modules — no binary and no non-test library path builds a vision encoder, loads `model.visual.*` weights, or calls a real image encode. | source-read + absence-grep | `crates/inference/src/lib.rs:44`; `generate_multimodal` defined at `metal_qwen35.rs:8788`, every live caller is a test fn (e.g. `:20700,:21694,:22396,:22417`); `vision/mod.rs:265` `VisionEncoder::new` sole call site is a test helper |
+| R3 | **The vision path is a CPU-only v0 scaffold.** No Metal implementation or API usage in the `vision/*.rs` files; the only Metal mentions are doc comments — naming the not-yet-implemented Metal path or referencing the `MetalQwen35State` struct. | source-read (no Metal impl) | `crates/inference/src/vision/vit.rs:12,14` (doc: "ADR-049 plans a Metal GPU forward pass; v0 implements the CPU path"); other doc-only mentions `vision/mod.rs:19`, `multimodal.rs:7,38` |
 | R4 | **The runtime model config carries zero vision fields.** `Qwen35Config` on head has no `vision_config`, image/video token ids, or M-RoPE fields; the parser drops every vision field the real 0.8B checkpoint carries, by design pending ADR-069 S1. | absence(exhaustive-grep) + source-read | `crates/inference/src/model/qwen35_config.rs` (comments `:211,:1533-1534` explicitly warn against letting vision fields leak into the text config) |
 | R5 | **The technical vision design is already accepted, not open.** ADR-069 (vision encoder recalibration for the real Qwen3.5-0.8B VL checkpoint) is merged; it stages the work S1 (config parsing) → S6 (serve/Studio wiring) and calls the current scaffold "inert" in its own words. | source-read + issue-state | `docs/adr/ADR-069-vision-encoder-qwen35-recalibration.md:15` ("…is **inert**: no `model.visual.*` weights are loaded…"), Scope `:120-126`; merged PR #669 / commit `c2c23e444` (2026-07-05) |
 | R6 | **S1 is already written and idle.** The config-parsing stage exists as an OPEN **draft** PR #670 (branch `s1-vision-config` → `feat/vision`, +296/−4, round-trip tests against the real 0.8B config fixture green), untouched since 2026-07-05 — additive, all new fields default `None`, forward pass unchanged. | issue-state | `gh pr view 670` (OPEN, draft, base `feat/vision`) |
@@ -51,10 +51,18 @@ only for completeness of the bundle's provenance chain.
    in ADR-069 (R5) and is **not** re-litigated, amended, or superseded here. ADR-078 only places the
    multimodal topic in the bundle's ranking and pins the honest current state.
 
-3. **The deferral is gated, not permanent.** It revisits the moment the vision dev lane (#564) is
-   scheduled. The nearest concrete step is landing PR #670 (S1 config parsing, R6) onto `feat/vision`,
-   then ADR-069 S2–S6. No new experiment is required to settle any of these claims — all are resolved
-   by source and issue/PR state.
+3. **The deferral is gated by a named re-entry trigger — not permanent.** Multimodal serving
+   re-enters this bundle's optimization-lever ranking when **either**:
+   - **(a)** the vision dev lane reaches **ADR-069 S5–S6** — a working, parity-gated served
+     multimodal path (S5 gate: end-to-end greedy first-N token parity vs HF Qwen3.5-0.8B; S6: chat/serve
+     wiring), the first point at which multimodal serving latency/throughput is a real optimization
+     target; **or**
+   - **(b)** an explicit decision schedules the vision build lane (#564) as a near-term priority,
+     which changes which levers are active.
+
+   Until one of those fires, the vision work is **build-lane** work (land PR #670 S1 → ADR-069 S2–S6,
+   tracked by #564), outside this bundle's optimization ranking. No new experiment is required to
+   settle any of these claims — all are resolved by source and issue/PR state.
 
 4. **Explicit non-deprioritization.** "Deferred in the near-term serving-lever ranking" is **not**
    "vision deprioritized." Vision is an active development lane (R7), and the model we already ship
