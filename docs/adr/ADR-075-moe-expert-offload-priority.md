@@ -10,8 +10,9 @@
 > **NEEDS-EXPERIMENT, reframed**: the ADR-075 question as commissioned — *rank the open MoE
 > expert-offload levers* — presupposes a working, measured, resident MoE serving path whose next
 > optimization is offload. **That precondition is false on the current head.** The single MoE preset
-> is source-verified as not loadable on any consumer Apple Silicon machine today, its Metal dispatch
-> has zero test/bench/measurement, and it runs only at f16. This ADR also **records a measured
+> is source-verified as not loadable on the 32–128 GB M-series/M-Max machines today (loadability on
+> the 192–512 GB Ultra-class desktops is unproven pending measurement), its Metal dispatch has zero
+> test/bench/measurement, and it runs only at f16. This ADR also **records a source-derived
 > correction to a merged ADR**: ADR-053's headline "~15 GiB resident expert weights" figure is off by
 > 4× — the real resident footprint is **60 GiB at f16** — because the Q4 basis it assumed was never
 > implemented for MoE. A parallel external prior-art survey is folded as **[prior, unvalidated on our
@@ -44,9 +45,11 @@ Three facts shape everything below:
    Because only f16 runs, routed-expert weights are 60 GiB resident — 4× ADR-053's "~15 GiB @ Q4"
    figure (§ amendment below). Worse, the engine constructor takes an already-fully-loaded
    `&ModelWeights`, so the CPU loader must materialize the entire model as owned f32 (~120 GiB) before
-   any Metal buffer is built. No consumer Apple Silicon machine (128 GiB max on M-Max) absorbs a
-   120 GiB f32 transient plus a growing 60 GiB f16 GPU allocation. **This is a loader-sequencing
-   ceiling, prior to and independent of "should experts be offloaded."** As with weight/KV quant
+   any Metal buffer is built. The 32–128 GB M-series/M-Max machines (laptops, mini, base Studio)
+   cannot absorb a 120 GiB f32 transient plus a growing 60 GiB f16 GPU allocation; only the 192–512 GB
+   Ultra-class Studio desktops could hold that peak, and whether they do is unproven until Step 0
+   measures the real peak RSS + Metal residency. **This is a loader-sequencing ceiling, prior to and
+   independent of "should experts be offloaded."** As with weight/KV quant
    (ADR-072/073), Apple GPUs have no low-precision matrix unit, so any offload/quant of experts is a
    storage/bandwidth play, not a compute one — but here the prior question is whether the *resident*
    path works at all.
@@ -61,7 +64,7 @@ exists — that absence is itself a load-bearing finding.
 | # | Finding | How known | Pointer |
 |---|---------|-----------|---------|
 | E1 | **Exactly one MoE preset**: `qwen36_35b_a3b` — 256 routed experts, top-8, 1 shared, 40 layers, hidden 2048, moe_intermediate 512. Test pins `num_experts=256`, `per_tok=8`, `moe_intermediate=512`. | source-read + unit-test-pinned | `model/qwen35_config.rs:260-299`; test `:960-962` |
-| E2 | **The MoE config is the struct `Default`** (`Qwen35Config::default() → qwen36_35b_a3b()`), yet no CLI surface selects it — every binary falls back to `qwen36_27b` when no `config.json` is present. Reachable only by constructing the preset in Rust. | source-read | `qwen35_config.rs:154-158`; `bin/chat_metal.rs:749-750`, `bin/lattice.rs:1061,1076` |
+| E2 | **The MoE config is the struct `Default`** (`Qwen35Config::default() → qwen36_35b_a3b()`), yet no CLI/loader default selects it — the dense defaults are path-specific: Q4 chat/serve fall back to `qwen36_27b`, safetensors loading falls back to `qwen35_2b`, some benches to `qwen35_0_8b`. Reachable only by constructing the preset in Rust. | source-read | `qwen35_config.rs:154-158`; `bin/lattice.rs:1061` (safetensors→2b), `:1076` (Q4→27b); `model/qwen35/model.rs:37-42` (from_safetensors→2b) |
 | E3 | **The served/measured large model, `qwen36_27b`, is dense** (`num_experts: None`) — a separate preset. It is the one labeled shipped (18 GB Q4, ~11 s load, ~4 tok/s M-series 32 GB); the MoE preset is labeled "partial: loader supported, not a polished serving path." | source-read + doc | `qwen35_config.rs:302-349`; `docs/models.md:66-67` |
 | E4 | **Metal MoE dispatch (ADR-053) is implemented and wired into the live forward loop**: the `FeedForwardWeights::Moe` arm builds `MoeMetalBuffers` and calls `encode_moe_ffn` from the main encode path. Merged by PR #57. | source-read + gh-verified | `forward/metal_qwen35.rs:2968-3060` (build), `:9844` (only call site), `:10412-10705` (impl); `gh pr view 57` MERGED 2026-05-20 |
 | E5 | **The Metal MoE path has zero runtime test/bench coverage.** `encode_moe_ffn` appears exactly twice in the file (definition + the single call site), never under `#[cfg(test)]`; PR #57's "8 new tests" are all CPU router-logic units. No `docs/bench_results/` MoE entry, no MoE bench bin, no e2e-parity MoE model. | source-read (absence) + gh-verified | grep: 2 occurrences of `encode_moe_ffn`; `e2e-parity.yml` names only `Qwen3.5-0.8B`; `docs/bench_results/` = 0 MoE hits |
@@ -86,7 +89,7 @@ Routed-expert weight is ~93–97% of model bytes at either precision, so it is t
 target *once a working resident path exists* — but at **f16 (60 GiB)**, not the Q4 (15 GiB) ADR-053
 assumed.
 
-## Amendment to ADR-053 (measured correction, recorded at priority level)
+## Amendment to ADR-053 (source-derived correction, recorded at priority level)
 
 ADR-053 §"Expert weight memory" states, verbatim: *"At Q4 with the current config dimensions ... Total
 routed expert weights across 40 layers: ~384 MiB × 40 ≈ **15 GiB**"* (`ADR-053:48-51`), and its R2
@@ -97,22 +100,29 @@ implemented — Q4/QuaRot, Q8-CPU, and Q8-NEON all refuse MoE at three independe
 **60 GiB, 4× the ADR-053 figure**. Causal mechanism: ADR-044 deferred per-expert QuaRot rotation to
 "v1," the deferral was enforced (not just documented) in the converter, and no subsequent MoE
 quantizer landed. Consequence: ADR-053-R2's "borderline on 32 GB" conclusion is wrong by 4× — with a
-120 GiB f32 load peak (E8) preceding a 60 GiB f16 GPU allocation, the model is **not loadable on any
-consumer Apple Silicon machine today**, not merely borderline. This amendment lands here (not by
+120 GiB f32 load peak (E8) preceding a 60 GiB f16 GPU allocation, the model is **not loadable on the
+32–128 GB M-series/M-Max machines** ADR-053-R2 targeted, not merely borderline; only the 192–512 GB
+Ultra-class Studio desktops could hold that peak, and that is unproven until Step 0 measures it. This amendment lands here (not by
 editing ADR-053, which is an immutable record); ADR-053's dispatch-count and routing design are
 unaffected — only its resident-memory arithmetic and the 32 GB feasibility claim are corrected.
 
 ## Prior / unvalidated on our hardware
 
-Folded from the external survey (`fleet_atlas_lat_moeoffload_001` harvest) as **data**. It is
-**repo-blind and scoped to a different model family**, decisively:
+Folded from the external survey (`fleet_atlas_lat_moeoffload_001` harvest) as **data**. The survey is
+an internal research artifact not part of this repo, so its repo-blindness is stated below as
+**repository-verifiable facts** — a reviewer can grep this tree to confirm each cited path does not
+exist; the packet-internal quotes are corroborating attribution only, not the load-bearing proof. It
+is **repo-blind and scoped to a different model family**, decisively:
 
-- **Repo-blind**: its `QUESTIONS.md` opens by asking "what is the pinned repository SHA" and for the
-  crate/module paths — the most basic facts a repo-connected pass would read. Its `patch.diff` targets
-  `crates/engine/src/moe/*` and a `.gguf` loader — **lattice has no `crates/engine` crate and no GGUF
-  loader anywhere**; the real MoE code is in `crates/inference/src/model/qwen35/moe.rs` and
-  `forward/metal_qwen35.rs`. `EXPERIMENT.md` invents binaries (`moe_trace`, `cache_sim`, …) that do
-  not exist. `MANIFEST.md` concedes the diff is "approximate ... anchored to plausible modules."
+- **Repo-blind (repository-verifiable)**: the survey's proposed `patch.diff` and experiment commands
+  target `crates/engine/src/moe/*`, a `.gguf` loader, and binaries like `moe_trace` / `cache_sim` —
+  **none of which exist in this tree**: there is no `crates/engine` crate (the crates are
+  `embed`/`fann`/`inference`/`transport`/`tune`), no GGUF loader anywhere in the source, and no such
+  binaries under `crates/inference/src/bin/`. The real MoE code is
+  `crates/inference/src/model/qwen35/moe.rs` and `forward/metal_qwen35.rs`. (The packet's own
+  `MANIFEST.md` corroborates this — conceding its diff is "approximate ... anchored to plausible
+  modules" and its `QUESTIONS.md` opening by asking for the repo SHA and module paths — but the reject
+  rests on the grep-confirmable absences above, not the unpublished packet text.)
 - **Wrong model family**: its primary target throughout is DeepSeek-V4-Flash-DSpark (284B/13B-active,
   FP4 experts, ~12 MiB/expert) — a model lattice has **no config, loader, or plan for**. Its
   "moderate model" comparison uses a **1.5 MiB/expert** figure that matches lattice's *aspirational
