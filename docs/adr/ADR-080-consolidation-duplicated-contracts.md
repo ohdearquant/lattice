@@ -13,7 +13,7 @@ non-cluster audit items tracked in #764-#777 (per-family checklists and standalo
 ## Context
 
 A structural duplication sweep over `crates/inference` (and the sibling `crates/tune`,
-`crates/fann` for cross-checking) built a per-family map of every site implementing the same
+`crates/fann`, and `crates/embed` for cross-checking) built a per-family map of every site implementing the same
 nominal numeric operation, then an adversarial verification pass read each candidate divergence against the live source
 and re-verified the survivors against a later commit. The sweep covers ten operation families;
 this ADR addresses the four families where the duplication itself — not a single bug — is the
