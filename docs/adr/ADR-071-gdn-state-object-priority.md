@@ -49,7 +49,7 @@ profiling with no merged artifact says so.
 | S1 | GDN state = **20,201,472 bytes (19.27 MiB)** active for Qwen3.5-0.8B (18 GDN layers × per-layer 1,122,304 B = conv 73,728 B + S-matrix 1,048,576 B). Fixed function of config. | unit-test-pinned | `metal_qwen35.rs:28190`; shape formula `:27938-27962` |
 | S2 | Per **decode step**, logical state traffic = **40,402,944 B (read+write, 20.2 MB each)** and is **context-invariant** — fixed by config, does not grow with context (unlike KV bytes/token). | unit-test-pinned + source-documented | `metal_qwen35.rs:28190-28191`; `examples/bench_gdn_state.rs:9-15` |
 | S3 | **Cross-turn GDN checkpoint replay is SHIPPED**: `ReplayFromCheckpoint` fully implemented via a `MetalGdnCheckpoint` ring (`CROSS_TURN_GDN_CHECKPOINT_CAP=3`), used by the CLI chat path. | source-verified (merged) | issue #590 / PR #635, commit `53a726b14` (on `main` 2026-07-04); `chat_metal.rs:426,:995` (call sites), `:488-496` (stats) |
-| S4 | **Cross-turn prefix caching is SHIPPED into both serve binaries**: `lattice_serve` (HTTP) via #662 and the `lattice serve` Metal worker via #666 (both merged 2026-07-05). `lattice_serve.rs:989` calls `chat_completion_streaming_with_prefix_cache_and_cancel` on `CrossTurnSlotId::DEFAULT`. #462 remains open only for the #661 renderer-unification tail and its greedy-parity acceptance test. | source-verified (merged) | #662, #666 (merged); `bin/lattice_serve.rs:989-990`; #462 (open, residual only) |
+| S4 | **Cross-turn prefix caching is SHIPPED into both serve binaries**: `lattice_serve` (HTTP) via #662 and the `lattice serve` Metal worker via #666 (both merged 2026-07-05). `lattice_serve.rs:989` calls `chat_completion_streaming_with_prefix_cache_and_cancel` on `CrossTurnSlotId::DEFAULT`. #462 remains open only for its greedy-parity / bit-exact acceptance test (the renderer unification asked for by #661 is already merged via #667). | source-verified (merged) | #662, #666 (merged); `bin/lattice_serve.rs:989-990`; #462 (open, residual only) |
 | S5 | GPU state is **not a first-class type** — two parallel `Vec<Buffer>` (`gdn_gpu_conv_bufs`, `gdn_gpu_s_matrices`) held by index discipline, no wrapping object/metadata. | source-read | #481 (tracking, open); `metal_qwen35.rs:1496-1497` |
 | S6 | **State-traffic observability is partially built** behind the `gdn-state-counters` feature: `GdnStateTrafficShape/Bucket/Report/Counters`, with the counter helpers **wired on the production decode path**, and `examples/bench_gdn_state.rs` documented as "the #491 bandwidth-share decision gate" harness. | source-verified | `Cargo.toml:36,188`; `metal_qwen35.rs:3579,3586` (helpers), `:5401,:5873,:5951` (decode-path attribution); `examples/bench_gdn_state.rs:9-15,196-203` |
 | S7 | **#491 is UNRUN**: the per-step state *numerator* (S2) is pinned, but the *fraction* f = state ÷ (state + KV + weight) has **no committed measurement** — it needs the bench run on real hardware to supply the denominator. | source-verified (issue open) | #491 (open) |
@@ -114,10 +114,11 @@ observability work that is genuinely open.
    token, reject it). Prerequisite for downstream precision/routing experiments. *Build, after P2.*
 
 **Serve residual (not a priority tier).** Cross-turn caching shipped via #662/#666 (S4); what
-remains under #462 is the #661 renderer-unification tail and **confirming the shipped serve
-cross-turn path carries the greedy-parity / bit-exact restore test its acceptance names** (adding
-it if absent — the determinism guarantee must be a test, not a prose claim). Small follow-up;
-close or narrow #462 once the parity test is confirmed.
+remains under #462 is **confirming the shipped serve cross-turn path carries the greedy-parity /
+bit-exact restore test its acceptance names, adding it if absent** — the determinism guarantee
+must ship as a test, not a prose claim, and that confirmation is a required part of closing #462,
+not optional. The renderer unification #661 asked for is already merged (#667); only a minor
+CPU-path renderer cleanup remains separately open (#668), unrelated to cross-turn correctness.
 
 **Deferred — NEEDS-EXPERIMENT (gated on the P2 object + the P1 measurement):** snapshot-only int8
 for **storage/branch artifacts** (the only compression thesis with a plausible payoff, and it is a
@@ -158,8 +159,8 @@ the top prefill lever (tied to ADR-070's deferred FA2 track).
 - #481 (first-class serveable state object, tracking) → **P2**, typed object; tick the cross-turn
   sub-items as delivered (GDN replay #590/#635; serve wiring #662/#666).
 - #462 (serve re-prefills each turn) → **serve cross-turn wiring shipped** (#662/#666); remaining =
-  the #661 renderer-unification tail plus confirming/adding the greedy-parity restore test; close or
-  narrow the issue once that test is confirmed.
+  confirming/adding the greedy-parity restore test (required to close #462, per the R2 gate).
+  Renderer unification already merged (#667); only a separate minor CPU-path cleanup stays open (#668).
 - #486 (agentic snapshot/branch/rollback) → deferred feature on the P2 object.
 - #175 (GDN chunk tiling) → closed-by-measurement (S9); the B=128 device-scratch variant is the
   sole untried sub-lever, low priority, gated on the prefill-attention track.
