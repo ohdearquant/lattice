@@ -7,9 +7,10 @@
 > **Evidence basis**: The Decision below is grounded in this engine's own measured
 > profiling and A/B results (the **Measured** table). A parallel external prior-art
 > survey (llama.cpp `mul_mm` per-family tiling, MLX `steel_gemm`, Indirect Command
-> Buffers, Flash-Attention-2-on-Metal, roofline ceilings) is in flight; its findings
-> will refine *how* each priority is implemented — and may reorder the GEMM *sub-levers* —
-> but not the top-level ranking. That the GEMM operator is attacked first is fixed by
+> Buffers, Flash-Attention-2-on-Metal, roofline ceilings) has partially landed — its first
+> tranche independently corroborated the M5/M6 GEMM results and the Amdahl profile; its
+> remaining findings will refine *how* each priority is implemented — and may reorder the
+> GEMM *sub-levers* — but not the top-level ranking. That the GEMM operator is attacked first is fixed by
 > Amdahl's law over the measured operator profile and does not depend on the survey.
 > Sections tagged **[prior, unvalidated on our hardware]** are explicitly held apart so
 > the survey folds in without a rewrite.
@@ -31,7 +32,7 @@ PPL delta budget (≤0.3 conservative, ≤1.0 aggressive).
 
 ## Measured evidence (this engine, this hardware)
 
-Each row is a runtime measurement (M2/M3/M5/M6/M7), an internal profiler result
+Each row is a runtime measurement (M2/M3/M5/M6/M7/M10), an internal profiler result
 (M1/M8/M9), or a source-level finding (M4) from this repo, tagged with its most durable
 pointer. Rows backed only by internal profiling say so and cite a tracking issue where one
 exists rather than a merged artifact. Hardware unless noted: M2 Max, Qwen3.5-0.8B, steady-state.
@@ -47,6 +48,7 @@ exists rather than a merged artifact. Hardware unless noted: M2 Max, Qwen3.5-0.8
 | M7 | **GDN chunked-prefill tiling: KILLED (both stages).** Stage-1 (tiled-C32 simdgroup solve) passed correctness and beat scalar 661.42 ms vs 728.50 ms @4K (1.10×, IQR<8%, n=9, cross-session stable). Stage-2 (tiled-B64) was ~24% *slower* than scalar-C32 (2,048.59 ms vs 1,649.33 ms @4096, interleaved n=9, non-overlapping ranges) — a 10% C32 tiling win cannot overcome scalar-B64's 1.74× penalty. Correctness all-green (oracle 1.16e-10, greedy 0-flip n=1..129, PPL delta 0.001, mutation-sensitive). **The GDN-chunk tiling family is closed for now.** | Stage-2 −24% | #175, commits dcee9c3d5 / fafe6d233 / 9f921fbec, 2026-07-08 |
 | M8 | **Prefill TTFT is O(n²) in prompt length**, knee at 1024–2048 tokens: 122 ms @128 → 3,203 ms @4096 (Qwen3.5-0.8B-Q4, M2 Max). Confirms attention cost is not yet dominant below the knee but grows super-linearly above it. | O(n²), knee 1–2K | internal TTFT sweep, 2026-07-06 (M2 Max, Qwen3.5-0.8B-Q4); internal profiling, no merged artifact |
 | M9 | **Dispatch count is ~378 per token** at ~5–15 µs fixed overhead each (≈1.9–5.7 ms/token in dispatch overhead alone); an empty command-buffer round-trip measured ~18 µs. Far above the fused per-layer graph a competitive engine issues. | 378 dispatches/token | internal dispatch-count profiling; tracked #172 |
+| M10 | **BN=64 Q4 GEMM N-tile widening: KILLED, −3.5%.** Widening the tiled Q4 GEMM's N-tile 32→64 (doubling per-simdgroup `simdgroup_float8x8` accumulators 8→16) regressed prefill −3.5% @512 **and** @1024 (2,310 → 2,229 tok/s @512; interleaved, tight non-overlapping ranges, re-measured independently by a second run agreeing at −3.6%). Threadgroup memory was ample at 14.75 KiB, so this is **not** the M5 occupancy-memory cliff — the cause is register/accumulator pressure. Correctness bit-exact (greedy 706/706, PPL delta 0.0), which together with a consistent throughput drop proves the wider kernel actually ran. Second tile-growth attempt to regress after M5 → the productive direction is shrink/restructure, not grow. **Closed lever.** | −3.5% | internal same-binary runtime-flag A/B (`LATTICE_GEMM_BN64`), 2026-07-08 |
 
 ## Prior / analyzed levers — **[prior, unvalidated on our hardware]**
 
@@ -54,11 +56,14 @@ These are designed or externally-evidenced but **not yet measured in this engine
 They are the search space the in-flight survey informs; none may be treated as decided
 until measured here.
 
-- **BN=64 N-tile widening** of the Q4 tiled GEMM. Recomputed threadgroup footprint
-  stays ~15 KiB (under the 32 KiB ceiling), doubling per-threadgroup compute. Identified
-  risk: doubling accumulators from 8 to 16 `simdgroup_float8x8` registers per simdgroup
-  may trigger compiler register spilling, which would silently negate the gain.
-  **Not yet measured on hardware.**
+- **GEMM structural sub-levers** (surfaced by the external survey; none measured here).
+  With tile *geometry* now exhausted on the measured side (M4 parity, M5 double-buffer
+  closed, M6 f32→half shipped, M10 BN=64 widening closed), the untried GEMM knobs are
+  structural: packed gate/up and packed QKV GEMMs (fewer, larger matmuls per block) and an
+  MLX-`steel_gemm`-style static tile-family / split-K router that selects a tile shape per
+  GEMM shape. Expected single-to-low-double-digit percent each; each gated on a per-shape
+  micro-bench before a build (M10 is the precedent that a plausible GEMM knob can regress).
+  **Not measured here.**
 - **Indirect Command Buffers (ICB)** to cheaply re-submit a fused, static command graph
   per token. Unknown-for-us: minimum graph-reduction size before ICB overhead pays off,
   resource-tracking-mode requirements, re-encode cost when the step-arguments struct
@@ -83,30 +88,31 @@ Rank the prefill levers by the measured operator profile and the falsifiability 
 experiment. The measured evidence fixes the *operator*: GEMM is the lever (M1: 72–80% of
 prefill; optimizing it caps at 3.6–5×, vs ~1.3× for everything else combined). It does
 **not** by itself measure which GEMM *sub-lever* wins — the geometry already matches the
-references at BN=32 (M4), so the remaining knobs are dequant staging and occupancy, where
-double-buffer is closed (M5) and f32→half is shipped (M6). Therefore:
+references at BN=32 (M4), and the tile-*geometry* knobs are now measured-exhausted: dequant
+staging shipped (M6), double-buffer closed (M5), and N-tile widening closed (M10). That
+leaves GEMM's remaining upside in *structural* changes (packing, shape-routing) — prior and
+unmeasured, but the highest-ceiling lever — with the measured dispatch overhead (M9) a
+smaller but ready parallel win. Therefore:
 
-**Priority 1 — BN=64 GEMM N-tile widening (the highest-priority falsifiable experiment on
-the dominant operator, not a measured-EV winner).** GEMM is the measured-dominant operator
-and this is the untried knob on it after M5/M6. The BN=64-specific rationale: M6 dropped
-threadgroup memory to ~9.75 KiB, leaving headroom under the 32 KiB / occupancy ceiling that
-BN=32 does not spend; widening N to 64 (recomputed footprint ~15 KiB, still under the
-cliff) converts that headroom into arithmetic intensity. The BN=32 geometry parity with the
-references (M4) is *why this is an experiment, not a certainty* — the references may sit at
-a different weight-precision / occupancy point than our Q4 inline-dequant path. Prototype
-the widened-tile Q4 kernel and measure throughput and register spill (occupancy / throughput
-cliff).
-- Success criterion: **≥+10% prefill throughput @512 with greedy parity 400/400 and no
-  PPL regression.** A spill-induced flat-or-negative result closes the lever (like M5).
-- Effort: low. `bench_gemm_variants.rs` A/B harness already exists.
-- The survey may reorder the GEMM sub-levers (e.g. if `steel_gemm`'s split-K or a different
-  tile shape scores higher than BN=64) and will inform spill mitigation and the roofline
-  ceiling; it does not change that a GEMM experiment is first.
+**Priority 1 — GEMM structural sub-levers (packing / shape-routing) — [prior, unvalidated;
+measure before committing].** GEMM is the Amdahl-dominant operator (M1: 72–80% of prefill;
+~3.6–5× ceiling), so it stays the first lever — but its tile *geometry* is now exhausted on
+the measured side (M4 parity, M5 double-buffer closed, M6 f32→half shipped, M10 BN=64 widening
+closed), so the next GEMM experiment is *structural*: packed gate/up and packed QKV GEMMs
+(fewer, larger matmuls) and an MLX-`steel_gemm`-style static tile-family / split-K router.
+This is the direct successor to the now-closed BN=64 slot. The external survey surfaced these;
+none is measured here. Gate each on a per-shape micro-bench before a full build — M10 (BN=64)
+is the cautionary precedent that a plausible GEMM knob can regress.
+- Success criterion: per-shape micro-bench win before wiring; then ≥+10% prefill @512 with
+  greedy parity and no PPL regression.
+- Effort: medium.
 
 **Priority 2 — Dispatch-count reduction: norm+residual fusion, then ICB.** M9 puts
 1.9–5.7 ms/token in dispatch overhead. Norm+residual fusion (~48 dispatches removed) is
-mechanical, numerically inert, and independently measurable; land it first, then wrap
-the fused per-layer graph in an ICB.
+mechanical, numerically inert, and independently measurable; land it first, then wrap the
+fused per-layer graph in an ICB. Its prefill share is modest — the ~378-dispatch fixed cost
+amortizes across the whole prompt in one forward pass — but it is a low-risk ready win and
+helps decode, where the per-token dispatch cost bites directly.
 - Success criterion: measured dispatch-count drop **and** per-token latency improvement.
 - Effort: low–medium.
 
@@ -125,8 +131,11 @@ before that sweep, risks large effort against a lever that is sub-dominant at ou
 workloads' current context lengths.
 
 **Closed by measured evidence — do not revisit without a fundamentally different resource
-layout.** Double-buffered threadgroup loads (M5, −20.7%) and GDN chunked-prefill tiling
-(M7, stage-2 −24%).
+layout.** Double-buffered threadgroup loads (M5, −20.7%), GDN chunked-prefill tiling
+(M7, stage-2 −24%), and BN=64 Q4 GEMM N-tile widening (M10, −3.5%; register/accumulator
+pressure, not a memory cliff). The external survey independently reached the same verdicts
+on double-buffer (M5) and f32→half staging (M6), and had flagged BN=64's register-pressure
+kill condition as a live risk before we measured it.
 
 **Out of scope (a hardware exclusion, not a measured kill).** Tensor-core /
 non-`simdgroup_matrix` GEMM paths: the M2 Max / Apple7–8 target exposes no low-precision
@@ -142,15 +151,16 @@ plus a measured A/B justify it.
   fast GEMM kernel cannot fully close the measured 4.07× gap (M2) at Q4 precision; a
   structural attention change (FA2) is what unlocks the regime past the M8 knee, and it is
   deliberately deferred to when a measured expected-value threshold says it pays.
-- **Pending external survey**: when the prior-art findings land, each priority's
-  implementation section is updated in place (exact per-family tile params for P1,
-  ICB gotchas for P2, FA2 SRAM-tiling for the deferred item). The priority ordering in
-  this ADR is not expected to change; if the survey's roofline result shows P1's headroom
-  is already near-exhausted, that is itself a decision input recorded as a follow-up, not
-  a silent reversal.
+- **External survey (partially landed)**: its first tranche corroborated M5/M6 and the
+  Amdahl profile and surfaced the P1 structural sub-levers. Remaining prior-art findings
+  fold into the per-priority implementation notes in place — per-family tile params / split-K
+  for P1, ICB gotchas for P2, FA2 SRAM-tiling for the deferred item — without changing the
+  ordering. If a later roofline result shows a priority's headroom is near-exhausted, that is
+  a recorded decision input, not a silent reversal.
 
 ## Follow-ups
 
-- P1 result (BN=64 measured) → its own perf PR with `make bench-compare` output.
-- Fold external survey findings into the per-priority implementation notes above.
+- BN=64 measured and closed (M10); the next GEMM experiment is the P1 structural
+  sub-levers, each gated on a per-shape micro-bench before a build.
+- Fold the remaining external survey findings into the per-priority implementation notes above.
 - Re-run the M8 context sweep to fix the FA2 gate threshold in tokens.
