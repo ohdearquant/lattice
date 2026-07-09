@@ -61,16 +61,18 @@ All pointers are on `origin/main @ 4cb006d32`.
 
 ## Prior / unvalidated on our hardware
 
-Folded from the external survey (`fleet_atlas_lat_adaptreason_001` harvest) as **data**. Unlike the
-fully repo-blind packets folded by ADR-073/074/075, this packet **did** inspect the repository (its
-`REPORT.md` cites a real public SHA read via a web file-view UI because `git clone` failed in its
-container), so its source citations — the `force_close_think`/`decode_cap` semantics, the `0.8B`
-config field values, the MTP field names — are accurate against the table above. Its central value is
-therefore corroboration, not new information: it **independently converged on the same research plan**
-(instrument margin/entropy → calibrate as a gate → three-tier adaptive budget → local cascade, with
-MTP-disagreement as an experimental side channel) **without ever citing the maintainer's own issue
-numbers** — evidence the plan is a reasonable one, not evidence beyond what the issue family already
-records.
+Folded from the external survey (`fleet_atlas_lat_adaptreason_001` harvest) as **data**, and used
+only as corroboration — the ADR's proof rests on the repo-verifiable source and issue facts in the
+table above, **not** on any packet-internal text. The packet artifact is internal and not
+reproducible from this repository, so statements about what it read or cited are corroborating
+attribution only. What **is** repo-verifiable and load-bearing: the survey's recommended plan —
+instrument margin/entropy → calibrate as a gate → three-tier adaptive budget → local cascade, with
+MTP-disagreement as an experimental side channel — is structurally the same as the already-filed
+`#482` issue family, and its concrete repo references are checkable against the table above (its
+`force_close_think`/`decode_cap` semantics and `0.8B` config values match; its invented `bench_decode`
+binary [real: `bench_decode_ab`] and nonexistent `--confidence-trace` flag are grep-confirmable
+divergences). The convergence is therefore treated as evidence the issue family's plan is a reasonable
+one, not as independent confirmation beyond what the issues already record.
 
 - **"Add top1/top2 margin + exact-entropy instrumentation" — CONFIRMED-BY-ANALYSIS.** Matches R12
   exactly: the gap is real and cheap (logits are already CPU-resident at sampling time, so the
@@ -84,10 +86,10 @@ records.
   Converges on #496 *and* carries the same saturation risk: ADR-074's MTP finding (~4.65% free-form
   acceptance) implies the signal may be uninformative on exactly the free-form reasoning text it would
   need to score.
-- **Repo-blind divergences (flagged, not trusted):** the packet invents a `bench_decode` binary (real:
-  `bench_decode_ab`) and a `--confidence-trace` flag (does not exist), and its `QUESTIONS.md` asks for
-  facts answerable by reading source. Its arithmetic and CLI shapes are approximate; only the
-  verdict-level convergence above is used.
+- **Divergences (repo-verifiable, not trusted for ranking):** the packet's arithmetic and CLI shapes
+  are approximate — the invented `bench_decode` binary and nonexistent `--confidence-trace` flag noted
+  above are the grep-confirmable examples. Only the verdict-level convergence is used, never its
+  concrete prescriptions.
 
 ## Decision
 
