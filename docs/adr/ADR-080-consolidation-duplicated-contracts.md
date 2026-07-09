@@ -8,7 +8,7 @@
 **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
 **Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); related
 non-cluster audit items tracked in #764-#777 (per-family checklists and standalone items)
-**Depends on**: ADR-058 (CPU performance regression CI), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate)
+**Depends on**: ADR-058 (CPU performance regression CI — superseded; retained for `make bench-compare` provenance), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate, Accepted)
 
 ## Context
 
@@ -36,14 +36,14 @@ defect** — the signature of a missing shared contract, not of intentional back
 
 ### Evidence summary (from the duplication maps)
 
-| cluster | nominal operations mapped | site counts (largest → smallest) | held findings (post-verification) |
-|---|---|---|---|
-| attention-softmax | 6 | 6, 6, 4, 4, 3, 3 | ATTENTIONSOFTMAX-P2-002, -005, -006, -007 (+ filed #739, #740, #741) |
-| http-serve | 6 | 3, 3, 3, 3, 2, 2 | HTTPSERVE-P2-005 (+ filed #744, #745, #746) |
-| sampling-decode | 6 | 10, 6, 4, 4, 4, 1 | SAMPLINGDECODE-P2-002, -003 |
-| matmul-gemm | 10 | 14, 7, 6, 5, 5, 5, 4, 4, 3, 1 | MATMULGEMM-P2-001, -002, -003, -004, -005 |
+| cluster | nominal operations mapped | site counts (largest → smallest) | unfiled held findings (post-verification) | filed issues |
+|---|---|---|---|---|
+| attention-softmax | 6 | 6, 6, 4, 4, 3, 3 | 4 (CPU MHA -inf floor, Flash-causal NaN-key, differential/native-sparse hardening, Qwen3 secondary-loop duplication) | #739, #740, #741 |
+| http-serve | 6 | 3, 3, 3, 3, 2, 2 | 1 (unify endpoint/error contracts) | #744, #745, #746 |
+| sampling-decode | 6 | 10, 6, 4, 4, 4, 1 | 2 (canonical greedy-selection sharing; fail-closed generation controls on alternate CPU decode loops) | none |
+| matmul-gemm | 10 | 14, 7, 6, 5, 5, 5, 4, 4, 3, 1 | 5 (scaled-SGEMM FFI validation, standalone WGPU/Metal validation, BitNet release-active checks, SwiGLU short-activation rejection, oversized-input unification) | none |
 
-All 12 held findings and the six filed issues above were confirmed against live source at the
+12 unfiled held findings plus 6 filed issues (18 total) were confirmed against live source at the
 audited commit and re-checked against a commit 51 revisions later; none was a stale artifact of
 the original audit commit.
 
@@ -53,28 +53,33 @@ The duplication sweep and the first adversarial verification pass ran at `13c8de
 checkout later found to be 51 commits behind `origin/main`. Every finding whose cited file changed
 in that 51-commit window was then re-verified at `origin/main @ 0699e60cc`; findings in unchanged
 files transfer directly. Three audit findings (outside this ADR's held set) were fixed by
-concurrent work in that window (#656, #657) and were not filed; none of the 12 held findings cited
-in this ADR was among them. Six of the findings driving this ADR are already filed as standalone issues
-(#739-#741, #744-#746); the 12 held findings are intentionally NOT filed as issues — they are
-resolved by this ADR's clusters and tracked in the post-ADR implementation checklists.
+concurrent work in that window (#656, #657) and were not filed; none of the 12 unfiled held findings
+cited in this ADR was among them. Six of the findings driving this ADR are already filed as
+standalone issues (#739-#741, #744-#746); the 12 unfiled held findings are intentionally NOT filed
+as issues — they are resolved by this ADR's clusters and tracked in the post-ADR implementation
+checklists (18 findings total across the four clusters).
 
 ## Decision
 
 **Consolidate within existing crates. Do not create a new crate.** Extract one small, checked,
-module-level helper per cluster inside `lattice-inference` (the crate that owns every duplicated
-site in all four clusters). Keep every backend-specific kernel — CPU scalar, CPU SIMD (NEON/AVX2),
-Metal, WGPU — as a separate implementation. The scalar/CPU implementation in each cluster is named
-the **numeric reference** ("formula oracle"): it is the specification other backends are checked
-against in parity tests, not itself replaced by a cross-backend abstraction.
+module-level helper per cluster inside `lattice-inference` (the crate that owns every site
+*selected for consolidation* in all four clusters). Keep every backend-specific kernel — CPU
+scalar, CPU SIMD (NEON/AVX2), Metal, WGPU — as a separate implementation. The scalar/CPU
+implementation in each cluster is named the **numeric reference** ("formula oracle"): it is the
+specification other backends are checked against in parity tests, not itself replaced by a
+cross-backend abstraction.
 
 A new crate is justified only when a helper's canonical dependency-free logic is needed by two or
 more *crates* that do not already share a dependency edge. None of the four clusters meets that
-bar: attention-softmax, sampling-decode, and matmul-gemm are entirely intra-`lattice-inference`;
-http-serve spans two binaries (`lattice.rs`, `lattice_serve.rs`) that already live in the same
-crate. Splitting a crate to share ~50-150 lines of validation logic between sibling modules of the
-same crate would invert the project's find-and-modify-before-create principle, add a publish-order
-dependency for no cross-crate consumer, and contradict the "pure-Rust, minimal-dependency-surface"
-posture in `AGENTS.md`.
+bar: attention-softmax, sampling-decode, and every matmul-gemm site *selected for consolidation*
+are intra-`lattice-inference`; http-serve spans two binaries (`lattice.rs`, `lattice_serve.rs`)
+that already live in the same crate. (The matmul-gemm survey also touched `lattice-fann`'s
+dense-layer GEMM and one delegating call site in `lattice-embed` — those are cross-crate,
+surveyed-but-out-of-scope operations that do not share the proposed inference GEMM contract; see
+"What we are NOT doing".) Splitting a crate to share ~50-150 lines of validation logic between
+sibling modules of the same crate would invert the project's find-and-modify-before-create
+principle, add a publish-order dependency for no cross-crate consumer, and contradict the
+"pure-Rust, minimal-dependency-surface" posture in `AGENTS.md`.
 
 ### C1: Softmax fail-closed row contract (attention-softmax)
 
@@ -112,11 +117,11 @@ Metal and WGPU kernels stay separate GPU code but gain an explicit non-finite-ro
 that checks the *kernel output* against the same reference. The unselected legacy Metal
 score/softmax kernel is deleted (dead code, not a live divergence to fix).
 
-**Resolves**: ATTENTIONSOFTMAX-P2-002 (exact zero for -inf-masked CPU MHA positions),
--005 (Flash-causal NaN-key fail-close), -006 (differential/native-sparse hardening),
--007 (Qwen3 secondary softmax duplicate removal); plus filed #739 (Qwen3.5 f32/F16/batched-prefill
-fail-close), #740 (CPU MHA NaN-lane drop), #741 (ViT softmax non-finite guard) — all of which land
-on the same shared helper once it exists, rather than being patched independently three more times.
+**Resolves**: the four unfiled held findings for this cluster — exact zero for -inf-masked CPU MHA
+positions, Flash-causal NaN-key fail-close, differential/native-sparse hardening, and Qwen3
+secondary softmax duplicate removal — plus filed #739 (Qwen3.5 f32/F16/batched-prefill fail-close),
+#740 (CPU MHA NaN-lane drop), #741 (ViT softmax non-finite guard) — all of which land on the same
+shared helper once it exists, rather than being patched independently three more times.
 
 ### C2: Dual-HTTP-server shared serving module (http-serve)
 
@@ -132,10 +137,12 @@ confirmed by re-verification at `0699e60cc`).
 in its own source comment that it has no disconnect-cancellation and keeps generating after a
 client disconnects; `lattice_serve.rs`'s `CancelOnDrop`/`should_cancel` machinery genuinely covers
 prefill and decode and is unaffected by #656. `lattice_serve.rs`'s `spawn_worker` structurally
-discards the engine's `stopped`/`stop_reason` fields (`.map(|out| (out.prompt_tokens,
-out.completion_tokens))`), so both its SSE and JSON responses discard the ENGINE-reported stop cause (stop-string and EOS terminations both serialize as `"stop"`; only a locally computed length branch survives), while `lattice.rs` carries the engine's actual stop state
-through. The two binaries also expose different router surfaces (only `lattice_serve.rs`'s
-`/v1/models` is actually installed and reachable from the macOS app).
+discards the engine's `stopped`/`stop_reason` fields (matching on `Ok(cached)` and returning only
+`(cached.output.prompt_tokens, cached.output.completion_tokens)`), so both its SSE and JSON
+responses discard the ENGINE-reported stop cause (stop-string and EOS terminations both serialize
+as `"stop"`; only a locally computed length branch survives), while `lattice.rs` carries the
+engine's actual stop state through. The two binaries also expose different router surfaces (only
+`lattice_serve.rs`'s `/v1/models` is actually installed and reachable from the macOS app).
 
 **Extraction plan**: move router construction, request normalization/validation, and response
 termination serialization into one shared serving module inside `crates/inference/src/bin/`
@@ -146,10 +153,10 @@ cancellation is added as a CPU-generation-aware API so `lattice.rs` can adopt th
 cancellation contract `lattice_serve.rs` already has, rather than each binary growing its own
 cancellation state machine.
 
-**Resolves**: HTTPSERVE-P2-005 (unify endpoint and error contracts); plus filed #744 (disconnect
-cancellation), #745 (max_tokens=0 fail-closed, scope narrowed during audit triage), #746
-(`finish_reason` hardcoding) — all three are instances of the same "two independently-maintained
-request/response paths" root cause this cluster targets.
+**Resolves**: the one unfiled held finding for this cluster — unifying endpoint and error contracts
+across both binaries — plus filed #744 (disconnect cancellation), #745 (max_tokens=0 fail-closed,
+scope narrowed during audit triage), #746 (`finish_reason` hardcoding) — all three are instances of
+the same "two independently-maintained request/response paths" root cause this cluster targets.
 
 ### C3: Backend-neutral decode policy (sampling-decode)
 
@@ -177,9 +184,9 @@ fast path) — explicitly rejects the unsupported `GenerateConfig` field at that
 of silently ignoring it. This is the same "apply or fail closed" contract the audit found already
 in place for grammar/logprobs; the extraction generalizes it to stop_strings/reasoning_budget.
 
-**Resolves**: SAMPLINGDECODE-P2-002 (canonical first-wins/repetition-aware greedy selection shared
-by MTP and self-speculative paths), -003 (fail-closed generation controls on the alternate CPU
-decode loops that currently silently omit stop_strings/reasoning_budget).
+**Resolves**: the two unfiled held findings for this cluster — canonical first-wins/repetition-aware
+greedy selection shared by MTP and self-speculative paths, and fail-closed generation controls on
+the alternate CPU decode loops that currently silently omit stop_strings/reasoning_budget.
 
 ### C4: One checked GEMM argument validator (matmul-gemm)
 
@@ -222,16 +229,16 @@ the map to be redundant, non-selected implementation surface rather than a live 
 are deleted or explicitly relabeled test/benchmark-only so they stop appearing as apparent
 duplication in future sweeps.
 
-**Resolves**: MATMULGEMM-P2-001 (validate scaled SGEMM before the macOS FFI call), -002 (validate
-standalone WGPU/Metal GEMM slices before dispatch), -003 (promote BitNet scalar GEMV checks to
-release-active validation shared with the safe wrapper), -004 (reject short activations in the
-training SwiGLU projection), -005 (unify oversized-input handling across f32/f16/Q8 GDN
-projections).
+**Resolves**: the five unfiled held findings for this cluster — validate scaled SGEMM before the
+macOS FFI call, validate standalone WGPU/Metal GEMM slices before dispatch, promote BitNet scalar
+GEMV checks to release-active validation shared with the safe wrapper, reject short activations in
+the training SwiGLU projection, and unify oversized-input handling across f32/f16/Q8 GDN
+projections.
 
 ## What we are NOT doing
 
 - **No new crate.** Every extracted helper lands inside `lattice-inference`, the crate that already
-  owns 100% of the duplicated sites in all four clusters. A new crate would add a publish-order
+  owns every site *selected for consolidation* in all four clusters. A new crate would add a publish-order
   dependency edge for zero cross-crate consumers.
 - **No cross-crate kernel unification.** `lattice-fann`'s dense-layer GEMM and
   `lattice-inference`'s attention/projection GEMMs stay independent implementations; only
@@ -257,8 +264,11 @@ most already-filed, independently verified issues and the smallest blast radius;
 widest span of call sites and the training/autodiff paths).
 
 1. **Bench-compare is required** on any PR touching `crates/inference/src/forward/` or
-   `crates/inference/src/attention/` per ADR-058 / the repository's `make bench-compare` process —
-   this applies to C1, C3, and C4, and to the CPU-generation-cancellation change in C2. Paste
+   `crates/inference/src/attention/` per the repository's current `make bench-compare` process
+   (ADR-058, the ADR that originally proposed a Criterion CI gate, is itself Superseded and its
+   Criterion PR gate was never created — the bench-compare requirement here is grounded in current
+   repo policy and in this ADR's own decision, not in an active ADR-058 gate) — this applies to
+   C1, C3, and C4, and to the CPU-generation-cancellation change in C2. Paste
    before/after numbers in every such PR description; a shared helper that changes hot-path
    instruction count is exactly the kind of change this gate exists to catch.
 2. **Every extracted guard needs a mutation-sensitive regression test**: for each fail-closed fix
@@ -274,9 +284,13 @@ widest span of call sites and the training/autodiff paths).
    and is exactly the failure mode this ADR exists to close off structurally.
 4. **Risk**: the http-serve and sampling-decode clusters touch production-facing serving behavior
    (`finish_reason`, disconnect handling, stop-string matching) that external OpenAI-API clients may
-   depend on for exact wire compatibility — the e2e-parity CI gate (ADR-066/e2e-parity.yml) and the
-   existing local-helper unit tests on `lattice.rs`'s request normalization are the primary
-   regression backstop; no new CI surface is proposed by this ADR.
+   depend on for exact wire compatibility. The e2e-parity CI gate (ADR-066/`e2e-parity.yml`) protects
+   only the underlying greedy-generation output (short-horizon token-ID agreement against HF
+   transformers) — it does not exercise the HTTP wire surface (routing, serialization, disconnects,
+   `finish_reason`). The actual backstop for this cluster's wire-compatibility risk is the
+   implementation-time work itself: new unit/integration tests covering streaming and JSON
+   `finish_reason` fidelity plus disconnect cancellation, added as part of the C2 PR series; no new
+   CI surface is proposed by this ADR beyond those tests.
 5. **Risk**: the matmul-gemm cluster's argument validator sits on the hottest code paths in the
    engine (every GEMM/GEMV call in prefill and decode). The bench-compare requirement in item 1
    above is the mitigation; if a measurable regression appears, the validator must be proven
@@ -286,16 +300,20 @@ widest span of call sites and the training/autodiff paths).
 ## Alternatives considered
 
 1. **Leave each duplicated site as-is and file/fix each held finding independently.**
-   Rejected. Six of the twelve held findings driving this ADR are already independently-filed
-   issues (#739-#741, #744-#746) that are each an instance of the same missing shared contract;
-   fixing them one at a time guarantees the next new call site repeats the same drift, which is
-   exactly what happened across the four to fourteen sites already mapped per cluster.
+   Rejected. Six of the eighteen findings driving this ADR (12 unfiled held + 6 filed) are already
+   independently-filed issues (#739-#741, #744-#746) that are each an instance of the same missing
+   shared contract; fixing them one at a time guarantees the next new call site repeats the same
+   drift, which is exactly what happened across the four to fourteen sites already mapped per
+   cluster.
 
 2. **Extract a new `lattice-kernels-core` (or similar) crate for all four clusters.**
-   Rejected. None of the four clusters has a cross-crate consumer today — all duplicated sites in
-   all four clusters live inside `lattice-inference`. A new crate would add a publish-order
-   dependency, a version-bump surface, and packaging overhead (per the repo's `make publish`
-   dependency-DAG process) with no crate outside `lattice-inference` to justify it.
+   Rejected. None of the four clusters has a cross-crate consumer for the sites selected for
+   consolidation — every such site in all four clusters lives inside `lattice-inference` (C4's
+   survey also found a `lattice-fann` dense-layer GEMM and one `lattice-embed` delegating call
+   site, but those are out of scope; see "What we are NOT doing"). A new crate would add a
+   publish-order dependency, a version-bump surface, and packaging overhead (per the repo's
+   `make publish` dependency-DAG process) with no in-scope crate outside `lattice-inference` to
+   justify it.
 
 3. **Unify backend kernels themselves (e.g. one softmax/GEMM implementation for CPU and Metal).**
    Rejected. The audit explicitly found that CPU/SIMD/Metal/WGPU reduction-order and
@@ -316,8 +334,8 @@ widest span of call sites and the training/autodiff paths).
 
 - Each of the four clusters collapses N independently-drifting copies of a fail-closed or validated
   contract into one checked helper plus N backend-specific kernels that consume it, closing the
-  root cause behind six already-filed issues and seven additional held findings in one motion per
-  cluster rather than one motion per site.
+  root cause behind six already-filed issues and twelve additional unfiled held findings (18 total)
+  in one motion per cluster rather than one motion per site.
 - The scalar/CPU reference implementation in each cluster becomes an explicit, named numeric oracle
   usable by future parity tests, rather than an implicit convention scattered across the crate.
 - Future new call sites (new dtype variants, new Metal entry points, new HTTP endpoints) get the
@@ -340,8 +358,9 @@ widest span of call sites and the training/autodiff paths).
 ### Risks
 
 - See "Sequencing & risk" above for the concrete per-cluster mitigations (bench-compare,
-  mutation-sensitive tests, sibling-invocation-path grep, e2e-parity as the wire-compatibility
-  backstop).
+  mutation-sensitive tests, sibling-invocation-path grep, and — for C2/C3's wire-compatibility risk
+  specifically — the new HTTP/serialization/cancellation tests added in that PR series, since
+  e2e-parity itself does not exercise the HTTP wire surface).
 
 ## Implementation plan
 
@@ -350,27 +369,28 @@ widest span of call sites and the training/autodiff paths).
 Extract the row finalizer in `crates/inference/src/attention/`; wire it into every CPU dtype
 variant, Flash-causal, and the three standalone-attention-variant sites; add non-finite-row
 contract tests for the live Metal kernel; delete the unselected legacy Metal softmax kernel. Closes
-#739, #740, #741 and the four held ATTENTIONSOFTMAX findings in this ADR.
+#739, #740, #741 and the four unfiled held attention-softmax findings in this ADR.
 
 ### Phase 2: C2 — shared serving module
 
 Extract router construction, request normalization, and termination serialization into one module
 consumed by both `lattice.rs` and `lattice_serve.rs`; add CPU disconnect-cancellation as an explicit
-generation API. Closes #744, #745, #746 and HTTPSERVE-P2-005.
+generation API. Closes #744, #745, #746 and the one unfiled held http-serve finding.
 
 ### Phase 3: C3 — backend-neutral decode policy
 
 Factor stop-string/reasoning-budget/logprobs policy into a wrapper around backend-specific forward
 callbacks; add explicit fail-closed rejection for any `GenerateConfig` field a given backend cannot
-honor. Closes SAMPLINGDECODE-P2-002 and -003.
+honor. Closes the two unfiled held sampling-decode findings (canonical greedy selection; fail-closed
+generation controls on the alternate CPU decode loops).
 
 ### Phase 4: C4 — GEMM argument validator
 
 Add the checked GEMM validator and the BitNet ternary validator; wire every safe CPU/WGPU/Metal
 wrapper entry point through them; delete or relabel undispatched rectangular Metal kernels; fix the
-training SwiGLU short-slice truncation. Closes MATMULGEMM-P2-001 through -005.
+training SwiGLU short-slice truncation. Closes the five unfiled held matmul-gemm findings.
 
-### Phase 5: Founder sign-off and merge sequencing
+### Phase 5: Maintainer sign-off and merge sequencing
 
 Each phase lands as its own PR series with bench-compare evidence and mutation-sensitive tests
 before merge, per "Sequencing & risk" above. No phase blocks another; they can proceed in parallel
@@ -384,5 +404,7 @@ lowest-risk/highest-already-confirmed cluster first.
 - `crates/inference/src/bin/lattice.rs`, `crates/inference/src/bin/lattice_serve.rs`
 - `crates/inference/src/model/qwen35/generation.rs`
 - `crates/inference/src/forward/cpu/matmul.rs`, `crates/inference/src/forward/cpu/blas.rs`
-- `docs/adr/ADR-058-cpu-perf-regression-ci.md`
+- `docs/adr/ADR-058-cpu-perf-regression-ci.md` (Superseded — bench-compare provenance only)
 - `docs/adr/ADR-064-ci-gate-taxonomy.md`
+- `docs/adr/ADR-066-output-correctness-gate-architecture.md` (Accepted — e2e-parity's actual
+  coverage scope)
