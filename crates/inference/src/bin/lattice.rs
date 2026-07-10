@@ -2550,6 +2550,35 @@ mod serve {
             tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
             max_context: usize,
         },
+        /// Test-only seam (ADR-080 C2 round 2, codex round-2 medium finding
+        /// #3): wraps a real tiny model for `tokenize_len`/`max_context`/
+        /// `tokenizer` (so request validation stays realistic) but
+        /// substitutes the CPU streaming generation call itself with an
+        /// injected closure. This lets a test observe `should_cancel` being
+        /// polled by the EXACT production composition in
+        /// `chat_completions`'s CPU streaming arm -- the same `on_token`/
+        /// `should_cancel` construction and `cancel_rx` wiring real
+        /// requests use -- independently of a real decode loop's timing,
+        /// isolating cancellation-signal wiring from `on_token`'s own
+        /// failed-send stop condition (the exact ambiguity the disconnect
+        /// test's mutation gap left open). Never constructible outside
+        /// `--features test-utils`.
+        #[cfg(all(feature = "test-utils", test))]
+        CpuFakeGenerate {
+            model: Arc<lattice_inference::model::qwen35::Qwen35Model>,
+            #[allow(clippy::type_complexity)]
+            generate: Arc<
+                dyn Fn(
+                        &str,
+                        &lattice_inference::model::qwen35_config::GenerateConfig,
+                        &mut dyn FnMut(&str) -> bool,
+                        &mut dyn FnMut() -> bool,
+                    )
+                        -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                    + Send
+                    + Sync,
+            >,
+        },
     }
 
     impl ModelBackend {
@@ -2558,6 +2587,10 @@ mod serve {
                 ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).real_length,
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).real_length,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => {
+                    model.tokenizer().tokenize(text).real_length
+                }
             }
         }
 
@@ -2566,6 +2599,8 @@ mod serve {
                 ModelBackend::Cpu(m) => m.max_context(),
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { max_context, .. } => *max_context,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => model.max_context(),
             }
         }
 
@@ -2576,6 +2611,8 @@ mod serve {
                 ModelBackend::Cpu(m) => m.tokenizer(),
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { tokenizer, .. } => tokenizer,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => model.tokenizer(),
             }
         }
 
@@ -3633,6 +3670,31 @@ mod serve {
                         }
                     });
                 }
+                // ADR-080 C2 round 2, codex round-2 medium finding #3: same
+                // `on_token`/`should_cancel`/`cancel_rx` composition as the
+                // real `Cpu` arm above, byte-for-byte, with only the
+                // generation call itself substituted -- this is the seam a
+                // post-drop cancellation probe test injects into.
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { generate, .. } => {
+                    tokio::task::spawn_blocking(move || {
+                        let tx_delta = tx.clone();
+                        let mut on_token = move |delta: &str| {
+                            tx_delta
+                                .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                .is_ok()
+                        };
+                        let mut should_cancel = move || *cancel_rx.borrow();
+                        let result = generate(&prompt, &gen_cfg, &mut on_token, &mut should_cancel);
+                        match result {
+                            Ok(output) => finish_streaming(output),
+                            Err(e) => {
+                                eprintln!("generation error (streaming, fake): {e}");
+                                let _ = tx.unbounded_send(StreamMsg::Failed);
+                            }
+                        }
+                    });
+                }
             }
 
             // Build the SSE stream.
@@ -3776,6 +3838,27 @@ mod serve {
                             message: "inference failed".to_string(),
                         }
                     })?,
+                // Non-streaming isn't the round-2 medium finding #3 probe's
+                // concern -- only the streaming arm's `generate` override
+                // matters for that -- so this delegates to the real tiny
+                // model exactly like `ModelBackend::Cpu` above.
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => {
+                    tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
+                        .await
+                        .map_err(|e| {
+                            eprintln!("task join error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                        .map_err(|e| {
+                            eprintln!("generation error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                }
             };
 
             // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
@@ -5305,7 +5388,10 @@ mod serve {
             /// returns `Interrupt` with zero tokens generated. Frame 1 (the
             /// role chunk) still arrives unconditionally either way, and a
             /// *second* frame still arrives either way too -- but under the
-            /// mutation it is the finish chunk (`finish_reason: "interrupt"`,
+            /// mutation it is the finish chunk (`finish_reason: "length"` --
+            /// the shared `finish_reason()` mapping has no `"interrupt"`
+            /// string; a cancelled/interrupted result reports `"length"`
+            /// exactly like a token-cap stop, see its own doc comment --
             /// no `content`) sent by `finish_streaming` for a zero-token
             /// result, not a real content delta. A test that only checks "a
             /// second frame arrived and was Ok" cannot tell these apart, so
@@ -5349,9 +5435,11 @@ mod serve {
                 // returns `Interrupt` with zero tokens, and
                 // `finish_streaming` sends `StreamMsg::Done` immediately --
                 // which *also* produces a well-formed, `Ok` SSE frame here,
-                // just one carrying `finish_reason: "interrupt"` and no
-                // `content` instead of a real delta. So this asserts the
-                // frame's actual payload shape, not just its arrival.
+                // just one carrying `finish_reason: "length"` (the shared
+                // mapping has no `"interrupt"` string; see
+                // `lattice_inference::serve::finish_reason`'s doc comment)
+                // and no `content` instead of a real delta. So this asserts
+                // the frame's actual payload shape, not just its arrival.
                 let frame = tokio::time::timeout(Duration::from_secs(10), body.frame())
                     .await
                     .expect(
@@ -5406,6 +5494,351 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
+        // Post-drop generator-side cancellation probe (ADR-080 C2 round 2,
+        // codex round-2 medium finding #3): `chat_completions_streaming_
+        // disconnect_stops_generation` above proves guard retention BEFORE
+        // the response is returned (frame 2 is a real content delta), but
+        // does NOT prove `should_cancel` reaching the generator AFTER the
+        // drop, independently of `on_token`'s own failed-send stop
+        // condition -- codex's exact reverse mutation (`cancel_rx`
+        // predicate replaced by `move || false`, `on_token`'s failed-send
+        // path left intact) left that test green in 0.02s, because the
+        // failed send alone stops a real decode loop just as fast as a
+        // correctly wired cancellation would.
+        //
+        // This test isolates the two signals: `ModelBackend::CpuFakeGenerate`
+        // (test-only, see its doc comment) sends exactly ONE delta -- so
+        // `on_token` is never called again after that point -- then enters a
+        // phase that polls ONLY `should_cancel`, in a loop that never touches
+        // `on_token`/the reply channel at all, and reports which of two
+        // outcomes ended that loop over a side channel `chat_completions`
+        // itself never sees. Because the probe stops polling `on_token`
+        // entirely after the first delta, `on_token`'s failed-send masking
+        // effect (the exact thing that hid finding #3 from the original
+        // test) cannot fire here -- only `should_cancel`'s own return value
+        // can end the loop.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod post_drop_cancellation_probe {
+            use super::*;
+            use http_body_util::BodyExt;
+            use std::sync::Mutex;
+            use std::time::Duration;
+
+            /// One real delta, then a bounded should_cancel-only poll loop.
+            /// `MAX_POLLS` * `POLL_INTERVAL` (10s) comfortably exceeds the
+            /// test's own 10s await-completion timeout below, so a broken
+            /// `should_cancel` wiring (the `move || false` mutation) makes
+            /// the outer `tokio::time::timeout` fire first with a clear
+            /// failure message, rather than this loop silently reporting
+            /// "exhausted" first in a way that could be confused with a
+            /// flake.
+            const MAX_POLLS: usize = 4000;
+            const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+            /// Same rationale as `disconnect_cancellation`'s constant of the
+            /// same value: the tiny test model's context window is a fixed
+            /// 1024 tokens, so this stays comfortably under it while still
+            /// being "effectively unbounded" relative to this test's own
+            /// timeouts.
+            const NEAR_MAX_CONTEXT_TOKENS: usize = 900;
+
+            /// `should_cancel`'s reading taken after the test's `checkpoint1`
+            /// signal (sent the instant `chat_completions(..).await`
+            /// returns, before the test reads any SSE frame or drops
+            /// anything) but before the `go` signal (sent only after
+            /// `drop(body)`). Must be `false` in correctly-wired code:
+            /// `cancel_guard` is still alive at this point (held by
+            /// `body_stream`'s `flat_map` closure, itself alive because the
+            /// test hasn't dropped the body/receiver yet), so `cancel_rx`
+            /// cannot have flipped. A `true` reading here is the direct,
+            /// timing-independent signature of finding #1's mutation (guard
+            /// capture removed): `cancel_guard` is then just an unused
+            /// local that drops the instant `chat_completions` returns --
+            /// gating this read on `checkpoint1` (rather than reading it
+            /// immediately after `on_token`, which raced against
+            /// `chat_completions`'s own return on an early version of this
+            /// test and non-deterministically read `false` even under the
+            /// mutation) guarantees the read happens causally after that
+            /// return, so an unused `cancel_guard` has unconditionally
+            /// already dropped by the time this reads it.
+            #[derive(Debug, PartialEq)]
+            struct ProbeOutcome {
+                pre_drop_cancelled: bool,
+                post_drop: PostDropOutcome,
+            }
+
+            #[derive(Debug, PartialEq)]
+            enum PostDropOutcome {
+                /// `should_cancel` returned `true` after this many polls
+                /// following the test's `go` signal (sent only after
+                /// `drop(body)`) -- the correctly-wired behavior.
+                CancelledAfterPolls(usize),
+                /// The poll budget was exhausted without `should_cancel`
+                /// ever returning `true` -- the `move || false` mutation's
+                /// signature (an unthreaded/replaced predicate that can
+                /// never observe the drop).
+                ExhaustedWithoutCancel,
+            }
+
+            /// Builds an `AppState` whose CPU streaming generation is the
+            /// injected `generate` closure instead of the real tiny model's
+            /// decode loop, via `ModelBackend::CpuFakeGenerate`. Tokenizer/
+            /// context-window behavior still comes from a real tiny model
+            /// (`tiny_zero_model()`), so request validation ahead of the
+            /// streaming branch is unchanged from the other HTTP-level
+            /// tests in this file.
+            fn tiny_state_with_fake_cpu_generate(
+                max_tokens_cap: usize,
+                generate: impl Fn(
+                    &str,
+                    &lattice_inference::model::qwen35_config::GenerateConfig,
+                    &mut dyn FnMut(&str) -> bool,
+                    &mut dyn FnMut() -> bool,
+                )
+                    -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                + Send
+                + Sync
+                + 'static,
+            ) -> AppState {
+                let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+                AppState {
+                    model: ModelBackend::CpuFakeGenerate {
+                        model: Arc::new(model),
+                        generate: Arc::new(generate),
+                    },
+                    default_max_tokens: max_tokens_cap,
+                    max_tokens_cap,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                }
+            }
+
+            /// Mutation-sensitive to BOTH of codex's named regressions
+            /// independently, via a test<->generator handshake that removes
+            /// the timing race a plain poll-and-time-it design would have
+            /// (an early, timing-dependent version of this test observed
+            /// `CancelledAfterPolls(1)` even under mutation (a), because
+            /// `cancel_guard` -- unused once its capture is removed --
+            /// drops at `chat_completions`'s own return, which can race
+            /// ahead of or behind the generator's first poll depending on
+            /// blocking-thread-pool scheduling):
+            ///
+            /// (a) removing `body_stream`'s
+            ///     `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
+            ///     capture flips `cancel_rx` the instant `chat_completions`
+            ///     returns -- before the test even reads its first SSE
+            ///     frame, let alone drops the body. `pre_drop_cancelled`
+            ///     (read BEFORE the generator waits on the `go` signal,
+            ///     which the test only sends after `drop(body)`) captures
+            ///     exactly this: `true` here is impossible under correct
+            ///     wiring regardless of scheduling, since `cancel_guard` is
+            ///     provably still alive at that point.
+            /// (b) replacing the CPU `should_cancel` predicate
+            ///     (`move || *cancel_rx.borrow()`) with `move || false`
+            ///     means the post-`go` poll loop never observes `true`, so
+            ///     it exhausts `MAX_POLLS` and reports
+            ///     `PostDropOutcome::ExhaustedWithoutCancel`.
+            #[tokio::test]
+            async fn chat_completions_streaming_disconnect_cancellation_reaches_generator_post_drop()
+             {
+                let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<ProbeOutcome>();
+                let outcome_tx = Mutex::new(Some(outcome_tx));
+                let (checkpoint1_tx, checkpoint1_rx) = std::sync::mpsc::channel::<()>();
+                let checkpoint1_rx = Mutex::new(Some(checkpoint1_rx));
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                let go_rx = Mutex::new(Some(go_rx));
+
+                let state = tiny_state_with_fake_cpu_generate(
+                    NEAR_MAX_CONTEXT_TOKENS,
+                    move |_prompt, _cfg, on_token, should_cancel| {
+                        // One real delta -- exactly what the disconnect test
+                        // above reads as its second frame -- so
+                        // `chat_completions`'s SSE framing has genuine
+                        // content before this probe phase begins. Queued
+                        // into the reply channel immediately; the test can
+                        // read it as frame 2 regardless of whether this
+                        // thread is later blocked waiting on `checkpoint1`.
+                        on_token("probe");
+
+                        // Block until the test confirms `chat_completions`
+                        // itself has already returned (see `pre_drop_cancelled`'s
+                        // doc comment on why this ordering, not an
+                        // immediate post-`on_token` read, is what makes the
+                        // next line's reading timing-independent).
+                        if let Some(rx) = checkpoint1_rx.lock().unwrap().take() {
+                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                        }
+                        let pre_drop_cancelled = should_cancel();
+
+                        // Block until the test signals it has dropped the
+                        // body (or give up after 10s so a broken handshake
+                        // fails this test instead of hanging the process).
+                        if let Some(rx) = go_rx.lock().unwrap().take() {
+                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                        }
+
+                        let mut polls = 0usize;
+                        let post_drop = loop {
+                            if should_cancel() {
+                                break PostDropOutcome::CancelledAfterPolls(polls);
+                            }
+                            if polls >= MAX_POLLS {
+                                break PostDropOutcome::ExhaustedWithoutCancel;
+                            }
+                            polls += 1;
+                            std::thread::sleep(POLL_INTERVAL);
+                        };
+                        if let Some(tx) = outcome_tx.lock().unwrap().take() {
+                            let _ = tx.send(ProbeOutcome {
+                                pre_drop_cancelled,
+                                post_drop,
+                            });
+                        }
+                        Ok(GenerateOutput {
+                            text: "probe".to_string(),
+                            token_ids: vec![],
+                            prompt_tokens: 1,
+                            generated_tokens: 1,
+                            stopped: false,
+                            stop_reason: Some(
+                                lattice_inference::stop_reason::StopReason::Interrupt,
+                            ),
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
+
+                let req = ChatCompletionRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![user_msg("hi")],
+                    max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
+                    stream: Some(true),
+                    ..bare_req()
+                };
+                let response = chat_completions(State(state), Ok(Json(req)))
+                    .await
+                    .expect("streaming request must be accepted");
+                // `chat_completions` has now unconditionally returned, so an
+                // unused `cancel_guard` (mutation (a)) has already dropped;
+                // signal the generator it may take its `pre_drop_cancelled`
+                // reading.
+                let _ = checkpoint1_tx.send(());
+                let mut body = response.into_body();
+
+                // Frame 1: role chunk.
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("role chunk frame must arrive quickly")
+                    .expect("role chunk frame must exist")
+                    .expect("role chunk frame must be Ok");
+
+                // Frame 2: the fake generator's one real delta.
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("delta frame must arrive quickly")
+                    .expect("delta frame must exist")
+                    .expect("delta frame must be Ok");
+
+                // Client disconnect: drop the body. The fake generator is
+                // waiting on `go_rx`, having already called `on_token` and
+                // taken its `pre_drop_cancelled` reading.
+                drop(body);
+                let _ = go_tx.send(());
+
+                let outcome = tokio::time::timeout(Duration::from_secs(10), outcome_rx)
+                    .await
+                    .expect(
+                        "the fake generator's post-drop probe phase must signal \
+                         completion within 10s of the client disconnecting -- a \
+                         timeout here means should_cancel never observed the \
+                         disconnect at all",
+                    )
+                    .expect("probe outcome sender must not be dropped without sending");
+
+                assert!(
+                    !outcome.pre_drop_cancelled,
+                    "should_cancel must read false before the test has dropped the \
+                     response body -- a true reading here means cancel_guard had \
+                     already dropped (e.g. because it is no longer tied to the \
+                     stream's lifetime) well before any disconnect happened: \
+                     {outcome:?}"
+                );
+                assert!(
+                    matches!(outcome.post_drop, PostDropOutcome::CancelledAfterPolls(_)),
+                    "should_cancel must return true within the poll budget after \
+                     the test drops the response body -- exhausting the budget \
+                     means the disconnect signal never reached the generator at \
+                     all: {outcome:?}"
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Streaming context-overflow status parity (ADR-080 C2 round 2, codex
+        // round-2 major finding #1): `lattice.rs` already gets this right
+        // structurally -- `prepare_chat_request`'s context-window preflight
+        // (`check_context_window`) runs unconditionally, before
+        // `chat_completions` ever branches on `req.stream` -- so a `stream:
+        // true` request that overflows the model's context window returns
+        // HTTP 400 `context_length_exceeded` before any SSE stream is ever
+        // built. `cm_serve_context_window_checked_before_stop_parsing` above
+        // already pins the underlying cascade ordering as a pure function;
+        // this drives the SAME contract through the real `Router` (matching
+        // `lattice_serve.rs`'s sibling test for the daemon side of the same
+        // finding), so a future regression at the HTTP-composition layer --
+        // not just inside `prepare_chat_request` itself -- is also caught.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod streaming_context_overflow {
+            use super::*;
+            use tower::ServiceExt as _;
+
+            /// The tiny test model's context window is a fixed 1024 tokens
+            /// (`test_support::tiny_zero_model`'s `max_position_embeddings`,
+            /// see `disconnect_cancellation`'s comment). `max_tokens` here
+            /// equals that whole window, so any non-empty prompt pushes
+            /// `prompt_token_count + max_tokens` past it; `max_tokens_cap` is
+            /// kept well above 1024 so `validate_max_tokens`'s cap-reject
+            /// (`max_tokens_exceeds_limit`) never fires first -- this test
+            /// must isolate the context-window check, not the cap check.
+            const MAX_TOKENS_AT_WINDOW: usize = 1024;
+            const CAP: usize = 4096;
+
+            #[tokio::test]
+            async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse()
+            {
+                let body = axum::body::Body::from(format!(
+                    r#"{{"model":"test-model","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{MAX_TOKENS_AT_WINDOW},"stream":true}}"#
+                ));
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .expect("fixture request must build");
+                let response = router(tiny_state(CAP))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "an over-context stream:true request must be rejected with HTTP \
+                     400 before any SSE stream is committed, matching \
+                     lattice_serve.rs's equivalent preflight for the identical \
+                     request body"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
+        }
+
+        // -----------------------------------------------------------------------
         // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2 round 2,
         // codex round-1 finding #1): drives every fixture body in
         // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
@@ -5438,10 +5871,10 @@ mod serve {
 
                     let app = router(tiny_state(CAP));
                     let request = axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/v1/chat/completions")
+                        .method(case.method)
+                        .uri(case.path)
                         .header("content-type", "application/json")
-                        .body(axum::body::Body::from(case.body))
+                        .body(axum::body::Body::from(case.body.build()))
                         .expect("fixture request must build");
                     let response = app
                         .oneshot(request)
