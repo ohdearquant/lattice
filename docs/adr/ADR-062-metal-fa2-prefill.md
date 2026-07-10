@@ -1,6 +1,6 @@
 # ADR-062: Metal FlashAttention-2 Prefill + KV Cache Quantization Chain
 
-**Status**: Proposed (partially superseded — see implementation status below)
+**Status**: Proposed (partially superseded — see implementation status below; KV-quant sequencing further superseded at the priority level by ADR-073)
 **Date**: 2026-05-27
 **Crate**: lattice-inference (Metal shaders, KV cache). Phase 0 proposes extracting shaders into a `crates/lattice-metal/` directory tree. **This introduces a new workspace member** — see Crate Layout below for dependency direction, feature gating, and publish-order consequences. If the team prefers keeping shaders inside `crates/inference/`, the same file structure applies under `crates/inference/src/metal/` without a new crate.
 **Research**: RQ-4 (`workspaces/20260527/04.md`)

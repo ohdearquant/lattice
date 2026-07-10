@@ -1,8 +1,12 @@
-# ADR-070: Prefill GEMM Optimization Priority (Metal)
+# ADR-081: Prefill GEMM Optimization Priority (Metal)
 
 **Status**: Proposed
 **Date**: 2026-07-08
 **Crate**: lattice-inference
+
+> Renumbered from ADR-070 on 2026-07-10 to resolve a numbering collision with
+> ADR-070-cpu-embedding-batched-encode.md (both files were independently merged under
+> number 070 three days apart, PR #671 and PR #721/#722).
 
 > **Evidence basis**: The Decision below is grounded in this engine's own measured
 > profiling and A/B results (the **Measured** table). A parallel external prior-art
