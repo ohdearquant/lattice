@@ -772,10 +772,11 @@ impl Qwen35Model {
                         break;
                     }
                     StepOutcome::Stopped => {
-                        // Unreachable on this path (no stop_strings
-                        // configured; the closure never returns
-                        // `StopCheckOutcome::Stopped`), handled for
-                        // exhaustiveness/defense-in-depth.
+                        // Unreachable on this path (`policy.stop_mode` is
+                        // always `Disabled` here -- no `stop_strings`
+                        // configured -- and `Disabled`'s `stop_check` arm
+                        // never returns `StopCheckOutcome::Stopped`), handled
+                        // for exhaustiveness/defense-in-depth.
                         stopped = true;
                         stop_reason = StopReason::Eos;
                         break;
@@ -1002,15 +1003,16 @@ pub(crate) enum StepOutcome {
     /// was never pushed. The loop must stop with `stopped = true`,
     /// `stop_reason = Eos`.
     Eos,
-    /// The mandatory `stop_check` callback (codex round-2 major #2, PR #787)
+    /// [`DecodePolicy::stop_check`] — driven internally from `self.stop_mode`
+    /// (codex round-3 major #1, PR #787 / Leo's ruling; see [`StopMode`]) —
     /// reported that a configured stop string matched as of this token. The
     /// token was pushed (via `push`) and every other backend-neutral
     /// per-step control already applied before `stop_check` ran; the loop
     /// must stop with `stopped = true`, `stop_reason = Eos`.
     Stopped,
-    /// The mandatory `stop_check` callback reported that the caller's
-    /// streaming sink can no longer consume output (e.g. a dropped SSE
-    /// receiver) — not a stop condition. The loop must stop with
+    /// [`DecodePolicy::stop_check`] reported that the caller's
+    /// streaming sink (`emit_confirmed`) can no longer consume output (e.g. a
+    /// dropped SSE receiver) — not a stop condition. The loop must stop with
     /// `stopped = false`, `stop_reason = Interrupt`.
     Interrupted,
     /// The token was pushed (via the caller's `push` callback), `stop_check`
@@ -1056,13 +1058,15 @@ pub(crate) enum StopCheckOutcome {
 /// transition ([`DecodePolicy::transition`]): each backend keeps
 /// `forward_step`, grammar masking, sampling, and its own token vectors
 /// (`generated_ids` / `all_ids` or the Metal equivalents) entirely to itself,
-/// hands `transition` the token its own pipeline just sampled plus four
+/// hands `transition` the token its own pipeline just sampled plus three
 /// backend callbacks (grammar-advance, EOS/stop-token check, the push into
-/// its own vectors, and the stop-string check below), and gets back a
+/// its own vectors) and raw per-token I/O primitives for the stop check
+/// (`decode_delta`, a `text`/`token_logprob_end_offsets` buffer pair, and
+/// `emit_confirmed` — see [`StopMode`] below), and gets back a
 /// [`StepOutcome`] that already reflects budget-override, reasoning-block
-/// tracking, logprobs recording, reasoning-end capture, the stop-string
-/// check, and the answer-budget check — in that fixed order, every time, for
-/// every site.
+/// tracking, logprobs recording, reasoning-end capture, the stop check, and
+/// the answer-budget check — in that fixed order, every time, for every
+/// site.
 ///
 /// Before this struct existed, this exact bookkeeping (`think_close_id`
 /// resolution, `thinking_closed` / `reasoning_end_len` tracking, the
@@ -1831,9 +1835,11 @@ fn decode_loop_with_stops(
                 break;
             }
             StepOutcome::Interrupted => {
-                // Unreachable from this closure (it never returns
-                // `StopCheckOutcome::Interrupted`; only the streaming call
-                // sites do), handled for exhaustiveness/defense-in-depth.
+                // Unreachable on this path (`policy.stop_mode` is
+                // `StopMode::FullScan` here, whose `stop_check` arm never
+                // returns `StopCheckOutcome::Interrupted` -- only
+                // `StopMode::Streaming`'s arm does, for the streaming call
+                // sites), handled for exhaustiveness/defense-in-depth.
                 stop_reason = StopReason::Interrupt;
                 break;
             }
