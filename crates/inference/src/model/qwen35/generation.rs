@@ -1402,6 +1402,61 @@ pub(crate) fn check_logprobs_not_set(gen_cfg: &GenerateConfig) -> Result<(), Inf
     Ok(())
 }
 
+/// Sibling guard to [`check_grammar_not_set`] / [`check_logprobs_not_set`]
+/// (ADR-080 C3, #783): fails closed instead of silently dropping a
+/// `stop_strings` request on a generation path that has not wired
+/// string-level stop matching into its decode loop.
+///
+/// Callers: `generate_f16` (`forward/cpu_f16.rs`), `generate_q8`
+/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`),
+/// `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`).
+///
+/// The base CPU `generate()` / `generate_streaming()` paths in this module,
+/// and the Metal `generate()` / `generate_streaming()` / `generate_multimodal`
+/// family, all wire `stop_strings` matching directly and therefore do not
+/// call this guard.
+pub(crate) fn check_stop_strings_not_set(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+    if !gen_cfg.stop_strings.is_empty() {
+        return Err(InferenceError::InvalidInput(
+            "stop_strings is not yet supported on this generation path; \
+             use the Qwen3.5 CPU generate() / generate_streaming() or the Metal \
+             generate() / generate_streaming(), which implement stop-string matching"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Sibling guard to [`check_stop_strings_not_set`] (ADR-080 C3, #783): fails
+/// closed instead of silently dropping a `reasoning_budget` request on a
+/// generation path that has not wired budget-forcing (`decode_cap` /
+/// `force_close_think`) into its decode loop.
+///
+/// Same CPU caller list as [`check_stop_strings_not_set`]. On the Metal side,
+/// the plain `generate()` entry point and `multimodal_generate_preflight`
+/// (`generate_multimodal`) both call this guard directly; the MTP and
+/// self-speculative greedy fast paths never see a set `reasoning_budget` in
+/// the first place — their route predicates (`mtp_route_active` /
+/// `self_spec_route_active`) exclude it, falling through to plain
+/// `generate()`, which rejects it via this same guard.
+///
+/// The base CPU `generate()` / `generate_streaming()` paths in this module,
+/// and the Metal `generate_streaming()` family, wire reasoning-budget forcing
+/// directly and therefore do not call this guard.
+pub(crate) fn check_reasoning_budget_not_set(
+    gen_cfg: &GenerateConfig,
+) -> Result<(), InferenceError> {
+    if gen_cfg.reasoning_budget.is_some() {
+        return Err(InferenceError::InvalidInput(
+            "reasoning_budget is not yet supported on this generation path; \
+             use the Qwen3.5 CPU generate() / generate_streaming() or the Metal \
+             generate_streaming(), which implement reasoning-budget forcing"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1732,6 +1787,68 @@ mod tests {
         };
         assert_eq!(cfg.stop_strings.len(), 2);
         assert_eq!(cfg.stop_strings[0], "</s>");
+    }
+
+    // -----------------------------------------------------------------------
+    // check_stop_strings_not_set / check_reasoning_budget_not_set
+    // (ADR-080 C3, #783) — mutation-sensitive unit tests for the shared guard
+    // primitives every alternate CPU/Metal decode loop calls.
+    // -----------------------------------------------------------------------
+
+    /// Mutation sensitivity: change `check_stop_strings_not_set` to always
+    /// return `Ok(())` → this assertion fails, catching a regression that
+    /// would let a non-empty `stop_strings` silently pass through an
+    /// unwired decode loop.
+    #[test]
+    fn check_stop_strings_not_set_rejects_nonempty() {
+        let cfg = GenerateConfig {
+            stop_strings: vec!["</s>".to_string()],
+            ..Default::default()
+        };
+        let result = check_stop_strings_not_set(&cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "non-empty stop_strings must be rejected with InvalidInput; got {result:?}"
+        );
+    }
+
+    /// Mutation sensitivity: change the guard to always return `Err(..)` →
+    /// this assertion fails, catching a regression that would reject every
+    /// caller including the default (no stop strings requested) config.
+    #[test]
+    fn check_stop_strings_not_set_allows_empty() {
+        assert!(
+            check_stop_strings_not_set(&GenerateConfig::default()).is_ok(),
+            "empty stop_strings (the default) must be allowed"
+        );
+    }
+
+    /// Mutation sensitivity: change `check_reasoning_budget_not_set` to
+    /// always return `Ok(())` → this assertion fails, catching a regression
+    /// that would let a set `reasoning_budget` silently pass through an
+    /// unwired decode loop.
+    #[test]
+    fn check_reasoning_budget_not_set_rejects_some() {
+        let cfg = GenerateConfig {
+            reasoning_budget: Some(128),
+            ..Default::default()
+        };
+        let result = check_reasoning_budget_not_set(&cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "Some(reasoning_budget) must be rejected with InvalidInput; got {result:?}"
+        );
+    }
+
+    /// Mutation sensitivity: change the guard to always return `Err(..)` →
+    /// this assertion fails, catching a regression that would reject every
+    /// caller including the default (no reasoning budget requested) config.
+    #[test]
+    fn check_reasoning_budget_not_set_allows_none() {
+        assert!(
+            check_reasoning_budget_not_set(&GenerateConfig::default()).is_ok(),
+            "reasoning_budget: None (the default) must be allowed"
+        );
     }
 
     // -----------------------------------------------------------------------

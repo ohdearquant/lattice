@@ -558,6 +558,13 @@ mod mtp_resolve_tests {
 /// `gen_cfg.stop_strings.is_empty()` is load-bearing: MTP's draft/verify loop
 /// has no string-stop awareness, so any non-empty `stop_strings` must route
 /// around it to the plain loop (which does check stops after every token).
+///
+/// `gen_cfg.reasoning_budget.is_none()` is the same kind of load-bearing
+/// route-around (ADR-080 C3, #783): MTP's draft/verify loop has no
+/// budget-forcing awareness (no `decode_cap` / `force_close_think` wiring),
+/// so any set `reasoning_budget` must route around it to the plain loop,
+/// which either applies budget forcing or rejects the config via
+/// `check_reasoning_budget_not_set`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_route_active(
     mtp_present: bool,
@@ -572,12 +579,13 @@ fn mtp_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
 }
 
 /// Whether `generate()` should take the GDN-first self-speculative greedy
 /// branch. Mirrors the `use_self_spec` computation inline in
-/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()`
-/// route-around rationale as [`mtp_route_active`].
+/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
+/// `reasoning_budget.is_none()` route-around rationale as [`mtp_route_active`].
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn self_spec_route_active(
     gdn_checkpoints_present: bool,
@@ -593,6 +601,7 @@ fn self_spec_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
         && num_active_linear_attention_layers > 0
 }
 
@@ -661,6 +670,43 @@ mod route_predicate_tests {
             !self_spec_route_active(true, true, &gen_cfg, false, 1),
             "self-spec must not activate when stop_strings is non-empty -- \
              same string-stop-unaware draft/verify loop as MTP"
+        );
+    }
+
+    /// ADR-080 C3 (#783): a set `reasoning_budget` must route around MTP even
+    /// though every other MTP precondition is satisfied -- MTP's draft/verify
+    /// loop has no budget-forcing (`decode_cap` / `force_close_think`)
+    /// awareness, mirroring the `stop_strings` route-around above.
+    ///
+    /// Mutation sensitivity: removing the `reasoning_budget.is_none()` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), which would silently drop the caller's reasoning budget once
+    /// MTP takes over decoding.
+    #[test]
+    fn mtp_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when reasoning_budget is set -- its \
+             draft/verify loop has no budget-forcing awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_set_reasoning_budget` for the
+    /// self-speculative route (ADR-080 C3, #783).
+    #[test]
+    fn self_spec_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when reasoning_budget is set -- same \
+             budget-forcing-unaware draft/verify loop as MTP"
         );
     }
 }
@@ -7855,14 +7901,11 @@ mod inner {
                 };
             }
 
-            // Greedy argmax from prefill logits.
-            let pending_first = prefill_logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            // Greedy argmax from prefill logits. Shared first-wins helper
+            // (ADR-080 C3, #783) rather than a hand-rolled `max_by`, which
+            // keeps the LAST tied maximum instead of the engine-wide-contract
+            // first tied maximum.
+            let pending_first = crate::sampling::argmax_f32_first_wins(prefill_logits);
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8100,15 +8143,10 @@ mod inner {
                 };
             }
 
-            let argmax_logits = |logits: &[f32]| -> u32 {
-                logits
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0)
-            };
+            // Shared first-wins argmax helper (ADR-080 C3, #783) rather than a
+            // hand-rolled `max_by` closure, which kept the LAST tied maximum
+            // instead of the engine-wide-contract first tied maximum.
+            let argmax_logits = crate::sampling::argmax_f32_first_wins;
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8453,6 +8491,16 @@ mod inner {
                     token_logprobs: vec![],
                 });
             }
+
+            // Reject reasoning_budget before any prefill/state work (ADR-080 C3,
+            // #783): budget-forcing (`decode_cap` / `force_close_think`) is not
+            // wired into this decode loop, unlike `generate_streaming` /
+            // `generate_streaming_with_cancel` below, which do apply it. Without
+            // this guard the field would be silently ignored, producing
+            // unbudgeted output despite a reasoning budget being requested.
+            // `stop_strings` does not need an equivalent guard here: this loop
+            // already applies it via `stop_text_state` further down.
+            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
 
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len) and panic the
@@ -22779,6 +22827,54 @@ mod inner {
             );
         }
 
+        /// `MetalQwen35State::generate` (the plain/direct entry point) must
+        /// reject a `GenerateConfig` with `reasoning_budget` set, with a typed
+        /// `InvalidInput` error, rather than silently ignoring the budget and
+        /// generating unbudgeted output (ADR-080 C3, #783).
+        ///
+        /// This is the production-seam test for the guard added to `generate`
+        /// itself, proving the call site is real — `route_predicate_tests`
+        /// and `multimodal_preflight_tests` already cover the pure guard
+        /// logic without a GPU device.
+        ///
+        /// Mutation sensitivity: removing the `check_reasoning_budget_not_set`
+        /// call from `generate` lets this request proceed through prefill and
+        /// sampling instead of erroring, so `result.is_err()` fails.
+        #[test]
+        fn metal_generate_plain_rejects_reasoning_budget_config() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: Some(2),
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "MetalQwen35State::generate must fail closed with InvalidInput when \
+                 reasoning_budget is set (ADR-080 C3, #783); got {result:?}"
+            );
+        }
+
         /// `generate_streaming`'s `max_new_tokens == 0` guard must return before the
         /// prefill token is sampled, pushed, or streamed, matching the CPU
         /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
@@ -27601,6 +27697,12 @@ mod topk_boundary_tie_tests {
 /// wired into this path either, so `gen_cfg.logprobs` is rejected the same
 /// way rather than silently returning an empty `token_logprobs`.
 ///
+/// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into this path
+/// either (no `decode_cap` / `force_close_think`), so `gen_cfg.reasoning_budget`
+/// is rejected the same way. `gen_cfg.stop_strings` does NOT need an
+/// equivalent guard here: `generate_multimodal` already applies it via its own
+/// `stop_text_state` / `StopStringMatcher` wiring further down.
+///
 /// Compiled when Metal-GPU is enabled (the production caller lives inside
 /// `mod inner`) or during test builds so that the module-level test can
 /// exercise the guard logic on any platform without GPU hardware.
@@ -27609,7 +27711,8 @@ pub(crate) fn multimodal_generate_preflight(
     gen_cfg: &crate::model::qwen35_config::GenerateConfig,
 ) -> Result<(), crate::error::InferenceError> {
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
-    crate::model::qwen35::check_logprobs_not_set(gen_cfg)
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)
 }
 
 #[cfg(test)]
@@ -27682,6 +27785,39 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "logprobs = None must not trigger the preflight guard"
+        );
+    }
+
+    /// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into the
+    /// multimodal path; the preflight must reject a config with
+    /// `reasoning_budget` set rather than silently returning an unbudgeted
+    /// output.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` (or drop the new `check_reasoning_budget_not_set` call)
+    /// → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_rejects_budget_config() {
+        let cfg_with_budget = GenerateConfig {
+            reasoning_budget: Some(32),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_budget);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when reasoning_budget is set; \
+             got {result:?}"
+        );
+    }
+
+    /// A config with `reasoning_budget` unset must pass through the preflight
+    /// without error.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_allows_no_budget() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "reasoning_budget = None must not trigger the preflight guard"
         );
     }
 }

@@ -52,6 +52,9 @@ pub(crate) use detokenize::decode_tokens;
 pub(crate) use generation::check_grammar_not_set;
 // Sibling guard for `logprobs` on the same unwired paths (#585).
 pub(crate) use generation::check_logprobs_not_set;
+// Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
+// paths (ADR-080 C3, #783).
+pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{
