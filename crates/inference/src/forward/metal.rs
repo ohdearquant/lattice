@@ -823,6 +823,7 @@ mod inner {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
 
         /// Guards the `flash_attention.metal` extraction: the file loaded via
         /// `include_str!` and run through `msl_source_for`'s token substitution must
@@ -858,6 +859,252 @@ mod inner {
                 library
                     .get_function(name, None)
                     .unwrap_or_else(|e| panic!("kernel '{name}' missing from library: {e}"));
+            }
+            // ADR-080 C1 (#791): attn_scores/attn_softmax/attn_context were dead
+            // code (no `make_pipeline` call referenced them, and the dead
+            // `attn_softmax` carried the same multiply-through-zero fail-open
+            // defect as #789) and were deleted from the shader source. Guard
+            // against silently resurrecting them.
+            for dead_name in ["attn_scores", "attn_softmax", "attn_context"] {
+                assert!(
+                    library.get_function(dead_name, None).is_err(),
+                    "'{dead_name}' should have been deleted as dead code (ADR-080 C1, #791) \
+                     but is present in the assembled MSL"
+                );
+            }
+        }
+
+        /// ADR-080 C1 (#789) regression: the fused_attention finalize must fail
+        /// closed by ASSIGNMENT when the online-softmax denominator is
+        /// non-positive or non-finite (e.g. a NaN score from a corrupted Q
+        /// lane), not by multiplying the (possibly already-NaN) numerator
+        /// through a zeroed reciprocal -- `NaN * 0.0f == NaN` under IEEE-754,
+        /// so a `* inv_l` finalize cannot recover a poisoned row.
+        ///
+        /// Mutation-sensitive: reverting the fix in flash_attention.metal back
+        /// to `O4[out_base4] = o_frag * inv_l;` makes this test fail (160/160
+        /// NaN elements instead of 0), confirmed at PR time.
+        #[test]
+        fn fused_attention_fails_closed_on_nan_q_lane() {
+            let _lock = gpu_test_lock();
+            let Some(_device_probe) = Device::system_default() else {
+                return;
+            };
+
+            let config = QwenConfig {
+                vocab_size: 8,
+                hidden_size: 32,
+                num_hidden_layers: 1,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                head_dim: 8,
+                intermediate_size: 48,
+                max_position_embeddings: 32,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1_000_000.0,
+            };
+            let hidden = config.hidden_size;
+            let q_dim = config.q_dim();
+            let kv_dim = config.kv_dim();
+            let intermediate = config.intermediate_size;
+
+            let mut rng = TestLcg::new(0x5EED_BAAD_F00Du64);
+            let embed_tokens_flat = test_random_vec(&mut rng, config.vocab_size * hidden);
+            let norm_weight_flat = test_random_positive_vec(&mut rng, hidden);
+
+            // Corrupt one entry of q_proj_weight so a single attention head's
+            // Q vector is NaN at every query position, while K/V/embeddings/
+            // residual stay completely clean -- isolates the softmax finalize
+            // as the only place the NaN could be cured.
+            let corrupt_head: usize = 1;
+            let corrupt_head_dim: usize = 3;
+            let corrupt_out_idx = corrupt_head * config.head_dim + corrupt_head_dim;
+            let corrupt_in_idx = 5usize;
+
+            let mut q_proj_flat = test_random_vec(&mut rng, q_dim * hidden);
+            q_proj_flat[corrupt_out_idx * hidden + corrupt_in_idx] = f32::NAN;
+            let k_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
+            let v_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
+            let o_proj_flat = test_random_vec(&mut rng, hidden * q_dim);
+            let q_norm_flat = test_random_positive_vec(&mut rng, config.head_dim);
+            let k_norm_flat = test_random_positive_vec(&mut rng, config.head_dim);
+            let input_ln_flat = test_random_positive_vec(&mut rng, hidden);
+            let gate_proj_flat = test_random_vec(&mut rng, intermediate * hidden);
+            let up_proj_flat = test_random_vec(&mut rng, intermediate * hidden);
+            let down_proj_flat = test_random_vec(&mut rng, hidden * intermediate);
+            let post_ln_flat = test_random_positive_vec(&mut rng, hidden);
+
+            let layer = QwenLayerWeights {
+                q_proj_weight: Tensor2D {
+                    data: &q_proj_flat,
+                    rows: q_dim,
+                    cols: hidden,
+                },
+                k_proj_weight: Tensor2D {
+                    data: &k_proj_flat,
+                    rows: kv_dim,
+                    cols: hidden,
+                },
+                v_proj_weight: Tensor2D {
+                    data: &v_proj_flat,
+                    rows: kv_dim,
+                    cols: hidden,
+                },
+                o_proj_weight: Tensor2D {
+                    data: &o_proj_flat,
+                    rows: hidden,
+                    cols: q_dim,
+                },
+                q_norm_weight: Tensor1D {
+                    data: &q_norm_flat,
+                    len: config.head_dim,
+                },
+                k_norm_weight: Tensor1D {
+                    data: &k_norm_flat,
+                    len: config.head_dim,
+                },
+                input_layernorm_weight: Tensor1D {
+                    data: &input_ln_flat,
+                    len: hidden,
+                },
+                gate_proj_weight: Tensor2D {
+                    data: &gate_proj_flat,
+                    rows: intermediate,
+                    cols: hidden,
+                },
+                up_proj_weight: Tensor2D {
+                    data: &up_proj_flat,
+                    rows: intermediate,
+                    cols: hidden,
+                },
+                down_proj_weight: Tensor2D {
+                    data: &down_proj_flat,
+                    rows: hidden,
+                    cols: intermediate,
+                },
+                post_attention_layernorm_weight: Tensor1D {
+                    data: &post_ln_flat,
+                    len: hidden,
+                },
+                fused_qkv: vec![0.0f32; (q_dim + 2 * kv_dim) * hidden],
+                qkv_out_dim: q_dim + 2 * kv_dim,
+                fused_gate_up: vec![0.0f32; (2 * intermediate) * hidden],
+                gate_up_out_dim: 2 * intermediate,
+            };
+            let weights = QwenWeights {
+                embed_tokens: Tensor2D {
+                    data: &embed_tokens_flat,
+                    rows: config.vocab_size,
+                    cols: hidden,
+                },
+                norm_weight: Tensor1D {
+                    data: &norm_weight_flat,
+                    len: hidden,
+                },
+                layers: vec![layer],
+            };
+
+            let input_ids: Vec<u32> = vec![1, 3, 2, 5, 6];
+            let seq_len = input_ids.len();
+
+            let mut hidden_input = vec![0.0f32; seq_len * hidden];
+            for (i, &tok) in input_ids.iter().enumerate() {
+                let tok = tok as usize;
+                hidden_input[i * hidden..(i + 1) * hidden]
+                    .copy_from_slice(&embed_tokens_flat[tok * hidden..(tok + 1) * hidden]);
+            }
+
+            let Ok(mut pass) = MetalForwardPass::new(&config, &weights, 8) else {
+                return; // no Metal device on this host
+            };
+
+            let metal_out = pass
+                .forward(&hidden_input, seq_len)
+                .expect("Metal forward should not itself error");
+
+            let nan_count = metal_out.iter().filter(|v| v.is_nan()).count();
+            assert_eq!(
+                nan_count,
+                0,
+                "fused_attention must fail closed (zero output) on a NaN-poisoned \
+                 Q lane instead of propagating NaN through the finalize multiply \
+                 (ADR-080 C1, #789); got {nan_count}/{} NaN elements",
+                metal_out.len()
+            );
+        }
+
+        struct TestLcg(u64);
+
+        impl TestLcg {
+            fn new(seed: u64) -> Self {
+                Self(seed)
+            }
+            fn next_u32(&mut self) -> u32 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (self.0 >> 32) as u32
+            }
+            fn next_f32(&mut self) -> f32 {
+                let x = self.next_u32() as f32 / u32::MAX as f32;
+                (x - 0.5) * 0.2
+            }
+        }
+
+        fn test_random_vec(rng: &mut TestLcg, len: usize) -> Vec<f32> {
+            (0..len).map(|_| rng.next_f32()).collect()
+        }
+
+        fn test_random_positive_vec(rng: &mut TestLcg, len: usize) -> Vec<f32> {
+            (0..len).map(|_| 0.5 + rng.next_f32().abs()).collect()
+        }
+
+        /// Serializes GPU-driving tests onto the single shared Metal device,
+        /// in-process and machine-wide (mirrors `forward::metal_qwen35`'s
+        /// `gpu_test_lock`; the in-process `Mutex` here is a separate instance
+        /// but the machine-wide `flock` on the same fixed path still
+        /// serializes correctly across both, since `flock` mutual exclusion
+        /// is per-path, not per-`Mutex`-instance).
+        struct GpuTestGuard {
+            _process: std::sync::MutexGuard<'static, ()>,
+            _machine: std::fs::File,
+        }
+
+        fn gpu_test_lock() -> GpuTestGuard {
+            use std::sync::Mutex;
+            static GPU_LOCK: Mutex<()> = Mutex::new(());
+            let process = GPU_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            const LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
+            const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(LOCK_PATH)
+                .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {LOCK_PATH}: {e}"));
+            let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!(
+                                "gpu_test_lock: another process has held {LOCK_PATH} for over \
+                                 {}s -- inspect `lsof {LOCK_PATH}`",
+                                LOCK_TIMEOUT.as_secs()
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        panic!("gpu_test_lock: flock on {LOCK_PATH} failed: {e}")
+                    }
+                }
+            }
+            GpuTestGuard {
+                _process: process,
+                _machine: file,
             }
         }
     }
