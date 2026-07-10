@@ -1441,9 +1441,74 @@ mod imp {
         // the non-streaming branch. Either way that's the client disconnect
         // signal the worker checks in `run_worker_loop`.
         if streaming {
+            // ADR-080 C2 round 2, codex round-2 major finding #1: without this
+            // preflight, a prompt-plus-budget overflow was only discoverable
+            // AFTER the HTTP response had already committed to 200 SSE (the
+            // worker's `Ev::Rejected` arrived mid-stream, terminating with
+            // `finish_reason: "length"` instead of the 400
+            // `context_length_exceeded` the non-streaming path and
+            // `lattice.rs`'s `check_context_window` preflight both return for
+            // the identical request body). Await the worker's FIRST event
+            // before deciding the status code at all -- exactly the
+            // non-streaming branch's own ordering below, just not looping to
+            // drain every event yet. `Ev::Rejected`/`Ev::Failed` on this first
+            // event get the same un-committed 400/500 treatment as
+            // non-streaming; anything else (`Ev::Delta`/`Ev::Done`) means the
+            // request passed the worker's checks, so NOW commit to 200 SSE --
+            // carrying that already-consumed first event into the stream's
+            // state machine (`pending`) so it isn't silently dropped.
+            let Some(first_ev) = rx.recv().await else {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    500,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    true,
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference worker unavailable",
+                    "internal_error",
+                );
+            };
+            let first_ev = match first_ev {
+                Ev::Rejected { message } => {
+                    emit_serve_event(
+                        "POST",
+                        "/v1/chat/completions",
+                        400,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                    );
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        &message,
+                        "context_length_exceeded",
+                    );
+                }
+                Ev::Failed { message } => {
+                    eprintln!("generation error (streaming): {message}");
+                    emit_serve_event(
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                    );
+                    return err_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "inference failed",
+                        "internal_error",
+                    );
+                }
+                ev @ (Ev::Delta(_) | Ev::Done { .. }) => ev,
+            };
             let stream = futures::stream::unfold(
-                (rx, Phase::Start, cancel_guard),
-                move |(mut rx, phase, cancel_guard)| {
+                (rx, Phase::Start, cancel_guard, Some(first_ev)),
+                move |(mut rx, phase, cancel_guard, mut pending)| {
                     let id = id.clone();
                     let model = model_id.clone();
                     async move {
@@ -1458,10 +1523,13 @@ mod imp {
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
                                     ),
-                                    (rx, Phase::Body, cancel_guard),
+                                    (rx, Phase::Body, cancel_guard, pending),
                                 ))
                             }
-                            Phase::Body => match rx.recv().await {
+                            Phase::Body => match match pending.take() {
+                                Some(ev) => Some(ev),
+                                None => rx.recv().await,
+                            } {
                                 Some(Ev::Delta(d)) => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1470,7 +1538,7 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Body, cancel_guard),
+                                        (rx, Phase::Body, cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Done {
@@ -1493,7 +1561,7 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(ct), cancel_guard),
+                                        (rx, Phase::Done(ct), cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Failed { message }) => {
@@ -1514,18 +1582,22 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Rejected { message }) => {
-                                    // #656: the request cannot fit the model's KV
-                                    // window (prompt + requested generation). The
-                                    // status code is already committed to 200 SSE,
-                                    // so this cannot become the 400 the
-                                    // non-streaming path returns; report it as
-                                    // `finish_reason: "length"` instead of "stop"
-                                    // so a client can at least tell no content was
-                                    // actually generated for this reason.
+                                    // Structurally unreachable at this point:
+                                    // `run_worker_loop`'s `check_prompt_fits_window`
+                                    // call happens before any `Ev::Delta`/`Ev::Done`
+                                    // is ever sent for a job, so `Ev::Rejected` can
+                                    // only ever be the FIRST event a job produces --
+                                    // and the preflight above (ADR-080 C2 round 2,
+                                    // codex round-2 major finding #1) already
+                                    // intercepts that one before committing to 200
+                                    // SSE. Kept as a defensive fallback (same
+                                    // graceful-termination shape as before) in case
+                                    // that invariant ever changes rather than
+                                    // deleting the arm outright.
                                     eprintln!("request rejected (streaming): {message}");
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1534,7 +1606,7 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                                 None => {
@@ -1545,13 +1617,13 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                             },
                             Phase::Done(ct) => Some((
                                 Ok(Event::default().data("[DONE]")),
-                                (rx, Phase::End(ct), cancel_guard),
+                                (rx, Phase::End(ct), cancel_guard, None),
                             )),
                             Phase::End(ct) => {
                                 emit_serve_event(
@@ -1799,8 +1871,11 @@ mod imp {
     /// `DefaultBodyLimit` the way `lattice.rs`'s `router()` does: this
     /// binary enforces the same [`lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`]
     /// cap manually inside `chat_completions` via `to_bytes`, a documented
-    /// intentional divergence in enforcement mechanism (same limit, +
-    /// different-status-code-vs-lattice.rs -- see the parity table).
+    /// intentional divergence in ENFORCEMENT MECHANISM only (axum's
+    /// `DefaultBodyLimit` layer vs. a direct `to_bytes` cap) -- the
+    /// resulting status/code (413 `request_body_too_large`) is identical on
+    /// both binaries today (round 2, codex finding #1's fix; see the
+    /// `oversized_body_over_limit` parity case).
     pub fn router(state: AppState) -> Router {
         Router::new()
             .route("/", get(root))
@@ -2968,6 +3043,73 @@ mod imp {
             );
         }
 
+        /// ADR-080 C2 round 2, codex round-2 major finding #1: a `stream:
+        /// true` request whose prompt overflows the model's context window
+        /// must return HTTP 400 `context_length_exceeded` BEFORE any SSE
+        /// stream is committed -- not silently commit to a 200 SSE response
+        /// that only discovers the overflow later via `Ev::Rejected`
+        /// mid-stream and terminates with `finish_reason: "length"` (the
+        /// exact drift this finding named; `lattice.rs`'s equivalent
+        /// `stream: true` request already returned 400 via
+        /// `check_context_window`, run unconditionally before its `stream`
+        /// branch). This fakes the worker side of the `Ev::Rejected`
+        /// contract (production code sends it from
+        /// `check_prompt_fits_window` inside `run_worker_loop`, prefixed
+        /// with `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under
+        /// test is purely `chat_completions`'s streaming branch: does it
+        /// await the worker's first event and inspect it for
+        /// `Ev::Rejected` BEFORE calling `Sse::new(..).into_response()`, or
+        /// does it commit unconditionally?
+        ///
+        /// Mutation-sensitive: reverting the pre-`Sse::new()` `first_ev`
+        /// preflight (going back to building `stream::unfold` and
+        /// returning `Sse::new(stream).into_response()` unconditionally,
+        /// discovering `Ev::Rejected` only inside `Phase::Body`) makes this
+        /// fail -- the response status would be 200 with an SSE body
+        /// carrying a `finish_reason: "length"` terminal chunk instead of a
+        /// 400 error envelope. Verified by reverting the preflight and
+        /// re-running: see the PR body's mutation log.
+        #[tokio::test]
+        async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Rejected {
+                        message: "prompt has 4090 tokens, leaving 6 of the 4096-token \
+                                  context window for generation, but this request needs \
+                                  100 generated tokens plus 1 (total 4191); reduce \
+                                  max_tokens/reasoning_budget or shorten the prompt"
+                            .to_string(),
+                    });
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "an Ev::Rejected worker reply for a stream:true request must surface \
+                 as a pre-commit HTTP 400, matching lattice.rs's behavior for the \
+                 identical request body, not a committed 200 SSE stream"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be JSON");
+            assert_eq!(value["error"]["code"], "context_length_exceeded");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("context window"),
+                "error message must carry the worker's actual overflow explanation, \
+                 got: {value}"
+            );
+        }
+
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
             let defaults = Defaults {
@@ -3086,10 +3228,10 @@ mod imp {
 
                     let app = router(test_app_state());
                     let request = axum::http::Request::builder()
-                        .method("POST")
-                        .uri("/v1/chat/completions")
+                        .method(case.method)
+                        .uri(case.path)
                         .header("content-type", "application/json")
-                        .body(Body::from(case.body))
+                        .body(Body::from(case.body.build()))
                         .expect("fixture request must build");
                     let response = app
                         .oneshot(request)
