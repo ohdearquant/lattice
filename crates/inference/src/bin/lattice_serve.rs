@@ -88,6 +88,16 @@ mod imp {
         Done {
             prompt_tokens: usize,
             completion_tokens: usize,
+            /// The engine's actual stop cause (ADR-080 C2, #746): `true` when
+            /// generation ended via an explicit stop condition (EOS,
+            /// stop-token-id, or stop-string match), `false` when the token
+            /// budget was exhausted or the caller cancelled. Previously
+            /// discarded entirely here -- both the SSE and non-streaming
+            /// handlers below hardcoded `finish_reason: "stop"`
+            /// unconditionally, so a length-capped completion was
+            /// misreported as an explicit stop. Fed through
+            /// `lattice_inference::serve::finish_reason` at both call sites.
+            stopped: bool,
         },
         /// Generation failed closed instead of completing (#611: e.g. a
         /// grammar mask that blocks every candidate token, mirroring the
@@ -831,21 +841,32 @@ mod imp {
             .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
     }
 
-    fn build_cfg(req: &ChatReq, d: &Defaults, model_max_context: usize) -> GenerateConfig {
-        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
-        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
-        // Reserve one slot of headroom so the worst-case decode cap below
-        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
-        // window even when `reasoning_budget` is absent/zero.
-        let max_new_tokens = req
+    fn build_cfg(
+        req: &ChatReq,
+        d: &Defaults,
+        model_max_context: usize,
+    ) -> Result<GenerateConfig, lattice_inference::serve::ApiError> {
+        // #745 (ADR-080 C2): reject a caller-supplied `max_tokens: 0` (or
+        // `max_completion_tokens: 0`) up front, on the alias-resolved but
+        // still-unclamped value -- previously this clamped straight through
+        // via `.min(..)` below into a zero-budget completion instead of a
+        // clear rejection. Checked before the clamp so the rejection reflects
+        // the caller's actual request, not a clamp artifact.
+        let max_new_tokens_requested = req
             .max_tokens
             // #656: `max_completion_tokens` is the current OpenAI field name;
             // `reject_unsupported` already rejected the two being present
             // and disagreeing, so whichever is set here is the caller's
             // single, unambiguous intent.
             .or(req.max_completion_tokens)
-            .unwrap_or(d.max_tokens)
-            .min(model_max_context.saturating_sub(1));
+            .unwrap_or(d.max_tokens);
+        lattice_inference::serve::reject_zero_max_tokens(max_new_tokens_requested)?;
+        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
+        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
+        // Reserve one slot of headroom so the worst-case decode cap below
+        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
+        // window even when `reasoning_budget` is absent/zero.
+        let max_new_tokens = max_new_tokens_requested.min(model_max_context.saturating_sub(1));
         // The worst-case decode cap is `reasoning_budget + max_new_tokens + 1`
         // (#551): keep it at or below the KV window the worker actually
         // allocated, not just below `model_max_context` in isolation.
@@ -858,7 +879,7 @@ mod imp {
             .or(d.reasoning_budget)
             .map(|n| n.min(reasoning_room))
             .filter(|&n| n > 0);
-        GenerateConfig {
+        Ok(GenerateConfig {
             max_new_tokens,
             temperature: req.temperature.unwrap_or(d.temperature),
             top_k: req.top_k.unwrap_or(d.top_k),
@@ -876,7 +897,7 @@ mod imp {
             // minimal server has no logprobs implementation at all, so a
             // `logprobs: true` request never reaches here (see below).
             logprobs: None,
-        }
+        })
     }
 
     /// Prefix marker used only by the KV-window pre-check in `spawn_worker`'s
@@ -1002,7 +1023,11 @@ mod imp {
                             cached.cache.prefetched_tokens,
                             cached.cache.prompt_tokens,
                         );
-                        Ok((cached.output.prompt_tokens, cached.output.completion_tokens))
+                        Ok((
+                            cached.output.prompt_tokens,
+                            cached.output.completion_tokens,
+                            cached.output.stopped,
+                        ))
                     }
                     // Fail-closed at the engine level already (live KV/GDN
                     // state and the retained prefix entry are both reset
@@ -1025,9 +1050,13 @@ mod imp {
     /// independently of `on_token` -- including during any phase that never
     /// calls `on_token` at all (a prefill-like section, or a run of
     /// empty-delta steps) -- and stop as soon as `should_cancel` returns
-    /// `true`. Either way, return `Ok((prompt_tokens, completion_tokens))` for
-    /// whatever was actually produced before stopping (early or at the cap),
-    /// or `Err(message)` if generation itself failed closed (#611: e.g. a
+    /// `true`. Either way, return
+    /// `Ok((prompt_tokens, completion_tokens, stopped))` for whatever was
+    /// actually produced before stopping (early or at the cap) -- `stopped`
+    /// is the engine's actual stop cause (ADR-080 C2, #746: `true` for an
+    /// explicit stop condition, `false` for a length cap or cancellation),
+    /// fed through `Ev::Done` instead of being discarded -- or
+    /// `Err(message)` if generation itself failed closed (#611: e.g. a
     /// grammar mask that blocks every candidate token) rather than
     /// completing or being cancelled.
     fn run_worker_loop(
@@ -1037,7 +1066,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String>,
+        ) -> Result<(usize, usize, bool), String>,
     ) {
         while let Some(job) = job_rx.blocking_recv() {
             if *job.cancel.borrow() {
@@ -1064,10 +1093,11 @@ mod imp {
             let cancel_for_predicate = job.cancel.clone();
             let mut should_cancel = move || *cancel_for_predicate.borrow();
             match generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel) {
-                Ok((prompt_tokens, completion_tokens)) => {
+                Ok((prompt_tokens, completion_tokens, stopped)) => {
                     let _ = job.tx.send(Ev::Done {
                         prompt_tokens,
                         completion_tokens,
+                        stopped,
                     });
                 }
                 Err(message) => {
@@ -1178,15 +1208,9 @@ mod imp {
 
     async fn list_models(State(s): State<AppState>) -> Json<Value> {
         let t = Instant::now();
-        let body = json!({
-            "object": "list",
-            "data": [{
-                "id": s.model_id.as_ref(),
-                "object": "model",
-                "created": unix_secs(),
-                "owned_by": "lattice",
-            }],
-        });
+        // ADR-080 C2: shared with `lattice.rs`'s equivalent route so both
+        // binaries advertise the single loaded model in byte-identical shape.
+        let body = lattice_inference::serve::models_list_body(s.model_id.as_ref(), unix_secs());
         emit_serve_event(
             "GET",
             "/v1/models",
@@ -1275,7 +1299,20 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message());
             }
         };
-        let cfg = build_cfg(&req, &s.defaults, s.model_max_context);
+        let cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                return err_response(StatusCode::BAD_REQUEST, err.message());
+            }
+        };
         let model_id = req.model.clone().unwrap_or_else(|| s.model_id.to_string());
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -1346,12 +1383,21 @@ mod imp {
                                 }
                                 Some(Ev::Done {
                                     completion_tokens: ct,
+                                    stopped,
                                     ..
                                 }) => {
+                                    // ADR-080 C2, #746: the engine's actual
+                                    // stop cause, not a hardcoded "stop" --
+                                    // `finish_reason` is "length" whenever
+                                    // `stopped` is false (token cap or
+                                    // cancellation), matching `lattice.rs`'s
+                                    // contract exactly.
+                                    let finish_reason =
+                                        lattice_inference::serve::finish_reason(stopped);
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
                                         "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
@@ -1437,15 +1483,18 @@ mod imp {
             let mut content = String::new();
             let mut prompt_tokens = 0usize;
             let mut completion_tokens = 0usize;
+            let mut stopped = false;
             while let Some(ev) = rx.recv().await {
                 match ev {
                     Ev::Delta(d) => content.push_str(&d),
                     Ev::Done {
                         prompt_tokens: pt,
                         completion_tokens: ct,
+                        stopped: s,
                     } => {
                         prompt_tokens = pt;
                         completion_tokens = ct;
+                        stopped = s;
                     }
                     Ev::Failed { message } => {
                         // Unlike streaming, the response has not been committed
@@ -1484,13 +1533,17 @@ mod imp {
                     }
                 }
             }
+            // ADR-080 C2, #746: the engine's actual stop cause, not a
+            // hardcoded "stop" -- matches the streaming path and
+            // `lattice.rs`'s non-streaming contract.
+            let finish_reason = lattice_inference::serve::finish_reason(stopped);
             let body = json!({
                 "id": id, "object": "chat.completion",
                 "created": created, "model": model_id,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_tokens,
@@ -1510,12 +1563,32 @@ mod imp {
         }
     }
 
+    /// ADR-080 C2 (#782): builds the shared `lattice_inference::serve::
+    /// ApiError` envelope instead of this binary's previous ad hoc 2-field
+    /// `{"error": {"message", "type"}}` shape (no `code`/`param` at all) --
+    /// `lattice.rs` already carried the 4-field OpenAI-style envelope; this
+    /// closes the drift so both binaries answer the same bad request with
+    /// the same JSON shape. Every existing call site passes only
+    /// `StatusCode::BAD_REQUEST`, `PAYLOAD_TOO_LARGE`, or
+    /// `INTERNAL_SERVER_ERROR`, so the status code produced here is
+    /// unchanged; only the body shape gains `code`/`param`.
     fn err_response(code: StatusCode, msg: &str) -> Response {
-        (
-            code,
-            Json(json!({"error": {"message": msg, "type": "invalid_request_error"}})),
-        )
-            .into_response()
+        use lattice_inference::serve::ApiError;
+        let api_err = if code == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge {
+                message: msg.to_string(),
+            }
+        } else if code == StatusCode::INTERNAL_SERVER_ERROR {
+            ApiError::Internal {
+                message: msg.to_string(),
+            }
+        } else {
+            ApiError::BadRequest {
+                message: msg.to_string(),
+                code: "invalid_request",
+            }
+        };
+        api_err.into_response()
     }
 
     /// Print a structured telemetry line to stdout for the app bridge to parse.
@@ -1738,7 +1811,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 started.fetch_add(1, Ordering::SeqCst);
                 let mut n = 0usize;
@@ -1753,7 +1826,7 @@ mod imp {
                     n += 1;
                     ran_tokens.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok((1, n))
+                Ok((1, n, false))
             }
         }
 
@@ -1774,12 +1847,12 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 for _ in 0..prefill_steps {
                     std::thread::sleep(Duration::from_millis(5));
                     if should_cancel() {
-                        return Ok((1, 0));
+                        return Ok((1, 0, false));
                     }
                 }
                 entered_decode.store(true, Ordering::SeqCst);
@@ -1794,7 +1867,7 @@ mod imp {
                     }
                     n += 1;
                 }
-                Ok((1, n))
+                Ok((1, n, false))
             }
         }
 
@@ -2051,13 +2124,13 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, _should_cancel| {
                 if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(message.to_string());
                 }
                 let _ = on_token("x", 0);
-                Ok((1, 1))
+                Ok((1, 1, true))
             }
         }
 
@@ -2271,7 +2344,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             assert!(cfg.max_new_tokens <= 8);
             let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
             assert!(reasoning_budget + cfg.max_new_tokens < 8);
@@ -2317,7 +2390,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             let err = check_prompt_fits_window(8, 2, &cfg).unwrap_err();
             assert!(
                 err.contains("2 tokens") && err.contains("8-token"),
@@ -2362,13 +2435,13 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             assert!(check_prompt_fits_window(8, 1, &cfg).is_err());
 
             // Same request, but the window has one more slot of room (9):
             // 1 + 6 + 1 + 1 = 9 <= 9 -- must be ACCEPTED, and `max_new_tokens`
             // must be the full requested 6, not needlessly truncated.
-            let cfg2 = build_cfg(&req, &defaults, 9);
+            let cfg2 = build_cfg(&req, &defaults, 9).unwrap();
             assert_eq!(cfg2.max_new_tokens, 6, "must not needlessly truncate");
             assert!(check_prompt_fits_window(9, 1, &cfg2).is_ok());
         }
@@ -2405,7 +2478,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 4096);
+            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
             assert_eq!(cfg.max_new_tokens, 50);
             // prompt_len=100: 100 + 50 + 0 + 1 = 151 <= 4096.
             assert!(check_prompt_fits_window(4096, 100, &cfg).is_ok());
@@ -2636,7 +2709,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 4096);
+            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
             assert_eq!(cfg.max_new_tokens, 42);
         }
 
