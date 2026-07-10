@@ -335,7 +335,7 @@ fn test_check_numeric_stability_inf() {
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
-fn test_learning_rate_tracking() {
+fn test_failed_step_preserves_lr_and_global_step() {
     if skip_if_no_gpu() {
         return;
     }
@@ -349,8 +349,9 @@ fn test_learning_rate_tracking() {
     // instead of dodging via a "harmless" optimizer choice (there isn't
     // one), this test now asserts what *is* true today: a failed optimizer
     // step propagates the error and does not silently advance the learning
-    // rate. This is a real, currently-meaningful invariant (no partial/silent
-    // state drift on failure), not a weakened stand-in for LR tracking.
+    // rate OR the public global-step counter. Both are real,
+    // currently-meaningful invariants (no partial/silent state drift on
+    // failure), not a weakened stand-in for LR/step tracking.
     let config = TrainingConfig {
         optimizer: OptimizerConfig {
             optimizer: Optimizer::Adam,
@@ -368,6 +369,7 @@ fn test_learning_rate_tracking() {
 
     let initial_lr = trainer.current_lr();
     assert!((initial_lr - 0.001).abs() < 1e-6);
+    assert_eq!(trainer.global_step(), 0);
 
     let batch = make_test_batch(2);
     let result = trainer.train_batch(&batch);
@@ -383,6 +385,16 @@ fn test_learning_rate_tracking() {
     assert!(
         (lr_after_failed_step - initial_lr).abs() < 1e-9,
         "learning rate must not change on a failed optimizer step: {initial_lr} -> {lr_after_failed_step}"
+    );
+
+    // global_step must also be untouched: it is now incremented after
+    // `update_weights()?` succeeds, so a failed optimizer step must not
+    // count as a completed training step (it previously did, feeding
+    // incorrect values into LR/epoch math on every failed call).
+    assert_eq!(
+        trainer.global_step(),
+        0,
+        "a failed optimizer step must not advance global_step"
     );
 }
 
