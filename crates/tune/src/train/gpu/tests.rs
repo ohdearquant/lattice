@@ -41,9 +41,20 @@ fn test_gpu_trainer_forward() {
         return;
     }
 
+    // Explicit SGD: the only optimizer arm that does not fail loudly (#797 —
+    // Adam/AdamW/SGDMomentum/RMSprop all error until GPU buffer bindings are
+    // wired). This test exercises forward+loss, not the optimizer step.
+    let config = TrainingConfig {
+        optimizer: OptimizerConfig {
+            optimizer: Optimizer::SGD,
+            ..Default::default()
+        },
+        ..TrainingConfig::quick()
+    };
+
     let mut trainer = GpuTrainerBuilder::new(6, 6)
         .hidden(16, Activation::ReLU)
-        .config(TrainingConfig::quick())
+        .config(config)
         .build()
         .unwrap();
 
@@ -112,7 +123,7 @@ fn test_validate_empty_dataset() {
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
-fn test_update_adam() {
+fn test_update_adam_fails_loud() {
     if skip_if_no_gpu() {
         return;
     }
@@ -135,22 +146,25 @@ fn test_update_adam() {
         .build()
         .unwrap();
 
-    for _ in 0..3 {
-        let batch = make_test_batch(2);
-        let result = trainer.train_batch(&batch);
-        assert!(
-            result.is_ok(),
-            "Adam training step failed: {:?}",
-            result.err()
-        );
-    }
+    let batch = make_test_batch(2);
+    let result = trainer.train_batch(&batch);
 
-    assert_eq!(trainer.global_step(), 3);
+    // #797: the GPU Adam optimizer dispatch has no buffer bindings wired —
+    // it must fail loudly rather than silently reporting a successful
+    // zero-effect update. If this assertion ever fails because the empty
+    // command-buffer no-op was restored, that is the regression this test
+    // guards against.
+    let err = result.expect_err("Adam GPU optimizer must fail until buffer bindings are wired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Adam") && msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
-fn test_update_adamw() {
+fn test_update_adamw_fails_loud() {
     if skip_if_no_gpu() {
         return;
     }
@@ -174,22 +188,20 @@ fn test_update_adamw() {
         .build()
         .unwrap();
 
-    for _ in 0..3 {
-        let batch = make_test_batch(2);
-        let result = trainer.train_batch(&batch);
-        assert!(
-            result.is_ok(),
-            "AdamW training step failed: {:?}",
-            result.err()
-        );
-    }
+    let batch = make_test_batch(2);
+    let result = trainer.train_batch(&batch);
 
-    assert_eq!(trainer.global_step(), 3);
+    let err = result.expect_err("AdamW GPU optimizer must fail until buffer bindings are wired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AdamW") && msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
-fn test_update_sgd_momentum() {
+fn test_update_sgd_momentum_fails_loud() {
     if skip_if_no_gpu() {
         return;
     }
@@ -210,17 +222,52 @@ fn test_update_sgd_momentum() {
         .build()
         .unwrap();
 
-    for _ in 0..3 {
-        let batch = make_test_batch(2);
-        let result = trainer.train_batch(&batch);
-        assert!(
-            result.is_ok(),
-            "SGD momentum training step failed: {:?}",
-            result.err()
-        );
+    let batch = make_test_batch(2);
+    let result = trainer.train_batch(&batch);
+
+    let err =
+        result.expect_err("SGD-momentum GPU optimizer must fail until buffer bindings are wired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SGD-momentum") && msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
+}
+
+#[test]
+#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
+fn test_update_rmsprop_fails_loud() {
+    if skip_if_no_gpu() {
+        return;
     }
 
-    assert_eq!(trainer.global_step(), 3);
+    let config = TrainingConfig {
+        optimizer: OptimizerConfig {
+            optimizer: Optimizer::RMSprop,
+            learning_rate: 0.01,
+            ..Default::default()
+        },
+        ..TrainingConfig::quick()
+    };
+
+    let mut trainer = GpuTrainerBuilder::new(6, 6)
+        .hidden(16, Activation::ReLU)
+        .config(config)
+        .build()
+        .unwrap();
+
+    let batch = make_test_batch(2);
+    let result = trainer.train_batch(&batch);
+
+    // #797 adjacent defect: RMSprop used to silently substitute plain SGD
+    // instead of running the requested algorithm. It must fail loudly and
+    // name the alternative instead.
+    let err = result.expect_err("RMSprop GPU optimizer must fail loudly, not silently fall back");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RMSprop") && msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[test]
@@ -285,9 +332,14 @@ fn test_learning_rate_tracking() {
         return;
     }
 
+    // SGD, not Adam: this test targets learning-rate-schedule tracking, which
+    // is orthogonal to the optimizer's weight-update mechanism. Adam/AdamW/
+    // SGDMomentum/RMSprop all fail loudly until GPU buffer bindings are
+    // wired (#797); SGD is the one arm that still runs `train_batch` to
+    // completion.
     let config = TrainingConfig {
         optimizer: OptimizerConfig {
-            optimizer: Optimizer::Adam,
+            optimizer: Optimizer::SGD,
             learning_rate: 0.001,
             ..Default::default()
         },
