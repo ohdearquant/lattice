@@ -1074,6 +1074,12 @@ fn causal_tiled_attention_head(
             acc[..head_dim].fill(0.0);
             let mut running_max = f32::NEG_INFINITY;
             let mut running_sum = 0.0f32;
+            // ADR-080 C1 (#780): tracked independently of the `local_max`/
+            // `running_max` folds because `if score > local_max` is `false`
+            // for a NaN operand (IEEE 754), silently dropping it from the
+            // max the same way `f32::max` does. This is the online-softmax
+            // single-row analogue of `flash_causal.rs`'s `block_has_poison`.
+            let mut row_poisoned = false;
 
             let max_kv_pos = q_row + 1;
             for kv_start in (0..max_kv_pos).step_by(tile_kv) {
@@ -1088,6 +1094,9 @@ fn causal_tiled_attention_head(
                         dot += q_vec[d] * k[k_off + d];
                     }
                     let score = dot * scale;
+                    if score.is_nan() || score == f32::INFINITY {
+                        row_poisoned = true;
+                    }
                     tile_scores[local_idx] = score;
                     if score > local_max {
                         local_max = score;
@@ -1121,9 +1130,23 @@ fn causal_tiled_attention_head(
             }
 
             let out_off = q_row * out_stride + q_head_offset;
-            let inv_sum = 1.0 / running_sum.max(f32::MIN_POSITIVE);
-            for d in 0..head_dim {
-                output[out_off + d] = acc[d] * inv_sum;
+            // ADR-080 C1 (#780): RED before the fix, `running_sum.max(f32::MIN_POSITIVE)`
+            // silently replaced a NaN `running_sum` with a tiny-but-positive
+            // finite value instead of failing closed, so `1.0 / running_sum`
+            // became an enormous (~8.5e37) finite number and the output row
+            // exploded into huge finite garbage rather than zero. Structurally
+            // distinct from `attention::softmax_row::finalize_row` (this
+            // online algorithm writes into a separate `acc` accumulator, not
+            // an in-place score row), so this is an inline contract-conformant
+            // fix rather than a call to the shared helper: fail closed on a
+            // poisoned row OR a non-positive/non-finite denominator.
+            if row_poisoned || !running_sum.is_finite() || running_sum <= 0.0 {
+                output[out_off..out_off + head_dim].fill(0.0);
+            } else {
+                let inv_sum = 1.0 / running_sum;
+                for d in 0..head_dim {
+                    output[out_off + d] = acc[d] * inv_sum;
+                }
             }
         }
     }
@@ -2086,6 +2109,71 @@ mod tests {
             out.stop_reason,
             Some(StopReason::Length),
             "max_new_tokens=0 must report stop_reason=Length"
+        );
+    }
+
+    /// ADR-080 C1 (#780): RED before the fix, `running_sum.max(f32::MIN_POSITIVE)`
+    /// silently replaced a NaN running denominator with a tiny positive
+    /// finite value, turning `1.0 / running_sum` into an enormous
+    /// (~8.5e37) finite number and exploding the output row into huge
+    /// finite garbage instead of failing closed to zero. Query row 0
+    /// (self-attends only, K0 finite) must stay clean and non-degenerate;
+    /// query row 2 (causally attends to the NaN-poisoned K1) must fail
+    /// closed to an exact-zero row.
+    #[test]
+    fn causal_tiled_attention_head_nan_key_fails_closed() {
+        let head_dim = 4;
+        let seq_len = 3;
+        let q_stride = head_dim;
+        let kv_stride = head_dim;
+        let out_stride = head_dim;
+
+        // Q rows all [1,0,0,0] so score(qi, ki) reduces to scale * K[ki][0].
+        let q = [1.0f32, 0.0, 0.0, 0.0].repeat(seq_len);
+        let mut k = vec![0.0f32; seq_len * head_dim];
+        k[0] = 1.0; // K0: finite
+        k[head_dim] = f32::NAN; // K1: poison
+        k[2 * head_dim] = 0.5; // K2: finite
+        let mut v = vec![0.0f32; seq_len * head_dim];
+        v[0] = 10.0; // V0
+        v[head_dim] = 20.0; // V1
+        v[2 * head_dim] = 30.0; // V2
+
+        let mut output = vec![1.0f32; seq_len * out_stride]; // nonzero: prove overwrite
+        let config = TiledAttentionConfig::new(1, 1, head_dim);
+        let mut buffers = TiledAttentionBuffers::default();
+        let mut acc = vec![0.0f32; head_dim];
+        let mut tile_scores = vec![0.0f32; config.tile_size_kv.max(1).max(seq_len)];
+
+        causal_tiled_attention_head(
+            &q,
+            &k,
+            &v,
+            &mut output,
+            seq_len,
+            q_stride,
+            kv_stride,
+            out_stride,
+            0,
+            0,
+            head_dim,
+            1.0,
+            &config,
+            &mut buffers,
+            &mut acc,
+            &mut tile_scores,
+        );
+
+        let row0 = &output[0..head_dim];
+        assert!(
+            (row0[0] - 10.0).abs() < 1e-4 && row0[1..].iter().all(|&v| v == 0.0),
+            "query 0 (self-attends only) must be unaffected: {row0:?}"
+        );
+        let row2 = &output[2 * out_stride..2 * out_stride + head_dim];
+        assert!(
+            row2.iter().all(|&v| v == 0.0),
+            "query 2 (causally attends to the NaN-poisoned position 1) must \
+             fail closed to exact zero, got {row2:?}"
         );
     }
 }

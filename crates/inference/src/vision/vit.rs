@@ -160,12 +160,23 @@ fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 }
 
 /// Softmax over a slice of logits (in-place).
+///
+/// ADR-080 C1: routes the fail-closed row contract through the shared
+/// row-finalizer (#741). Previously this had NO guard at all — a NaN or
+/// `+inf` logit propagated NaN through the unconditional division into every
+/// element of the row and onward through the rest of the ViT forward pass.
 fn softmax_inplace(x: &mut [f32]) {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = x.iter().map(|v| (v - max).exp()).sum();
-    for v in x.iter_mut() {
-        *v = ((*v - max).exp()) / sum;
+    let (max, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(x);
+    if crate::attention::softmax_row::row_fails_closed_pre_exp(max, any_nan) {
+        x.fill(0.0);
+        return;
     }
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    crate::attention::softmax_row::finalize_row(x, sum);
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +628,40 @@ mod tests {
         for &v in &out {
             assert!(v.is_finite(), "ViT output contained non-finite: {v}");
         }
+    }
+
+    // ADR-080 C1 / #741: `softmax_inplace` previously had NO fail-closed guard
+    // at all — a NaN or `+inf` logit divided every element by a NaN/Inf `sum`,
+    // propagating NaN through the whole row instead of zeroing it. RED before
+    // the fix: these assertions failed with a NaN-populated row.
+    #[test]
+    fn softmax_inplace_nan_fails_closed() {
+        let mut x = vec![1.0f32, f32::NAN, 2.0, 0.5];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
+    }
+
+    #[test]
+    fn softmax_inplace_pos_inf_fails_closed() {
+        let mut x = vec![1.0f32, f32::INFINITY, 2.0];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
+    }
+
+    #[test]
+    fn softmax_inplace_all_neg_inf_fails_closed() {
+        let mut x = vec![f32::NEG_INFINITY; 4];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
+    }
+
+    #[test]
+    fn softmax_inplace_normal_row_still_normalizes() {
+        let mut x = vec![1.0f32, 2.0, 3.0];
+        softmax_inplace(&mut x);
+        let sum: f32 = x.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "row must sum to ~1: {x:?}");
+        assert!(x.iter().all(|v| v.is_finite() && *v >= 0.0));
     }
 
     #[test]

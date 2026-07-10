@@ -337,9 +337,18 @@ fn apply_scaled_causal_softmax_fused(
             *v *= scale;
         }
 
-        let mut max_val = f32::NEG_INFINITY;
-        for &v in &row[..valid] {
-            max_val = max_val.max(v);
+        // ADR-080 C1: route the fail-closed final decision through the
+        // shared row-finalizer contract (#780). Behavior-preserving: this
+        // implementation used real `.exp()` (not an approximation), so a
+        // lone NaN score already propagated into `sum` and tripped the old
+        // `sum > 0.0 && sum.is_finite()` else-branch; the explicit
+        // `any_nan` pre-scan here just short-circuits that same outcome
+        // before spending the `exp()` calls, matching `decode.rs`/
+        // `flash-causal`'s degenerate-row fallback.
+        let (max_val, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(&row[..valid]);
+        if crate::attention::softmax_row::row_fails_closed_pre_exp(max_val, any_nan) {
+            row.fill(0.0);
+            continue;
         }
 
         let mut sum = 0.0f32;
@@ -348,20 +357,7 @@ fn apply_scaled_causal_softmax_fused(
             sum += *v;
         }
 
-        if sum > 0.0 && sum.is_finite() {
-            let inv = 1.0 / sum;
-            for v in &mut row[..valid] {
-                *v *= inv;
-            }
-        } else {
-            // Degenerate row: every valid score was masked or non-finite, so `max_val`
-            // is non-finite and `exp` produced NaN/Inf (e.g. all -inf, or any +inf).
-            // Emit a zero-probability row instead of propagating NaN into the context,
-            // matching `decode.rs` (`row.fill(0.0)` when the normalizer is not positive)
-            // and the flash-causal non-finite handling.
-            row[..valid].fill(0.0);
-        }
-
+        crate::attention::softmax_row::finalize_row(&mut row[..valid], sum);
         row[valid..].fill(0.0);
     }
 }
@@ -645,6 +641,28 @@ mod tests {
         assert!(
             scores.iter().all(|&v| v == 0.0),
             "degenerate row must be zero"
+        );
+    }
+
+    /// ADR-080 C1: a lone NaN score anywhere in the visible range must zero
+    /// the whole row via the shared `row_fails_closed_pre_exp` pre-scan, not
+    /// just leave the NaN lane corrupted. Row 1 (qi=1, valid=2) is poisoned;
+    /// row 0 (qi=0, valid=1, its own well-formed score) is unaffected.
+    #[test]
+    fn fused_softmax_nan_lane_zeros_whole_row() {
+        let seq_len = 2usize;
+        let batch_rows = 2usize; // one query group of seq_len rows
+        let mut scores = vec![1.0f32, 0.0, f32::NAN, 2.0];
+        apply_scaled_causal_softmax_fused(&mut scores, batch_rows, seq_len, 1.0);
+        assert!(
+            scores[seq_len..].iter().all(|&v| v == 0.0),
+            "NaN-poisoned row must zero out: {:?}",
+            &scores[seq_len..]
+        );
+        assert!(
+            scores[..seq_len].iter().all(|v| v.is_finite()),
+            "sibling row must be unaffected: {:?}",
+            &scores[..seq_len]
         );
     }
 }

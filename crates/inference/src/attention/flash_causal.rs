@@ -169,6 +169,10 @@ pub fn flash_attention_causal_with_config(
     let mut scratch = FlashAttentionScratch::new(br, bc, head_dim);
     let mut group_m = vec![f32::NEG_INFINITY; groups * seq_len];
     let mut group_l = vec![0.0f32; groups * seq_len];
+    // ADR-080 C1 (#780): per-row fail-closed flag, threaded across K-blocks
+    // like `group_m`/`group_l`, set once any processed block observes a
+    // genuine NaN/`+inf` score for that row.
+    let mut group_bad = vec![false; groups * seq_len];
 
     let num_q_blocks = ceil_div(seq_len, br);
     let num_k_blocks = ceil_div(seq_len, bc);
@@ -176,6 +180,7 @@ pub fn flash_attention_causal_with_config(
     for kv_h in 0..num_kv_heads {
         group_m.fill(f32::NEG_INFINITY);
         group_l.fill(0.0);
+        group_bad.fill(false);
 
         let q_head_base = kv_h * groups;
         for g in 0..groups {
@@ -209,6 +214,7 @@ pub fn flash_attention_causal_with_config(
                 let q_h = q_head_base + g;
                 let m_head = &mut group_m[g * seq_len..(g + 1) * seq_len];
                 let l_head = &mut group_l[g * seq_len..(g + 1) * seq_len];
+                let bad_head = &mut group_bad[g * seq_len..(g + 1) * seq_len];
 
                 for q_block_idx in 0..num_q_blocks {
                     let q_start = q_block_idx * br;
@@ -243,6 +249,7 @@ pub fn flash_attention_causal_with_config(
                         &mut scratch,
                         &mut m_head[q_start..q_start + br_cur],
                         &mut l_head[q_start..q_start + br_cur],
+                        &mut bad_head[q_start..q_start + br_cur],
                         q_start,
                         k_start,
                         br_cur,
@@ -272,6 +279,7 @@ pub fn flash_attention_causal_with_config(
                 q_head_base + g,
                 seq_len,
                 &group_l[g * seq_len..(g + 1) * seq_len],
+                &group_bad[g * seq_len..(g + 1) * seq_len],
             );
         }
     }
@@ -417,11 +425,29 @@ fn normalize_head_output(
     head_idx: usize,
     seq_len: usize,
     l: &[f32],
+    bad: &[bool],
 ) {
     let head_off = head_idx * head_dim;
     for row in 0..seq_len {
-        let inv_l = if l[row] > 0.0 { 1.0 / l[row] } else { 0.0 };
         let off = row * q_dim + head_off;
+        // ADR-080 C1: a row flagged `bad` (NaN/`+inf` score seen in any
+        // processed K-block, #780) fails closed to an exact-zero row
+        // regardless of what `l[row]` (or the accumulated unnormalized
+        // output) holds, matching the shared fail-closed contract rather
+        // than trusting a possibly-corrupted running denominator. This is
+        // an explicit `= 0.0` assignment, not a `*= 0.0` multiply: the
+        // accumulator can itself hold NaN by this point (e.g. if the same
+        // poisoned key's V row is also non-finite), and `NaN * 0.0` is
+        // still `NaN` under IEEE 754.
+        if bad[row] {
+            attn_out[off..off + head_dim].fill(0.0);
+            continue;
+        }
+        let inv_l = if l[row].is_finite() && l[row] > 0.0 {
+            1.0 / l[row]
+        } else {
+            0.0
+        };
         for d in 0..head_dim {
             attn_out[off + d] *= inv_l;
         }
@@ -432,6 +458,7 @@ fn flash_update_block(
     scratch: &mut FlashAttentionScratch,
     m_rows: &mut [f32],
     l_rows: &mut [f32],
+    bad_rows: &mut [bool],
     q_start: usize,
     k_start: usize,
     br_cur: usize,
@@ -457,10 +484,21 @@ fn flash_update_block(
         let row_p = &mut p[row * bc_cur..(row + 1) * bc_cur];
 
         let mut block_row_max = f32::NEG_INFINITY;
+        // ADR-080 C1 (#780): a genuine NaN or `+inf` score anywhere in this
+        // row's VISIBLE (non-causally-masked) columns must fail-close the
+        // whole row, not just that lane. `-inf` from the causal mask itself
+        // is legitimate and must not trip this. Tracked independently of
+        // `block_row_max`'s fold because `if *score > block_row_max` is
+        // `false` for a NaN operand (IEEE 754), silently dropping it from
+        // the max the same way `f32::max` does.
+        let mut block_has_poison = false;
 
         if block_is_strictly_lower {
             for score in row_scores.iter_mut() {
                 *score *= scale;
+                if score.is_nan() || *score == f32::INFINITY {
+                    block_has_poison = true;
+                }
                 if *score > block_row_max {
                     block_row_max = *score;
                 }
@@ -473,12 +511,20 @@ fn flash_update_block(
                     *score = f32::NEG_INFINITY;
                 } else {
                     *score *= scale;
+                    if score.is_nan() || *score == f32::INFINITY {
+                        block_has_poison = true;
+                    }
                     if *score > block_row_max {
                         block_row_max = *score;
                     }
                 }
             }
         }
+
+        if block_has_poison {
+            bad_rows[row] = true;
+        }
+        let row_is_bad = bad_rows[row];
 
         let m_old = m_rows[row];
         let m_new = if m_old > block_row_max {
@@ -488,15 +534,21 @@ fn flash_update_block(
         };
         scratch.row_m_new[row] = m_new;
 
-        let alpha = if m_old.is_finite() && m_new.is_finite() {
+        let alpha = if !row_is_bad && m_old.is_finite() && m_new.is_finite() {
             (m_old - m_new).exp()
         } else {
+            // Once a row is condemned, discard whatever partial output it
+            // accumulated from earlier (clean) blocks too: the final
+            // `normalize_head_output` forces this row to exact zero, but
+            // `alpha = 0.0` here keeps the intermediate accumulator from
+            // carrying forward stale non-finite state across further
+            // blocks for no purpose.
             0.0
         };
         scratch.row_alpha[row] = alpha;
 
         let mut row_sum = 0.0f32;
-        if m_new.is_finite() {
+        if !row_is_bad && m_new.is_finite() {
             for col in 0..bc_cur {
                 let score = row_scores[col];
                 let value = if score.is_finite() {
@@ -559,37 +611,45 @@ fn standard_attention_causal(
             let q_off = qi * q_dim + q_head_off;
             let q_row = &q_buf[q_off..q_off + head_dim];
 
-            let mut max_score = f32::NEG_INFINITY;
             for ki in 0..seq_len {
-                let score = if ki > qi {
+                scores[ki] = if ki > qi {
                     f32::NEG_INFINITY
                 } else {
                     let k_off = ki * kv_dim + kv_head_off;
                     let k_row = &k_buf[k_off..k_off + head_dim];
                     scale * dot(q_row, k_row)
                 };
-                scores[ki] = score;
-                if score > max_score {
-                    max_score = score;
-                }
-            }
-
-            let mut denom = 0.0f32;
-            for ki in 0..seq_len {
-                let p = if scores[ki].is_finite() {
-                    (scores[ki] - max_score).exp()
-                } else {
-                    0.0
-                };
-                probs[ki] = p;
-                denom += p;
             }
 
             let out_off = qi * q_dim + q_head_off;
             let out_row = &mut attn_out[out_off..out_off + head_dim];
             out_row.fill(0.0);
 
-            if denom > 0.0 {
+            // ADR-080 C1: route the fail-closed final decision through the
+            // shared row-finalizer contract (#780). RED before the fix: a
+            // lone NaN score among the visible (ki <= qi) range was silently
+            // dropped to a zero-weight lane via `scores[ki].is_finite()`
+            // while the row's OTHER valid lanes still normalized around a
+            // `max_score` fold that had already silently ignored the NaN
+            // operand (`if score > max_score` is false for NaN) — a
+            // partially-normalized row, which the fail-closed contract
+            // forbids. `ki > qi` positions are always exactly `-inf`
+            // (never NaN), so `row_max_and_any_nan` cannot false-positive
+            // on legitimate causal masking.
+            let row = &mut scores[..seq_len];
+            let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+            if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+                continue;
+            }
+
+            let mut denom = 0.0f32;
+            for ki in 0..=qi {
+                let p = (row[ki] - max_score).exp();
+                probs[ki] = p;
+                denom += p;
+            }
+
+            if denom.is_finite() && denom > 0.0 {
                 let inv = 1.0 / denom;
                 for ki in 0..=qi {
                     let weight = probs[ki] * inv;
@@ -910,5 +970,112 @@ mod tests {
                 fallback_below: 0,
             },
         );
+    }
+
+    /// ADR-080 C1 (#780): `standard_attention_causal` (the short-sequence
+    /// fallback path, used here via `head_dim=4 > seq_len=3`). A NaN key
+    /// score at position 1 must fail-close every row that causally attends
+    /// to it (query 2), while query 0 (attends only to itself, never sees
+    /// position 1) stays unaffected.
+    #[test]
+    fn standard_path_nan_key_fails_closed_for_dependent_rows_only() {
+        let seq_len = 3;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 4; // seq_len(3) < fallback_below(head_dim=4) -> standard path
+        let q_buf = [1.0f32, 0.0, 0.0, 0.0].repeat(seq_len);
+        let mut k_buf = vec![0.0f32; seq_len * head_dim];
+        k_buf[0] = 1.0; // K0
+        k_buf[head_dim] = f32::NAN; // K1: poison
+        k_buf[2 * head_dim] = 0.5; // K2
+        let mut v_buf = vec![0.0f32; seq_len * head_dim];
+        v_buf[0] = 10.0; // V0
+        v_buf[head_dim] = 20.0; // V1
+        v_buf[2 * head_dim] = 30.0; // V2
+        let mut out = vec![1.0f32; seq_len * head_dim]; // pre-fill nonzero to prove overwrite
+
+        flash_attention_causal(
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+        );
+
+        let pos0 = &out[0..head_dim];
+        assert!(
+            (pos0[0] - 10.0).abs() < 1e-4 && pos0[1..].iter().all(|&v| v == 0.0),
+            "query 0 (self-attends only) must be unaffected: {pos0:?}"
+        );
+        let pos2 = &out[2 * head_dim..3 * head_dim];
+        assert!(
+            pos2.iter().all(|&v| v == 0.0),
+            "query 2 (causally attends to the NaN-poisoned position 1) must \
+             fail closed to exact zero: {pos2:?}"
+        );
+    }
+
+    /// ADR-080 C1 (#780): the tiled Flash Attention path threads a per-row
+    /// `bad` flag across K-blocks (`flash_update_block`'s `bad_rows` /
+    /// `normalize_head_output`'s `bad`) so a NaN key discovered in one block
+    /// fails closed every row that causally depends on it, even in a LATER
+    /// block. `br=2, bc=2` forces `seq_len=4` into 2 K-blocks and 2 Q-blocks
+    /// with `fallback_below=0` (never use the short-sequence fallback), so
+    /// this specifically exercises `flash_update_block`/`normalize_head_output`,
+    /// not `standard_attention_causal`. Poison sits in K-block 0 (position 1);
+    /// query 0 (block 0, self-attends only) must stay clean, while queries
+    /// 1, 2, and 3 (which all causally see position 1, queries 2/3 via a
+    /// LATER Q-block re-processing the FIRST K-block) must all fail closed.
+    #[test]
+    fn tiled_path_nan_key_fails_closed_across_blocks() {
+        let seq_len = 4;
+        let num_heads = 1;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let q_buf = [1.0f32, 0.0, 0.0, 0.0].repeat(seq_len);
+        let mut k_buf = vec![0.0f32; seq_len * head_dim];
+        k_buf[0] = 1.0; // K0
+        k_buf[head_dim] = f32::NAN; // K1: poison
+        k_buf[2 * head_dim] = 0.5; // K2
+        k_buf[3 * head_dim] = 0.3; // K3
+        let mut v_buf = vec![0.0f32; seq_len * head_dim];
+        v_buf[0] = 10.0; // V0
+        v_buf[head_dim] = 20.0; // V1
+        v_buf[2 * head_dim] = 30.0; // V2
+        v_buf[3 * head_dim] = 40.0; // V3
+        let mut out = vec![1.0f32; seq_len * head_dim];
+
+        flash_attention_causal_with_config(
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len,
+            FlashAttentionConfig {
+                br: 2,
+                bc: 2,
+                fallback_below: 0,
+            },
+        );
+
+        let pos0 = &out[0..head_dim];
+        assert!(
+            (pos0[0] - 10.0).abs() < 1e-4 && pos0[1..].iter().all(|&v| v == 0.0),
+            "query 0 (self-attends only) must be unaffected: {pos0:?}"
+        );
+        for qi in 1..seq_len {
+            let row = &out[qi * head_dim..(qi + 1) * head_dim];
+            assert!(
+                row.iter().all(|&v| v == 0.0),
+                "query {qi} (causally attends to the NaN-poisoned position 1) \
+                 must fail closed to exact zero: {row:?}"
+            );
+        }
     }
 }

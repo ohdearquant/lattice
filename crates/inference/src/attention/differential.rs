@@ -391,25 +391,25 @@ pub fn apply_differential_attention(
                     }
                 }
 
-                // Softmax (numerically stable, two-pass)
+                // Softmax (numerically stable, two-pass). ADR-080 C1: route the
+                // fail-closed final decision through the shared row-finalizer
+                // instead of the bare `sum > 0.0` check, which had no `else`
+                // branch and left a NaN/+inf-poisoned row un-zeroed (#780).
                 for qi in 0..seq_len {
                     let row = &mut score_slice[qi * seq_len..(qi + 1) * seq_len];
                     let valid = qi + 1;
-                    let max_val = row[..valid]
-                        .iter()
-                        .copied()
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    let (max_val, any_nan) =
+                        crate::attention::softmax_row::row_max_and_any_nan(&row[..valid]);
+                    if crate::attention::softmax_row::row_fails_closed_pre_exp(max_val, any_nan) {
+                        row.fill(0.0);
+                        continue;
+                    }
                     let mut sum = 0.0_f32;
                     for v in &mut row[..valid] {
                         *v = (*v - max_val).exp();
                         sum += *v;
                     }
-                    if sum > 0.0 {
-                        let inv = 1.0 / sum;
-                        for v in &mut row[..valid] {
-                            *v *= inv;
-                        }
-                    }
+                    crate::attention::softmax_row::finalize_row(&mut row[..valid], sum);
                     row[valid..].fill(0.0);
                 }
             }
@@ -644,6 +644,49 @@ mod tests {
             out.len(),
             seq_len * cfg.num_heads * 2 * cfg.head_dim,
             "output length must be seq_len * num_heads * 2 * head_dim"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // ADR-080 C1: NaN score must fail closed (zero the poisoned row), not
+    // propagate. RED before the fix: the softmax loop's `if sum > 0.0` had no
+    // `else` branch, so a NaN-poisoned row was left holding NaN/Inf exponentials
+    // instead of being zeroed (#780).
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_diff_attn_nan_score_fails_closed() {
+        let head_dim = 2_usize;
+        let cfg = make_cfg(1, 1, head_dim, 0);
+        let seq_len = 3_usize;
+
+        // Poison q at position 1 so the QK dot product for query row 1 is NaN.
+        let mut q = det_data(seq_len * cfg.q_dim(), 11);
+        q[cfg.q_dim()] = f32::NAN;
+        let k = det_data(seq_len * cfg.k_dim(), 12);
+        let v = det_data(seq_len * cfg.v_dim(), 13);
+
+        let params = zero_lambda_params(head_dim);
+        let subln_w = vec![1.0f32; 2 * head_dim];
+        let mut out = vec![0.0f32; seq_len * cfg.out_dim()];
+        let mut scratch = DiffAttnScratch::default();
+
+        apply_differential_attention(
+            &q,
+            &k,
+            &v,
+            &params,
+            &subln_w,
+            1e-6,
+            &mut out,
+            seq_len,
+            &cfg,
+            &mut scratch,
+        );
+
+        assert!(
+            out.iter().all(|x| x.is_finite()),
+            "differential attention output must stay finite even with a NaN score, got {out:?}"
         );
     }
 

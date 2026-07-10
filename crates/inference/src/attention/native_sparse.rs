@@ -1037,23 +1037,29 @@ fn aggregate_selection_importance(p_cmp: &[f32], sj: usize, cps: usize, ipc: usi
 }
 
 /// Numerically stable in-place softmax.
+///
+/// ADR-080 C1: routes the fail-closed decision through the shared row
+/// finalizer. Previously `if sum > 0.0` had no `else` branch, so a NaN/+inf
+/// score left `x` holding raw NaN/Inf exponentials instead of a zeroed row
+/// (#780) — this is the single softmax helper shared by all three
+/// `apply_native_sparse_attention` branches (compression, selection, sliding
+/// window), so the fix applies to all of them at once.
 #[inline]
 fn softmax_inplace(x: &mut [f32]) {
     if x.is_empty() {
         return;
     }
-    let max_val = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let (max_val, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(x);
+    if crate::attention::softmax_row::row_fails_closed_pre_exp(max_val, any_nan) {
+        x.fill(0.0);
+        return;
+    }
     let mut sum = 0.0f32;
     for v in x.iter_mut() {
         *v = (*v - max_val).exp();
         sum += *v;
     }
-    if sum > 0.0 {
-        let inv = 1.0 / sum;
-        for v in x.iter_mut() {
-            *v *= inv;
-        }
-    }
+    crate::attention::softmax_row::finalize_row(x, sum);
 }
 
 #[inline]
@@ -1799,6 +1805,30 @@ mod tests {
         // softmax is monotone: larger input → larger output
         assert!(x[0] > x[2], "softmax({}) > softmax({})", orig[0], orig[2]);
         assert!(x[2] > x[1], "softmax({}) > softmax({})", orig[2], orig[1]);
+    }
+
+    // ADR-080 C1: a NaN score must zero the WHOLE row, not leave NaN/Inf in
+    // place. RED before the fix: `if sum > 0.0` had no `else`, so `x` was left
+    // holding the raw (NaN-poisoned) unnormalized exponentials (#780).
+    #[test]
+    fn test_softmax_inplace_nan_fails_closed() {
+        let mut x = vec![1.0f32, f32::NAN, 2.0, 0.5];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
+    }
+
+    #[test]
+    fn test_softmax_inplace_pos_inf_fails_closed() {
+        let mut x = vec![1.0f32, f32::INFINITY, 2.0];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
+    }
+
+    #[test]
+    fn test_softmax_inplace_all_neg_inf_fails_closed() {
+        let mut x = vec![f32::NEG_INFINITY; 3];
+        softmax_inplace(&mut x);
+        assert!(x.iter().all(|&v| v == 0.0), "expected all-zero row: {x:?}");
     }
 
     // ---------------------------------------------------------------
