@@ -416,23 +416,21 @@ fn full_attention_step_q8(
 
         // Softmax. Fail closed on a non-finite score row: a NaN Q/K activation
         // (e.g. from an infinite Q8 scale via `0.0 * inf`) makes `sum_exp` NaN, and
-        // `NaN > 0.0` is false, so without the else-branch the unnormalized NaN
-        // weights would flow into the V accumulation and poison the logits. Mirrors
+        // real (unclamped) `.exp()` already reaches the shared row-finalizer's
+        // full-row-zero outcome via that NaN-into-`sum_exp` propagation. Mirrors
         // generate.rs::compute_attention (#409) and cpu_f16 moe_ffn_step_f16 (#411).
+        // ADR-080 C1 (#785 round-1 medium 1): routed through `finalize_row` for
+        // consolidation -- behavior-preserving, no output change.
         let mut sum_exp = 0.0f32;
         for t in 0..cur_seq_len {
             let e = (scratch.scores[scores_start + t] - max_score).exp();
             scratch.scores[scores_start + t] = e;
             sum_exp += e;
         }
-        if sum_exp > 0.0 {
-            let inv_sum = 1.0 / sum_exp;
-            for t in 0..cur_seq_len {
-                scratch.scores[scores_start + t] *= inv_sum;
-            }
-        } else {
-            scratch.scores[scores_start..scores_start + cur_seq_len].fill(0.0);
-        }
+        crate::attention::softmax_row::finalize_row(
+            &mut scratch.scores[scores_start..scores_start + cur_seq_len],
+            sum_exp,
+        );
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
@@ -1267,6 +1265,44 @@ mod tests {
             scratch.context[..q_dim].iter().all(|v| v.is_finite()),
             "Q8 attention must fail closed (zero context), not propagate NaN"
         );
+    }
+
+    /// ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: after
+    /// routing this site's finalizer through the shared `finalize_row` helper,
+    /// a well-formed (non-poisoned) single-position row must still normalize
+    /// to exactly `1.0` (softmax of one score is always `1.0`), not be
+    /// incidentally swept into the fail-closed zero branch.
+    #[test]
+    fn test_full_attn_step_q8_clean_row_still_normalizes() {
+        let (cfg, rope, weights, hidden) = tiny_full_attn_fixture();
+        let num_heads = cfg.num_attention_heads;
+
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+        let mut kv_cache = KvCache::new(1);
+
+        full_attention_step_q8(
+            &weights,
+            0,
+            3,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        // cur_seq_len == 1 (fresh cache): each head's single-position row must
+        // normalize to exactly 1.0, proving `finalize_row`'s normalize branch
+        // fired rather than its fail-closed zero branch.
+        for h in 0..num_heads {
+            assert_eq!(
+                scratch.scores[h], 1.0,
+                "head {h}: clean single-position row must normalize to 1.0"
+            );
+        }
     }
 
     /// A decay-gate overflow (`a_log.exp() == +inf`) combined with a softplus

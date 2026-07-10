@@ -659,16 +659,29 @@ mod tests {
         let head_dim = 2_usize;
         let cfg = make_cfg(1, 1, head_dim, 0);
         let seq_len = 3_usize;
+        let q_dim = cfg.q_dim();
+        let out_dim = cfg.out_dim();
 
-        // Poison q at position 1 so the QK dot product for query row 1 is NaN.
-        let mut q = det_data(seq_len * cfg.q_dim(), 11);
-        q[cfg.q_dim()] = f32::NAN;
+        // Differential attention packs TWO Q sub-vectors per head (Q1 -> scores1,
+        // Q2 -> scores2; see the `(q_h0, k_h0, scores1), (q_h1, k_h1, scores2)`
+        // pair loop above). Poisoning only ONE sub-vector's dim (as the original
+        // regression test did) only fails ONE of the two differential softmaxes
+        // closed, so `context = attn1 - lambda*attn2` is `0 - lambda*attn2`, not
+        // exactly zero -- `is_finite()` passed on that output for the wrong
+        // reason (a still-finite nonzero value), not because the row was zeroed.
+        // Poison the WHOLE token-1 Q row (both sub-vectors) so BOTH softmaxes
+        // fail closed and the differential context is `0 - lambda*0 == 0`
+        // exactly, letting this test pin "zero in full" instead of "finite".
+        let mut q = det_data(seq_len * q_dim, 11);
+        for d in 0..q_dim {
+            q[q_dim + d] = f32::NAN;
+        }
         let k = det_data(seq_len * cfg.k_dim(), 12);
         let v = det_data(seq_len * cfg.v_dim(), 13);
 
         let params = zero_lambda_params(head_dim);
         let subln_w = vec![1.0f32; 2 * head_dim];
-        let mut out = vec![0.0f32; seq_len * cfg.out_dim()];
+        let mut out = vec![0.0f32; seq_len * out_dim];
         let mut scratch = DiffAttnScratch::default();
 
         apply_differential_attention(
@@ -684,9 +697,87 @@ mod tests {
             &mut scratch,
         );
 
+        let poisoned_row = &out[out_dim..2 * out_dim];
         assert!(
-            out.iter().all(|x| x.is_finite()),
-            "differential attention output must stay finite even with a NaN score, got {out:?}"
+            poisoned_row.iter().all(|&x| x == 0.0),
+            "differential attention's poisoned query row must be exactly \
+             all-zero (fail-closed), not merely finite; got {poisoned_row:?}"
+        );
+
+        // Sibling rows (query 0 and query 2) share no poisoned Q/K/V and must
+        // stay finite and non-degenerate (a real normalized result, not
+        // incidentally zero).
+        for t in [0usize, 2usize] {
+            let row = &out[t * out_dim..(t + 1) * out_dim];
+            assert!(
+                row.iter().all(|x| x.is_finite()),
+                "query {t}'s row must stay finite, got {row:?}"
+            );
+            assert!(
+                row.iter().any(|&x| x != 0.0),
+                "query {t}'s row must be a real (non-degenerate) result, got {row:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // test_diff_attn_partial_nan_row_fails_closed_in_full
+    // ---------------------------------------------------------------
+
+    /// #785 round-1 medium 2 (codex): poisoning a WHOLE Q row (as
+    /// `test_diff_attn_nan_score_fails_closed` does) makes every lane of that
+    /// row NaN together, so it can't distinguish "zero the whole row" from a
+    /// buggy "zero only the NaN lane(s), normalize the rest" mutation -- both
+    /// produce the same all-zero result there. This test poisons a single K
+    /// TIME STEP instead (both packed K halves at position 0), which causal
+    /// masking puts in every later query's row but leaves the *other* lanes of
+    /// that row (k1, k2, ...) untouched: query 1's row is `[NaN, finite]`, a
+    /// genuinely mixed row. A one-lane-only-zero mutation would zero just lane
+    /// 0 and renormalize lane 1 to a nonzero weight, producing a nonzero
+    /// combined context; the real fail-closed contract must zero the WHOLE
+    /// row so the combined context is exactly zero.
+    #[test]
+    fn test_diff_attn_partial_nan_row_fails_closed_in_full() {
+        let head_dim = 2_usize;
+        let cfg = make_cfg(1, 1, head_dim, 0);
+        let seq_len = 2_usize;
+        let out_dim = cfg.out_dim();
+
+        let q = det_data(seq_len * cfg.q_dim(), 21);
+        // Poison K time-step 0 across BOTH packed K halves (k_h0 -> scores1,
+        // k_h1 -> scores2) so both differential softmax paths see the same
+        // partial-NaN pattern for every query that includes position 0.
+        let mut k = det_data(seq_len * cfg.k_dim(), 22);
+        for d in 0..cfg.k_dim() {
+            k[d] = f32::NAN;
+        }
+        let v = det_data(seq_len * cfg.v_dim(), 23);
+
+        let params = zero_lambda_params(head_dim);
+        let subln_w = vec![1.0f32; 2 * head_dim];
+        let mut out = vec![0.0f32; seq_len * out_dim];
+        let mut scratch = DiffAttnScratch::default();
+
+        apply_differential_attention(
+            &q,
+            &k,
+            &v,
+            &params,
+            &subln_w,
+            1e-6,
+            &mut out,
+            seq_len,
+            &cfg,
+            &mut scratch,
+        );
+
+        // Query 1's row is `[k0=NaN, k1=finite]` in both scores1 and scores2 --
+        // exactly the mixed-lane case a per-lane-only fix would mishandle.
+        let mixed_row = &out[out_dim..2 * out_dim];
+        assert!(
+            mixed_row.iter().all(|&x| x == 0.0),
+            "a row with any NaN lane must fail closed in FULL (all lanes zero), \
+             not just the poisoned lane(s); got {mixed_row:?}"
         );
     }
 

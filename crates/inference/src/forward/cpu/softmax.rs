@@ -136,62 +136,53 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
             let n = row.len();
             let chunks = n / CHUNK;
 
-            // --- Step 1: Find row max with 4x unrolling, plus an explicit NaN scan ---
-            // Use the maxNum intrinsics (FMAXNM: vmaxnmq/vmaxnmvq) rather than FMAX
-            // (vmaxq/vmaxvq). FMAX PROPAGATES a NaN operand; Rust `f32::max` in the
-            // scalar reference (and the scalar tail below) follows IEEE maxNum and
-            // DROPS a single NaN. With FMAX, a NaN anywhere in the row makes the whole
-            // reduced max NaN, every `neon_exp(x - NaN)` underflows to 0.0, the sum is
-            // 0.0, and the row is left all-zeros — diverging from the scalar path,
-            // which ignores the NaN and normalizes the finite logits. FMAXNM matches
-            // the scalar reference exactly and is byte-identical on all-finite rows
-            // (the only case that occurs in healthy inference), at no extra cost.
-            //
-            // FMAXNM dropping NaN from the *max* means a NaN score would otherwise
-            // survive undetected as a single bad lane (ADR-080 C1 / #740) instead of
-            // failing the whole row closed. `vceqq_f32(v, v)` is all-ones for every
-            // non-NaN lane (NaN never equals itself), so ANDing that mask across all
-            // chunks and reducing with `vminvq_u32` gives an explicit any-NaN flag at
-            // negligible extra cost (one more vector op per chunk, no extra load).
+            // --- Step 1: Find row max with 4x unrolling ---
+            // ADR-080 C1 (#785 round-1 perf): use the plain FMAX intrinsics
+            // (vmaxq/vmaxvq), which PROPAGATE a NaN operand, instead of the
+            // maxNum FMAXNM intrinsics (vmaxnmq/vmaxnmvq) paired with an
+            // explicit `vceqq`/`vandq` NaN-tracking mask. The C1 contract
+            // requires a NaN score to fail the WHOLE row closed (not survive
+            // as a single bad lane, #740) — the same outcome FMAX gives for
+            // free via `!max_val.is_finite()` below, mirroring the scalar
+            // reference (`row_max_and_any_nan`/`row_fails_closed_pre_exp`) and
+            // `attention/decode.rs`'s `softmax_decode_neon`. The prior
+            // FMAXNM-drops-NaN + explicit-track approach was redundant work
+            // once the scalar path itself started failing closed on NaN;
+            // there is no longer a "normalize around the NaN" case to
+            // preserve. `-inf` masked lanes still flow through `max`
+            // correctly (they are not NaN and always lose to a real value).
             let mut m0 = vdupq_n_f32(f32::NEG_INFINITY);
             let mut m1 = m0;
             let mut m2 = m0;
             let mut m3 = m0;
-            let mut nm0 = vdupq_n_u32(u32::MAX);
-            let mut nm1 = nm0;
-            let mut nm2 = nm0;
-            let mut nm3 = nm0;
             for c in 0..chunks {
                 let base = c * CHUNK;
-                let v0 = vld1q_f32(ptr.add(base) as *const f32);
-                let v1 = vld1q_f32(ptr.add(base + 4) as *const f32);
-                let v2 = vld1q_f32(ptr.add(base + 8) as *const f32);
-                let v3 = vld1q_f32(ptr.add(base + 12) as *const f32);
-                m0 = vmaxnmq_f32(m0, v0);
-                m1 = vmaxnmq_f32(m1, v1);
-                m2 = vmaxnmq_f32(m2, v2);
-                m3 = vmaxnmq_f32(m3, v3);
-                nm0 = vandq_u32(nm0, vceqq_f32(v0, v0));
-                nm1 = vandq_u32(nm1, vceqq_f32(v1, v1));
-                nm2 = vandq_u32(nm2, vceqq_f32(v2, v2));
-                nm3 = vandq_u32(nm3, vceqq_f32(v3, v3));
+                m0 = vmaxq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
+                m1 = vmaxq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
+                m2 = vmaxq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
+                m3 = vmaxq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
             }
-            let vmax = vmaxnmq_f32(vmaxnmq_f32(m0, m1), vmaxnmq_f32(m2, m3));
-            let mut max_val = vmaxnmvq_f32(vmax);
-            let nan_free_mask = vandq_u32(vandq_u32(nm0, nm1), vandq_u32(nm2, nm3));
-            let mut any_nan = vminvq_u32(nan_free_mask) == 0;
+            let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
+            let mut max_val = vmaxvq_f32(vmax);
             for i in (chunks * CHUNK)..n {
                 let v = *ptr.add(i);
-                if v.is_nan() {
-                    any_nan = true;
-                } else {
-                    max_val = max_val.max(v);
+                // `f32::max` returns the finite operand when the other is
+                // NaN, which would drop a tail NaN AND erase an already-NaN
+                // chunk max behind a later finite tail lane. Force NaN to
+                // propagate across the chunk/tail boundary explicitly,
+                // exactly like `softmax_decode_neon`.
+                if max_val.is_nan() || v.is_nan() {
+                    max_val = f32::NAN;
+                    break;
                 }
+                max_val = max_val.max(v);
             }
 
-            // All-masked row (max stayed -inf), a `+inf` max, or any NaN score: zero
-            // it and skip, matching the scalar reference (ADR-080 C1 contract).
-            if any_nan || !max_val.is_finite() {
+            // All-masked row (max stayed -inf), a `+inf` max, or any NaN score
+            // (NaN propagated through FMAX above, so `is_finite()` alone now
+            // catches it): zero it and skip, matching the scalar reference
+            // (ADR-080 C1 contract).
+            if !max_val.is_finite() {
                 row.fill(0.0);
                 continue;
             }

@@ -657,17 +657,16 @@ fn full_attention_step_q8_neon(
             sum_exp += e;
         }
         // Fail closed: a non-finite score (NaN/+inf from a corrupt Q/K
-        // activation) poisons sum_exp; `NaN > 0.0` is false, so the else
-        // branch zeros the row instead of scaling by a NaN inv_sum. Mirrors
-        // the Q8 CPU and f32 siblings (forward::cpu_q8, generate::compute_attention).
-        if sum_exp > 0.0 {
-            let inv_sum = 1.0 / sum_exp;
-            for t in 0..cur_seq_len {
-                scratch.scores[scores_start + t] *= inv_sum;
-            }
-        } else {
-            scratch.scores[scores_start..scores_start + cur_seq_len].fill(0.0);
-        }
+        // activation) poisons sum_exp; real (unclamped) `.exp()` already
+        // reaches the shared row-finalizer's full-row-zero outcome via that
+        // NaN-into-`sum_exp` propagation. Mirrors the Q8 CPU and f32 siblings
+        // (forward::cpu_q8, generate::compute_attention). ADR-080 C1 (#785
+        // round-1 medium 1): routed through `finalize_row` for consolidation
+        // -- behavior-preserving, no output change.
+        crate::attention::softmax_row::finalize_row(
+            &mut scratch.scores[scores_start..scores_start + cur_seq_len],
+            sum_exp,
+        );
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
@@ -2338,6 +2337,19 @@ mod tests {
             &cfg,
             &rope,
             hidden,
+        );
+
+        // ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: before any
+        // poisoning, this well-formed single-position row (identity q/k/v
+        // projections, non-zero input) must normalize through `finalize_row`,
+        // not be incidentally swept into the fail-closed zero branch.
+        assert_eq!(
+            scratch.scores[0], 1.0,
+            "clean single-position row must normalize to 1.0 before poisoning"
+        );
+        assert!(
+            scratch.context[..q_dim].iter().any(|&v| v != 0.0),
+            "clean row's context must be a real (non-degenerate) result"
         );
 
         // Corrupt the prior cached K (position 0) and advance to position 1 so

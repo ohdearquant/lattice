@@ -520,27 +520,29 @@ pub fn gqa_forward_with_cache(
             let kv_off = kvh * head_dim;
             let q = &q_after_rope[t][q_off..q_off + head_dim];
 
-            let mut max_score = f32::NEG_INFINITY;
             let prob_start = qh * (t + 1);
             for s in 0..=t {
                 let k = &k_after_rope[s * kv_dim + kv_off..s * kv_dim + kv_off + head_dim];
                 let dot: f32 = q.iter().zip(k.iter()).map(|(qi, ki)| qi * ki).sum();
-                let score = dot * scale;
-                probs_all[prob_start + s] = score;
-                if score > max_score {
-                    max_score = score;
-                }
+                probs_all[prob_start + s] = dot * scale;
             }
 
-            let mut sum_exp = 0.0f32;
-            for s in 0..=t {
-                let e = (probs_all[prob_start + s] - max_score).exp();
-                probs_all[prob_start + s] = e;
-                sum_exp += e;
-            }
-            let inv = 1.0 / sum_exp;
-            for s in 0..=t {
-                probs_all[prob_start + s] *= inv;
+            // ADR-080 C1 (#785 round-1 major 1): this forward-recompute builds
+            // `softmax_probs` for the backward tape, not a vocabulary softmax and
+            // not the `gqa.rs` test oracle -- a NaN/`+inf` score must zero the
+            // whole probability row (and its context row), not poison the
+            // gradient path via a bare `1.0 / sum_exp`.
+            let row = &mut probs_all[prob_start..prob_start + t + 1];
+            let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+            if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+                row.fill(0.0);
+            } else {
+                let mut sum_exp = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max_score).exp();
+                    sum_exp += *v;
+                }
+                crate::attention::softmax_row::finalize_row(row, sum_exp);
             }
 
             let ctx_off = t * q_dim + qh * head_dim;
@@ -818,5 +820,119 @@ mod tests {
         assert!(err_av < 1e-2, "GQA grad_A_v rel_err {err_av:.2e} >= 1e-2");
         assert!(err_bq < 1e-2, "GQA grad_B_q rel_err {err_bq:.2e} >= 1e-2");
         assert!(err_bv < 1e-2, "GQA grad_B_v rel_err {err_bv:.2e} >= 1e-2");
+    }
+
+    /// ADR-080 C1 (#785 round-1 major 1): `gqa_forward_with_cache`'s
+    /// forward-recompute causal attention (used to build `softmax_probs` and
+    /// `context` for the backward tape) is a production attention row, not the
+    /// `gqa.rs` test oracle and not a vocabulary softmax. Poisoning ONE Q
+    /// component for one query head (via a NaN weight, not a NaN input row --
+    /// so V is never touched and the "poisoned weight times poisoned V"
+    /// confound documented elsewhere in this cluster cannot mask the result)
+    /// must zero that head's entire stored probability row and context row at
+    /// every time step, while the sibling query head's rows stay finite and
+    /// normalized.
+    #[test]
+    fn gqa_forward_with_cache_nan_q_score_fails_closed_sibling_head_stays_finite() {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let eps_norm = 1e-6f32;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xC0FF_EE00_u64;
+        let mut w_q = rand_vec(&mut rng, 2 * q_dim * hidden, 0.1);
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_o = rand_vec(&mut rng, hidden * q_dim, 0.1);
+        let q_norm_w = vec![1.0f32; head_dim];
+        let k_norm_w = vec![1.0f32; head_dim];
+        let x = rand_vec(&mut rng, seq_len * hidden, 0.2);
+
+        // Poison query head 0's first raw Q output dim (`deinterleave_q_gate`
+        // maps head `h`'s Q half to raw indices `[h*head_dim*2, h*head_dim*2 +
+        // head_dim)`; head 0 starts at raw index 0). This is a WEIGHT mutation,
+        // not an input mutation: it never touches `w_k` or `w_v`, so K and V
+        // stay finite for every position -- only every time step's own head-0
+        // Q vector becomes NaN (further smeared by q_norm's shared `inv_rms`
+        // and RoPE's rotation, but always confined to head 0).
+        w_q[0] = f32::NAN;
+
+        let cos_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.cos()
+            })
+            .collect();
+        let sin_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.sin()
+            })
+            .collect();
+
+        let (_out, cache) = gqa_forward_with_cache(
+            &x,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &q_norm_w,
+            &k_norm_w,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps_norm,
+        );
+
+        for t in 0..seq_len {
+            let row_len = t + 1;
+            let poisoned_probs = &cache.softmax_probs[t][0..row_len];
+            let clean_probs = &cache.softmax_probs[t][row_len..2 * row_len];
+            assert!(
+                poisoned_probs.iter().all(|&p| p == 0.0),
+                "t={t}: query head 0 (NaN Q) probability row must be exactly \
+                 all-zero, got {poisoned_probs:?}"
+            );
+            assert!(
+                clean_probs.iter().all(|p| p.is_finite()),
+                "t={t}: sibling query head 1 probability row must stay finite, \
+                 got {clean_probs:?}"
+            );
+
+            let ctx_poisoned = &cache.context[t * q_dim..t * q_dim + head_dim];
+            let ctx_clean = &cache.context[t * q_dim + head_dim..t * q_dim + 2 * head_dim];
+            assert!(
+                ctx_poisoned.iter().all(|&v| v == 0.0),
+                "t={t}: query head 0's context row must be exactly all-zero, \
+                 got {ctx_poisoned:?}"
+            );
+            assert!(
+                ctx_clean.iter().all(|v| v.is_finite()),
+                "t={t}: sibling query head 1's context row must stay finite, \
+                 got {ctx_clean:?}"
+            );
+        }
     }
 }
