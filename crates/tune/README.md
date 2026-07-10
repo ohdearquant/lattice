@@ -326,11 +326,20 @@ let finetuned = RegisteredModel::new("intent_classifier", "1.1.0")
 | ---------------- | ------- | ------------------------------------------------------------ |
 | `std`            | Yes     | Standard library support                                     |
 | `serde`          | No      | Serialization (propagates to lattice-fann)                   |
-| `gpu`            | No      | GPU-accelerated training                                     |
+| `gpu`            | No      | GPU-accelerated forward/backward passes and validation[^gpu-limitation] |
 | `gpu-tests`      | No      | GPU tests requiring hardware                                 |
 | `safetensors`    | No      | Safe checkpoint serialization                                |
 | `inference-hook` | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`) |
 | `train-backward` | No      | Backward/gradient training surface (pulls in `lattice-inference`) |
+
+[^gpu-limitation]: **Current limitation**: `GpuTrainer::train_batch` returns
+`Err` for every optimizer choice (Adam, AdamW, SGD-momentum, plain SGD,
+RMSprop) — the GPU-shader optimizer dispatch has no buffer bindings wired to
+the network's weight/gradient buffers, and the CPU-side plain-SGD arm has
+neither real gradient plumbing nor a mutable weight write-back path. Forward
+pass and loss computation work correctly; only the weight-update step is
+unimplemented. See [issue #797](https://github.com/ohdearquant/lattice/issues/797).
+This note will be removed once that wiring lands.
 
 ```toml
 [dependencies]
