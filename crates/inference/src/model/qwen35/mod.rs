@@ -55,6 +55,14 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+// Shared backend-neutral decode-policy struct (reasoning-budget accounting +
+// logprobs formatting), consumed by the Metal streaming loops in
+// `crate::forward::metal_qwen35` so the same bookkeeping isn't re-duplicated
+// across the CPU/Metal boundary (ADR-080 C3). Only the Metal (`mod inner`,
+// gated identically) consumer needs the re-export; `generation.rs` itself
+// uses `DecodePolicy` directly within its own module.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::DecodePolicy;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

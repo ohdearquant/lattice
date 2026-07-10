@@ -251,7 +251,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        let thinking_closed_seed = Some(next_id) == think_close_id;
+        let mut policy = DecodePolicy::new(gen_cfg, think_close_id, next_id, generated_ids.len());
 
         if gen_cfg.stop_strings.is_empty() {
             // Fast path: no string-level stops. Behaviour byte-for-byte identical
@@ -266,8 +266,7 @@ impl Qwen35Model {
                 &mut kv_cache,
                 &mut scratch,
                 &mut grammar_state,
-                think_close_id,
-                thinking_closed_seed,
+                &mut policy,
                 &mut token_logprobs,
             )?;
 
@@ -333,8 +332,7 @@ impl Qwen35Model {
                 &mut detok,
                 &mut full,
                 &mut grammar_state,
-                think_close_id,
-                thinking_closed_seed,
+                &mut policy,
                 &mut token_logprobs,
                 &mut token_logprob_end_offsets,
             )?;
@@ -617,14 +615,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        let mut thinking_closed = Some(next_id) == think_close_id;
-        // Tracks generated_ids length at the moment </think> was emitted, for the
-        // answer-budget break. None when reasoning_budget is disabled (parity-safe).
-        let mut reasoning_end_len: Option<usize> = None;
-        // Capture close-point after prefill push (covers budget=1 edge case).
-        if thinking_closed && reasoning_end_len.is_none() {
-            reasoning_end_len = Some(generated_ids.len());
-        }
+        let mut policy = DecodePolicy::new(gen_cfg, think_close_id, next_id, generated_ids.len());
 
         // Incremental detokenization: emit only complete-UTF-8 text deltas. A
         // byte-level BPE codepoint can span several tokens, so we buffer raw bytes
@@ -658,7 +649,7 @@ impl Qwen35Model {
             let mut stop_reason = StopReason::Length;
             // Decode loop (mirrors decode_loop free function exactly).
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a
@@ -704,14 +695,7 @@ impl Qwen35Model {
 
                 // Budget forcing: override sampled token with </think> when the
                 // reasoning budget is exhausted and the block is still open.
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
+                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
                 // Grammar advance on the actually-emitted token (after any budget
                 // override): a false return signals grammar completion. Set
@@ -726,9 +710,7 @@ impl Qwen35Model {
                 }
 
                 // Track when the thinking block closes (natural or forced).
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
+                policy.note_emitted(next_id);
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -738,17 +720,14 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
-                record_logprob(
+                policy.record_logprob(
                     &mut token_logprobs,
                     &scratch.logits[..cfg.vocab_size],
                     next_id,
                     gen_cfg.temperature,
-                    gen_cfg.logprobs,
                 );
                 // Capture close-point after push so </think> is the last reasoning token.
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
+                policy.capture_reasoning_end(generated_ids.len());
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if !delta.is_empty() {
@@ -761,9 +740,7 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if policy.answer_budget_exhausted(generated_ids.len()) {
                     break;
                 }
             }
@@ -835,7 +812,7 @@ impl Qwen35Model {
             let mut stop_reason = StopReason::Length;
             // Decode loop for the string-stop path.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 if should_cancel() {
                     stopped_by_caller = true;
@@ -877,14 +854,7 @@ impl Qwen35Model {
 
                 // Budget forcing: override sampled token with </think> when the
                 // reasoning budget is exhausted and the block is still open.
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
+                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
                 // Grammar advance on the actually-emitted token (after any budget
                 // override): break cleanly when the grammar signals completion.
@@ -897,9 +867,7 @@ impl Qwen35Model {
                 }
 
                 // Track when the thinking block closes (natural or forced).
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
+                policy.note_emitted(next_id);
 
                 if should_stop_token(cfg, gen_cfg, next_id) {
                     stopped = true;
@@ -909,17 +877,14 @@ impl Qwen35Model {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
-                record_logprob(
+                policy.record_logprob(
                     &mut token_logprobs,
                     &scratch.logits[..cfg.vocab_size],
                     next_id,
                     gen_cfg.temperature,
-                    gen_cfg.logprobs,
                 );
                 // Capture close-point after push so </think> is the last reasoning token.
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
+                policy.capture_reasoning_end(generated_ids.len());
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 let mut iter_interrupted = false;
@@ -940,9 +905,7 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if policy.answer_budget_exhausted(generated_ids.len()) {
                     break;
                 }
             }
@@ -972,6 +935,146 @@ impl Qwen35Model {
                 token_logprobs,
             })
         }
+    }
+}
+
+/// Backend-neutral decode-policy state (ADR-080 C3): reasoning-budget
+/// accounting and logprobs formatting, shared by every canonical/streaming
+/// decode loop — CPU [`decode_loop`], [`decode_loop_with_stops`], both
+/// branches of [`Qwen35Model::generate_streaming_with_cancel`], and the Metal
+/// `generate_streaming` / `generate_streaming_with_prefix_cache_and_cancel_inner`
+/// loops in `crate::forward::metal_qwen35` — via a per-step forward callback
+/// seam: each backend keeps `forward_step`, grammar masking/advance,
+/// sampling, and EOS/stop-token checking entirely to itself, and only hands
+/// the policy the token its own pipeline just sampled
+/// ([`DecodePolicy::apply_override`], which may replace it with the forced
+/// `</think>` token), then reports back once the final token is actually
+/// emitted ([`DecodePolicy::note_emitted`] / [`DecodePolicy::capture_reasoning_end`])
+/// so the policy can tell the loop when the answer-budget window has closed
+/// ([`DecodePolicy::answer_budget_exhausted`]).
+///
+/// Before this struct existed, this exact bookkeeping (`think_close_id`
+/// resolution, `thinking_closed` / `reasoning_end_len` tracking, the
+/// `decode_cap` / `force_close_think` calls, and the answer-budget break
+/// condition) was hand-duplicated across six independent decode loops —
+/// exactly the drift ADR-080 C3 exists to prevent: a seventh loop could add
+/// its own copy and silently diverge from the other six. `DecodePolicy` also
+/// owns per-step logprobs recording ([`DecodePolicy::record_logprob`]), which
+/// was already a single shared free function (`crate::sampling::record_logprob`)
+/// called identically by all six sites; wrapping it here keeps every piece of
+/// backend-neutral per-step policy under one owner.
+///
+/// Stop-string matching state is deliberately *not* folded into this struct:
+/// the streaming callers need [`StopStringMatcher`]'s incremental
+/// byte-holdback semantics (a partial match must never reach `on_token`),
+/// while the non-streaming path scans the fully accumulated string via
+/// `earliest_stop_match` / `earliest_stop_match_from`. Both were already
+/// unified at the type/free-function level before this PR (every streaming
+/// caller, CPU and Metal, shares the one `StopStringMatcher` type; every
+/// non-streaming caller shares the one `earliest_stop_match*` pair) — there
+/// is no per-loop duplication left to remove there, only two genuinely
+/// different consumption modes of the same shared components, mirroring the
+/// same "document, don't force" principle applied to backend-specific Metal
+/// logic elsewhere in this cluster.
+pub(crate) struct DecodePolicy {
+    reasoning_budget: Option<usize>,
+    enable_thinking: bool,
+    max_new_tokens: usize,
+    logprobs: Option<usize>,
+    think_close_id: Option<u32>,
+    thinking_closed: bool,
+    reasoning_end_len: Option<usize>,
+}
+
+impl DecodePolicy {
+    /// `think_close_id` is resolved by the caller (`tokenizer.special_token_id("</think>")`
+    /// when `gen_cfg.reasoning_budget.is_some()`, `None` otherwise) since each backend
+    /// reaches its tokenizer differently. `first_emitted_id` / `first_generated_len` seed
+    /// `thinking_closed` / `reasoning_end_len` from the token already sampled and pushed
+    /// before the decode loop starts (the prefill-derived first token), covering the
+    /// `reasoning_budget == 1` edge case exactly as the six duplicated call sites did.
+    pub(crate) fn new(
+        gen_cfg: &GenerateConfig,
+        think_close_id: Option<u32>,
+        first_emitted_id: u32,
+        first_generated_len: usize,
+    ) -> Self {
+        let thinking_closed = Some(first_emitted_id) == think_close_id;
+        let reasoning_end_len = if thinking_closed {
+            Some(first_generated_len)
+        } else {
+            None
+        };
+        Self {
+            reasoning_budget: gen_cfg.reasoning_budget,
+            enable_thinking: gen_cfg.enable_thinking,
+            max_new_tokens: gen_cfg.max_new_tokens,
+            logprobs: gen_cfg.logprobs,
+            think_close_id,
+            thinking_closed,
+            reasoning_end_len,
+        }
+    }
+
+    /// Total decode-loop iteration cap (`rb + max_new_tokens + 1` when budgeted,
+    /// `max_new_tokens` otherwise) — see [`decode_cap`].
+    pub(crate) fn cap(&self) -> usize {
+        decode_cap(self.reasoning_budget, self.max_new_tokens)
+    }
+
+    /// Overrides `sampled_id` with the forced `</think>` token when the reasoning
+    /// budget is exhausted and the block is still open; a no-op pass-through
+    /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
+    /// token, post-override, is what grammar must advance on).
+    pub(crate) fn apply_override(&self, generated_len: usize, sampled_id: u32) -> u32 {
+        force_close_think(
+            self.reasoning_budget,
+            self.enable_thinking,
+            self.thinking_closed,
+            generated_len,
+            self.think_close_id,
+        )
+        .unwrap_or(sampled_id)
+    }
+
+    /// Marks the thinking block closed when `next_id` (the actually-emitted,
+    /// post-override token) is the `</think>` token. Call after grammar-advance
+    /// succeeds, before the EOS/stop-token check — mirrors the original inline
+    /// ordering across all six sites.
+    pub(crate) fn note_emitted(&mut self, next_id: u32) {
+        if Some(next_id) == self.think_close_id {
+            self.thinking_closed = true;
+        }
+    }
+
+    /// Captures the answer-budget window start the first time the thinking block
+    /// closes, using the generated-token count *after* the token was pushed (so
+    /// `</think>` itself is the last reasoning token, not the first answer token).
+    /// A no-op once already captured or while the block is still open.
+    pub(crate) fn capture_reasoning_end(&mut self, generated_len_after_push: usize) {
+        if self.thinking_closed && self.reasoning_end_len.is_none() {
+            self.reasoning_end_len = Some(generated_len_after_push);
+        }
+    }
+
+    /// True once `max_new_tokens` answer tokens have followed the `</think>` close
+    /// point — the decode loop should break on this, in addition to its normal cap.
+    pub(crate) fn answer_budget_exhausted(&self, generated_len: usize) -> bool {
+        self.reasoning_end_len
+            .is_some_and(|end| generated_len.saturating_sub(end) >= self.max_new_tokens)
+    }
+
+    /// Thin, zero-behavior-change wrapper over `crate::sampling::record_logprob`,
+    /// so logprobs formatting is owned by the same struct as the other two
+    /// backend-neutral policy legs (ADR-080 C3 contract text).
+    pub(crate) fn record_logprob(
+        &self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        logits: &[f32],
+        token_id: u32,
+        temperature: f32,
+    ) {
+        record_logprob(token_logprobs, logits, token_id, temperature, self.logprobs);
     }
 }
 
@@ -1039,18 +1142,11 @@ fn decode_loop(
     kv_cache: &mut KvCache,
     scratch: &mut ForwardScratch,
     grammar_state: &mut Option<GrammarState>,
-    think_close_id: Option<u32>,
-    thinking_closed_seed: bool,
+    policy: &mut DecodePolicy,
     token_logprobs: &mut Vec<TokenLogprob>,
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
-    let mut thinking_closed = thinking_closed_seed;
-    let mut reasoning_end_len: Option<usize> = if thinking_closed {
-        Some(generated_ids.len())
-    } else {
-        None
-    };
-    let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+    let cap = policy.cap();
     for _ in 1..cap {
         let pos = kv_cache.seq_len;
         let Some(&last_token) = all_ids.last() else {
@@ -1081,14 +1177,7 @@ fn decode_loop(
 
         // Budget forcing: override the sampled token with </think> when the
         // reasoning budget is exhausted and the block is still open.
-        let next_id = force_close_think(
-            gen_cfg.reasoning_budget,
-            gen_cfg.enable_thinking,
-            thinking_closed,
-            generated_ids.len(),
-            think_close_id,
-        )
-        .unwrap_or(sampled_id);
+        let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
         // Grammar advance on the actually-emitted token (after any budget
         // override); a false return signals grammar completion.
@@ -1099,9 +1188,7 @@ fn decode_loop(
         }
 
         // Track when the thinking block closes (natural or forced).
-        if Some(next_id) == think_close_id {
-            thinking_closed = true;
-        }
+        policy.note_emitted(next_id);
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok((true, StopReason::Eos));
@@ -1109,22 +1196,17 @@ fn decode_loop(
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
-        record_logprob(
+        policy.record_logprob(
             token_logprobs,
             &scratch.logits[..cfg.vocab_size],
             next_id,
             gen_cfg.temperature,
-            gen_cfg.logprobs,
         );
         // Capture close-point after push so </think> is the last reasoning token.
-        if thinking_closed && reasoning_end_len.is_none() {
-            reasoning_end_len = Some(generated_ids.len());
-        }
+        policy.capture_reasoning_end(generated_ids.len());
 
         // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if let Some(end) = reasoning_end_len
-            && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-        {
+        if policy.answer_budget_exhausted(generated_ids.len()) {
             break;
         }
     }
@@ -1153,21 +1235,14 @@ fn decode_loop_with_stops(
     detok: &mut IncrementalDetokenizer,
     full: &mut String,
     grammar_state: &mut Option<GrammarState>,
-    think_close_id: Option<u32>,
-    thinking_closed_seed: bool,
+    policy: &mut DecodePolicy,
     token_logprobs: &mut Vec<TokenLogprob>,
     token_logprob_end_offsets: &mut Vec<usize>,
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
     let mut stop_reason = StopReason::Length;
-    let mut thinking_closed = thinking_closed_seed;
-    let mut reasoning_end_len: Option<usize> = if thinking_closed {
-        Some(generated_ids.len())
-    } else {
-        None
-    };
-    let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+    let cap = policy.cap();
     // Longest configured stop string, used to bound the per-token stop scan to
     // the suffix that could contain a new match (see `earliest_stop_match_from`).
     // `full` already reflects everything scanned before this function was
@@ -1209,14 +1284,7 @@ fn decode_loop_with_stops(
 
         // Budget forcing: override the sampled token with </think> when the
         // reasoning budget is exhausted and the block is still open.
-        let next_id = force_close_think(
-            gen_cfg.reasoning_budget,
-            gen_cfg.enable_thinking,
-            thinking_closed,
-            generated_ids.len(),
-            think_close_id,
-        )
-        .unwrap_or(sampled_id);
+        let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
         // Grammar advance on the actually-emitted token (after any budget
         // override); a false return signals grammar completion.
@@ -1229,9 +1297,7 @@ fn decode_loop_with_stops(
         }
 
         // Track when the thinking block closes (natural or forced).
-        if Some(next_id) == think_close_id {
-            thinking_closed = true;
-        }
+        policy.note_emitted(next_id);
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             stopped = true;
@@ -1241,17 +1307,14 @@ fn decode_loop_with_stops(
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
-        record_logprob(
+        policy.record_logprob(
             token_logprobs,
             &scratch.logits[..cfg.vocab_size],
             next_id,
             gen_cfg.temperature,
-            gen_cfg.logprobs,
         );
         // Capture close-point after push so </think> is the last reasoning token.
-        if thinking_closed && reasoning_end_len.is_none() {
-            reasoning_end_len = Some(generated_ids.len());
-        }
+        policy.capture_reasoning_end(generated_ids.len());
 
         let prev_len = full.len();
         let delta = detok.push(&model.tokenizer, next_id);
@@ -1285,9 +1348,7 @@ fn decode_loop_with_stops(
         }
 
         // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if let Some(end) = reasoning_end_len
-            && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-        {
+        if policy.answer_budget_exhausted(generated_ids.len()) {
             break;
         }
     }

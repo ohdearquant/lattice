@@ -732,9 +732,7 @@ mod inner {
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
-    use crate::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
-    };
+    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
     use crate::sampling::record_logprob;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
@@ -12922,7 +12920,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -13028,20 +13025,11 @@ mod inner {
                 });
             }
 
-            // Track whether the thinking block has been closed after prefill sampling.
-            // Enables budget=1 to behave sanely (prefill token counts against budget).
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             // Incremental detokenization: stream only complete-UTF-8 deltas. A
             // byte-level BPE codepoint (CJK/emoji) can span several tokens, so
             // per-token lossy decode would emit U+FFFD mojibake the caller cannot
             // retract. Mirrors the non-Metal path (model::qwen35::generation).
             let mut detok = IncrementalDetokenizer::new();
-            // Tracks the generated_ids length at the moment </think> was emitted;
-            // used by the answer-budget break below.
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
             // #585: record the prefill token's logprob (no-op unless requested).
@@ -13054,10 +13042,17 @@ mod inner {
                 gen_cfg.temperature,
                 gen_cfg.logprobs,
             );
-            // Capture close-point after the prefill push (covers budget=1 edge case).
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
+            // Backend-neutral reasoning-budget + logprobs policy (ADR-080 C3):
+            // constructed here (post-prefill-push) so its `thinking_closed` /
+            // `reasoning_end_len` seed covers the budget=1 edge case exactly as
+            // the pre-extraction inline bookkeeping did. Shared with the CPU
+            // `model::qwen35::generation` loops -- see `DecodePolicy`'s doc comment.
+            let mut policy = crate::model::qwen35::DecodePolicy::new(
+                gen_cfg,
+                think_close_id,
+                next_id,
+                generated_ids.len(),
+            );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
@@ -13137,7 +13132,7 @@ mod inner {
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
@@ -13186,14 +13181,7 @@ mod inner {
 
                 // Budget forcing: override sampled token with </think> when the
                 // reasoning budget is exhausted and the block is still open.
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
+                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
                 // Advance grammar state after sampling (or forced token).
                 // Interaction note: if reasoning_budget AND grammar are both active and the
@@ -13208,9 +13196,7 @@ mod inner {
                 }
 
                 // Track when the thinking block closes (natural or forced).
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
+                policy.note_emitted(next_id);
 
                 if is_stop(next_id) {
                     stopped = true;
@@ -13223,18 +13209,15 @@ mod inner {
                 // #585: record this step's logprob (no-op unless requested). next_id
                 // here is the final, post-force_close_think token — step_logits is
                 // the distribution it was actually sampled/forced from.
-                record_logprob(
+                policy.record_logprob(
                     &mut token_logprobs,
                     &step_logits,
                     next_id,
                     gen_cfg.temperature,
-                    gen_cfg.logprobs,
                 );
                 // Capture the close-point after the push so </think> is the
                 // last reasoning token (not the first answer token).
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
+                policy.capture_reasoning_end(generated_ids.len());
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
@@ -13272,9 +13255,7 @@ mod inner {
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if policy.answer_budget_exhausted(generated_ids.len()) {
                     break;
                 }
             }
@@ -15444,7 +15425,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
@@ -15569,17 +15549,21 @@ mod inner {
                 });
             }
 
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             let mut detok = IncrementalDetokenizer::new();
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
+            // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
+            // `generate_streaming` above and the CPU `model::qwen35::generation`
+            // loops. This path has never recorded per-token logprobs (see the
+            // `token_logprobs: vec![]` returns throughout this function) --
+            // `policy.record_logprob` is deliberately not called below, matching
+            // that pre-existing (out-of-scope-for-C3) behavior exactly.
+            let mut policy = crate::model::qwen35::DecodePolicy::new(
+                gen_cfg,
+                think_close_id,
+                next_id,
+                generated_ids.len(),
+            );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
@@ -15676,7 +15660,7 @@ mod inner {
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
 
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
@@ -15725,14 +15709,7 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
+                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
                     && !engine.advance(gs, next_id)
@@ -15741,9 +15718,7 @@ mod inner {
                     break;
                 }
 
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
+                policy.note_emitted(next_id);
 
                 if is_stop(next_id) {
                     stopped = true;
@@ -15753,9 +15728,7 @@ mod inner {
 
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
+                policy.capture_reasoning_end(generated_ids.len());
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
@@ -15793,9 +15766,7 @@ mod inner {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if policy.answer_budget_exhausted(generated_ids.len()) {
                     break;
                 }
             }
