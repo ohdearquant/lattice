@@ -60,8 +60,17 @@ Each historical class is now a named invariant with a required fail-closed test 
 that implements the operation. New sites implementing these operations MUST ship the matching
 contract test (this is enforceable in review by grepping the catalog):
 
-1. **Softmax totality**: every softmax row normalizes to Σ=1.0±ε or returns `InvalidInput` —
-   never silent un-normalized output (all-NaN / all-±inf rows are the adversarial cases).
+1. **Softmax totality** (scope amended 2026-07-10, see below): at a **public boundary** — a
+   softmax whose row feeds a sampler or is otherwise host-visible (the #611 sampling/serve
+   class) — every row normalizes to Σ=1.0±ε or returns `InvalidInput`, never silent
+   un-normalized output. For **internal attention softmax** (a softmax row that feeds a matmul
+   inside the forward pass, never observed directly by a caller), the canonical fail-closed
+   contract is ADR-080 C1's **zeroed row**: a non-positive or non-finite denominator (NaN, +inf,
+   or all-`-inf` row) zeroes the row by direct assignment, and the forward call returns `Ok`. A
+   zero row multiplies into zero attention output for that position — bounded and deterministic
+   — and an all-masked row is a legitimate runtime state (every key excluded by causal/padding
+   masking), not an input error to reject. See the amendment below for the full rationale and
+   the tradeoff this scoping accepts.
 2. **Mask exactness**: masked attention positions get `-inf` (post-softmax probability exactly
    0.0), never a finite sentinel.
 3. **Quantizer scale sanity**: a scale computed from any non-finite weight fails the load;
@@ -85,6 +94,57 @@ contract test (this is enforceable in review by grepping the catalog):
    self-consistency. (Full closure blocked on an asymmetric checkpoint — #262.)
 10. **Fail-closed context bounds**: forward paths return errors, never assert-panic, when
     `prompt_len > max_context()`.
+
+#### Amendment (2026-07-10): internal attention-softmax fail-closed scope (PR #794 review)
+
+PR #794's codex round-1 review read invariant #1 literally against the live Metal
+`fused_attention` finalize (`forward/shaders/flash_attention.metal`) and flagged a contract
+conflict: the kernel zeroes an invalid row and the forward call returns `Ok`, while invariant #1
+as originally worded says a softmax row "normalizes to Σ=1.0±ε or returns `InvalidInput`." Both
+readings were independently correct against their own evidence — the review against this ADR's
+literal text, the PR against ADR-080 C1's explicit zeroed-row contract (`docs/adr/ADR-080-consolidation-duplicated-contracts.md`,
+section C1) and the two sites ADR-080 names as authoritative (`attention/gqa.rs`,
+`attention/decode.rs`). This amendment resolves the conflict by scoping invariant #1 rather than
+picking a winner by fiat:
+
+- **Public-boundary softmax** (a row a caller can observe or that feeds a sampler directly — the
+  #611 grammar/sampling class) keeps the original invariant #1 wording verbatim: normalize or
+  return `InvalidInput`. A malformed row reaching a sampler is an input-validation failure the
+  caller needs to see.
+- **Internal attention softmax** (a row that feeds a matmul inside the forward pass and is never
+  itself host-visible) follows ADR-080 C1's zeroed-row contract instead: zero the row by direct
+  assignment on a non-positive or non-finite denominator, and let the forward call return `Ok`.
+  This was already the actual behavior of every canonical site ADR-080 C1 identifies (CPU GQA,
+  CPU decode, the Metal `fused_attention` finalize once #789 is fixed) before this amendment;
+  the amendment brings the ADR-066 text into agreement with the contract ADR-080 already
+  establishes, rather than changing behavior.
+
+**Why zero-row is the right internal contract, not a weaker one.** An all-masked or
+all-invalid attention row is a legitimate runtime state — every key excluded by causal or
+padding masking, or (adversarially) a NaN/inf score reaching the row — and the finalize's job is
+bounded, deterministic arithmetic: a zero row contributes zero to that position's output via the
+downstream matmul, exactly like a fully-masked row should. Returning `InvalidInput` from inside
+a Metal kernel has no cheap host-visible channel (the kernel has no per-forward status buffer
+today), and even a future typed error would currently be swallowed by `QwenModel::forward`'s
+silent CPU fallback (`model/qwen.rs`) rather than surfaced — building that plumbing to reject a
+runtime state that is not itself an input-validation error is the wrong shape for this layer.
+
+**The tradeoff this scoping accepts, stated plainly:** zeroing swallows numerical *defects*, not
+just legitimate masked rows. A NaN produced by an upstream bug (a corrupted weight, a bad
+kernel dispatch, a poisoned activation) that reaches this softmax becomes a silent zero row
+instead of a visible failure — the forward pass keeps running and returns `Ok` with a locally
+zeroed attention contribution. This ADR does not read as "NaN in internal attention is fine": it
+is not fine, and this is exactly the defect class ADR-066's own D1 table assigns to the
+differential/validation gate layer (D1's L2, `parity-gate`) and L3 quality gates, not to this L1
+zero-row contract. The zero-row finalize is the **fail-closed arithmetic guarantee** (bounded,
+deterministic, never propagates NaN/inf downstream); catching *why* a row went NaN in the first
+place is a detection problem those higher layers own, and PR #794's own regression tests
+(`fused_attention_fails_closed_on_nan_q_lane`, `fused_attention_fails_closed_on_inf_q_lane`)
+verify the arithmetic guarantee, not defect detection.
+
+This amendment does not reopen ADR-080 C1 (unchanged) and does not require the typed-error
+plumbing the round-1 review requested for internal attention; it resolves the review's blocker
+by making explicit what was previously only implicit in ADR-080's separately-landed text.
 
 ### D3. Signal-design rules (how gates report, not just what they check)
 

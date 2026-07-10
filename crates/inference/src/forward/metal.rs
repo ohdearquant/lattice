@@ -825,6 +825,28 @@ mod inner {
         use super::*;
         use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
 
+        /// ADR-066 D3.1 / ADR-080 C1 (codex round-1 major, PR #794): a capability-gated
+        /// Metal test must report a distinct skip or fail closed when
+        /// `LATTICE_METAL_TEST_ENFORCE=1` is set, never silently early-return `ok` —
+        /// otherwise a runner that loses its Metal device (or never had one) greens every
+        /// gate that depends on this module without ever executing the Metal path.
+        /// Mirrors the `forward::metal_qwen35` enforce convention already used by the Q4
+        /// and grammar fail-closed CI steps.
+        fn metal_test_device(context: &str) -> Option<Device> {
+            match Device::system_default() {
+                Some(device) => Some(device),
+                None => {
+                    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present ({context})"
+                    );
+                    eprintln!("[METAL_TEST_SKIP] context={context} reason=no_metal_device");
+                    None
+                }
+            }
+        }
+
         /// Guards the `flash_attention.metal` extraction: the file loaded via
         /// `include_str!` and run through `msl_source_for`'s token substitution must
         /// still produce a complete, compilable shader library. Mutation-sensitive —
@@ -839,8 +861,9 @@ mod inner {
                 "unsubstituted placeholder token remains in assembled MSL"
             );
             // Compile the assembled shader and confirm every pipeline function resolves.
-            // Skips silently if the host exposes no Metal device (e.g. non-GPU CI).
-            let Some(device) = Device::system_default() else {
+            // Fails closed under LATTICE_METAL_TEST_ENFORCE=1 if no Metal device is present
+            // (see `metal_test_device`); otherwise reports a distinct skip.
+            let Some(device) = metal_test_device("msl_template_assembles_and_compiles") else {
                 return;
             };
             let opts = CompileOptions::new();
@@ -874,22 +897,24 @@ mod inner {
             }
         }
 
-        /// ADR-080 C1 (#789) regression: the fused_attention finalize must fail
-        /// closed by ASSIGNMENT when the online-softmax denominator is
-        /// non-positive or non-finite (e.g. a NaN score from a corrupted Q
-        /// lane), not by multiplying the (possibly already-NaN) numerator
-        /// through a zeroed reciprocal -- `NaN * 0.0f == NaN` under IEEE-754,
-        /// so a `* inv_l` finalize cannot recover a poisoned row.
+        /// ADR-080 C1 (#789) regression fixture: corrupts a single entry of
+        /// `q_proj_weight` with `corrupt_value` so one attention head's Q vector
+        /// carries that value at every query position (K/V/embeddings/residual stay
+        /// completely clean), then runs the live `MetalForwardPass::forward` boundary
+        /// and returns its output. Shared by the NaN and +inf invalid-row regressions
+        /// below (ADR-066 D2 invariant #1's non-finite-row classes) so both exercise
+        /// the identical construction and the identical finalize fix.
         ///
-        /// Mutation-sensitive: reverting the fix in flash_attention.metal back
-        /// to `O4[out_base4] = o_frag * inv_l;` makes this test fail (160/160
-        /// NaN elements instead of 0), confirmed at PR time.
-        #[test]
-        fn fused_attention_fails_closed_on_nan_q_lane() {
+        /// Returns `None` only when there is no Metal device and
+        /// `LATTICE_METAL_TEST_ENFORCE` is unset (see `metal_test_device`); with the
+        /// enforce var set, a missing device or failed pass construction panics
+        /// instead of skipping.
+        fn run_fused_attention_with_corrupted_q_lane(
+            context: &str,
+            corrupt_value: f32,
+        ) -> Option<Vec<f32>> {
             let _lock = gpu_test_lock();
-            let Some(_device_probe) = Device::system_default() else {
-                return;
-            };
+            let _device_probe = metal_test_device(context)?;
 
             let config = QwenConfig {
                 vocab_size: 8,
@@ -922,7 +947,7 @@ mod inner {
             let corrupt_in_idx = 5usize;
 
             let mut q_proj_flat = test_random_vec(&mut rng, q_dim * hidden);
-            q_proj_flat[corrupt_out_idx * hidden + corrupt_in_idx] = f32::NAN;
+            q_proj_flat[corrupt_out_idx * hidden + corrupt_in_idx] = corrupt_value;
             let k_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
             let v_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
             let o_proj_flat = test_random_vec(&mut rng, hidden * q_dim);
@@ -1014,13 +1039,50 @@ mod inner {
                     .copy_from_slice(&embed_tokens_flat[tok * hidden..(tok + 1) * hidden]);
             }
 
-            let Ok(mut pass) = MetalForwardPass::new(&config, &weights, 8) else {
-                return; // no Metal device on this host
+            let pass = MetalForwardPass::new(&config, &weights, 8);
+            let mut pass = match pass {
+                Ok(pass) => pass,
+                Err(err) => {
+                    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but MetalForwardPass::new failed \
+                         ({context}): {err}"
+                    );
+                    eprintln!(
+                        "[METAL_TEST_SKIP] context={context} reason=forward_pass_construct_failed \
+                         error={err}"
+                    );
+                    return None;
+                }
             };
 
             let metal_out = pass
                 .forward(&hidden_input, seq_len)
                 .expect("Metal forward should not itself error");
+
+            Some(metal_out)
+        }
+
+        /// ADR-080 C1 (#789) regression, NaN class: the fused_attention finalize must
+        /// fail closed by ASSIGNMENT when the online-softmax denominator is
+        /// non-positive or non-finite (here: a NaN score from a corrupted Q lane), not
+        /// by multiplying the (possibly already-NaN) numerator through a zeroed
+        /// reciprocal -- `NaN * 0.0f == NaN` under IEEE-754, so a `* inv_l` finalize
+        /// cannot recover a poisoned row.
+        ///
+        /// Mutation-sensitive: reverting the fix in flash_attention.metal back to
+        /// `O4[out_base4] = o_frag * inv_l;` makes this test fail (160/160 NaN
+        /// elements instead of 0), confirmed at PR time (round 1) and reconfirmed
+        /// after the fix-round refactor (round 2).
+        #[test]
+        fn fused_attention_fails_closed_on_nan_q_lane() {
+            let Some(metal_out) = run_fused_attention_with_corrupted_q_lane(
+                "fused_attention_fails_closed_on_nan_q_lane",
+                f32::NAN,
+            ) else {
+                return;
+            };
 
             let nan_count = metal_out.iter().filter(|v| v.is_nan()).count();
             assert_eq!(
@@ -1032,6 +1094,56 @@ mod inner {
                 metal_out.len()
             );
         }
+
+        /// ADR-080 C1 / ADR-066 D2 invariant #1, +inf class: the same corrupted-Q-lane
+        /// construction as the NaN test above, but with the poisoned weight entry set
+        /// to `f32::INFINITY` instead of `f32::NAN`. Because only one weight entry is
+        /// corrupted and the rest of the accumulation over `hidden` dims is finite, the
+        /// resulting Q component for that head goes to +inf or -inf depending on the
+        /// sign of the corresponding hidden-input activation at each query position --
+        /// both are covered by the `!is_finite()` check below. This reaches the
+        /// finalize's non-finite-denominator branch through a distinct arithmetic path
+        /// from the NaN test (an infinite accumulator/denominator rather than a NaN
+        /// one), so it is not redundant with it.
+        ///
+        /// Mutation-sensitive by the same finalize revert as the NaN test above (same
+        /// shared shader guard).
+        #[test]
+        fn fused_attention_fails_closed_on_inf_q_lane() {
+            let Some(metal_out) = run_fused_attention_with_corrupted_q_lane(
+                "fused_attention_fails_closed_on_inf_q_lane",
+                f32::INFINITY,
+            ) else {
+                return;
+            };
+
+            let non_finite_count = metal_out.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(
+                non_finite_count,
+                0,
+                "fused_attention must fail closed (zero output) on an inf-poisoned \
+                 Q lane instead of propagating inf/NaN through the finalize multiply \
+                 (ADR-080 C1, #789; ADR-066 D2 invariant #1); got {non_finite_count}/{} \
+                 non-finite elements",
+                metal_out.len()
+            );
+        }
+
+        // ADR-066 D2 invariant #1, all-(-inf) class: NOT covered by a direct
+        // kernel-dispatch fixture here, by design, not oversight (codex round-1
+        // review, PR #794). `fused_attention` takes no external mask buffer -- the
+        // only way a score row goes to all -inf is every Q.K dot product in that row
+        // underflowing to -inf, and the live kernel always includes the causal
+        // self-key (Q_i . K_i), which stays finite for any finite Q/K pair. Forcing a
+        // genuine all-(-inf) row would require injecting -inf directly into the score
+        // buffer, i.e. bypassing the live entry point this suite is scoped to (the
+        // corrupted-weight construction above always produces a *finite* Q/K pair
+        // whose dot product can go to NaN or +-inf, never a row of literal -inf by
+        // construction). The finalize guard's arithmetic is the same for this class as
+        // for the +inf class above (`l_i` non-positive or non-finite triggers the same
+        // zero-assignment branch), so the +inf regression already exercises the shared
+        // fail-closed code path; there is no code path reachable from a live forward
+        // call that this suite could exercise differently for all-(-inf) specifically.
 
         struct TestLcg(u64);
 
