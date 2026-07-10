@@ -245,13 +245,14 @@ jobs:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
       # ADR-080 C1 / #789: the `forward::metal::` module's assembled-MSL check and the
-      # NaN/+inf fused_attention fail-closed regressions (codex round-1 major on PR
-      # #794) silently early-returned when no Metal device was present and were never
-      # actually run by any required workflow — the `q4` filter above does not match
-      # this module. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or failed
-      # pass construction a hard test failure instead of a skip, matching the Q4 and
+      # The NaN/+inf fused_attention fail-closed regressions (#789) silently
+      # early-returned when no Metal device was present and were never actually run
+      # by any required workflow — the `q4` filter above does not match this module.
+      # LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or failed pass
+      # construction a hard test failure instead of a skip, matching the Q4 and
       # grammar steps' convention; the exact-count grep guards against a silently
-      # zero-matching filter the same way those steps do.
+      # zero-matching filter the same way those steps do. The gating command writes
+      # its log directly (no pipe) so its exit status gates on its own.
       - name: inference — metal-gpu fused_attention fail-closed gate (macOS only)
         if: runner.os == 'macOS'
         env:
@@ -259,7 +260,11 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-fused-attention-failclosed-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib forward::metal:: -- --nocapture 2>&1 | tee "$log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib forward::metal:: -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a

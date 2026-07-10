@@ -97,7 +97,7 @@ contract test (this is enforceable in review by grepping the catalog):
 
 #### Amendment (2026-07-10): internal attention-softmax fail-closed scope (PR #794 review)
 
-PR #794's codex round-1 review read invariant #1 literally against the live Metal
+PR #794's review read invariant #1 literally against the live Metal
 `fused_attention` finalize (`forward/shaders/flash_attention.metal`) and flagged a contract
 conflict: the kernel zeroes an invalid row and the forward call returns `Ok`, while invariant #1
 as originally worded says a softmax row "normalizes to Σ=1.0±ε or returns `InvalidInput`." Both

@@ -825,7 +825,7 @@ mod inner {
         use super::*;
         use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
 
-        /// ADR-066 D3.1 / ADR-080 C1 (codex round-1 major, PR #794): a capability-gated
+        /// ADR-066 D3.1 / ADR-080 C1 (PR #794): a capability-gated
         /// Metal test must report a distinct skip or fail closed when
         /// `LATTICE_METAL_TEST_ENFORCE=1` is set, never silently early-return `ok` —
         /// otherwise a runner that loses its Metal device (or never had one) greens every
@@ -1130,7 +1130,7 @@ mod inner {
         }
 
         // ADR-066 D2 invariant #1, all-(-inf) class: NOT covered by a direct
-        // kernel-dispatch fixture here, by design, not oversight (codex round-1
+        // kernel-dispatch fixture here, by design, not oversight (PR #794 round-1
         // review, PR #794). `fused_attention` takes no external mask buffer -- the
         // only way a score row goes to all -inf is every Q.K dot product in that row
         // underflowing to -inf, and the live kernel always includes the causal
