@@ -30,6 +30,30 @@ use tokio::sync::watch;
 /// two binaries still wire it into axum differently.
 pub const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 
+/// Shared streaming context-overflow parity fixture (ADR-080 C2 round 3,
+/// codex round-3 medium finding #2): both binaries' real-router
+/// context-overflow tests build their request from these SAME constants and
+/// configure their real (tiny, test-only CPU) model's effective context
+/// window to this SAME value, so "same input, same effective limit" is
+/// enforced by shared constants rather than by two independently-typed
+/// literals that could silently drift apart. `lattice.rs`'s tiny test model
+/// (`lattice_inference::model::qwen35::test_support::tiny_zero_model`) has a
+/// fixed 1024-token context window; `lattice_serve.rs`'s real-worker test
+/// configures its `AppState.model_max_context` to the same figure.
+pub const OVERFLOW_PARITY_CONTEXT_WINDOW: usize = 1024;
+/// `max_tokens` for the shared overflow-parity request: equal to the whole
+/// context window, so any non-empty prompt pushes `prompt_len + max_tokens`
+/// past it once the worker's full-window check (not just `build_cfg`'s
+/// in-isolation clamp) runs.
+pub const OVERFLOW_PARITY_MAX_TOKENS: usize = OVERFLOW_PARITY_CONTEXT_WINDOW;
+/// Request-level `max_tokens` cap, kept well above
+/// [`OVERFLOW_PARITY_MAX_TOKENS`] so a cap-rejection (`max_tokens_exceeds_limit`
+/// / equivalent) never fires first and masks the context-window check this
+/// fixture exists to isolate.
+pub const OVERFLOW_PARITY_MAX_TOKENS_CAP: usize = 4096;
+/// The exact request body both binaries' overflow-parity tests send.
+pub const OVERFLOW_PARITY_REQUEST_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"stream":true}"#;
+
 /// Structured HTTP error shared by both binaries, serializing to the OpenAI
 /// error envelope: `{"error": {"message", "type", "code", "param"}}`.
 #[derive(Debug)]
