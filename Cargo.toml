@@ -76,6 +76,12 @@ axum = "0.8"
 # Testing
 proptest = "1.0"
 tempfile = "3.10"
+# Partial-body polling (`BodyExt::frame`) and `tower::Service::oneshot` for
+# axum `Router`-level HTTP tests (ADR-080 C2 round 2). Both are already
+# transitive axum 0.8 dependencies; declared here so direct dev-dependents
+# pin one workspace-wide version instead of each re-pinning locally.
+http-body-util = "0.1"
+tower = "0.5"
 
 [workspace.lints.clippy]
 # Correctness
