@@ -11,6 +11,7 @@
 // This is a zero-dependency approach: Accelerate.framework is a system
 // framework available on all macOS installations.
 
+use super::gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_gemm_strided_shape};
 #[cfg(not(target_os = "macos"))]
 use super::matmul::{matmul_bt, matmul_into};
 
@@ -62,13 +63,16 @@ pub(super) fn accelerate_matmul_bt(
     n: usize,
     k: usize,
 ) {
-    assert!(a.len() >= m * k, "A too small: {} < {}", a.len(), m * k);
-    assert!(b.len() >= n * k, "B too small: {} < {}", b.len(), n * k);
-    assert!(
-        output.len() >= m * n,
-        "C too small: {} < {}",
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4) —
+    // validated BEFORE the unsafe Accelerate FFI call below.
+    validate_gemm_bt(
+        a.len(),
+        b.len(),
         output.len(),
-        m * n
+        m,
+        k,
+        n,
+        "accelerate_matmul_bt",
     );
 
     // Note: cblas_sgemv was benchmarked for M=1 and was SLOWER than sgemm
@@ -117,14 +121,9 @@ pub(super) fn accelerate_matmul(
     n: usize,
     k: usize,
 ) {
-    assert!(a.len() >= m * k, "A too small: {} < {}", a.len(), m * k);
-    assert!(b.len() >= k * n, "B too small: {} < {}", b.len(), k * n);
-    assert!(
-        output.len() >= m * n,
-        "C too small: {} < {}",
-        output.len(),
-        m * n
-    );
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4) —
+    // validated BEFORE the unsafe Accelerate FFI call below.
+    validate_gemm_nn(a.len(), b.len(), output.len(), m, k, n, "accelerate_matmul");
 
     // SAFETY: Same safety argument as accelerate_matmul_bt. Pointers are valid
     // for the specified dimensions, verified by assertions above.
@@ -183,6 +182,12 @@ pub unsafe fn sgemm_bt_strided(
     n: usize,
     k: usize,
 ) {
+    // Release-active, overflow-first shape/stride check (ADR-080 C4) — the caller contract
+    // (raw pointers) means we cannot verify buffer length, but shape-product overflow and an
+    // undersized leading dimension are both checkable and are exactly the class of malformed
+    // input that would otherwise cross into the unsafe FFI call below.
+    validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, true, "sgemm_bt_strided");
+
     // SAFETY: Caller guarantees that a[row * lda + col] is valid for
     // row in 0..m, col in 0..k; similarly for b and c. The Accelerate
     // framework reads/writes only within these bounds.
@@ -230,6 +235,9 @@ pub unsafe fn sgemm_nn_strided(
     n: usize,
     k: usize,
 ) {
+    // Release-active, overflow-first shape/stride check (ADR-080 C4) — see sgemm_bt_strided.
+    validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, false, "sgemm_nn_strided");
+
     // SAFETY: Same argument as sgemm_bt_strided. Caller guarantees all
     // pointer+stride combinations are within valid allocations.
     unsafe {
@@ -270,11 +278,14 @@ pub fn sgemm_nn_ab(
     alpha: f32,
     beta: f32,
 ) {
-    debug_assert!(a.len() >= m * k, "A too small: {} < {}", a.len(), m * k);
-    debug_assert!(b.len() >= k * n, "B too small: {} < {}", b.len(), k * n);
-    debug_assert!(c.len() >= m * n, "C too small: {} < {}", c.len(), m * n);
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4,
+    // held finding: this was previously `debug_assert!`-gated, so a short slice on a
+    // release build's non-macOS scalar copy merely tripped Rust's own bounds checks while
+    // this cfg-gated Accelerate FFI copy crossed into unsafe code with undersized
+    // pointers). Validated BEFORE the unsafe FFI call below.
+    validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
-    // SAFETY: Pointers valid for specified dimensions per debug_asserts above.
+    // SAFETY: Pointers valid for specified dimensions per the release-active check above.
     unsafe {
         accelerate::cblas_sgemm(
             accelerate::CBLAS_ROW_MAJOR,
@@ -309,9 +320,10 @@ pub fn sgemm_nn_ab(
     alpha: f32,
     beta: f32,
 ) {
-    debug_assert!(a.len() >= m * k);
-    debug_assert!(b.len() >= k * n);
-    debug_assert!(c.len() >= m * n);
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4) —
+    // matches the macOS `sgemm_nn_ab` variant so both platform copies share the same
+    // release-active guarantee instead of only the FFI copy being upgraded.
+    validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
     for i in 0..m {
         for j in 0..n {
@@ -343,6 +355,11 @@ pub unsafe fn sgemm_bt_strided(
     n: usize,
     k: usize,
 ) {
+    // Release-active, overflow-first shape/stride check (ADR-080 C4) — validated before any
+    // of the unsafe strided reads/writes below. Previously this fallback had NO validation
+    // at all (unlike the macOS FFI copy of this function).
+    validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, true, "sgemm_bt_strided");
+
     // Copy strided A into contiguous buffer.
     let mut a_contig = vec![0.0f32; m * k];
     for row in 0..m {
@@ -385,6 +402,10 @@ pub unsafe fn sgemm_nn_strided(
     n: usize,
     k: usize,
 ) {
+    // Release-active, overflow-first shape/stride check (ADR-080 C4) — validated before any
+    // of the unsafe strided reads/writes below.
+    validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, false, "sgemm_nn_strided");
+
     let mut a_contig = vec![0.0f32; m * k];
     for row in 0..m {
         // SAFETY: Caller guarantees a[row * lda..row * lda + k] is readable.
@@ -403,5 +424,108 @@ pub unsafe fn sgemm_nn_strided(
         // SAFETY: Caller guarantees c[row * ldc..row * ldc + n] is writable.
         let dst = unsafe { std::slice::from_raw_parts_mut(c.add(row * ldc), n) };
         dst.copy_from_slice(&c_contig[row * n..(row + 1) * n]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- sgemm_nn_ab: release-active argument validation (ADR-080 C4 held finding) ---
+
+    #[test]
+    #[should_panic(expected = "a too short for m*k")]
+    fn sgemm_nn_ab_rejects_short_a() {
+        let a = [0.0f32; 1]; // needs m*k = 2
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 1];
+        sgemm_nn_ab(&a, &b, &mut c, 1, 1, 2, 1.0, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for k*n")]
+    fn sgemm_nn_ab_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs k*n = 2
+        let mut c = [0.0f32; 1];
+        sgemm_nn_ab(&a, &b, &mut c, 1, 2, 1, 1.0, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape overflow: m*k")]
+    fn sgemm_nn_ab_rejects_overflow() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 2];
+        sgemm_nn_ab(&a, &b, &mut c, usize::MAX, 2, 2, 1.0, 0.0);
+    }
+
+    #[test]
+    fn sgemm_nn_ab_accepts_oversized_buffers_and_computes_correctly() {
+        // m=1, k=2, n=2: C = alpha * A@B + beta*C. A=[1,2], B=[[1,0],[0,1]] (row-major k x n).
+        let a = [1.0f32, 2.0, 99.0]; // oversized by 1
+        let b = [1.0f32, 0.0, 0.0, 1.0, 99.0]; // oversized by 1
+        let mut c = [0.0f32, 0.0, 99.0]; // oversized by 1
+        sgemm_nn_ab(&a, &b, &mut c, 1, 2, 2, 1.0, 0.0);
+        assert!((c[0] - 1.0).abs() < 1e-6);
+        assert!((c[1] - 2.0).abs() < 1e-6);
+    }
+
+    // --- accelerate_matmul_bt / accelerate_matmul: overflow-first + oversized-allowed ---
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn accelerate_matmul_bt_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs n*k = 2
+        let mut c = [0.0f32; 1];
+        accelerate_matmul_bt(&a, &b, &mut c, 1, 1, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "shape overflow: n*k")]
+    fn accelerate_matmul_bt_rejects_overflow() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 2];
+        accelerate_matmul_bt(&a, &b, &mut c, 2, usize::MAX, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "b too short for k*n")]
+    fn accelerate_matmul_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs k*n = 2
+        let mut c = [0.0f32; 1];
+        accelerate_matmul(&a, &b, &mut c, 1, 1, 2);
+    }
+
+    // --- strided GEMM wrappers: shape/stride check before pointer dereference ---
+
+    #[test]
+    #[should_panic(expected = "ldb too small for row extent n")]
+    fn sgemm_nn_strided_rejects_short_ldb() {
+        let a = [0.0f32; 4];
+        let b = [0.0f32; 4];
+        let mut c = [0.0f32; 4];
+        // SAFETY: never reached — the validator panics before any pointer is dereferenced.
+        unsafe {
+            sgemm_nn_strided(a.as_ptr(), 2, b.as_ptr(), 1, c.as_mut_ptr(), 2, 1, 2, 2);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ldb too small for row extent k")]
+    fn sgemm_bt_strided_rejects_short_ldb() {
+        let a = [0.0f32; 4];
+        let b = [0.0f32; 4];
+        let mut c = [0.0f32; 4];
+        // SAFETY: never reached — the validator panics before any pointer is dereferenced.
+        unsafe {
+            sgemm_bt_strided(a.as_ptr(), 2, b.as_ptr(), 1, c.as_mut_ptr(), 2, 1, 2, 2);
+        }
     }
 }
