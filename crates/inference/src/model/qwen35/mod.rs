@@ -34,6 +34,13 @@ pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 #[cfg(test)]
 mod tests;
 
+/// Test-only tiny zero-weight model construction (ADR-080 C2 round 2, codex
+/// finding #2), gated behind the `test-utils` Cargo feature so it never
+/// ships in a normal build -- see the module doc comment for why this can't
+/// just be `#[cfg(test)]` like the library's own internal test fixtures.
+#[cfg(feature = "test-utils")]
+pub mod test_support;
+
 pub use model::Qwen35Model;
 pub use weights::ModelWeights;
 
