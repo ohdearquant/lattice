@@ -3,7 +3,7 @@
 //! Supports temperature scaling, top-k filtering, top-p (nucleus) sampling,
 //! and repetition penalty.
 
-use crate::model::qwen35_config::{GenerateConfig, TokenLogprob, TopLogprob};
+use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
 
 /// Greedy argmax over a dense `f32` logit slice, with **first-wins** tie-break
 /// (ADR-080 C3, #783; held finding from the ADR-080 duplication audit).
@@ -750,7 +750,17 @@ const LOGPROB_NEG_SENTINEL: f32 = -1.0e9;
 /// Falls back to [`LOGPROB_NEG_SENTINEL`] wherever a value would otherwise be
 /// non-finite (e.g. every logit non-finite) or `token_id` is outside the
 /// vocabulary covered by `logits`.
-fn compute_step_logprobs(
+///
+/// `pub(crate)` (codex round-3 medium #2, PR #787 / Leo's ruling): this is
+/// the pure-computation half of what `record_logprob` used to expose as one
+/// combined `pub(crate)` function. `DecodePolicy::record_logprob`
+/// (`model::qwen35::generation`) is the only place that pushes the result
+/// into a `token_logprobs: &mut Vec<TokenLogprob>` -- a decode call site can
+/// read a logprob distribution for its own purposes, but it can no longer
+/// independently append to a `token_logprobs` accumulator without going
+/// through `DecodePolicy`, since no freestanding "record" function exists to
+/// call anymore.
+pub(crate) fn compute_step_logprobs(
     logits: &[f32],
     token_id: u32,
     temperature: f32,
@@ -832,31 +842,6 @@ fn compute_step_logprobs(
     };
 
     (token_logprob, top)
-}
-
-/// Appends one decode step's logprob data to `token_logprobs` when requested.
-///
-/// `logprobs_requested` is the caller's `top_logprobs` count (`Some(0)` when
-/// `logprobs` was requested without a `top_logprobs` count); `None` disables
-/// capture entirely and this is a no-op, so callers can invoke it
-/// unconditionally on every decode step -- the cost of the softmax pass over
-/// the full vocabulary is paid only when logprobs were actually requested.
-pub(crate) fn record_logprob(
-    token_logprobs: &mut Vec<TokenLogprob>,
-    logits: &[f32],
-    token_id: u32,
-    temperature: f32,
-    logprobs_requested: Option<usize>,
-) {
-    let Some(top_n) = logprobs_requested else {
-        return;
-    };
-    let (logprob, top) = compute_step_logprobs(logits, token_id, temperature, top_n);
-    token_logprobs.push(TokenLogprob {
-        token_id,
-        logprob,
-        top,
-    });
 }
 
 /// Fail-closed pre-scan for `sample_full_logits`: detects whether `logits`
@@ -2392,32 +2377,14 @@ mod tests {
         assert!((top[0].logprob - reference[2]).abs() < 1e-4);
     }
 
-    #[test]
-    fn test_record_logprob_noop_when_not_requested() {
-        let mut token_logprobs = Vec::new();
-        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, None);
-        assert!(
-            token_logprobs.is_empty(),
-            "record_logprob must not allocate/push anything when logprobs \
-             were not requested -- this is the zero-cost default path"
-        );
-    }
-
-    #[test]
-    fn test_record_logprob_appends_entry_when_requested() {
-        let mut token_logprobs = Vec::new();
-        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, Some(2));
-        assert_eq!(token_logprobs.len(), 1);
-        assert_eq!(token_logprobs[0].token_id, 2);
-        assert_eq!(token_logprobs[0].top.len(), 2);
-
-        // A second call appends rather than overwrites, matching per-step
-        // accumulation across a whole generation.
-        record_logprob(&mut token_logprobs, &[3.0, 2.0, 1.0], 0, 1.0, Some(0));
-        assert_eq!(token_logprobs.len(), 2);
-        assert_eq!(token_logprobs[1].token_id, 0);
-        assert!(token_logprobs[1].top.is_empty());
-    }
+    // `record_logprob`'s noop/appends behavior moved to
+    // `model::qwen35::generation`'s `DecodePolicy::record_logprob` tests
+    // (codex round-3 medium #2, PR #787 / Leo's ruling) -- see
+    // `decode_policy_record_logprob_noop_when_not_requested` and
+    // `transition_records_one_logprob_per_generated_token` there. The
+    // freestanding `pub(crate) record_logprob` this module used to export no
+    // longer exists: only `compute_step_logprobs` (pure computation) remains
+    // shared, and mutating `token_logprobs` is exclusively `DecodePolicy`'s.
 
     // -------------------------------------------------------------------
     // CPU-side microbench (issue #650): before/after `sample_full_logits`.

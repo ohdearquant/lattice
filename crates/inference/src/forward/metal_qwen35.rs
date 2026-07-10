@@ -13213,6 +13213,11 @@ mod inner {
             // independently. `prefill_logits` is untouched since
             // `forward_prefill()` populated it above, and reflects the same
             // distribution `next_id` was sampled from.
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
                 gen_cfg,
                 think_close_id,
@@ -13221,79 +13226,56 @@ mod inner {
                 &prefill_logits,
                 gen_cfg.temperature,
                 generated_ids.len(),
+                true,
             );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            // Holds back a partial suffix that could still become a stop match, so
-            // `text`/`on_token` never see a stop string that spans a token boundary.
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: true,
-                            stop_reason: Some(StopReason::Eos),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: token_logprobs.clone(),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: true,
+                    stop_reason: Some(StopReason::Eos),
+                    token_logprobs: token_logprobs.clone(),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -13355,12 +13337,12 @@ mod inner {
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
                 //
-                // The `stop_check` closure (codex round-2 major #2, PR #787 /
-                // Leo's ruling) owns this path's detok + (optional)
-                // `StopStringMatcher` byte-holdback check + `on_token` sink --
-                // moving it into the mandatory callback makes it structurally
-                // impossible for this call site to invoke `transition` while
-                // skipping the stop check.
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -13380,35 +13362,10 @@ mod inner {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
                     },
-                    |next_id, _token_logprobs| {
-                        let delta = detok.push(tokenizer, next_id);
-                        if delta.is_empty() {
-                            return crate::model::qwen35::StopCheckOutcome::Continue;
-                        }
-                        if let Some(matcher) = stop_matcher.as_mut() {
-                            let mut caller_interrupted = false;
-                            let stop_matched = matcher.push(&delta, &mut |emit| {
-                                if !caller_interrupted && !emit.is_empty() {
-                                    text.push_str(emit);
-                                    if !on_token(emit, next_id) {
-                                        caller_interrupted = true;
-                                    }
-                                }
-                            });
-                            if caller_interrupted {
-                                return crate::model::qwen35::StopCheckOutcome::Interrupted;
-                            }
-                            if stop_matched {
-                                return crate::model::qwen35::StopCheckOutcome::Stopped;
-                            }
-                        } else {
-                            text.push_str(&delta);
-                            if !on_token(&delta, next_id) {
-                                return crate::model::qwen35::StopCheckOutcome::Interrupted;
-                            }
-                        }
-                        crate::model::qwen35::StopCheckOutcome::Continue
-                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
                 );
 
                 let (next_id, answer_budget_exhausted) = match outcome {
@@ -13456,30 +13413,18 @@ mod inner {
             // so streamed deltas concatenate to exactly the returned text. Skip when
             // the caller asked to stop — it is no longer consuming the stream.
             if !stopped_by_caller {
+                // This flush emits the residual incomplete-UTF-8 bytes of the
+                // already-generated final token, not a new generation step —
+                // generation has already terminated for the stop_reason decided
+                // above. A late cancel here (return value intentionally unused)
+                // does not change why generation stopped, so treating it as
+                // Interrupt would misattribute the stop cause to this flush.
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    // No-op if a stop already matched inside the loop; otherwise a
-                    // stop string can still complete in the final detokenizer tail.
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    // This flush emits the residual incomplete-UTF-8 bytes of the
-                    // already-generated final token, not a new generation step —
-                    // generation has already terminated for the stop_reason decided
-                    // above. A late cancel here (return value intentionally unused)
-                    // does not change why generation stopped, so treating it as
-                    // Interrupt would misattribute the stop cause to this flush.
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
             Ok(GenerateOutput {
@@ -15775,6 +15720,11 @@ mod inner {
             // so this site is structurally indistinguishable from the other
             // five at the `DecodePolicy::init` / `transition` call sites.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
                 gen_cfg,
                 think_close_id,
@@ -15783,98 +15733,74 @@ mod inner {
                 &prefill_logits,
                 gen_cfg.temperature,
                 generated_ids.len(),
+                true,
             );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             // Set when a stop string matches: CPU-identical semantics can retain
             // token ids whose text was truncated, so the tokens behind a
             // string-stop match must never be saved into the cross-turn cache —
             // that would represent text the caller never received.
             let mut stopped_by_stop_string = false;
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        self.cross_turn_prefix_cache.remove(slot_id);
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: true,
-                                stop_reason: Some(StopReason::Eos),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        // The caller cut the stream after exactly one forwarded
-                        // token (the prefill sample) — state represents prompt +
-                        // that one token already (forward happens on the *next*
-                        // iteration in the loop below, which never runs here).
-                        // Nothing further was forwarded, so do not save a cache
-                        // entry claiming more than live state represents.
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                // The caller cut the stream after exactly one forwarded
+                // token (the prefill sample) — state represents prompt +
+                // that one token already (forward happens on the *next*
+                // iteration in the loop below, which never runs here).
+                // Nothing further was forwarded, so do not save a cache
+                // entry claiming more than live state represents.
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                self.cross_turn_prefix_cache.remove(slot_id);
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -15929,14 +15855,12 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`. The
-                // `stop_check` closure (codex round-2 major #2, PR #787 /
-                // Leo's ruling) owns this path's detok + (optional)
-                // `StopStringMatcher` byte-holdback check + `on_token` sink
-                // -- moving it into the mandatory callback makes it
-                // structurally impossible for this call site to invoke
-                // `transition` while skipping the stop check.
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -15956,35 +15880,10 @@ mod inner {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
                     },
-                    |next_id, _token_logprobs| {
-                        let delta = detok.push(tokenizer, next_id);
-                        if delta.is_empty() {
-                            return crate::model::qwen35::StopCheckOutcome::Continue;
-                        }
-                        if let Some(matcher) = stop_matcher.as_mut() {
-                            let mut caller_interrupted = false;
-                            let stop_matched = matcher.push(&delta, &mut |emit| {
-                                if !caller_interrupted && !emit.is_empty() {
-                                    text.push_str(emit);
-                                    if !on_token(emit, next_id) {
-                                        caller_interrupted = true;
-                                    }
-                                }
-                            });
-                            if caller_interrupted {
-                                return crate::model::qwen35::StopCheckOutcome::Interrupted;
-                            }
-                            if stop_matched {
-                                return crate::model::qwen35::StopCheckOutcome::Stopped;
-                            }
-                        } else {
-                            text.push_str(&delta);
-                            if !on_token(&delta, next_id) {
-                                return crate::model::qwen35::StopCheckOutcome::Interrupted;
-                            }
-                        }
-                        crate::model::qwen35::StopCheckOutcome::Continue
-                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
                 );
 
                 let (next_id, answer_budget_exhausted) = match outcome {
@@ -16033,22 +15932,12 @@ mod inner {
             // must also suppress caching the truncated generation (see below).
             if !stopped_by_caller {
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stopped_by_stop_string = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stopped_by_stop_string = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
 

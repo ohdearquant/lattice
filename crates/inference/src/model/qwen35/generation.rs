@@ -12,7 +12,7 @@ use crate::grammar::pda::GrammarState;
 use crate::model::qwen35_config::{
     GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
 };
-use crate::sampling::record_logprob;
+use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
 
@@ -256,6 +256,7 @@ impl Qwen35Model {
             &scratch.logits[..cfg.vocab_size],
             gen_cfg.temperature,
             generated_ids.len(),
+            false,
         );
 
         if gen_cfg.stop_strings.is_empty() {
@@ -290,7 +291,7 @@ impl Qwen35Model {
             // String-stop path: accumulate decoded text and check after every token.
             let mut detok = IncrementalDetokenizer::new();
             let first_delta = detok.push(&self.tokenizer, next_id);
-            let mut full = first_delta;
+            let mut full = String::new();
 
             // Tracks, per recorded `token_logprobs` entry, the length of `full`
             // immediately after that token's delta landed — grown in lockstep
@@ -298,20 +299,24 @@ impl Qwen35Model {
             // a stop-string truncation can drop exactly the trailing entries
             // whose text didn't fully survive. See
             // `truncate_token_logprobs_to_retained_text`.
-            let mut token_logprob_end_offsets: Vec<usize> = if token_logprobs.is_empty() {
-                Vec::new()
-            } else {
-                vec![full.len()]
-            };
+            let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-            // Check stop strings after the first token.
-            if let Some(hit) = earliest_stop_match(&full, &gen_cfg.stop_strings) {
-                full.truncate(hit);
-                truncate_token_logprobs_to_retained_text(
+            // Check stop strings after the first token (codex round-3 major
+            // #1, PR #787 / Leo's ruling): routed through the policy's owned
+            // stop-mode adapter (`check_initial_stop`) instead of the free
+            // `earliest_stop_match` call this site used to make directly --
+            // `full`/`token_logprob_end_offsets` are populated by the adapter
+            // itself, not by this call site.
+            if matches!(
+                policy.check_initial_stop(
                     &mut token_logprobs,
-                    &token_logprob_end_offsets,
-                    hit,
-                );
+                    &mut full,
+                    &mut token_logprob_end_offsets,
+                    &first_delta,
+                    |_| true,
+                ),
+                StopCheckOutcome::Stopped
+            ) {
                 // generated_ids already contains next_id; we cannot un-generate it,
                 // so token_ids/generated_tokens reflect all tokens up to the match.
                 return Ok(GenerateOutput {
@@ -625,6 +630,7 @@ impl Qwen35Model {
             &scratch.logits[..cfg.vocab_size],
             gen_cfg.temperature,
             generated_ids.len(),
+            true,
         );
 
         // Incremental detokenization: emit only complete-UTF-8 text deltas. A
@@ -638,20 +644,31 @@ impl Qwen35Model {
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(&self.tokenizer, next_id);
-            if !delta.is_empty() {
-                text.push_str(&delta);
-                if !on_token(&delta) {
-                    return Ok(GenerateOutput {
-                        text,
-                        token_ids: generated_ids.clone(),
-                        prompt_tokens: prompt_len,
-                        generated_tokens: generated_ids.len(),
-                        stopped: false, // caller interrupted the stream, not a stop condition
-                        stop_reason: Some(StopReason::Interrupt),
-                        token_logprobs,
-                    });
-                }
+            // Codex round-3 major #1, PR #787 / Leo's ruling: routed through
+            // the policy's owned stop-mode adapter (always `Disabled` here,
+            // since `gen_cfg.stop_strings` is empty) instead of a manual
+            // `text.push_str` + `on_token` call.
+            if matches!(
+                policy.check_initial_stop(
+                    &mut token_logprobs,
+                    &mut text,
+                    &mut throwaway_offsets,
+                    &delta,
+                    |s| on_token(s),
+                ),
+                StopCheckOutcome::Interrupted
+            ) {
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs,
+                });
             }
 
             let mut stopped = false;
@@ -707,13 +724,12 @@ impl Qwen35Model {
                 // major #3, PR #787) -- see `DecodePolicy::transition`. Set
                 // stopped=true on a grammar stop so the caller sees a
                 // grammar-terminal stop as stopped=true, matching
-                // decode_loop's `return Ok(true)`. The `stop_check` closure
-                // (codex round-2 major #2, PR #787 / Leo's ruling) owns this
-                // fast path's delta-push + `on_token` interrupt check --
-                // there is no stop-string matching on this path
-                // (`gen_cfg.stop_strings` is empty), but the callback is
-                // still required, so it reports `Interrupted` when the
-                // caller's sink can no longer consume output.
+                // decode_loop's `return Ok(true)`. `policy.stop_mode` is
+                // always `Disabled` on this path (`gen_cfg.stop_strings` is
+                // empty); the adapter still threads text through to
+                // `on_token` and reports `Interrupted` when the caller's sink
+                // can no longer consume output (codex round-3 major #1, PR
+                // #787 / Leo's ruling).
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -733,16 +749,10 @@ impl Qwen35Model {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
                     },
-                    |next_id, _token_logprobs| {
-                        let delta = detok.push(&self.tokenizer, next_id);
-                        if !delta.is_empty() {
-                            text.push_str(&delta);
-                            if !on_token(&delta) {
-                                return StopCheckOutcome::Interrupted;
-                            }
-                        }
-                        StopCheckOutcome::Continue
-                    },
+                    |next_id| detok.push(&self.tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, _next_id| on_token(s),
                 );
 
                 let answer_budget_exhausted = match outcome {
@@ -803,25 +813,24 @@ impl Qwen35Model {
                 token_logprobs,
             })
         } else {
-            // String-stop path: use StopStreamer to hold back (max_stop - 1) bytes and
-            // never emit a partial stop prefix before we can confirm it is not a match.
-            let mut streamer = StopStringMatcher::new(&gen_cfg.stop_strings);
-
-            // `StopStringMatcher::push`'s sink is `FnMut(&str)` (no return
-            // value), so a caller-requested stop is threaded through a
-            // captured flag instead -- mirrors the Metal
-            // `generate_streaming_with_cancel`'s `caller_interrupted` idiom
-            // exactly, for the same structural reason.
-            let mut caller_interrupted = false;
+            // String-stop path: `policy.stop_mode` is `StopMode::Streaming`
+            // (constructed in `DecodePolicy::init` above from the same
+            // non-empty `gen_cfg.stop_strings`), holding back (max_stop - 1)
+            // bytes so a partial stop prefix is never emitted before it is
+            // confirmed not to be a match.
+            let mut text = String::new();
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             let first_delta = detok.push(&self.tokenizer, next_id);
-            let stop_matched = streamer.push(&first_delta, &mut |s| {
-                if !caller_interrupted && !on_token(s) {
-                    caller_interrupted = true;
-                }
-            });
-            if caller_interrupted {
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &first_delta,
+                |s| on_token(s),
+            );
+            if matches!(initial_outcome, StopCheckOutcome::Interrupted) {
                 return Ok(GenerateOutput {
-                    text: streamer.into_text(),
+                    text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
@@ -830,11 +839,11 @@ impl Qwen35Model {
                     token_logprobs,
                 });
             }
-            if stop_matched {
+            if matches!(initial_outcome, StopCheckOutcome::Stopped) {
                 // Stop matched in the very first token.
                 // token_ids already contain next_id; cannot un-generate it.
                 return Ok(GenerateOutput {
-                    text: streamer.into_text(),
+                    text,
                     token_ids: generated_ids.clone(),
                     prompt_tokens: prompt_len,
                     generated_tokens: generated_ids.len(),
@@ -890,13 +899,14 @@ impl Qwen35Model {
                 );
 
                 // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`. The
-                // `stop_check` closure (codex round-2 major #2, PR #787 /
-                // Leo's ruling) owns this path's incremental byte-holdback
-                // stop-string match via `StopStringMatcher` -- moving it into
-                // the mandatory callback makes it structurally impossible
-                // for this call site to invoke `transition` while skipping
-                // the stop check.
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` at
+                // construction) owns the incremental byte-holdback
+                // stop-string match itself now (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers, so it can no
+                // longer independently choose to skip the real stop check.
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -916,22 +926,10 @@ impl Qwen35Model {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
                     },
-                    |next_id, _token_logprobs| {
-                        let delta = detok.push(&self.tokenizer, next_id);
-                        let mut iter_interrupted = false;
-                        let stop_matched = streamer.push(&delta, &mut |s| {
-                            if !iter_interrupted && !on_token(s) {
-                                iter_interrupted = true;
-                            }
-                        });
-                        if iter_interrupted {
-                            return StopCheckOutcome::Interrupted;
-                        }
-                        if stop_matched {
-                            return StopCheckOutcome::Stopped;
-                        }
-                        StopCheckOutcome::Continue
-                    },
+                    |next_id| detok.push(&self.tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, _next_id| on_token(s),
                 );
 
                 let answer_budget_exhausted = match outcome {
@@ -972,18 +970,16 @@ impl Qwen35Model {
             // the stream, and `on_token`'s return value here would not change
             // why generation actually stopped.
             if !stopped_by_caller {
-                streamer.finish(&detok.finish(), &mut |s| {
-                    on_token(s);
-                });
-                // finish() may itself complete a stop in the tail bytes.
-                if streamer.stopped() && !stopped {
+                let tail_stopped = policy.finish_stop(&mut text, &detok.finish(), |s| on_token(s));
+                // finish_stop may itself complete a stop in the tail bytes.
+                if tail_stopped && !stopped {
                     stopped = true;
                     stop_reason = StopReason::Eos;
                 }
             }
 
             Ok(GenerateOutput {
-                text: streamer.into_text(),
+                text,
                 token_ids: generated_ids.clone(),
                 prompt_tokens: prompt_len,
                 generated_tokens: generated_ids.len(),
@@ -1031,22 +1027,13 @@ pub(crate) enum StepOutcome {
     },
 }
 
-/// Outcome of the mandatory per-step stop-check callback [`DecodePolicy::transition`]
-/// drives (Leo's ruling on codex round-2 major #2, PR #787): the backend-specific
-/// stop-string consumption shape — streaming incremental byte-holdback via
-/// [`StopStringMatcher`], or non-streaming full-text rescan via
-/// `earliest_stop_match_from` — still differs by call site (these are genuinely
-/// different shapes per the existing round-1 rationale, not arbitrary
-/// duplication), and each shape needs its own backend-owned text buffer /
-/// `on_token` sink, which cannot move into this crate-shared enum. What
-/// changes is that a call site can no longer independently choose whether to
-/// check for a stop-string match at all: `transition` now takes the
-/// stop-check callback as a *required* parameter (the exact same footing as
-/// its existing `grammar_advance` / `is_eos` callbacks) and drives it at the
-/// one fixed point in the per-step order every site already used before this
-/// change. Omitting the callback is a compile error, not a silent gap — the
-/// no-stop-strings fast paths supply a trivial `|_, _| StopCheckOutcome::Continue`
-/// closure rather than skipping the parameter.
+/// Outcome of the mandatory per-step stop-check [`DecodePolicy::transition`]
+/// drives internally (codex round-3 major #1, PR #787: the round-2 mandatory
+/// `stop_check` closure could still compile as a trivial
+/// `|_, _| StopCheckOutcome::Continue` for a configuration that actually had
+/// stop strings — an arbitrary outcome-producing closure cannot be forced to
+/// consult real matcher state. `transition` no longer accepts one at all; see
+/// [`StopMode`] and [`DecodePolicy::stop_check`]).
 pub(crate) enum StopCheckOutcome {
     /// No stop-string match yet (or `stop_strings` is not configured for
     /// this generation at all) — keep decoding.
@@ -1096,22 +1083,22 @@ pub(crate) enum StopCheckOutcome {
 /// to skip a control, and doing so breaks every one of these behaviors at
 /// once rather than silently dropping just one.
 ///
-/// Stop-string matching (codex round-2 major #2, PR #787 / Leo's ruling): the
-/// streaming callers need [`StopStringMatcher`]'s incremental byte-holdback
-/// semantics (a partial match must never reach `on_token`), while the
-/// non-streaming path scans the fully accumulated string via
-/// `earliest_stop_match` / `earliest_stop_match_from` — genuinely different
-/// consumption shapes, each needing its own backend-owned text buffer /
-/// `on_token` sink that cannot move into this crate-shared struct (the sink
-/// signature itself differs: CPU's is `FnMut(&str) -> bool`, Metal's is
-/// `FnMut(&str, u32) -> bool`). What changed: `transition` now takes the
-/// stop-check as a sixth, *required* parameter — same footing as
-/// `grammar_advance` / `is_eos` — and drives it internally at the one fixed
-/// point every site already ran it at (see [`StopCheckOutcome`]). A call site
-/// can no longer invoke `transition` while independently choosing whether to
-/// check for a stop-string match at all: omitting the callback is a compile
-/// error, not a silent gap, and the no-stop-strings fast paths must supply an
-/// explicit no-op closure rather than skipping the parameter.
+/// Stop-string matching (codex round-3 major #1, PR #787 / Leo's Option A
+/// ruling): the streaming vs non-streaming consumption shapes genuinely
+/// differ (incremental byte-holdback via [`StopStringMatcher`] vs full-text
+/// rescan via `earliest_stop_match_from`), but which one applies — and
+/// whether checking happens at all — is now [`StopMode`], a value chosen
+/// exactly once from the real `gen_cfg.stop_strings` at [`DecodePolicy::init`]
+/// time and stored privately on the policy. A caller can no longer supply a
+/// closure that *decides* the stop outcome (round 2's `stop_check` parameter,
+/// which could compile as a trivial `|_, _| Continue` for any configuration
+/// regardless of what `stop_strings` actually held); it supplies only raw
+/// per-token I/O primitives — a decoded delta (`decode_delta`) and a
+/// confirmed-text sink (`emit_confirmed`) — and [`DecodePolicy::stop_check`]
+/// (called from both [`DecodePolicy::check_initial_stop`], for the
+/// prefill-derived first token, and `transition`, for every token after)
+/// dispatches on `self.stop_mode` to decide, using the real adapter for that
+/// mode, not caller-supplied decision logic.
 pub(crate) struct DecodePolicy {
     reasoning_budget: Option<usize>,
     enable_thinking: bool,
@@ -1120,6 +1107,54 @@ pub(crate) struct DecodePolicy {
     think_close_id: Option<u32>,
     thinking_closed: bool,
     reasoning_end_len: Option<usize>,
+    stop_mode: StopMode,
+}
+
+/// The stop-string check adapter a [`DecodePolicy`] owns (codex round-3
+/// major #1, PR #787 / Leo's Option A ruling). The only place a value of this
+/// type is ever produced is the private [`StopMode::for_config`], called once
+/// from [`DecodePolicy::init`] on the real `gen_cfg.stop_strings` — there is
+/// no public constructor, so a caller cannot independently choose (or swap
+/// in) `Disabled` for a configuration that actually has stop strings: the
+/// variant a given policy drives is fixed by the config it was built from,
+/// not by anything a call site writes.
+enum StopMode {
+    /// `gen_cfg.stop_strings` was empty at construction — there is nothing to
+    /// match, so [`DecodePolicy::stop_check`] only threads decoded text
+    /// through to the caller's sink (still needed for streaming callers'
+    /// `on_token`; a no-op for `decode_loop`, which has no text pipeline at
+    /// all).
+    Disabled,
+    /// Streaming incremental byte-holdback: the owned [`StopStringMatcher`]
+    /// ensures a partial match never reaches the caller's confirmed-text
+    /// sink. Used by every streaming call site with `stop_strings` set (CPU
+    /// `generate_streaming_with_cancel`'s stop-string branch, both Metal
+    /// streaming loops).
+    Streaming(StopStringMatcher),
+    /// Non-streaming full-text rescan, bounded to the suffix that could
+    /// contain a new match (`stop_scan_search_start`). Used only by CPU
+    /// `decode_loop_with_stops` (via `Qwen35Model::generate`'s stop-string
+    /// branch), which has no external consumer to hold text back from.
+    FullScan {
+        stop_strings: Vec<String>,
+        max_stop: usize,
+    },
+}
+
+impl StopMode {
+    fn for_config(stop_strings: &[String], streaming: bool) -> Self {
+        if stop_strings.is_empty() {
+            StopMode::Disabled
+        } else if streaming {
+            StopMode::Streaming(StopStringMatcher::new(stop_strings))
+        } else {
+            let max_stop = stop_strings.iter().map(String::len).max().unwrap_or(1);
+            StopMode::FullScan {
+                stop_strings: stop_strings.to_vec(),
+                max_stop,
+            }
+        }
+    }
 }
 
 impl DecodePolicy {
@@ -1143,7 +1178,13 @@ impl DecodePolicy {
     /// before the decode loop starts (the prefill-derived first token), covering the
     /// `reasoning_budget == 1` edge case exactly as the six duplicated call sites did.
     /// `first_logits` / `temperature` are the same values the free-function
-    /// `record_logprob` call used to take directly.
+    /// `record_logprob` call used to take directly. `streaming` selects which
+    /// [`StopMode`] a non-empty `gen_cfg.stop_strings` resolves to
+    /// (`Streaming`'s incremental holdback vs `FullScan`'s full-text rescan;
+    /// see [`StopMode::for_config`]) — pass `true` for every streaming caller
+    /// (CPU `generate_streaming_with_cancel`, both Metal streaming loops),
+    /// `false` for non-streaming callers (`Qwen35Model::generate`). An empty
+    /// `stop_strings` always resolves to `Disabled` regardless of `streaming`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn init(
         gen_cfg: &GenerateConfig,
@@ -1153,6 +1194,7 @@ impl DecodePolicy {
         first_logits: &[f32],
         temperature: f32,
         first_generated_len: usize,
+        streaming: bool,
     ) -> Self {
         let thinking_closed = Some(first_emitted_id) == think_close_id;
         let reasoning_end_len = if thinking_closed {
@@ -1168,6 +1210,7 @@ impl DecodePolicy {
             think_close_id,
             thinking_closed,
             reasoning_end_len,
+            stop_mode: StopMode::for_config(&gen_cfg.stop_strings, streaming),
         };
         policy.record_logprob(token_logprobs, first_logits, first_emitted_id, temperature);
         policy
@@ -1233,12 +1276,22 @@ impl DecodePolicy {
             .is_some_and(|end| generated_len.saturating_sub(end) >= self.max_new_tokens)
     }
 
-    /// Thin, zero-behavior-change wrapper over `crate::sampling::record_logprob`,
-    /// so logprobs formatting is owned by the same struct as the other two
-    /// backend-neutral policy legs (ADR-080 C3 contract text).
+    /// Appends one decode step's logprob data to `token_logprobs` when
+    /// `self.logprobs` requests it; a no-op otherwise (so callers can invoke
+    /// it unconditionally on every step -- the softmax pass over the full
+    /// vocabulary is paid only when logprobs were actually requested).
+    ///
+    /// This is the ONLY place in the crate that pushes onto a
+    /// `token_logprobs: &mut Vec<TokenLogprob>` accumulator (codex round-3
+    /// medium #2, PR #787 / Leo's ruling): `crate::sampling` exposes only
+    /// the pure computation (`compute_step_logprobs`), not a freestanding
+    /// "record" function a sibling decode call site could invoke directly
+    /// to recreate the exact duplicate-choreography bug this method's
+    /// privacy already closes for the other four constituent methods.
     ///
     /// Private (codex round-1 major #3, PR #787): only reachable through
-    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    /// [`DecodePolicy::transition`] / [`DecodePolicy::init`], which own the
+    /// full per-step ordering.
     fn record_logprob(
         &self,
         token_logprobs: &mut Vec<TokenLogprob>,
@@ -1246,7 +1299,128 @@ impl DecodePolicy {
         token_id: u32,
         temperature: f32,
     ) {
-        record_logprob(token_logprobs, logits, token_id, temperature, self.logprobs);
+        let Some(top_n) = self.logprobs else {
+            return;
+        };
+        let (logprob, top) = compute_step_logprobs(logits, token_id, temperature, top_n);
+        token_logprobs.push(TokenLogprob {
+            token_id,
+            logprob,
+            top,
+        });
+    }
+
+    /// The stop-check adapter dispatch (codex round-3 major #1, PR #787 /
+    /// Leo's Option A ruling): drives whichever [`StopMode`] this policy was
+    /// constructed with, given the caller's freshly decoded delta text for
+    /// the current token. The caller supplies no decision logic at all — only
+    /// the decoded text and a sink for whatever text is confirmed safe to
+    /// release (`emit_confirmed`, called with the post-holdback-safe
+    /// substring for `Streaming`, the raw delta for `Disabled`, never for
+    /// `FullScan`, which has no external consumer). Shared by
+    /// [`DecodePolicy::check_initial_stop`] (the prefill-derived first token,
+    /// called once before the decode loop) and `transition` (every token
+    /// after) — the same `self.stop_mode` instance is mutated across both
+    /// calls, so `Streaming`'s incremental byte-holdback state carries over
+    /// correctly from the first token onward, exactly as it did when each
+    /// call site constructed and drove its own matcher by hand.
+    ///
+    /// Private (codex round-1 major #3 / round-3 major #1, PR #787): only
+    /// reachable through the two methods above.
+    fn stop_check(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        delta: &str,
+        mut emit_confirmed: impl FnMut(&str) -> bool,
+    ) -> StopCheckOutcome {
+        match &mut self.stop_mode {
+            StopMode::Disabled => {
+                if delta.is_empty() {
+                    return StopCheckOutcome::Continue;
+                }
+                text.push_str(delta);
+                if emit_confirmed(delta) {
+                    StopCheckOutcome::Continue
+                } else {
+                    StopCheckOutcome::Interrupted
+                }
+            }
+            StopMode::Streaming(matcher) => {
+                let mut interrupted = false;
+                let stop_matched = matcher.push(delta, &mut |s| {
+                    if !s.is_empty() {
+                        text.push_str(s);
+                        if !interrupted && !emit_confirmed(s) {
+                            interrupted = true;
+                        }
+                    }
+                });
+                if interrupted {
+                    StopCheckOutcome::Interrupted
+                } else if stop_matched {
+                    StopCheckOutcome::Stopped
+                } else {
+                    StopCheckOutcome::Continue
+                }
+            }
+            StopMode::FullScan {
+                stop_strings,
+                max_stop,
+            } => {
+                let prev_len = text.len();
+                if !delta.is_empty() {
+                    text.push_str(delta);
+                }
+                // Keep the offset tracker in lockstep with token_logprobs'
+                // conditional growth (record_logprob is a no-op unless
+                // gen_cfg.logprobs is set).
+                if token_logprobs.len() > token_logprob_end_offsets.len() {
+                    token_logprob_end_offsets.push(text.len());
+                }
+                let search_start = stop_scan_search_start(text, prev_len, *max_stop);
+                if let Some(hit) = earliest_stop_match_from(text, stop_strings, search_start) {
+                    text.truncate(hit);
+                    truncate_token_logprobs_to_retained_text(
+                        token_logprobs,
+                        token_logprob_end_offsets,
+                        hit,
+                    );
+                    StopCheckOutcome::Stopped
+                } else {
+                    StopCheckOutcome::Continue
+                }
+            }
+        }
+    }
+
+    /// Checks the prefill-derived first token's already-decoded delta text
+    /// against this policy's stop-mode (codex round-3 major #1, PR #787 /
+    /// Leo's ruling), before the decode loop starts — the first token is
+    /// pushed and its logprob recorded by [`DecodePolicy::init`] outside
+    /// `transition`'s per-step scope (it has no preceding grammar-advance /
+    /// EOS check of its own to run through `transition` for), so its
+    /// stop-string check needs its own entry point. Uses the SAME
+    /// `self.stop_mode` instance `transition` will keep driving for every
+    /// subsequent token, so `Streaming`'s byte-holdback state is continuous
+    /// across the boundary — critical for a match that spans the first and
+    /// second tokens, which a freshly-constructed second matcher would miss.
+    pub(crate) fn check_initial_stop(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        delta: &str,
+        emit_confirmed: impl FnMut(&str) -> bool,
+    ) -> StopCheckOutcome {
+        self.stop_check(
+            token_logprobs,
+            text,
+            token_logprob_end_offsets,
+            delta,
+            emit_confirmed,
+        )
     }
 
     /// The one per-step transition (ADR-080 C3 / codex round-1 major #3, PR
@@ -1255,7 +1429,7 @@ impl DecodePolicy {
     /// callback, the emitted-token bookkeeping, the backend's EOS/stop-token
     /// callback, the backend's push callback (into its own `generated_ids` /
     /// `all_ids` or Metal-equivalent vectors), per-token logprobs recording,
-    /// reasoning-end capture, the backend's stop-string check, and the
+    /// reasoning-end capture, the owned stop-check adapter, and the
     /// answer-budget check.
     ///
     /// `grammar_advance` and `is_eos` are backend callbacks because grammar
@@ -1269,26 +1443,24 @@ impl DecodePolicy {
     /// the *next* loop iteration (`all_ids.last()` feeds the next
     /// `forward_step`) — the caller cannot hand that ownership to the policy.
     ///
-    /// `stop_check` is likewise a required backend callback (codex round-2
-    /// major #2, PR #787 / Leo's ruling): the incremental byte-holdback
-    /// (streaming) vs full-text rescan (non-streaming) shapes, and their
-    /// backend-owned text buffers / `on_token` sinks, remain genuinely
-    /// backend-specific — but the callback itself is no longer optional
-    /// choreography a call site can skip. It receives the emitted token id
-    /// and a reborrow of `token_logprobs` (so a non-streaming caller can
-    /// retroactively drop trailing logprob entries whose text a stop match
-    /// truncated away, exactly as `decode_loop_with_stops` already did), and
-    /// runs after logprobs recording / reasoning-end capture, before the
-    /// answer-budget check — the same position every site already ran its
-    /// stop-check code at before this change.
+    /// `decode_delta` / `text` / `token_logprob_end_offsets` / `emit_confirmed`
+    /// (codex round-3 major #1, PR #787 / Leo's ruling) replace round-2's
+    /// arbitrary outcome-producing `stop_check` closure: the caller supplies
+    /// only raw I/O (decode a token to text; a buffer to accumulate into; an
+    /// offset tracker only `StopMode::FullScan` consults; a sink for
+    /// confirmed-safe text), and [`DecodePolicy::stop_check`] — driven from
+    /// `self.stop_mode`, fixed at construction from the real
+    /// `gen_cfg.stop_strings` — decides the outcome. A call site can no
+    /// longer claim `Continue` for a configuration that actually has stop
+    /// strings, because it no longer produces the outcome at all.
     ///
     /// Returns [`StepOutcome::GrammarStop`] / [`StepOutcome::Eos`] without
     /// ever calling `push` when the token is rejected before emission
     /// (matching the existing contract that a stop token is never present in
     /// `token_ids`); [`StepOutcome::Stopped`] / [`StepOutcome::Interrupted`]
-    /// when `stop_check` reports either outcome (the answer-budget check is
-    /// skipped in both cases, matching every site's original control flow,
-    /// which broke out of the loop before ever reaching it); or
+    /// when the stop-check adapter reports either outcome (the answer-budget
+    /// check is skipped in both cases, matching every site's original control
+    /// flow, which broke out of the loop before ever reaching it); or
     /// [`StepOutcome::Emitted`] once the token has been pushed and every
     /// remaining control, including a `Continue` stop-check, applied.
     #[allow(clippy::too_many_arguments)]
@@ -1302,7 +1474,10 @@ impl DecodePolicy {
         mut grammar_advance: impl FnMut(u32) -> bool,
         mut is_eos: impl FnMut(u32) -> bool,
         mut push: impl FnMut(u32),
-        mut stop_check: impl FnMut(u32, &mut Vec<TokenLogprob>) -> StopCheckOutcome,
+        mut decode_delta: impl FnMut(u32) -> String,
+        text: &mut String,
+        token_logprob_end_offsets: &mut Vec<usize>,
+        mut emit_confirmed: impl FnMut(&str, u32) -> bool,
     ) -> StepOutcome {
         let next_id = self.apply_override(generated_len_before, sampled_id);
 
@@ -1322,7 +1497,15 @@ impl DecodePolicy {
         self.record_logprob(token_logprobs, logits, next_id, temperature);
         self.capture_reasoning_end(generated_len_after);
 
-        match stop_check(next_id, token_logprobs) {
+        let delta = decode_delta(next_id);
+        let stop_outcome = self.stop_check(
+            token_logprobs,
+            text,
+            token_logprob_end_offsets,
+            &delta,
+            |s| emit_confirmed(s, next_id),
+        );
+        match stop_outcome {
             StopCheckOutcome::Stopped => return StepOutcome::Stopped,
             StopCheckOutcome::Interrupted => return StepOutcome::Interrupted,
             StopCheckOutcome::Continue => {}
@@ -1331,6 +1514,49 @@ impl DecodePolicy {
         StepOutcome::Emitted {
             token_id: next_id,
             answer_budget_exhausted: self.answer_budget_exhausted(generated_len_after),
+        }
+    }
+
+    /// Natural-end flush (decode loop ended by cap/EOS/grammar-stop, not by
+    /// `stop_check` reporting `Stopped`/`Interrupted`). `tail` is the
+    /// detokenizer's own end-of-generation flush (`detok.finish()`).
+    ///
+    /// A no-op for `Disabled` beyond appending+emitting `tail` directly (there
+    /// is nothing held back to reconcile) and for `FullScan` (the
+    /// non-streaming caller owns its own tail-flush against its `full` buffer
+    /// directly, e.g. `decode_loop_with_stops`, since it has no external
+    /// consumer to hold text back from in the first place). Only `Streaming`
+    /// mode's owned [`StopStringMatcher`] can be holding back up to
+    /// `max_stop - 1` unconfirmed bytes that must be reconciled once the
+    /// token source is exhausted — mirrors `StopStringMatcher::finish`
+    /// exactly, since that is the only mode this call does real work for.
+    ///
+    /// Returns `true` when the tail flush itself completed a stop match
+    /// (`Streaming` only; always `false` for `Disabled`/`FullScan`).
+    pub(crate) fn finish_stop(
+        &mut self,
+        text: &mut String,
+        tail: &str,
+        mut emit_confirmed: impl FnMut(&str) -> bool,
+    ) -> bool {
+        match &mut self.stop_mode {
+            StopMode::Disabled => {
+                if !tail.is_empty() {
+                    text.push_str(tail);
+                    emit_confirmed(tail);
+                }
+                false
+            }
+            StopMode::Streaming(matcher) => {
+                matcher.finish(tail, &mut |s| {
+                    if !s.is_empty() {
+                        text.push_str(s);
+                        emit_confirmed(s);
+                    }
+                });
+                matcher.stopped()
+            }
+            StopMode::FullScan { .. } => false,
         }
     }
 }
@@ -1435,14 +1661,22 @@ fn decode_loop(
         // One atomic per-step transition (ADR-080 C3 / codex round-1 major
         // #3, PR #787): budget override, grammar-advance callback, emitted
         // bookkeeping, EOS callback, push callback, logprobs, reasoning-end
-        // capture, the (here, no-op) stop-check callback, and the
-        // answer-budget check, all in the fixed required order -- see
-        // `DecodePolicy::transition`. This function is only ever called when
-        // `gen_cfg.stop_strings` is empty (see `generate()`'s branch), so
-        // `stop_check` is a trivial `Continue` (codex round-2 major #2, PR
-        // #787 / Leo's ruling: the callback is required on every call, not
-        // just where a real check is needed).
+        // capture, the stop-check adapter, and the answer-budget check, all
+        // in the fixed required order -- see `DecodePolicy::transition`. This
+        // function is only ever called when `gen_cfg.stop_strings` is empty
+        // (see `generate()`'s branch), so `policy.stop_mode` is always
+        // `StopMode::Disabled` here, and this function has no text/detok
+        // pipeline of its own at all (it returns raw token ids, decoded once
+        // at the very end by `decode_tokens`) -- `decode_delta`/`text`/
+        // `token_logprob_end_offsets`/`emit_confirmed` are therefore
+        // throwaway values the `Disabled` dispatch never populates
+        // meaningfully (codex round-3 major #1, PR #787 / Leo's ruling: this
+        // is honest, not an escape hatch -- the empty-stop_strings guarantee
+        // now lives in `policy.stop_mode`, derived from the real config at
+        // `DecodePolicy::init`, not in a caller-chosen closure).
         let generated_len_before = generated_ids.len();
+        let mut throwaway_text = String::new();
+        let mut throwaway_offsets: Vec<usize> = Vec::new();
         let outcome = policy.transition(
             token_logprobs,
             sampled_id,
@@ -1461,7 +1695,10 @@ fn decode_loop(
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
             },
-            |_next_id, _token_logprobs| StopCheckOutcome::Continue,
+            |_next_id| String::new(),
+            &mut throwaway_text,
+            &mut throwaway_offsets,
+            |_delta, _next_id| true,
         );
 
         match outcome {
@@ -1514,17 +1751,6 @@ fn decode_loop_with_stops(
     let mut stopped = false;
     let mut stop_reason = StopReason::Length;
     let cap = policy.cap();
-    // Longest configured stop string, used to bound the per-token stop scan to
-    // the suffix that could contain a new match (see `earliest_stop_match_from`).
-    // `full` already reflects everything scanned before this function was
-    // called (the pre-loop first-token check), so its current length is the
-    // correct starting point for the "already scanned" prefix.
-    let max_stop = gen_cfg
-        .stop_strings
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or(1);
     for _ in 1..cap {
         let pos = kv_cache.seq_len;
         let Some(&last_token) = all_ids.last() else {
@@ -1554,12 +1780,15 @@ fn decode_loop_with_stops(
         );
 
         // One atomic per-step transition (ADR-080 C3 / codex round-1 major
-        // #3, PR #787) -- see `DecodePolicy::transition`. The `stop_check`
-        // closure (codex round-2 major #2, PR #787 / Leo's ruling) now owns
-        // exactly the detok/rescan/truncate work this loop used to run
-        // separately AFTER `transition` returned -- moving it into the
-        // mandatory callback makes it structurally impossible for this call
-        // site to invoke `transition` while skipping the stop check.
+        // #3, PR #787) -- see `DecodePolicy::transition`. The stop-check
+        // adapter (codex round-3 major #1, PR #787 / Leo's ruling) now owns
+        // the rescan/truncate work this loop used to run itself in a
+        // `stop_check` closure -- this call site supplies only `decode_delta`
+        // (this loop's own detokenizer) and the shared `full`/
+        // `token_logprob_end_offsets` buffers; `policy.stop_mode` (fixed to
+        // `StopMode::FullScan` at construction, since this function is only
+        // called when `gen_cfg.stop_strings` is non-empty) does the actual
+        // rescan/truncate, not caller-supplied closure logic.
         let generated_len_before = generated_ids.len();
         let outcome = policy.transition(
             token_logprobs,
@@ -1579,43 +1808,10 @@ fn decode_loop_with_stops(
                 generated_ids.push(next_id);
                 all_ids.push(next_id);
             },
-            |next_id, token_logprobs| {
-                let prev_len = full.len();
-                let delta = detok.push(&model.tokenizer, next_id);
-                if !delta.is_empty() {
-                    full.push_str(&delta);
-                }
-
-                // Keep the offset tracker in lockstep with token_logprobs'
-                // conditional growth (record_logprob is a no-op unless
-                // gen_cfg.logprobs is set).
-                if token_logprobs.len() > token_logprob_end_offsets.len() {
-                    token_logprob_end_offsets.push(full.len());
-                }
-
-                // Only the suffix that could contain a NEW match needs
-                // rescanning -- any match fully inside `full[..prev_len]`
-                // would already have been found on a prior iteration (see
-                // `earliest_stop_match_from`'s doc comment). Bounds
-                // per-token work instead of rescanning all of `full`.
-                // Shared with `StopStringMatcher::push` via
-                // `stop_scan_search_start` so both call sites derive the
-                // bound identically.
-                let search_start = stop_scan_search_start(full, prev_len, max_stop);
-                if let Some(hit) =
-                    earliest_stop_match_from(full, &gen_cfg.stop_strings, search_start)
-                {
-                    full.truncate(hit);
-                    truncate_token_logprobs_to_retained_text(
-                        token_logprobs,
-                        token_logprob_end_offsets,
-                        hit,
-                    );
-                    StopCheckOutcome::Stopped
-                } else {
-                    StopCheckOutcome::Continue
-                }
-            },
+            |next_id| detok.push(&model.tokenizer, next_id),
+            full,
+            token_logprob_end_offsets,
+            |_delta, _next_id| true,
         );
 
         let (_next_id, answer_budget_exhausted) = match outcome {
@@ -2786,8 +2982,8 @@ mod tests {
     /// this test pins that alternate code path independently of the fast
     /// path above).
     ///
-    /// Mutation sensitivity: dropping the `caller_interrupted` check after
-    /// the pre-loop `streamer.push` call lets generation continue into the
+    /// Mutation sensitivity: dropping the interrupted check after the
+    /// pre-loop `check_initial_stop` call lets generation continue into the
     /// decode loop, failing `generated_tokens == 1`.
     #[test]
     fn generate_streaming_with_cancel_on_token_false_stops_generation_stop_string_path() {
@@ -2902,6 +3098,41 @@ mod tests {
             result.token_logprobs.is_empty(),
             "both tokens' text was only partially retained after truncation, so both \
              logprobs entries must be dropped; got {} entries",
+            result.token_logprobs.len()
+        );
+    }
+
+    /// Codex round-3 medium #2 (PR #787 / Leo's ruling): with `gen_cfg.logprobs`
+    /// left at its default (`None`), `DecodePolicy::record_logprob` (driven by
+    /// both `init` for the prefill token and `transition` for every token
+    /// after) must be a true no-op -- `token_logprobs` stays empty for the
+    /// whole generation, not just for the truncated-text case the test above
+    /// covers. Replaces `sampling.rs`'s now-removed
+    /// `test_record_logprob_noop_when_not_requested`: that free function no
+    /// longer exists (its mutation into `crate::sampling` was the whole
+    /// point of the fix), so its behavioral contract is asserted here, at
+    /// the only place that can still exercise it.
+    ///
+    /// Mutation sensitivity: removing the `let Some(top_n) = self.logprobs
+    /// else { return; };` guard inside `DecodePolicy::record_logprob` makes
+    /// every token here get an (incorrect) `TokenLogprob` entry, failing
+    /// `token_logprobs.is_empty()`.
+    #[test]
+    fn decode_policy_record_logprob_noop_when_not_requested() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            logprobs: None,
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("plain generate must succeed");
+        assert!(
+            result.token_logprobs.is_empty(),
+            "logprobs: None must record nothing across the whole generation \
+             (prefill token via init, decode tokens via transition); got {} entries",
             result.token_logprobs.len()
         );
     }
