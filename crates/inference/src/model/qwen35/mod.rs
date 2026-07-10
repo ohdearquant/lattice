@@ -52,6 +52,22 @@ pub(crate) use detokenize::decode_tokens;
 pub(crate) use generation::check_grammar_not_set;
 // Sibling guard for `logprobs` on the same unwired paths (#585).
 pub(crate) use generation::check_logprobs_not_set;
+// Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
+// paths (ADR-080 C3, #783).
+pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+// Shared backend-neutral decode-policy struct (reasoning-budget accounting +
+// logprobs formatting), consumed by the Metal streaming loops in
+// `crate::forward::metal_qwen35` so the same bookkeeping isn't re-duplicated
+// across the CPU/Metal boundary (ADR-080 C3). Only the Metal (`mod inner`,
+// gated identically) consumer needs the re-export; `generation.rs` itself
+// uses `DecodePolicy` directly within its own module.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
+// Sibling guard for `enable_mtp` on the cross-turn prefix-cache path, which
+// has no MTP draft/verify wiring (codex round-2 medium #4, PR #787). Only
+// that Metal-only path needs it, same gate as `DecodePolicy`/`StepOutcome`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::check_mtp_not_requested;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{
