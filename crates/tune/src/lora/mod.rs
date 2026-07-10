@@ -239,6 +239,8 @@ impl LoraAdapter {
                 ("o_proj", true) => (config.full_q_dim(), config.hidden_size),
                 ("in_proj_qkv", false) => (config.hidden_size, config.linear_qkv_dim()),
                 ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
+                ("in_proj_b", false) => (config.hidden_size, config.linear_num_key_heads),
+                ("in_proj_a", false) => (config.hidden_size, config.linear_num_key_heads),
                 ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
                 ("gate_proj", _) => (config.hidden_size, config.intermediate_size),
                 ("up_proj", _) => (config.hidden_size, config.intermediate_size),
@@ -507,6 +509,34 @@ mod tests {
             let adapter = make_adapter_for_layer(3, "xq_proj_typo", 1024, 4096);
             let err = adapter.validate_against(&cfg).unwrap_err();
             assert!(err.to_string().contains("not a recognised"));
+        }
+
+        #[test]
+        fn test_validate_against_gdn_all_modules_pass() {
+            // Regression: train_grad_full --save emits all five GDN LoRA modules
+            // (in_proj_qkv/z/b/a, out_proj). The forward applies every one of them
+            // (gdn_fused.rs), so validate_against must accept each with the dims the
+            // loader and trainer use. Dims are derived from the config, not hardcoded,
+            // so this stays correct if the reference dims change.
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let gdn_layer = (0..cfg.num_hidden_layers)
+                .find(|&i| !cfg.is_full_attention(i))
+                .expect("0.8b config has linear-attention layers");
+            let h = cfg.hidden_size;
+            let cases = [
+                ("in_proj_qkv", h, cfg.linear_qkv_dim()),
+                ("in_proj_z", h, cfg.linear_output_dim()),
+                ("in_proj_b", h, cfg.linear_num_key_heads),
+                ("in_proj_a", h, cfg.linear_num_key_heads),
+                ("out_proj", cfg.linear_output_dim(), h),
+            ];
+            for (module, d_in, d_out) in cases {
+                let adapter = make_adapter_for_layer(gdn_layer, module, d_in, d_out);
+                assert!(
+                    adapter.validate_against(&cfg).is_ok(),
+                    "GDN LoRA module {module} should validate (d_in={d_in}, d_out={d_out})"
+                );
+            }
         }
     }
 }
