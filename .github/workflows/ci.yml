@@ -225,7 +225,12 @@ jobs:
         run: |
           cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu
           cargo test -p lattice-inference --bin chat_metal --features f16,metal-gpu
-          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu
+          # test-utils (ADR-080 C2 round 2) gates the tiny zero-weight CPU
+          # model the lattice.rs HTTP-level client-disconnect test needs to
+          # exercise the real chat_completions -> body_stream cancel_guard
+          # -> generate_streaming_with_cancel composition; without it here
+          # that test would silently not compile/run under this job.
+          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
       # were local-only — a green CI here verified compilation, not behavior.

@@ -166,7 +166,7 @@ mod imp {
     }
 
     #[derive(Clone)]
-    struct AppState {
+    pub struct AppState {
         jobs: mpsc::UnboundedSender<Job>,
         model_id: Arc<str>,
         defaults: Defaults,
@@ -200,19 +200,41 @@ mod imp {
     /// A request-validation failure that must surface as HTTP 400 (#641,
     /// #649). Fail-closed: unknown roles and unsupported content parts are
     /// never coerced or dropped, they always produce one of these.
+    ///
+    /// `code` carries the OpenAI-style error code (ADR-080 C2 round 2,
+    /// codex finding #1): previously this variant was message-only, so
+    /// every validation failure collapsed to `err_response`'s generic
+    /// `"invalid_request"` fallback regardless of what specifically went
+    /// wrong -- `lattice.rs`'s `ApiError::BadRequest` already differentiated
+    /// (`invalid_role`, `unsupported_feature`, `invalid_messages`, ...) for
+    /// the equivalent checks. Codes below are chosen to match `lattice.rs`'s
+    /// codes for the SAME violation wherever an equivalent check exists on
+    /// both binaries; a handful of checks are lattice_serve-only (the #649
+    /// content-part size/count DoS hardening has no lattice.rs analog) and
+    /// get a new, stable, lattice_serve-only code instead of an invented
+    /// false match.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RequestError {
-        BadRequest(String),
+        BadRequest { message: String, code: &'static str },
     }
 
     impl RequestError {
-        fn bad_request(message: impl Into<String>) -> Self {
-            Self::BadRequest(message.into())
+        fn bad_request(message: impl Into<String>, code: &'static str) -> Self {
+            Self::BadRequest {
+                message: message.into(),
+                code,
+            }
         }
 
         fn message(&self) -> &str {
             match self {
-                Self::BadRequest(message) => message,
+                Self::BadRequest { message, .. } => message,
+            }
+        }
+
+        fn code(&self) -> &'static str {
+            match self {
+                Self::BadRequest { code, .. } => code,
             }
         }
     }
@@ -279,35 +301,49 @@ mod imp {
         if req.tools.is_some() || req.tool_choice.is_some() {
             return Err(RequestError::bad_request(
                 "tools and tool_choice are not supported by this server",
+                "unsupported_feature",
             ));
         }
         if req.n.unwrap_or(1) > 1 {
-            return Err(RequestError::bad_request("n > 1 is not supported"));
+            return Err(RequestError::bad_request(
+                "n > 1 is not supported",
+                "unsupported_feature",
+            ));
         }
         if let Some(fmt) = &req.response_format
             && fmt.r#type != "text"
         {
-            return Err(RequestError::bad_request(format!(
-                "response_format.type '{}' is not supported; use 'text'",
-                fmt.r#type
-            )));
+            return Err(RequestError::bad_request(
+                format!(
+                    "response_format.type '{}' is not supported; use 'text'",
+                    fmt.r#type
+                ),
+                "unsupported_feature",
+            ));
         }
         if req.logprobs.unwrap_or(false) || req.top_logprobs.is_some() {
             return Err(RequestError::bad_request(
                 "logprobs/top_logprobs are not supported by this server",
+                "unsupported_feature",
             ));
         }
         if req.stop.is_some() {
             return Err(RequestError::bad_request(
                 "stop is not supported by this server",
+                "unsupported_feature",
             ));
         }
         if let (Some(a), Some(b)) = (req.max_tokens, req.max_completion_tokens)
             && a != b
         {
-            return Err(RequestError::bad_request(format!(
-                "max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"
-            )));
+            return Err(RequestError::bad_request(
+                format!("max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"),
+                // Matches lattice.rs's `validate_max_tokens`, which uses the
+                // generic "invalid_request" code for this exact conflict
+                // (not a more specific "invalid_max_tokens" -- that code is
+                // reserved for the zero/cap cases).
+                "invalid_request",
+            ));
         }
         Ok(())
     }
@@ -329,14 +365,25 @@ mod imp {
     }
 
     impl MessageRole {
+        /// ADR-080 C2 round 2 (codex finding #1): differentiates the same
+        /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
+        /// `developer` are real OpenAI roles this server does not implement
+        /// (`unsupported_feature`), while anything else is not an OpenAI
+        /// chat role at all (`invalid_role`). Previously both collapsed to
+        /// one generic message with no code differentiation.
         fn parse(raw: &str) -> Result<Self, RequestError> {
             match raw {
                 "system" => Ok(Self::System),
                 "user" => Ok(Self::User),
                 "assistant" => Ok(Self::Assistant),
-                other => Err(RequestError::bad_request(format!(
-                    "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
-                ))),
+                "tool" | "developer" => Err(RequestError::bad_request(
+                    format!("role '{raw}' is not supported by this server"),
+                    "unsupported_feature",
+                )),
+                other => Err(RequestError::bad_request(
+                    format!("unsupported role '{other}'; must be 'system', 'user', or 'assistant'"),
+                    "invalid_role",
+                )),
             }
         }
     }
@@ -472,6 +519,13 @@ mod imp {
                         if v.len() > MAX_CONTENT_PART_BYTES {
                             *self.violation.borrow_mut() = Some(RequestError::bad_request(
                                 part_too_large_message(self.message_index, self.part_index),
+                                // #649 DoS-hardening surface with no
+                                // lattice.rs analog (lattice.rs has no
+                                // content-part size/count limit at all) --
+                                // a new, stable, lattice_serve-only code
+                                // rather than an invented false match with
+                                // any lattice.rs code (ADR-080 C2 round 2).
+                                "content_part_limit_exceeded",
                             ));
                         }
                         Ok(())
@@ -611,6 +665,7 @@ mod imp {
                 if v.len() > MAX_CONTENT_PART_BYTES {
                     *self.violation.borrow_mut() = Some(RequestError::bad_request(
                         part_too_large_message(self.message_index, 0),
+                        "content_part_limit_exceeded",
                     ));
                 }
                 Ok(())
@@ -638,8 +693,10 @@ mod imp {
                             // is accepted and only the (MAX+1)-th is rejected.
                             if part_index > MAX_CONTENT_PARTS_PER_MESSAGE {
                                 let msg = too_many_parts_message(self.message_index);
-                                *self.violation.borrow_mut() =
-                                    Some(RequestError::bad_request(msg.clone()));
+                                *self.violation.borrow_mut() = Some(RequestError::bad_request(
+                                    msg.clone(),
+                                    "content_part_limit_exceeded",
+                                ));
                                 return Err(A::Error::custom(msg));
                             }
                         }
@@ -795,8 +852,14 @@ mod imp {
     /// clamp has run.
     fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
         validate_content_part_limits(body)?;
-        serde_json::from_slice::<ChatReq>(body)
-            .map_err(|_| RequestError::bad_request("invalid JSON request body"))
+        serde_json::from_slice::<ChatReq>(body).map_err(|_| {
+            RequestError::bad_request(
+                "invalid JSON request body",
+                // Matches lattice.rs's JSON-extraction-failure code
+                // (ADR-080 C2 round 2, codex finding #1).
+                "invalid_request_body",
+            )
+        })
     }
 
     /// Flatten message content to plain text (#641, #649). Fails closed:
@@ -812,12 +875,21 @@ mod imp {
                     match part {
                         Part::Text { text } => out.push_str(text),
                         Part::ImageUrl { .. } => {
-                            return Err(RequestError::bad_request(IMAGE_REQUIRES_VISION_MESSAGE));
+                            // Matches lattice.rs's `message_text` image
+                            // rejection code (ADR-080 C2 round 2, codex
+                            // finding #1).
+                            return Err(RequestError::bad_request(
+                                IMAGE_REQUIRES_VISION_MESSAGE,
+                                "unsupported_feature",
+                            ));
                         }
                         Part::Unsupported { kind } => {
-                            return Err(RequestError::bad_request(format!(
-                                "unsupported content part type '{kind}'; only 'text' parts are accepted"
-                            )));
+                            return Err(RequestError::bad_request(
+                                format!(
+                                    "unsupported content part type '{kind}'; only 'text' parts are accepted"
+                                ),
+                                "unsupported_feature",
+                            ));
                         }
                     }
                 }
@@ -1195,11 +1267,9 @@ mod imp {
 
     async fn root() -> Json<Value> {
         let t = Instant::now();
-        let body = json!({
-            "name": "lattice",
-            "object": "engine",
-            "endpoints": ["/v1/chat/completions", "/v1/models", "/health"],
-        });
+        // ADR-080 C2 round 2: shared with lattice.rs's equivalent route so
+        // both binaries advertise the same engine-identity document.
+        let body = lattice_inference::serve::root_body();
         emit_serve_event(
             "GET",
             "/",
@@ -1243,14 +1313,19 @@ mod imp {
             emit_serve_event(
                 "POST",
                 "/v1/chat/completions",
-                400,
+                413,
                 None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
+            // ADR-080 C2 round 2 (codex finding #1): previously mapped to
+            // HTTP 400 + generic "invalid_request", diverging from
+            // lattice.rs's 413 + "request_body_too_large" for the identical
+            // oversized-body condition. Aligned to match.
             return err_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+                "request_body_too_large",
             );
         };
         let req = match parse_chat_req(&body) {
@@ -1264,7 +1339,7 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message());
+                return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
         if let Err(err) = reject_unsupported(&req) {
@@ -1276,7 +1351,7 @@ mod imp {
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
-            return err_response(StatusCode::BAD_REQUEST, err.message());
+            return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
         }
         if req.messages.is_empty() {
             emit_serve_event(
@@ -1287,7 +1362,13 @@ mod imp {
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
-            return err_response(StatusCode::BAD_REQUEST, "`messages` must not be empty");
+            // Matches lattice.rs's `validate_chat_request` code for the
+            // identical empty-messages condition (ADR-080 C2 round 2).
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "`messages` must not be empty",
+                "invalid_messages",
+            );
         }
 
         let messages: Vec<ChatMessage> = match req.messages.iter().map(to_chat_message).collect() {
@@ -1301,7 +1382,7 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message());
+                return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
         let cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
@@ -1315,7 +1396,14 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message());
+                // ADR-080 C2 round 2 (codex finding #1): `build_cfg` already
+                // returns the shared `lattice_inference::serve::ApiError`
+                // with the correct status+code (e.g. `invalid_max_tokens`
+                // for #745's max_tokens=0 rejection) -- routing it through
+                // `err_response`'s (StatusCode, &str) signature discarded
+                // that code and re-wrapped it as generic "invalid_request".
+                // Propagate the original error directly instead.
+                return err.into_response();
             }
         };
         let model_id = req.model.clone().unwrap_or_else(|| s.model_id.to_string());
@@ -1345,6 +1433,7 @@ mod imp {
             return err_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "inference worker unavailable",
+                "internal_error",
             );
         }
         // Dropped when nobody cares about the response anymore: at the end of
@@ -1515,7 +1604,11 @@ mod imp {
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
                         );
-                        return err_response(StatusCode::INTERNAL_SERVER_ERROR, "inference failed");
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "inference failed",
+                            "internal_error",
+                        );
                     }
                     Ev::Rejected { message } => {
                         // #656: client-caused request-contract violation (the
@@ -1532,7 +1625,14 @@ mod imp {
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
                         );
-                        return err_response(StatusCode::BAD_REQUEST, &message);
+                        // Matches lattice.rs's `check_context_window` code
+                        // for the analogous prompt-plus-budget-exceeds-window
+                        // condition (ADR-080 C2 round 2, codex finding #1).
+                        return err_response(
+                            StatusCode::BAD_REQUEST,
+                            &message,
+                            "context_length_exceeded",
+                        );
                     }
                 }
             }
@@ -1575,7 +1675,14 @@ mod imp {
     /// `StatusCode::BAD_REQUEST`, `PAYLOAD_TOO_LARGE`, or
     /// `INTERNAL_SERVER_ERROR`, so the status code produced here is
     /// unchanged; only the body shape gains `code`/`param`.
-    fn err_response(code: StatusCode, msg: &str) -> Response {
+    /// `error_code` is the OpenAI-style code for the `BAD_REQUEST` branch
+    /// (ADR-080 C2 round 2, codex finding #1): previously hardcoded to the
+    /// generic `"invalid_request"` regardless of what specifically failed,
+    /// which is exactly how the `max_tokens: 0` rejection lost its
+    /// `"invalid_max_tokens"` code on the way through this function. Ignored
+    /// for the `PAYLOAD_TOO_LARGE`/`INTERNAL_SERVER_ERROR` branches, which
+    /// carry their own fixed codes in `ApiError`'s `IntoResponse` impl.
+    fn err_response(code: StatusCode, msg: &str, error_code: &'static str) -> Response {
         use lattice_inference::serve::ApiError;
         let api_err = if code == StatusCode::PAYLOAD_TOO_LARGE {
             ApiError::PayloadTooLarge {
@@ -1588,7 +1695,7 @@ mod imp {
         } else {
             ApiError::BadRequest {
                 message: msg.to_string(),
-                code: "invalid_request",
+                code: error_code,
             }
         };
         api_err.into_response()
@@ -1683,6 +1790,26 @@ mod imp {
                 .is_some()
     }
 
+    /// Builds the daemon's router in isolation from `run()`'s process
+    /// startup (arg parsing, model loading, binding a listener) so tests --
+    /// including the cross-binary parity table in
+    /// `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` -- can drive
+    /// real HTTP requests through it via `tower::ServiceExt::oneshot`
+    /// (ADR-080 C2 round 2, codex finding #1). Deliberately does NOT install
+    /// `DefaultBodyLimit` the way `lattice.rs`'s `router()` does: this
+    /// binary enforces the same [`lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`]
+    /// cap manually inside `chat_completions` via `to_bytes`, a documented
+    /// intentional divergence in enforcement mechanism (same limit, +
+    /// different-status-code-vs-lattice.rs -- see the parity table).
+    pub fn router(state: AppState) -> Router {
+        Router::new()
+            .route("/", get(root))
+            .route("/health", get(health))
+            .route("/v1/models", get(list_models))
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state)
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<String> = std::env::args().collect();
 
@@ -1763,12 +1890,7 @@ mod imp {
             .enable_all()
             .build()?;
         rt.block_on(async move {
-            let app = Router::new()
-                .route("/", get(root))
-                .route("/health", get(health))
-                .route("/v1/models", get(list_models))
-                .route("/v1/chat/completions", post(chat_completions))
-                .with_state(state);
+            let app = router(state);
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
@@ -2267,11 +2389,26 @@ mod imp {
 
         #[test]
         fn message_role_unknown_rejected() {
-            let err = MessageRole::parse("developer").unwrap_err();
+            // Not an OpenAI chat role at all -- `invalid_role`, matching
+            // `lattice.rs`'s `ValidatedRole::parse` for the same case.
+            let err = MessageRole::parse("moderator").unwrap_err();
             assert_eq!(
                 err.message(),
-                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+                "unsupported role 'moderator'; must be 'system', 'user', or 'assistant'"
             );
+            assert_eq!(err.code(), "invalid_role");
+        }
+
+        #[test]
+        fn message_role_tool_and_developer_rejected_as_unsupported_feature() {
+            // A real OpenAI role this server does not implement --
+            // `unsupported_feature`, matching `lattice.rs`'s split between
+            // "not a role" and "a role we don't support" (ADR-080 C2
+            // round 2, codex finding #1).
+            for role in ["tool", "developer"] {
+                let err = MessageRole::parse(role).unwrap_err();
+                assert_eq!(err.code(), "unsupported_feature");
+            }
         }
 
         #[test]
@@ -2539,15 +2676,40 @@ mod imp {
 
         #[tokio::test]
         async fn chat_completions_unknown_role_400() {
+            // A role string that is not an OpenAI chat role at all (as
+            // opposed to "developer"/"tool", which ARE real OpenAI roles
+            // this server just doesn't implement -- see
+            // `chat_completions_tool_and_developer_role_400_unsupported_feature`
+            // below for that split, ADR-080 C2 round 2 codex finding #1).
             let body =
-                Body::from(r#"{"messages":[{"role":"developer","content":"hi"}]}"#.to_string());
+                Body::from(r#"{"messages":[{"role":"moderator","content":"hi"}]}"#.to_string());
             let response = chat_completions(State(test_app_state()), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
                 message,
-                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+                "unsupported role 'moderator'; must be 'system', 'user', or 'assistant'"
             );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
+            for role in ["tool", "developer"] {
+                let body = Body::from(format!(
+                    r#"{{"messages":[{{"role":"{role}","content":"hi"}}]}}"#
+                ));
+                let response = chat_completions(State(test_app_state()), body).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+                assert_eq!(
+                    v["error"]["code"], "unsupported_feature",
+                    "role '{role}' must be reported as unsupported_feature, not invalid_role"
+                );
+            }
         }
 
         #[tokio::test]
@@ -2897,6 +3059,78 @@ mod imp {
                 "a mismatched `model` must reach the job queue on this surface today \
                  (expected deviation, tracked in #663)"
             );
+        }
+
+        // ── cross-binary parity table (ADR-080 C2 round 2, codex round-1
+        // finding #1) ────────────────────────────────────────────────────
+        //
+        // Drives every fixture body in
+        // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
+        // THIS binary's real `Router` (via `router()`, extracted from
+        // `run()` specifically so it's testable in isolation from process
+        // startup) and compares the resulting status + error code against
+        // the case's `lattice_serve`-side expectation. `lattice.rs`'s own
+        // test module runs the SAME table against its own router, asserting
+        // the `lattice`-side expectation -- together the two prove
+        // same-input parity (or a documented, intentional divergence) at
+        // the real HTTP layer.
+        mod parity_table {
+            use super::*;
+            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use tower::ServiceExt as _;
+
+            #[tokio::test]
+            async fn chat_completions_matches_shared_parity_table() {
+                for case in CHAT_COMPLETIONS_PARITY_CASES {
+                    let (expected_status, expected_code) = case.expected(Binary::LatticeServe);
+
+                    let app = router(test_app_state());
+                    let request = axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(case.body))
+                        .expect("fixture request must build");
+                    let response = app
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+
+                    let status = response.status().as_u16();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("response body reads");
+
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "case '{}': expected status {expected_status}, got {status} \
+                         (body: {})",
+                        case.name,
+                        String::from_utf8_lossy(&body)
+                    );
+
+                    // See `lattice.rs`'s mirror of this test for why 2xx
+                    // responses skip the error-code check.
+                    if !(200..300).contains(&status) {
+                        let value: serde_json::Value = serde_json::from_slice(&body)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "case '{}': non-2xx response body must be the shared \
+                                     error envelope JSON: {e} (body: {})",
+                                    case.name,
+                                    String::from_utf8_lossy(&body)
+                                )
+                            });
+                        assert_eq!(
+                            value["error"]["code"], expected_code,
+                            "case '{}': expected error code '{expected_code}', got {} \
+                             (full body: {value})",
+                            case.name, value["error"]["code"]
+                        );
+                    }
+                }
+            }
         }
     }
 }

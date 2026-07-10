@@ -141,6 +141,21 @@ pub fn reject_zero_max_tokens(effective: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// `GET /` response body: a minimal engine-identity/endpoint-discovery
+/// document. Shared so both binaries expose a byte-identical root route
+/// (ADR-080 C2 round 2, codex finding #1): `lattice_serve.rs` already
+/// served this; `lattice.rs` had no `GET /` route at all, an undocumented
+/// divergence the review's route-set audit caught. Both binaries expose the
+/// same three routes, so the endpoint list is a fixed constant here rather
+/// than a per-binary parameter.
+pub fn root_body() -> Value {
+    serde_json::json!({
+        "name": "lattice",
+        "object": "engine",
+        "endpoints": ["/v1/chat/completions", "/v1/models", "/health"],
+    })
+}
+
 /// `GET /v1/models` response body: advertises the single loaded model.
 /// Shared so both binaries expose byte-identical shapes for the same model
 /// id and `created` timestamp -- previously only `lattice_serve.rs`
@@ -185,6 +200,142 @@ pub fn cancel_pair() -> (CancelOnDrop, watch::Receiver<bool>) {
     (CancelOnDrop(tx), rx)
 }
 
+/// Which binary a [`ParityCase`] expectation applies to. Both binaries build
+/// their own `Router` and drive it independently (bins can't cross-import
+/// each other's `chat_completions`/router as a normal dependency), so a case
+/// carries per-binary expected outcomes rather than one shared HTTP call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binary {
+    Lattice,
+    LatticeServe,
+}
+
+/// One row of the cross-binary `/v1/chat/completions` parity table (ADR-080
+/// C2 round 2, codex finding #1): a single request body, and the expected
+/// `(status, error_code)` for each binary. Use [`ParityCase::same`] when both
+/// binaries must produce an identical outcome for this body (the common
+/// case, post-alignment); use [`ParityCase::diverging`] only for a
+/// documented, intentional per-binary difference -- an undocumented
+/// divergence is exactly the drift this table exists to catch.
+pub struct ParityCase {
+    pub name: &'static str,
+    pub body: &'static str,
+    lattice: (u16, &'static str),
+    lattice_serve: (u16, &'static str),
+    /// `Some` only for a documented intentional divergence; explains WHY the
+    /// two expected outcomes differ (reviewed alongside the table, not left
+    /// to be inferred from the two tuples).
+    pub divergence_reason: Option<&'static str>,
+}
+
+impl ParityCase {
+    pub fn expected(&self, binary: Binary) -> (u16, &'static str) {
+        match binary {
+            Binary::Lattice => self.lattice,
+            Binary::LatticeServe => self.lattice_serve,
+        }
+    }
+}
+
+/// Shared fixture table for both binaries' `/v1/chat/completions` HTTP
+/// contract, driven through each binary's real `Router` via
+/// `tower::ServiceExt::oneshot` in `lattice.rs`'s and `lattice_serve.rs`'s
+/// own test modules. Every case that ISN'T a documented divergence must
+/// resolve to the SAME `(status, code)` on both binaries -- codex's review
+/// named concrete drift this closes: oversized body (413/`request_body_too_large`
+/// vs 400/`invalid_request`), zero `max_tokens` (`invalid_max_tokens` vs
+/// erased to `invalid_request`), and unknown role (generic message/no code
+/// on one side).
+pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
+    ParityCase {
+        name: "unknown_role_not_openai",
+        // A trailing valid `user` turn keeps this isolated to the role
+        // check: `lattice.rs` separately requires the conversation's LAST
+        // message to have role `user` (a Qwen ChatML constraint, unrelated
+        // to and checked before role-validity), so a single-message
+        // `moderator` body would fail on THAT check first with
+        // `invalid_messages` instead of exercising role validation at all.
+        body: r#"{"model":"test-model","messages":[{"role":"moderator","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        lattice: (400, "invalid_role"),
+        lattice_serve: (400, "invalid_role"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "developer_role_unsupported_feature",
+        // See `unknown_role_not_openai`'s comment on the trailing `user` turn.
+        body: r#"{"model":"test-model","messages":[{"role":"developer","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        lattice: (400, "unsupported_feature"),
+        lattice_serve: (400, "unsupported_feature"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "empty_messages",
+        body: r#"{"model":"test-model","messages":[]}"#,
+        lattice: (400, "invalid_messages"),
+        lattice_serve: (400, "invalid_messages"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "max_tokens_zero",
+        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
+        lattice: (400, "invalid_max_tokens"),
+        lattice_serve: (400, "invalid_max_tokens"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "max_tokens_and_max_completion_tokens_conflict",
+        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
+        lattice: (400, "invalid_request"),
+        lattice_serve: (400, "invalid_request"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "tools_unsupported",
+        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#,
+        lattice: (400, "unsupported_feature"),
+        lattice_serve: (400, "unsupported_feature"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "malformed_json_body",
+        body: r#"{"model":"test-model","messages":"#,
+        lattice: (400, "invalid_request_body"),
+        lattice_serve: (400, "invalid_request_body"),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "max_tokens_over_cap_reject_vs_clamp",
+        // Both servers are configured (in each binary's own oneshot test
+        // harness) with a small cap/context window; this body's max_tokens
+        // exceeds it. `lattice.rs` rejects before ever touching the
+        // model/worker; `lattice_serve.rs` clamps to the model's context
+        // window in `build_cfg` and proceeds past validation entirely
+        // (#745's triaged scope, kept deliberately unnified by
+        // `reject_zero_max_tokens`'s doc comment). `lattice_serve`'s
+        // expected (500, "internal_error") here is a harness artifact, not
+        // real-server behavior: the router-level test fixture has no live
+        // worker behind its job queue (matching this test module's existing
+        // `test_app_state()` convention -- HTTP-level 400 tests only, no
+        // GPU/model load), so a request that clears validation and reaches
+        // `jobs.send(..)` fails there instead. The signal this case actually
+        // proves is "not a 400 at the validation cascade" -- clamp-not-reject
+        // -- which the diverging (500 vs 400) outcome demonstrates without
+        // needing a real model.
+        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#,
+        lattice: (400, "max_tokens_exceeds_limit"),
+        lattice_serve: (500, "internal_error"),
+        divergence_reason: Some(
+            "lattice.rs rejects max_tokens above its server cap at validation time; \
+             lattice_serve.rs clamps the resolved value to the model's context \
+             window and proceeds past validation instead of rejecting -- an \
+             intentional per-binary policy difference, not drift (see \
+             reject_zero_max_tokens's doc comment). The lattice_serve 500 here is \
+             this router-level fixture's no-live-worker harness artifact once past \
+             validation, not the divergence itself.",
+        ),
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +366,17 @@ mod tests {
     fn reject_zero_max_tokens_accepts_positive() {
         assert!(reject_zero_max_tokens(1).is_ok());
         assert!(reject_zero_max_tokens(4096).is_ok());
+    }
+
+    #[test]
+    fn root_body_shape() {
+        let body = root_body();
+        assert_eq!(body["name"], "lattice");
+        assert_eq!(body["object"], "engine");
+        assert_eq!(
+            body["endpoints"],
+            serde_json::json!(["/v1/chat/completions", "/v1/models", "/health"])
+        );
     }
 
     #[test]

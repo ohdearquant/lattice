@@ -3275,6 +3275,16 @@ mod serve {
         Json(HealthResponse { status: "ok" })
     }
 
+    /// `GET /` (ADR-080 C2 round 2, codex finding #1): a minimal engine-
+    /// identity/endpoint-discovery document, in the same shape
+    /// `lattice_serve.rs` already served on its own daemon -- this binary
+    /// had no equivalent route at all, an undocumented route-set divergence
+    /// the review's route audit caught (the PR body's "routes now match
+    /// 1:1" claim was false until this route landed).
+    pub async fn root() -> Json<Value> {
+        Json(lattice_inference::serve::root_body())
+    }
+
     /// `GET /v1/models` (ADR-080 C2, #746's sibling gap): advertises the
     /// single loaded model, in the same shape `lattice_serve.rs` already
     /// served on its own daemon -- this binary had no equivalent route at
@@ -3820,6 +3830,7 @@ mod serve {
 
     pub fn router(state: AppState) -> Router {
         Router::new()
+            .route("/", get(root))
             .route("/health", get(health))
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
@@ -5221,6 +5232,261 @@ mod serve {
             };
             let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
             assert_eq!(validated.logprobs, Some(3));
+        }
+
+        // -----------------------------------------------------------------------
+        // Shared `AppState` builder for the router-level test modules below --
+        // both need a real (tiny, deterministic) CPU model, gated behind
+        // `test-utils` (see `lattice_inference::model::qwen35::test_support`)
+        // for the same reason: bin targets can't see this crate's own
+        // `#[cfg(test)]`-only fixtures across the bin/lib compilation
+        // boundary, only a real Cargo feature crosses it.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        fn tiny_state(max_tokens_cap: usize) -> AppState {
+            let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+            AppState {
+                model: ModelBackend::Cpu(Arc::new(model)),
+                default_max_tokens: max_tokens_cap,
+                max_tokens_cap,
+                model_id: "test-model".to_string(),
+                request_counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // HTTP-level client-disconnect cancellation (ADR-080 C2 round 2, codex
+        // round-1 finding #2) -- gated behind `test-utils` (see
+        // `lattice_inference::model::qwen35::test_support`) because it needs a
+        // real, tiny, deterministic CPU model to exercise the actual
+        // `chat_completions` -> `body_stream`'s `cancel_guard` capture ->
+        // `generate_streaming_with_cancel` composition end to end, not just the
+        // primitive (already unit/mutation-tested in
+        // `model/qwen35/generation.rs`) or the guard type (already unit-tested
+        // in `serve/mod.rs`) in isolation. Codex's review: "the disclosed
+        // HTTP-level disconnect test gap ... does not waive that gate."
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod disconnect_cancellation {
+            use super::*;
+            use http_body_util::BodyExt;
+            use std::time::Duration;
+
+            /// The tiny test model's context window is a fixed 1024 tokens
+            /// (`test_support::tiny_zero_model`'s `max_position_embeddings`),
+            /// so `max_tokens` here must leave room for the rendered prompt
+            /// (well under 1024) -- "effectively unbounded relative to this
+            /// test's timeouts" rather than the vastly larger figure a real
+            /// model's context window would allow.
+            const NEAR_MAX_CONTEXT_TOKENS: usize = 900;
+
+            fn tiny_state() -> AppState {
+                super::tiny_state(NEAR_MAX_CONTEXT_TOKENS)
+            }
+
+            /// Proves the real `chat_completions` streaming composition --
+            /// not just its primitives in isolation -- actually stops
+            /// generation on client disconnect. A tiny all-zero-weight model
+            /// with `max_tokens` near the tiny model's 1024-token context window means
+            /// uncancelled generation would keep running far longer than
+            /// this test's timeouts; it reads two real SSE frames (proving
+            /// generation is genuinely under way) before dropping the
+            /// response body to simulate a disconnect.
+            ///
+            /// Mutation-sensitive to codex's named regression: if
+            /// `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
+            /// is removed from `body_stream`'s `flat_map` closure in
+            /// `chat_completions`, `cancel_guard` is no longer captured by
+            /// anything and drops at the end of `chat_completions`'s own
+            /// function body -- i.e. before the response is even returned to
+            /// the caller, let alone before the client could disconnect.
+            /// That flips `cancel_rx` immediately, so
+            /// `generate_streaming_with_cancel`'s pre-prefill checkpoint
+            /// returns `Interrupt` with zero tokens generated. Frame 1 (the
+            /// role chunk) still arrives unconditionally either way, and a
+            /// *second* frame still arrives either way too -- but under the
+            /// mutation it is the finish chunk (`finish_reason: "interrupt"`,
+            /// no `content`) sent by `finish_streaming` for a zero-token
+            /// result, not a real content delta. A test that only checks "a
+            /// second frame arrived and was Ok" cannot tell these apart, so
+            /// this asserts the frame's actual JSON payload shape: real code
+            /// path yields `finish_reason: null` + a string `delta.content`;
+            /// the mutated path yields a non-null `finish_reason` and no
+            /// `content`, and the second `assert!` fails. Verified by
+            /// reverting that exact line and re-running: see the PR body's
+            /// mutation log.
+            #[tokio::test]
+            async fn chat_completions_streaming_disconnect_stops_generation() {
+                let req = ChatCompletionRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![user_msg("hi")],
+                    max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
+                    stream: Some(true),
+                    ..bare_req()
+                };
+
+                let response = chat_completions(State(tiny_state()), Ok(Json(req)))
+                    .await
+                    .expect("streaming request must be accepted");
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let mut body = response.into_body();
+
+                // Frame 1: the role chunk, emitted unconditionally before any
+                // generation output (`futures::stream::once(role_chunk).chain(body_stream)`).
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("role chunk frame must arrive quickly")
+                    .expect("role chunk frame must exist")
+                    .expect("role chunk frame must be Ok");
+
+                // Frame 2: must be a genuine content delta from the tiny
+                // model's decode loop, not the finish chunk. A frame merely
+                // *arriving* here does not prove generation ran: if
+                // `cancel_guard` is no longer tied to the stream, it drops
+                // (flipping `cancel_rx`) before the blocking task's
+                // pre-prefill checkpoint, `generate_streaming_with_cancel`
+                // returns `Interrupt` with zero tokens, and
+                // `finish_streaming` sends `StreamMsg::Done` immediately --
+                // which *also* produces a well-formed, `Ok` SSE frame here,
+                // just one carrying `finish_reason: "interrupt"` and no
+                // `content` instead of a real delta. So this asserts the
+                // frame's actual payload shape, not just its arrival.
+                let frame = tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect(
+                        "a second frame must arrive quickly -- if this times out, \
+                         nothing at all was sent after the role chunk",
+                    )
+                    .expect("second frame must exist")
+                    .expect("second frame must be Ok");
+                let data = frame
+                    .into_data()
+                    .expect("second frame must carry data (not trailers)");
+                let text = std::str::from_utf8(&data).expect("SSE frame must be UTF-8");
+                let payload = text
+                    .strip_prefix("data: ")
+                    .unwrap_or(text)
+                    .trim_end_matches(['\n', '\r']);
+                let chunk: serde_json::Value =
+                    serde_json::from_str(payload).expect("SSE frame must carry a JSON chunk");
+                let choice = &chunk["choices"][0];
+                assert!(
+                    choice["finish_reason"].is_null(),
+                    "second frame must be a content delta, not the finish chunk \
+                     (generation was interrupted before producing any output, \
+                     i.e. cancel_guard fired before the stream had a chance to \
+                     run): {chunk}"
+                );
+                assert!(
+                    choice["delta"]["content"].is_string(),
+                    "second frame must carry delta.content (a real generated \
+                     token), got: {chunk}"
+                );
+
+                // Client disconnect: drop the body. `cancel_guard` (captured
+                // by `body_stream`'s `flat_map` closure) drops with it,
+                // flipping the paired `cancel_rx` -- the CPU decode loop's
+                // `generate_streaming_with_cancel` polls that flag at the top
+                // of every iteration (already unit/mutation-tested in
+                // `model/qwen35/generation.rs`) and stops within one step
+                // instead of running toward `max_tokens` (900). This
+                // test's own fast, deterministic completion (it does not hang
+                // waiting on the now-unobservable background task) is the
+                // practical proof: dropping never blocks, and the tiny
+                // model's decode loop is fast enough on the blocking-thread
+                // pool that a broken cancellation path would otherwise pin a
+                // thread pool worker in an unbounded loop for the remainder
+                // of the test process's life -- observable across this
+                // binary's full test run as sporadic slowdowns/hangs in
+                // later tests sharing the pool, not just this test in
+                // isolation.
+                drop(body);
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2 round 2,
+        // codex round-1 finding #1): drives every fixture body in
+        // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
+        // THIS binary's real `Router` via `tower::ServiceExt::oneshot`, and
+        // compares the resulting status + error code against the case's
+        // `lattice`-side expectation. `lattice_serve.rs`'s own test module
+        // runs the SAME table against its own router, asserting the
+        // `lattice_serve`-side expectation -- together the two prove
+        // same-input parity (or a documented, intentional divergence) at the
+        // real HTTP layer, not just in each binary's private validation
+        // helpers. Gated behind `test-utils` for the same reason as
+        // `disconnect_cancellation`: `router()` needs a real `AppState`,
+        // which needs a real (tiny) CPU model.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod parity_table {
+            use super::*;
+            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use tower::ServiceExt as _;
+
+            /// Small enough that `max_tokens_over_cap_reject_vs_clamp`'s
+            /// 999999 genuinely exceeds both `default_max_tokens` and
+            /// `max_tokens_cap`.
+            const CAP: usize = 64;
+
+            #[tokio::test]
+            async fn chat_completions_matches_shared_parity_table() {
+                for case in CHAT_COMPLETIONS_PARITY_CASES {
+                    let (expected_status, expected_code) = case.expected(Binary::Lattice);
+
+                    let app = router(tiny_state(CAP));
+                    let request = axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(case.body))
+                        .expect("fixture request must build");
+                    let response = app
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+
+                    let status = response.status().as_u16();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("response body reads");
+
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "case '{}': expected status {expected_status}, got {status} \
+                         (body: {})",
+                        case.name,
+                        String::from_utf8_lossy(&body)
+                    );
+
+                    // A non-2xx status must carry the expected shared error
+                    // code; a 2xx status has no error envelope to check
+                    // (the `max_tokens_over_cap_reject_vs_clamp` divergence
+                    // case is the only non-error entry today, and even its
+                    // "success" side is a harness-artifact 500 -- see the
+                    // case's own doc comment in `serve/mod.rs`).
+                    if !(200..300).contains(&status) {
+                        let value: serde_json::Value = serde_json::from_slice(&body)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "case '{}': non-2xx response body must be the shared \
+                                     error envelope JSON: {e} (body: {})",
+                                    case.name,
+                                    String::from_utf8_lossy(&body)
+                                )
+                            });
+                        assert_eq!(
+                            value["error"]["code"], expected_code,
+                            "case '{}': expected error code '{expected_code}', got {} \
+                             (full body: {value})",
+                            case.name, value["error"]["code"]
+                        );
+                    }
+                }
+            }
         }
     }
 }
