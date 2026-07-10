@@ -2679,6 +2679,130 @@ mod imp {
             );
         }
 
+        // ── ADR-080 C2 (#782): max_tokens=0 rejection + finish_reason round-trip ──
+
+        #[tokio::test]
+        async fn chat_completions_max_tokens_zero_400() {
+            // #745: previously clamped straight through into a zero-budget
+            // completion instead of being rejected.
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#.to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "max_tokens must be at least 1");
+        }
+
+        /// Builds an `AppState` wired to a fresh `jobs` channel plus the
+        /// receiving half, so tests can stand in for the worker: reply with
+        /// whatever `Ev` sequence the test wants without a real GPU/model.
+        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<Job>) {
+            let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+            };
+            (state, jobs_rx)
+        }
+
+        /// #746 (ADR-080 C2): the non-streaming JSON response's
+        /// `finish_reason` must reflect the engine's actual `stopped` flag,
+        /// not a hardcoded `"stop"`. A fake worker task stands in for the
+        /// GPU, replying with a crafted `Ev::Done { stopped }` directly.
+        async fn non_streaming_finish_reason_for(stopped: bool) -> String {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
+                    let _ = job.tx.send(Ev::Done {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        stopped,
+                    });
+                }
+            });
+            let body = Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+            v["choices"][0]["finish_reason"]
+                .as_str()
+                .expect("finish_reason must be a string")
+                .to_string()
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_finish_reason_stop_when_engine_stopped() {
+            assert_eq!(non_streaming_finish_reason_for(true).await, "stop");
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_finish_reason_length_when_not_stopped() {
+            // Previously this hardcoded "stop" unconditionally, so a
+            // length-capped or cancelled completion was misreported as an
+            // explicit stop condition (#746).
+            assert_eq!(non_streaming_finish_reason_for(false).await, "length");
+        }
+
+        /// Same round-trip as above, but through the SSE streaming path
+        /// (`Phase::Body`'s `Ev::Done` arm) instead of the non-streaming
+        /// JSON body.
+        async fn streaming_finish_reason_for(stopped: bool) -> String {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
+                    let _ = job.tx.send(Ev::Done {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        stopped,
+                    });
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("SSE response body must be readable");
+            String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8")
+        }
+
+        #[tokio::test]
+        async fn chat_completions_streaming_finish_reason_stop_when_engine_stopped() {
+            let text = streaming_finish_reason_for(true).await;
+            assert!(
+                text.contains("\"finish_reason\":\"stop\""),
+                "SSE body must carry finish_reason: stop; got: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_streaming_finish_reason_length_when_not_stopped() {
+            let text = streaming_finish_reason_for(false).await;
+            assert!(
+                text.contains("\"finish_reason\":\"length\""),
+                "SSE body must carry finish_reason: length, not a hardcoded \"stop\" \
+                 (#746); got: {text}"
+            );
+        }
+
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
             let defaults = Defaults {
