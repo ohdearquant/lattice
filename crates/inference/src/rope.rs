@@ -38,11 +38,7 @@ impl RopeTable {
     /// Callers that index `apply` / `cos_at` / `sin_at` beyond this will panic.
     #[inline]
     pub fn max_positions(&self) -> usize {
-        if self.half_dim == 0 {
-            0
-        } else {
-            self.cos.len() / self.half_dim
-        }
+        self.cos.len().checked_div(self.half_dim).unwrap_or(0)
     }
 
     /// **Unstable**: row stride in the cos/sin tables — equals `head_dim / 2`.

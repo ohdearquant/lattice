@@ -461,11 +461,7 @@ pub fn apply_native_sparse_attention(
 
     // model_dim: infer from x_buf length. seq_len=0 is handled below after the early return.
     // For seq_len>0 the division is safe because seq_len>=1.
-    let model_dim = if seq_len > 0 {
-        x_buf.len() / seq_len
-    } else {
-        0
-    };
+    let model_dim = x_buf.len().checked_div(seq_len).unwrap_or(0);
     assert_eq!(
         x_buf.len(),
         seq_len * model_dim,
